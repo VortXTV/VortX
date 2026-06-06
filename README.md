@@ -88,6 +88,10 @@ server.js isn't included here because it's Stremio's own streaming server. It sh
 
 It started out talking to addons by hand, and that kept getting small things wrong. So it was moved onto stremio-core, Stremio's open-source Rust engine. The engine is built as a static library, packaged as StremioXCore.xcframework, and talks to Swift as plain JSON over a C interface (see the `core/` folder). The SwiftUI screens send the engine actions and render whatever state it hands back, which is why the behavior lines up with the official app: it is the official engine. There's more in `docs/REBASE-stremio-core.md`.
 
+## What's next
+
+The plan for upcoming work (native iOS on the engine, live playback progress, Search and Add-ons on the engine, Apple TV Top Shelf, and more) is in [ROADMAP.md](ROADMAP.md).
+
 ## Not affiliated
 
 This is an independent community project. It is not affiliated with or endorsed by Stremio, Anthropic, or Apple. All names and trademarks belong to their owners.
