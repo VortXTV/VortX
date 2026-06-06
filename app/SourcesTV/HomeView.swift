@@ -5,6 +5,7 @@ import SwiftUI
 /// Selecting a title opens its detail page (still the legacy meta resolver for now; migrated later).
 struct HomeView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
 
     var body: some View {
         NavigationStack {
@@ -18,7 +19,7 @@ struct HomeView: View {
                         CoreCatalogRowView(row: row)
                     }
                     if core.continueWatching.isEmpty && core.boardRows.isEmpty {
-                        placeholder
+                        if account.isSignedIn { placeholder } else { CoreEmptyState.signedOut }
                     }
                 }
                 .padding(.vertical, 40)

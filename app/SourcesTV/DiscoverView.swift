@@ -5,6 +5,7 @@ import SwiftUI
 /// type/catalog/genre selection is exactly the official app's behavior.
 struct DiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
     private let columns = Array(repeating: GridItem(.fixed(220), spacing: 28), count: 6)
 
     var body: some View {
@@ -17,8 +18,10 @@ struct DiscoverView: View {
                         catalogChips(discover.selectable.catalogs)
                         genreChips(discover.selectable.extra)
                         grid(discover.items)
-                    } else {
+                    } else if account.isSignedIn {
                         ProgressView().controlSize(.large).padding(60).frame(maxWidth: .infinity)
+                    } else {
+                        CoreEmptyState.signedOut
                     }
                 }
                 .padding(.vertical, 40)
