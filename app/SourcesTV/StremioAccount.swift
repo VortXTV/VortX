@@ -143,13 +143,22 @@ final class StremioAccount: ObservableObject {
     private let log = Logger(subsystem: "com.stremiox.app", category: "account")
 
     private var authKey: String? {
-        get { UserDefaults.standard.string(forKey: tokenKey) }   // TODO: move to Keychain
-        set { UserDefaults.standard.setValue(newValue, forKey: tokenKey) }
+        get { Keychain.string(tokenKey) }
+        set { Keychain.set(newValue, for: tokenKey) }
     }
 
     init() {
         email = UserDefaults.standard.string(forKey: emailKey)
+        migrateTokenToKeychain()
         if authKey != nil { isSignedIn = true; Task { await loadAddons() } }
+    }
+
+    /// Move a token saved by an older build (UserDefaults) into the Keychain, once.
+    private func migrateTokenToKeychain() {
+        guard authKey == nil,
+              let legacy = UserDefaults.standard.string(forKey: tokenKey), !legacy.isEmpty else { return }
+        Keychain.set(legacy, for: tokenKey)
+        UserDefaults.standard.removeObject(forKey: tokenKey)
     }
 
     func signIn(email rawEmail: String, password: String) async {
