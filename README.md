@@ -1,12 +1,14 @@
 # StremioX
 
-Stremio for iPhone, iPad, and Apple TV. I built it because the official apps stopped getting updates.
+Stremio for iPhone, iPad, and Apple TV. An independent, updated client for Apple devices, with a native Apple TV app built on stremio-core.
 
 ## Why this exists
 
-Apple kept pulling Stremio off the App Store, and after enough rounds of that fight Stremio basically gave up on Apple. The last build we got was v1.3.6, back in February 2026. Everyone on Android and Windows kept moving forward while we sat on an old app that barely worked anymore.
+Apple pulled Stremio from the App Store, and Stremio's answer was to go the sideload route. In February 2026 they released fully featured sideloadable IPAs for iPhone, iPad, and Apple TV, said they were waiting to hear back from Apple about returning to the store, and hinted at more coming in 2026. That February build (v1.3.6) is almost certainly the one most of us are running.
 
-It bugged me for a long time. I couldn't watch anything properly on my Apple TV, and on my iPhone and iPad I was stuck on a stale, limited build while the rest of Stremio moved on. At some point I stopped waiting for someone else to fix it and just did it myself: updated apps for iOS and Apple TV, put out here so other Apple users don't have to put up with the same thing.
+The catch is what happened after. Those Apple builds have not been updated in months, the download links quietly went missing from the site, and meanwhile the Android, Windows, and web apps kept getting features and fixes. On Apple TV the official option is "Stremio Lite," which is deliberately feature limited. So Apple users, and Apple TV users in particular, are stuck on something stale while everyone else moves on.
+
+That is the gap I wanted to close. StremioX is an independent, updated client, built fresh for Apple TV on stremio-core (the same engine Stremio uses) and for iPhone and iPad. It is not a replacement for Stremio, it is not affiliated with them, and it takes nothing away from their apps. It is just a way for Apple users to stop waiting.
 
 One thing I want to be straight about. I didn't write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own devices, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was actually good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo.
 
@@ -49,16 +51,27 @@ A few things the Apple TV app does:
 
 ## Installing
 
-The builds are attached to the [latest release](../../releases/latest). They are unsigned on purpose. There's no shared signing identity, and the app uses some private APIs, so the App Store was never the goal. You re-sign them yourself:
+The builds are attached to the [latest release](../../releases/latest). They are unsigned because this is a third-party Stremio client distributed outside the App Store, and there is no shared signing identity to ship a signed build. You re-sign them yourself:
 
 - iPhone and iPad: Signulous, AltStore or SideStore, or Sideloadly. A free Apple ID works for personal use.
 - Apple TV: Sideloadly or Xcode, or a paid signing service.
 
 What I used myself is Signulous, and it was pretty straightforward. You pay once a year per device, upload the IPA, and it signs and installs within a minute.
 
+## Security and privacy
+
+Reasonable questions for any unsigned build, so here is the straight version:
+
+- It is unsigned on purpose. You re-sign it with your own identity, so nothing here runs under my signature.
+- What the Apple TV app talks to: Stremio's official API (api.strem.io) to sign in and sync, the addons you have installed, and whichever streaming server you point it at. Nothing else. It adds no analytics, no telemetry, and no third-party trackers.
+- The iPhone and iPad app hosts Stremio's own stremio-web interface, so it behaves like Stremio's official web app and talks to the same places that does.
+- Your account token is kept in the device Keychain, not in plain preferences, and it only ever goes to Stremio's own API.
+- Each release lists SHA-256 checksums next to the assets, so you can confirm the file you downloaded matches what was published.
+- You do not have to take my word for any of this. The full source is here, and you can build the IPA yourself.
+
 ## It comes with nothing
 
-You sign in with your own Stremio account and bring your own addons (Cinemeta, your debrid or AIOStreams setup, whatever you already use). No content is bundled and no addons are bundled. What you watch, and whether it's legal where you live, is on you.
+You sign in with your own Stremio account and bring your own addons. No content is bundled and no addons are bundled. What you watch, and whether it is legal where you live, is on you.
 
 ## Building it yourself
 
@@ -107,4 +120,4 @@ This is an independent community project. It is not affiliated with or endorsed 
 
 ## License
 
-[GPL-3.0](LICENSE), because the app links MPVKit-GPL. Stremio's own pieces (stremio-web, server.js) come from Stremio and stay under their own terms. They are not redistributed here.
+[GPL-3.0](LICENSE), because the app links MPVKit-GPL. Stremio's own components, the open-source stremio-web and the proprietary server.js, come from Stremio and remain under their own terms. This source repository does not include them; they are fetched from a copy of Stremio's own app at build time.
