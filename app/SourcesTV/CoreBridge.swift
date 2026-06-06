@@ -20,6 +20,7 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var metaDetails: CoreMetaDetails?
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
+    @Published private(set) var searchResults: [CoreMeta] = []
 
     private var started = false
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
@@ -147,6 +148,21 @@ final class CoreBridge: ObservableObject {
         guard let requestDict = Self.encodeToDict(request) else { return }
         dispatch(action: ["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": requestDict]]],
                  field: "library")
+    }
+
+    /// Search across the installed addons (engine `search` field = CatalogsWithExtra with a search
+    /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
+    func search(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
+        guard trimmed.count >= 2 else { return }
+        dispatch(action: ["action": "Load",
+                          "args": ["model": "CatalogsWithExtra",
+                                   "args": ["type": NSNull(), "extra": [["search", trimmed]]]]],
+                 field: "search")
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": 30]]],
+                 field: "search")
     }
 
     private static func encodeToDict<T: Encodable>(_ value: T) -> [String: Any]? {
@@ -336,6 +352,13 @@ final class CoreBridge: ObservableObject {
         if fields.contains("library") {
             let value = decode(CoreLibrary.self, field: "library")
             DispatchQueue.main.async { [weak self] in self?.library = value }
+        }
+        if fields.contains("search") {
+            let board = decode(CoreBoardState.self, field: "search")
+            let items = board?.catalogs.flatMap { page in page.compactMap { $0.content?.ready }.flatMap { $0 } } ?? []
+            var seen = Set<String>(); var unique: [CoreMeta] = []
+            for item in items where seen.insert(item.id).inserted { unique.append(item) }
+            DispatchQueue.main.async { [weak self] in self?.searchResults = unique }
         }
 
         DispatchQueue.main.async { [weak self] in

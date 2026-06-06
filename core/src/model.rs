@@ -34,6 +34,8 @@ pub struct TvosModel {
     pub continue_watching_preview: ContinueWatchingPreview,
     /// Home board, every catalog of every installed addon (ActionLoad::CatalogsWithExtra).
     pub board: CatalogsWithExtra,
+    /// Search results across the installed addons (ActionLoad::CatalogsWithExtra with a search extra).
+    pub search: CatalogsWithExtra,
     pub discover: CatalogWithFilters<MetaItemPreview>,
     pub library: LibraryWithFilters<NotRemovedFilter>,
     pub continue_watching: LibraryWithFilters<ContinueWatchingFilter>,
@@ -73,6 +75,7 @@ impl TvosModel {
             ),
             continue_watching_preview,
             board: Default::default(),
+            search: Default::default(),
             discover,
             library: library_,
             continue_watching,
@@ -98,6 +101,7 @@ impl TvosModel {
                 serde_json::to_string(&self.continue_watching_preview)
             }
             TvosModelField::Board => serde_json::to_string(&self.board),
+            TvosModelField::Search => serde_json::to_string(&self.search),
             TvosModelField::Discover => serde_json::to_string(&self.discover),
             TvosModelField::Library => serde_json::to_string(&self.library),
             TvosModelField::ContinueWatching => serde_json::to_string(&self.continue_watching),

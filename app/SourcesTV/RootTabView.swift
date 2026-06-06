@@ -4,7 +4,6 @@ import SwiftUI
 /// Home · Discover · Library · Add-ons · Search · Settings.
 struct RootTabView: View {
     @EnvironmentObject private var account: StremioAccount
-    private let client = AddonClient()
 
     var body: some View {
         TabView {
@@ -16,7 +15,7 @@ struct RootTabView: View {
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }
             AddonsView()
                 .tabItem { Label("Add-ons", systemImage: "puzzlepiece.extension.fill") }
-            NavigationStack { SearchView(client: client) }
+            NavigationStack { SearchView() }
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
             SettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }

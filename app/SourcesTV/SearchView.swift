@@ -1,26 +1,25 @@
 import SwiftUI
 
-/// Simple search (Cinemeta), reachable from the Search tab.
+/// Search across your installed addons, powered by the engine (CatalogsWithExtra with a search extra).
 struct SearchView: View {
-    let client: AddonClient
+    @EnvironmentObject private var core: CoreBridge
     @State private var query = ""
-    @State private var results: [MetaPreview] = []
+    private let columns = Array(repeating: GridItem(.fixed(220), spacing: 28), count: 6)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             TextField("Search movies & series", text: $query)
                 .textFieldStyle(.plain).font(.title2).padding(.horizontal, 60).padding(.top, 40)
-                .onSubmit { Task { await run() } }
+                .onSubmit { core.search(query) }
             ScrollView {
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(220), spacing: 28), count: 5), spacing: 28) {
-                    ForEach(results) { item in
+                LazyVGrid(columns: columns, spacing: 28) {
+                    ForEach(core.searchResults) { item in
                         VStack(spacing: 12) {
-                            NavigationLink { DetailView(type: item.type, id: item.id, client: client) } label: {
-                                PosterImage(item: item)
-                            }
+                            NavigationLink {
+                                DetailView(type: item.type, id: item.id)
+                            } label: { CorePoster(item.poster) }
                             .buttonStyle(.card)
-                            Text(item.name)
-                                .font(.caption).lineLimit(1).truncationMode(.tail)
+                            Text(item.name).font(.caption).lineLimit(1).truncationMode(.tail)
                                 .foregroundStyle(.secondary).frame(width: 220)
                         }
                         .frame(width: 220)
@@ -30,12 +29,5 @@ struct SearchView: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
-    }
-
-    private func run() async {
-        guard query.count >= 2 else { return }
-        async let movies = try? client.search(type: "movie", query: query)
-        async let series = try? client.search(type: "series", query: query)
-        results = ((await movies) ?? []) + ((await series) ?? [])
     }
 }
