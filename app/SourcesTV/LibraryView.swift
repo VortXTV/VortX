@@ -4,6 +4,7 @@ import SwiftUI
 /// type + sort filters. Auto-refreshes as the library changes (add/remove/mark watched), no reload.
 struct LibraryView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
     private let columns = Array(repeating: GridItem(.fixed(220), spacing: 28), count: 6)
 
     var body: some View {
@@ -18,8 +19,10 @@ struct LibraryView: View {
                         } else {
                             grid(library.catalog)
                         }
-                    } else {
+                    } else if account.isSignedIn {
                         ProgressView().controlSize(.large).padding(60).frame(maxWidth: .infinity)
+                    } else {
+                        CoreEmptyState.signedOut
                     }
                 }
                 .padding(.vertical, 40)

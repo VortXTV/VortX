@@ -3,10 +3,18 @@ import SwiftUI
 /// Search across your installed addons, powered by the engine (CatalogsWithExtra with a search extra).
 struct SearchView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
     @State private var query = ""
     private let columns = Array(repeating: GridItem(.fixed(220), spacing: 28), count: 6)
 
     var body: some View {
+        Group {
+            if account.isSignedIn { results } else { CoreEmptyState.signedOut }
+        }
+        .background(Color.black.ignoresSafeArea())
+    }
+
+    private var results: some View {
         VStack(alignment: .leading, spacing: 24) {
             TextField("Search movies & series", text: $query)
                 .textFieldStyle(.plain).font(.title2).padding(.horizontal, 60).padding(.top, 40)
