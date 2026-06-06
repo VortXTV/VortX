@@ -21,7 +21,11 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
     @Published private(set) var searchResults: [CoreMeta] = []
+    @Published private(set) var addons: [CoreDescriptor] = []
 
+    /// Raw addon descriptors keyed by transportUrl, kept so we can round-trip a full Descriptor back
+    /// to the engine for UninstallAddon (which takes the whole descriptor, not just a URL).
+    private var rawAddonsByUrl: [String: [String: Any]] = [:]
     private var started = false
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
@@ -58,6 +62,30 @@ final class CoreBridge: ObservableObject {
             if !items.isEmpty { self.continueWatching = items }
             if !rows.isEmpty { self.boardRows = rows }
         }
+        refreshAddons()
+    }
+
+    /// Refresh the installed-addons list (and the raw descriptors for uninstall) from ctx.profile.
+    private func refreshAddons() {
+        let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
+        var raw: [String: [String: Any]] = [:]
+        if let data = stateData("ctx"),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let profile = object["profile"] as? [String: Any],
+           let addons = profile["addons"] as? [[String: Any]] {
+            for addon in addons { if let url = addon["transportUrl"] as? String { raw[url] = addon } }
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.addons = typed
+            self?.rawAddonsByUrl = raw
+        }
+    }
+
+    /// Remove an installed addon. UninstallAddon takes a full Descriptor, so we send back the raw one
+    /// the engine gave us (matched by transportUrl).
+    func uninstallAddon(_ descriptor: CoreDescriptor) {
+        guard let raw = rawAddonsByUrl[descriptor.transportUrl] else { return }
+        dispatchCtx(["action": "UninstallAddon", "args": raw])
     }
 
     /// stremio-core's storage schema version, a smoke check that the FFI is wired end-to-end.
@@ -341,6 +369,7 @@ final class CoreBridge: ObservableObject {
             let rows = buildBoardRows()
             DispatchQueue.main.async { [weak self] in self?.boardRows = rows }
         }
+        if fields.contains("ctx") { refreshAddons() }
         if fields.contains("meta_details") {
             let details = decode(CoreMetaDetails.self, field: "meta_details")
             DispatchQueue.main.async { [weak self] in self?.metaDetails = details }

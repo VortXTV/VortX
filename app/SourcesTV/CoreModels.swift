@@ -95,14 +95,51 @@ struct CoreProfile: Decodable {
     let addons: [CoreDescriptor]
 }
 
-struct CoreDescriptor: Decodable {
+struct CoreDescriptor: Decodable, Identifiable {
     let manifest: CoreManifest
     let transportUrl: String
+    let flags: CoreDescriptorFlags?
+    var id: String { transportUrl }
+    /// Default addons (Cinemeta, the local addon) the engine refuses to uninstall.
+    var isProtected: Bool { flags?.protected ?? false }
+
+    var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
+    var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
+    var providesSubtitles: Bool { (manifest.resources ?? []).contains { $0.name == "subtitles" } }
+    var hasCatalogs: Bool { !manifest.catalogs.isEmpty }
+    /// Host only (the full transportUrl can embed a debrid config token).
+    var host: String { URL(string: transportUrl)?.host ?? transportUrl }
+    /// "Catalogs · Streams · Subtitles", the resource kinds the addon exposes.
+    var capabilities: String {
+        var caps: [String] = []
+        if hasCatalogs { caps.append("Catalogs") }
+        if providesStreams { caps.append("Streams") }
+        if providesMeta { caps.append("Metadata") }
+        if providesSubtitles { caps.append("Subtitles") }
+        return caps.isEmpty ? "Add-on" : caps.joined(separator: " · ")
+    }
 }
 
 struct CoreManifest: Decodable {
     let name: String
     let catalogs: [CoreManifestCatalog]
+    let resources: [CoreManifestResource]?
+}
+
+/// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
+/// ({ name: "stream", types: [...] }). Decode either into the resource name.
+struct CoreManifestResource: Decodable {
+    let name: String
+    init(from decoder: Decoder) throws {
+        if let short = try? decoder.singleValueContainer().decode(String.self) { name = short; return }
+        name = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .name)
+    }
+    enum CodingKeys: String, CodingKey { case name }
+}
+
+struct CoreDescriptorFlags: Decodable {
+    let official: Bool?
+    let `protected`: Bool?
 }
 
 struct CoreManifestCatalog: Decodable {

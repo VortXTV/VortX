@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Add-ons: the addons installed on the signed-in account (Cinemeta, Debridio, Trakt, …),
-/// with what each provides (catalogs / streams / meta / subtitles).
+/// Add-ons installed on your account, read live from the engine. You can remove a non-default addon
+/// here; install new ones from the Stremio web or mobile app (they sync down on next launch).
 struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var core: CoreBridge
 
     var body: some View {
         NavigationStack {
@@ -12,12 +13,10 @@ struct AddonsView: View {
                     Text("Add-ons").font(.system(size: 56, weight: .heavy))
                     if !account.isSignedIn {
                         hint("Sign in (Settings tab) to see your installed add-ons.")
-                    } else if account.addons.isEmpty {
+                    } else if core.addons.isEmpty {
                         hint("No add-ons found on your account yet.")
                     } else {
-                        ForEach(account.addons, id: \.transportUrl) { addon in
-                            addonRow(addon)
-                        }
+                        ForEach(core.addons) { addon in addonRow(addon) }
                     }
                 }
                 .padding(60)
@@ -27,37 +26,27 @@ struct AddonsView: View {
         }
     }
 
-    private func addonRow(_ addon: AddonDescriptor) -> some View {
+    private func addonRow(_ addon: CoreDescriptor) -> some View {
         HStack(alignment: .top, spacing: 22) {
             Image(systemName: addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill")
                 .font(.system(size: 40)).foregroundStyle(addon.providesStreams ? .cyan : .secondary)
                 .frame(width: 56)
             VStack(alignment: .leading, spacing: 8) {
                 Text(addon.manifest.name).font(.title3.weight(.semibold))
-                Text(capabilities(addon)).font(.callout).foregroundStyle(.secondary)
-                Text(host(addon.transportUrl)).font(.caption.monospaced()).foregroundStyle(.secondary.opacity(0.7))
+                Text(addon.capabilities).font(.callout).foregroundStyle(.secondary)
+                Text(addon.host).font(.caption.monospaced()).foregroundStyle(.secondary.opacity(0.7))
             }
             Spacer()
+            if !addon.isProtected {
+                Button(role: .destructive) { core.uninstallAddon(addon) } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
-    }
-
-    /// "Catalogs · Streams · Subtitles", the resource kinds the addon exposes.
-    private func capabilities(_ addon: AddonDescriptor) -> String {
-        var caps: [String] = []
-        let res = Set(addon.manifest.resources.map { $0.name.lowercased() })
-        if addon.manifest.catalogs?.isEmpty == false { caps.append("Catalogs") }
-        if res.contains("stream") { caps.append("Streams") }
-        if res.contains("meta") { caps.append("Metadata") }
-        if res.contains("subtitles") { caps.append("Subtitles") }
-        return caps.isEmpty ? "Add-on" : caps.joined(separator: " · ")
-    }
-
-    /// Show only the host (the full transportUrl can embed a debrid config token).
-    private func host(_ urlString: String) -> String {
-        URL(string: urlString)?.host ?? urlString
     }
 
     private func hint(_ text: String) -> some View {
