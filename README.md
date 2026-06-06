@@ -54,6 +54,8 @@ The builds are attached to the [latest release](../../releases/latest). They are
 - iPhone and iPad: Signulous, AltStore or SideStore, or Sideloadly. A free Apple ID works for personal use.
 - Apple TV: Sideloadly or Xcode, or a paid signing service.
 
+What I used myself is Signulous, and it was pretty straightforward. You pay once a year per device, upload the IPA, and it signs and installs within a minute.
+
 ## It comes with nothing
 
 You sign in with your own Stremio account and bring your own addons (Cinemeta, your debrid or AIOStreams setup, whatever you already use). No content is bundled and no addons are bundled. What you watch, and whether it's legal where you live, is on you.
