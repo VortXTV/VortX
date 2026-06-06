@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Base Info.plist: Xcode merges its GENERATE_INFOPLIST_FILE keys (scene manifest, launch
+	     screen, icons, bundle keys) on top of this. We only declare what generation can't: the
+	     ATS exception that lets the WKWebView (https web.stremio.com) reach the embedded streaming
+	     server at http://127.0.0.1:11470 (cleartext loopback), otherwise it shows "Error". -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
+		<true/>
+	</dict>
+	<!-- Schemes the "Play in another app" handoff queries with canOpenURL, so it can offer the
+	     external players that are actually installed (Infuse, VLC). Without these, canOpenURL
+	     always returns false and no direct-handoff buttons ever appear. -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>infuse</string>
+		<string>vlc-x-callback</string>
+		<string>vlc</string>
+	</array>
+</dict>
+</plist>

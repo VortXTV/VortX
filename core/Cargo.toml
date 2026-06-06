@@ -1,0 +1,37 @@
+[package]
+name = "stremiox-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "StremioX native core, Rust ⇄ Swift FFI bridge over stremio-core (the real Stremio engine) for the tvOS app."
+
+[lib]
+name = "stremiox_core"
+# staticlib → bundled into an .xcframework and linked by the tvOS app (like NodeMobile).
+crate-type = ["staticlib"]
+
+[dependencies]
+# The real Stremio engine.
+#  - `derive`          : the #[derive(Model)] proc-macro used by TvosModel.
+#  - `env-future-send` : makes EnvFuture = Send BoxFuture so Runtime's Send+Sync bounds hold
+#                        on a multi-threaded (non-wasm) host. REQUIRED for tvOS; wasm-incompatible.
+stremio-core = { git = "https://github.com/Stremio/stremio-core", branch = "development", features = ["derive", "env-future-send"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+
+once_cell = "1"
+futures = "0.3"
+chrono = "0.4"
+
+# Async executor for the engine's effects (Env::exec_concurrent / exec_sequential).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+
+# HTTP for Env::fetch, rustls (no system OpenSSL/SecureTransport) so it stays a self-contained static lib.
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

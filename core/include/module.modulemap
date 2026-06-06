@@ -1,0 +1,4 @@
+module StremioXCore {
+    header "stremiox_core.h"
+    export *
+}

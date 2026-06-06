@@ -1,0 +1,31 @@
+# --- build artifacts & deps (reconstructed by scripts/build-web.sh) ---
+web/
+**/node_modules/
+**/build/
+**/DerivedData/
+**/.build/
+
+# --- packaged outputs ---
+*.ipa
+*.xcarchive
+*.dSYM.zip
+
+# --- generated Xcode project (produced by XcodeGen from app/project.yml) ---
+app/*.xcodeproj
+
+# --- reference IPAs (Stremio's proprietary binaries, never commit) ---
+reference/
+
+# --- vendored nodejs-mobile (downloaded by scripts; ~51MB) ---
+app/Vendor/
+
+# --- bundled streaming server (extracted from Stremio's macOS app; proprietary) ---
+app/Resources/server.js
+
+# --- tooling / misc ---
+.DS_Store
+.playwright-mcp/
+*.log
+
+# agent / editor config
+.claude/
