@@ -23,6 +23,7 @@ Where StremioX is headed next. This is a community build with no fixed schedule,
 - Engine-sourced resume, and a watched hook near the end of playback.
 - Live playback progress through the engine Player, so Continue Watching updates mid-session.
 - Clear sign-in states on the main tabs instead of an endless spinner.
+- Full UI redesign on a shared design system (warm editorial-cinema direction, crafted remote focus, poster-forward layout), captured in DESIGN.md for the iOS client to inherit.
 - Sign-in token stored in the Keychain, with a one-time migration from the old storage.
 - Sign-in seeds the engine immediately, and sign-out clears it.
 - Both apps shipped as unsigned IPAs in the releases.
