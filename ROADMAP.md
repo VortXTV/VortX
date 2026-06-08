@@ -41,6 +41,30 @@ and others opt in.
 - **Trakt integration**: import history and scrobble watch events.
 - **HDR / Dolby Vision badge** on stream rows (parsed, not just raw addon text).
 
+## Planned: playback quality (researched from Stremio-Kai, Harbor, Seanime)
+
+From studying the best libmpv-based Stremio clients. Most are libmpv config or small UI on top of the
+existing player. Closest references: `harborstremio/harbor` (MIT, Rust + bundled libmpv) and
+`allecsc/Stremio-Kai`.
+
+- **Full ASS/SSA subtitle styling** beyond size and colour: font, outline, box, margin, alignment. The
+  main reason this audience prefers libmpv over AVPlayer.
+- **Smart Track Selector**: auto-pick audio and subtitle by language priority, with a forced-subtitle
+  override and per-language or per-keyword rejection lists (Kai's best idea).
+- **Skip intro / outro**: chapter markers first, then AniSkip / TheIntroDB, with a tvOS skip overlay.
+- **HDR / Dolby Vision**: verify true passthrough on Apple TV and expose tonemapping profiles
+  (neutral / cinematic / vivid). Apple TV is strong here and most clients get it wrong.
+- **Smooth Motion toggle (judder reduction)**: mpv built-in `interpolation=yes` +
+  `video-sync=display-resample` + `tscale=oversample`. True SVP / VapourSynth motion interpolation is not
+  possible on tvOS or iOS (no JIT, no dynamic plugins, not in MPVKit), so this reduces 24fps-on-60Hz
+  judder, not the TV "soap-opera" effect, and should be labelled honestly.
+- **Anime4K upscaling** via bundled mpv GLSL shader presets, toggleable per title.
+- **Stream-ranking pipeline**: parse, trust, score, rank, so cached and high-quality sources sort to the
+  top of the source list automatically.
+- **AniList integration**: OAuth + GraphQL, mark-watched from the player, automatic episode tracking
+  (Seanime's strength). Pairs with Stremio's Kitsu addon for anime ID mapping.
+- **Casting**: AirPlay first (table stakes on Apple), then DLNA and Chromecast.
+
 ## Planned: Apple TV and polish
 
 - **Top Shelf**: Continue Watching on the tvOS home screen. Exploratory, a Top Shelf extension needs a
