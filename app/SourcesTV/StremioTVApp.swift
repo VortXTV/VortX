@@ -4,6 +4,7 @@ import SwiftUI
 struct StremioTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
+    @StateObject private var presenter = PlayerPresenter()
 
     init() {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
@@ -24,12 +25,21 @@ struct StremioTVApp: App {
                 if ProcessInfo.processInfo.arguments.contains("-tv-selftest") {
                     TVPlayerView(url: URL(string: "https://vjs.zencdn.net/v/oceans.mp4")!, title: "Player Test, Oceans")
                 } else {
-                    RootTabView()   // Board · Discover · Library · Add-ons · Search · Settings
+                    RootView()   // player OR shell, never both — the only reliable tvOS focus isolation
                 }
             }
             .environmentObject(account)
             .environmentObject(core)
+            .environmentObject(presenter)
             .preferredColorScheme(.dark)
+            .onAppear {
+                // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
+                guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    presenter.request = PlaybackRequest(
+                        url: URL(string: "https://vjs.zencdn.net/v/oceans.mp4")!, title: "Player Test")
+                }
+            }
         }
     }
 }

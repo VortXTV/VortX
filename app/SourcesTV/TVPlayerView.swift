@@ -555,45 +555,50 @@ struct TVPlayerView: View {
 
 /// A focusable UIView that captures every Siri-remote press and forwards it to SwiftUI. This is far more
 /// reliable than SwiftUI `@FocusState` + `onMoveCommand` inside a full-screen cover on tvOS.
-private struct RemoteCatcher: UIViewRepresentable {
+private struct RemoteCatcher: UIViewControllerRepresentable {
     var onPress: (UIPress.PressType) -> Void
     var onSwipe: () -> Void
 
-    func makeUIView(context: Context) -> CatchView {
-        let v = CatchView(); v.onPress = onPress; v.onSwipe = onSwipe; return v
+    func makeUIViewController(context: Context) -> CatchVC {
+        let vc = CatchVC(); vc.onPress = onPress; vc.onSwipe = onSwipe; return vc
     }
-    func updateUIView(_ uiView: CatchView, context: Context) { uiView.onPress = onPress; uiView.onSwipe = onSwipe }
+    func updateUIViewController(_ vc: CatchVC, context: Context) { vc.onPress = onPress; vc.onSwipe = onSwipe }
 
-    final class CatchView: UIView {
+    /// Focusable root view for the catcher controller.
+    final class FocusableView: UIView {
+        override var canBecomeFocused: Bool { true }
+    }
+
+    /// Owns the remote. Its root view is the only focusable; `preferredFocusEnvironments` points at it, so
+    /// the focus system always has an explicit target to keep — or pull — focus onto the catcher, even when
+    /// a directional press would otherwise move focus to nothing (which left the player deaf to the remote).
+    final class CatchVC: UIViewController {
         var onPress: ((UIPress.PressType) -> Void)?
         var onSwipe: (() -> Void)?
-        override var canBecomeFocused: Bool { true }
 
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            guard window != nil else { return }
+        override func loadView() { view = FocusableView() }
+
+        override var preferredFocusEnvironments: [UIFocusEnvironment] {
+            isViewLoaded ? [view] : super.preferredFocusEnvironments
+        }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.backgroundColor = .clear
+            // Swipes on the Siri-remote touch surface are NOT UIPress events, so pressesBegan never sees
+            // them. A pan recognizer for indirect (remote) touches wakes the controls on a swipe.
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleSurfaceTouch))
+            pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
+            view.addGestureRecognizer(pan)
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
             setNeedsFocusUpdate(); updateFocusIfNeeded()
-            if gestureRecognizers?.isEmpty ?? true {
-                // Swipes on the Siri-remote touch surface are NOT UIPress events, so pressesBegan never
-                // sees them. A pan recognizer for indirect (remote) touches wakes the controls on a swipe.
-                let pan = UIPanGestureRecognizer(target: self, action: #selector(handleSurfaceTouch))
-                pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
-                addGestureRecognizer(pan)
-            }
         }
 
         @objc private func handleSurfaceTouch(_ g: UIPanGestureRecognizer) {
             if g.state == .began { onSwipe?() }
-        }
-
-        /// Trap focus: refuse to let the focus engine move focus AWAY from this view, so a directional
-        /// press cannot walk focus off the player. The shell is also `.disabled` while playing (nothing
-        /// else is focusable), so this is the lock on the door rather than a fight-the-engine re-grab.
-        override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
-            if context.previouslyFocusedItem === self && context.nextFocusedItem !== self {
-                return false
-            }
-            return super.shouldUpdateFocus(in: context)
         }
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -606,6 +611,20 @@ private struct RemoteCatcher: UIViewRepresentable {
                 }
             }
             if !handled { super.pressesBegan(presses, with: event) }
+        }
+
+        override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+            super.didUpdateFocus(in: context, with: coordinator)
+            // Keep focus on the catcher: if it drifts off (e.g. a directional press moves focus to nil),
+            // re-request. preferredFocusEnvironments gives the system an explicit target (our view), so
+            // focus returns reliably with no competitor to fight.
+            if isViewLoaded, view.window != nil, (context.nextFocusedItem as? UIView) !== view {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isViewLoaded, self.view.window != nil, !self.view.isFocused else { return }
+                    self.setNeedsFocusUpdate()
+                    self.updateFocusIfNeeded()
+                }
+            }
         }
     }
 }
