@@ -34,6 +34,9 @@ enum NodeServer {
         setenv("NO_CORS", "1", 1)
         FileManager.default.changeCurrentDirectoryPath(caches)
 
+        // The bundled, pinned stremio-web build (built by scripts/build-web.sh as a folder reference).
+        let webDir = (Bundle.main.resourcePath as NSString?)?.appendingPathComponent("web") ?? ""
+
         // node's stdout/stderr aren't surfaced by nodejs-mobile, so tee console + uncaught
         // errors to a log file we can read (essential for debugging the torrent engine).
         let logPath = (caches as NSString).appendingPathComponent("stremio-server.log")
@@ -47,30 +50,38 @@ enum NodeServer {
         process.on('unhandledRejection',function(e){w('[rej]',[e&&e.stack||e])});
         w('[boot]',['preload active']);
 
-        // Reverse-proxy stremio-web on http://127.0.0.1:11471 so the WKWebView can load the UI
-        // from a loopback origin. Loopback is a secure context (Service Workers / WASM / crypto
-        // all work) yet uses the http scheme, so the page AND its workers can reach the streaming
-        // server at http://127.0.0.1:11470 with no mixed-content block (that's the whole reason the
-        // web UI showed the server as "Error" when loaded from https web.stremio.com). We strip
-        // CSP/HSTS/frame headers so the proxied page renders, and rewrite redirects to stay local.
+        // Serve the bundled, pinned stremio-web (v5) on http://127.0.0.1:11471. Loopback is a secure
+        // context (Service Workers / WASM / crypto all work) on the http scheme, so the page and its
+        // workers reach the streaming server at http://127.0.0.1:11470 with no mixed-content block.
+        // We serve a local pinned build instead of proxying web.stremio.com, which now serves v6 and
+        // no longer runs in our WKWebView host.
         (function () {
           try {
-            var http = require('http'), https = require('https'), UP = 'web.stremio.com';
-            http.createServer(function (req, res) {
-              var opts = { host: UP, path: req.url, method: req.method,
-                headers: Object.assign({}, req.headers, { host: UP }) };
-              var preq = https.request(opts, function (pres) {
-                var h = Object.assign({}, pres.headers);
-                delete h['content-security-policy']; delete h['content-security-policy-report-only'];
-                delete h['strict-transport-security']; delete h['x-frame-options'];
-                if (h.location) h.location = String(h.location).split('https://' + UP).join('').split('http://' + UP).join('');
-                res.writeHead(pres.statusCode, h);
-                pres.pipe(res);
+            var http = require('http'), fs = require('fs'), path = require('path');
+            var ROOT = \(jsString(webDir));
+            var MIME = { '.html':'text/html','.js':'text/javascript','.mjs':'text/javascript',
+              '.css':'text/css','.json':'application/json','.wasm':'application/wasm','.png':'image/png',
+              '.jpg':'image/jpeg','.jpeg':'image/jpeg','.gif':'image/gif','.svg':'image/svg+xml',
+              '.ico':'image/x-icon','.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf',
+              '.map':'application/json','.txt':'text/plain','.webmanifest':'application/manifest+json' };
+            function send(res, file) {
+              fs.readFile(file, function (e, data) {
+                if (e) { res.writeHead(404); res.end('not found'); return; }
+                res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream' });
+                res.end(data);
               });
-              preq.on('error', function (e) { try { res.writeHead(502); res.end(String(e)); } catch (_) {} });
-              req.pipe(preq);
-            }).listen(11471, '127.0.0.1', function () { w('[proxy]', ['stremio-web on 11471']); });
-          } catch (e) { w('[proxy-err]', [String(e)]); }
+            }
+            http.createServer(function (req, res) {
+              var p = decodeURIComponent((req.url || '/').split('?')[0]);
+              var file = path.normalize(path.join(ROOT, p));
+              if (file.lastIndexOf(ROOT, 0) !== 0) { res.writeHead(403); res.end('no'); return; }  // no traversal
+              fs.stat(file, function (e, st) {
+                if (!e && st.isFile()) send(res, file);
+                else if (!e && st.isDirectory()) send(res, path.join(file, 'index.html'));
+                else send(res, path.join(ROOT, 'index.html'));   // SPA fallback for client-side routes
+              });
+            }).listen(11471, '127.0.0.1', function () { w('[web]', ['bundled stremio-web on 11471 from ' + ROOT]); });
+          } catch (e) { w('[web-err]', [String(e)]); }
         })();
         """
         try? preload.write(toFile: preloadPath, atomically: true, encoding: .utf8)

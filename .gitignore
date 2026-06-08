@@ -29,3 +29,5 @@ app/Resources/server.js
 
 # agent / editor config
 .claude/
+/web/
+app/Resources/web/

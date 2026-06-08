@@ -17,6 +17,11 @@ targets:
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources
+      # Pinned stremio-web build (scripts/build-web.sh), served locally by NodeServer. Folder
+      # reference so the directory structure is preserved in the bundle.
+      - path: Resources/web
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
