@@ -1,29 +1,84 @@
 # Roadmap
 
-Where StremioX is headed next. This is a community build with no fixed schedule, but this is the plan, in rough priority order. Done items are at the bottom so you can see what already landed.
+A community build, no fixed schedule. This is the real plan: what is shipping, what is being built now,
+and what is next, in rough priority order. Feature-gap detail lives in
+[docs/FEATURE-PARITY.md](docs/FEATURE-PARITY.md); the iOS plan in [docs/REBASE-iOS.md](docs/REBASE-iOS.md).
 
-## Planned
+## In progress
 
-1. **iOS on stremio-core.** Right now the iPhone and iPad app hosts the real stremio-web interface inside a web view. The plan is to rebuild it as a native client on stremio-core, the same way the Apple TV app already works, so it is faster and behaves the same on every Apple device. This is the big one.
+### Native iOS / iPadOS client on stremio-core
+The iPhone and iPad app currently hosts Stremio's live web UI in a WKWebView, which broke when Stremio
+moved the web to v6. The fix is to rebuild iOS the way the Apple TV app already works: native SwiftUI on
+stremio-core, reusing the same engine bridge and design system, with no dependency on Stremio's live web.
 
-2. **Apple TV Top Shelf.** Surface Continue Watching on the Apple TV home screen, the way the official app does. This one is exploratory: a Top Shelf extension needs a shared app group, which can be awkward to keep working across the kind of re-signing sideloading relies on, so it may not survive every install method.
+- Done: stremio-core now compiles for iOS; `StremioXCore.xcframework` ships all four slices (ios-arm64,
+  ios-arm64-simulator, tvos-arm64, tvos-arm64-simulator).
+- Next: share the engine layer (`CoreBridge`, `CoreModels`, `Theme`, `PlaybackMeta`) into the iOS target,
+  then build the touch-adapted screens (Home, Detail, Streams, Discover, Library, Search, Settings) for
+  iPhone and iPad, then a native touch player on the libmpv core. Retire the web host at parity.
 
-3. **Open-source streaming server.** The released IPAs currently bundle Stremio's proprietary `server.js`. Replacing it with an open-source streaming server (for example perpetus/stream-server) would remove the one proprietary piece and let CI build the IPAs end to end. Unproven inside nodejs-mobile on iOS and tvOS, so it needs investigation.
+## Next: a StremioX streaming server
 
-4. **More player and UI polish.** Subtitles pulled from addons (OpenSubtitles and similar), a load-failure state on detail pages, a bundled licenses/acknowledgements screen, and localization. (Clear sign-in states on the main tabs already landed.)
+Replace Stremio's proprietary `server.js` with our own streaming server, better than both Stremio's and
+the open-source drop-ins. This removes the one proprietary piece, unblocks end-to-end CI, and is where the
+features below actually live. Shipped behind a branch so people who prefer stremio-core/server stay there
+and others opt in.
 
-5. **Tests and CI.** A set of characterization tests around the Swift to Rust bridge, and a GitHub Action that builds the IPAs on each release tag (this becomes possible once the streaming server is open-source, since the proprietary `server.js` cannot live in CI).
+- **Usenet support.** Native Usenet streaming (the maintainer uses it).
+- **Live TV / IPTV.** Channel playback with an EPG (program guide).
+- **Stream proxying** and a configurable cache.
+
+## Planned: player and library (engine already supports these)
+
+- **Add to / remove from Library on the detail page.** Today titles only enter the library via account
+  sync; the engine actions exist, we just need to surface them.
+- **Last-used stream per title**, for one-click replay instead of re-picking from the source list.
+- **Infinite scroll on Home**, lazy-loading more catalogs (replaces the old "scroll forever" feel).
+- **Progressive seeking + a seek-step setting** (today it is fixed plus/minus 10s), and an "ends at" clock
+  on the player.
+- **Automatic subtitle selection** by preferred language, plus a hide-other-languages filter.
+- **Addon subtitles** (OpenSubtitles and similar) with download and copy.
+- **Trakt integration**: import history and scrobble watch events.
+- **HDR / Dolby Vision badge** on stream rows (parsed, not just raw addon text).
+
+## Planned: Apple TV and polish
+
+- **Top Shelf**: Continue Watching on the tvOS home screen. Exploratory, a Top Shelf extension needs a
+  shared app group that may not survive the re-signing sideloading relies on.
+- **External-player handoff to Infuse** on tvOS (iOS already has it).
+- **Interface scaling**, a bundled licenses/acknowledgements screen, and localization.
+
+## Planned: tests and CI
+
+- Characterization tests around the Swift-to-Rust bridge.
+- A GitHub Action that builds the IPAs on each release tag. Blocked today because the proprietary
+  `server.js` cannot live in CI; it unblocks once the StremioX server above lands. (CodeQL scanning of the
+  Rust engine is already wired up.)
 
 ## Done
 
-- Apple TV rebased onto stremio-core: Home, Discover, Library, Detail, and the per-addon stream list.
-- Search across every installed addon, on the engine.
-- Add-ons screen on the engine, with remove for non-default addons.
-- Watched and unwatched markers, with the option to mark by episode, by season, or for a whole series.
-- Engine-sourced resume, and a watched hook near the end of playback.
-- Live playback progress through the engine Player, so Continue Watching updates mid-session.
-- Clear sign-in states on the main tabs instead of an endless spinner.
-- Full UI redesign on a shared design system (warm editorial-cinema direction, crafted remote focus, poster-forward layout), captured in DESIGN.md for the iOS client to inherit.
-- Sign-in token stored in the Keychain, with a one-time migration from the old storage.
-- Sign-in seeds the engine immediately, and sign-out clears it.
-- Both apps shipped as unsigned IPAs in the releases.
+### Apple TV (native, on stremio-core)
+- Full rebase onto stremio-core: Home (real Continue Watching + every addon catalog), Discover
+  (type / catalog / genre filters), Library (type / sort filters), Detail (cinematic hero, season picker,
+  episodes), the complete per-addon stream list, Search, and Add-ons (with remove).
+- Watched and unwatched markers, by episode, by season, or whole series.
+- Live playback progress through the engine, engine-sourced resume, and a watched hook near the end.
+- A full UI redesign on a shared design system (warm editorial-cinema direction, crafted remote focus,
+  poster-forward layout), in `Theme.swift` and DESIGN.md, ready for iOS to inherit.
+- Reliability fixes: sign-in reliably seeds the engine; Discover and Library load; the player is
+  full-screen; detail pages open reliably; Back returns to the tab instead of exiting.
+
+### Cross-platform
+- Sign-in token stored in the Keychain (with a one-time migration and a UserDefaults fallback where the
+  Keychain is unavailable). Sign-in seeds the engine immediately; sign-out clears it.
+- stremio-core engine built for both tvOS and iOS.
+
+### Project
+- Shipped as unsigned IPAs with SHA-256 checksums on each release.
+- Security: SECURITY.md policy, private vulnerability reporting, Dependabot alerts + security updates +
+  version config, secret scanning with push protection, and CodeQL scanning of the Rust engine.
+- README corrected to the accurate Stremio history, with a security section and honest AI-authorship note.
+
+### iPhone / iPad (current, interim)
+- Hosts Stremio's live web UI in a WKWebView with a native libmpv player and an Infuse / VLC handoff.
+  Being replaced by the native client above.
