@@ -20,13 +20,17 @@ Home, with your real Continue Watching and every catalog from your addons:
 
 ![Home](docs/screenshots/home.png)
 
-A title page with the backdrop, a season picker, episodes, and watched markers:
+A cinematic title page: backdrop, synopsis, episodes (or sources), and mark-watched controls:
 
 ![Detail](docs/screenshots/detail.png)
 
-Every source your addons return, with their exact details, filterable by addon:
+Every source your addons return, with their exact details, filterable by quality and addon:
 
 ![Streams](docs/screenshots/streams.png)
+
+A clean, full-screen libmpv player with resume, audio, and subtitle controls:
+
+![Player](docs/screenshots/player.png)
 
 Discover and Library, with proper type, catalog, genre, and sort filters:
 
