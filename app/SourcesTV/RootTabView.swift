@@ -14,9 +14,9 @@ final class PlayerPresenter: ObservableObject {
     @Published var request: PlaybackRequest?
 }
 
-/// App root: shows EITHER the player OR the shell, never both. This is the only thing that reliably
-/// isolates focus on tvOS — the shell is removed from the view hierarchy entirely while playing, so the
-/// focus engine cannot traverse to it and steal directional presses from the player.
+/// App root: shows EITHER the player OR the shell, never both. The shell is removed from the view
+/// hierarchy entirely while playing, and the player's catcher locks focus on itself (see TVPlayerView),
+/// so the TabView's focus map cannot steal the remote from the player.
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
 
@@ -35,82 +35,28 @@ struct RootView: View {
 
 /// The app shell: Home · Discover · Library · Add-ons · Search · Settings.
 ///
-/// IMPORTANT: this is a CUSTOM tab bar (focusable buttons), NOT SwiftUI's `TabView`. SwiftUI's `TabView`
-/// is backed by a `UITabBarController` that it does not deallocate on conditional removal, so it lingers
-/// in the tvOS focus map and steals the remote from the player (confirmed: covers, overlays, `.disabled`,
-/// hidden windows, conditional render, and `.id()` teardown all failed; only never creating it works).
-/// Plain SwiftUI buttons tear down cleanly, so `RootView`'s root-replacement genuinely removes the shell
-/// from focus while the player is up.
+/// Uses the native tvOS `TabView` so the top tab bar gets correct focus behaviour for free: tabs switch
+/// as focus crosses them, and focus moves cleanly between the tab bar and the page content (up/down). The
+/// player no longer depends on the shell being a custom bar — it locks focus on its own catcher while up,
+/// so the native tab bar can't steal the remote.
 struct RootTabView: View {
     @EnvironmentObject private var account: StremioAccount
-    @State private var tab = 0
-    @FocusState private var focusedTab: Int?
-
-    private static let tabs: [(title: String, icon: String)] = [
-        ("Home", "house.fill"),
-        ("Discover", "safari.fill"),
-        ("Library", "books.vertical.fill"),
-        ("Add-ons", "puzzlepiece.extension.fill"),
-        ("Search", "magnifyingglass"),
-        ("Settings", "gearshape.fill"),
-    ]
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: Theme.Space.sm) {
-                ForEach(Array(Self.tabs.enumerated()), id: \.offset) { index, item in
-                    Button { tab = index } label: {
-                        Label(item.title, systemImage: item.icon)
-                            .labelStyle(.titleAndIcon)
-                            .font(Theme.Typography.label)
-                    }
-                    .buttonStyle(TabBarButtonStyle(selected: tab == index))
-                    .focused($focusedTab, equals: index)
-                }
-            }
-            .focusSection()
-            .padding(.top, Theme.Space.xl)
-            .padding(.bottom, Theme.Space.md)
-
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .focusSection()   // its own section so the content can release focus UP to the tab bar
+        TabView {
+            HomeView()
+                .tabItem { Label("Home", systemImage: "house.fill") }
+            DiscoverView()
+                .tabItem { Label("Discover", systemImage: "safari.fill") }
+            LibraryView()
+                .tabItem { Label("Library", systemImage: "books.vertical.fill") }
+            AddonsView()
+                .tabItem { Label("Add-ons", systemImage: "puzzlepiece.extension.fill") }
+            NavigationStack { SearchView() }
+                .tabItem { Label("Search", systemImage: "magnifyingglass") }
+            SettingsView()
+                .tabItem { Label("Settings", systemImage: "gearshape.fill") }
         }
-        .background(Theme.Palette.canvas.ignoresSafeArea())
-        // Native tvOS tab bars switch the tab as focus crosses them — replicate that so you don't have to
-        // click each tab. Only react when a tab is actually focused (nil = focus moved into the content).
-        .onChange(of: focusedTab) { newValue in
-            if let newValue { tab = newValue }
-        }
-    }
-
-    @ViewBuilder private var content: some View {
-        switch tab {
-        case 0: HomeView()
-        case 1: DiscoverView()
-        case 2: LibraryView()
-        case 3: AddonsView()
-        case 4: NavigationStack { SearchView() }
-        default: SettingsView()
-        }
-    }
-}
-
-/// Tab-bar chip: ember fill when selected, brighter + lifted when focused.
-private struct TabBarButtonStyle: ButtonStyle {
-    let selected: Bool
-    @Environment(\.isFocused) private var focused: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.vertical, Theme.Space.sm)
-            .foregroundStyle(selected || focused ? Theme.Palette.canvas : Theme.Palette.textSecondary)
-            .background(
-                Capsule().fill(focused ? Theme.Palette.accent
-                                       : (selected ? Theme.Palette.accent.opacity(0.85) : Color.clear))
-            )
-            .scaleEffect(focused ? 1.06 : 1.0)
-            .animation(.easeOut(duration: 0.15), value: focused)
+        .tint(Theme.Palette.accent)
     }
 }
