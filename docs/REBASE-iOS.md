@@ -2,7 +2,7 @@
 
 Replace the iPhone/iPad web-host (WKWebView hosting Stremio's live web) with a native SwiftUI client on
 stremio-core, the same way the Apple TV app already works. This removes the dependency on Stremio's live
-web (which broke when it moved to v6) and gives iOS the redesigned UI for free.
+web (which broke when the hosted web changed) and gives iOS the redesigned UI for free.
 
 ## What gets reused (already built for tvOS)
 
