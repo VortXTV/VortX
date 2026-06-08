@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # The Rust engine crate (stremio-core and its deps).
+  - package-ecosystem: cargo
+    directory: /core
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+  # GitHub Actions workflows (kept current as CI is added).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "chore(ci)"
