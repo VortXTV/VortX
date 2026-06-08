@@ -109,7 +109,14 @@ It started out talking to addons by hand, and that kept getting small things wro
 
 ## What's next
 
-The plan for upcoming work (native iOS on the engine, live playback progress, Search and Add-ons on the engine, Apple TV Top Shelf, and more) is in [ROADMAP.md](ROADMAP.md).
+The plan for upcoming work (the native iPhone and iPad client on the engine, our own streaming server with Usenet and live TV, and more) is in [ROADMAP.md](ROADMAP.md).
+
+## Known issues
+
+- **Some subtitles show as blocks.** Subtitles in certain scripts can render as empty boxes. This is a font-coverage issue and a fix is in progress; trying a different subtitle source can help in the meantime.
+- **Occasional playback stutter.** Some high-bitrate or 4K streams can hitch depending on the stream and your network. Under investigation.
+- **iPhone and iPad follow Stremio's live web.** The iOS app hosts Stremio's live web interface, so a Stremio web update can occasionally disrupt it. The native iOS client on the roadmap removes this dependency.
+- **Unsigned builds.** You re-sign the IPA yourself, and depending on the signing method, reinstalling can require signing in again.
 
 ## Not affiliated
 
