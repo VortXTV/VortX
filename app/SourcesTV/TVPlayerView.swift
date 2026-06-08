@@ -102,14 +102,16 @@ struct TVPlayerView: View {
                 ProgressView().controlSize(.large).tint(Theme.Palette.accent)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            // When the bar is hidden, a full-screen focusable button owns the remote: Select or any
-            // swipe reveals the controls. A concrete Button focuses far more reliably than a bare
-            // .focusable() surface inside the full-screen cover, which dropped remote input on device.
+            // When the bar is hidden, a transparent focusable layer owns the remote: any swipe or Select
+            // reveals the controls. A focusable Color (not a Button) avoids tvOS's button focus
+            // highlight, which was washing the whole video white, while still catching remote input.
             if controlsHidden {
-                Button { showControls() } label: { Color.clear.contentShape(Rectangle()) }
-                    .buttonStyle(.plain)
+                Color.clear
+                    .contentShape(Rectangle())
+                    .focusable()
                     .focused($focus, equals: .player)
                     .onMoveCommand { _ in showControls() }
+                    .onTapGesture { showControls() }
             }
             if showInfo && !showOptions && !loadFailed { controlBar }
             if showOptions { optionsPanel }
