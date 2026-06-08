@@ -1,81 +1,85 @@
-# Feature parity with Stremio
+# StremioX features and what is missing
 
-A running diff of what Stremio shipped recently (all platforms) versus what StremioX has, so we know what to add. Sourced from the Stremio blog tech updates (#56 to #79, 2026), the stremio-web / stremio-core release notes, and the stremio-web feature branches.
+The full feature target for StremioX, and where each piece stands. The goal is the most complete,
+best-looking media client on every platform. Status: **Have** (shipped), **Building** (in progress),
+**Planned** (designed, not started).
 
-## Stremio v6 (the current beta: App 6.0.1-beta.01, Shell 5.1.23, Server 4.20.17)
+## Platforms
 
-v6 is deployed to Stremio's beta channel (Mac app + web) ahead of public GitHub tags (the public repo still tags v5.0.0-beta.37, and the running build commit is not in the public history). v6 is not a rewrite: it is the same stremio-core engine StremioX already runs, with a wave of features layered on. The in-flight `feat/*` branches are the v6 program:
+- **Apple TV** native on the engine. **Have.**
+- **iPhone and iPad** native client on the engine. **Building** (a web host runs in the meantime).
+- **macOS** native, sharing the same SwiftUI and engine code. **Planned.**
+- **Windows and Linux.** **Planned** (longer term).
 
-- **Full casting** (`feat/full-casting-support`, `android-tv-casting`): Chromecast / AirPlay.
-- **Trakt integration** (`feat/trakt-import`, `fix/trakt-events`): import history and scrobble watch events.
-- **EPG / live TV** (`feat/discover-epg-support`): program guide for live channels.
-- **Infinite scroll on Home** (`board-infinite-scroll`): lazy-load more catalogs as you scroll.
-- **Last-used stream per title** (`feat/meta-details-last-used-stream`): remember the source you played, for quick replay.
-- **Interface size / UI scaling** (`feat/shell-interface-size`).
-- **Stream proxying** (`proxy_streams_enabled`): proxy streams through the server.
-- **Media-session controls** (`feat/media-session-control`), **hardware rendering** (`feat/hardware-rendering`), Discord rich presence (desktop), series episode picker, player polish (subtitle position, volume-on-scroll, statistics, fullscreen on Safari).
+## Player
 
-Because v6 rides on the same core, almost all of this is reachable from StremioX's existing `CoreBridge`; we just have not surfaced it. The highest-value v6 items for Apple are folded into the priority list below.
+- Native libmpv player, wide codec and container support. **Have.**
+- Aggressive read-ahead caching so big streams do not stall. **Have** (disk caching and tuning ongoing).
+- Reliable on-screen controls and a redesigned, cinematic player UI. **Building.**
+- Live metadata line (resolution, HDR, audio). **Have.**
+- **Customizable player**: user-arranged controls and on-screen layout. **Planned.**
+- HDR and Dolby Vision passthrough, plus HDR to SDR tonemapping with a target-nits setting. **Planned.**
+- Full subtitle styling: font, size, color, outline, box, margin, alignment; dual subtitle tracks;
+  per-title delay; custom font upload; broad script coverage including CJK. **Building.**
+- Extra subtitle sources with download. **Planned.**
+- Smart track selection: auto audio and subtitle by language, forced-subtitle override, per-language and
+  per-keyword rejection lists, per-show memory. **Planned.**
+- Audio: codec and channel detection, passthrough, optional night and voice-clarity modes, audio delay.
+  **Planned.**
+- Anime upscaling shaders with quality presets and content auto-detection. **Planned.**
+- Smooth-motion (judder reduction) toggle. **Planned.**
+- Skip intro and outro, with an on-screen skip button. **Planned.**
+- Trickplay scrub previews on the seek bar. **Planned.**
+- In-player source switcher and Next Up. **Planned.**
+- A/B loop, sleep timer, frame grab, stats overlay, picture-in-picture, seek-step setting, an ends-at clock.
+  **Planned.**
+- Resume and watched sync, auto-advance, auto-retry, decode-error fallback. **Have.**
 
-## Stremio's recent changelog, by platform
+## Sources and stream selection
 
-**Stremio v5 (web + desktop, the current generation, in beta)**: tech updates #69, #73, #77, #78
-- Gamepad / controller support (Xbox, PlayStation, etc.).
-- Media key support (play/pause, next/previous track).
-- Video scale / zoom property.
-- HDR badge indicator.
-- Subtitle context menu (download subtitle, copy sub id, copy sub link).
-- External player support for Infuse and Vidhub.
-- Library items behavior improvements; translation (localization) improvements.
+- Catalogs, search, and add-ons through the engine. **Have.**
+- **Add debrid API keys directly in the app** (multiple services), with a uniform cache check. **Planned.**
+- Smart stream ranking: parse quality, audio, and language; filter fakes and mislabeled or low-quality
+  sources; read cache hints; float the best cached high-quality source to the top. **Planned.**
+- A safety filter (strict / balanced / off) and a fresh-release fake-filter window. **Planned.**
+- Direct torrent streaming without a debrid account. **Planned.**
 
-**Android TV v1.10.2 + Android Mobile v2.2.3 (June 2026, latest)**: tech update #79
-- MPV player.
-- Usenet support.
-- Progressive seeking (the longer you hold, the bigger the step) + a seek-duration setting.
-- Automatic subtitle selection setting.
-- "Ends at" time and a clock on the player.
-- Progress shown in the player's videos menu.
-- Changelog in settings; refreshed settings / library / nav / login UI.
+## Metadata and tracking
 
-**Official Apple TV (tvOS) app**: tech update #57 (this is the feature-limited "Lite," our closest comparison)
-- External player support for Infuse.
-- Live video playback.
-- Add to library from the dropdown menu.
+- Real Continue Watching and library from the engine. **Have.**
+- Rich metadata and posters, multi-source ratings, and award highlights. **Planned.**
+- Watch-history tracking and scrobbling with automatic episode tracking. **Planned.**
+- Hero banner with daily recommendations, taste-based Discover rails, and a calendar. **Planned.**
+- Add to and remove from Library on the detail page; last-used source per title. **Planned.**
 
-## What StremioX already has (do not rebuild)
+## Look and feel
 
-- libmpv player (Stremio only just added MPV to Android; StremioX shipped with it).
-- Video fit / zoom / stretch, audio + subtitle track picking, subtitle styling, playback speed, resume.
-- Watched / unwatched markers (episode, season, whole series).
-- Live playback progress into the engine; engine-sourced resume.
-- Full engine-driven Home, Discover, Library, Detail, per-addon Streams, Search, Add-ons (with uninstall), Settings.
-- iOS: Infuse / VLC external-player handoff.
-- A native design system (the recent redesign).
+- Cinematic, designed UI on a shared design system. **Have.**
+- **Customizable theme**: accent color and full color theming, multiple presets and layouts, custom fonts.
+  **Planned.**
+- Profiles with parental PIN and content hiding. **Planned.**
+- Localization and remote / keyboard remapping. **Planned.**
 
-## The gap, prioritized (all verified absent in our code)
+## Casting
 
-### High value, tractable (engine already supports these)
-1. **Add to / Remove from Library on the detail page.** The engine has the actions; we never expose them, so a title can only enter the library via account sync. Core library management.
-2. **Last-used stream per title (v6).** Remember the source you played for a title and offer a quick replay, instead of re-picking from the stream list every time.
-3. **Infinite scroll / lazy-load more catalogs on Home (v6).** We load a fixed set of board rows; lazy-load more on scroll. This is the fix for the old "press down forever to reach more catalogs" complaint.
-4. **Progressive seeking + seek-duration setting.** We have fixed plus/minus 10s; add an accelerating seek and a base-step setting.
-5. **"Ends at" time + a clock on the player overlay.** Small, high-perceived-quality.
-6. **Automatic subtitle selection (preferred language) + hide-other-languages filter** in the subtitle menu.
-7. **Addon subtitles (OpenSubtitles) with a download / copy context menu.** Already roadmapped; v5/v6 work confirms its importance.
+- AirPlay (native). **Planned.**
+- Chromecast, DLNA, and Roku. **Planned.**
+- Transcode-for-cast via the StremioX server. **Planned.**
 
-### Medium
-8. **Trakt integration (v6).** Import history and scrobble watch events. The engine supports Trakt; higher effort (auth + an addon flow) but high value for power users.
-9. **HDR / Dolby Vision badge on stream rows.** We show the addon's raw text; a parsed badge is cleaner.
-10. **tvOS external-player handoff to Infuse.** The official tvOS app has this; our iOS already does.
-11. **Interface size / UI scaling (v6).** Accessibility and TV-distance comfort.
-12. **Media-session controls (v6), changelog in Settings, gamepad support, localization.**
+## Live TV
 
-### Niche / server-dependent (fits the custom-server direction)
-13. **AirPlay / casting (v6).** More relevant to the iOS app than to Apple TV (the TV is already the screen).
-14. **EPG / live TV (v6).** Program guide for live channels.
-15. **Stream proxying (v6) and Usenet.** Both are server features and belong in a custom StremioX server.
+- Playlist and provider sources (M3U, Xtream, XMLTV). **Planned.**
+- Channel browser with logos and now-playing, favorites, and categories. **Planned.**
+- EPG guide grid with a now indicator, catchup / timeshift, and recording. **Planned.**
 
-## Notes
+## Social and advanced
 
-- Items 11 to 12 and a lot of advanced streaming live on the server side. They are the natural place for a custom StremioX streaming server (better than Stremio's proprietary `server.js` or an open-source drop-in), shipped behind a branch so stremio-core/server users stay put and others opt in.
-- Nothing here blocks the current build; this is the post-stabilization backlog.
+- Watch together: synced playback, chat, on-screen cursors, draw-over-video. **Planned.**
+- Multiview (more than one stream at once). **Planned.**
+- Webhooks and rich-presence integrations. **Planned.**
+
+## Foundations
+
+- Our own streaming server (replacing the bundled one), unlocking Usenet, live TV, full background caching,
+  and transcoding. **Planned.**
+- Shipped as unsigned, sideloaded builds with checksums; manual updates. **Have.**
