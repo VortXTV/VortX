@@ -15,7 +15,7 @@ struct TVPlayerView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @State private var markedWatched = false   // mark the engine watched once, near end of playback
-    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var presenter: PlayerPresenter   // root overlay: clear request to dismiss
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
     @State private var buffering = true
     @State private var isPaused = false
@@ -135,7 +135,7 @@ struct TVPlayerView: View {
     private func handlePress(_ type: UIPress.PressType) {
         if loadFailed {
             switch type {
-            case .menu: saveProgress(at: currentTime); dismiss()
+            case .menu: saveProgress(at: currentTime); presenter.request = nil
             case .select, .playPause: retryLoad()
             default: break
             }
@@ -153,7 +153,7 @@ struct TVPlayerView: View {
         }
         if controlsHidden {
             switch type {
-            case .menu: saveProgress(at: currentTime); dismiss()
+            case .menu: saveProgress(at: currentTime); presenter.request = nil
             case .playPause: toggle()
             default: showControls()                       // any swipe / select reveals the bar
             }
@@ -161,7 +161,7 @@ struct TVPlayerView: View {
         }
         // Control bar is shown: navigate it.
         switch type {
-        case .menu: saveProgress(at: currentTime); dismiss()
+        case .menu: saveProgress(at: currentTime); presenter.request = nil
         case .playPause: toggle()
         case .select: activate(selected)
         case .leftArrow: moveSelected(-1)
@@ -193,7 +193,7 @@ struct TVPlayerView: View {
 
     private func activate(_ c: Control) {
         switch c {
-        case .close: saveProgress(at: currentTime); dismiss()
+        case .close: saveProgress(at: currentTime); presenter.request = nil
         case .back:  seek(-10)
         case .fwd:   seek(10)
         case .play:  toggle()
@@ -461,7 +461,7 @@ struct TVPlayerView: View {
 
     /// Auto-advance when an episode ends: next episode if there is one, otherwise leave the player.
     private func autoAdvance() {
-        if hasNextEpisode { playNext() } else { saveProgress(at: currentTime); dismiss() }
+        if hasNextEpisode { playNext() } else { saveProgress(at: currentTime); presenter.request = nil }
     }
 
     /// Switch to another episode in place: flush progress, resolve a stream, then reload mpv.
@@ -571,18 +571,14 @@ private struct RemoteCatcher: UIViewRepresentable {
             if window != nil { setNeedsFocusUpdate(); updateFocusIfNeeded() }
         }
 
-        /// Trap focus: a directional press both fires our handler AND tells the focus engine to move
-        /// focus (up to the tab bar behind the cover). If it tries to leave, pull it straight back, so
-        /// the player keeps owning the remote and the controls stay reachable.
-        override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
-            super.didUpdateFocus(in: context, with: coordinator)
-            if window != nil, context.nextFocusedItem !== self {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.window != nil else { return }
-                    self.setNeedsFocusUpdate()
-                    self.updateFocusIfNeeded()
-                }
+        /// Trap focus: refuse to let the focus engine move focus AWAY from this view, so a directional
+        /// press cannot walk focus off the player. The shell is also `.disabled` while playing (nothing
+        /// else is focusable), so this is the lock on the door rather than a fight-the-engine re-grab.
+        override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+            if context.previouslyFocusedItem === self && context.nextFocusedItem !== self {
+                return false
             }
+            return super.shouldUpdateFocus(in: context)
         }
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {

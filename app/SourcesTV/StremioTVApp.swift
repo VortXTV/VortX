@@ -4,6 +4,7 @@ import SwiftUI
 struct StremioTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
+    @StateObject private var presenter = PlayerPresenter()
 
     init() {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
@@ -29,6 +30,7 @@ struct StremioTVApp: App {
             }
             .environmentObject(account)
             .environmentObject(core)
+            .environmentObject(presenter)
             .preferredColorScheme(.dark)
         }
     }

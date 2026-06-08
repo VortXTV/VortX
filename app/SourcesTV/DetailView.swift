@@ -252,7 +252,7 @@ struct CoreStreamList: View {
     var meta: PlaybackMeta? = nil
     @EnvironmentObject private var core: CoreBridge
     @State private var sourceFilter: String? = nil
-    @State private var playing: CoreStream? = nil   // drives a full-screen player cover (over the tab bar)
+    @EnvironmentObject private var presenter: PlayerPresenter   // root-level player overlay (focus-safe)
 
     var body: some View {
         let groups = core.streamGroups()
@@ -277,13 +277,15 @@ struct CoreStreamList: View {
                 .padding(.vertical, Theme.Space.md)
             }
         }
-        // Full-screen so the player covers the tab bar (a NavigationLink push leaves the tvOS tab bar on top).
-        .fullScreenCover(item: $playing) { stream in
-            if let url = stream.playableURL {
-                TVPlayerView(url: url, title: title, meta: meta)
-                    .task { core.loadEnginePlayer(for: stream); prepareTorrent(stream) }
-            }
-        }
+    }
+
+    /// Present the player as a root-level overlay (focus-safe on tvOS), after wiring the engine and
+    /// preparing torrents. See RootTabView / PlayerPresenter.
+    private func play(_ stream: CoreStream) {
+        guard let url = stream.playableURL else { return }
+        core.loadEnginePlayer(for: stream)
+        prepareTorrent(stream)
+        presenter.request = PlaybackRequest(url: url, title: title, meta: meta)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {
@@ -302,7 +304,7 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if stream.playableURL != nil {
-            Button { playing = stream } label: { streamLabel(addon, stream, enabled: true) }
+            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true) }
                 .buttonStyle(RowFocusStyle())
         } else {
             streamLabel(addon, stream, enabled: false)   // external/youtube, not playable in-app
