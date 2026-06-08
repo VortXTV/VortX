@@ -17,6 +17,9 @@ targets:
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources
+      - path: Resources/fonts
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -50,6 +53,9 @@ targets:
       - Sources/NodeServer.swift
       - ResourcesTV/Assets.xcassets
       - path: Resources/server.js
+        buildPhase: resources
+      - path: Resources/fonts
+        type: folder
         buildPhase: resources
     dependencies:
       - package: MPVKit

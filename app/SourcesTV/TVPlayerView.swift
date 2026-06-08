@@ -1,10 +1,11 @@
 import SwiftUI
+import UIKit
 import os
 
-/// Full-screen libmpv player for tvOS with an on-screen, focusable control bar (Back / Play / Fwd /
-/// Audio / Subtitles / Previous / Next / Episodes), navigate it with the remote like any other
-/// player. When the bar is hidden, any remote input brings it back; Menu exits. Shares the MPVKit
-/// core with the iOS app.
+/// Full-screen libmpv player for tvOS. All remote input is handled at the UIKit level by a focusable
+/// `RemoteCatcher` (pressesBegan), and the control bar / options panel are driven by plain state with
+/// no SwiftUI focus, because SwiftUI `@FocusState` is unreliable inside a full-screen cover on tvOS.
+/// Shares the MPVKit core with the iOS app.
 struct TVPlayerView: View {
     let url: URL
     let title: String
@@ -31,6 +32,7 @@ struct TVPlayerView: View {
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var showOptions = false             // audio/subtitle/episode list panel
+    @State private var optionRow = 0                   // highlighted row in the options panel
     @State private var loadFailed = false              // playback couldn't start
     @State private var loadErrorMsg = ""
     @State private var hasStartedPlaying = false
@@ -41,12 +43,11 @@ struct TVPlayerView: View {
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
 
-    /// Which on-screen control (or the video surface) currently has remote focus.
-    private enum Focus: Hashable { case player, close, back, play, fwd, audio, subs, prev, next, episodes }
-    @FocusState private var focus: Focus?
+    /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
+    private enum Control: Hashable { case close, back, play, fwd, audio, subs, prev, next, episodes }
+    @State private var selected: Control = .play
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
-    /// True when no control bar / panel / error is up, so the full-screen catch button owns the remote.
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
 
     var body: some View {
@@ -98,38 +99,20 @@ struct TVPlayerView: View {
                 }
                 .ignoresSafeArea()
 
+            // UIKit owns ALL remote input (reliable inside the full-screen cover, unlike SwiftUI focus).
+            RemoteCatcher { handlePress($0) }
+
             if buffering && !loadFailed {
                 ProgressView().controlSize(.large).tint(Theme.Palette.accent)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            // When the bar is hidden, a transparent focusable layer owns the remote: any swipe or Select
-            // reveals the controls. A focusable Color (not a Button) avoids tvOS's button focus
-            // highlight, which was washing the whole video white, while still catching remote input.
-            if controlsHidden {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .focusable()
-                    .focused($focus, equals: .player)
-                    .onMoveCommand { _ in showControls() }
-                    .onTapGesture { showControls() }
             }
             if showInfo && !showOptions && !loadFailed { controlBar }
             if showOptions { optionsPanel }
             if loadFailed { loadErrorOverlay }
         }
-        .defaultFocus($focus, .play)                      // seed focus into the cover (device-safe)
-        .onPlayPauseCommand { toggle() }
-        .onExitCommand {
-            if showOptions { closePanel() }
-            else { saveProgress(at: currentTime); dismiss() }
-        }
-        .onChange(of: focus) { _ in
-            if showInfo { scheduleHide() }                // moving across the bar keeps it visible
-        }
         .onAppear {
             if curURL == nil { curURL = url; curTitle = title; curMeta = meta }   // seed from initial
-            showInfo = true; scheduleHide(); startLoadTimeout()
-            DispatchQueue.main.async { focus = .play }    // after the cover's focus env is ready
+            showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
             if let m = curMeta {
                 if let engineResume = core.engineResumeSeconds(for: m) {
                     resumeSeconds = engineResume; maybeResume()       // engine library = source of truth
@@ -144,6 +127,79 @@ struct TVPlayerView: View {
             hideTask?.cancel(); loadTimeout?.cancel()
             saveProgress(at: currentTime)
             core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position to the engine
+        }
+    }
+
+    // MARK: - Remote handling (all input arrives here from the UIKit catcher)
+
+    private func handlePress(_ type: UIPress.PressType) {
+        if loadFailed {
+            switch type {
+            case .menu: saveProgress(at: currentTime); dismiss()
+            case .select, .playPause: retryLoad()
+            default: break
+            }
+            return
+        }
+        if showOptions {
+            switch type {
+            case .menu: closePanel()
+            case .upArrow: moveOption(-1)
+            case .downArrow: moveOption(1)
+            case .select: activateOption()
+            default: break
+            }
+            return
+        }
+        if controlsHidden {
+            switch type {
+            case .menu: saveProgress(at: currentTime); dismiss()
+            case .playPause: toggle()
+            default: showControls()                       // any swipe / select reveals the bar
+            }
+            return
+        }
+        // Control bar is shown: navigate it.
+        switch type {
+        case .menu: saveProgress(at: currentTime); dismiss()
+        case .playPause: toggle()
+        case .select: activate(selected)
+        case .leftArrow: moveSelected(-1)
+        case .rightArrow: moveSelected(1)
+        case .upArrow, .downArrow: flashControls()        // keep the bar up
+        default: break
+        }
+    }
+
+    /// Controls in remote left/right order (close is leftmost, then transport, then audio/subs/episodes).
+    private var visibleControls: [Control] {
+        var c: [Control] = [.close, .back]
+        if episodes.count > 1 && hasPrevEpisode { c.append(.prev) }
+        c.append(.play)
+        if episodes.count > 1 && hasNextEpisode { c.append(.next) }
+        c.append(.fwd)
+        if !audioTracks.isEmpty { c.append(.audio) }
+        c.append(.subs)
+        if episodes.count > 1 { c.append(.episodes) }
+        return c
+    }
+
+    private func moveSelected(_ d: Int) {
+        let v = visibleControls
+        let i = v.firstIndex(of: selected) ?? 0
+        selected = v[max(0, min(v.count - 1, i + d))]
+        flashControls()
+    }
+
+    private func activate(_ c: Control) {
+        switch c {
+        case .close: saveProgress(at: currentTime); dismiss()
+        case .back:  seek(-10)
+        case .fwd:   seek(10)
+        case .play:  toggle()
+        case .prev:  playPrevious()
+        case .next:  playNext()
+        case .audio, .subs, .episodes: openPanel()
         }
     }
 
@@ -181,9 +237,8 @@ struct TVPlayerView: View {
 
     private var controlBar: some View {
         VStack(spacing: 0) {
-            // Top chrome: back + title + live metadata
             HStack(alignment: .top, spacing: Theme.Space.lg) {
-                ctrlButton(.close, "chevron.left") { saveProgress(at: currentTime); dismiss() }
+                ctrlButton(.close, "chevron.left")
                 Spacer(minLength: Theme.Space.lg)
                 VStack(alignment: .trailing, spacing: 6) {
                     if !curTitle.isEmpty {
@@ -201,7 +256,6 @@ struct TVPlayerView: View {
 
             Spacer()
 
-            // Bottom: scrubber + centered transport with trailing audio/subs/episodes
             VStack(spacing: Theme.Space.lg) {
                 HStack(spacing: Theme.Space.md) {
                     Text(timeString(currentTime)).font(.callout.monospacedDigit())
@@ -212,16 +266,16 @@ struct TVPlayerView: View {
                 }
                 ZStack {
                     HStack(spacing: Theme.Space.md) {
-                        ctrlButton(.back, "gobackward.10") { seek(-10) }
-                        if episodes.count > 1 && hasPrevEpisode { ctrlButton(.prev, "backward.end.fill") { playPrevious() } }
-                        ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true) { toggle() }
-                        if episodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") { playNext() } }
-                        ctrlButton(.fwd, "goforward.10") { seek(10) }
+                        ctrlButton(.back, "gobackward.10")
+                        if episodes.count > 1 && hasPrevEpisode { ctrlButton(.prev, "backward.end.fill") }
+                        ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true)
+                        if episodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") }
+                        ctrlButton(.fwd, "goforward.10")
                     }
                     HStack(spacing: Theme.Space.md) {
-                        if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") { openPanel() } }
-                        ctrlButton(.subs, "captions.bubble") { openPanel() }
-                        if episodes.count > 1 { ctrlButton(.episodes, "list.bullet") { openPanel() } }
+                        if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
+                        ctrlButton(.subs, "captions.bubble")
+                        if episodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
                 }
@@ -232,7 +286,7 @@ struct TVPlayerView: View {
         .transition(.opacity)
     }
 
-    /// Slim ember seek bar with a knob. Position display; seeking is via the ±10 controls / remote.
+    /// Slim ember seek bar with a knob. Position display; seeking is via the ±10 controls.
     private var scrubber: some View {
         GeometryReader { geo in
             let frac = duration > 0 ? min(1, max(0, currentTime / duration)) : 0
@@ -249,61 +303,77 @@ struct TVPlayerView: View {
         .frame(height: 18)
     }
 
-    /// Circular, focus-reactive control. Focused → ember fill + lift; the play button is larger.
-    private func ctrlButton(_ f: Focus, _ icon: String, big: Bool = false, action: @escaping () -> Void) -> some View {
-        let focused = (focus == f)
+    /// Circular control, highlighted (ember fill + lift) when it is the selected control. Visual only;
+    /// activation is driven by the remote handler, not a tap.
+    private func ctrlButton(_ c: Control, _ icon: String, big: Bool = false) -> some View {
+        let sel = (selected == c)
         let d: CGFloat = big ? 92 : 64
-        return Button { action(); flashControls() } label: {
-            Image(systemName: icon)
-                .font(.system(size: big ? 38 : 26, weight: .semibold))
-                .foregroundStyle(focused ? Theme.Palette.canvas : Theme.Palette.textPrimary)
-                .frame(width: d, height: d)
-                .background(Circle().fill(focused ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.12)))
-                .scaleEffect(focused ? 1.12 : 1.0)
-        }
-        .buttonStyle(.plain)
-        .focused($focus, equals: f)
-        .animation(.easeOut(duration: 0.18), value: focused)
+        return Image(systemName: icon)
+            .font(.system(size: big ? 38 : 26, weight: .semibold))
+            .foregroundStyle(sel ? Theme.Palette.canvas : Theme.Palette.textPrimary)
+            .frame(width: d, height: d)
+            .background(Circle().fill(sel ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.12)))
+            .scaleEffect(sel ? 1.12 : 1.0)
+            .animation(.easeOut(duration: 0.18), value: sel)
     }
 
-    // MARK: - Options panel (audio / subtitles / episodes)
+    // MARK: - Options panel (audio / subtitles / episodes), driven by optionRow
+
+    private struct OptionRow: Identifiable { let id = UUID(); let label: String; let isSelected: Bool; let action: () -> Void }
+
+    private var optionRows: [OptionRow] {
+        var rows: [OptionRow] = []
+        for t in audioTracks {
+            rows.append(OptionRow(label: "Audio  ·  " + t.label, isSelected: t.selected) {
+                coordinator.player?.setAudioTrack(t.id); refreshTracksSoon()
+            })
+        }
+        rows.append(OptionRow(label: "Subtitles  ·  Off", isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
+            coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
+        })
+        for t in subtitleTracks {
+            rows.append(OptionRow(label: "Subtitles  ·  " + t.label, isSelected: t.selected) {
+                coordinator.player?.setSubtitleTrack(t.id); refreshTracksSoon()
+            })
+        }
+        if episodes.count > 1 {
+            for ep in episodes {
+                rows.append(OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
+                    play(episode: ep)
+                })
+            }
+        }
+        return rows
+    }
 
     private var optionsPanel: some View {
-        HStack(spacing: 0) {
+        let rows = optionRows
+        return HStack(spacing: 0) {
             Spacer()
-            List {
-                if !audioTracks.isEmpty {
-                    Section("Audio") {
-                        ForEach(audioTracks) { t in
-                            trackRow(t.label, selected: t.selected) {
-                                coordinator.player?.setAudioTrack(t.id); refreshTracksSoon()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                            HStack {
+                                Text(row.label).lineLimit(1)
+                                    .foregroundStyle(i == optionRow ? Theme.Palette.canvas : Theme.Palette.textPrimary)
+                                Spacer()
+                                if row.isSelected {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(i == optionRow ? Theme.Palette.canvas : Theme.Palette.accent)
+                                }
                             }
+                            .padding(.horizontal, Theme.Space.lg).padding(.vertical, Theme.Space.sm)
+                            .background(i == optionRow ? Theme.Palette.accent : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                            .id(i)
                         }
                     }
+                    .padding(Theme.Space.lg)
                 }
-                Section("Subtitles") {
-                    trackRow("Off", selected: subtitleTracks.allSatisfy { !$0.selected }) {
-                        coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
-                    }
-                    ForEach(subtitleTracks) { t in
-                        trackRow(t.label, selected: t.selected) {
-                            coordinator.player?.setSubtitleTrack(t.id); refreshTracksSoon()
-                        }
-                    }
-                    if subtitleTracks.isEmpty {
-                        Text("No subtitle tracks in this stream").foregroundStyle(Theme.Palette.textSecondary)
-                    }
-                }
-                if episodes.count > 1 {
-                    Section("Episodes") {
-                        ForEach(episodes) { ep in
-                            trackRow("\(ep.episodeNumber). \(ep.episodeTitle)",
-                                     selected: ep.id == curMeta?.videoId) { play(episode: ep) }
-                        }
-                    }
-                }
+                .onChange(of: optionRow) { _ in withAnimation { proxy.scrollTo(optionRow, anchor: .center) } }
             }
-            .frame(width: 720)
+            .frame(width: 760)
             .frame(maxHeight: .infinity)
             .background(Theme.Palette.surface1.opacity(0.98))
         }
@@ -311,24 +381,26 @@ struct TVPlayerView: View {
         .transition(.move(edge: .trailing))
     }
 
-    private func trackRow(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Text(label).lineLimit(1)
-                Spacer()
-                if selected { Image(systemName: "checkmark").foregroundStyle(Theme.Palette.accent) }
-            }
-        }
+    private func moveOption(_ d: Int) {
+        let count = optionRows.count
+        guard count > 0 else { return }
+        optionRow = max(0, min(count - 1, optionRow + d))
+    }
+    private func activateOption() {
+        let rows = optionRows
+        guard optionRow >= 0, optionRow < rows.count else { return }
+        rows[optionRow].action()
     }
 
     private func openPanel() {
         refreshTracks()
         hideTask?.cancel()
+        optionRow = optionRows.firstIndex { $0.isSelected } ?? 0
         withAnimation { showOptions = true }
     }
     private func closePanel() {
         withAnimation { showOptions = false }
-        showInfo = true; focus = .play; scheduleHide()
+        showInfo = true; selected = .play; scheduleHide()
     }
 
     private func refreshTracks() {
@@ -392,8 +464,7 @@ struct TVPlayerView: View {
         if hasNextEpisode { playNext() } else { saveProgress(at: currentTime); dismiss() }
     }
 
-    /// Switch to another episode in place: flush progress, resolve a stream (same proven path as
-    /// StreamList), then reload mpv. Falls back to the load-error overlay if nothing is playable.
+    /// Switch to another episode in place: flush progress, resolve a stream, then reload mpv.
     private func play(episode v: Video) {
         guard let m = curMeta else { return }
         saveProgress(at: currentTime)
@@ -404,7 +475,7 @@ struct TVPlayerView: View {
                                    name: m.name, poster: m.poster, season: v.season, episode: v.episode)
         curMeta = newMeta
         curTitle = "\(m.name) · S\(v.season ?? 0)E\(v.episodeNumber) · \(v.episodeTitle)"
-        showInfo = true; focus = .play; flashControls()
+        showInfo = true; selected = .play; flashControls()
         Task {
             var client = AddonClient(); client.streamSources = account.streamSources
             let streams = await client.streams(type: "series", videoId: v.id)
@@ -451,13 +522,13 @@ struct TVPlayerView: View {
         flashControls()
     }
 
-    /// Reveal the bar from a hidden state and focus the Play button.
+    /// Reveal the bar from a hidden state, selecting Play, and restart the auto-hide timer.
     private func showControls() {
         withAnimation { showInfo = true }
-        if focus == .player || focus == nil { focus = .play }
+        if controlsHidden || selected == .close { selected = .play }
         scheduleHide()
     }
-    /// Keep the bar visible + reset the auto-hide timer, without moving focus (used by button taps).
+    /// Keep the bar visible and reset the auto-hide timer, without changing the selection.
     private func flashControls() {
         withAnimation { showInfo = true }
         scheduleHide()
@@ -469,7 +540,6 @@ struct TVPlayerView: View {
             try? await Task.sleep(for: .seconds(8))
             guard !showOptions else { return }
             withAnimation { showInfo = false }
-            focus = .player                          // hand focus to the full-screen catch button
         }
     }
 
@@ -477,5 +547,40 @@ struct TVPlayerView: View {
         guard t.isFinite, t >= 0 else { return "0:00" }
         let s = Int(t), h = s / 3600, m = (s % 3600) / 60, sec = s % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    }
+}
+
+// MARK: - UIKit remote catcher
+
+/// A focusable UIView that captures every Siri-remote press and forwards it to SwiftUI. This is far more
+/// reliable than SwiftUI `@FocusState` + `onMoveCommand` inside a full-screen cover on tvOS.
+private struct RemoteCatcher: UIViewRepresentable {
+    var onPress: (UIPress.PressType) -> Void
+
+    func makeUIView(context: Context) -> CatchView {
+        let v = CatchView(); v.onPress = onPress; return v
+    }
+    func updateUIView(_ uiView: CatchView, context: Context) { uiView.onPress = onPress }
+
+    final class CatchView: UIView {
+        var onPress: ((UIPress.PressType) -> Void)?
+        override var canBecomeFocused: Bool { true }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil { setNeedsFocusUpdate(); updateFocusIfNeeded() }
+        }
+
+        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            var handled = false
+            for press in presses {
+                switch press.type {
+                case .select, .menu, .playPause, .upArrow, .downArrow, .leftArrow, .rightArrow:
+                    onPress?(press.type); handled = true
+                default: break
+                }
+            }
+            if !handled { super.pressesBegan(presses, with: event) }
+        }
     }
 }

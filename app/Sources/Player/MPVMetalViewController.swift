@@ -129,10 +129,13 @@ final class MPVMetalViewController: UIViewController {
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &metalLayer))
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
-        // Use CoreText for font lookup so libass falls back to the system CJK fonts (Apple SD Gothic Neo
-        // for Korean, PingFang, Hiragino) for non-Latin subtitles instead of rendering them as empty
-        // boxes. Keep embedded fonts (ASS/SSA) enabled too.
-        checkError(mpv_set_option_string(mpv, "sub-font-provider", "coretext"))
+        // Bundle a broad CJK font and point libass at the folder so non-Latin subtitles (e.g. Korean)
+        // render instead of empty boxes. CoreText fallback alone did not cover them in this build, so we
+        // ship the font and set it as the default subtitle font directly.
+        if let res = Bundle.main.resourcePath {
+            checkError(mpv_set_option_string(mpv, "sub-fonts-dir", res + "/fonts"))
+        }
+        checkError(mpv_set_option_string(mpv, "sub-font", "Noto Sans CJK KR"))
         checkError(mpv_set_option_string(mpv, "embeddedfonts", "yes"))
         // User-configured subtitle appearance (size / colour / background), see SubtitleStyle.
         for (name, value) in SubtitleStyle.mpvOptions {
