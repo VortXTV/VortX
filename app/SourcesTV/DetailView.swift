@@ -238,6 +238,7 @@ struct CoreStreamList: View {
     var meta: PlaybackMeta? = nil
     @EnvironmentObject private var core: CoreBridge
     @State private var sourceFilter: String? = nil
+    @State private var playing: CoreStream? = nil   // drives a full-screen player cover (over the tab bar)
 
     var body: some View {
         let groups = core.streamGroups()
@@ -262,6 +263,13 @@ struct CoreStreamList: View {
                 .padding(.vertical, Theme.Space.md)
             }
         }
+        // Full-screen so the player covers the tab bar (a NavigationLink push leaves the tvOS tab bar on top).
+        .fullScreenCover(item: $playing) { stream in
+            if let url = stream.playableURL {
+                TVPlayerView(url: url, title: title, meta: meta)
+                    .task { core.loadEnginePlayer(for: stream); prepareTorrent(stream) }
+            }
+        }
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {
@@ -279,12 +287,9 @@ struct CoreStreamList: View {
     }
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
-        if let url = stream.playableURL {
-            NavigationLink {
-                TVPlayerView(url: url, title: title, meta: meta)
-                    .task { core.loadEnginePlayer(for: stream); prepareTorrent(stream) }
-            } label: { streamLabel(addon, stream, enabled: true) }
-            .buttonStyle(RowFocusStyle())
+        if stream.playableURL != nil {
+            Button { playing = stream } label: { streamLabel(addon, stream, enabled: true) }
+                .buttonStyle(RowFocusStyle())
         } else {
             streamLabel(addon, stream, enabled: false)   // external/youtube, not playable in-app
                 .background(Theme.Palette.surface1.opacity(0.5),

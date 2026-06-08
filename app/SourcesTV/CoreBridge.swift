@@ -31,7 +31,7 @@ final class CoreBridge: ObservableObject {
     private var awaitingAuthMigration = false
 
     /// Where the legacy hand-rolled client (StremioAccount) stores the Stremio session key.
-    private static let legacyAuthKeyDefaultsKey = "stremiox.authKey"
+    private static let authTokenKey = "stremiox.authKey"   // matches StremioAccount.tokenKey (Keychain)
 
     private init() {}
 
@@ -103,9 +103,8 @@ final class CoreBridge: ObservableObject {
             loadBoard() // addons already hydrated from the engine's own storage
             return
         }
-        guard let key = UserDefaults.standard.string(forKey: Self.legacyAuthKeyDefaultsKey),
-              !key.isEmpty else {
-            NSLog("[CoreBridge] no legacy authKey; engine stays signed out")
+        guard let key = Keychain.string(Self.authTokenKey), !key.isEmpty else {
+            NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
             return
         }
         awaitingAuthMigration = true
@@ -425,6 +424,14 @@ final class CoreBridge: ObservableObject {
         if fields.contains("discover") {
             let value = decode(CoreDiscover.self, field: "discover")
             DispatchQueue.main.async { [weak self] in self?.discover = value }
+            // A null first load derives the default catalog before the selectable is refreshed from
+            // addons, so it can land with catalogs available but nothing selected (Discover stuck on
+            // the spinner). If so, load the first catalog to unstick it.
+            if let value, value.items.isEmpty,
+               !value.selectable.types.contains(where: { $0.selected }),
+               let first = value.selectable.types.first {
+                selectDiscover(first.request)
+            }
         }
         if fields.contains("library") {
             let value = decode(CoreLibrary.self, field: "library")

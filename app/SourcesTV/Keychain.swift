@@ -1,9 +1,14 @@
 import Foundation
 import Security
 
-/// Tiny Keychain wrapper for small secrets (the Stremio auth token). Stored as a generic password,
-/// readable after first unlock, not synced to iCloud.
+/// Small-secret store for the Stremio auth token. Prefers the Keychain (generic password, readable
+/// after first unlock, not iCloud-synced). If the Keychain is unavailable, which happens on the
+/// unsigned Simulator and can happen on a re-signed sideload where the keychain-access-group does not
+/// match, it falls back to UserDefaults so the token is never silently lost. On a normally signed
+/// device the Keychain path is used and nothing is mirrored to UserDefaults.
 enum Keychain {
+    private static func fallbackKey(_ account: String) -> String { "kcfallback." + account }
+
     static func string(_ account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -12,9 +17,12 @@ enum Keychain {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var result: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+           let data = result as? Data, let value = String(data: data, encoding: .utf8) {
+            return value
+        }
+        // Keychain miss or unavailable → fall back to UserDefaults.
+        return UserDefaults.standard.string(forKey: fallbackKey(account))
     }
 
     static func set(_ value: String?, for account: String) {
@@ -23,10 +31,22 @@ enum Keychain {
             kSecAttrAccount as String: account,
         ]
         SecItemDelete(base as CFDictionary)   // replace any existing item
-        guard let value, let data = value.data(using: .utf8) else { return }
+
+        guard let value, let data = value.data(using: .utf8) else {
+            UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // clearing the token
+            return
+        }
+
         var add = base
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(add as CFDictionary, nil)
+        let status = SecItemAdd(add as CFDictionary, nil)
+
+        if status == errSecSuccess {
+            UserDefaults.standard.removeObject(forKey: fallbackKey(account))   // Keychain is authoritative
+        } else {
+            // Keychain unavailable (unsigned Simulator, entitlement mismatch) → keep it working.
+            UserDefaults.standard.set(value, forKey: fallbackKey(account))
+        }
     }
 }
