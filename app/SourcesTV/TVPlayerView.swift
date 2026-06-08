@@ -571,6 +571,20 @@ private struct RemoteCatcher: UIViewRepresentable {
             if window != nil { setNeedsFocusUpdate(); updateFocusIfNeeded() }
         }
 
+        /// Trap focus: a directional press both fires our handler AND tells the focus engine to move
+        /// focus (up to the tab bar behind the cover). If it tries to leave, pull it straight back, so
+        /// the player keeps owning the remote and the controls stay reachable.
+        override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+            super.didUpdateFocus(in: context, with: coordinator)
+            if window != nil, context.nextFocusedItem !== self {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.window != nil else { return }
+                    self.setNeedsFocusUpdate()
+                    self.updateFocusIfNeeded()
+                }
+            }
+        }
+
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             var handled = false
             for press in presses {
