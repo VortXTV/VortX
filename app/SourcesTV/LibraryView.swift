@@ -30,7 +30,9 @@ struct LibraryView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { if core.library == nil { core.loadLibrary() } }
+        // Reload while empty: the library syncs from the API asynchronously after sign-in, so the
+        // first load can land before ctx.library is populated. Revisiting the tab refills it.
+        .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
     }
 
     private func filters(_ selectable: CoreLibrarySelectable) -> some View {
