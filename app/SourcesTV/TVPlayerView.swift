@@ -539,7 +539,11 @@ struct TVPlayerView: View {
         hideTask?.cancel()
         hideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(8))
-            guard !showOptions else { return }
+            // A cancelled sleep still falls through here (try? swallows CancellationError), so check
+            // explicitly. Every re-show/navigation cancels the prior task; without this guard that
+            // cancelled task would immediately run `showInfo = false` and the bar would vanish on the
+            // very next press.
+            guard !Task.isCancelled, !showOptions else { return }
             withAnimation { showInfo = false }
         }
     }
@@ -595,6 +599,17 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
             setNeedsFocusUpdate(); updateFocusIfNeeded()
+        }
+
+        /// Lock focus on the catcher. It is the ONLY focusable while playing and it handles every remote
+        /// input itself (hidden state, control-bar navigation, AND the audio/subtitle panel), so it never
+        /// needs to yield focus. Without this, a directional press knocks focus to nil and the controls
+        /// stop responding until an async re-grab catches up — a race the input never wins under load.
+        override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+            if isViewLoaded, view.window != nil, context.nextFocusedItem !== view {
+                return false
+            }
+            return super.shouldUpdateFocus(in: context)
         }
 
         @objc private func handleSurfaceTouch(_ g: UIPanGestureRecognizer) {
