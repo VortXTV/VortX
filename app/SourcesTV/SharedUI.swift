@@ -299,6 +299,21 @@ private struct FocusReporter: View {
     }
 }
 
+extension View {
+    /// Cages a browse page's scrolling content in a bottom strip. The focus engine centers focused
+    /// rows inside THIS viewport, so they are geometrically incapable of riding up over the hero;
+    /// rows leaving the strip fade out at its top edge instead of clipping hard.
+    func heroBottomStrip(height: CGFloat = 470) -> some View {
+        mask(VStack(spacing: 0) {
+            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
+                .frame(height: 50)
+            Color.black
+        })
+        .frame(height: height)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+    }
+}
+
 /// The browse pages' background layer: the focused title's artwork at full bleed with a detail
 /// block (title, meta line, synopsis) on the upper-left band. Content scrolls over it.
 struct BrowseHeroBackdrop: View {

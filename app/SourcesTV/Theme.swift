@@ -103,8 +103,10 @@ private struct CardFocusContent: View {
         let lifted = focused && !reduceMotion
         configuration.label
             .scaleEffect(lifted ? scale : (configuration.isPressed ? 0.97 : 1))
-            .shadow(color: focused ? Theme.Palette.accent.opacity(0.5) : .black.opacity(0.35),
-                    radius: focused ? 30 : 14, x: 0, y: focused ? 18 : 8)
+            // Depth, not color: a black shadow melts into the canvas and artwork at any theme,
+            // where an accent-tinted one reads as a solid slab stamped behind the card.
+            .shadow(color: .black.opacity(focused ? 0.55 : 0.35),
+                    radius: focused ? 26 : 14, x: 0, y: focused ? 14 : 8)
             .animation(reduceMotion ? nil : Theme.Motion.focus, value: focused)
             .animation(Theme.Motion.state, value: configuration.isPressed)
     }

@@ -34,9 +34,7 @@ struct HomeView: View {
                     .padding(.top, Theme.Space.sm)
                     .padding(.bottom, Theme.Space.xl)
                 }
-                .mask(stripMask)
-                .frame(height: 470)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .heroBottomStrip()
             }
             .overlay(alignment: .topLeading) {
                 header
@@ -56,15 +54,6 @@ struct HomeView: View {
     private func configureMetaSources() {
         FocusedItemModel.configureMetaSources(
             transportUrls: core.addons.filter(\.providesMeta).map(\.transportUrl))
-    }
-
-    /// Rows leaving the strip fade out at its top edge instead of clipping hard.
-    private var stripMask: some View {
-        VStack(spacing: 0) {
-            LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                .frame(height: 50)
-            Color.black
-        }
     }
 
     /// First render shows the page's actual first item, and Continue Watching pre-fetches its

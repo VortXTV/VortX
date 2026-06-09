@@ -12,10 +12,9 @@ struct DiscoverView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                // The focused title's artwork + details show through the band between the chips
-                // and the grid; the grid scrolls over them. detailsTop clears the page title plus
-                // three chip rows.
-                BrowseHeroBackdrop(model: focusModel, detailsTop: 430)
+                // The living backdrop: art owns the screen, details pinned above the strip. The
+                // title, chips, and grid all live in the bottom strip and tuck under the hero.
+                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Text("Discover").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
@@ -23,7 +22,6 @@ struct DiscoverView: View {
                             typeChips(discover.selectable.types)
                             catalogChips(discover.selectable.catalogs)
                             genreChips(discover.selectable.extra)
-                            Color.clear.frame(height: 380)
                             grid(discover.items)
                         } else if account.isSignedIn {
                             ProgressView().controlSize(.large).tint(Theme.Palette.accent)
@@ -32,8 +30,10 @@ struct DiscoverView: View {
                             CoreEmptyState.signedOut
                         }
                     }
-                    .padding(.vertical, Theme.Space.xl)
+                    .padding(.top, Theme.Space.sm)
+                    .padding(.bottom, Theme.Space.xl)
                 }
+                .heroBottomStrip()
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
@@ -91,10 +91,10 @@ struct DiscoverView: View {
                 .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
         } else {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                ForEach(items) { item in
                     PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
                                menu: .catalog,
-                               onFocus: { focusModel.focus(item.focusedHero, showsDetails: index < 6) })
+                               onFocus: { focusModel.focus(item.focusedHero) })
                 }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
