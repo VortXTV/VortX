@@ -212,6 +212,13 @@ struct CoreVideo: Decodable, Identifiable {
     let thumbnail: String?
     let season: Int?
     let episode: Int?
+
+    /// Display helpers used by the player's episode list and Prev/Next buttons.
+    var episodeNumber: Int { episode ?? 0 }
+    var episodeTitle: String {
+        if let title, !title.isEmpty { return title }
+        return "Episode \(episode ?? 0)"
+    }
 }
 
 /// One addon's stream response for the selected meta/episode (`ResourceLoadable<Vec<Stream>>`).

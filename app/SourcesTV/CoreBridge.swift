@@ -256,6 +256,19 @@ final class CoreBridge: ObservableObject {
         return (loaded, details.streams.count)
     }
 
+    /// The first ready, playable stream for a specific stream/episode id, matched on the stream request's
+    /// own path id. An in-player episode switch uses this so it never grabs the previous episode's streams
+    /// that are still loaded in `metaDetails` during the brief window before the new ones arrive.
+    func playableStream(forStreamId streamId: String) -> CoreStream? {
+        guard let details = metaDetails else { return nil }
+        for group in details.streams where group.request.path.id == streamId {
+            if let stream = group.content?.ready?.first(where: { $0.playableURL != nil }) {
+                return stream
+            }
+        }
+        return nil
+    }
+
     private func addonNamesByBase() -> [String: String] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [:] }
         var map: [String: String] = [:]

@@ -165,7 +165,7 @@ struct CoreSeasonedEpisodes: View {
     private func episodeRow(_ v: CoreVideo) -> some View {
         let isWatched = watched.contains(v.id)
         return NavigationLink {
-            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season)
+            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: episodes)
         } label: {
             HStack(alignment: .top, spacing: Theme.Space.md) {
                 thumbnail(v, isWatched: isWatched)
@@ -230,6 +230,7 @@ struct CoreEpisodeStreams: View {
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
+    var episodes: [CoreVideo] = []
     @EnvironmentObject private var core: CoreBridge
 
     var body: some View {
@@ -237,7 +238,8 @@ struct CoreEpisodeStreams: View {
             CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
                            meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                                               name: meta.name, poster: meta.poster,
-                                              season: video.season, episode: video.episode))
+                                              season: video.season, episode: video.episode),
+                           episodes: episodes)
                 .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xl)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
@@ -250,6 +252,7 @@ struct CoreEpisodeStreams: View {
 struct CoreStreamList: View {
     let title: String
     var meta: PlaybackMeta? = nil
+    var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
     @EnvironmentObject private var core: CoreBridge
     @State private var sourceFilter: String? = nil
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
@@ -321,7 +324,7 @@ struct CoreStreamList: View {
         guard let url = stream.playableURL else { return }
         core.loadEnginePlayer(for: stream)
         prepareTorrent(stream)
-        presenter.request = PlaybackRequest(url: url, title: title, meta: meta)
+        presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

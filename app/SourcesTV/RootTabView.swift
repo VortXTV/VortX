@@ -6,7 +6,7 @@ struct PlaybackRequest: Identifiable {
     let url: URL
     let title: String
     var meta: PlaybackMeta? = nil
-    var episodes: [Video] = []
+    var episodes: [CoreVideo] = []
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.

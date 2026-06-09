@@ -10,7 +10,7 @@ struct TVPlayerView: View {
     let url: URL
     let title: String
     var meta: PlaybackMeta? = nil          // when set, resume + record watch progress to the library
-    var episodes: [Video] = []             // series' ordered episodes (empty for movies) → Next/Prev/list
+    var episodes: [CoreVideo] = []             // series' ordered episodes (empty for movies) → Next/Prev/list
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     @EnvironmentObject private var account: StremioAccount
@@ -636,8 +636,9 @@ struct TVPlayerView: View {
         if hasNextEpisode { playNext() } else { saveProgress(at: currentTime); onClose() }
     }
 
-    /// Switch to another episode in place: flush progress, resolve a stream, then reload mpv.
-    private func play(episode v: Video) {
+    /// Switch to another episode in place: flush progress, resolve a stream through the ENGINE (same path
+    /// as launch), then reload mpv. Engine-consistent, replacing the retired hand-rolled AddonClient.
+    private func play(episode v: CoreVideo) {
         guard let m = curMeta else { return }
         saveProgress(at: currentTime)
         withAnimation { showOptions = false }
@@ -649,19 +650,39 @@ struct TVPlayerView: View {
         curTitle = "\(m.name) · S\(v.season ?? 0)E\(v.episodeNumber) · \(v.episodeTitle)"
         showInfo = true; selected = .play; flashControls()
         Task {
-            var client = AddonClient(); client.streamSources = account.streamSources
-            let streams = await client.streams(type: "series", videoId: v.id)
-            guard let s = streams.first(where: { $0.isPlayable }), let u = StremioServer.resolveURL(for: s) else {
-                loadErrorMsg = "No playable source found for this episode."
-                withAnimation { loadFailed = true }
-                return
+            core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+            // Wait for THIS episode's streams, matched by id so we never grab the previous episode's
+            // still-loaded ones during the brief window before the new ones arrive.
+            for _ in 0..<80 {                                          // ~8s
+                if let s = core.playableStream(forStreamId: v.id), let u = s.playableURL {
+                    core.loadEnginePlayer(for: s)
+                    prepareTorrent(s)                                  // no-op for direct / debrid URLs
+                    curURL = u
+                    resumeSeconds = await account.resumeOffset(for: newMeta)
+                    coordinator.player?.loadFile(u)
+                    startLoadTimeout()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(100))
             }
-            StremioServer.prepare(s)                       // torrents: create on the local server
-            curURL = u
-            resumeSeconds = await account.resumeOffset(for: newMeta)
-            coordinator.player?.loadFile(u)
-            startLoadTimeout()
+            loadErrorMsg = "No playable source found for this episode."
+            withAnimation { loadFailed = true }
         }
+    }
+
+    /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.
+    private func prepareTorrent(_ stream: CoreStream) {
+        guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
+              let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
+        var sources = stream.sources ?? []
+        sources.append("dht:\(hash)")
+        let body: [String: Any] = ["torrent": ["infoHash": hash],
+                                   "peerSearch": ["sources": sources, "min": 40, "max": 150]]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var request = URLRequest(url: url); request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+        URLSession.shared.dataTask(with: request).resume()
     }
 
     // MARK: - Playback helpers
