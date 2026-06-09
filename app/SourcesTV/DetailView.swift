@@ -235,15 +235,73 @@ struct CoreEpisodeStreams: View {
 
     var body: some View {
         ScrollView {
-            CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
-                           meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
-                                              name: meta.name, poster: meta.poster,
-                                              season: video.season, episode: video.episode),
-                           episodes: episodes)
-                .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xl)
+            VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                header
+                CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
+                               meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                                  name: meta.name, poster: meta.poster,
+                                                  season: video.season, episode: video.episode),
+                               episodes: episodes)
+                    .padding(.horizontal, Theme.Space.screenEdge)
+            }
+            .padding(.bottom, Theme.Space.xl)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .ignoresSafeArea(edges: .top)            // let the still bleed to the top edge, like the movie hero
         .onAppear { core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id) }
+    }
+
+    /// Cinematic episode header that mirrors the movie hero: the episode still bleeding to the top edge
+    /// with a canvas-blended gradient, then show name / episode title / S·E · air date / overview on the
+    /// lower band. Gives the episode's stream screen the same context and polish as a movie detail page.
+    private var header: some View {
+        ZStack(alignment: .bottomLeading) {
+            AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
+                switch phase {
+                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+                default: Theme.Palette.surface1
+                }
+            }
+            .frame(height: 440)
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .overlay(LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
+                                    startPoint: .top, endPoint: .bottom))
+            .overlay(LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
+                                    startPoint: .leading, endPoint: .center))
+
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Text(meta.name.uppercased())
+                    .font(Theme.Typography.eyebrow).tracking(1.5)
+                    .foregroundStyle(Theme.Palette.accent)
+                Text(episodeTitle)
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(2).minimumScaleFactor(0.7)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                HStack(spacing: Theme.Space.md) {
+                    Text("S\(season) · E\(video.episode ?? 0)")
+                    if let released = video.released, released.count >= 10 { Text(String(released.prefix(10))) }
+                }
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                if let overview = video.overview, !overview.isEmpty {
+                    Text(overview)
+                        .font(Theme.Typography.body)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .lineLimit(3).lineSpacing(2)
+                        .frame(maxWidth: 1000, alignment: .leading)
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.bottom, Theme.Space.lg)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var episodeTitle: String {
+        let t = video.title ?? ""
+        return t.isEmpty ? "Episode \(video.episode ?? 0)" : t
     }
 }
 
@@ -318,6 +376,10 @@ struct CoreStreamList: View {
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             }
         }
+        // Greedy width so the column never shrinks to its widest child. Without this, the Watch-Now state
+        // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
+        // enclosing ScrollView centered it — the "black bar with two buttons in the middle" bug.
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.
