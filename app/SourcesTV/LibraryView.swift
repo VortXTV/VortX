@@ -12,8 +12,9 @@ struct LibraryView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                // detailsTop clears the page title plus two filter rows.
-                BrowseHeroBackdrop(model: focusModel, detailsTop: 340)
+                // The living backdrop: art owns the screen, details pinned above the strip. The
+                // title, filters, and grid all live in the bottom strip and tuck under the hero.
+                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
@@ -22,7 +23,6 @@ struct LibraryView: View {
                             if library.catalog.isEmpty {
                                 hint("Your library is empty. Add titles to your library in Stremio and they will show up here.")
                             } else {
-                                Color.clear.frame(height: 380)
                                 grid(library.catalog)
                             }
                         } else if account.isSignedIn {
@@ -32,8 +32,10 @@ struct LibraryView: View {
                             CoreEmptyState.signedOut
                         }
                     }
-                    .padding(.vertical, Theme.Space.xl)
+                    .padding(.top, Theme.Space.sm)
+                    .padding(.bottom, Theme.Space.xl)
                 }
+                .heroBottomStrip()
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
@@ -72,10 +74,10 @@ struct LibraryView: View {
 
     private func grid(_ items: [CoreCWItem]) -> some View {
         LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
-            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+            ForEach(items) { item in
                 PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
                            progress: item.progress > 0 ? item.progress : nil, menu: .library,
-                           onFocus: { focusModel.focus(item.focusedHero, showsDetails: index < 6) })
+                           onFocus: { focusModel.focus(item.focusedHero) })
             }
         }
         .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.sm)
