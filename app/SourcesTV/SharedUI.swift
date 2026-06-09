@@ -62,13 +62,14 @@ struct PosterArt: View {
     }
 }
 
+/// Which long-press (context) menu a `PosterCard` shows. `.continueWatching` offers a dismiss; `.catalog`
+/// offers add-to-library plus mark watched / unwatched; `.library` swaps add for remove-from-library;
+/// `.none` attaches no menu at all.
+enum PosterMenu { case none, continueWatching, catalog, library }
+
 /// The focusable poster + title used in every rail and grid. Navigates to the detail page; crafted
 /// focus (scale + ember glow + lift) comes from `CardFocusStyle`. Optional progress stripe for
 /// in-progress titles.
-/// Which long-press (context) menu a `PosterCard` shows. `.continueWatching` offers a dismiss; `.catalog`
-/// offers add-to-library plus mark watched / unwatched; `.none` attaches no menu at all.
-enum PosterMenu { case none, continueWatching, catalog }
-
 struct PosterCard: View {
     let title: String
     let poster: String?
@@ -116,7 +117,7 @@ struct PosterCard: View {
             EmptyView()
         case .continueWatching:
             Button(role: .destructive) {
-                CoreBridge.shared.dismissFromContinueWatching(id: id)
+                CoreBridge.shared.removeFromLibrary(id: id)
             } label: {
                 Label("Remove from Continue Watching", systemImage: "minus.circle")
             }
@@ -135,6 +136,22 @@ struct PosterCard: View {
                 CoreBridge.shared.setCatalogWatched(metaId: id, false)
             } label: {
                 Label("Mark as Unwatched", systemImage: "circle")
+            }
+        case .library:
+            Button {
+                CoreBridge.shared.setLibraryItemWatched(id: id, true)
+            } label: {
+                Label("Mark as Watched", systemImage: "checkmark.circle")
+            }
+            Button {
+                CoreBridge.shared.setLibraryItemWatched(id: id, false)
+            } label: {
+                Label("Mark as Unwatched", systemImage: "circle")
+            }
+            Button(role: .destructive) {
+                CoreBridge.shared.removeFromLibrary(id: id)
+            } label: {
+                Label("Remove from Library", systemImage: "trash")
             }
         }
     }

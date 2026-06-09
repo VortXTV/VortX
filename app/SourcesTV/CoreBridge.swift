@@ -321,11 +321,19 @@ final class CoreBridge: ObservableObject {
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)
 
-    /// Remove a title from Continue Watching. Stremio auto-adds an item to the library when you start
-    /// playing it, so the CW "dismiss" is a full library removal (the engine sets `removed`), matching the
-    /// reference apps. The engine re-emits `continue_watching_preview`, so the rail updates on its own.
-    func dismissFromContinueWatching(id: String) {
+    /// Remove a title from the library entirely (the engine sets `removed = true`). Used by both the
+    /// Continue Watching "dismiss" (Stremio auto-adds to the library on play, so dismissing is a library
+    /// removal, matching the reference apps) and the Library tab's "Remove from Library". The engine
+    /// re-emits `continue_watching_preview` + `library`, so both rails update on their own.
+    func removeFromLibrary(id: String) {
         dispatchCtx(["action": "RemoveFromLibrary", "args": id])
+    }
+
+    /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
+    /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
+    /// entries rather than full catalog previews. A no-op if the id isn't in the library.
+    func setLibraryItemWatched(id: String, _ isWatched: Bool) {
+        dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
     }
 
     /// Drop a finished title (a movie, or the last episode of a series) out of Continue Watching by
