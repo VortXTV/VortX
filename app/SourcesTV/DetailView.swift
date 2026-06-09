@@ -256,25 +256,61 @@ struct CoreStreamList: View {
 
     var body: some View {
         let groups = core.streamGroups()
-        let total = groups.reduce(0) { $0 + $1.streams.count }
+        let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
+        let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
         return VStack(alignment: .leading, spacing: Theme.Space.md) {
-            if total > 0 {
-                Text("\(visible.reduce(0) { $0 + $1.streams.count }) of \(total) source\(total == 1 ? "" : "s")")
+            // Header: live add-on progress while streams arrive, settled source count once done.
+            if loadingAddons && addons.total > 0 {
+                HStack(spacing: Theme.Space.sm) {
+                    ProgressView().tint(Theme.Palette.accent)
+                    Text("Loaded \(addons.loaded)/\(addons.total) add-ons")
+                        .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    if streamCount > 0 {
+                        Text("·  \(streamCount) source\(streamCount == 1 ? "" : "s") so far")
+                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                }
+                .padding(.vertical, Theme.Space.xs)
+            } else if streamCount > 0 {
+                Text("\(visible.reduce(0) { $0 + $1.streams.count }) of \(streamCount) source\(streamCount == 1 ? "" : "s")")
                     .eyebrowStyle()
-                if groups.count > 1 { filterBar(groups, total: total) }
+            }
+
+            if streamCount > 0 {
+                if groups.count > 1 { filterBar(groups, total: streamCount) }
                 VStack(spacing: Theme.Space.sm) {
                     ForEach(visible) { group in
                         ForEach(group.streams) { stream in streamRow(group.addon, stream) }
                     }
                 }
-            } else {
+            } else if loadingAddons {
+                // Focusable so focus stays in this pushed view instead of escaping to the tab bar while
+                // streams load: the tvOS focus engine needs a target, and with none it jumps to the top
+                // nav. (Same anchor pattern DetailView uses for its meta spinner.)
                 HStack(spacing: Theme.Space.sm) {
                     ProgressView().tint(Theme.Palette.accent)
-                    Text("Finding streams…").font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    Text(addons.total > 0 ? "Finding streams…  (\(addons.loaded)/\(addons.total) add-ons)" : "Finding streams…")
+                        .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                 }
                 .padding(.vertical, Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .focusable()
+            } else {
+                // Every add-on finished with nothing playable. Focusable so Back still pops the view.
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    Text("No sources found")
+                        .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    Text("None of your \(addons.total) add-on\(addons.total == 1 ? "" : "s") returned a playable source for this title.")
+                        .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .padding(.vertical, Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .focusable()
             }
         }
     }

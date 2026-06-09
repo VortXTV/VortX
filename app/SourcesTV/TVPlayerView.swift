@@ -50,9 +50,18 @@ struct TVPlayerView: View {
     @State private var curMeta: PlaybackMeta?
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, back, play, fwd, audio, subs, aspect, prev, next, episodes }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, prev, next, episodes }
     private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, episodes }
     @State private var selected: Control = .play
+    @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
+    // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
+    // presses); the seek commits ~0.6s after the last move, or on Select. One mpv seek per gesture, so
+    // holding to travel far doesn't thrash the decoder.
+    @State private var scrubbing = false
+    @State private var scrubTarget = 0.0
+    @State private var scrubStep = 10.0
+    @State private var lastScrubAt = 0.0
+    @State private var scrubCommit: Task<Void, Never>?
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
@@ -175,21 +184,25 @@ struct TVPlayerView: View {
             }
             return
         }
-        // Control bar is shown: navigate it.
+        // Control bar is shown: 2D navigation. Up/down moves between rows (close ↔ scrubber ↔ buttons);
+        // left/right seeks on the scrubber or moves within the button row.
         switch type {
-        case .menu: saveProgress(at: currentTime); onClose()
+        case .menu:
+            if scrubbing { cancelScrub() } else { saveProgress(at: currentTime); onClose() }
         case .playPause: toggle()
         case .select: activate(selected)
-        case .leftArrow: moveSelected(-1)
-        case .rightArrow: moveSelected(1)
-        case .upArrow, .downArrow: flashControls()        // keep the bar up
+        case .leftArrow: horizontal(-1)
+        case .rightArrow: horizontal(1)
+        case .upArrow: vertical(-1)
+        case .downArrow: vertical(1)
         default: break
         }
     }
 
-    /// Controls in remote left/right order (close is leftmost, then transport, then audio/subs/episodes).
-    private var visibleControls: [Control] {
-        var c: [Control] = [.close, .back]
+    /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
+    /// bar) are separate rows above this one; up/down moves between the three.
+    private var buttonRow: [Control] {
+        var c: [Control] = [.restart, .back]
         if episodes.count > 1 && hasPrevEpisode { c.append(.prev) }
         c.append(.play)
         if episodes.count > 1 && hasNextEpisode { c.append(.next) }
@@ -201,21 +214,46 @@ struct TVPlayerView: View {
         return c
     }
 
-    private func moveSelected(_ d: Int) {
-        let v = visibleControls
-        let i = v.firstIndex(of: selected) ?? 0
-        selected = v[max(0, min(v.count - 1, i + d))]
+    /// Left/right: seek when on the scrubber, otherwise move within the button row. `.close` is alone.
+    private func horizontal(_ d: Int) {
+        switch selected {
+        case .scrub: scrubBy(d)
+        case .close: flashControls()
+        default:
+            let row = buttonRow
+            let i = row.firstIndex(of: selected) ?? 0
+            selected = row[max(0, min(row.count - 1, i + d))]
+            lastButton = selected
+            flashControls()
+        }
+    }
+
+    /// Up/down moves between the three rows: close (top) ↔ scrubber ↔ buttons (bottom). A direction
+    /// press while scrubbing commits the pending seek first. This makes "Down from the Back button drops
+    /// into the controls" work, replacing the old flat left/right-only list.
+    private func vertical(_ d: Int) {
+        commitScrubIfNeeded()
+        switch selected {
+        case .close:
+            if d > 0 { selected = .scrub }
+        case .scrub:
+            selected = d < 0 ? .close : lastButton
+        default:                                   // a button-row control
+            if d < 0 { selected = .scrub }
+        }
         flashControls()
     }
 
     private func activate(_ c: Control) {
         switch c {
-        case .close: saveProgress(at: currentTime); onClose()
-        case .back:  seek(-10)
-        case .fwd:   seek(10)
-        case .play:  toggle()
-        case .prev:  playPrevious()
-        case .next:  playNext()
+        case .close:   saveProgress(at: currentTime); onClose()
+        case .scrub:   scrubbing ? commitScrub() : toggle()
+        case .restart: restart()
+        case .back:    seek(-10)
+        case .fwd:     seek(10)
+        case .play:    toggle()
+        case .prev:    playPrevious()
+        case .next:    playNext()
         case .audio:    openPanel(.audio)
         case .subs:     openPanel(.subtitles)
         case .aspect:   openPanel(.aspect)
@@ -278,14 +316,15 @@ struct TVPlayerView: View {
 
             VStack(spacing: Theme.Space.lg) {
                 HStack(spacing: Theme.Space.md) {
-                    Text(timeString(currentTime)).font(.callout.monospacedDigit())
-                        .foregroundStyle(Theme.Palette.textPrimary)
+                    Text(timeString(scrubbing ? scrubTarget : currentTime)).font(.callout.monospacedDigit())
+                        .foregroundStyle(scrubbing ? Theme.Palette.accent : Theme.Palette.textPrimary)
                     scrubber
                     Text(timeString(duration)).font(.callout.monospacedDigit())
                         .foregroundStyle(Theme.Palette.textSecondary)
                 }
                 ZStack {
                     HStack(spacing: Theme.Space.md) {
+                        ctrlButton(.restart, "arrow.counterclockwise")
                         ctrlButton(.back, "gobackward.10")
                         if episodes.count > 1 && hasPrevEpisode { ctrlButton(.prev, "backward.end.fill") }
                         ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true)
@@ -307,21 +346,30 @@ struct TVPlayerView: View {
         .transition(.opacity)
     }
 
-    /// Slim ember seek bar with a knob. Position display; seeking is via the ±10 controls.
+    /// Seekable ember bar with a knob. When the scrubber row is focused it thickens; while scrubbing it
+    /// shows the preview playhead (the not-yet-committed target). Left/right move the preview and the seek
+    /// commits shortly after the last move (see scrubBy / commitScrub), so it works like a YouTube scrubber.
     private var scrubber: some View {
-        GeometryReader { geo in
-            let frac = duration > 0 ? min(1, max(0, currentTime / duration)) : 0
+        let focused = (selected == .scrub)
+        let shown = scrubbing ? scrubTarget : currentTime
+        return GeometryReader { geo in
+            let frac = duration > 0 ? min(1, max(0, shown / duration)) : 0
             let w = geo.size.width
+            let barH: CGFloat = focused ? 10 : 6
+            let knob: CGFloat = focused ? 28 : 18
             ZStack(alignment: .leading) {
-                Capsule().fill(Theme.Palette.textPrimary.opacity(0.22)).frame(height: 6)
-                Capsule().fill(Theme.Palette.accent).frame(width: max(0, w * frac), height: 6)
-                Circle().fill(Theme.Palette.accent).frame(width: 18, height: 18)
-                    .shadow(color: Theme.Palette.accent.opacity(0.6), radius: 6)
-                    .offset(x: max(0, w * frac - 9))
+                Capsule().fill(Theme.Palette.textPrimary.opacity(0.22)).frame(height: barH)
+                Capsule().fill(Theme.Palette.accent).frame(width: max(0, w * frac), height: barH)
+                Circle().fill(Theme.Palette.accent).frame(width: knob, height: knob)
+                    .overlay(Circle().stroke(Theme.Palette.canvas, lineWidth: focused ? 3 : 0))
+                    .shadow(color: Theme.Palette.accent.opacity(0.6), radius: focused ? 10 : 6)
+                    .offset(x: max(0, w * frac - knob / 2))
             }
             .frame(maxHeight: .infinity, alignment: .center)
+            .animation(.easeOut(duration: 0.15), value: focused)
+            .animation(.easeOut(duration: 0.12), value: frac)
         }
-        .frame(height: 18)
+        .frame(height: 28)
     }
 
     /// Circular control, highlighted (ember fill + lift) when it is the selected control. Visual only;
@@ -646,6 +694,56 @@ struct TVPlayerView: View {
         flashControls()
     }
 
+    /// Jump back to the very start and keep playing.
+    private func restart() {
+        commitScrubIfNeeded()
+        coordinator.player?.seek(to: 0)
+        currentTime = 0; lastSaved = 0
+        flashControls()
+    }
+
+    // MARK: - Scrub-to-seek (the scrubber row)
+
+    /// Move the preview playhead one step in `dir`. The step grows on rapid or held presses (10s up to
+    /// 120s) so you cross a long film in a few presses or a single hold, instead of tapping ±10 a hundred
+    /// times. Nothing is actually sought until commit.
+    private func scrubBy(_ dir: Int) {
+        guard duration > 0 else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        if !scrubbing {
+            scrubbing = true; scrubTarget = currentTime; scrubStep = 10
+        } else if now - lastScrubAt < 0.4 {
+            scrubStep = min(scrubStep * 1.6, 120)        // accelerate while moving fast / holding
+        } else {
+            scrubStep = 10                               // paused between presses → back to fine steps
+        }
+        lastScrubAt = now
+        scrubTarget = min(duration, max(0, scrubTarget + Double(dir) * scrubStep))
+        flashControls()
+        scheduleScrubCommit()
+    }
+
+    /// Commit the seek a beat after the last scrub move, so a hold is one seek at the end, not hundreds.
+    private func scheduleScrubCommit() {
+        scrubCommit?.cancel()
+        scrubCommit = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled, scrubbing else { return }
+            commitScrub()
+        }
+    }
+    private func commitScrub() {
+        scrubCommit?.cancel()
+        guard scrubbing else { return }
+        scrubbing = false
+        coordinator.player?.seek(to: scrubTarget)
+        currentTime = scrubTarget; lastSaved = scrubTarget
+        flashControls()
+    }
+    private func commitScrubIfNeeded() { if scrubbing { commitScrub() } }
+    /// Discard the in-progress scrub preview and keep playing where we are (Menu while scrubbing).
+    private func cancelScrub() { scrubCommit?.cancel(); scrubbing = false; flashControls() }
+
     /// Reveal the bar from a hidden state, selecting Play, and restart the auto-hide timer.
     private func showControls() {
         withAnimation { showInfo = true }
@@ -739,17 +837,49 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             if g.state == .began { onSwipe?() }
         }
 
+        // Hold an arrow → repeat the press, so you can hold to seek (the scrubber) or scroll a long list.
+        // tvOS skips its own key-repeat because we own focus, so we synthesize it: fire once on press,
+        // then repeat after a short hold delay until release. A hard cap guards a missed pressesEnded.
+        private var repeatTimer: Timer?
+        private var repeatType: UIPress.PressType?
+        private var repeatCount = 0
+
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             var handled = false
             for press in presses {
                 switch press.type {
-                case .select, .menu, .playPause, .upArrow, .downArrow, .leftArrow, .rightArrow:
+                case .select, .menu, .playPause:
                     onPress?(press.type); handled = true
+                case .upArrow, .downArrow, .leftArrow, .rightArrow:
+                    onPress?(press.type); handled = true
+                    startRepeat(press.type)
                 default: break
                 }
             }
             if !handled { super.pressesBegan(presses, with: event) }
         }
+
+        override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            stopRepeat(); super.pressesEnded(presses, with: event)
+        }
+        override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+            stopRepeat(); super.pressesCancelled(presses, with: event)
+        }
+
+        private func startRepeat(_ type: UIPress.PressType) {
+            stopRepeat()
+            repeatType = type; repeatCount = 0
+            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] t in
+                guard let self, let type = self.repeatType else { t.invalidate(); return }
+                self.repeatCount += 1
+                if self.repeatCount > 120 { self.stopRepeat(); return }   // ~14s safety cap
+                self.onPress?(type)
+            }
+            timer.fireDate = Date().addingTimeInterval(0.45)              // hold delay before repeats kick in
+            RunLoop.main.add(timer, forMode: .common)
+            repeatTimer = timer
+        }
+        private func stopRepeat() { repeatTimer?.invalidate(); repeatTimer = nil; repeatType = nil }
 
         override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
             super.didUpdateFocus(in: context, with: coordinator)

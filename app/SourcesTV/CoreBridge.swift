@@ -240,6 +240,22 @@ final class CoreBridge: ObservableObject {
         return groups
     }
 
+    /// Stream-addon load progress: `total` = add-ons queried for this title's streams, `loaded` = those
+    /// that have finished (returned streams or errored). The engine creates one loadable per stream
+    /// add-on up front (all `.loading`), so `total` is stable and the UI can show "Loaded X/Y add-ons"
+    /// to tell users whether to keep waiting or whether loading has stalled.
+    func streamLoadProgress() -> (loaded: Int, total: Int) {
+        guard let details = metaDetails else { return (0, 0) }
+        var loaded = 0
+        for group in details.streams {
+            switch group.content {
+            case .some(.ready), .some(.err): loaded += 1
+            default: break   // .loading or nil → not done yet
+            }
+        }
+        return (loaded, details.streams.count)
+    }
+
     private func addonNamesByBase() -> [String: String] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [:] }
         var map: [String: String] = [:]
