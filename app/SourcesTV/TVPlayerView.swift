@@ -56,8 +56,8 @@ struct TVPlayerView: View {
     @State private var curMeta: PlaybackMeta?
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, prev, next, episodes }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, episodes }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, prev, next, episodes, sources }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, episodes, sources }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -275,6 +275,7 @@ struct TVPlayerView: View {
         case .subs:     openPanel(.subtitles)
         case .aspect:   openPanel(.aspect)
         case .episodes: openPanel(.episodes)
+        case .sources:  openPanel(.sources)
         }
     }
 
@@ -352,6 +353,7 @@ struct TVPlayerView: View {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
                         ctrlButton(.aspect, "aspectratio")
+                        if hasAlternateSources { ctrlButton(.sources, "rectangle.stack") }
                         if episodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
@@ -462,6 +464,8 @@ struct TVPlayerView: View {
                     play(episode: ep)
                 }
             }
+        case .sources:
+            return sourceRows()
         }
     }
 
@@ -491,6 +495,61 @@ struct TVPlayerView: View {
         return Locale.current.localizedString(forLanguageCode: c)?.capitalized ?? code.uppercased()
     }
 
+    // MARK: - Source switching (swap to another loaded source without leaving the player)
+
+    /// True when more than one playable source is loaded for the current title / episode.
+    private var hasAlternateSources: Bool {
+        core.streamGroups().reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
+    }
+
+    /// Up to `maxInPlayerSources` loaded sources, grouped by add-on in their existing priority order, so
+    /// switching is quick. The full (sometimes thousands-long) source list stays on the detail page;
+    /// capping here keeps the panel light, since the options panel renders its rows eagerly.
+    private func sourceRows() -> [OptionRow] {
+        let maxInPlayerSources = 40
+        var rows: [OptionRow] = []
+        var count = 0
+        for group in core.streamGroups() {
+            let playable = group.streams.filter { $0.playableURL != nil }
+            guard !playable.isEmpty, count < maxInPlayerSources else { continue }
+            rows.append(OptionRow(label: group.addon, isHeader: true))
+            for stream in playable {
+                guard count < maxInPlayerSources else { break }
+                count += 1
+                rows.append(OptionRow(label: sourceLabel(stream), isSelected: stream.playableURL == curURL) {
+                    switchStream(to: stream)
+                })
+            }
+        }
+        return rows
+    }
+
+    /// A concise one-line label for a source: the first line of its name, else its description.
+    private func sourceLabel(_ s: CoreStream) -> String {
+        func firstLine(_ t: String?) -> String {
+            (t ?? "").split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        }
+        let name = firstLine(s.name)
+        if !name.isEmpty { return name }
+        let desc = firstLine(s.description)
+        return desc.isEmpty ? "Source" : desc
+    }
+
+    /// Switch the playing source in place: reload the picked stream's URL and resume at the current
+    /// position (via `resumeSeconds`), so a buffering or low-quality source can be swapped without
+    /// leaving the player. Resets the auto-recovery budget for the fresh source.
+    private func switchStream(to stream: CoreStream) {
+        guard let newURL = stream.playableURL, newURL != curURL else { closePanel(); return }
+        closePanel()
+        curURL = newURL
+        resumeSeconds = currentTime
+        appliedResume = false
+        buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; loadErrorMsg = ""
+        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
+        coordinator.player?.loadFile(newURL)
+        startLoadTimeout()
+    }
+
     /// Nudge subtitle sync by `delta` seconds (rounded to 0.1); keeps the panel open to repeat.
     private func adjustSubDelay(_ delta: Double) {
         subDelay = ((subDelay + delta) * 10).rounded() / 10
@@ -512,6 +571,7 @@ struct TVPlayerView: View {
         case .subtitleSettings: return "Subtitle Settings"
         case .aspect:           return "Aspect Ratio"
         case .episodes:         return "Episodes"
+        case .sources:          return "Sources"
         }
     }
 
