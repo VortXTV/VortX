@@ -8,30 +8,19 @@ struct DetailView: View {
     let id: String
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                if let meta = core.metaDetails?.meta {
-                    VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                        hero(meta) { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } }
-                        Group {
-                            if type == "series", let videos = meta.videos, !videos.isEmpty {
-                                CoreSeasonedEpisodes(meta: meta, videos: videos,
-                                                     watched: core.metaDetails?.watchedIds ?? [])
-                            } else {
-                                CoreStreamList(title: meta.name,
-                                               meta: PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: type,
-                                                                  name: meta.name, poster: meta.poster,
-                                                                  season: nil, episode: nil))
-                                    .padding(.horizontal, Theme.Space.screenEdge)
-                            }
-                        }
-                        .id("detailContent")
-                    }
-                    .padding(.bottom, Theme.Space.xl)
+        Group {
+            if let meta = core.metaDetails?.meta {
+                if type == "series", let videos = meta.videos, !videos.isEmpty {
+                    seriesPage(meta, videos: videos)
                 } else {
-                    // Focusable so Back pops this view instead of exiting the app while it loads.
+                    moviePage(meta)
+                }
+            } else {
+                // Focusable so Back pops this view instead of exiting the app while it loads.
+                ScrollView {
                     ProgressView().controlSize(.large).tint(Theme.Palette.accent).padding(120).focusable()
                 }
             }
@@ -39,6 +28,56 @@ struct DetailView: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .ignoresSafeArea(edges: .top)            // let the backdrop bleed to the top edge
         .onAppear { core.loadMeta(type: type, id: id) }
+    }
+
+    /// Series keep the hero + episode-list layout (the page below the hero is full of content).
+    private func seriesPage(_ meta: CoreMetaItem, videos: [CoreVideo]) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                    hero(meta) { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } }
+                    CoreSeasonedEpisodes(meta: meta, videos: videos,
+                                         watched: core.metaDetails?.watchedIds ?? [])
+                        .id("detailContent")
+                }
+                .padding(.bottom, Theme.Space.xl)
+            }
+        }
+    }
+
+    /// Movies get the full-bleed cinematic page: the backdrop fills the whole viewport (no dead black
+    /// band under the buttons), the title block sits on the lower band, and the source list scrolls
+    /// over the scrimmed artwork.
+    private func moviePage(_ m: CoreMetaItem) -> some View {
+        ZStack {
+            FullBleedBackdrop(url: m.background ?? m.poster)
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    Spacer().frame(height: 380)
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        Text(m.name)
+                            .font(Theme.Typography.hero).tracking(-1.5)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .lineLimit(2).minimumScaleFactor(0.6)
+                            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                        metaRow(m)
+                        if let d = m.description, !d.isEmpty {
+                            Text(d)
+                                .font(Theme.Typography.body)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(4).lineSpacing(2)
+                                .frame(maxWidth: 1000, alignment: .leading)
+                        }
+                    }
+                    CoreStreamList(title: m.name,
+                                   meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
+                                                      name: m.name, poster: m.poster,
+                                                      season: nil, episode: nil))
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.bottom, Theme.Space.xl)
+            }
+        }
     }
 
     /// Full-bleed backdrop with a canvas-blended gradient and the title / metadata / synopsis on the
@@ -113,6 +152,7 @@ struct CoreSeasonedEpisodes: View {
     let videos: [CoreVideo]
     var watched: Set<String> = []
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
 
     @State private var season: Int = 1
 
@@ -232,76 +272,100 @@ struct CoreEpisodeStreams: View {
     let season: Int
     var episodes: [CoreVideo] = []
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                header
-                CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
-                               meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
-                                                  name: meta.name, poster: meta.poster,
-                                                  season: video.season, episode: video.episode),
-                               episodes: episodes)
-                    .padding(.horizontal, Theme.Space.screenEdge)
+        ZStack {
+            FullBleedBackdrop(url: video.thumbnail ?? meta.background ?? meta.poster)
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    Spacer().frame(height: 400)   // let the episode still own the top of the screen
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        Text(meta.name.uppercased())
+                            .font(Theme.Typography.eyebrow).tracking(1.5)
+                            .foregroundStyle(Theme.Palette.accent)
+                        Text(episodeTitle)
+                            .font(Theme.Typography.screenTitle)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .lineLimit(2).minimumScaleFactor(0.7)
+                            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                        episodeMetaRow
+                        if let overview = video.overview, !overview.isEmpty {
+                            Text(overview)
+                                .font(Theme.Typography.body)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(4).lineSpacing(2)
+                                .frame(maxWidth: 1000, alignment: .leading)
+                        }
+                    }
+                    CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
+                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                                      name: meta.name, poster: meta.poster,
+                                                      season: video.season, episode: video.episode),
+                                   episodes: episodes)
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.bottom, Theme.Space.xl)
             }
-            .padding(.bottom, Theme.Space.xl)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .ignoresSafeArea(edges: .top)            // let the still bleed to the top edge, like the movie hero
         .onAppear { core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id) }
     }
 
-    /// Cinematic episode header that mirrors the movie hero: the episode still bleeding to the top edge
-    /// with a canvas-blended gradient, then show name / episode title / S·E · air date / overview on the
-    /// lower band. Gives the episode's stream screen the same context and polish as a movie detail page.
-    private var header: some View {
-        ZStack(alignment: .bottomLeading) {
-            AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
-                switch phase {
-                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-                default: Theme.Palette.surface1
+    /// Season/episode, air date, then the show-level facts (runtime, rating, genres) for context.
+    private var episodeMetaRow: some View {
+        HStack(spacing: Theme.Space.md) {
+            Text("S\(season) · E\(video.episode ?? 0)")
+            if let released = video.released, released.count >= 10 { Text(String(released.prefix(10))) }
+            if let rt = meta.runtime { Text(rt) }
+            if let imdb = meta.imdbRating {
+                HStack(spacing: 6) {
+                    Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
+                    Text(imdb)
                 }
             }
-            .frame(height: 440)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            .overlay(LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
-                                    startPoint: .top, endPoint: .bottom))
-            .overlay(LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
-                                    startPoint: .leading, endPoint: .center))
-
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                Text(meta.name.uppercased())
-                    .font(Theme.Typography.eyebrow).tracking(1.5)
-                    .foregroundStyle(Theme.Palette.accent)
-                Text(episodeTitle)
-                    .font(Theme.Typography.screenTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(2).minimumScaleFactor(0.7)
-                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
-                HStack(spacing: Theme.Space.md) {
-                    Text("S\(season) · E\(video.episode ?? 0)")
-                    if let released = video.released, released.count >= 10 { Text(String(released.prefix(10))) }
-                }
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                if let overview = video.overview, !overview.isEmpty {
-                    Text(overview)
-                        .font(Theme.Typography.body)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineLimit(3).lineSpacing(2)
-                        .frame(maxWidth: 1000, alignment: .leading)
-                }
-            }
-            .padding(.horizontal, Theme.Space.screenEdge)
-            .padding(.bottom, Theme.Space.lg)
+            let genres = meta.genres
+            if !genres.isEmpty { Text(genres.prefix(3).joined(separator: " · ")).lineLimit(1) }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .font(Theme.Typography.label)
+        .foregroundStyle(Theme.Palette.textSecondary)
     }
 
     private var episodeTitle: String {
         let t = video.title ?? ""
         return t.isEmpty ? "Episode \(video.episode ?? 0)" : t
+    }
+}
+
+/// Full-screen backdrop for the cinematic pages: the artwork fills the entire viewport (no dead black
+/// band anywhere), with canvas scrims that keep the lower text block and the leading edge readable
+/// while the image stays vivid up top. Content scrolls over it.
+struct FullBleedBackdrop: View {
+    let url: String?
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        Color.clear
+            .overlay {
+                AsyncImage(url: URL(string: url ?? "")) { phase in
+                    switch phase {
+                    case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+                    default: Theme.Palette.surface1
+                    }
+                }
+            }
+            .clipped()
+            .overlay(
+                LinearGradient(stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.42),
+                    .init(color: Theme.Palette.canvas.opacity(0.88), location: 0.72),
+                    .init(color: Theme.Palette.canvas, location: 1.0),
+                ], startPoint: .top, endPoint: .bottom))
+            .overlay(
+                LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
+                               startPoint: .leading, endPoint: .center))
+            .ignoresSafeArea()
     }
 }
 
@@ -312,6 +376,7 @@ struct CoreStreamList: View {
     var meta: PlaybackMeta? = nil
     var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation

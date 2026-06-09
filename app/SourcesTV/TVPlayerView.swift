@@ -49,7 +49,10 @@ struct TVPlayerView: View {
     @State private var autoRetryTask: Task<Void, Never>?
     private let maxAutoRetries = 2                     // transient source hiccups recover; a dead link still falls through fast
     private let autoRetryBackoff = 1.2                 // seconds between auto-retries
-    @State private var skipSegments: [SkipSegment] = []   // intro/outro spans derived from the file's chapters
+    @State private var skipSegments: [SkipSegment] = []   // resolved skip spans (chapters + crowd timestamps)
+    @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
+    @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
+    @State private var skipFetchTask: Task<Void, Never>?
     // Current episode (changes when switching via Next/Prev/Episodes or auto-advance). Seeded from
     // the passed url/title/meta in onAppear so the first load is unchanged.
     @State private var curURL: URL?
@@ -108,7 +111,7 @@ struct TVPlayerView: View {
                     case MPVProperty.videoParamsSigPeak:
                         if let p = data as? Double { isHDR = p > 1.0 }
                     case MPVProperty.duration:
-                        if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments() }
+                        if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps() }
                     case MPVProperty.trackList:
                         refreshTracks()
                         let s = coordinator.player?.mediaSummary()
@@ -162,7 +165,7 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
-            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel()
             saveProgress(at: currentTime)
             core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position to the engine
             UIApplication.shared.isIdleTimerDisabled = false   // let the screensaver resume once the player closes
@@ -358,7 +361,7 @@ struct TVPlayerView: View {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
                         ctrlButton(.aspect, "aspectratio")
-                        if hasAlternateSources { ctrlButton(.sources, "rectangle.stack") }
+                        if hasAlternateSources { ctrlButton(.sources, "rectangle.2.swap") }
                         if episodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
@@ -747,9 +750,32 @@ struct TVPlayerView: View {
         return skipSegments.first { currentTime >= $0.start && currentTime < $0.end }
     }
 
-    /// Recompute intro/outro spans from the current file's named chapters, once its duration is known.
+    /// Re-resolve skip spans from every available layer (named chapters + crowd timestamps), once the
+    /// file's duration is known. The resolver's sanity guards keep any one bad span from mis-skipping.
     private func refreshSkipSegments() {
-        skipSegments = SkipSegments.detect(chapters: coordinator.player?.chapters() ?? [], duration: duration)
+        let chapterCandidates = SkipSegments.chapterCandidates(chapters: coordinator.player?.chapters() ?? [],
+                                                               duration: duration)
+        skipSegments = SegmentResolver.resolve(chapterCandidates + apiSkipCandidates, duration: duration)
+    }
+
+    /// Pull crowd-sourced intro/credits spans for the current title (disk-cached, non-blocking): the
+    /// pill simply appears once the result lands, normally well before the intro is reached.
+    private func fetchSkipTimestamps() {
+        guard let m = curMeta else { plog.info("skip: no curMeta, not fetching"); return }
+        let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
+        if key != skipFetchKey { apiSkipCandidates = [] }   // drop spans from the previous episode
+        skipFetchKey = key
+        let dur = duration
+        plog.info("skip: fetching key=\(key, privacy: .public) dur=\(Int(dur), privacy: .public)")
+        skipFetchTask?.cancel()
+        skipFetchTask = Task { @MainActor in
+            let found = await SkipTimestampService.candidates(imdbId: m.libraryId, season: m.season,
+                                                              episode: m.episode, durationSeconds: dur)
+            guard !Task.isCancelled, skipFetchKey == key else { return }
+            apiSkipCandidates = found
+            refreshSkipSegments()
+            plog.info("skip: \(found.count, privacy: .public) crowd spans, \(skipSegments.count, privacy: .public) resolved segments")
+        }
     }
 
     /// Jump past a skip segment to its end, updating the playhead so the pill clears immediately.
