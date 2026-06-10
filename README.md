@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" width="560" alt="StremioX"></p>
+
 # StremioX
 
 Stremio for iPhone, iPad, and Apple TV. An independent, updated client for Apple devices, with a native Apple TV app built on stremio-core.
