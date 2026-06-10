@@ -218,11 +218,12 @@ struct CoreSeasonedEpisodes: View {
 
     private func episodeRow(_ v: CoreVideo) -> some View {
         let isWatched = watched.contains(v.id)
+        let progress = episodeProgress(v)
         return NavigationLink {
             CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: episodes)
         } label: {
             HStack(alignment: .top, spacing: Theme.Space.md) {
-                thumbnail(v, isWatched: isWatched)
+                thumbnail(v, isWatched: isWatched, progress: progress)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 8) {
                         if isWatched {
@@ -253,7 +254,7 @@ struct CoreSeasonedEpisodes: View {
         }
     }
 
-    private func thumbnail(_ v: CoreVideo, isWatched: Bool) -> some View {
+    private func thumbnail(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
         AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
             switch phase {
             case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
@@ -269,7 +270,19 @@ struct CoreSeasonedEpisodes: View {
                     .font(.title2).foregroundStyle(Theme.Palette.accent).padding(8).shadow(radius: 3)
             }
         }
+        .overlay(alignment: .bottom) {
+            if !isWatched, progress > 0.01 {
+                ProgressStripe(value: progress).padding(Theme.Space.xs)
+            }
+        }
         .opacity(isWatched ? 0.55 : 1)
+    }
+
+    private func episodeProgress(_ v: CoreVideo) -> Double {
+        guard let item = core.metaDetails?.libraryItem,
+              item.state.videoId == v.id,
+              item.state.duration > 0 else { return 0 }
+        return min(max(item.state.timeOffset / item.state.duration, 0), 1)
     }
 
     private func episodeTitle(_ v: CoreVideo) -> String {
