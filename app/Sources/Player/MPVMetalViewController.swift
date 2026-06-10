@@ -16,18 +16,13 @@ final class MPVMetalViewController: UIViewController {
     var onSingleTap: (() -> Void)?
     var hdrAvailable : Bool = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
-    var hdrEnabled = false {
-        didSet {
-            // FIXME: target-colorspace-hint does not support being changed at runtime.
-            // this option should be set as early as possible otherwise can cause issues
-            // not recommended to use this way.
-            if hdrEnabled {
-                checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
-            } else {
-                checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "no"))
-            }
-        }
-    }
+    /// The dynamic range currently applied to the output chain (mpv transfer curve,
+    /// Metal layer colorspace, and on tvOS the display mode). Tracked so the sig-peak
+    /// observer, which fires on every video reconfigure, only reapplies on change.
+    /// NOTE: mpv's own target-colorspace-hint must stay OFF here. It is unsupported
+    /// on the Metal/MoltenVK backend and known to crash it (double free); the app
+    /// does the HDR signalling itself in syncDisplayDynamicRange.
+    private var appliedDynamicRange: ContentDynamicRange = .sdr
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -232,6 +227,12 @@ final class MPVMetalViewController: UIViewController {
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
         NotificationCenter.default.removeObserver(self)
+#if os(tvOS)
+        // Hand the TV back its default display mode; the view can already be
+        // detached here, so HDRDisplayMode falls back to the app's window.
+        HDRDisplayMode.reset(in: viewIfLoaded?.window)
+#endif
+        appliedDynamicRange = .sdr
         guard let handle = mpv else { return }
         mpv_set_wakeup_callback(handle, nil, nil)
         // Tell the core to wind down NOW (mpv_command_string is thread-safe): decode and network
@@ -273,6 +274,50 @@ final class MPVMetalViewController: UIViewController {
     
     func togglePause() {
         getFlag(MPVProperty.pause) ? play() : pause()
+    }
+
+    /// Match the output chain to the playing file's dynamic range: mpv encodes
+    /// PQ or HLG instead of tone-mapping to SDR, the Metal layer gets the matching
+    /// colorspace tag, and on tvOS the TV is asked to switch into HDR mode (which
+    /// is what lights the TV's HDR badge). Runs on the main thread from the
+    /// sig-peak observer, once per video reconfigure.
+    private func syncDisplayDynamicRange(sigPeak: Double) {
+        guard let handle = mpv else { return }
+        let gamma = getString(MPVProperty.videoParamsGamma) ?? ""
+        let range: ContentDynamicRange
+        if gamma == "hlg" {
+            range = .hlg
+        } else if gamma == "pq" || sigPeak > 1.0 {
+            range = .hdr10
+        } else {
+            range = .sdr
+        }
+        guard range != appliedDynamicRange else { return }
+        appliedDynamicRange = range
+
+        switch range {
+        case .hdr10:
+            checkError(mpv_set_property_string(handle, "target-trc", "pq"))
+            checkError(mpv_set_property_string(handle, "target-prim", "bt.2020"))
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        case .hlg:
+            checkError(mpv_set_property_string(handle, "target-trc", "hlg"))
+            checkError(mpv_set_property_string(handle, "target-prim", "bt.2020"))
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
+        case .sdr:
+            checkError(mpv_set_property_string(handle, "target-trc", "auto"))
+            checkError(mpv_set_property_string(handle, "target-prim", "auto"))
+            metalLayer.colorspace = nil
+        }
+        mpvLog.log("output range → \(range.rawValue, privacy: .public) (gamma=\(gamma, privacy: .public) sigPeak=\(sigPeak, privacy: .public))")
+
+#if os(tvOS)
+        HDRDisplayMode.request(range,
+                               fps: getDouble("container-fps"),
+                               width: getInt("video-params/w"),
+                               height: getInt("video-params/h"),
+                               in: view.window)
+#endif
     }
     
     func play() {
@@ -477,6 +522,7 @@ final class MPVMetalViewController: UIViewController {
                                     let maxEDRRange = self.view.window?.screen.potentialEDRHeadroom ?? 1.0
                                     // display screen support HDR and current playing HDR video
                                     self.hdrAvailable = maxEDRRange > 1.0 && sigPeak > 1.0
+                                    self.syncDisplayDynamicRange(sigPeak: sigPeak)
                                     self.playDelegate?.propertyChange(mpv: mpv, propertyName: propertyName, data: sigPeak)
                                 }
                             }

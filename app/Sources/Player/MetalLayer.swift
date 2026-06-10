@@ -15,9 +15,11 @@ class MetalLayer: CAMetalLayer {
         }
     }
     
-    // Hack for fix [target-colorspace-hint] option:
-    // Update wantsExtendedDynamicRangeContent need run in main thread to activate screen EDR mode, other thread can't activate
-    // (EDR/HDR layer control is iOS/macOS-only; not available on tvOS.)
+    // EDR layer control exists on iOS 16+/macOS only; CAMetalLayer has no
+    // wantsExtendedDynamicRangeContent on tvOS at all. tvOS HDR is driven by
+    // HDRDisplayMode (an AVDisplayManager HDMI display-mode switch) plus the
+    // PQ/HLG colorspace tag applied in MPVMetalViewController.
+    // The setter must run on the main thread to activate screen EDR mode.
     #if os(iOS)
     override var wantsExtendedDynamicRangeContent: Bool  {
         get {
