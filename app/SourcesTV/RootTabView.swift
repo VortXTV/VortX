@@ -114,40 +114,21 @@ struct RootTabView: View {
     }
 }
 
-/// An invisible focus landing strip pinned to the very top of each tab page.
+/// An invisible focus REDIRECT strip pinned to the very top of each tab page.
 ///
 /// The tvOS tab bar auto-hides when focus dives into content, and UIKit only summons it back when
 /// focus reaches the TOP EDGE of the screen (or on Menu). Our browse layouts keep every focusable
 /// element in a bottom strip, so after popping back from a detail page there was nothing up top to
 /// trigger the summon: Up from the rails did nothing and the bar looked gone until a Menu press.
-/// Landing focus here satisfies the top-edge rule natively, and the explicit focus request hands
-/// the remote straight to the bar so it never feels like focus vanished.
+/// This strip hosts a UIFocusGuide, which redirects focus WITHOUT ever holding it, so one Up from
+/// the rails lands on the bar with no invisible stop in between (a focusable view here cost an
+/// extra press in each direction).
 struct TabBarSummoner: View {
     var body: some View {
-        Button(action: Self.focusTabBar) {
-            Color.clear
-                .frame(maxWidth: .infinity)
-                .frame(height: 8)
-                .background { FocusReporter(onFocus: Self.focusTabBar) }
-        }
-        .buttonStyle(SummonerStyle())
-    }
-
-    /// Chrome-free: the strip is a pure focus target, never a visible control.
-    private struct SummonerStyle: ButtonStyle {
-        func makeBody(configuration: Configuration) -> some View { configuration.label }
-    }
-
-    static func focusTabBar() {
-        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            for window in scene.windows {
-                guard let bar = firstTabBar(under: window.rootViewController) else { continue }
-                healIfParked(bar)
-                bar.setNeedsLayout()
-                UIFocusSystem.focusSystem(for: window)?.requestFocusUpdate(to: bar)
-                return
-            }
-        }
+        TabBarFocusGuide()
+            .frame(maxWidth: .infinity)
+            .frame(height: 40)
+            .allowsHitTesting(false)
     }
 
     /// Heal a wedged tab bar without focusing it (run when the player closes).
@@ -165,7 +146,7 @@ struct TabBarSummoner: View {
     /// y = -1288 after a player close); the focus engine refuses to summon it from there and the
     /// bar looks gone forever. Re-home it to the normal just-hidden position so the next focus
     /// pass can slide it in.
-    private static func healIfParked(_ bar: UITabBar) {
+    fileprivate static func healIfParked(_ bar: UITabBar) {
         guard let container = bar.superview else { return }
         let height = max(container.frame.height, 68)
         if container.frame.origin.y < -(height * 3) {
@@ -174,12 +155,63 @@ struct TabBarSummoner: View {
         }
     }
 
-    private static func firstTabBar(under controller: UIViewController?) -> UITabBar? {
+    fileprivate static func firstTabBar(under controller: UIViewController?) -> UITabBar? {
         guard let controller else { return nil }
         if let tabs = controller as? UITabBarController { return tabs.tabBar }
         for child in controller.children {
             if let bar = firstTabBar(under: child) { return bar }
         }
         return firstTabBar(under: controller.presentedViewController)
+    }
+}
+
+/// The mechanism behind TabBarSummoner: a UIFocusGuide spanning the strip. Direction-aware by
+/// being DISABLED whenever focus is already inside the bar, so pressing Down from the bar falls
+/// through to the content instead of bouncing straight back up.
+private struct TabBarFocusGuide: UIViewRepresentable {
+    func makeUIView(context: Context) -> GuideView { GuideView() }
+    func updateUIView(_ uiView: GuideView, context: Context) {}
+
+    final class GuideView: UIView {
+        private let guide = UIFocusGuide()
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            guard window != nil else { return }
+            if guide.owningView == nil {
+                addLayoutGuide(guide)
+                NSLayoutConstraint.activate([
+                    guide.topAnchor.constraint(equalTo: topAnchor),
+                    guide.leadingAnchor.constraint(equalTo: leadingAnchor),
+                    guide.widthAnchor.constraint(equalTo: widthAnchor),
+                    guide.heightAnchor.constraint(equalTo: heightAnchor),
+                ])
+                NotificationCenter.default.addObserver(self, selector: #selector(focusDidUpdate),
+                                                       name: UIFocusSystem.didUpdateNotification,
+                                                       object: nil)
+            }
+            retarget()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            retarget()
+        }
+
+        @objc private func focusDidUpdate() { retarget() }
+
+        private func retarget() {
+            guard let window,
+                  let bar = TabBarSummoner.firstTabBar(under: window.rootViewController) else {
+                guide.preferredFocusEnvironments = []
+                return
+            }
+            TabBarSummoner.healIfParked(bar)
+            let focused = UIFocusSystem.focusSystem(for: self)?.focusedItem
+            let focusInBar = (focused as? UIView).map { $0.isDescendant(of: bar) } ?? false
+            guide.preferredFocusEnvironments = focusInBar ? [] : [bar]
+        }
+
+        deinit { NotificationCenter.default.removeObserver(self) }
     }
 }
