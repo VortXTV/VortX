@@ -501,6 +501,10 @@ struct CoreEmptyState: View {
     let systemImage: String
     let title: String
     let message: String
+    var showsSignInButton = false
+    @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var theme: ThemeManager
+    @State private var showingLogin = false
 
     var body: some View {
         VStack(spacing: Theme.Space.md) {
@@ -516,9 +520,21 @@ struct CoreEmptyState: View {
                 .multilineTextAlignment(.center)
                 .lineSpacing(4)
                 .frame(maxWidth: 760)
+            if showsSignInButton {
+                Button {
+                    showingLogin = true
+                } label: {
+                    Label("Sign In", systemImage: "person.crop.circle")
+                }
+                .buttonStyle(PrimaryActionStyle())
+                .padding(.top, Theme.Space.sm)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(Theme.Space.screenEdge)
+        .fullScreenCover(isPresented: $showingLogin) {
+            LoginView(account: account)
+        }
     }
 
     /// The standard "you are not signed in" state, shown on the main tabs.
@@ -526,7 +542,8 @@ struct CoreEmptyState: View {
         CoreEmptyState(
             systemImage: "person.crop.circle.badge.questionmark",
             title: "Sign in to get started",
-            message: "Open the Settings tab and sign in to your Stremio account to load your library, catalogs, and add-ons."
+            message: "Sign in to your Stremio account to load your library, catalogs, and add-ons.",
+            showsSignInButton: true
         )
     }
 }
