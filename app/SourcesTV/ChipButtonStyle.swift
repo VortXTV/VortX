@@ -10,15 +10,18 @@ struct ChipButtonStyle: ButtonStyle {
     var selected: Bool = false
     var accent: Color = Theme.Palette.accent
     var accentText: Color = Theme.Palette.accent
+    private let focusMargin: CGFloat = 5
 
     func makeBody(configuration: Configuration) -> some View {
-        Chip(selected: selected, accent: accent, accentText: accentText, configuration: configuration)
+        Chip(selected: selected, accent: accent, accentText: accentText,
+             focusMargin: focusMargin, configuration: configuration)
     }
 
     private struct Chip: View {
         let selected: Bool
         let accent: Color
         let accentText: Color
+        let focusMargin: CGFloat
         let configuration: ButtonStyleConfiguration
         @Environment(\.isFocused) private var focused: Bool
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -32,7 +35,9 @@ struct ChipButtonStyle: ButtonStyle {
                 .background(fill, in: Capsule(style: .continuous))
                 .overlay(Capsule(style: .continuous).strokeBorder(accent, lineWidth: focused ? 3 : 0))
                 .scaleEffect(configuration.isPressed ? 0.97 : (focused && !reduceMotion ? 1.06 : 1))
-                .shadow(color: accent.opacity(focused ? 0.4 : 0), radius: 18, y: 8)
+                .padding(focusMargin)
+                .contentShape(Capsule(style: .continuous))
+                .focusEffectDisabled()
                 .animation(reduceMotion ? nil : Theme.Motion.focus, value: focused)
         }
 
