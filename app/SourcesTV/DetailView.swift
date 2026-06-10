@@ -185,9 +185,19 @@ struct DetailView: View {
 
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
-        if let item = core.metaDetails?.libraryItem,
-           item.state.timeOffset > 0,
-           let videoId = item.state.videoId,
+        // Resume position: the engine's library entry is account level, so overlay
+        // profiles resolve theirs from the profile overlay instead (the same
+        // invariant as the ticks and the progress stripes).
+        let resume: (videoId: String?, timeOffset: Double) = {
+            guard profiles.activeUsesEngineHistory else {
+                let entry = profiles.watch[core.metaDetails?.meta?.id ?? ""]
+                return (entry?.videoId, Double(entry?.timeOffsetMs ?? 0))
+            }
+            let state = core.metaDetails?.libraryItem?.state
+            return (state?.videoId, state?.timeOffset ?? 0)
+        }()
+        if resume.timeOffset > 0,
+           let videoId = resume.videoId,
            let video = sorted.first(where: { $0.id == videoId }),
            !watched.contains(video.id) {
             return (video, true)
