@@ -238,6 +238,7 @@ struct CoreSeasonedEpisodes: View {
     let videos: [CoreVideo]
     var watched: Set<String> = []
     var initialSeason: Int?
+    @State private var showBulkMenu = false
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
@@ -276,6 +277,19 @@ struct CoreSeasonedEpisodes: View {
                                         Label("Mark Whole Series Unwatched", systemImage: "circle")
                                     }
                                 }
+                        }
+                        // The discoverable face of the bulk menu (long-pressing a season
+                        // chip is the shortcut for the same actions).
+                        Button { showBulkMenu = true } label: {
+                            Image(systemName: "ellipsis")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                        .confirmationDialog("Mark watched", isPresented: $showBulkMenu, titleVisibility: .visible) {
+                            Button("\(seasonLabel(season)) watched") { core.markSeasonWatched(season, true) }
+                            Button("\(seasonLabel(season)) unwatched") { core.markSeasonWatched(season, false) }
+                            Button("Whole series watched") { core.markWatched(true) }
+                            Button("Whole series unwatched") { core.markWatched(false) }
+                            Button("Cancel", role: .cancel) {}
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xs)
