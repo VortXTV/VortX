@@ -75,6 +75,7 @@ enum CoreLoadable<T: Decodable>: Decodable {
     }
 
     var ready: T? { if case let .ready(value) = self { return value } else { return nil } }
+    var isLoading: Bool { if case .loading = self { return true } else { return false } }
 }
 
 struct CoreMeta: Decodable, Identifiable {
@@ -90,6 +91,18 @@ struct CoreMeta: Decodable, Identifiable {
     let releaseInfo: String?
     let imdbRating: String?
     let genres: [String]?
+}
+
+struct CoreLocalSearchState: Decodable {
+    let searchResults: [CoreSearchSuggestion]
+}
+
+struct CoreSearchSuggestion: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let type: String
+    let poster: String?
+    let releaseInfo: String?
 }
 
 // MARK: ctx (only what we need: addon manifests for catalog row titles)

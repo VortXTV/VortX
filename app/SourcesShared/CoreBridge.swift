@@ -21,6 +21,8 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
     @Published private(set) var searchResults: [CoreMeta] = []
+    @Published private(set) var searchIsLoading = false
+    @Published private(set) var searchSuggestions: [CoreSearchSuggestion] = []
     @Published private(set) var addons: [CoreDescriptor] = []
 
     /// Raw addon descriptors keyed by transportUrl, kept so we can round-trip a full Descriptor back
@@ -241,8 +243,11 @@ final class CoreBridge: ObservableObject {
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
-        guard trimmed.count >= 2 else { return }
+        setSearchLoading(trimmed.count >= 2)
+        guard trimmed.count >= 2 else {
+            DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
+            return
+        }
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": [["search", trimmed]]]]],
@@ -250,6 +255,28 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange", "args": ["start": 0, "end": 30]]],
                  field: "search")
+    }
+
+    private func setSearchLoading(_ loading: Bool) {
+        if Thread.isMainThread {
+            searchIsLoading = loading
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.searchIsLoading = loading }
+        }
+    }
+
+    /// Load Cinemeta's local-search index and ask it for autocomplete suggestions as the user types.
+    func loadSearchSuggestions() {
+        dispatch(action: ["action": "Load", "args": ["model": "LocalSearch"]], field: "local_search")
+    }
+
+    func suggestSearch(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.main.async { [weak self] in self?.searchSuggestions = [] }
+        guard trimmed.count >= 2 else { return }
+        dispatch(action: ["action": "Search",
+                          "args": ["searchQuery": trimmed, "maxResults": 10]],
+                 field: "local_search")
     }
 
     private static func encodeToDict<T: Encodable>(_ value: T) -> [String: Any]? {
@@ -704,10 +731,24 @@ final class CoreBridge: ObservableObject {
         }
         if fields.contains("search") {
             let board = decode(CoreBoardState.self, field: "search")
-            let items = board?.catalogs.flatMap { page in page.compactMap { $0.content?.ready }.flatMap { $0 } } ?? []
+            let pages = board?.catalogs.flatMap { $0 } ?? []
+            let hasLoadingPages = pages.isEmpty || pages.contains { page in
+                guard let content = page.content else { return true }
+                return content.isLoading
+            }
+            let items = pages.compactMap { $0.content?.ready }.flatMap { $0 }
             var seen = Set<String>(); var unique: [CoreMeta] = []
             for item in items where seen.insert(item.id).inserted { unique.append(item) }
-            DispatchQueue.main.async { [weak self] in self?.searchResults = unique }
+            DispatchQueue.main.async { [weak self] in
+                self?.searchIsLoading = hasLoadingPages
+                if !hasLoadingPages || !unique.isEmpty {
+                    self?.searchResults = unique
+                }
+            }
+        }
+        if fields.contains("local_search") {
+            let value = decode(CoreLocalSearchState.self, field: "local_search")
+            DispatchQueue.main.async { [weak self] in self?.searchSuggestions = value?.searchResults ?? [] }
         }
 
         DispatchQueue.main.async { [weak self] in
