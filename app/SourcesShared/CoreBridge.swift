@@ -29,9 +29,13 @@ final class CoreBridge: ObservableObject {
     private var started = false
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
+    /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
+    private var switchInFlight = false
+    private var switchFromUID: String?
 
-    /// Where the legacy hand-rolled client (StremioAccount) stores the Stremio session key.
-    private static let authTokenKey = "stremiox.authKey"   // matches StremioAccount.tokenKey (Keychain)
+    /// The Keychain slot holding the ACTIVE profile's session key (shared profiles use the primary
+    /// slot, own-account profiles their own). Resolved per read so a profile switch re-points it.
+    private var activeTokenAccount: String { ProfileStore.shared.activeKeychainAccount }
 
     private init() {}
 
@@ -103,7 +107,7 @@ final class CoreBridge: ObservableObject {
             loadBoard() // addons already hydrated from the engine's own storage
             return
         }
-        guard let key = Keychain.string(Self.authTokenKey), !key.isEmpty else {
+        guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
             NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
             return
         }
@@ -118,13 +122,39 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
 
-    /// Seed the engine right after a fresh sign-in (the legacy LoginView wrote the authKey), so a
-    /// brand-new user doesn't have to relaunch for the engine to pick up their session. Idempotent.
-    func signedInWithLegacyAuthKey() { bootstrapAuth() }
+    /// Seed the engine right after a fresh sign-in (LoginView wrote the authKey to the active
+    /// profile's slot). When the engine still holds ANOTHER profile's session, this routes through
+    /// the switch path instead, because bootstrapAuth would see "logged in" and keep the old session.
+    func signedInWithLegacyAuthKey() {
+        if isLoggedIn(), let key = Keychain.string(activeTokenAccount), !key.isEmpty {
+            switchAccount(token: key)
+        } else {
+            bootstrapAuth()
+        }
+    }
 
-    /// Log out of the engine (clears the persisted profile + library) and the published UI state.
+    /// Switch the engine to a different Stremio session WITHOUT logging the current one out.
+    /// (Engine Logout destroys its session server-side, which would permanently invalidate the
+    /// profile we're leaving.) LoginWithToken installs the new session in place and the engine then
+    /// pulls that account's addons + library itself; completion is detected in handleEvent when the
+    /// ctx uid changes.
+    func switchAccount(token: String) {
+        switchInFlight = true
+        switchFromUID = currentUID()
+        clearUserState()
+        NSLog("[CoreBridge] switching engine session (profile change)…")
+        dispatchCtx(["action": "Authenticate", "args": ["type": "LoginWithToken", "token": token]])
+    }
+
+    /// Log out of the engine (clears the persisted profile + library, and kills the session
+    /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
     func logOut() {
         dispatchCtx(["action": "Logout"])
+        clearUserState()
+    }
+
+    /// Clear the published per-account UI state (rails, library, details).
+    private func clearUserState() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.continueWatching = []
@@ -256,17 +286,35 @@ final class CoreBridge: ObservableObject {
         return (loaded, details.streams.count)
     }
 
-    /// The first ready, playable stream for a specific stream/episode id, matched on the stream request's
-    /// own path id. An in-player episode switch uses this so it never grabs the previous episode's streams
-    /// that are still loaded in `metaDetails` during the brief window before the new ones arrive.
-    func playableStream(forStreamId streamId: String) -> CoreStream? {
-        guard let details = metaDetails else { return nil }
+    /// Ready stream groups for a specific stream/episode id, matched on the stream request's own
+    /// path id. An in-player episode switch uses this so it never grabs the previous episode's
+    /// streams that are still loaded in `metaDetails` during the brief window before the new ones
+    /// arrive, and so it can RANK across every add-on instead of taking whoever answered first.
+    func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
+        guard let details = metaDetails else { return [] }
+        let names = addonNamesByBase()
+        var groups: [CoreStreamSourceGroup] = []
         for group in details.streams where group.request.path.id == streamId {
-            if let stream = group.content?.ready?.first(where: { $0.playableURL != nil }) {
-                return stream
+            guard let streams = group.content?.ready, !streams.isEmpty else { continue }
+            groups.append(CoreStreamSourceGroup(id: group.request.base,
+                                                addon: names[group.request.base] ?? "Add-on",
+                                                streams: streams))
+        }
+        return groups
+    }
+
+    /// Stream-addon load progress for one stream/episode id (see `streamLoadProgress`).
+    func streamLoadProgress(forStreamId streamId: String) -> (loaded: Int, total: Int) {
+        guard let details = metaDetails else { return (0, 0) }
+        var loaded = 0, total = 0
+        for group in details.streams where group.request.path.id == streamId {
+            total += 1
+            switch group.content {
+            case .some(.ready), .some(.err): loaded += 1
+            default: break
             }
         }
-        return nil
+        return (loaded, total)
     }
 
     private func addonNamesByBase() -> [String: String] {
@@ -423,9 +471,14 @@ final class CoreBridge: ObservableObject {
     /// Report the playback position to the engine Player (in ms), so Continue Watching reflects it live.
     func reportProgress(timeSeconds: Double, durationSeconds: Double) {
         guard durationSeconds > 0, timeSeconds >= 0 else { return }
+        #if os(tvOS)
+        let device = "tvOS"
+        #else
+        let device = "iOS"
+        #endif
         let payload: [String: Any] = ["time": Int(timeSeconds * 1000),
                                       "duration": Int(durationSeconds * 1000),
-                                      "device": "tvOS"]
+                                      "device": device]
         dispatch(action: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]],
                  field: "player")
     }
@@ -440,6 +493,17 @@ final class CoreBridge: ObservableObject {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let profile = object["profile"] as? [String: Any] else { return false }
         return profile["auth"] is [String: Any]
+    }
+
+    /// The signed-in account's uid (`ctx.profile.auth.user._id`), nil when signed out. Used to
+    /// detect when an account switch has actually landed.
+    private func currentUID() -> String? {
+        guard let data = stateData("ctx"),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profile = object["profile"] as? [String: Any],
+              let auth = profile["auth"] as? [String: Any],
+              let user = auth["user"] as? [String: Any] else { return nil }
+        return (user["_id"] as? String) ?? (user["email"] as? String)
     }
 
     /// Dispatch an `Action::Ctx(...)` to the whole model (field = nil).
@@ -499,6 +563,17 @@ final class CoreBridge: ObservableObject {
         if awaitingAuthMigration, fields.contains("ctx"), isLoggedIn() {
             awaitingAuthMigration = false
             NSLog("[CoreBridge] authKey migrated → pulling addons + syncing library")
+            refreshFromAPI()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+        }
+
+        // A profile's account switch landed (the ctx uid moved off the old session) → reload all
+        // per-account state. Authenticate already pulls addons + library; the explicit refresh and
+        // board load repopulate our published screens.
+        if switchInFlight, fields.contains("ctx"), isLoggedIn(), currentUID() != switchFromUID {
+            switchInFlight = false
+            switchFromUID = nil
+            NSLog("[CoreBridge] account switch complete → reloading")
             refreshFromAPI()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
         }

@@ -58,6 +58,9 @@ struct TVPlayerView: View {
     @State private var curURL: URL?
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
+    // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
+    @State private var preloaded: PreloadedEpisode?
+    @State private var preloadingID: String?
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, prev, next, episodes, sources }
@@ -107,6 +110,7 @@ struct TVPlayerView: View {
                                 markedWatched = true            // ~90% in → flip the watched marker live
                                 core.markPlaybackWatched(m)
                             }
+                            if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
                         }
                     case MPVProperty.videoParamsSigPeak:
                         if let p = data as? Double { isHDR = p > 1.0 }
@@ -825,7 +829,8 @@ struct TVPlayerView: View {
     }
 
     /// Switch to another episode in place: flush progress, resolve a stream through the ENGINE (same path
-    /// as launch), then reload mpv. Engine-consistent, replacing the retired hand-rolled AddonClient.
+    /// as launch), then reload mpv. If the next episode was preloaded in the background, it plays its
+    /// already-ranked best source instantly with no resolution wait.
     private func play(episode v: CoreVideo) {
         guard let m = curMeta else { return }
         saveProgress(at: currentTime)
@@ -837,12 +842,46 @@ struct TVPlayerView: View {
         curMeta = newMeta
         curTitle = "\(m.name) · S\(v.season ?? 0)E\(v.episodeNumber) · \(v.episodeTitle)"
         showInfo = true; selected = .play; flashControls()
+
+        // The preload already fetched and ranked this episode across every add-on → play it now.
+        if let pre = preloaded, pre.episodeID == v.id, let u = pre.stream.playableURL {
+            preloaded = nil
+            plog.info("episode switch: playing preloaded best source")
+            prepareTorrent(pre.stream)
+            curURL = u
+            Task {
+                core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+                resumeSeconds = await account.resumeOffset(for: newMeta)
+                coordinator.player?.loadFile(u)
+                startLoadTimeout()
+                // Hand the stream to the engine Player once its meta_details catches up, so
+                // Continue Watching keeps tracking; harmless if it never matches.
+                for _ in 0..<60 {
+                    if !core.streamGroups(forStreamId: v.id).isEmpty {
+                        core.loadEnginePlayer(for: pre.stream)
+                        break
+                    }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
+            return
+        }
+
         Task {
             core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
-            // Wait for THIS episode's streams, matched by id so we never grab the previous episode's
-            // still-loaded ones during the brief window before the new ones arrive.
-            for _ in 0..<80 {                                          // ~8s
-                if let s = core.playableStream(forStreamId: v.id), let u = s.playableURL {
+            // Wait for THIS episode's streams (matched by id), then take the RANKED best across
+            // add-ons: either every add-on has answered, or the first playable landed a few seconds
+            // ago and we stop waiting for stragglers.
+            var firstPlayableAt: Date?
+            for _ in 0..<100 {                                          // ~10s
+                let groups = core.streamGroups(forStreamId: v.id)
+                let progress = core.streamLoadProgress(forStreamId: v.id)
+                let hasPlayable = groups.contains { $0.streams.contains { $0.playableURL != nil } }
+                if hasPlayable, firstPlayableAt == nil { firstPlayableAt = Date() }
+                let settled = progress.total > 0 && progress.loaded == progress.total
+                let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
+                if settled || waitedEnough,
+                   let s = StreamRanking.best(groups), let u = s.playableURL {
                     core.loadEnginePlayer(for: s)
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
@@ -856,6 +895,57 @@ struct TVPlayerView: View {
             loadErrorMsg = "No playable source found for this episode."
             withAnimation { loadFailed = true }
         }
+    }
+
+    // MARK: - Next-episode preload (so auto-advance plays the best link with zero wait)
+
+    /// The next episode's best stream, resolved in the background mid-episode. Fetched over the
+    /// add-on HTTP protocol directly so the engine's `meta_details` (which the screen behind the
+    /// player still shows) is never disturbed.
+    private struct PreloadedEpisode { let episodeID: String; let stream: CoreStream }
+
+    /// Kick off the preload once per episode, triggered when playback crosses the halfway mark.
+    private func preloadNextIfNeeded() {
+        guard let i = episodeIndex, i + 1 < episodes.count else { return }
+        let next = episodes[i + 1]
+        guard preloaded?.episodeID != next.id, preloadingID != next.id else { return }
+        preloadingID = next.id
+        let sources = account.streamSources
+        plog.info("preloading next episode \(next.id, privacy: .public) from \(sources.count, privacy: .public) add-ons")
+        Task {
+            var groups: [CoreStreamSourceGroup] = []
+            await withTaskGroup(of: CoreStreamSourceGroup?.self) { tasks in
+                for source in sources {
+                    tasks.addTask { await Self.fetchStreams(base: source.base, addon: source.name, id: next.id) }
+                }
+                for await group in tasks { if let group { groups.append(group) } }
+            }
+            // Keep the user's add-on priority order for ranking ties. Bases can REPEAT in the
+            // add-on list, so this must unique (uniqueKeysWithValues: traps on duplicates).
+            let order = Dictionary(sources.enumerated().map { ($1.base, $0) },
+                                   uniquingKeysWith: { first, _ in first })
+            groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
+            if let best = StreamRanking.best(groups) {
+                preloaded = PreloadedEpisode(episodeID: next.id, stream: best)
+                plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(next.id, privacy: .public)")
+            } else {
+                plog.info("preload found nothing for \(next.id, privacy: .public)")
+            }
+            preloadingID = nil
+        }
+    }
+
+    /// One add-on's streams for an episode, straight over the Stremio addon protocol.
+    private static func fetchStreams(base: String, addon: String, id: String) async -> CoreStreamSourceGroup? {
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 25
+        struct Response: Decodable { let streams: [CoreStream]? }
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let response = try? JSONDecoder().decode(Response.self, from: data),
+              let streams = response.streams, !streams.isEmpty else { return nil }
+        return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
     }
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.

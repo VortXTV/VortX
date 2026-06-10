@@ -15,22 +15,24 @@ final class PlayerPresenter: ObservableObject {
     @Published var request: PlaybackRequest?
 }
 
-/// App root: shows EITHER the player OR the shell, never both. The shell is removed from the view
-/// hierarchy entirely while playing, and the player's catcher locks focus on itself (see TVPlayerView),
-/// so the TabView's focus map cannot steal the remote from the player.
+/// App root: the player presents OVER the shell, which stays alive hidden + disabled, so closing
+/// the player returns to the exact page playback started from (episode list, detail, search…)
+/// instead of a rebuilt Home. Disabled views are unfocusable and the player's catcher window owns
+/// the remote (see TVPlayerView), so the TabView still can't steal a single press.
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
 
     var body: some View {
-        Group {
+        ZStack {
+            RootTabView()
+                .opacity(presenter.request == nil ? 1 : 0)
+                .disabled(presenter.request != nil)
             if let req = presenter.request {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              onClose: { presenter.request = nil })
-            } else {
-                RootTabView()
+                    .id(req.id)   // clean player teardown per request
             }
         }
-        .id(presenter.request == nil ? "shell" : "player")   // force a clean teardown on switch
     }
 }
 

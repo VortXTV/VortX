@@ -138,7 +138,9 @@ final class StremioAccount: ObservableObject {
     var streamAddonBases: [String] { streamSources.map(\.base) }
 
     private let api = "https://api.strem.io/api"
-    private let tokenKey = "stremiox.authKey"
+    /// The active profile's Keychain slot (shared profiles use the primary slot), so a profile
+    /// switch re-points every token read and write at once.
+    private var tokenKey: String { ProfileStore.shared.activeKeychainAccount }
     private let emailKey = "stremiox.email"
     private let log = Logger(subsystem: "com.stremiox.app", category: "account")
 
@@ -148,9 +150,29 @@ final class StremioAccount: ObservableObject {
     }
 
     init() {
-        email = UserDefaults.standard.string(forKey: emailKey)
+        email = Self.displayEmail()
         migrateTokenToKeychain()
         if authKey != nil { isSignedIn = true; Task { await loadAddons() } }
+    }
+
+    /// Re-read the session for the newly active profile (called after a profile switch).
+    func reloadForActiveProfile() {
+        signInError = nil
+        streamSources = []
+        addons = []
+        email = Self.displayEmail()
+        if authKey != nil {
+            isSignedIn = true
+            Task { await loadAddons() }
+        } else {
+            isSignedIn = false
+        }
+    }
+
+    /// Own-account profiles carry their email; shared profiles show the primary account's.
+    private static func displayEmail() -> String? {
+        if let profile = ProfileStore.shared.active, profile.usesOwnAccount { return profile.email }
+        return UserDefaults.standard.string(forKey: "stremiox.email")
     }
 
     /// Move a token saved by an older build (UserDefaults) into the Keychain, once.
@@ -200,7 +222,13 @@ final class StremioAccount: ObservableObject {
 
     private func setEmail(_ value: String?) {
         email = value
-        UserDefaults.standard.setValue(value, forKey: emailKey)
+        let store = ProfileStore.shared
+        if var profile = store.active, profile.usesOwnAccount {
+            profile.email = value          // the bound account belongs to this profile only
+            store.update(profile)
+        } else {
+            UserDefaults.standard.setValue(value, forKey: emailKey)
+        }
     }
 
     func loadAddons() async {

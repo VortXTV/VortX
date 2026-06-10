@@ -394,6 +394,7 @@ struct CoreStreamList: View {
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
+    @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
 
     var body: some View {
@@ -404,15 +405,29 @@ struct CoreStreamList: View {
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
         let best = StreamRanking.best(groups)
 
+        // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
+        // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
+        // button hostage: the timeout opens the gate anyway.
+        let watchReady = !loadingAddons || settleTimedOut
+
         return VStack(alignment: .leading, spacing: Theme.Space.md) {
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
                 HStack(spacing: Theme.Space.md) {
                     Button { play(best) } label: {
-                        Label("Watch in \(StreamRanking.qualityLabel(best))", systemImage: "play.fill")
+                        if watchReady {
+                            Label("Watch in \(StreamRanking.qualityLabel(best))", systemImage: "play.fill")
+                        } else {
+                            HStack(spacing: Theme.Space.sm) {
+                                ProgressView().tint(Theme.Palette.onAccent)
+                                Text("Finding best…  \(addons.loaded)/\(addons.total)")
+                            }
+                        }
                     }
                     .buttonStyle(PrimaryActionStyle())
+                    .disabled(!watchReady)
+                    .opacity(watchReady ? 1 : 0.55)
                     .contextMenu { resolutionMenu(groups) }
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
@@ -489,6 +504,10 @@ struct CoreStreamList: View {
         // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
         // enclosing ScrollView centered it — the "black bar with two buttons in the middle" bug.
         .frame(maxWidth: .infinity, alignment: .leading)
+        .task {
+            try? await Task.sleep(for: .seconds(12))
+            settleTimedOut = true
+        }
     }
 
     /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.

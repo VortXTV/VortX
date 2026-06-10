@@ -16,7 +16,18 @@ enum StreamRanking {
             score += 80
         }
         if isCached(s, text) { score += 8000 }   // cached / direct = instant; outranks any non-cached quality
+        if isRealDebrid(text) { score -= 20000 } // RD purged its cache + throttles; last resort only
         return score
+    }
+
+    /// Real-Debrid sources sink below every other option (the service purged its cache and now
+    /// blocks/throttles aggressively), so they only play when nothing else exists. Matches the
+    /// service name plus the bracketed/delimited "RD"/"RD+" tags add-ons put in stream names; the
+    /// word-boundary regex cannot match inside words like HDR.
+    static func isRealDebrid(_ qualityText: String) -> Bool {
+        if qualityText.contains("realdebrid") || qualityText.contains("real-debrid")
+            || qualityText.contains("real debrid") { return true }
+        return qualityText.range(of: #"\brd\+?\b"#, options: .regularExpression) != nil
     }
 
     /// Each group's streams sorted best-first, stable within equal scores (so add-on order is preserved
