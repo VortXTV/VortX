@@ -44,14 +44,18 @@ struct DetailView: View {
 
     /// Series keep the hero + episode-list layout (the page below the hero is full of content).
     private func seriesPage(_ meta: CoreMetaItem, videos: [CoreVideo]) -> some View {
-        ScrollViewReader { proxy in
+        let watched = profiles.activeUsesEngineHistory
+            ? (core.metaDetails?.watchedIds ?? [])
+            : profiles.watchedVideoIds(forMeta: meta.id)
+        let primary = seriesPrimaryEpisode(videos, watched: watched)
+        return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                    hero(meta) { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } }
+                    hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
+                         scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                     CoreSeasonedEpisodes(meta: meta, videos: videos,
-                                         watched: profiles.activeUsesEngineHistory
-                                            ? (core.metaDetails?.watchedIds ?? [])
-                                            : profiles.watchedVideoIds(forMeta: meta.id))
+                                         watched: watched,
+                                         initialSeason: primary?.video.season)
                         .id("detailContent")
                 }
                 .padding(.bottom, Theme.Space.xl)
@@ -96,7 +100,8 @@ struct DetailView: View {
 
     /// Full-bleed backdrop with a canvas-blended gradient and the title / metadata / synopsis on the
     /// lower band. The serif title is the editorial signature.
-    private func hero(_ m: CoreMetaItem, scrollToContent: @escaping () -> Void) -> some View {
+    private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
+                      scrollToContent: @escaping () -> Void) -> some View {
         ZStack(alignment: .bottomLeading) {
             AsyncImage(url: URL(string: m.background ?? m.poster ?? "")) { phase in
                 switch phase {
@@ -128,11 +133,31 @@ struct DetailView: View {
                 }
                 // On-screen focusable anchor: grabs initial focus on push (so Back pops instead of
                 // exiting), and jumps to the episodes / sources below.
-                Button(action: scrollToContent) {
-                    Label(type == "series" ? "Episodes" : "Watch",
-                          systemImage: type == "series" ? "list.bullet" : "play.fill")
+                HStack(spacing: Theme.Space.sm) {
+                    if let primaryEpisode {
+                        NavigationLink {
+                            CoreEpisodeStreams(meta: m, video: primaryEpisode,
+                                               season: primaryEpisode.season ?? 0,
+                                               episodes: seasonEpisodes(videos: m.videos ?? [], season: primaryEpisode.season ?? 0))
+                        } label: {
+                            Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume),
+                                  systemImage: "play.fill")
+                        }
+                        .buttonStyle(PrimaryActionStyle())
+                    }
+                    if primaryEpisode == nil {
+                        Button(action: scrollToContent) {
+                            Label(type == "series" ? "Episodes" : "Watch",
+                                  systemImage: type == "series" ? "list.bullet" : "play.fill")
+                        }
+                        .buttonStyle(PrimaryActionStyle())
+                    } else {
+                        Button(action: scrollToContent) {
+                            Label("Episodes", systemImage: "list.bullet")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                    }
                 }
-                .buttonStyle(PrimaryActionStyle())
                 .padding(.top, Theme.Space.xs)
             }
             .padding(.horizontal, Theme.Space.screenEdge)
@@ -157,6 +182,43 @@ struct DetailView: View {
         .font(Theme.Typography.label)
         .foregroundStyle(Theme.Palette.textSecondary)
     }
+
+    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>) -> (video: CoreVideo, isResume: Bool)? {
+        let sorted = sortedEpisodes(videos)
+        if let item = core.metaDetails?.libraryItem,
+           item.state.timeOffset > 0,
+           let videoId = item.state.videoId,
+           let video = sorted.first(where: { $0.id == videoId }),
+           !watched.contains(video.id) {
+            return (video, true)
+        }
+        if let next = sorted.first(where: { !watched.contains($0.id) }) {
+            return (next, false)
+        }
+        return sorted.first.map { ($0, false) }
+    }
+
+    private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool) -> String {
+        let prefix = isResume ? "Resume" : "Play"
+        guard let season = video.season else { return "\(prefix) Episode \(video.episodeNumber)" }
+        return "\(prefix) S\(season) E\(video.episodeNumber)"
+    }
+
+    private func seasonEpisodes(videos: [CoreVideo], season: Int) -> [CoreVideo] {
+        sortedEpisodes(videos).filter { ($0.season ?? 0) == season }
+    }
+
+    private func sortedEpisodes(_ videos: [CoreVideo]) -> [CoreVideo] {
+        videos.sorted {
+            let leftSeason = $0.season ?? 0
+            let rightSeason = $1.season ?? 0
+            if leftSeason != rightSeason { return leftSeason < rightSeason }
+            let leftEpisode = $0.episode ?? 0
+            let rightEpisode = $1.episode ?? 0
+            if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
+            return $0.id < $1.id
+        }
+    }
 }
 
 /// Series episodes grouped by season: a season selector, then the chosen season's episodes with
@@ -165,6 +227,7 @@ struct CoreSeasonedEpisodes: View {
     let meta: CoreMetaItem
     let videos: [CoreVideo]
     var watched: Set<String> = []
+    var initialSeason: Int?
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
@@ -186,25 +249,24 @@ struct CoreSeasonedEpisodes: View {
                         ForEach(seasons, id: \.self) { s in
                             Button { season = s } label: { Text(seasonLabel(s)) }
                                 .buttonStyle(ChipButtonStyle(selected: season == s))
+                                .contextMenu {
+                                    Button { core.markSeasonWatched(s, true) } label: {
+                                        Label("Mark \(seasonLabel(s)) Watched", systemImage: "checkmark.circle")
+                                    }
+                                    Button { core.markSeasonWatched(s, false) } label: {
+                                        Label("Mark \(seasonLabel(s)) Unwatched", systemImage: "arrow.uturn.backward")
+                                    }
+                                    Button { core.markWatched(true) } label: {
+                                        Label("Mark Whole Series Watched", systemImage: "checkmark.circle.fill")
+                                    }
+                                    Button { core.markWatched(false) } label: {
+                                        Label("Mark Whole Series Unwatched", systemImage: "circle")
+                                    }
+                                }
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xs)
                 }
-            }
-
-            // Mark watched/unwatched: selected season + whole series. (Per-episode: long-press a row.)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: Theme.Space.sm) {
-                    Button { core.markSeasonWatched(season, true) } label: { Label("\(seasonLabel(season)) watched", systemImage: "checkmark.circle") }
-                        .buttonStyle(ChipButtonStyle())
-                    Button { core.markSeasonWatched(season, false) } label: { Label("\(seasonLabel(season)) unwatched", systemImage: "arrow.uturn.backward") }
-                        .buttonStyle(ChipButtonStyle())
-                    Button { core.markWatched(true) } label: { Text("Whole series watched") }
-                        .buttonStyle(ChipButtonStyle())
-                    Button { core.markWatched(false) } label: { Text("Whole series unwatched") }
-                        .buttonStyle(ChipButtonStyle())
-                }
-                .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xs)
             }
 
             VStack(spacing: Theme.Space.sm) {
@@ -213,8 +275,25 @@ struct CoreSeasonedEpisodes: View {
             .padding(.horizontal, Theme.Space.screenEdge)
         }
         .onAppear {
-            if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+            let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if seasons.contains(preferred) { season = preferred }
+            else if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
         }
+    }
+
+    private var firstUnwatchedSeason: Int? {
+        videos
+            .sorted {
+                let leftSeason = $0.season ?? 0
+                let rightSeason = $1.season ?? 0
+                if leftSeason != rightSeason { return leftSeason < rightSeason }
+                let leftEpisode = $0.episode ?? 0
+                let rightEpisode = $1.episode ?? 0
+                if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
+                return $0.id < $1.id
+            }
+            .first { !watched.contains($0.id) }?
+            .season
     }
 
     private func episodeRow(_ v: CoreVideo) -> some View {
