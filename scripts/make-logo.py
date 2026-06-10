@@ -129,3 +129,6 @@ save(draw_icon(1024, rounded=False).convert("RGB"),
 # README: transparent lockups for GitHub's light and dark themes
 lockup(1600, 400, os.path.join(ROOT, "docs/logo-light.png"), TEXT_GRAY)
 lockup(1600, 400, os.path.join(ROOT, "docs/logo-dark.png"), TEXT_LIGHT)
+
+# Standalone app icon (rounded, transparent corners): the linkable brand file.
+save(draw_icon(1024, rounded=True), os.path.join(ROOT, "docs/brand/app-icon.png"))
