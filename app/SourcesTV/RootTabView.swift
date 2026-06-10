@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import os
 
 /// A request to play something full-screen.
 struct PlaybackRequest: Identifiable {
@@ -15,11 +16,15 @@ final class PlayerPresenter: ObservableObject {
     @Published var request: PlaybackRequest?
 }
 
-/// App root, two focus rules learned the hard way:
-///  - The profile picker is ROOT REPLACEMENT: while it's up, the shell does not exist. On a real
-///    Siri remote the focus engine would not move into an overlay above the (even disabled) UIKit
-///    tab bar, leaving the picker unselectable; as the only root content it always gets focus.
-///    Nothing is lost: the picker only shows at cold start or on an explicit profile switch.
+/// App root, three focus rules learned the hard way:
+///  - The shell (and its UITabBarController) is mounted ONCE and never torn down. Conditionally
+///    recreating the TabView (the 0.2.9 "root replacement" picker) made UIKit initialize the tab
+///    bar's auto-hide offsets against a mid-transition layout, intermittently parking the bar
+///    absurdly far offscreen (observed live at y = -1288) where the focus engine cannot summon it:
+///    THE vanishing tab bar bug, which did not exist while the shell was permanent (through 0.2.8).
+///  - The profile picker presents as a REAL modal (fullScreenCover). UIKit moves focus into actual
+///    presentations natively on a Siri remote; the hand-rolled ZStack overlay it replaces could
+///    never receive focus on device. (The editor and login covers prove modal focus works here.)
 ///  - The player presents OVER the live but hidden + disabled shell, so closing it returns to the
 ///    exact page playback started from; the player's catcher window owns the remote (TVPlayerView).
 struct RootView: View {
@@ -27,28 +32,33 @@ struct RootView: View {
     @EnvironmentObject private var profiles: ProfileStore
 
     var body: some View {
-        Group {
-            if profiles.needsPicker && presenter.request == nil {
-                ProfilePickerView()
-            } else {
-                ZStack {
-                    RootTabView()
-                        .opacity(presenter.request == nil ? 1 : 0)
-                        .disabled(presenter.request != nil)
-                    if let req = presenter.request {
-                        TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
-                                     onClose: { presenter.request = nil })
-                            .id(req.id)   // clean player teardown per request
-                    }
-                }
+        ZStack {
+            RootTabView()
+                .opacity(presenter.request == nil ? 1 : 0)
+                .disabled(presenter.request != nil)
+            if let req = presenter.request {
+                TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
+                             onClose: { presenter.request = nil })
+                    .id(req.id)   // clean player teardown per request
             }
         }
-        // The tab bar's container can get parked far offscreen during the player's lifetime;
-        // re-home it the moment playback ends so the bar is summonable immediately.
+        .fullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
+        // Re-sync the bar's visibility after playback ends: two shots, because the desync can
+        // assert itself after the first layout settles.
         .onChange(of: presenter.request?.id) {
             guard presenter.request == nil else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { TabBarSummoner.healTabBar() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { TabBarHealer.heal("player-closed") }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { TabBarHealer.heal("player-closed+3s") }
         }
+    }
+
+    /// Cold start with a real choice, or Settings' "Switch Profile". Dismissing with Menu counts
+    /// as picking the current profile, so the binding's setter just marks the launch as picked.
+    private var pickerPresented: Binding<Bool> {
+        Binding(
+            get: { profiles.needsPicker && presenter.request == nil },
+            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+        )
     }
 }
 
@@ -114,104 +124,50 @@ struct RootTabView: View {
     }
 }
 
-/// An invisible focus REDIRECT strip pinned to the very top of each tab page.
-///
-/// The tvOS tab bar auto-hides when focus dives into content, and UIKit only summons it back when
-/// focus reaches the TOP EDGE of the screen (or on Menu). Our browse layouts keep every focusable
-/// element in a bottom strip, so after popping back from a detail page there was nothing up top to
-/// trigger the summon: Up from the rails did nothing and the bar looked gone until a Menu press.
-/// This strip hosts a UIFocusGuide, which redirects focus WITHOUT ever holding it, so one Up from
-/// the rails lands on the bar with no invisible stop in between (a focusable view here cost an
-/// extra press in each direction).
-struct TabBarSummoner: View {
-    var body: some View {
-        TabBarFocusGuide()
-            .frame(maxWidth: .infinity)
-            .frame(height: 40)
-            .allowsHitTesting(false)
-    }
+/// Re-sync the tab bar's visibility after something full-screen (the player, the system keyboard)
+/// takes focus and gives it back. Symptom caught live: focus could sit ON the bar's pills (Right
+/// switched tabs) while the bar itself stayed invisible, its container parked offscreen, until a
+/// tab change forced a real layout pass. The heal uses the SUPPORTED visibility API (frame surgery
+/// on the private container gets stomped by the next layout pass) and logs what it saw, so a
+/// failed heal explains itself in the log.
+enum TabBarHealer {
+    private static let log = Logger(subsystem: "com.stremiox.app", category: "tabbar")
 
-    /// Heal a wedged tab bar without focusing it (run when the player closes).
-    static func healTabBar() {
+    static func heal(_ reason: String) {
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
             for window in scene.windows {
-                guard let bar = firstTabBar(under: window.rootViewController) else { continue }
-                healIfParked(bar)
+                guard let tabs = firstTabBarController(under: window.rootViewController) else { continue }
+                let bar = tabs.tabBar
+                let container = bar.superview
+                let containerY = container?.frame.origin.y ?? .nan
+                if #available(tvOS 18.0, *) {
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden) controllerHidden=\(tabs.isTabBarHidden)")
+                    if tabs.isTabBarHidden {
+                        tabs.setTabBarHidden(false, animated: false)
+                        log.info("heal: setTabBarHidden(false) applied")
+                    }
+                } else {
+                    log.info("heal(\(reason, privacy: .public)): containerY=\(containerY, privacy: .public) barHidden=\(bar.isHidden)")
+                }
+                // Re-home a parked container as well; harmless if the layout pass recomputes it.
+                if let container, container.frame.origin.y < -(max(container.frame.height, 68) * 3) {
+                    container.frame.origin.y = -max(container.frame.height, 68)
+                    log.info("heal: re-homed parked container")
+                }
+                tabs.view.setNeedsLayout()
+                tabs.view.layoutIfNeeded()
                 return
             }
         }
+        log.info("heal(\(reason, privacy: .public)): no tab bar controller found")
     }
 
-    /// Under heavy load UIKit can park the bar's container absurdly far offscreen (seen live at
-    /// y = -1288 after a player close); the focus engine refuses to summon it from there and the
-    /// bar looks gone forever. Re-home it to the normal just-hidden position so the next focus
-    /// pass can slide it in.
-    fileprivate static func healIfParked(_ bar: UITabBar) {
-        guard let container = bar.superview else { return }
-        let height = max(container.frame.height, 68)
-        if container.frame.origin.y < -(height * 3) {
-            container.frame.origin.y = -height
-            container.setNeedsLayout()
-        }
-    }
-
-    fileprivate static func firstTabBar(under controller: UIViewController?) -> UITabBar? {
+    private static func firstTabBarController(under controller: UIViewController?) -> UITabBarController? {
         guard let controller else { return nil }
-        if let tabs = controller as? UITabBarController { return tabs.tabBar }
+        if let tabs = controller as? UITabBarController { return tabs }
         for child in controller.children {
-            if let bar = firstTabBar(under: child) { return bar }
+            if let tabs = firstTabBarController(under: child) { return tabs }
         }
-        return firstTabBar(under: controller.presentedViewController)
-    }
-}
-
-/// The mechanism behind TabBarSummoner: a UIFocusGuide spanning the strip. Direction-aware by
-/// being DISABLED whenever focus is already inside the bar, so pressing Down from the bar falls
-/// through to the content instead of bouncing straight back up.
-private struct TabBarFocusGuide: UIViewRepresentable {
-    func makeUIView(context: Context) -> GuideView { GuideView() }
-    func updateUIView(_ uiView: GuideView, context: Context) {}
-
-    final class GuideView: UIView {
-        private let guide = UIFocusGuide()
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            guard window != nil else { return }
-            if guide.owningView == nil {
-                addLayoutGuide(guide)
-                NSLayoutConstraint.activate([
-                    guide.topAnchor.constraint(equalTo: topAnchor),
-                    guide.leadingAnchor.constraint(equalTo: leadingAnchor),
-                    guide.widthAnchor.constraint(equalTo: widthAnchor),
-                    guide.heightAnchor.constraint(equalTo: heightAnchor),
-                ])
-                NotificationCenter.default.addObserver(self, selector: #selector(focusDidUpdate),
-                                                       name: UIFocusSystem.didUpdateNotification,
-                                                       object: nil)
-            }
-            retarget()
-        }
-
-        override func layoutSubviews() {
-            super.layoutSubviews()
-            retarget()
-        }
-
-        @objc private func focusDidUpdate() { retarget() }
-
-        private func retarget() {
-            guard let window,
-                  let bar = TabBarSummoner.firstTabBar(under: window.rootViewController) else {
-                guide.preferredFocusEnvironments = []
-                return
-            }
-            TabBarSummoner.healIfParked(bar)
-            let focused = UIFocusSystem.focusSystem(for: self)?.focusedItem
-            let focusInBar = (focused as? UIView).map { $0.isDescendant(of: bar) } ?? false
-            guide.preferredFocusEnvironments = focusInBar ? [] : [bar]
-        }
-
-        deinit { NotificationCenter.default.removeObserver(self) }
+        return firstTabBarController(under: controller.presentedViewController)
     }
 }

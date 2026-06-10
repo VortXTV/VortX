@@ -52,7 +52,6 @@ struct HomeView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
-            .overlay(alignment: .top) { TabBarSummoner() }   // brings the hidden tab bar back on Up
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
         .onAppear { configureMetaSources(); seed() }

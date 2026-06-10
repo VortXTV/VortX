@@ -12,7 +12,6 @@ struct SearchView: View {
         Group {
             if account.isSignedIn { results } else { CoreEmptyState.signedOut }
         }
-        .overlay(alignment: .top) { TabBarSummoner() }   // brings the hidden tab bar back on Up
         .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 

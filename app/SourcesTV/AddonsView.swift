@@ -24,7 +24,6 @@ struct AddonsView: View {
                 .padding(.vertical, Theme.Space.xl)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .overlay(alignment: .top) { TabBarSummoner() }   // brings the hidden tab bar back on Up
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
     }
