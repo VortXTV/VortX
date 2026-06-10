@@ -215,6 +215,17 @@ final class StremioAccount: ObservableObject {
         }
     }
 
+    func signInWithAuthKey(_ token: String) async {
+        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { signInError = "Sign-in failed."; return }
+        signInError = nil
+        authKey = token
+        await backfillEmail()
+        isSignedIn = true
+        log.info("signed in with link ok")
+        await loadAddons()
+    }
+
     func signOut() {
         authKey = nil; isSignedIn = false; streamSources = []; addons = []
         setEmail(nil)

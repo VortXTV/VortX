@@ -1,15 +1,18 @@
 import SwiftUI
-import Combine
 
-/// tvOS sign-in for a Stremio account. Pulls the user's addons (AIOStreams etc.) so their
-/// real streams play. The token and addon URLs stay on-device.
+/// tvOS sign-in for a Stremio account. Link login is the default so passwords are entered on
+/// Stremio's own web flow; password login remains available as a fallback.
 struct LoginView: View {
     @ObservedObject var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @Environment(\.dismiss) private var dismiss
+
+    @State private var mode: Mode = .link
     @State private var email = ""
     @State private var password = ""
-    @State private var busy = false
+    @State private var passwordBusy = false
+
+    private enum Mode { case link, password }
 
     var body: some View {
         ZStack {
@@ -21,39 +24,64 @@ struct LoginView: View {
                 }
                 .font(Theme.Typography.hero)
 
-                Text("Sign in to your Stremio account to load your addons and streams.")
+                Text(mode == .link
+                     ? "Scan the QR code or enter the code on another device to sign in."
+                     : "Sign in to your Stremio account to load your addons and streams.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
 
-                VStack(spacing: Theme.Space.md) {
-                    field { TextField("Email", text: $email)
-                        .textContentType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled() }
-                    field { SecureField("Password", text: $password).textContentType(.password) }
-                }
-                .frame(width: 700)
-
-                if let err = account.signInError {
-                    Text(err).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
-                }
+                if mode == .link { LinkLoginView(account: account) }
+                else { passwordLogin }
 
                 Button {
-                    busy = true
-                    Task { await account.signIn(email: email, password: password); busy = false }
+                    switchMode()
                 } label: {
-                    Text(busy ? "Signing in…" : "Sign In").frame(width: 280)
+                    Text(mode == .link ? "Use password instead" : "Use QR code instead")
+                        .frame(width: 320)
                 }
-                .buttonStyle(PrimaryActionStyle())
-                .disabled(busy || email.isEmpty || password.isEmpty)
+                .buttonStyle(ChipButtonStyle())
             }
             .padding(Theme.Space.screenEdge)
         }
-        // Login is pushed via NavigationLink; pop back the moment the token is saved, otherwise a
-        // successful sign-in leaves the user staring at this same screen.
         .onReceive(account.$isSignedIn) { signedIn in
             if signedIn {
                 core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
                 dismiss()
             }
+        }
+    }
+
+    private var passwordLogin: some View {
+        VStack(spacing: Theme.Space.md) {
+            field { TextField("Email", text: $email)
+                .textContentType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled() }
+            field { SecureField("Password", text: $password).textContentType(.password) }
+
+            if let err = account.signInError {
+                Text(err).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+            }
+
+            Button {
+                passwordBusy = true
+                Task {
+                    await account.signIn(email: email, password: password)
+                    await MainActor.run { passwordBusy = false }
+                }
+            } label: {
+                Text(passwordBusy ? "Signing in…" : "Sign In").frame(width: 280)
+            }
+            .buttonStyle(PrimaryActionStyle())
+            .disabled(passwordBusy || email.isEmpty || password.isEmpty)
+        }
+        .frame(width: 700)
+    }
+
+    private func switchMode() {
+        if mode == .link {
+            mode = .password
+        } else {
+            mode = .link
         }
     }
 
