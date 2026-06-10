@@ -1,4 +1,9 @@
-<p align="center"><img src="docs/logo.png" width="560" alt="StremioX"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img src="docs/logo-light.png" width="560" alt="StremioX">
+  </picture>
+</p>
 
 # StremioX
 
@@ -65,6 +70,8 @@ Everything the Apple TV app does today:
 - Home with your real Continue Watching and every catalog from every installed add-on, matching the official app, because the official engine builds them.
 - A living backdrop on Home, Discover, and Library: whichever title you focus fills the screen with its real backdrop art, year, rating, runtime, genres, and synopsis, on every row and every grid, with rows tucking away underneath as you browse deeper.
 - Full-bleed movie and episode pages: the artwork owns the screen, the details sit over it, episode pages show the still, air date, runtime, rating, and synopsis.
+- Series pages open ready to play: a Resume or Play button on the hero jumps straight to the right episode (the one in progress, or the first unwatched), and the episode list opens on that season. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
+- Partly watched episodes show a progress stripe on their thumbnail, and bulk season and series watched controls live in a long-press menu on the season chips. Also contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
 - Discover with type, catalog, and genre filters; Library with type and sort filters; search across your add-ons; add-on management built in.
 - Long-press menus on posters everywhere: dismiss from Continue Watching, add to or remove from the library, mark watched or unwatched, by episode, season, or series. Finished titles leave Continue Watching on their own.
 
@@ -103,6 +110,7 @@ Everything the Apple TV app does today:
 **The rest**
 
 - Eight accent themes plus a true-black OLED mode; the whole app, including the focused tab, repaints live when you switch.
+- A branded launch splash covers the engine boot, honoring Reduce Motion.
 - The screen stays awake during playback and sleeps when paused.
 - Point it at your own streaming server if you run one; the embedded one runs out of the box.
 
