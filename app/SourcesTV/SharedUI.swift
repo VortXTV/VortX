@@ -484,6 +484,8 @@ struct PosterCard: View {
 /// A thin resume-progress bar that sits at the bottom of a poster.
 struct ProgressStripe: View {
     let value: Double
+    @EnvironmentObject private var theme: ThemeManager
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
