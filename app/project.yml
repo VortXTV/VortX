@@ -29,8 +29,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
-        MARKETING_VERSION: "0.2.12"
-        CURRENT_PROJECT_VERSION: "36"
+        MARKETING_VERSION: "0.2.13"
+        CURRENT_PROJECT_VERSION: "37"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -70,8 +70,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
-        MARKETING_VERSION: "0.2.12"
-        CURRENT_PROJECT_VERSION: "36"
+        MARKETING_VERSION: "0.2.13"
+        CURRENT_PROJECT_VERSION: "37"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
