@@ -92,6 +92,18 @@ struct CoreMeta: Decodable, Identifiable {
     let genres: [String]?
 }
 
+struct CoreLocalSearchState: Decodable {
+    let searchResults: [CoreSearchSuggestion]
+}
+
+struct CoreSearchSuggestion: Decodable, Identifiable {
+    let id: String
+    let name: String
+    let type: String
+    let poster: String?
+    let releaseInfo: String?
+}
+
 // MARK: ctx (only what we need: addon manifests for catalog row titles)
 
 struct CoreCtx: Decodable {

@@ -21,6 +21,7 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
     @Published private(set) var searchResults: [CoreMeta] = []
+    @Published private(set) var searchSuggestions: [CoreSearchSuggestion] = []
     @Published private(set) var addons: [CoreDescriptor] = []
 
     /// Raw addon descriptors keyed by transportUrl, kept so we can round-trip a full Descriptor back
@@ -250,6 +251,20 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange", "args": ["start": 0, "end": 30]]],
                  field: "search")
+    }
+
+    /// Load Cinemeta's local-search index and ask it for autocomplete suggestions as the user types.
+    func loadSearchSuggestions() {
+        dispatch(action: ["action": "Load", "args": ["model": "LocalSearch"]], field: "local_search")
+    }
+
+    func suggestSearch(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        DispatchQueue.main.async { [weak self] in self?.searchSuggestions = [] }
+        guard trimmed.count >= 2 else { return }
+        dispatch(action: ["action": "Search",
+                          "args": ["searchQuery": trimmed, "maxResults": 10]],
+                 field: "local_search")
     }
 
     private static func encodeToDict<T: Encodable>(_ value: T) -> [String: Any]? {
@@ -708,6 +723,10 @@ final class CoreBridge: ObservableObject {
             var seen = Set<String>(); var unique: [CoreMeta] = []
             for item in items where seen.insert(item.id).inserted { unique.append(item) }
             DispatchQueue.main.async { [weak self] in self?.searchResults = unique }
+        }
+        if fields.contains("local_search") {
+            let value = decode(CoreLocalSearchState.self, field: "local_search")
+            DispatchQueue.main.async { [weak self] in self?.searchSuggestions = value?.searchResults ?? [] }
         }
 
         DispatchQueue.main.async { [weak self] in
