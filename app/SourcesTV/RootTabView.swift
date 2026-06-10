@@ -30,6 +30,7 @@ final class PlayerPresenter: ObservableObject {
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
+    @State private var splashDone = false
 
     var body: some View {
         ZStack {
@@ -40,6 +41,13 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
+            }
+            // The launch splash sits above everything for its ~2 seconds. It has no
+            // focusable content, so the focus engine settles on the shell underneath
+            // and nothing fights it; the profile picker waits for it (binding below).
+            if !splashDone {
+                SplashView { splashDone = true }
+                    .zIndex(10)
             }
         }
         .fullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
@@ -56,7 +64,7 @@ struct RootView: View {
     /// as picking the current profile, so the binding's setter just marks the launch as picked.
     private var pickerPresented: Binding<Bool> {
         Binding(
-            get: { profiles.needsPicker && presenter.request == nil },
+            get: { splashDone && profiles.needsPicker && presenter.request == nil },
             set: { presented in if !presented { profiles.pickedThisLaunch = true } }
         )
     }
