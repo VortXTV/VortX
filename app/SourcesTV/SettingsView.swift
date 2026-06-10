@@ -36,12 +36,14 @@ struct SettingsView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
         .task {
-            // The embedded server cold-starts a few seconds after launch, so poll instead of checking
-            // once, otherwise an early miss shows "offline" forever even after the server comes up.
-            for _ in 0..<12 {
-                if await StremioServer.isOnline() { serverOnline = true; return }
-                serverOnline = false
-                try? await Task.sleep(for: .seconds(2))
+            // Live server monitor that NEVER gives up. The embedded server cold-starts well after
+            // launch on a real Apple TV (node boots while the engine and sync are also busy), and
+            // the old 24-second window could expire first, showing "Offline" until a relaunch.
+            // Retries fast while offline, keeps the badge fresh once up; restarts on each visit.
+            while !Task.isCancelled {
+                let online = await StremioServer.isOnline()
+                serverOnline = online
+                try? await Task.sleep(for: .seconds(online ? 12 : 3))
             }
         }
     }

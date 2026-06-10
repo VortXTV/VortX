@@ -25,7 +25,9 @@ struct ProfilePickerView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                 HStack(alignment: .top, spacing: Theme.Space.xl) {
                     ForEach(store.profiles) { profile in
-                        ProfileCard(profile: profile) { pick(profile) }
+                        ProfileCard(profile: profile, isCurrent: profile.id == store.activeID) {
+                            pick(profile)
+                        }
                     }
                     AddProfileCard {
                         editorProfile = UserProfile(name: "", avatar: "🎬",
@@ -106,10 +108,26 @@ struct ProfilePickerView: View {
     }
 }
 
-/// One profile in the picker: a flat accent disc with the avatar, name underneath, focus = lift.
+/// One profile in the picker: a flat accent disc with the avatar, name underneath. Focus is
+/// unmistakable at ten feet: a thick warm-white ring, a brighter fill, a soft glow, and the name
+/// lights up, on top of the card lift. The profile you're currently using carries a check badge.
 private struct ProfileCard: View {
     let profile: UserProfile
+    let isCurrent: Bool
     let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ProfileCardContent(profile: profile, isCurrent: isCurrent)
+        }
+        .buttonStyle(CardFocusStyle())
+    }
+}
+
+private struct ProfileCardContent: View {
+    let profile: UserProfile
+    let isCurrent: Bool
+    @Environment(\.isFocused) private var focused
     @EnvironmentObject private var theme: ThemeManager
 
     private var accent: Color {
@@ -117,31 +135,38 @@ private struct ProfileCard: View {
     }
 
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: Theme.Space.md) {
-                ZStack {
-                    Circle().fill(accent.opacity(0.28))
-                    Circle().strokeBorder(accent, lineWidth: 3)
-                    Text(profile.avatar).font(.system(size: 88))
-                    if profile.hasPin {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 24, weight: .bold))
-                            .foregroundStyle(Theme.Palette.textPrimary)
-                            .padding(10)
-                            .background(Theme.Palette.surface2, in: Circle())
-                            .frame(maxWidth: .infinity, maxHeight: .infinity,
-                                   alignment: .bottomTrailing)
-                    }
+        VStack(spacing: Theme.Space.md) {
+            ZStack {
+                Circle().fill(accent.opacity(focused ? 0.5 : 0.24))
+                Circle().strokeBorder(focused ? Theme.Palette.textPrimary : accent.opacity(0.7),
+                                      lineWidth: focused ? 6 : 3)
+                Text(profile.avatar).font(.system(size: 88, weight: .bold))
+                if profile.hasPin {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .padding(10)
+                        .background(Theme.Palette.surface2, in: Circle())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 }
-                .frame(width: 200, height: 200)
-                Text(profile.name)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .lineLimit(1)
+                if isCurrent {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 22, weight: .heavy))
+                        .foregroundStyle(Theme.Palette.onAccent)
+                        .padding(9)
+                        .background(accent, in: Circle())
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                }
             }
-            .frame(width: 230)
+            .frame(width: 200, height: 200)
+            .shadow(color: focused ? accent.opacity(0.55) : .clear, radius: 34, y: 6)
+            Text(profile.name)
+                .font(focused ? Theme.Typography.cardTitle : Theme.Typography.label)
+                .foregroundStyle(focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
+                .lineLimit(1)
         }
-        .buttonStyle(CardFocusStyle())
+        .frame(width: 230)
+        .animation(Theme.Motion.focus, value: focused)
     }
 }
 
@@ -179,6 +204,7 @@ struct ProfileEditorView: View {
 
     @State private var draft: UserProfile
     @State private var pinText: String
+    @State private var customAvatar = ""
     @State private var confirmDelete = false
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
@@ -208,9 +234,27 @@ struct ProfileEditorView: View {
 
                     row("Avatar") {
                         ForEach(Self.avatars, id: \.self) { emoji in
-                            Button(emoji) { draft.avatar = emoji }
+                            Button(emoji) { draft.avatar = emoji; customAvatar = "" }
                                 .buttonStyle(ChipButtonStyle(selected: draft.avatar == emoji))
                         }
+                    }
+                    HStack(spacing: Theme.Space.md) {
+                        TextField("Or type your own: any emoji or a letter", text: $customAvatar)
+                            .font(Theme.Typography.body)
+                            .frame(width: 600)
+                            .onChange(of: customAvatar) {
+                                // One grapheme (emoji-safe); single letters display uppercased.
+                                guard let first = customAvatar.first else { return }
+                                let avatar = String(first)
+                                draft.avatar = avatar.count == avatar.uppercased().count
+                                    ? avatar.uppercased() : avatar
+                            }
+                        ZStack {
+                            Circle().fill(Theme.Palette.surface2)
+                            Text(draft.avatar).font(.system(size: 34, weight: .bold))
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                        }
+                        .frame(width: 64, height: 64)
                     }
 
                     row("Accent") {
