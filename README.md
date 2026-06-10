@@ -167,11 +167,12 @@ You sign in with your own Stremio account and bring your own addons. No content 
 
 ## Building it yourself
 
-You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node and pnpm (for the iOS web bundle), Rust nightly with rust-src (for the tvOS engine), and a copy of Stremio's free macOS app (the streaming server gets pulled out of it). MPVKit comes in over Swift Package Manager.
+You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node and pnpm (for the iOS web bundle), and Rust nightly with rust-src (for the tvOS engine). MPVKit comes in over Swift Package Manager. No local Stremio install is needed: the fetch script downloads everything it cannot find.
 
 ```bash
-# 1) Streaming-server deps. server.js is not in this repo. Put Stremio's free macOS
-#    app at reference/macos/Stremio.app first, then:
+# 1) Streaming-server deps: NodeMobile (tvOS-enabled build from this repo's vendor
+#    release), server.js (your local Stremio.app if present, otherwise Stremio's
+#    public CDN), and the bundled subtitle fallback fonts.
 ./scripts/fetch-server-deps.sh
 
 # 2) iOS only: build the stremio-web bundle
@@ -189,7 +190,7 @@ xcodebuild -scheme StremioXTV -sdk appletvos -destination 'generic/platform=tvOS
 ./scripts/repackage-ipa.sh <dir-with-Payload> build/StremioX.ipa
 ```
 
-server.js isn't included here because it's Stremio's own streaming server. It ships free inside their macOS app, so the script pulls it from a copy you provide instead of redistributing it.
+server.js isn't included here because it's Stremio's own streaming server. The script prefers a copy from a local Stremio.app (set `STREMIO_APP` to point at one) and otherwise downloads the standard desktop build straight from Stremio's public CDN, so a fresh clone builds without any local Stremio install.
 
 ## How the tvOS app works
 
