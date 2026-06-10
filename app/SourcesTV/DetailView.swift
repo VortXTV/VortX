@@ -9,6 +9,7 @@ struct DetailView: View {
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var profiles: ProfileStore
 
     var body: some View {
         Group {
@@ -21,7 +22,7 @@ struct DetailView: View {
             } else {
                 // Focusable so Back pops this view instead of exiting the app while it loads.
                 ScrollView {
-                    ProgressView().controlSize(.large).tint(Theme.Palette.accent).padding(120).focusable()
+                    BigSpinner().padding(120).focusable()
                 }
             }
         }
@@ -48,7 +49,9 @@ struct DetailView: View {
                 VStack(alignment: .leading, spacing: Theme.Space.xl) {
                     hero(meta) { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } }
                     CoreSeasonedEpisodes(meta: meta, videos: videos,
-                                         watched: core.metaDetails?.watchedIds ?? [])
+                                         watched: profiles.activeUsesEngineHistory
+                                            ? (core.metaDetails?.watchedIds ?? [])
+                                            : profiles.watchedVideoIds(forMeta: meta.id))
                         .id("detailContent")
                 }
                 .padding(.bottom, Theme.Space.xl)

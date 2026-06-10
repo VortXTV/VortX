@@ -358,20 +358,64 @@ final class CoreBridge: ObservableObject {
 
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
     func markWatched(_ isWatched: Bool) {
+        if overlayMarkWatched(isWatched, videoIds: { meta in (meta.videos ?? []).map(\.id) }) { return }
         dispatchMetaDetails(["action": "MarkAsWatched", "args": isWatched])
     }
 
     /// Mark every episode of a season watched/unwatched.
     func markSeasonWatched(_ season: Int, _ isWatched: Bool) {
+        if overlayMarkWatched(isWatched, videoIds: { meta in
+            (meta.videos ?? []).filter { $0.season == season }.map(\.id)
+        }) { return }
         dispatchMetaDetails(["action": "MarkSeasonAsWatched", "args": [season, isWatched]])
     }
 
     /// Mark a single episode watched/unwatched. The engine's `Video` only needs `id`.
     func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool) {
+        if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
         var payload: [String: Any] = ["id": video.id]
         if let season = video.season { payload["season"] = season }
         if let episode = video.episode { payload["episode"] = episode }
         dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, isWatched]])
+    }
+
+    /// Route a detail-page watched toggle into the overlay when the active profile keeps
+    /// its own history, so a non-owner profile can never touch the account's library.
+    /// Returns false for engine profiles, which then dispatch as before.
+    private func overlayMarkWatched(_ isWatched: Bool, videoIds: (CoreMetaItem) -> [String]) -> Bool {
+        guard !ProfileStore.shared.activeUsesEngineHistory else { return false }
+        guard let meta = metaDetails?.meta else { return true }   // no detail context: drop, never mutate the account
+        let ids = videoIds(meta)
+        ProfileStore.shared.setWatched(isWatched, metaId: meta.id,
+                                       videoIds: ids.isEmpty ? [meta.id] : ids,
+                                       name: meta.name, type: meta.type, poster: meta.poster)
+        return true
+    }
+
+    /// Display info for an overlay watch entry when a toggle arrives by bare id (the
+    /// Library tab and poster menus). Resolved from whatever state already holds the
+    /// title; nil means nothing knows it and the toggle is dropped rather than creating
+    /// a nameless Continue Watching card.
+    private func overlayDisplayInfo(forId id: String) -> (name: String, type: String, poster: String?)? {
+        if let meta = metaDetails?.meta, meta.id == id { return (meta.name, meta.type, meta.poster) }
+        if let item = continueWatching.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
+        if let item = library?.catalog.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
+        return nil
+    }
+
+    /// Id-only watched toggle into the overlay. Without an episode list the id itself is
+    /// the marker (exactly how movies are tracked); unwatch clears everything recorded.
+    private func overlaySetWatchedById(_ id: String, _ isWatched: Bool) {
+        if isWatched {
+            guard let info = overlayDisplayInfo(forId: id) else { return }
+            ProfileStore.shared.setWatched(true, metaId: id, videoIds: [id],
+                                           name: info.name, type: info.type, poster: info.poster)
+        } else {
+            let recorded = Array(ProfileStore.shared.watchedVideoIds(forMeta: id))
+            guard !recorded.isEmpty else { return }
+            ProfileStore.shared.setWatched(false, metaId: id, videoIds: recorded,
+                                           name: "", type: "", poster: nil)
+        }
     }
 
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
@@ -415,6 +459,10 @@ final class CoreBridge: ObservableObject {
     /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
     /// entries rather than full catalog previews. A no-op if the id isn't in the library.
     func setLibraryItemWatched(id: String, _ isWatched: Bool) {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            overlaySetWatchedById(id, isWatched)   // overlay profile: private history only
+            return
+        }
         dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
     }
 
@@ -440,6 +488,10 @@ final class CoreBridge: ObservableObject {
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
     func setCatalogWatched(metaId: String, _ isWatched: Bool) {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            overlaySetWatchedById(metaId, isWatched)   // overlay profile: private history only
+            return
+        }
         guard let raw = rawMetaPreview(forId: metaId) else { return }
         dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": raw, "is_watched": isWatched]])
     }

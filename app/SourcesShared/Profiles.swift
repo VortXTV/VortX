@@ -336,6 +336,32 @@ final class ProfileStore: ObservableObject {
         return entry.timeOffsetMs > 0 ? Double(entry.timeOffsetMs) / 1000 : 0
     }
 
+    /// Episode ids the active overlay profile has watched for a title; drives the
+    /// detail page's per-profile ticks.
+    func watchedVideoIds(forMeta metaId: String) -> Set<String> {
+        Set(watch[metaId]?.watchedVideoIds ?? [])
+    }
+
+    /// Bulk watched toggle for the detail page's episode, season, and whole-series
+    /// menus on overlay profiles. Engine profiles never come through here.
+    func setWatched(_ isWatched: Bool, metaId: String, videoIds: [String],
+                    name: String, type: String, poster: String?) {
+        guard !videoIds.isEmpty else { return }
+        var entry = watch[metaId] ?? WatchEntry(
+            videoId: nil, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
+            name: name, type: type, poster: poster)
+        if isWatched {
+            for id in videoIds where !entry.watchedVideoIds.contains(id) {
+                entry.watchedVideoIds.append(id)
+            }
+        } else {
+            entry.watchedVideoIds.removeAll { videoIds.contains($0) }
+        }
+        watch[metaId] = entry
+        saveWatchCache()
+        schedulePushWatch()
+    }
+
     func markWatched(meta: PlaybackMeta) {
         var entry = watch[meta.libraryId] ?? WatchEntry(
             videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
