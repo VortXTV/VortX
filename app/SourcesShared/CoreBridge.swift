@@ -105,6 +105,7 @@ final class CoreBridge: ObservableObject {
         if isLoggedIn() {
             refreshFromAPI()
             loadBoard() // addons already hydrated from the engine's own storage
+            scheduleSessionRepair()
             return
         }
         guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
@@ -114,6 +115,23 @@ final class CoreBridge: ObservableObject {
         awaitingAuthMigration = true
         NSLog("[CoreBridge] seeding engine from legacy authKey…")
         dispatchCtx(["action": "PullUserFromAPI", "args": ["token": key]])
+    }
+
+    /// Self-heal a stale engine session. The engine can be "logged in" with a session the API no
+    /// longer honors (it happened in the wild after an account-slot bug): every sync then silently
+    /// returns nothing and the library + Continue Watching sit empty forever. If no account data
+    /// has arrived a while after the launch refresh, re-establish the session from the stored
+    /// token, which makes the engine pull addons + the full library fresh.
+    private func scheduleSessionRepair() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self else { return }
+            let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+            let libraryEmpty = self.library?.catalog.isEmpty ?? true
+            guard self.continueWatching.isEmpty, cwItems.isEmpty, libraryEmpty,
+                  let key = Keychain.string(self.activeTokenAccount), !key.isEmpty else { return }
+            NSLog("[CoreBridge] session present but no account data arrived; re-authenticating with the stored token")
+            self.switchAccount(token: key)
+        }
     }
 
     /// Refresh installed addons + library from api.strem.io (needs an authenticated session).
@@ -144,6 +162,18 @@ final class CoreBridge: ObservableObject {
         clearUserState()
         NSLog("[CoreBridge] switching engine session (profile change)…")
         dispatchCtx(["action": "Authenticate", "args": ["type": "LoginWithToken", "token": token]])
+        // A re-auth into the SAME account never changes the uid, so the uid-watch in handleEvent
+        // cannot see it complete and the cleared UI would stay empty. Refresh unconditionally once
+        // the round trip has had time to land; harmless when the uid-watch already did it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self, self.switchInFlight else { return }
+            self.switchInFlight = false
+            self.switchFromUID = nil
+            NSLog("[CoreBridge] account switch backstop → reloading")
+            self.refreshFromAPI()
+            self.seedInitialState()
+            self.loadBoard()
+        }
     }
 
     /// Log out of the engine (clears the persisted profile + library, and kills the session
