@@ -295,21 +295,24 @@ final class MPVMetalViewController: UIViewController {
         guard range != appliedDynamicRange else { return }
         appliedDynamicRange = range
 
+        // Synchronous breadcrumbs: if any of these statements kills the process
+        // (MoltenVK owns the layer's drawables and mid-stream colorspace changes
+        // are crash-suspect territory), the last line in diagnostics.log names it.
+        let trc = range == .hdr10 ? "pq" : (range == .hlg ? "hlg" : "auto")
+        let prim = range == .sdr ? "auto" : "bt.2020"
+        DiagnosticsLog.logSync("mpv", "applying target-trc=\(trc)")
+        checkError(mpv_set_property_string(handle, "target-trc", trc))
+        DiagnosticsLog.logSync("mpv", "applying target-prim=\(prim)")
+        checkError(mpv_set_property_string(handle, "target-prim", prim))
+        DiagnosticsLog.logSync("mpv", "tagging layer colorspace for \(range.rawValue)")
         switch range {
-        case .hdr10:
-            checkError(mpv_set_property_string(handle, "target-trc", "pq"))
-            checkError(mpv_set_property_string(handle, "target-prim", "bt.2020"))
-            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
-        case .hlg:
-            checkError(mpv_set_property_string(handle, "target-trc", "hlg"))
-            checkError(mpv_set_property_string(handle, "target-prim", "bt.2020"))
-            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
-        case .sdr:
-            checkError(mpv_set_property_string(handle, "target-trc", "auto"))
-            checkError(mpv_set_property_string(handle, "target-prim", "auto"))
-            metalLayer.colorspace = nil
+        case .hdr10: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+        case .hlg:   metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
+        case .sdr:   metalLayer.colorspace = nil
         }
+        DiagnosticsLog.logSync("mpv", "layer colorspace tagged")
         mpvLog.log("output range → \(range.rawValue, privacy: .public) (gamma=\(gamma, privacy: .public) sigPeak=\(sigPeak, privacy: .public))")
+        DiagnosticsLog.log("mpv", "output range → \(range.rawValue) (gamma=\(gamma) sigPeak=\(sigPeak))")
 
 #if os(tvOS)
         HDRDisplayMode.request(range,

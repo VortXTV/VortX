@@ -30,8 +30,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
-        MARKETING_VERSION: "0.2.14"
-        CURRENT_PROJECT_VERSION: "38"
+        MARKETING_VERSION: "0.2.17"
+        CURRENT_PROJECT_VERSION: "44"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -69,11 +69,18 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # AVKit must be an explicit link: the only thing used from it is the
+      # UIWindow.avDisplayManager CATEGORY (no link-time symbols), so autolink
+      # plus the dead-stripping linker silently dropped the framework, the
+      # category never loaded at runtime, and every avDisplayManager access
+      # aborted with an unrecognized selector (sim AND device, 2026-06-10).
+      - sdk: AVKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
-        MARKETING_VERSION: "0.2.14"
-        CURRENT_PROJECT_VERSION: "38"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        MARKETING_VERSION: "0.2.17"
+        CURRENT_PROJECT_VERSION: "44"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist

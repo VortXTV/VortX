@@ -5,6 +5,7 @@ struct StremioTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var presenter = PlayerPresenter()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
@@ -34,6 +35,11 @@ struct StremioTVApp: App {
             .environmentObject(ThemeManager.shared)
             .environmentObject(ProfileStore.shared)
             .preferredColorScheme(.dark)
+            .onChange(of: scenePhase) { _, phase in
+                // Distinguishes "the system suspended us" (an unhandled menu press)
+                // from "we crashed" when a device report says the app vanished.
+                DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
+            }
             .onAppear {
                 // Profile housekeeping (the library repair scan + sync probe) is background work;
                 // delay it so it never competes with the engine boot and the node server's
