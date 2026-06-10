@@ -173,13 +173,12 @@ struct SettingsView: View {
                 HStack(spacing: Theme.Space.md) {
                     ForEach(ThemeManager.accents) { opt in
                         Button { theme.accentID = opt.id } label: {
-                            Circle().fill(opt.base).frame(width: 58, height: 58)
-                                .overlay(Circle().strokeBorder(Theme.Palette.textPrimary,
-                                                               lineWidth: theme.accentID == opt.id ? 5 : 0))
+                            AccentCircle(color: opt.base, selected: theme.accentID == opt.id)
                         }
                         .buttonStyle(CardFocusStyle())
                     }
                 }
+                .padding(.horizontal, Theme.Space.sm)
                 .padding(.vertical, Theme.Space.xs)
             }
             choiceRow("Background", [("warm", "Warm"), ("oled", "OLED Black")],
@@ -268,5 +267,26 @@ struct SettingsView: View {
             Text(value).foregroundStyle(Theme.Palette.textSecondary)
         }
         .font(Theme.Typography.body)
+    }
+}
+
+private struct AccentCircle: View {
+    let color: Color
+    let selected: Bool
+    @Environment(\.isFocused) private var focused
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: 58, height: 58)
+            .overlay(Circle().strokeBorder(ringColor, lineWidth: ringWidth))
+    }
+
+    private var ringColor: Color {
+        focused ? Theme.Palette.accentBright : Theme.Palette.textPrimary
+    }
+
+    private var ringWidth: CGFloat {
+        focused || selected ? 5 : 0
     }
 }
