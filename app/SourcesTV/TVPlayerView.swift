@@ -1159,7 +1159,20 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
         }
 
         override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            stopRepeat(); super.pressesEnded(presses, with: event)
+            stopRepeat()
+            // Swallow the RELEASE of every press type pressesBegan handled, not just
+            // the press itself. Forwarding the menu release to UIKit let the system
+            // act on it anyway and suspend the app to the home screen, intermittently,
+            // raced against the player teardown the menu press had just started.
+            let unhandled = presses.filter {
+                switch $0.type {
+                case .select, .menu, .playPause, .upArrow, .downArrow, .leftArrow, .rightArrow:
+                    return false
+                default:
+                    return true
+                }
+            }
+            if !unhandled.isEmpty { super.pressesEnded(unhandled, with: event) }
         }
         override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
             stopRepeat(); super.pressesCancelled(presses, with: event)
