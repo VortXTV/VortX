@@ -28,9 +28,12 @@ jobs:
           sudo xcode-select -s "$XCODE"
 
       - name: Show toolchain
+        id: toolchain
         run: |
           xcodebuild -version
           xcrun --sdk appletvos --show-sdk-version
+          echo "xcode_version=$(xcodebuild -version | tr ' \n' '-')" >> "$GITHUB_OUTPUT"
+          echo "tvos_sdk=$(xcrun --sdk appletvos --show-sdk-version)" >> "$GITHUB_OUTPUT"
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -53,7 +56,15 @@ jobs:
       - name: Fetch server deps (NodeMobile, server.js, subtitle fonts)
         run: ./scripts/fetch-server-deps.sh
 
+      - name: Cache stremio-core xcframework
+        id: cache-core-xcframework
+        uses: actions/cache@v4
+        with:
+          path: app/Vendor/StremioXCore.xcframework
+          key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
+
       - name: Build the stremio-core xcframework
+        if: steps.cache-core-xcframework.outputs.cache-hit != 'true'
         run: ./scripts/build-core-xcframework.sh
 
       - name: Generate the Xcode project
