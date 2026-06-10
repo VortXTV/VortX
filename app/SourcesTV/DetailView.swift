@@ -47,11 +47,13 @@ struct DetailView: View {
         let watched = profiles.activeUsesEngineHistory
             ? (core.metaDetails?.watchedIds ?? [])
             : profiles.watchedVideoIds(forMeta: meta.id)
-        let primary = seriesPrimaryEpisode(videos, watched: watched)
+        let primary = seriesPrimaryEpisode(videos, watched: watched, metaID: meta.id)
+        let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.xl) {
                     hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
+                         primaryProgress: primaryProgress,
                          scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                     CoreSeasonedEpisodes(meta: meta, videos: videos,
                                          watched: watched,
@@ -101,6 +103,7 @@ struct DetailView: View {
     /// Full-bleed backdrop with a canvas-blended gradient and the title / metadata / synopsis on the
     /// lower band. The serif title is the editorial signature.
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
+                      primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
         ZStack(alignment: .bottomLeading) {
             AsyncImage(url: URL(string: m.background ?? m.poster ?? "")) { phase in
@@ -133,29 +136,39 @@ struct DetailView: View {
                 }
                 // On-screen focusable anchor: grabs initial focus on push (so Back pops instead of
                 // exiting), and jumps to the episodes / sources below.
-                HStack(spacing: Theme.Space.sm) {
-                    if let primaryEpisode {
-                        NavigationLink {
-                            CoreEpisodeStreams(meta: m, video: primaryEpisode,
-                                               season: primaryEpisode.season ?? 0,
-                                               episodes: seasonEpisodes(videos: m.videos ?? [], season: primaryEpisode.season ?? 0))
-                        } label: {
-                            Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume),
-                                  systemImage: "play.fill")
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    HStack(spacing: Theme.Space.sm) {
+                        if let primaryEpisode {
+                            VStack(spacing: Theme.Space.xs) {
+                                NavigationLink {
+                                    CoreEpisodeStreams(meta: m, video: primaryEpisode,
+                                                       season: primaryEpisode.season ?? 0,
+                                                       episodes: seasonEpisodes(videos: m.videos ?? [], season: primaryEpisode.season ?? 0))
+                                } label: {
+                                    Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume),
+                                          systemImage: "play.fill")
+                                }
+                                .buttonStyle(PrimaryActionStyle())
+                                if primaryIsResume, primaryProgress > 0.01 {
+                                    ProgressStripe(value: primaryProgress)
+                                        .padding(.horizontal, Theme.Space.sm)
+                                }
+                            }
+                            .fixedSize(horizontal: true, vertical: false)
                         }
-                        .buttonStyle(PrimaryActionStyle())
-                    }
-                    if primaryEpisode == nil {
-                        Button(action: scrollToContent) {
-                            Label(type == "series" ? "Episodes" : "Watch",
-                                  systemImage: type == "series" ? "list.bullet" : "play.fill")
+                        if primaryEpisode == nil {
+                            Button(action: scrollToContent) {
+                                Label(type == "series" ? "Episodes" : "Watch",
+                                      systemImage: type == "series" ? "list.bullet" : "play.fill")
+                            }
+                            .buttonStyle(PrimaryActionStyle())
+                        } else {
+                            Button(action: scrollToContent) {
+                                Label("Episodes", systemImage: "list.bullet")
+                            }
+                            .buttonStyle(ChipButtonStyle())
                         }
-                        .buttonStyle(PrimaryActionStyle())
-                    } else {
-                        Button(action: scrollToContent) {
-                            Label("Episodes", systemImage: "list.bullet")
-                        }
-                        .buttonStyle(ChipButtonStyle())
+                        Spacer(minLength: 0)
                     }
                 }
                 .padding(.top, Theme.Space.xs)
@@ -183,14 +196,14 @@ struct DetailView: View {
         .foregroundStyle(Theme.Palette.textSecondary)
     }
 
-    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>) -> (video: CoreVideo, isResume: Bool)? {
+    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
         // Resume position: the engine's library entry is account level, so overlay
         // profiles resolve theirs from the profile overlay instead (the same
         // invariant as the ticks and the progress stripes).
         let resume: (videoId: String?, timeOffset: Double) = {
             guard profiles.activeUsesEngineHistory else {
-                let entry = profiles.watch[core.metaDetails?.meta?.id ?? ""]
+                let entry = profiles.watch[metaID]
                 return (entry?.videoId, Double(entry?.timeOffsetMs ?? 0))
             }
             let state = core.metaDetails?.libraryItem?.state
@@ -228,6 +241,17 @@ struct DetailView: View {
             if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
             return $0.id < $1.id
         }
+    }
+
+    private func episodeProgress(_ video: CoreVideo, metaID: String) -> Double {
+        guard profiles.activeUsesEngineHistory else {
+            guard let entry = profiles.watch[metaID], entry.videoId == video.id else { return 0 }
+            return entry.progress
+        }
+        guard let item = core.metaDetails?.libraryItem,
+              item.state.videoId == video.id,
+              item.state.duration > 0 else { return 0 }
+        return min(max(item.state.timeOffset / item.state.duration, 0), 1)
     }
 }
 
