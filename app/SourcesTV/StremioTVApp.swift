@@ -39,6 +39,7 @@ struct StremioTVApp: App {
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
+                if phase == .active { UpdateChecker.shared.checkIfStale() }
             }
             .onAppear {
                 // Profile housekeeping (the library repair scan + sync probe) is background work;

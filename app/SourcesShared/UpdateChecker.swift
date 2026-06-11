@@ -15,7 +15,7 @@ final class UpdateChecker: ObservableObject {
     /// A release newer than the running build, or nil (also nil before/without a check).
     @Published private(set) var available: Release?
 
-    private var checked = false
+    private static let lastCheckedKey = "stremiox.update.lastChecked"
 
     /// The running version, overridable for testing the Settings row
     /// (-stremiox-fake-version 0.1.0).
@@ -25,9 +25,18 @@ final class UpdateChecker: ObservableObject {
         return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
 
-    func checkOnce() {
-        guard !checked else { return }
-        checked = true
+    /// Re-check when the last check is older than maxAge (6h). tvOS apps rarely
+    /// relaunch: they suspend for days, so a once-per-launch check meant a user
+    /// could sit one release behind forever. Called from Settings and on every
+    /// return to the foreground.
+    func checkIfStale(maxAge: TimeInterval = 6 * 3600) {
+        let last = UserDefaults.standard.double(forKey: Self.lastCheckedKey)
+        guard Date().timeIntervalSince1970 - last >= maxAge else { return }
+        check()
+    }
+
+    private func check() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastCheckedKey)
         Task { [weak self] in
             guard let self else { return }
             // /releases/latest excludes drafts and prereleases (the vendor asset
