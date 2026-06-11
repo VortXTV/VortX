@@ -257,9 +257,10 @@ struct ProfileEditorView: View {
                         }
                         .frame(width: 64, height: 64)
                     }
+                    .focusSection()
 
-                    ThemeAccentPicker(selection: $draft.accentID)
-                    ThemeBackgroundPicker(oled: $draft.oled)
+                    ThemeAccentPicker(selection: $draft.accentID).focusSection()
+                    ThemeBackgroundPicker(oled: $draft.oled).focusSection()
 
                     if draft.isOwner {
                         // The owner IS the main account; offering "its own account" here once
@@ -313,6 +314,7 @@ struct ProfileEditorView: View {
                         }
                     }
                     .padding(.top, Theme.Space.md)
+                    .focusSection()
                 }
                 .padding(Theme.Space.screenEdge)
             }
@@ -351,5 +353,9 @@ struct ProfileEditorView: View {
                     .padding(.vertical, Theme.Space.xs / 2)
             }
         }
+        // Treat each row as a focus section so Down always drops to the next row, even when
+        // the focused chip sits far to the right of the item below it. Without this, tvOS does
+        // a strict geometric down-search and refuses to move unless you first level horizontally.
+        .focusSection()
     }
 }
