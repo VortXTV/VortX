@@ -82,6 +82,7 @@ struct ProfilePickerView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                 SecureField("PIN", text: $pinInput)
                     .font(Theme.Typography.body)
+                    .keyboardType(.numberPad)
                     .frame(width: 360)
                     .onChange(of: pinInput) {
                         pinInput = String(pinInput.filter(\.isNumber).prefix(4))
@@ -257,20 +258,8 @@ struct ProfileEditorView: View {
                         .frame(width: 64, height: 64)
                     }
 
-                    row("Accent") {
-                        ForEach(ThemeManager.accents) { option in
-                            Button(option.label) { draft.accentID = option.id }
-                                .buttonStyle(ChipButtonStyle(selected: draft.accentID == option.id,
-                                                             accent: option.base))
-                        }
-                    }
-
-                    row("Background") {
-                        Button("Warm") { draft.oled = false }
-                            .buttonStyle(ChipButtonStyle(selected: !draft.oled))
-                        Button("OLED Black") { draft.oled = true }
-                            .buttonStyle(ChipButtonStyle(selected: draft.oled))
-                    }
+                    ThemeAccentPicker(selection: $draft.accentID)
+                    ThemeBackgroundPicker(oled: $draft.oled)
 
                     if draft.isOwner {
                         // The owner IS the main account; offering "its own account" here once
@@ -298,8 +287,9 @@ struct ProfileEditorView: View {
                     }
 
                     row("PIN") {
-                        TextField("4 digits, empty for none", text: $pinText)
+                        SecureField("4 digits, empty for none", text: $pinText)
                             .font(Theme.Typography.body)
+                            .keyboardType(.numberPad)
                             .frame(width: 600)
                             .onChange(of: pinText) {
                                 pinText = String(pinText.filter(\.isNumber).prefix(4))

@@ -169,22 +169,8 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         section("Appearance") {
-            Text("Accent").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: Theme.Space.md) {
-                    ForEach(ThemeManager.accents) { opt in
-                        Button { theme.accentID = opt.id } label: {
-                            AccentCircle(color: opt.base, selected: theme.accentID == opt.id)
-                        }
-                        .buttonStyle(CardFocusStyle())
-                    }
-                }
-                .padding(.horizontal, Theme.Space.sm)
-                .padding(.vertical, Theme.Space.xs)
-            }
-            choiceRow("Background", [("warm", "Warm"), ("oled", "OLED Black")],
-                      selection: Binding(get: { theme.oled ? "oled" : "warm" },
-                                         set: { theme.oled = ($0 == "oled") }))
+            ThemeAccentPicker(selection: $theme.accentID)
+            ThemeBackgroundPicker(oled: $theme.oled)
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
@@ -280,6 +266,44 @@ struct SettingsView: View {
             Text(value).foregroundStyle(Theme.Palette.textSecondary)
         }
         .font(Theme.Typography.body)
+    }
+}
+
+struct ThemeAccentPicker: View {
+    @Binding var selection: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Accent").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.Space.md) {
+                    ForEach(ThemeManager.accents) { opt in
+                        Button { selection = opt.id } label: {
+                            AccentCircle(color: opt.base, selected: selection == opt.id)
+                        }
+                        .buttonStyle(CardFocusStyle())
+                    }
+                }
+                .padding(.horizontal, Theme.Space.sm)
+                .padding(.vertical, Theme.Space.xs)
+            }
+        }
+    }
+}
+
+struct ThemeBackgroundPicker: View {
+    @Binding var oled: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Background").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            HStack(spacing: Theme.Space.sm) {
+                Button("Warm") { oled = false }
+                    .buttonStyle(ChipButtonStyle(selected: !oled))
+                Button("OLED Black") { oled = true }
+                    .buttonStyle(ChipButtonStyle(selected: oled))
+            }
+        }
     }
 }
 
