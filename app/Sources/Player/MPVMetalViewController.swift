@@ -283,8 +283,19 @@ final class MPVMetalViewController: UIViewController {
     ) {
         var args = [url.absoluteString]
         var options = [String]()
-        
+
         args.append("replace")
+
+        // Size the read-ahead by where the bytes come from. A torrent plays from the embedded server
+        // on 127.0.0.1, which already buffers the file into its OWN disk cache, so a 512 MiB mpv
+        // read-ahead just double-buffers it in RAM. Stacked on the embedded server's own memory, that
+        // drove the whole process RSS up without bound during a torrent (the heartbeat caught it climb
+        // 161 -> 499 MB and still rising) until tvOS jetsam-killed the app -- the "server died" with the
+        // torrent still playing. So a LOCAL (torrent) stream gets a small read-ahead; a remote debrid or
+        // direct CDN keeps the full buffer for network resilience. Set per file at runtime.
+        let isLocalStream = url.host == "127.0.0.1" || url.host == "localhost"
+            || (url.host?.hasSuffix("strem.io") ?? false)
+        mpv_set_property_string(mpv, "demuxer-max-bytes", isLocalStream ? "128MiB" : "512MiB")
 
         if !options.isEmpty {
             args.append(options.joined(separator: ","))
