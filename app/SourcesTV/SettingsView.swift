@@ -6,6 +6,7 @@ struct SettingsView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var updates = UpdateChecker.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
     @State private var editingProfile: UserProfile?
@@ -232,10 +233,22 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         section("About") {
+            if let update = updates.available {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Update available: \(update.name)", systemImage: "arrow.down.circle.fill")
+                        .font(Theme.Typography.body.weight(.semibold))
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text("Sideload the new IPA from the GitHub releases page, your sign-in and settings carry over.")
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .padding(.vertical, Theme.Space.xs)
+            }
             infoRow("Version", appVersion)
             infoRow("Player", "libmpv · MPVKit")
             infoRow("Server", "Stremio streaming server (nodejs-mobile)")
         }
+        .task { updates.checkOnce() }
     }
 
     private var appVersion: String {

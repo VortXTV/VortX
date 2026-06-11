@@ -1,0 +1,67 @@
+import Foundation
+
+/// Once per launch, asks GitHub for the latest release and remembers whether it
+/// is newer than the running build. Sideloaded apps have no update channel, so
+/// this is how users find out a new IPA exists; Settings shows the result.
+@MainActor
+final class UpdateChecker: ObservableObject {
+    static let shared = UpdateChecker()
+
+    struct Release: Equatable {
+        let version: String   // "0.2.23", tag with the leading v stripped
+        let name: String      // release title, e.g. "StremioX 0.2.23"
+    }
+
+    /// A release newer than the running build, or nil (also nil before/without a check).
+    @Published private(set) var available: Release?
+
+    private var checked = false
+
+    /// The running version, overridable for testing the Settings row
+    /// (-stremiox-fake-version 0.1.0).
+    private var currentVersion: String {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-stremiox-fake-version"), i + 1 < args.count { return args[i + 1] }
+        return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+    }
+
+    func checkOnce() {
+        guard !checked else { return }
+        checked = true
+        Task { [weak self] in
+            guard let self else { return }
+            // /releases/latest excludes drafts and prereleases (the vendor asset
+            // release stays invisible here).
+            guard let url = URL(string: "https://api.github.com/repos/mamaclapper/StremioX/releases/latest"),
+                  let (data, response) = try? await URLSession.shared.data(from: url),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let payload = try? JSONDecoder().decode(LatestRelease.self, from: data) else { return }
+            let tag = payload.tagName.hasPrefix("v") ? String(payload.tagName.dropFirst()) : payload.tagName
+            if Self.isVersion(tag, newerThan: self.currentVersion) {
+                self.available = Release(version: tag, name: payload.name ?? tag)
+            }
+        }
+    }
+
+    /// Plain numeric semver comparison; unparseable components count as zero.
+    static func isVersion(_ lhs: String, newerThan rhs: String) -> Bool {
+        let a = lhs.split(separator: ".").map { Int($0) ?? 0 }
+        let b = rhs.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    private struct LatestRelease: Decodable {
+        let tagName: String
+        let name: String?
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case name
+        }
+    }
+}
