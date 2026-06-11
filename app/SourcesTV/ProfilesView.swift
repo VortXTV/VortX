@@ -94,7 +94,7 @@ struct ProfilePickerView: View {
                 HStack(spacing: Theme.Space.md) {
                     Button("Unlock") {
                         guard let target = pinTarget else { return }
-                        if pinInput == target.pin { commit(target) } else { pinWrong = true }
+                        if target.pinMatches(pinInput) { commit(target) } else { pinWrong = true }
                     }
                     .buttonStyle(PrimaryActionStyle())
                     .disabled(pinInput.count != 4)
@@ -215,7 +215,7 @@ struct ProfileEditorView: View {
     init(original: UserProfile) {
         self.original = original
         _draft = State(initialValue: original)
-        _pinText = State(initialValue: original.pin ?? "")
+        _pinText = State(initialValue: "")   // stored PINs are hashes; the field only ever takes a NEW pin
     }
 
     var body: some View {
@@ -287,13 +287,18 @@ struct ProfileEditorView: View {
                     }
 
                     row("PIN") {
-                        SecureField("4 digits, empty for none", text: $pinText)
+                        SecureField(draft.hasPin ? "PIN set. Enter a new one to change it" : "4 digits, empty for none",
+                                    text: $pinText)
                             .font(Theme.Typography.body)
                             .keyboardType(.numberPad)
                             .frame(width: 600)
                             .onChange(of: pinText) {
                                 pinText = String(pinText.filter(\.isNumber).prefix(4))
                             }
+                        if draft.hasPin {
+                            Button("Remove PIN") { draft.pin = nil; pinText = "" }
+                                .buttonStyle(ChipButtonStyle(selected: false))
+                        }
                     }
 
                     HStack(spacing: Theme.Space.md) {
@@ -328,7 +333,10 @@ struct ProfileEditorView: View {
 
     private func save() {
         draft.name = draft.name.trimmingCharacters(in: .whitespaces)
-        draft.pin = pinText.isEmpty ? nil : pinText
+        if !pinText.isEmpty {
+            draft.pin = UserProfile.pinHash(pinText, profileID: draft.id)
+        }
+        // empty field keeps the existing PIN; Remove PIN cleared it explicitly
         if isNew { store.add(draft) } else { store.update(draft) }
         dismiss()
     }
