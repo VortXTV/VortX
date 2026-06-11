@@ -169,9 +169,14 @@ enum StreamRanking {
             if let current = best[label], current.score >= sc { continue }
             best[label] = (sc, s)
         }
-        return best.map { (label: $0.key, stream: $0.value.stream) }
-            .sorted { score($0.stream) > score($1.stream) }
-            .prefix(8).map { $0 }
+        return best.map { entry -> (label: String, stream: CoreStream) in
+            // The dedup key is the flavor; append the chosen stream's size for display.
+            let size = sourceDetail(entry.value.stream).size
+            let label = size.map { "\(entry.key)  ·  \($0)" } ?? entry.key
+            return (label: label, stream: entry.value.stream)
+        }
+        .sorted { score($0.stream) > score($1.stream) }
+        .prefix(8).map { $0 }
     }
 
     private static func tier(of s: CoreStream) -> String {

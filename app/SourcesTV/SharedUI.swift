@@ -402,6 +402,7 @@ struct PosterCard: View {
     var menu: PosterMenu = .none
     var onFocus: (() -> Void)? = nil   // browse pages report focus to drive the hero backdrop
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
+    var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
 
     var body: some View {
         if menu == .none {
@@ -452,6 +453,11 @@ struct PosterCard: View {
         case .none:
             EmptyView()
         case .continueWatching:
+            if let onDetails {
+                Button(action: onDetails) {
+                    Label("Details", systemImage: "info.circle")
+                }
+            }
             Button(role: .destructive) {
                 CoreBridge.shared.removeFromLibrary(id: id)
             } label: {

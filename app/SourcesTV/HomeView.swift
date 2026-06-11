@@ -101,6 +101,9 @@ struct RailHeader: View {
     }
 }
 
+/// Target for opening a full detail page from a Continue Watching card's long-press menu.
+struct CWDetailTarget: Identifiable, Hashable { let id: String; let type: String }
+
 /// "Continue Watching" rail from the engine (`continue_watching_preview`), newest first, with a
 /// resume-progress stripe on each poster.
 struct CoreContinueWatchingRow: View {
@@ -110,6 +113,7 @@ struct CoreContinueWatchingRow: View {
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
+    @State private var detailTarget: CWDetailTarget?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -123,7 +127,8 @@ struct CoreContinueWatchingRow: View {
                                    onFocus: focusModel.map { model in
                                        { model.focus(item.focusedHero) }
                                    },
-                                   directPlay: directResume(item))
+                                   directPlay: directResume(item),
+                                   onDetails: { detailTarget = CWDetailTarget(id: item.id, type: item.type) })
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -131,6 +136,7 @@ struct CoreContinueWatchingRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .navigationDestination(item: $detailTarget) { DetailView(type: $0.type, id: $0.id) }
     }
 
     /// Continue Watching resumes the exact link that was playing last time, straight

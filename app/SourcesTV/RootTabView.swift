@@ -49,9 +49,13 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
+            // Brand canvas behind everything, so the moment between the splash fading
+            // and the profile picker animating in shows the app's own background, never
+            // a flash of the main profile's Home underneath.
+            Theme.Palette.canvas.ignoresSafeArea()
             RootTabView()
-                .opacity(presenter.request == nil ? 1 : 0)
-                .disabled(presenter.request != nil)
+                .opacity(shellVisible ? 1 : 0)
+                .disabled(!shellVisible)
             if let req = presenter.request {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
@@ -78,6 +82,13 @@ struct RootView: View {
 
     /// Cold start with a real choice, or Settings' "Switch Profile". Dismissing with Menu counts
     /// as picking the current profile, so the binding's setter just marks the launch as picked.
+    /// Home stays hidden until a profile is settled: while the picker is owed (more
+    /// than one profile, none chosen this launch) the shell is invisible, so nothing
+    /// of the main profile leaks out before the picker arrives.
+    private var shellVisible: Bool {
+        presenter.request == nil && !profiles.needsPicker
+    }
+
     private var pickerPresented: Binding<Bool> {
         Binding(
             get: { splashDone && profiles.needsPicker && presenter.request == nil },
