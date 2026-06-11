@@ -1164,25 +1164,7 @@ struct TVPlayerView: View {
     private func prepareTorrent(_ stream: CoreStream) {
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
               let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
-        var sources = stream.sources ?? []
-        sources.append("dht:\(hash)")
-        // UDP is dead in the embedded node on device (DHT pings go unanswered), and
-        // add-ons hand out almost exclusively udp:// trackers. The big public
-        // trackers answer the same announce over HTTP on the same port, so query
-        // every udp tracker's HTTP twin too; that is where the real swarms are.
-        let httpTwins = sources.compactMap { entry -> String? in
-            guard entry.hasPrefix("tracker:udp://") else { return nil }
-            let body = entry.dropFirst("tracker:udp://".count)
-            guard let hostPort = body.split(separator: "/").first, !hostPort.isEmpty else { return nil }
-            return "tracker:http://\(hostPort)/announce"
-        }
-        sources.append(contentsOf: httpTwins)
-        sources.append(contentsOf: [
-            "tracker:http://tracker.opentrackr.org:1337/announce",
-            "tracker:http://open.acgnxtracker.com:80/announce",
-            "tracker:http://tracker.files.fm:6969/announce",
-            "tracker:http://tracker.bt4g.com:2095/announce",
-        ])
+        let sources = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)
         let body: [String: Any] = ["torrent": ["infoHash": hash],
                                    "peerSearch": ["sources": sources, "min": 40, "max": 150]]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }

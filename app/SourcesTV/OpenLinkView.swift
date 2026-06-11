@@ -111,22 +111,9 @@ enum LinkOpener {
     /// metadata is in (it needs at least one peer), with the file list; pick the
     /// biggest video file.
     static func resolveMagnet(_ magnet: Magnet) async -> (url: URL, fileName: String)? {
-        var sources = magnet.trackers
-        sources.append("dht:\(magnet.infoHash)")
-        // The same UDP-free fallback as the player: HTTP twins of the udp trackers
-        // plus the big public HTTP trackers (UDP is unavailable on device).
-        sources.append(contentsOf: magnet.trackers.compactMap { entry -> String? in
-            guard entry.hasPrefix("tracker:udp://") else { return nil }
-            let body = entry.dropFirst("tracker:udp://".count)
-            guard let hostPort = body.split(separator: "/").first, !hostPort.isEmpty else { return nil }
-            return "tracker:http://\(hostPort)/announce"
-        })
-        sources.append(contentsOf: [
-            "tracker:http://tracker.opentrackr.org:1337/announce",
-            "tracker:http://open.acgnxtracker.com:80/announce",
-            "tracker:http://tracker.files.fm:6969/announce",
-            "tracker:http://tracker.bt4g.com:2095/announce",
-        ])
+        let sources = TorrentTrackers.sources(forHash: magnet.infoHash,
+                                              streamSources: nil,
+                                              addonTrackers: magnet.trackers)
         guard let createURL = URL(string: "\(StremioServer.base)/\(magnet.infoHash)/create") else { return nil }
         var request = URLRequest(url: createURL)
         request.httpMethod = "POST"
