@@ -67,6 +67,24 @@ enum NodeServer {
         process.on('unhandledRejection',function(e){w('[rej]',[e&&e.stack||e])});
         w('[boot]',['preload active']);
 
+        // Boot probes: which outbound layers work in this node build? (UDP probe
+        // result on device: ping "sent", no pong ever. These narrow it further.)
+        (function(){
+          function probeHttp(mod, name, url){ try {
+            var req = mod.get(url, function(res){ w('[probe]', [name + ' OK: HTTP ' + res.statusCode]); res.resume(); });
+            req.on('error', function(e){ w('[probe]', [name + ' ERROR: ' + e]); });
+            req.setTimeout(8000, function(){ w('[probe]', [name + ' TIMEOUT']); try{req.destroy()}catch(_){} });
+          } catch(e){ w('[probe]', [name + ' THREW: ' + e]); } }
+          probeHttp(require('https'), 'outbound HTTPS (strem.io)', 'https://www.strem.io/');
+          probeHttp(require('http'), 'outbound HTTP (opentrackr:1337)', 'http://tracker.opentrackr.org:1337/announce');
+          try {
+            var net = require('net');
+            var c = net.connect({ host: 'one.one.one.one', port: 80 }, function(){ w('[probe]', ['outbound TCP OK (one.one.one.one:80)']); c.destroy(); });
+            c.setTimeout(8000, function(){ w('[probe]', ['outbound TCP TIMEOUT']); c.destroy(); });
+            c.on('error', function(e){ w('[probe]', ['outbound TCP ERROR: ' + e]); });
+          } catch(e){ w('[probe]', ['TCP THREW: ' + e]); }
+        })();
+
         // Boot probe: is UDP (dgram) functional in this node build? BitTorrent peer
         // discovery is UDP-first (DHT, udp trackers); a broken dgram on the device
         // slice would explain torrents finding zero peers while HTTP works fine.
