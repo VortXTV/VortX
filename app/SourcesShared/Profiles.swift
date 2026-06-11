@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// One viewer of the app: local view settings (name, avatar, theme, parental PIN) plus an optional
 /// binding to its own Stremio account. Profiles without their own account share the primary one,
@@ -17,6 +18,22 @@ struct UserProfile: Codable, Identifiable, Equatable {
     var isOwner: Bool = false
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
+
+    /// Salted hash for a PIN, stored instead of the raw digits so a PIN can be
+    /// changed but never read back. The salt is the profile id, which is stable
+    /// across devices, so hashed PINs survive roster sync.
+    static func pinHash(_ raw: String, profileID: UUID) -> String {
+        let digest = SHA256.hash(data: Data("\(profileID.uuidString):\(raw)".utf8))
+        return "sha256:" + digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Whether the input unlocks this profile. Accepts hashed entries and the
+    /// legacy plaintext ones from rosters saved before hashing existed.
+    func pinMatches(_ input: String) -> Bool {
+        guard let stored = pin, !stored.isEmpty else { return true }
+        if stored.hasPrefix("sha256:") { return stored == Self.pinHash(input, profileID: id) }
+        return stored == input
+    }
     /// Whether this profile's history is the account library itself (the owner, and any profile on
     /// its own account) or a private synced overlay (every other shared profile).
     var usesEngineHistory: Bool { isOwner || usesOwnAccount }
@@ -74,6 +91,7 @@ final class ProfileStore: ObservableObject {
     private init() {
         load()
         if profiles.isEmpty { migrateFromSingleAccount() }
+        hashLegacyPins()
         // Rosters saved before history separation existed have no owner; the migrated first
         // profile is the account's main one.
         if !profiles.contains(where: { $0.isOwner }), !profiles.isEmpty {
@@ -199,6 +217,19 @@ final class ProfileStore: ObservableObject {
 
     /// `touch` marks a real roster edit (add/update/remove): it bumps the local modification time
     /// and schedules a push, so the roster follows the account to other devices.
+    /// One-time migration: rosters from before PIN hashing carry raw digits;
+    /// replace them with salted hashes on first load.
+    private func hashLegacyPins() {
+        var changed = false
+        for i in profiles.indices {
+            if let raw = profiles[i].pin, !raw.isEmpty, !raw.hasPrefix("sha256:") {
+                profiles[i].pin = UserProfile.pinHash(raw, profileID: profiles[i].id)
+                changed = true
+            }
+        }
+        if changed { persist(touch: false) }
+    }
+
     private func persist(touch: Bool = true) {
         if let data = try? JSONEncoder().encode(profiles) {
             UserDefaults.standard.set(data, forKey: Self.listKey)
