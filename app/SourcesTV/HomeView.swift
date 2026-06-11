@@ -140,6 +140,7 @@ struct CoreContinueWatchingRow: View {
     private func directResume(_ item: CoreCWItem) -> (() -> Void)? {
         guard let entry = LastStreamStore.entry(for: item.id, profileID: profiles.activeID),
               let url = URL(string: entry.url) else { return nil }
+        if PlaybackSettings.torrentsDisabled && entry.torrent == true { return nil }
         if item.type == "series", let cwVideo = item.state.videoId, cwVideo != entry.videoId { return nil }
         return {
             presenter.request = PlaybackRequest(

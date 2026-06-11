@@ -1,5 +1,29 @@
 import Foundation
 
+enum PlaybackSettings {
+    enum Key {
+        static let directLinksOnly = "stremiox.directLinksOnly"
+    }
+
+    static var directLinksOnlyForced: Bool {
+        #if STREMIOX_NO_EMBEDDED_SERVER
+        true
+        #else
+        false
+        #endif
+    }
+
+    static var directLinksOnly: Bool {
+        #if STREMIOX_NO_EMBEDDED_SERVER
+        true
+        #else
+        UserDefaults.standard.bool(forKey: Key.directLinksOnly)
+        #endif
+    }
+
+    static var torrentsDisabled: Bool { directLinksOnly }
+}
+
 /// What audio and subtitle track the player should pick automatically. Persisted in UserDefaults and
 /// shared by the iOS and tvOS players; configured from tvOS Settings, with sensible defaults until then.
 struct TrackPreferences: Equatable {

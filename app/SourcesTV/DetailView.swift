@@ -550,9 +550,10 @@ struct CoreStreamList: View {
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
+    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
-        let groups = StreamRanking.rankedGroups(core.streamGroups())   // best source first within each add-on
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()))   // best source first within each add-on
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
@@ -673,6 +674,15 @@ struct CoreStreamList: View {
         }
     }
 
+    private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        guard directLinksOnly else { return groups }
+        return groups.compactMap { group in
+            let streams = group.streams.filter { !$0.isTorrent }
+            guard !streams.isEmpty else { return nil }
+            return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
+        }
+    }
+
     /// Play a stream by handing a request to the root, which swaps the whole shell out for the player
     /// (the only reliable tvOS focus isolation — see RootView). Wires the engine + prepares torrents first.
     private func play(_ stream: CoreStream) {
@@ -744,6 +754,7 @@ struct CoreStreamList: View {
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.
     private func prepareTorrent(_ stream: CoreStream) {
+        guard !PlaybackSettings.torrentsDisabled else { return }
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
               let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
         var sources = stream.sources ?? []

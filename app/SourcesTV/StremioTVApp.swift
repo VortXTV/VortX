@@ -11,9 +11,12 @@ struct StremioTVApp: App {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
-        if !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
+        #if !STREMIOX_NO_EMBEDDED_SERVER
+        if !PlaybackSettings.torrentsDisabled,
+           !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
         }
+        #endif
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()

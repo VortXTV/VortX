@@ -266,6 +266,7 @@ struct CoreStream: Decodable, Identifiable {
     /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
     var playableURL: URL? {
         if let url, let parsed = URL(string: url) { return parsed }
+        guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let hash = infoHash?.lowercased() else { return nil }
         return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
     }

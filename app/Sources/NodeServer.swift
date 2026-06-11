@@ -13,6 +13,7 @@ enum NodeServer {
 
     /// One-line state for the Settings diagnostics.
     static var statusDescription: String {
+        if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if !started { return "Not started (server.js missing from the bundle)" }
         if let code = exitCode { return "Server exited with code \(code). Relaunch the app to restart it." }
         return "Server process running"

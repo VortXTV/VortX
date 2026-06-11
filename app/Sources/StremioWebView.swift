@@ -133,6 +133,10 @@ struct StremioWebView: UIViewRepresentable {
         /// libmpv reaches http://127.0.0.1:11470 directly (not a web context, no mixed-content,
         /// which is why this can't be done from the WKWebView's JS).
         private func handleTorrent(infoHash: String, fileIdx: Int?, sources: [String]) {
+            guard !PlaybackSettings.torrentsDisabled else {
+                log.info("torrent capture ignored: Direct Links Only is enabled")
+                return
+            }
             let ih = infoHash.lowercased()
             let base = "http://127.0.0.1:11470"
             var srcs = sources
