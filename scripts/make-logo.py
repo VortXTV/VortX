@@ -130,5 +130,25 @@ save(draw_icon(1024, rounded=False).convert("RGB"),
 lockup(1600, 400, os.path.join(ROOT, "docs/logo-light.png"), TEXT_GRAY)
 lockup(1600, 400, os.path.join(ROOT, "docs/logo-dark.png"), TEXT_LIGHT)
 
-# Standalone app icon (rounded, transparent corners): the linkable brand file.
+# Standalone app icon (rounded, transparent corners): the linkable brand file,
+# and the file to upload as the GitHub account avatar.
 save(draw_icon(1024, rounded=True), os.path.join(ROOT, "docs/brand/app-icon.png"))
+
+# GitHub social preview (1280x640): what link embeds show on Reddit and the rest.
+# Upload at repo Settings > General > Social preview.
+social = Image.new("RGBA", (1280, 640), INDIGO + (255,))
+_icon = draw_icon(300)
+_font = ImageFont.truetype(_HELVETICA, 150, index=1)
+_d = ImageDraw.Draw(social)
+_tw = _d.textlength("Stremio", font=_font)
+_xw = _d.textlength("X", font=_font)
+_total = 300 + 56 + _tw + _xw
+_x = (1280 - _total) / 2
+social.alpha_composite(_icon, (int(_x), 138))
+_d.text((_x + 356, 195), "Stremio", font=_font, fill=TEXT_LIGHT)
+_d.text((_x + 356 + _tw, 195), "X", font=_font, fill=VIOLET_LIGHT)
+_sub = ImageFont.truetype(_HELVETICA, 40, index=0)
+_caption = "Stremio for Apple TV, iPhone, and iPad. Updated, native, free."
+_cw = _d.textlength(_caption, font=_sub)
+_d.text(((1280 - _cw) / 2, 425), _caption, font=_sub, fill=(170, 165, 190, 255))
+save(social.convert("RGB"), os.path.join(ROOT, "docs/brand/social-preview.png"))
