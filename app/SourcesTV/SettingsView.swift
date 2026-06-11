@@ -269,8 +269,8 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         section("Appearance") {
-            ThemeAccentPicker(selection: $theme.accentID)
-            ThemeBackgroundPicker(oled: $theme.oled)
+            ThemeAccentPicker(selection: $theme.accentID).focusSection()
+            ThemeBackgroundPicker(oled: $theme.oled).focusSection()
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
@@ -321,6 +321,9 @@ struct SettingsView: View {
                 }
             }
         }
+        // Each row is its own focus section so Down moves between stacked rows (e.g. Size ->
+        // Color -> Background) without first leveling onto the chip beneath the focused one.
+        .focusSection()
     }
 
     // MARK: About
