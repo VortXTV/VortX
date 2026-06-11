@@ -23,7 +23,7 @@ unzip -q /tmp/nodemobile.zip -d app/Vendor/nodejs-mobile
 #      c) /Applications/Stremio.app (typical install)
 #      d) Stremio's public CDN (no local install needed)
 SERVER_DEST="app/Resources/server.js"
-SERVER_VERSION="${STREMIO_SERVER_VERSION:-4.20.17}"
+SERVER_VERSION="${STREMIO_SERVER_VERSION:-4.21.0}"
 found=""
 for candidate in "${STREMIO_APP:-}" "reference/macos/Stremio.app" "/Applications/Stremio.app"; do
     if [ -n "$candidate" ] && [ -f "$candidate/Contents/MacOS/server.js" ]; then
