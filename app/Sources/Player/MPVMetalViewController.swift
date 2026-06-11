@@ -598,12 +598,11 @@ final class MPVMetalViewController: UIViewController {
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
-                                // Emit the play head at 2 Hz, not per frame. Each emit re-renders the
-                                // player view, which competes with decode and remote-input handling for
-                                // the main thread. On weak hardware (Apple TV HD, A8, no HEVC hardware
-                                // decode) that contention is what makes the remote feel frozen during
-                                // playback. 0.5 s is imperceptible on a clock and halves the churn.
-                                if now - self.lastTimePosEmit >= 0.5 {
+                                // Coalesce the play head to ~4 Hz (mpv fires this per decoded frame):
+                                // smooth on the progress bar without re-rendering the player every frame.
+                                // Kept at 4 Hz, not dropped lower, so play-head smoothness is never traded
+                                // away for weak-hardware savings.
+                                if now - self.lastTimePosEmit >= 0.25 {
                                     self.lastTimePosEmit = now
                                     self.emit(propertyName, value)
                                 }

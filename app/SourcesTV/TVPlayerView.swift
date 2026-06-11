@@ -509,7 +509,10 @@ struct TVPlayerView: View {
             }
             .frame(maxHeight: .infinity, alignment: .center)
             .animation(.easeOut(duration: 0.15), value: focused)
-            .animation(.easeOut(duration: 0.12), value: frac)
+            // Linear so consecutive scrub steps blend into one continuous glide instead of each easing
+            // out and stuttering against the next; slightly longer when not scrubbing so the play head
+            // drifts smoothly between the position updates.
+            .animation(scrubbing ? .linear(duration: 0.16) : .linear(duration: 0.28), value: frac)
         }
         .frame(height: 28)
     }
@@ -1365,7 +1368,11 @@ struct TVPlayerView: View {
         if !scrubbing {
             scrubbing = true; scrubTarget = currentTime; scrubStep = 10
         } else if now - lastScrubAt < 0.4 {
-            scrubStep = min(scrubStep * 1.6, 120)        // accelerate while moving fast / holding
+            // Gentle LINEAR ramp while holding. The old 1.6x exponential hit the 120s cap in a few
+            // repeats, so a brief hold flung the play head by wildly different amounts each press,
+            // which is the "jumps randomly" feel. A fixed +6 grows predictably and tops out lower, so
+            // a hold glides across the timeline at a controllable, even pace.
+            scrubStep = min(scrubStep + 6, 75)
         } else {
             scrubStep = 10                               // paused between presses → back to fine steps
         }
