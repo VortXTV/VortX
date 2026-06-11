@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import Libmpv
+import AVFoundation
 import os
 
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
@@ -100,7 +101,24 @@ final class MPVMetalViewController: UIViewController {
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
     #endif
 
+    /// tvOS and iOS default the audio session to `soloAmbient`, which does not reliably route to
+    /// an external receiver or soundbar over HDMI eARC: some setups get NO audio at all while the
+    /// system and other apps play fine (reported on Apple TV 4K + eARC soundbar, while the same
+    /// hardware has sound in other players). A video player must claim `.playback`; `.moviePlayback`
+    /// mode also lets multichannel PCM (decoded TrueHD / DTS-HD / Atmos) reach the receiver. Set
+    /// before mpv's audio output is created.
+    private func configureAudioSession() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .moviePlayback, options: [])
+            try session.setActive(true)
+        } catch {
+            mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     func setupMpv() {
+        configureAudioSession()
         mpv = mpv_create()
         if mpv == nil {
             print("failed creating context\n")
