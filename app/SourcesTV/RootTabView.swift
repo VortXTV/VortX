@@ -15,6 +15,9 @@ struct PlaybackRequest: Identifiable {
     /// True when the stream rides the embedded torrent engine, which needs warm-up
     /// patience the player gives it.
     var torrent: Bool = false
+    /// The add-on's release-group tag for the playing stream, so auto-next can lock
+    /// the next episode to the same release.
+    var bingeGroup: String? = nil
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -45,7 +48,7 @@ struct RootView: View {
                 .disabled(presenter.request != nil)
             if let req = presenter.request {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
-                             sourceHint: req.sourceHint, torrent: req.torrent,
+                             sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }

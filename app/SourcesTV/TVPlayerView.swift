@@ -13,6 +13,7 @@ struct TVPlayerView: View {
     var episodes: [CoreVideo] = []             // series' ordered episodes (empty for movies) → Next/Prev/list
     var sourceHint: String? = nil              // quality signature of the launching stream (source continuity)
     var torrent: Bool = false                  // stream rides the embedded torrent engine (gets warm-up patience)
+    var bingeGroup: String? = nil              // the launching stream's release-group tag, for sticky auto-next
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     @EnvironmentObject private var account: StremioAccount
@@ -65,6 +66,14 @@ struct TVPlayerView: View {
     @State private var preloadingID: String?
     @State private var warmedID: String?               // next episode whose source was pre-warmed
     @State private var curHint: String?                // quality signature of what is playing now
+    @State private var curBinge: String?               // bingeGroup of what is playing now (drives sticky auto-next)
+    // Mid-playback stall recovery: a watchdog reloads the stream in place when the
+    // position freezes while NOT buffering or paused (the black-screen / hard-stall
+    // case), bounded so a genuinely dead source still falls through to the overlay.
+    @State private var stallWatchdog: Task<Void, Never>?
+    @State private var lastObservedTime = -1.0
+    @State private var stalledTicks = 0
+    @State private var stallRecoveries = 0
     // Direct-resume launches (Continue Watching) start without an episode list;
     // it loads in the background so Next/auto-advance still work.
     @State private var loadedEpisodes: [CoreVideo] = []
@@ -183,6 +192,8 @@ struct TVPlayerView: View {
         .onAppear {
             if curURL == nil { curURL = url; curTitle = title; curMeta = meta; curIsTorrent = torrent }   // seed from initial
             if curHint == nil { curHint = sourceHint }
+            if curBinge == nil { curBinge = bingeGroup }
+            startStallWatchdog()
             if episodes.isEmpty, let m = curMeta, m.type == "series", loadedEpisodes.isEmpty {
                 // Direct resume launched without the episode list; fetch it behind
                 // playback so Next, the episode panel, and auto-advance still work.
@@ -212,7 +223,7 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
-            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel()
             saveProgress(at: currentTime)
             core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position to the engine
             UIApplication.shared.isIdleTimerDisabled = false   // let the screensaver resume once the player closes
@@ -225,7 +236,12 @@ struct TVPlayerView: View {
         if loadFailed {
             switch type {
             case .menu: saveProgress(at: currentTime); onClose()
-            case .select, .playPause: retryLoad()
+            case .select:
+                if !core.streamGroups().isEmpty {     // jump straight to another source
+                    withAnimation { loadFailed = false }
+                    openPanel(.sources)
+                } else { retryLoad() }
+            case .playPause: retryLoad()
             default: break
             }
             return
@@ -650,7 +666,8 @@ struct TVPlayerView: View {
         closePanel()
         curURL = newURL
         curIsTorrent = stream.isTorrent
-        torrentWarmupsUsed = 0; torrentStatus = nil
+        curBinge = stream.behaviorHints?.bingeGroup
+        torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         prepareTorrent(stream)   // mid-playback switches never announced the torrent before
         resumeSeconds = currentTime
         appliedResume = false
@@ -793,12 +810,57 @@ struct TVPlayerView: View {
                      : "It may be unavailable, offline, or unsupported.  (\(loadErrorMsg))")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 900)
-                Text("Menu = back to sources    ·    Play/Pause = retry")
+                Text("Select = choose another source    ·    Play/Pause = retry    ·    Menu = back")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary).padding(.top, Theme.Space.xs)
             }
             .padding(Theme.Space.screenEdge)
         }
         .transition(.opacity)
+    }
+
+    /// Watch for a hard stall: the position frozen while NOT paused and NOT
+    /// buffering. mpv's own cache stalls set buffering, so this fires only on the
+    /// freeze/black-screen case, and reloads in place at the current position.
+    private func startStallWatchdog() {
+        stallWatchdog?.cancel()
+        lastObservedTime = -1; stalledTicks = 0
+        stallWatchdog = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(6))
+                guard hasStartedPlaying, !isPaused, !buffering, !loadFailed, duration > 0 else {
+                    lastObservedTime = currentTime; stalledTicks = 0; continue
+                }
+                if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
+                    stalledTicks += 1
+                    if stalledTicks >= 3 {            // ~18s frozen with no buffering -> recover
+                        stalledTicks = 0
+                        recoverFromStall()
+                    }
+                } else {
+                    stalledTicks = 0
+                    stallRecoveries = 0               // sustained good playback clears the budget
+                }
+                lastObservedTime = currentTime
+            }
+        }
+    }
+
+    private func recoverFromStall() {
+        guard stallRecoveries < 3 else {
+            // Repeated stalls on the same source: stop reloading and let the viewer
+            // pick another source from the error overlay.
+            DiagnosticsLog.log("player", "stall recovery exhausted, showing error overlay")
+            loadErrorMsg = "Playback kept stalling on this source."
+            withAnimation { loadFailed = true }
+            return
+        }
+        stallRecoveries += 1
+        plog.info("mid-playback stall, reloading at \(currentTime, privacy: .public)")
+        DiagnosticsLog.log("player", "mid-playback stall \(stallRecoveries), reloading at \(Int(currentTime))s")
+        resumeSeconds = currentTime
+        appliedResume = false; appliedAutoTracks = false
+        buffering = true
+        coordinator.player?.loadFile(curURL ?? url)
     }
 
     private func startLoadTimeout() {
@@ -1036,8 +1098,10 @@ struct TVPlayerView: View {
             preloaded = nil
             warmedID = nil
             curHint = pre.signature
+            curBinge = pre.bingeGroup
             curIsTorrent = pre.stream.isTorrent
             torrentWarmupsUsed = 0; torrentStatus = nil
+            stallRecoveries = 0
             plog.info("episode switch: playing preloaded best source")
             prepareTorrent(pre.stream)
             curURL = u
@@ -1094,7 +1158,7 @@ struct TVPlayerView: View {
     /// The next episode's best stream, resolved in the background mid-episode. Fetched over the
     /// add-on HTTP protocol directly so the engine's `meta_details` (which the screen behind the
     /// player still shows) is never disturbed.
-    private struct PreloadedEpisode { let episodeID: String; let stream: CoreStream; let signature: String }
+    private struct PreloadedEpisode { let episodeID: String; let stream: CoreStream; let signature: String; let bingeGroup: String? }
 
     /// Kick off the preload once per episode, triggered when playback crosses the halfway mark.
     private func preloadNextIfNeeded() {
@@ -1117,8 +1181,9 @@ struct TVPlayerView: View {
             let order = Dictionary(sources.enumerated().map { ($1.base, $0) },
                                    uniquingKeysWith: { first, _ in first })
             groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
-            if let best = StreamRanking.best(groups, continuity: curHint) {
-                preloaded = PreloadedEpisode(episodeID: next.id, stream: best, signature: StreamRanking.signature(best))
+            if let best = StreamRanking.best(groups, continuity: curHint, binge: curBinge) {
+                preloaded = PreloadedEpisode(episodeID: next.id, stream: best, signature: StreamRanking.signature(best),
+                                             bingeGroup: best.behaviorHints?.bingeGroup)
                 plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(next.id, privacy: .public)")
             } else {
                 plog.info("preload found nothing for \(next.id, privacy: .public)")

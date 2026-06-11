@@ -153,6 +153,10 @@ final class MPVMetalViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "hwdec", hwdec))
         mpvLog.log("hwdec = \(hwdec, privacy: .public)")
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
+        // Quality tone curve for any HDR -> SDR mapping (used when the Dolby Vision /
+        // HDR compatibility toggle forces SDR output for displays that show DV P7
+        // remuxes as green/purple garbage). Harmless for native SDR content.
+        checkError(mpv_set_option_string(mpv, "tone-mapping", "bt.2446a"))
         // Apply the saved video-size mode up front so the first frame is sized correctly + uniformly.
         applyVideoSize { self.checkError(mpv_set_option_string(self.mpv, $0, $1)) }
 
@@ -284,12 +288,19 @@ final class MPVMetalViewController: UIViewController {
     private func syncDisplayDynamicRange(sigPeak: Double) {
         guard let handle = mpv else { return }
         let gamma = getString(MPVProperty.videoParamsGamma) ?? ""
-        let range: ContentDynamicRange
+        var range: ContentDynamicRange
         if gamma == "hlg" {
             range = .hlg
         } else if gamma == "pq" || sigPeak > 1.0 {
             range = .hdr10
         } else {
+            range = .sdr
+        }
+        // Dolby Vision / HDR compatibility: when on, render HDR and DV as tone-mapped
+        // SDR instead of switching the display into HDR. Fixes DV Profile 7 dual-layer
+        // remuxes that come out green/purple on setups that mishandle the base layer.
+        if UserDefaults.standard.bool(forKey: "stremiox.forceSDRTonemap"), range != .sdr {
+            DiagnosticsLog.log("mpv", "HDR compatibility on -> tone-mapping \(range.rawValue) to SDR")
             range = .sdr
         }
         guard range != appliedDynamicRange else { return }
