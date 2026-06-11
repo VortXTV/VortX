@@ -374,10 +374,17 @@ final class CoreBridge: ObservableObject {
         return (loaded, total)
     }
 
+    /// Cache of the addon transportUrl -> name map. Decoding the whole `ctx` JSON to build
+    /// it ran on EVERY streamGroups() call, which the DetailView and player source panel hit
+    /// per render. Built once, reused, and invalidated on the main actor whenever `ctx`
+    /// changes (handleEvent). Main-actor only: addonNamesByBase is called from view code.
+    private var addonNamesCache: [String: String]?
     private func addonNamesByBase() -> [String: String] {
+        if let cached = addonNamesCache { return cached }
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [:] }
         var map: [String: String] = [:]
         for addon in ctx.profile.addons { map[addon.transportUrl] = addon.manifest.name }
+        addonNamesCache = map   // only cache a real result; an empty decode retries next call
         return map
     }
 
@@ -748,7 +755,10 @@ final class CoreBridge: ObservableObject {
             let rows = buildBoardRows()
             DispatchQueue.main.async { [weak self] in self?.boardRows = rows }
         }
-        if fields.contains("ctx") { refreshAddons() }
+        if fields.contains("ctx") {
+            DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
+            refreshAddons()
+        }
         if fields.contains("meta_details") {
             let details = decode(CoreMetaDetails.self, field: "meta_details")
             DispatchQueue.main.async { [weak self] in self?.metaDetails = details }
