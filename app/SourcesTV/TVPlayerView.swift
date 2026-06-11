@@ -1097,6 +1097,7 @@ struct TVPlayerView: View {
         if let pre = preloaded, pre.episodeID == v.id, let u = pre.stream.playableURL {
             preloaded = nil
             warmedID = nil
+            DiagnosticsLog.log("binge", "auto-next PRELOAD: wanted binge=\(curBinge ?? "nil") got=\(pre.bingeGroup ?? "nil") name=\(pre.stream.name?.prefix(60) ?? "")")
             curHint = pre.signature
             curBinge = pre.bingeGroup
             curIsTorrent = pre.stream.isTorrent
@@ -1137,7 +1138,10 @@ struct TVPlayerView: View {
                 let settled = progress.total > 0 && progress.loaded == progress.total
                 let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
                 if settled || waitedEnough,
-                   let s = StreamRanking.best(groups), let u = s.playableURL {
+                   let s = StreamRanking.best(groups, continuity: curHint, binge: curBinge), let u = s.playableURL {
+                    DiagnosticsLog.log("binge", "auto-next FALLBACK: wanted binge=\(curBinge ?? "nil") got=\(s.behaviorHints?.bingeGroup ?? "nil") name=\(s.name?.prefix(60) ?? "")")
+                    curBinge = s.behaviorHints?.bingeGroup
+                    curHint = StreamRanking.signature(s)
                     core.loadEnginePlayer(for: s)
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
@@ -1181,6 +1185,8 @@ struct TVPlayerView: View {
             let order = Dictionary(sources.enumerated().map { ($1.base, $0) },
                                    uniquingKeysWith: { first, _ in first })
             groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
+            let withBinge = groups.flatMap { $0.streams }.filter { ($0.behaviorHints?.bingeGroup?.isEmpty == false) }.count
+            DiagnosticsLog.log("binge", "preload next ep: want binge=\(curBinge ?? "nil"), \(withBinge) of \(groups.flatMap { $0.streams }.count) streams carry a bingeGroup")
             if let best = StreamRanking.best(groups, continuity: curHint, binge: curBinge) {
                 preloaded = PreloadedEpisode(episodeID: next.id, stream: best, signature: StreamRanking.signature(best),
                                              bingeGroup: best.behaviorHints?.bingeGroup)
