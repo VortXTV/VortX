@@ -43,6 +43,12 @@ struct TVPlayerView: View {
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @State private var optionRow = 0                   // highlighted row in the options panel
+    // The open panel's rows, computed ONCE per open/refresh. The rows used to be a
+    // computed property read by the panel body, which re-rendered ~4x a second with
+    // the clock; for Sources that meant re-ranking a thousand-plus streams on the
+    // main thread per frame, freezing the whole player (the "remote stopped
+    // responding / sources came up a minute later" reports).
+    @State private var panelRows: [OptionRow] = []
     @State private var loadFailed = false              // playback couldn't start
     @State private var loadErrorMsg = ""
     @State private var hasStartedPlaying = false
@@ -198,11 +204,13 @@ struct TVPlayerView: View {
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
-            if episodes.isEmpty, let m = curMeta, m.type == "series", loadedEpisodes.isEmpty {
-                // Direct resume launched without the episode list; fetch it behind
-                // playback so Next, the episode panel, and auto-advance still work.
+            if episodes.isEmpty, let m = curMeta, loadedEpisodes.isEmpty {
+                // Direct resume launches with no meta loaded: fetch it behind playback
+                // so the sources panel shows THIS title (not whatever detail page was
+                // open last), and series get their episode list for Next/auto-advance.
                 Task {
-                    core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: m.videoId)
+                    core.loadMeta(type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId)
+                    guard m.type == "series" else { return }
                     for _ in 0..<40 {
                         if let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
                            let vids = loaded.videos, !vids.isEmpty {
@@ -642,10 +650,19 @@ struct TVPlayerView: View {
         let maxInPlayerSources = 60
         var rows: [OptionRow] = []
         var count = 0
-        for group in core.streamGroups() {
+        let groups = core.streamGroups()
+        if groups.isEmpty {
+            return [OptionRow(label: "Loading sources…", isHeader: true)]
+        }
+        for group in groups {
+            // Score each stream ONCE; the old sort recomputed the (string-heavy)
+            // score inside the comparator, which is what melted the main thread
+            // on thousand-source titles.
             let best = group.streams.filter { $0.playableURL != nil }
-                .sorted { StreamRanking.score($0) > StreamRanking.score($1) }
+                .map { (stream: $0, rank: StreamRanking.score($0)) }
+                .sorted { $0.rank > $1.rank }
                 .prefix(perAddon)
+                .map(\.stream)
             guard !best.isEmpty, count < maxInPlayerSources else { continue }
             rows.append(OptionRow(label: group.addon, isHeader: true))
             for stream in best {
@@ -719,7 +736,7 @@ struct TVPlayerView: View {
     }
 
     private var optionsPanel: some View {
-        let rows = optionRows
+        let rows = panelRows
         return HStack(spacing: 0) {
             Spacer()
             VStack(alignment: .leading, spacing: 0) {
@@ -767,27 +784,41 @@ struct TVPlayerView: View {
         }
         .ignoresSafeArea()
         .transition(.move(edge: .trailing))
+        .task(id: showOptions) {
+            // Sources and episodes keep arriving after the panel opens (add-ons
+            // answer at their own pace; direct-resume loads meta in the background).
+            // Refresh the cached rows once a second while those panels are up:
+            // live arrival without per-frame re-ranking.
+            while showOptions, !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard showOptions, panelKind == .sources || panelKind == .episodes else { continue }
+                panelRows = optionRows
+            }
+        }
     }
 
     private func moveOption(_ d: Int) {
-        let rows = optionRows
+        let rows = panelRows
         let selectable = rows.indices.filter { !rows[$0].isHeader }
         guard !selectable.isEmpty else { return }
         let cur = selectable.firstIndex(of: optionRow) ?? 0
         optionRow = selectable[max(0, min(selectable.count - 1, cur + d))]
     }
     private func activateOption() {
-        let rows = optionRows
+        let rows = panelRows
         guard optionRow >= 0, optionRow < rows.count, !rows[optionRow].isHeader else { return }
         rows[optionRow].action()
+        // Selection state may have changed (speed, tracks, aspect, stats); one
+        // recompute per press keeps the checkmarks honest.
+        if showOptions { panelRows = optionRows }
     }
 
     private func openPanel(_ kind: PanelKind) {
         panelKind = kind
         refreshTracks()
         hideTask?.cancel()
-        let rows = optionRows
-        optionRow = rows.firstIndex { $0.isSelected } ?? rows.firstIndex { !$0.isHeader } ?? 0
+        panelRows = optionRows
+        optionRow = panelRows.firstIndex { $0.isSelected } ?? panelRows.firstIndex { !$0.isHeader } ?? 0
         withAnimation { showOptions = true }
     }
     private func closePanel() {

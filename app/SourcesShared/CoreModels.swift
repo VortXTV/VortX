@@ -16,8 +16,12 @@ struct CoreCWItem: Decodable, Identifiable {
     let name: String
     let poster: String?
     let state: CoreLibState
+    /// Library bookkeeping: a removed entry stays in the bucket flagged `removed`,
+    /// and watched-from-catalog markers are `temp`. "In the library" means neither.
+    var removed: Bool? = nil
+    var temp: Bool? = nil
 
-    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state }
+    enum CodingKeys: String, CodingKey { case id = "_id", type, name, poster, state, removed, temp }
 
     /// 0…1 watch progress (timeOffset/duration; both in ms).
     var progress: Double {

@@ -168,6 +168,7 @@ struct DetailView: View {
                             }
                             .buttonStyle(ChipButtonStyle())
                         }
+                        LibraryChip()
                         Spacer(minLength: 0)
                     }
                 }
@@ -625,6 +626,8 @@ struct CoreStreamList: View {
                               systemImage: showAllSources ? "chevron.up" : "list.bullet")
                     }
                     .buttonStyle(ChipButtonStyle(selected: showAllSources))
+
+                    LibraryChip()
                 }
                 if loadingAddons && addons.total > 0 {
                     Text("Still finding more · \(addons.loaded)/\(addons.total) add-ons")
@@ -771,5 +774,29 @@ struct CoreStreamList: View {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
         URLSession.shared.dataTask(with: request).resume()
+    }
+}
+
+
+/// The watch-later button: saves the open title to the library (the same library
+/// the Library tab and the engine's sync use), or removes it again. State comes
+/// from the engine's own library entry for this title, so it stays truthful
+/// across Continue Watching, catalog, and Library entrances.
+struct LibraryChip: View {
+    @EnvironmentObject private var core: CoreBridge
+
+    var body: some View {
+        let saved = core.detailInLibrary
+        Button {
+            if saved {
+                if let id = core.metaDetails?.meta?.id { core.removeFromLibrary(id: id) }
+            } else {
+                core.addDetailToLibrary()
+            }
+        } label: {
+            Label(saved ? "In Library" : "Add to Library",
+                  systemImage: saved ? "bookmark.fill" : "bookmark")
+        }
+        .buttonStyle(ChipButtonStyle(selected: saved))
     }
 }

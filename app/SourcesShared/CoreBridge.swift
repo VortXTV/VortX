@@ -521,6 +521,30 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "RewindLibraryItem", "args": libraryId])
     }
 
+    /// Whether the open detail page's title is saved to the library proper (present,
+    /// not removed, not a temporary watched-marker entry). Drives the Library button.
+    var detailInLibrary: Bool {
+        guard let item = metaDetails?.libraryItem else { return false }
+        return item.removed != true && item.temp != true
+    }
+
+    /// Add the OPEN detail page's title to the library. Catalog adds round-trip a
+    /// `MetaItemPreview` found in a catalog, but a detail page reached from the
+    /// Library tab or Continue Watching is in no catalog, so this hands the engine
+    /// its own full meta JSON instead (a superset of the preview it expects).
+    func addDetailToLibrary() {
+        guard let data = stateData("meta_details"),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let metaItems = object["metaItems"] as? [[String: Any]] else { return }
+        for entry in metaItems {
+            if let content = entry["content"] as? [String: Any],
+               let ready = content["ready"] as? [String: Any] {
+                dispatchCtx(["action": "AddToLibrary", "args": ready])
+                return
+            }
+        }
+    }
+
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id
     /// in whichever catalog field holds it) so the shape is exactly what the engine expects back.
     func addToLibrary(metaId: String) {
