@@ -9,6 +9,7 @@ struct SettingsView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
+    @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
@@ -144,6 +145,21 @@ struct SettingsView: View {
                     Text(line).font(.system(size: 16, design: .monospaced))
                         .foregroundStyle(Theme.Palette.textTertiary).lineLimit(1)
                 }
+            }
+            // Apple TV has no user-facing force quit, and a dead embedded server can
+            // only come back with a fresh process (node starts once per process).
+            Button { showRestartConfirm = true } label: {
+                Label("Restart App", systemImage: "arrow.clockwise.circle")
+            }
+            .buttonStyle(ChipButtonStyle())
+            .confirmationDialog("Restart StremioX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
+                Button("Quit Now", role: .destructive) {
+                    DiagnosticsLog.logSync("app", "user requested app restart from Settings")
+                    exit(0)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The app quits immediately. Open it again from the Home Screen; the streaming server restarts with it.")
             }
             NavigationLink {
                 ServerConfigView { Task { serverOnline = await StremioServer.isOnline() } }

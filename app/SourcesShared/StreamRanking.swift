@@ -170,6 +170,33 @@ enum StreamRanking {
         }
     }
 
+    /// Everything a switcher row should say about a source: parsed tags
+    /// (resolution, remux/web class, DV/HDR, audio, codec, cached) and the file
+    /// size when the add-on includes one.
+    static func sourceDetail(_ s: CoreStream) -> (tags: String, size: String?) {
+        let t = qualityText(s)
+        var tags: [String] = [qualityLabel(s)]
+        if t.contains("remux") { tags.append("Remux") }
+        else if t.contains("bluray") || t.contains("blu-ray") { tags.append("BluRay") }
+        else if t.contains("web") { tags.append("WEB") }
+        if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi")
+            || t.range(of: #"\bdv\b"#, options: .regularExpression) != nil { tags.append("DV") }
+        else if t.contains("hdr") { tags.append("HDR") }
+        if t.contains("atmos") { tags.append("Atmos") }
+        else if t.contains("dts-hd") || t.contains("dts hd") { tags.append("DTS-HD") }
+        else if t.contains("dts") { tags.append("DTS") }
+        if t.contains("hevc") || t.contains("x265") || t.contains("h265") || t.contains("h.265") { tags.append("HEVC") }
+        else if t.contains("av1") { tags.append("AV1") }
+        if isCached(s, t) { tags.append("Cached") }
+        var size: String?
+        if let m = t.range(of: #"(\d+(?:\.\d+)?)\s*(gb|gib)"#, options: .regularExpression) {
+            size = String(t[m]).uppercased().replacingOccurrences(of: "GIB", with: "GB")
+        } else if let m = t.range(of: #"(\d+(?:\.\d+)?)\s*(mb|mib)"#, options: .regularExpression) {
+            size = String(t[m]).uppercased().replacingOccurrences(of: "MIB", with: "MB")
+        }
+        return (tags.joined(separator: " · "), size)
+    }
+
     /// A short resolution tag for the Watch-Now button ("4K" / "1080p" / …), or "Best" when unknown.
     static func qualityLabel(_ s: CoreStream) -> String {
         let t = qualityText(s)

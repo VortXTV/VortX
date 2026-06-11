@@ -450,6 +450,29 @@ final class MPVMetalViewController: UIViewController {
 
     func setSpeed(_ speed: Double) { setString(MPVProperty.speed, String(format: "%.2f", speed)) }
 
+    /// Live numbers for the player's "Playback info" overlay.
+    func playbackStats() -> [(String, String)] {
+        guard mpv != nil else { return [] }
+        var rows: [(String, String)] = []
+        let w = getInt("video-params/w"), h = getInt("video-params/h")
+        if w > 0 { rows.append(("Video", "\(w)×\(h)  \(getString("video-codec-name") ?? "")")) }
+        let gamma = getString("video-params/gamma") ?? ""
+        rows.append(("Range", gamma == "pq" ? "HDR (PQ)" : gamma == "hlg" ? "HLG" : "SDR"))
+        rows.append(("Decode", getString("hwdec-current") ?? "software"))
+        let fps = getDouble("container-fps")
+        if fps > 0 { rows.append(("FPS", String(format: "%.3f", fps))) }
+        rows.append(("Dropped", "\(getInt("frame-drop-count"))"))
+        if let audio = getString("audio-codec-name") {
+            let channels = getInt("audio-params/channel-count")
+            rows.append(("Audio", channels > 0 ? "\(audio)  \(channels)ch" : audio))
+        }
+        let cache = getDouble("demuxer-cache-duration")
+        if cache > 0 { rows.append(("Buffer", String(format: "%.0fs ahead", cache))) }
+        let speed = getDouble("speed")
+        if speed > 0, abs(speed - 1) > 0.01 { rows.append(("Speed", "\(speed.formatted())×")) }
+        return rows
+    }
+
     /// Re-apply the current subtitle appearance to a running player (used after a settings change).
     func applySubtitleStyle() {
         for (name, value) in SubtitleStyle.mpvOptions { setString(name, value) }

@@ -67,10 +67,13 @@ struct TVPlayerView: View {
     // Direct-resume launches (Continue Watching) start without an episode list;
     // it loads in the background so Next/auto-advance still work.
     @State private var loadedEpisodes: [CoreVideo] = []
+    @State private var playSpeed = 1.0                  // mpv playback speed (sticky for the session)
+    @State private var showStats = false                // live playback info overlay
+    @State private var statsRows: [(String, String)] = []
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, prev, next, episodes, sources }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, episodes, sources }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, sources }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -167,6 +170,7 @@ struct TVPlayerView: View {
             if showOptions { optionsPanel }
             if loadFailed { loadErrorOverlay }
             if controlsHidden, let seg = currentSkip { skipPill(seg) }
+            if showStats, !loadFailed { statsOverlay }
         }
         .onAppear {
             if curURL == nil { curURL = url; curTitle = title; curMeta = meta }   // seed from initial
@@ -269,6 +273,7 @@ struct TVPlayerView: View {
         if !audioTracks.isEmpty { c.append(.audio) }
         c.append(.subs)
         c.append(.aspect)
+        c.append(.playback)
         if hasAlternateSources { c.append(.sources) }   // was drawn but missing here → unreachable by remote
         if allEpisodes.count > 1 { c.append(.episodes) }
         return c
@@ -317,8 +322,34 @@ struct TVPlayerView: View {
         case .audio:    openPanel(.audio)
         case .subs:     openPanel(.subtitles)
         case .aspect:   openPanel(.aspect)
+        case .playback: openPanel(.playback)
         case .episodes: openPanel(.episodes)
         case .sources:  openPanel(.sources)
+        }
+    }
+
+    /// Live playback numbers, top-left, refreshed every second while visible.
+    private var statsOverlay: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(statsRows, id: \.0) { row in
+                HStack(spacing: 12) {
+                    Text(row.0).foregroundStyle(Theme.Palette.textTertiary)
+                    Spacer(minLength: 8)
+                    Text(row.1).foregroundStyle(Theme.Palette.textPrimary)
+                }
+            }
+        }
+        .font(.system(size: 20, design: .monospaced))
+        .padding(Theme.Space.md)
+        .frame(width: 440)
+        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(Theme.Space.xl)
+        .task(id: showStats) {
+            while showStats, !Task.isCancelled {
+                statsRows = coordinator.player?.playbackStats() ?? []
+                try? await Task.sleep(for: .seconds(1))
+            }
         }
     }
 
@@ -396,6 +427,7 @@ struct TVPlayerView: View {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
                         ctrlButton(.aspect, "aspectratio")
+                        ctrlButton(.playback, "speedometer")
                         if hasAlternateSources { ctrlButton(.sources, "rectangle.2.swap") }
                         if allEpisodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                     }
@@ -501,6 +533,22 @@ struct TVPlayerView: View {
                 OptionRow(label: "Fill  ·  crop to screen", isSelected: mode == "fill" || mode == "zoom") { coordinator.player?.setVideoSize("fill") },
                 OptionRow(label: "Stretch  ·  fill, distort", isSelected: mode == "stretch") { coordinator.player?.setVideoSize("stretch") },
             ]
+        case .playback:
+            var rows: [OptionRow] = [OptionRow(label: "Speed", isHeader: true)]
+            for s in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                rows.append(OptionRow(label: s == 1.0 ? "Normal  ·  1×" : "\(s.formatted())×",
+                                      isSelected: abs(playSpeed - s) < 0.01) {
+                    playSpeed = s
+                    coordinator.player?.setSpeed(s)
+                })
+            }
+            rows.append(OptionRow(label: "Info", isHeader: true))
+            rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
+                                  isSelected: showStats) {
+                showStats.toggle()
+                withAnimation { showOptions = false }
+            })
+            return rows
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
@@ -549,17 +597,25 @@ struct TVPlayerView: View {
     /// switching is quick. The full (sometimes thousands-long) source list stays on the detail page;
     /// capping here keeps the panel light, since the options panel renders its rows eagerly.
     private func sourceRows() -> [OptionRow] {
-        let maxInPlayerSources = 40
+        // Every add-on contributes its ranked best few, so a single add-on with
+        // hundreds of results can no longer flood the panel and bury the rest.
+        let perAddon = 5
+        let maxInPlayerSources = 60
         var rows: [OptionRow] = []
         var count = 0
         for group in core.streamGroups() {
-            let playable = group.streams.filter { $0.playableURL != nil }
-            guard !playable.isEmpty, count < maxInPlayerSources else { continue }
+            let best = group.streams.filter { $0.playableURL != nil }
+                .sorted { StreamRanking.score($0) > StreamRanking.score($1) }
+                .prefix(perAddon)
+            guard !best.isEmpty, count < maxInPlayerSources else { continue }
             rows.append(OptionRow(label: group.addon, isHeader: true))
-            for stream in playable {
+            for stream in best {
                 guard count < maxInPlayerSources else { break }
                 count += 1
-                rows.append(OptionRow(label: sourceLabel(stream), isSelected: stream.playableURL == curURL) {
+                let info = StreamRanking.sourceDetail(stream)
+                let name = String(sourceLabel(stream).prefix(40))
+                rows.append(OptionRow(label: "\(info.tags)   \(name)", detail: info.size ?? "",
+                                      isSelected: stream.playableURL == curURL) {
                     switchStream(to: stream)
                 })
             }
@@ -613,6 +669,7 @@ struct TVPlayerView: View {
         case .subtitles:        return "Subtitles"
         case .subtitleSettings: return "Subtitle Settings"
         case .aspect:           return "Aspect Ratio"
+        case .playback:         return "Playback"
         case .episodes:         return "Episodes"
         case .sources:          return "Sources"
         }
