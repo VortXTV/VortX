@@ -301,7 +301,7 @@ struct ThemeAccentPicker: View {
                     }
                 }
                 .padding(.horizontal, Theme.Space.sm)
-                .padding(.vertical, Theme.Space.xs)
+                .padding(.vertical, Theme.Space.md)   // room for the focus halo on the swatches
             }
         }
     }

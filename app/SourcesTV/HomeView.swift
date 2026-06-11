@@ -27,7 +27,7 @@ struct HomeView: View {
                 // The rails live in a bottom strip. The focus engine centers focused rows inside
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: Theme.Space.xl) {
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         if !continueWatching.isEmpty {
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel,
                                                     // the long-press menu mutates the ACCOUNT library;
@@ -127,7 +127,7 @@ struct CoreContinueWatchingRow: View {
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.vertical, Theme.Space.md)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -172,7 +172,7 @@ struct CoreCatalogRowView: View {
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.vertical, Theme.Space.md)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -193,7 +193,7 @@ struct LoadingRail: View {
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.vertical, Theme.Space.md)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
         }
     }
