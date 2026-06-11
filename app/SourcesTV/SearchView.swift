@@ -9,6 +9,7 @@ struct SearchView: View {
     @State private var query = ""
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
+    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
         Group {
@@ -21,7 +22,7 @@ struct SearchView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Button { showOpenLink = true } label: {
-                    Label("Play a link or magnet", systemImage: "link")
+                    Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .sheet(isPresented: $showOpenLink) { OpenLinkView() }

@@ -22,7 +22,13 @@ struct PlaybackRequest: Identifiable {
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
 final class PlayerPresenter: ObservableObject {
-    @Published var request: PlaybackRequest?
+    @Published var request: PlaybackRequest? {
+        didSet {
+            if request?.torrent == true && PlaybackSettings.torrentsDisabled {
+                request = nil
+            }
+        }
+    }
 }
 
 /// App root, three focus rules learned the hard way:

@@ -1227,6 +1227,7 @@ struct TVPlayerView: View {
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.
     private func prepareTorrent(_ stream: CoreStream) {
+        guard !PlaybackSettings.torrentsDisabled else { return }
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
               let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
         let sources = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)

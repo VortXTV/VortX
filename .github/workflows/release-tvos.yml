@@ -13,7 +13,6 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/release-tvos.yml"
-      - "app/**"
       - "core/**"
       - "scripts/**"
   release:
@@ -85,28 +84,40 @@ jobs:
           xcodebuild -project StremioX.xcodeproj -scheme StremioXTV \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath build/ci CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -project StremioX.xcodeproj -scheme StremioXTVDirect \
+            -configuration Release -destination 'generic/platform=tvOS' \
+            -derivedDataPath build/ci-direct CODE_SIGNING_ALLOWED=NO build
 
-      - name: Package the IPA
+      - name: Package the IPAs
         run: |
-          mkdir -p out/Payload
-          cp -R app/build/ci/Build/Products/Release-appletvos/StremioXTV.app out/Payload/
-          cd out
-          zip -qry StremioX-tvOS-ci.ipa Payload
-          shasum -a 256 StremioX-tvOS-ci.ipa | tee SHA256SUMS-ci.txt
+          mkdir -p out/full/Payload out/direct/Payload
+          cp -R app/build/ci/Build/Products/Release-appletvos/StremioXTV.app out/full/Payload/
+          cp -R app/build/ci-direct/Build/Products/Release-appletvos/StremioXTVDirect.app out/direct/Payload/
+          (cd out/full && zip -qry ../StremioX-tvOS-ci.ipa Payload)
+          (cd out/direct && zip -qry ../StremioX-tvOS-direct-ci.ipa Payload)
+          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-direct-ci.ipa | tee out/SHA256SUMS-ci.txt
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: StremioX-tvOS-ci
-          path: out/StremioX-tvOS-ci.ipa
+          path: |
+            out/StremioX-tvOS-ci.ipa
+            out/StremioX-tvOS-direct-ci.ipa
+            out/SHA256SUMS-ci.txt
 
-      - name: Attach the CI build to the release
+      - name: Attach the CI builds to the release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
           mv out/StremioX-tvOS-ci.ipa "out/StremioX-tvOS-$TAG-ci.ipa"
-          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" > out/SHA256SUMS-ci.txt
-          gh release upload "$TAG" "out/StremioX-tvOS-$TAG-ci.ipa" out/SHA256SUMS-ci.txt --clobber
+          mv out/StremioX-tvOS-direct-ci.ipa "out/StremioX-tvOS-direct-$TAG-ci.ipa"
+          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-direct-$TAG-ci.ipa" > out/SHA256SUMS-ci.txt
+          gh release upload "$TAG" \
+            "out/StremioX-tvOS-$TAG-ci.ipa" \
+            "out/StremioX-tvOS-direct-$TAG-ci.ipa" \
+            out/SHA256SUMS-ci.txt \
+            --clobber

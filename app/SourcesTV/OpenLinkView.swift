@@ -9,16 +9,19 @@ struct OpenLinkView: View {
     @State private var input = ""
     @State private var working = false
     @State private var status: String?
+    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
             Text("Play a link")
                 .font(Theme.Typography.sectionTitle)
                 .foregroundStyle(Theme.Palette.textPrimary)
-            Text("A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), or a magnet link.")
+            Text(directLinksOnly
+                 ? "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s)."
+                 : "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), or a magnet link.")
                 .font(Theme.Typography.body)
                 .foregroundStyle(Theme.Palette.textSecondary)
-            TextField("https://…   magnet:?xt=…   or paste any direct stream link", text: $input)
+            TextField(directLinksOnly ? "https://..." : "https://...  or  magnet:?xt=...", text: $input)
                 .font(Theme.Typography.body)
                 .disableAutocorrection(true)
             HStack(spacing: Theme.Space.md) {
@@ -41,6 +44,10 @@ struct OpenLinkView: View {
     private func play() {
         var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.lowercased().hasPrefix("magnet:") {
+            guard !PlaybackSettings.torrentsDisabled else {
+                status = "Torrenting is disabled. Use a direct or debrid http(s) link."
+                return
+            }
             guard let magnet = LinkOpener.parseMagnet(text) else {
                 status = "That magnet link has no usable info hash."
                 return
@@ -52,7 +59,9 @@ struct OpenLinkView: View {
         if !text.contains("://"), text.contains(".") { text = "https://" + text }
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
-            status = "Not a playable link. Paste a direct http(s) stream link (debrid and usenet links count) or a magnet."
+            status = directLinksOnly
+                ? "Not a playable link. Paste a direct http(s) stream link (debrid and usenet links count)."
+                : "Not a playable link. Paste a direct http(s) stream link (debrid and usenet links count) or a magnet."
             return
         }
         let title = url.lastPathComponent.isEmpty ? (url.host ?? "Stream") : url.lastPathComponent
@@ -113,6 +122,7 @@ enum LinkOpener {
     /// metadata is in (it needs at least one peer), with the file list; pick the
     /// biggest video file.
     static func resolveMagnet(_ magnet: Magnet) async -> (url: URL, fileName: String)? {
+        guard !PlaybackSettings.torrentsDisabled else { return nil }
         let sources = TorrentTrackers.sources(forHash: magnet.infoHash,
                                               streamSources: nil,
                                               addonTrackers: magnet.trackers)

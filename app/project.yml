@@ -88,3 +88,63 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: StremioX
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+  # Direct/debrid-only tvOS build. This omits NodeMobile and server.js entirely,
+  # so the app cannot create or play torrents even if old preferences say otherwise.
+  StremioXTVDirect:
+    type: application
+    platform: tvOS
+    sources:
+      - SourcesTV
+      - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
+      - Sources/Player
+      - ResourcesTV/Assets.xcassets
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+      - sdk: AVKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.direct
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
+        MARKETING_VERSION: "0.2.31"
+        CURRENT_PROJECT_VERSION: "58"
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: StremioX Direct
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
+schemes:
+  StremioX:
+    build:
+      targets:
+        StremioX: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  StremioXTV:
+    build:
+      targets:
+        StremioXTV: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  StremioXTVDirect:
+    build:
+      targets:
+        StremioXTVDirect: all
+    run:
+      config: Debug
+    archive:
+      config: Release

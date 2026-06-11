@@ -18,6 +18,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
         NavigationStack {
@@ -26,6 +27,7 @@ struct SettingsView: View {
                     Text("Settings").screenTitleStyle()
                     profilesSection
                     accountSection
+                    playbackSection
                     serverSection
                     appearanceSection
                     audioSubtitleSection
@@ -44,6 +46,11 @@ struct SettingsView: View {
             // the old 24-second window could expire first, showing "Offline" until a relaunch.
             // Retries fast while offline, keeps the badge fresh once up; restarts on each visit.
             while !Task.isCancelled {
+                if effectiveDirectLinksOnly {
+                    serverOnline = nil
+                    try? await Task.sleep(for: .seconds(12))
+                    continue
+                }
                 let online = await StremioServer.isOnline()
                 serverOnline = online
                 try? await Task.sleep(for: .seconds(online ? 12 : 3))
@@ -122,6 +129,57 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Playback
+
+    private var playbackSection: some View {
+        section("Playback") {
+            if PlaybackSettings.directLinksOnlyForced {
+                directLinksOnlyRow
+                    .background(Theme.Palette.surface1,
+                                in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            } else {
+                Button { setDirectLinksOnly(!directLinksOnly) } label: {
+                    directLinksOnlyRow
+                }
+                .buttonStyle(RowFocusStyle())
+            }
+        }
+    }
+
+    private var effectiveDirectLinksOnly: Bool {
+        PlaybackSettings.directLinksOnly
+    }
+
+    private var directLinksOnlyRow: some View {
+        HStack(alignment: .center, spacing: Theme.Space.lg) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Direct Links Only")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(PlaybackSettings.directLinksOnlyForced
+                     ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
+                     : "Hide torrent and magnet sources. Only direct and debrid links will play.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: Theme.Space.md)
+            TogglePill(isOn: effectiveDirectLinksOnly, locked: PlaybackSettings.directLinksOnlyForced)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+
+    private func setDirectLinksOnly(_ value: Bool) {
+        directLinksOnly = value
+        #if !STREMIOX_NO_EMBEDDED_SERVER
+        if !value, !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
+            NodeServer.startIfNeeded()
+        }
+        #endif
+    }
+
     // MARK: Streaming server
 
     private var serverSection: some View {
@@ -130,22 +188,25 @@ struct SettingsView: View {
                 Circle().fill(serverColor).frame(width: 16, height: 16)
                 Text(serverText).font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
                 Spacer()
-                Text(StremioServer.isCustom ? "CUSTOM" : "EMBEDDED")
+                Text(PlaybackSettings.directLinksOnlyForced ? "NOT BUNDLED" : (StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"))
                     .font(Theme.Typography.eyebrow).tracking(1)
                     .padding(.horizontal, 12).padding(.vertical, 5)
                     .background(Theme.Palette.surface3, in: Capsule())
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
-            Text(StremioServer.base).font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
+            Text(PlaybackSettings.directLinksOnlyForced ? "Embedded server not bundled" : StremioServer.base)
+                .font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
             // When the embedded server is unreachable, explain itself: node's run state and the
             // server's own last log lines, so a dead server is diagnosable from the couch.
             if serverOnline == false && !StremioServer.isCustom {
+                #if !STREMIOX_NO_EMBEDDED_SERVER
                 Text(NodeServer.statusDescription)
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 ForEach(NodeServer.logTail(), id: \.self) { line in
                     Text(line).font(.system(size: 16, design: .monospaced))
                         .foregroundStyle(Theme.Palette.textTertiary).lineLimit(1)
                 }
+                #endif
             }
             // Apple TV has no user-facing force quit, and a dead embedded server can
             // only come back with a fresh process (node starts once per process).
@@ -162,16 +223,19 @@ struct SettingsView: View {
             } message: {
                 Text("The app quits immediately. Open it again from the Home Screen; the streaming server restarts with it.")
             }
-            NavigationLink {
-                ServerConfigView { Task { serverOnline = await StremioServer.isOnline() } }
-            } label: {
-                Label("Configure server", systemImage: "server.rack")
+            if !PlaybackSettings.directLinksOnlyForced {
+                NavigationLink {
+                    ServerConfigView { Task { serverOnline = await StremioServer.isOnline() } }
+                } label: {
+                    Label("Configure server", systemImage: "server.rack")
+                }
+                .buttonStyle(PrimaryActionStyle())
             }
-            .buttonStyle(PrimaryActionStyle())
         }
     }
 
     private var serverColor: Color {
+        if effectiveDirectLinksOnly { return Theme.Palette.textTertiary }
         switch serverOnline {
         case .some(true): return Color(.sRGB, red: 0.45, green: 0.72, blue: 0.42)
         case .some(false): return Theme.Palette.danger
@@ -179,6 +243,7 @@ struct SettingsView: View {
         }
     }
     private var serverText: String {
+        if effectiveDirectLinksOnly { return "Disabled by Direct Links Only" }
         switch serverOnline { case .some(true): return "Online"; case .some(false): return "Offline"; default: return "Checking…" }
     }
 
@@ -291,6 +356,32 @@ struct SettingsView: View {
             Text(value).foregroundStyle(Theme.Palette.textSecondary)
         }
         .font(Theme.Typography.body)
+    }
+}
+
+private struct TogglePill: View {
+    let isOn: Bool
+    var locked: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(locked ? "Locked" : (isOn ? "On" : "Off"))
+                .font(Theme.Typography.eyebrow)
+                .tracking(1)
+            ZStack(alignment: isOn ? .trailing : .leading) {
+                Capsule()
+                    .fill(isOn ? Theme.Palette.accent.opacity(0.24) : Theme.Palette.surface3)
+                    .frame(width: 64, height: 34)
+                Circle()
+                    .fill(isOn ? Theme.Palette.accent : Theme.Palette.textTertiary)
+                    .frame(width: 24, height: 24)
+                    .padding(.horizontal, 5)
+            }
+        }
+        .foregroundStyle(isOn ? Theme.Palette.accent : Theme.Palette.textSecondary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.Palette.surface2, in: Capsule(style: .continuous))
     }
 }
 

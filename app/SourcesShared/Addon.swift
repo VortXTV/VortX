@@ -70,7 +70,7 @@ struct Stream: Identifiable, Decodable, Hashable {
     /// Short tag the addon shows (addon name + quality), e.g. "Torrentio\n1080p".
     var heading: String { (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
     /// Direct/debrid URLs play in libmpv; torrents (infoHash) play via the embedded server.
-    var isPlayable: Bool { url != nil || infoHash != nil }
+    var isPlayable: Bool { url != nil || (!PlaybackSettings.torrentsDisabled && infoHash != nil) }
     var isTorrent: Bool { url == nil && infoHash != nil }
 }
 

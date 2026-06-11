@@ -55,6 +55,7 @@ enum StremioServer {
     /// torrent. Pure (no side effects); call `prepare(_:)` to actually create the torrent.
     static func resolveURL(for stream: Stream) -> URL? {
         if let u = stream.url, let url = URL(string: u) { return url }
+        guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let ih = stream.infoHash?.lowercased() else { return nil }
         return URL(string: "\(base)/\(ih)/\(stream.fileIdx ?? 0)")
     }
@@ -62,6 +63,7 @@ enum StremioServer {
     /// For torrents, tell the server to create the torrent (start fetching peers) before playback.
     /// No-op for direct/debrid streams. Fire-and-forget, the file endpoint blocks until ready.
     static func prepare(_ stream: Stream) {
+        guard !PlaybackSettings.torrentsDisabled else { return }
         guard stream.url == nil, let ih = stream.infoHash?.lowercased(),
               let url = URL(string: "\(base)/\(ih)/create") else { return }
         var sources = stream.sources ?? []
