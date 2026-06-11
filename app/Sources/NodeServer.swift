@@ -83,6 +83,33 @@ enum NodeServer {
         process.on('unhandledRejection',function(e){w('[rej]',[e&&e.stack||e])});
         w('[boot]',['preload active']);
 
+        // Tracker-announce tap: UDP/DHT are dead in this sandbox, so peers can ONLY
+        // come from HTTP/HTTPS trackers. Wrap the (shared, core) http/https.request to
+        // log every "/announce" and its result, so a device run shows definitively
+        // whether the trackers are reached, what they return, and whether peers come
+        // back -- instead of us guessing why connectionTries stays 0. http.get calls
+        // http.request internally, so wrapping request covers both.
+        (function(){
+          ['http','https'].forEach(function(modName){
+            var mod; try { mod = require(modName); } catch(e){ return; }
+            var orig = mod.request;
+            mod.request = function(){
+              var req = orig.apply(this, arguments);
+              try {
+                var a0 = arguments[0];
+                var u = (typeof a0 === 'string') ? a0
+                      : (a0 && (a0.href || (modName + '://' + (a0.hostname || a0.host || '') + (a0.path || ''))));
+                if (u && u.indexOf('/announce') !== -1) {
+                  w('[trk]', ['-> ' + u]);
+                  req.on('response', function(res){ var n=0; res.on('data', function(d){ n += d.length; }); res.on('end', function(){ w('[trk]', ['<- HTTP ' + res.statusCode + ' ' + n + 'B ' + u]); }); });
+                  req.on('error', function(e){ w('[trk]', ['ERR ' + u + ': ' + (e && e.message || e)]); });
+                }
+              } catch(e){}
+              return req;
+            };
+          });
+        })();
+
         // Boot probes: which outbound layers work in this node build? (UDP probe
         // result on device: ping "sent", no pong ever. These narrow it further.)
         (function(){
