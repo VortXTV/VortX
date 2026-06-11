@@ -7,6 +7,15 @@ name: Release tvOS IPA
 # stremio-core engine built from the core/ crate in this repo.
 
 on:
+  # Release-tag caches are isolated per tag, so seed the same exact cache key on
+  # main where later release runs can restore it from the default-branch scope.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-tvos.yml"
+      - "app/**"
+      - "core/**"
+      - "scripts/**"
   release:
     types: [published]
   workflow_dispatch:

@@ -6,7 +6,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/../core"
 source "$HOME/.cargo/env" 2>/dev/null || true
-export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 
 BUILDSTD="-Z build-std=std,panic_abort"
 LIB="libstremiox_core.a"
