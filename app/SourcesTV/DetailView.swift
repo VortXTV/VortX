@@ -558,7 +558,11 @@ struct CoreStreamList: View {
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
-        let best = StreamRanking.best(groups)
+        // Per-series quality memory: bias Watch Now toward the quality signature of
+        // whatever this title played last (per profile), so a series you watch in a
+        // specific quality keeps opening in it. Cached/instant still outranks it.
+        let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
+        let best = StreamRanking.best(groups, continuity: remembered)
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the

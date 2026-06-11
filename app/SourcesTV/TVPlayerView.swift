@@ -83,6 +83,7 @@ struct TVPlayerView: View {
     @State private var playSpeed = 1.0                  // mpv playback speed (sticky for the session)
     @State private var showStats = false                // live playback info overlay
     @State private var statsRows: [(String, String)] = []
+    @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources }
@@ -188,6 +189,9 @@ struct TVPlayerView: View {
             if loadFailed { loadErrorOverlay }
             if controlsHidden, let seg = currentSkip { skipPill(seg) }
             if showStats, !loadFailed { statsOverlay }
+            if showStreamQR, let link = shareLink {
+                StreamLinkQRView(title: isTorrentPlayback ? "Magnet link" : "Stream link", link: link)
+            }
         }
         .onAppear {
             if curURL == nil { curURL = url; curTitle = title; curMeta = meta; curIsTorrent = torrent }   // seed from initial
@@ -233,6 +237,10 @@ struct TVPlayerView: View {
     // MARK: - Remote handling (all input arrives here from the UIKit catcher)
 
     private func handlePress(_ type: UIPress.PressType) {
+        if showStreamQR {
+            if type == .menu || type == .select || type == .playPause { showStreamQR = false }
+            return
+        }
         if loadFailed {
             switch type {
             case .menu: saveProgress(at: currentTime); onClose()
@@ -572,6 +580,13 @@ struct TVPlayerView: View {
                 showStats.toggle()
                 withAnimation { showOptions = false }
             })
+            if shareLink != nil {
+                rows.append(OptionRow(label: isTorrentPlayback ? "Magnet link  ·  QR for your phone"
+                                                               : "Stream link  ·  QR for your phone") {
+                    withAnimation { showOptions = false }
+                    showStreamQR = true
+                })
+            }
             return rows
         case .episodes:
             return allEpisodes.map { ep in
@@ -875,6 +890,19 @@ struct TVPlayerView: View {
             if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
             withAnimation { loadFailed = true }
         }
+    }
+
+    /// What another device can actually use: the stream URL for direct and debrid
+    /// links, a magnet rebuilt from the info hash for torrents (the local server
+    /// URL is meaningless off this Apple TV).
+    private var shareLink: String? {
+        guard let u = curURL else { return nil }
+        if isTorrentPlayback {
+            let hash = u.pathComponents.count >= 2 ? u.pathComponents[1] : ""
+            guard hash.count == 40 else { return nil }
+            return "magnet:?xt=urn:btih:\(hash)"
+        }
+        return u.absoluteString
     }
 
     /// Decided by the URL shape alone ({server}:11470/{40-hex-hash}/{idx}), which
