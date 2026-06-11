@@ -164,7 +164,11 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: Theme.Space.md)
-            TogglePill(isOn: effectiveDirectLinksOnly, locked: PlaybackSettings.directLinksOnlyForced)
+            if PlaybackSettings.directLinksOnlyForced {
+                UnavailableBadge(text: "Not bundled")
+            } else {
+                TogglePill(isOn: effectiveDirectLinksOnly)
+            }
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -188,42 +192,50 @@ struct SettingsView: View {
                 Circle().fill(serverColor).frame(width: 16, height: 16)
                 Text(serverText).font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
                 Spacer()
-                Text(PlaybackSettings.directLinksOnlyForced ? "NOT BUNDLED" : (StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"))
+                Text(serverBadgeText)
                     .font(Theme.Typography.eyebrow).tracking(1)
                     .padding(.horizontal, 12).padding(.vertical, 5)
                     .background(Theme.Palette.surface3, in: Capsule())
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
-            Text(PlaybackSettings.directLinksOnlyForced ? "Embedded server not bundled" : StremioServer.base)
-                .font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
-            // When the embedded server is unreachable, explain itself: node's run state and the
-            // server's own last log lines, so a dead server is diagnosable from the couch.
-            if serverOnline == false && !StremioServer.isCustom {
-                #if !STREMIOX_NO_EMBEDDED_SERVER
-                Text(NodeServer.statusDescription)
-                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                ForEach(NodeServer.logTail(), id: \.self) { line in
-                    Text(line).font(.system(size: 16, design: .monospaced))
-                        .foregroundStyle(Theme.Palette.textTertiary).lineLimit(1)
+
+            if effectiveDirectLinksOnly {
+                Text(PlaybackSettings.directLinksOnlyForced
+                     ? "This build does not bundle the streaming server."
+                     : "Direct Links Only is enabled, so torrent streaming and server configuration are inactive.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(StremioServer.base)
+                    .font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
+                // When the embedded server is unreachable, explain itself: node's run state and the
+                // server's own last log lines, so a dead server is diagnosable from the couch.
+                if serverOnline == false && !StremioServer.isCustom {
+                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    Text(NodeServer.statusDescription)
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    ForEach(NodeServer.logTail(), id: \.self) { line in
+                        Text(line).font(.system(size: 16, design: .monospaced))
+                            .foregroundStyle(Theme.Palette.textTertiary).lineLimit(1)
+                    }
+                    #endif
                 }
-                #endif
-            }
-            // Apple TV has no user-facing force quit, and a dead embedded server can
-            // only come back with a fresh process (node starts once per process).
-            Button { showRestartConfirm = true } label: {
-                Label("Restart App", systemImage: "arrow.clockwise.circle")
-            }
-            .buttonStyle(ChipButtonStyle())
-            .confirmationDialog("Restart StremioX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
-                Button("Quit Now", role: .destructive) {
-                    DiagnosticsLog.logSync("app", "user requested app restart from Settings")
-                    exit(0)
+                // Apple TV has no user-facing force quit, and a dead embedded server can
+                // only come back with a fresh process (node starts once per process).
+                Button { showRestartConfirm = true } label: {
+                    Label("Restart App", systemImage: "arrow.clockwise.circle")
                 }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("The app quits immediately. Open it again from the Home Screen; the streaming server restarts with it.")
-            }
-            if !PlaybackSettings.directLinksOnlyForced {
+                .buttonStyle(ChipButtonStyle())
+                .confirmationDialog("Restart StremioX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
+                    Button("Quit Now", role: .destructive) {
+                        DiagnosticsLog.logSync("app", "user requested app restart from Settings")
+                        exit(0)
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The app quits immediately. Open it again from the Home Screen; the streaming server restarts with it.")
+                }
                 NavigationLink {
                     ServerConfigView { Task { serverOnline = await StremioServer.isOnline() } }
                 } label: {
@@ -245,6 +257,12 @@ struct SettingsView: View {
     private var serverText: String {
         if effectiveDirectLinksOnly { return "Disabled by Direct Links Only" }
         switch serverOnline { case .some(true): return "Online"; case .some(false): return "Offline"; default: return "Checking…" }
+    }
+    private var serverBadgeText: String {
+        if effectiveDirectLinksOnly {
+            return PlaybackSettings.directLinksOnlyForced ? "NOT BUNDLED" : "DISABLED"
+        }
+        return StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"
     }
 
     // MARK: Appearance (accent + chrome)
@@ -361,11 +379,10 @@ struct SettingsView: View {
 
 private struct TogglePill: View {
     let isOn: Bool
-    var locked: Bool = false
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(locked ? "Locked" : (isOn ? "On" : "Off"))
+            Text(isOn ? "On" : "Off")
                 .font(Theme.Typography.eyebrow)
                 .tracking(1)
             ZStack(alignment: isOn ? .trailing : .leading) {
@@ -382,6 +399,20 @@ private struct TogglePill: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(Theme.Palette.surface2, in: Capsule(style: .continuous))
+    }
+}
+
+private struct UnavailableBadge: View {
+    let text: String
+
+    var body: some View {
+        Label(text, systemImage: "lock.fill")
+            .font(Theme.Typography.eyebrow)
+            .tracking(1)
+            .foregroundStyle(Theme.Palette.textSecondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Theme.Palette.surface2, in: Capsule(style: .continuous))
     }
 }
 
