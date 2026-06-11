@@ -63,6 +63,11 @@ enum NodeServer {
         // official mobile builds set via IOS_APP / TV_ENV; we never did, and that was
         // the bug behind "torrents stopped loading" and "the remote freezes in torrents".
         setenv("CASTING_DISABLED", "1", 1)
+        // Memory: the server defaults its torrent cache to 2 GB, which is a lot for the
+        // Apple TV's per-app memory budget. We do NOT disable caching (that thins the
+        // torrent buffer); instead the app caps it to a TV-safe size via a /settings
+        // POST once the server is up (StremioServer.applyServerConfig). The player's own
+        // read-ahead buffer and the binge preload are separate from this and unaffected.
         FileManager.default.changeCurrentDirectoryPath(caches)
 
         // node's stdout/stderr aren't surfaced by nodejs-mobile, so tee console + uncaught
@@ -153,7 +158,12 @@ enum NodeServer {
         })();
         """
         try? preload.write(toFile: preloadPath, atomically: true, encoding: .utf8)
-        try? "".write(toFile: logPath, atomically: true, encoding: .utf8)
+        // Keep the tail of the previous boot's log instead of wiping it, so a crash that
+        // takes the whole app (and this server) down leaves its last lines readable after
+        // relaunch. Capped so it can't grow without bound.
+        let prior = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        let keptTail = prior.count > 48_000 ? String(prior.suffix(48_000)) : prior
+        try? (keptTail + "\n===== BOOT =====\n").write(toFile: logPath, atomically: true, encoding: .utf8)
 
         NSLog("StremioX: starting node streaming server (HOME=\(caches), log=\(logPath))")
         var argv: [UnsafeMutablePointer<CChar>?] =

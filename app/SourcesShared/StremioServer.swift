@@ -79,4 +79,28 @@ enum StremioServer {
         req.httpBody = data
         URLSession.shared.dataTask(with: req).resume()
     }
+
+    /// Cap the embedded server's torrent cache once it's reachable. The server defaults to a
+    /// 2 GB cache, which is too much for the Apple TV's per-app memory budget: a torrent
+    /// buffering pieces into it pushes the app past the limit and tvOS jetsam-kills the whole
+    /// process (the "server crash" -- nav bar dead, back drops to Home, server offline on
+    /// reopen). 512 MB keeps a healthy streaming buffer without the memory pressure. The player's
+    /// own read-ahead buffer and the binge preload are independent of this and unaffected.
+    /// POST /settings merges the value (server.js: saveSettings -> userSettings.extend). Custom
+    /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
+    static func applyServerConfig() async {
+        guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return }
+        let cap = 512 * 1024 * 1024   // 512 MB, vs the 2 GB default
+        for _ in 0 ..< 12 {
+            if await isOnline() {
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = try? JSONSerialization.data(withJSONObject: ["cacheSize": cap])
+                _ = try? await URLSession.shared.data(for: req)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+    }
 }

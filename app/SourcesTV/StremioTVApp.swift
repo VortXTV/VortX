@@ -15,6 +15,9 @@ struct StremioTVApp: App {
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
+            // Once the server is up, cap its torrent cache to a TV-safe size (the 2 GB default
+            // can get the whole app jetsam-killed mid-torrent). Detached so it never blocks launch.
+            Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
