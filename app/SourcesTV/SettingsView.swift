@@ -9,6 +9,7 @@ struct SettingsView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
+    @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
@@ -188,6 +189,14 @@ struct SettingsView: View {
             ThemeAccentPicker(selection: $theme.accentID)
             ThemeBackgroundPicker(oled: $theme.oled)
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            Toggle(isOn: $forceSDRTonemap) {
+                Text("Dolby Vision / HDR compatibility").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.Palette.accent)
+            Text("Tone-maps HDR and Dolby Vision to SDR. Turn this on only if 4K Dolby Vision remuxes look washed out, green, or purple on your TV; most TVs should leave it off.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }

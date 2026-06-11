@@ -28,12 +28,25 @@ enum StreamRanking {
         return bonus
     }
 
-    /// best() with the continuity bonus applied on top of the base score.
-    static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?) -> CoreStream? {
-        guard let hint, !hint.isEmpty else { return best(groups) }
+    /// An exact bingeGroup match is the strongest next-episode signal there is:
+    /// the add-on is telling us this stream is the same release as the last one,
+    /// so auto-next stays on the same group with no quality jump mid-binge.
+    static func bingeBonus(_ s: CoreStream, group: String?) -> Int {
+        guard let group, !group.isEmpty, s.behaviorHints?.bingeGroup == group else { return 0 }
+        return 2500
+    }
+
+    /// best() with the continuity and bingeGroup bonuses applied on top of the base
+    /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
+    /// heuristic; both fall back to the plain best when absent.
+    static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil) -> CoreStream? {
+        let hasHint = hint?.isEmpty == false
+        let hasBinge = binge?.isEmpty == false
+        guard hasHint || hasBinge else { return best(groups) }
         let candidates = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
         return candidates.max { lhs, rhs in
-            (score(lhs) + continuityBonus(lhs, hint: hint)) < (score(rhs) + continuityBonus(rhs, hint: hint))
+            (score(lhs) + continuityBonus(lhs, hint: hint) + bingeBonus(lhs, group: binge)) <
+            (score(rhs) + continuityBonus(rhs, hint: hint) + bingeBonus(rhs, group: binge))
         }
     }
 

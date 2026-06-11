@@ -15,10 +15,10 @@ struct OpenLinkView: View {
             Text("Play a link")
                 .font(Theme.Typography.sectionTitle)
                 .foregroundStyle(Theme.Palette.textPrimary)
-            Text("A direct video URL (mp4, mkv, m3u8 and friends) or a magnet link.")
+            Text("A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), or a magnet link.")
                 .font(Theme.Typography.body)
                 .foregroundStyle(Theme.Palette.textSecondary)
-            TextField("https://…  or  magnet:?xt=…", text: $input)
+            TextField("https://…   magnet:?xt=…   or paste any direct stream link", text: $input)
                 .font(Theme.Typography.body)
                 .disableAutocorrection(true)
             HStack(spacing: Theme.Space.md) {
@@ -39,7 +39,7 @@ struct OpenLinkView: View {
     }
 
     private func play() {
-        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.lowercased().hasPrefix("magnet:") {
             guard let magnet = LinkOpener.parseMagnet(text) else {
                 status = "That magnet link has no usable info hash."
@@ -48,9 +48,11 @@ struct OpenLinkView: View {
             playMagnet(magnet)
             return
         }
+        // A bare host or path with no scheme is almost always meant as https.
+        if !text.contains("://"), text.contains(".") { text = "https://" + text }
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
-            status = "Not a playable link. Use a direct http(s) video URL or a magnet."
+            status = "Not a playable link. Paste a direct http(s) stream link (debrid and usenet links count) or a magnet."
             return
         }
         let title = url.lastPathComponent.isEmpty ? (url.host ?? "Stream") : url.lastPathComponent
