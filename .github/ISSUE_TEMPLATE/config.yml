@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/mamaclapper/StremioX/discussions
+    about: Not sure it is a bug? Start a discussion instead.

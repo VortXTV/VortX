@@ -1,0 +1,36 @@
+name: Bug report
+description: Something broken in the app
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Settings > About in the app, e.g. 0.2.23 (50)
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and OS
+      description: e.g. Apple TV 4K (3rd gen), tvOS 26.5
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead. Screenshots or a phone video of the TV help a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: playback
+    attributes:
+      label: If playback related
+      description: What kind of file (resolution, HDR or Dolby Vision, remux or web rip) and whether Match Dynamic Range is on (Settings > Video and Audio > Match Content on the Apple TV).
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I am on the latest release (the app shows an update notice in Settings > About if not)
