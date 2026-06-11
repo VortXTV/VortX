@@ -234,7 +234,7 @@ struct SettingsView: View {
             infoRow("Player", "libmpv · MPVKit")
             infoRow("Server", "Stremio streaming server (nodejs-mobile)")
         }
-        .task { updates.checkIfStale() }
+        .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
     }
 
     private var appVersion: String {

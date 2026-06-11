@@ -29,14 +29,17 @@ final class UpdateChecker: ObservableObject {
     /// relaunch: they suspend for days, so a once-per-launch check meant a user
     /// could sit one release behind forever. Called from Settings and on every
     /// return to the foreground.
+    /// Settings passes a short maxAge (visiting it usually MEANS "any updates?");
+    /// background activations use the 6 hour default. The fake-version test hook
+    /// bypasses the gate entirely.
     func checkIfStale(maxAge: TimeInterval = 6 * 3600) {
+        let testing = ProcessInfo.processInfo.arguments.contains("-stremiox-fake-version")
         let last = UserDefaults.standard.double(forKey: Self.lastCheckedKey)
-        guard Date().timeIntervalSince1970 - last >= maxAge else { return }
+        guard testing || Date().timeIntervalSince1970 - last >= maxAge else { return }
         check()
     }
 
     private func check() {
-        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastCheckedKey)
         Task { [weak self] in
             guard let self else { return }
             // /releases/latest excludes drafts and prereleases (the vendor asset
@@ -45,6 +48,9 @@ final class UpdateChecker: ObservableObject {
                   let (data, response) = try? await URLSession.shared.data(from: url),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let payload = try? JSONDecoder().decode(LatestRelease.self, from: data) else { return }
+            // Only a successful check counts: a network blip must not silence
+            // update notices for the next six hours.
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastCheckedKey)
             let tag = payload.tagName.hasPrefix("v") ? String(payload.tagName.dropFirst()) : payload.tagName
             if Self.isVersion(tag, newerThan: self.currentVersion) {
                 self.available = Release(version: tag, name: payload.name ?? tag)
