@@ -536,6 +536,13 @@ final class MPVMetalViewController: UIViewController {
         }
     }
 
+    /// mpv emits time-pos changes far faster than the UI needs (often per decoded
+    /// frame), and each one hops to the main actor and re-renders the player's
+    /// scrubber. Coalesce to ~4 Hz: smooth for a scrubber, and it stops the playhead
+    /// from competing with remote input on the main thread (the player-sluggishness
+    /// the audit flagged). Threshold logic in the delegate still fires fine at 4 Hz.
+    private var lastTimePosEmit: TimeInterval = 0
+
     func readEvents() {
         queue.async { [weak self] in
             guard let self else { return }
@@ -566,9 +573,17 @@ final class MPVMetalViewController: UIViewController {
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
                             self.emit(propertyName, buffering)
-                        case MPVProperty.timePos, MPVProperty.duration:
+                        case MPVProperty.duration:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 self.emit(propertyName, value)
+                            }
+                        case MPVProperty.timePos:
+                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
+                                let now = ProcessInfo.processInfo.systemUptime
+                                if now - self.lastTimePosEmit >= 0.25 {
+                                    self.lastTimePosEmit = now
+                                    self.emit(propertyName, value)
+                                }
                             }
                         case MPVProperty.pause:
                             let paused = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? false

@@ -43,6 +43,10 @@ struct TVPlayerView: View {
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @State private var optionRow = 0                   // highlighted row in the options panel
+    // Cached so the player body does not rebuild a string and rescan skip spans on
+    // every playhead tick (audit #1): updated only when their inputs change.
+    @State private var metadataLine = ""
+    @State private var currentSkip: SkipSegment?
     // The open panel's rows, computed ONCE per open/refresh. The rows used to be a
     // computed property read by the panel body, which re-rendered ~4x a second with
     // the clock; for Sources that meant re-ranking a thousand-plus streams on the
@@ -138,6 +142,7 @@ struct TVPlayerView: View {
                                 }
                             }
                             currentTime = d
+                            updateCurrentSkip(at: d)
                             if lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
                                 lastSaved = d
                                 saveProgress(at: d)
@@ -151,13 +156,14 @@ struct TVPlayerView: View {
                             if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
                         }
                     case MPVProperty.videoParamsSigPeak:
-                        if let p = data as? Double { isHDR = p > 1.0 }
+                        if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
                     case MPVProperty.duration:
                         if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps() }
                     case MPVProperty.trackList:
                         refreshTracks()
                         let s = coordinator.player?.mediaSummary()
                         videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
+                        metadataLine = computeMetadataLine()
                         if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
                             appliedAutoTracks = true
                             autoSelectTracks()
@@ -396,7 +402,7 @@ struct TVPlayerView: View {
     // MARK: - Control bar
 
     /// Resolution / HDR / audio summary under the title, read live from mpv.
-    private var metadataLine: String {
+    private func computeMetadataLine() -> String {
         var parts: [String] = []
         switch videoHeight {
         case 2000...:     parts.append("4K")
@@ -1056,9 +1062,11 @@ struct TVPlayerView: View {
 
     /// The skip segment the playhead is currently inside, if any. Gated on `hasStartedPlaying` so a stale
     /// segment from the previous file never flashes during a load.
-    private var currentSkip: SkipSegment? {
-        guard hasStartedPlaying else { return nil }
-        return skipSegments.first { currentTime >= $0.start && currentTime < $0.end }
+    /// Recompute the active skip span for a playhead value, assigning only on change
+    /// so the player body re-renders when the pill appears/disappears, not per tick.
+    private func updateCurrentSkip(at time: Double) {
+        let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
+        if skip?.start != currentSkip?.start { currentSkip = skip }
     }
 
     /// Re-resolve skip spans from every available layer (named chapters + crowd timestamps), once the
@@ -1067,6 +1075,7 @@ struct TVPlayerView: View {
         let chapterCandidates = SkipSegments.chapterCandidates(chapters: coordinator.player?.chapters() ?? [],
                                                                duration: duration)
         skipSegments = SegmentResolver.resolve(chapterCandidates + apiSkipCandidates, duration: duration)
+        updateCurrentSkip(at: currentTime)
     }
 
     /// Pull crowd-sourced intro/credits spans for the current title (disk-cached, non-blocking): the
@@ -1387,13 +1396,13 @@ struct TVPlayerView: View {
 
     /// Reveal the bar from a hidden state, selecting Play, and restart the auto-hide timer.
     private func showControls() {
-        withAnimation { showInfo = true }
+        if !showInfo { withAnimation { showInfo = true } }
         if controlsHidden || selected == .close { selected = .play }
         scheduleHide()
     }
     /// Keep the bar visible and reset the auto-hide timer, without changing the selection.
     private func flashControls() {
-        withAnimation { showInfo = true }
+        if !showInfo { withAnimation { showInfo = true } }   // no SwiftUI transaction per repeat-press when already shown
         scheduleHide()
     }
 
