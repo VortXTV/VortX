@@ -63,6 +63,12 @@ enum NodeServer {
         // official mobile builds set via IOS_APP / TV_ENV; we never did, and that was
         // the bug behind "torrents stopped loading" and "the remote freezes in torrents".
         setenv("CASTING_DISABLED", "1", 1)
+        // Give libuv more worker threads. With UDP dead, peer-search leans on HTTP/HTTPS
+        // tracker announces; their DNS lookups (getaddrinfo) and the engine's disk/crypto
+        // all share the libuv threadpool (default 4). Many dead trackers resolving slowly
+        // can saturate it and stall the engine. 16 threads relieves that contention. Cheap
+        // and harmless; the heartbeat in the preload tells us if the loop still freezes.
+        setenv("UV_THREADPOOL_SIZE", "16", 1)
         // Memory: the server defaults its torrent cache to 2 GB, which is a lot for the
         // Apple TV's per-app memory budget. We do NOT disable caching (that thins the
         // torrent buffer); instead the app caps it to a TV-safe size via a /settings
@@ -108,6 +114,23 @@ enum NodeServer {
               return req;
             };
           });
+        })();
+
+        // Event-loop heartbeat: the decisive instrument for the "server froze / went
+        // offline" symptom. Every second, log the loop lag (how late this tick fired vs
+        // the 1s schedule) plus RSS/heap. If the loop FREEZES, these [hb] lines stop dead
+        // and the gap + last lag pinpoint the moment; if it's MEMORY, rss climbs before
+        // the process dies. Either way the next device run names the cause instead of us
+        // guessing. ~60 lines/min, fine for a short repro.
+        (function(){
+          var last = Date.now();
+          setInterval(function(){
+            try {
+              var now = Date.now(), lag = now - last - 1000; last = now;
+              var m = process.memoryUsage();
+              w('[hb]', ['lag=' + lag + 'ms rss=' + Math.round(m.rss/1048576) + 'MB heap=' + Math.round(m.heapUsed/1048576) + 'MB']);
+            } catch(e){}
+          }, 1000);
         })();
 
         // Boot probes: which outbound layers work in this node build? (UDP probe
