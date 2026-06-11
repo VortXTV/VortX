@@ -32,6 +32,7 @@ struct TVPlayerView: View {
     @State private var lastSaved = -1.0               // last position persisted (throttle)
     @State private var showInfo = true
     @State private var hideTask: Task<Void, Never>?
+    @State private var hideDeadline: Date = .distantFuture   // controls auto-hide once now passes this
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var appliedAutoTracks = false       // auto-select audio/subtitle once per load
@@ -210,6 +211,7 @@ struct TVPlayerView: View {
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
+            scheduleHide(); startHideLoop()
             if episodes.isEmpty, let m = curMeta, loadedEpisodes.isEmpty {
                 // Direct resume launches with no meta loaded: fetch it behind playback
                 // so the sources panel shows THIS title (not whatever detail page was
@@ -822,7 +824,7 @@ struct TVPlayerView: View {
     private func openPanel(_ kind: PanelKind) {
         panelKind = kind
         refreshTracks()
-        hideTask?.cancel()
+        scheduleHide()   // loop won't hide while showOptions; this just keeps the deadline fresh
         panelRows = optionRows
         optionRow = panelRows.firstIndex { $0.isSelected } ?? panelRows.firstIndex { !$0.isHeader } ?? 0
         withAnimation { showOptions = true }
@@ -1406,16 +1408,24 @@ struct TVPlayerView: View {
         scheduleHide()
     }
 
+    /// Push the auto-hide deadline forward. A single long-lived poll loop (started in
+    /// onAppear) does the hiding, so a remote press here is just a Date assignment, not
+    /// a Task cancel-and-recreate 6-8 times a second during held-key navigation.
     private func scheduleHide() {
+        hideDeadline = Date().addingTimeInterval(8)
+    }
+
+    /// The one hide loop. Polls twice a second; hides the bar once the deadline passes
+    /// and no options panel is open. Cancelled in onDisappear.
+    private func startHideLoop() {
         hideTask?.cancel()
         hideTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(8))
-            // A cancelled sleep still falls through here (try? swallows CancellationError), so check
-            // explicitly. Every re-show/navigation cancels the prior task; without this guard that
-            // cancelled task would immediately run `showInfo = false` and the bar would vanish on the
-            // very next press.
-            guard !Task.isCancelled, !showOptions else { return }
-            withAnimation { showInfo = false }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                if showInfo, !showOptions, !loadFailed, Date() >= hideDeadline {
+                    withAnimation { showInfo = false }
+                }
+            }
         }
     }
 

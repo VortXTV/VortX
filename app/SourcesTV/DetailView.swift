@@ -269,10 +269,15 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
 
     @State private var season: Int = 1
+    // Cached so a re-render (watch-state updates arrive often) does not re-filter and
+    // re-sort the episode list every time. seasons depends only on the immutable
+    // `videos`; episodes additionally on `season`.
+    @State private var seasons: [Int] = []
+    @State private var episodes: [CoreVideo] = []
 
-    private var seasons: [Int] { Array(Set(videos.map { $0.season ?? 0 })).sorted() }
-    private var episodes: [CoreVideo] {
-        videos.filter { ($0.season ?? 0) == season }.sorted { ($0.episode ?? 0) < ($1.episode ?? 0) }
+    private func recomputeSeasons() { seasons = Array(Set(videos.map { $0.season ?? 0 })).sorted() }
+    private func recomputeEpisodes() {
+        episodes = videos.filter { ($0.season ?? 0) == season }.sorted { ($0.episode ?? 0) < ($1.episode ?? 0) }
     }
 
     var body: some View {
@@ -327,10 +332,13 @@ struct CoreSeasonedEpisodes: View {
             .padding(.horizontal, Theme.Space.screenEdge)
         }
         .onAppear {
+            recomputeSeasons()
             let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
             if seasons.contains(preferred) { season = preferred }
             else if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+            recomputeEpisodes()
         }
+        .onChange(of: season) { recomputeEpisodes() }
     }
 
     private var firstUnwatchedSeason: Int? {
