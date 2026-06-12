@@ -40,6 +40,9 @@ enum StreamRanking {
     /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
     /// heuristic; both fall back to the plain best when absent.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil) -> CoreStream? {
+        if SourcePreferences.shared.useAddonOrder {
+            return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
+        }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
         guard hasHint || hasBinge else { return best(groups) }
@@ -69,8 +72,22 @@ enum StreamRanking {
         else if text.contains("dts-hd") || text.contains("dts hd") || text.contains("dts-ma") { score += 50 }
         else if text.contains("dts") { score += 20 }
         if isCached(s, text) { score += 8000 }   // cached / direct = instant; outranks any non-cached quality
-        if isRealDebrid(text) { score -= 20000 } // RD purged its cache + throttles; last resort only
+        // Source type is the dominant sort key: user-ranked tier (debrid > usenet > torrent > direct
+        // by default) contributes a 15k-spaced weight that always overrules quality within a tier.
+        score += SourcePreferences.shared.tierWeight(for: sourceType(s, text))
         return score
+    }
+
+    /// Classify a stream into the four source categories used for user-rankable tier scoring.
+    static func sourceType(_ s: CoreStream, _ text: String) -> SourceType {
+        if text.contains("debrid") || text.contains("premiumize") || text.contains("torbox")
+            || text.contains("alldebrid") || text.contains("[rd") || text.contains("[ad+]")
+            || text.contains("[pm+]") || text.contains("[tb+]") || text.contains("[dl+]") {
+            return .debrid
+        }
+        if text.contains("usenet") || text.contains("nzb") { return .usenet }
+        if s.isTorrent { return .torrent }
+        return .direct
     }
 
     /// File size in GB parsed from the add-on's stream text (name / description / filename),
@@ -97,7 +114,8 @@ enum StreamRanking {
     /// Each group's streams sorted best-first, stable within equal scores (so add-on order is preserved
     /// among ties). Scores are computed once per stream, not per comparison.
     static func rankedGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        groups.map { group in
+        guard !SourcePreferences.shared.useAddonOrder else { return groups }
+        return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {
                 scored.append((stream: stream, score: score(stream), index: i))
@@ -109,7 +127,10 @@ enum StreamRanking {
 
     /// The single best playable stream across all groups, for the one-press "Watch Now".
     static func best(_ groups: [CoreStreamSourceGroup]) -> CoreStream? {
-        groups.flatMap { $0.streams }.filter { $0.playableURL != nil }.max { score($0) < score($1) }
+        if SourcePreferences.shared.useAddonOrder {
+            return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
+        }
+        return groups.flatMap { $0.streams }.filter { $0.playableURL != nil }.max { score($0) < score($1) }
     }
 
     /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first — feeds the

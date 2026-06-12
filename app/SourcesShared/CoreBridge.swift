@@ -778,6 +778,15 @@ final class CoreBridge: ObservableObject {
         if fields.contains("library") {
             let value = decode(CoreLibrary.self, field: "library")
             DispatchQueue.main.async { [weak self] in self?.library = value }
+            // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
+            // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
+            // button state) reflects the change immediately without waiting for a page reload.
+            if metaDetails != nil {
+                let details = decode(CoreMetaDetails.self, field: "meta_details")
+                DispatchQueue.main.async { [weak self] in
+                    if self?.metaDetails != nil { self?.metaDetails = details }
+                }
+            }
         }
         if fields.contains("search") {
             let board = decode(CoreBoardState.self, field: "search")

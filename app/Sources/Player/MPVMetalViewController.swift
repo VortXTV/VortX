@@ -142,13 +142,16 @@ final class MPVMetalViewController: UIViewController {
         checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &metalLayer))
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
-        // Bundle a broad CJK font and point libass at the folder so non-Latin subtitles (e.g. Korean)
-        // render instead of empty boxes. CoreText fallback alone did not cover them in this build, so we
-        // ship the font and set it as the default subtitle font directly.
+        // Point libass at the bundled fonts for non-Latin subtitle rendering.
+        // Full build: fonts live in a "fonts" subfolder (folder reference).
+        // Lite build: fonts are at the bundle root (individual resources, no CJK to save ~14 MB).
         if let res = Bundle.main.resourcePath {
-            checkError(mpv_set_option_string(mpv, "sub-fonts-dir", res + "/fonts"))
+            let fontsSubdir = res + "/fonts"
+            let fontsDir = FileManager.default.fileExists(atPath: fontsSubdir) ? fontsSubdir : res
+            checkError(mpv_set_option_string(mpv, "sub-fonts-dir", fontsDir))
+            let hasCJK = FileManager.default.fileExists(atPath: fontsDir + "/NotoSansCJK.otf")
+            checkError(mpv_set_option_string(mpv, "sub-font", hasCJK ? "Noto Sans CJK KR" : "Noto Sans"))
         }
-        checkError(mpv_set_option_string(mpv, "sub-font", "Noto Sans CJK KR"))
         checkError(mpv_set_option_string(mpv, "embeddedfonts", "yes"))
         // User-configured subtitle appearance (size / colour / background), see SubtitleStyle.
         for (name, value) in SubtitleStyle.mpvOptions {
