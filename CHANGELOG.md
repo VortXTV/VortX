@@ -4,6 +4,18 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.2.45 (prerelease) - 2026-06-12
+
+### Fixed
+- Add to Library now reflects immediately. After tapping the button the page updates to show the title is saved, without requiring a reload. Affected all profiles.
+- Stream ranking no longer penalises cached streams from debrid services. A bad penalty was knocking cached debrid streams below uncached torrents of the same quality; Watch Now and the 4K button now correctly prefer the faster source.
+
+### Added
+- Source type priority in Settings, Streams. A reorderable list lets you put debrid, Usenet, torrent, or direct streams at the top. The default order is Debrid, Usenet, Torrent, Direct.
+- Use add-on ranking order toggle. Turning it on passes stream order through unchanged, useful if you use a ranking add-on that already sorts sources the way you want.
+- Browse backdrops restored on all hardware. The moving artwork on the Home and catalog pages is no longer suppressed on the Apple TV HD; only the player-side buffers and animation rate remain lighter on that model.
+- Lite build no longer bundles the CJK subtitle font (~14 MB compressed). Non-CJK scripts (Latin, Arabic, Devanagari, Hebrew, Thai) are unaffected; the Full build keeps full CJK support.
+
 ## 0.2.44 - 2026-06-11
 
 ### Fixed

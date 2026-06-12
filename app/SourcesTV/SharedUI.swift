@@ -329,14 +329,9 @@ struct BrowseHeroBackdrop: View {
         ZStack(alignment: .topLeading) {
             Theme.Palette.canvas.ignoresSafeArea()
             if let hero = model.hero {
-                // The full-screen backdrop art (decode + gradient + crossfade on every focus move) is
-                // the heaviest thing on the browse pages. On a constrained Apple TV (A8) skip it and
-                // keep just the canvas + hero text, so the weak GPU is free for scrolling and playback.
-                if !PerformanceMode.reduced {
-                    FullBleedBackdrop(url: hero.backdrop)
-                        .id(hero.id)
-                        .transition(.opacity)
-                }
+                FullBleedBackdrop(url: hero.backdrop)
+                    .id(hero.id)
+                    .transition(.opacity)
                 if model.detailsVisible {
                     positioned(detailsBlock(hero)
                         .frame(maxWidth: 860, alignment: .leading)

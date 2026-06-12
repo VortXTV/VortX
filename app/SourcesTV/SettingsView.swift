@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
+    @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {
         NavigationStack {
@@ -29,6 +30,7 @@ struct SettingsView: View {
                     profilesSection
                     accountSection
                     playbackSection
+                    streamsSection
                     serverSection
                     appearanceSection
                     audioSubtitleSection
@@ -284,8 +286,61 @@ struct SettingsView: View {
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow("Performance", [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
-            Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced drops the moving backdrop, trims animations, and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
+            Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
+    // MARK: Stream source preferences
+
+    private var streamsSection: some View {
+        section("Streams") {
+            Toggle(isOn: $sourcePrefs.useAddonOrder) {
+                Text("Use add-on ranking order")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.Palette.accent)
+            Text("When on, streams appear in the order your add-ons return them. Useful if you use a ranking add-on like AIOStreams. When off, the app's own ranking applies.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            if !sourcePrefs.useAddonOrder {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    Text("Source type priority")
+                        .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    ForEach(Array(sourcePrefs.typeOrder.enumerated()), id: \.element) { index, sourceType in
+                        HStack(spacing: 12) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(sourceType.label)
+                                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
+                                Text(sourceType.detail)
+                                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                            }
+                            Spacer()
+                            HStack(spacing: 8) {
+                                Button {
+                                    sourcePrefs.moveType(at: index, direction: -1)
+                                } label: {
+                                    Image(systemName: "chevron.up").frame(width: 36, height: 36)
+                                }
+                                .opacity(index == 0 ? 0.3 : 1)
+                                .disabled(index == 0)
+                                Button {
+                                    sourcePrefs.moveType(at: index, direction: 1)
+                                } label: {
+                                    Image(systemName: "chevron.down").frame(width: 36, height: 36)
+                                }
+                                .opacity(index == sourcePrefs.typeOrder.count - 1 ? 0.3 : 1)
+                                .disabled(index == sourcePrefs.typeOrder.count - 1)
+                            }
+                        }
+                        .padding(.vertical, Theme.Space.xs)
+                    }
+                }
+                .focusSection()
+                Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
         }
     }
 
