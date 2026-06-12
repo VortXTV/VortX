@@ -18,6 +18,9 @@ enum LastStreamStore {
         var qualityText: String?
         var torrent: Bool? = nil
         var savedAt: Date
+        /// HTTP headers the stream's add-on requires; without them a direct resume of a
+        /// header-gated stream is rejected by its CDN. Optional, so old entries decode.
+        var headers: [String: String]? = nil
     }
 
     private static func key(_ profileID: UUID) -> String { "stremiox.lastStream.\(profileID.uuidString)" }

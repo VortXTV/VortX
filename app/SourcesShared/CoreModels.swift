@@ -274,12 +274,26 @@ struct CoreStream: Decodable, Identifiable {
         guard let hash = infoHash?.lowercased() else { return nil }
         return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
     }
+
+    /// HTTP request headers the add-on declares this stream NEEDS (behaviorHints.proxyHeaders):
+    /// some add-ons front CDNs that reject requests without a specific Referer or browser
+    /// User-Agent. Official clients apply these; the player must too or the stream 403s.
+    var requestHeaders: [String: String]? {
+        guard let headers = behaviorHints?.proxyHeaders?.request, !headers.isEmpty else { return nil }
+        return headers
+    }
 }
 
 struct CoreStreamBehaviorHints: Decodable {
     let notWebReady: Bool?
     let bingeGroup: String?
     let filename: String?
+    let proxyHeaders: CoreProxyHeaders?
+}
+
+/// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.
+struct CoreProxyHeaders: Decodable {
+    let request: [String: String]?
 }
 
 /// Streams grouped by source addon, for the per-addon filter + source labels.

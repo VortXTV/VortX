@@ -14,6 +14,7 @@ struct TVPlayerView: View {
     var sourceHint: String? = nil              // quality signature of the launching stream (source continuity)
     var torrent: Bool = false                  // stream rides the embedded torrent engine (gets warm-up patience)
     var bingeGroup: String? = nil              // the launching stream's release-group tag, for sticky auto-next
+    var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     @EnvironmentObject private var account: StremioAccount
@@ -76,6 +77,7 @@ struct TVPlayerView: View {
     // Current episode (changes when switching via Next/Prev/Episodes or auto-advance). Seeded from
     // the passed url/title/meta in onAppear so the first load is unchanged.
     @State private var curURL: URL?
+    @State private var curHeaders: [String: String]?   // the playing stream's required HTTP headers
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
     // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
@@ -124,7 +126,7 @@ struct TVPlayerView: View {
             Color.black.ignoresSafeArea()
 
             MPVMetalPlayerView(coordinator: coordinator)
-                .play(url)
+                .play(url, headers: headers)
                 .onPropertyChange { _, name, data in
                     switch name {
                     case MPVProperty.pausedForCache: if let b = data as? Bool { buffering = b }
@@ -144,7 +146,7 @@ struct TVPlayerView: View {
                                         videoId: m.videoId, url: u.absoluteString, title: curTitle,
                                         season: m.season, episode: m.episode, name: m.name,
                                         poster: m.poster, type: m.type, qualityText: curHint,
-                                        torrent: curIsTorrent, savedAt: Date()),
+                                        torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
                                         profileID: ProfileStore.shared.activeID)
                                 }
                             }
@@ -216,7 +218,7 @@ struct TVPlayerView: View {
             }
         }
         .onAppear {
-            if curURL == nil { curURL = url; curTitle = title; curMeta = meta; curIsTorrent = torrent }   // seed from initial
+            if curURL == nil { curURL = url; curTitle = title; curMeta = meta; curIsTorrent = torrent; curHeaders = headers }   // seed from initial
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
@@ -765,6 +767,7 @@ struct TVPlayerView: View {
         curURL = newURL
         curIsTorrent = stream.isTorrent
         curBinge = stream.behaviorHints?.bingeGroup
+        curHeaders = stream.requestHeaders
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         prepareTorrent(stream)   // mid-playback switches never announced the torrent before
@@ -772,7 +775,7 @@ struct TVPlayerView: View {
         appliedResume = false
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
-        coordinator.player?.loadFile(newURL)
+        coordinator.player?.loadFile(newURL, headers: curHeaders)
         startLoadTimeout()
     }
 
@@ -1029,7 +1032,7 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         appliedResume = false; appliedAutoTracks = false
         buffering = true
-        coordinator.player?.loadFile(curURL ?? url)
+        coordinator.player?.loadFile(curURL ?? url, headers: curHeaders)
     }
 
     private func startLoadTimeout() {
@@ -1174,7 +1177,7 @@ struct TVPlayerView: View {
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; loadErrorMsg = ""
-        coordinator.player?.loadFile(curURL ?? url)
+        coordinator.player?.loadFile(curURL ?? url, headers: curHeaders)
         startLoadTimeout()
     }
 
@@ -1290,6 +1293,7 @@ struct TVPlayerView: View {
             curHint = pre.signature
             curBinge = pre.bingeGroup
             curIsTorrent = pre.stream.isTorrent
+            curHeaders = pre.stream.requestHeaders
             torrentWarmupsUsed = 0; torrentStatus = nil
             stallRecoveries = 0
             plog.info("episode switch: playing preloaded best source")
@@ -1298,7 +1302,7 @@ struct TVPlayerView: View {
             Task {
                 core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
                 resumeSeconds = await account.resumeOffset(for: newMeta)
-                coordinator.player?.loadFile(u)
+                coordinator.player?.loadFile(u, headers: curHeaders)
                 startLoadTimeout()
                 // Hand the stream to the engine Player once its meta_details catches up, so
                 // Continue Watching keeps tracking; harmless if it never matches.
@@ -1331,11 +1335,12 @@ struct TVPlayerView: View {
                     DiagnosticsLog.log("binge", "auto-next FALLBACK: wanted binge=\(curBinge ?? "nil") got=\(s.behaviorHints?.bingeGroup ?? "nil") name=\(s.name?.prefix(60) ?? "")")
                     curBinge = s.behaviorHints?.bingeGroup
                     curHint = StreamRanking.signature(s)
+                    curHeaders = s.requestHeaders
                     core.loadEnginePlayer(for: s)
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
                     resumeSeconds = await account.resumeOffset(for: newMeta)
-                    coordinator.player?.loadFile(u)
+                    coordinator.player?.loadFile(u, headers: curHeaders)
                     startLoadTimeout()
                     return
                 }

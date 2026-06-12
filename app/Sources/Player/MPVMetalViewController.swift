@@ -26,6 +26,7 @@ final class MPVMetalViewController: UIViewController {
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     
     var playUrl: URL?
+    var playHeaders: [String: String]?
     var onSingleTap: (() -> Void)?
     var hdrAvailable : Bool = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
@@ -57,7 +58,7 @@ final class MPVMetalViewController: UIViewController {
         setupMpv()
         
         if let url = playUrl {
-            loadFile(url)
+            loadFile(url, headers: playHeaders)
         }
     }
     
@@ -304,13 +305,36 @@ final class MPVMetalViewController: UIViewController {
         wakeupRelay?.release()
     }
 
+    /// mpv's stock User-Agent, captured once so a stream with custom headers can never leak
+    /// its UA into the next stream.
+    private lazy var defaultUserAgent = getString("user-agent") ?? ""
+
     func loadFile(
-        _ url: URL
+        _ url: URL,
+        headers: [String: String]? = nil
     ) {
         var args = [url.absoluteString]
         var options = [String]()
 
         args.append("replace")
+
+        // Per-stream HTTP headers (behaviorHints.proxyHeaders): some add-ons front CDNs that
+        // require a specific Referer or a browser User-Agent; without them the server rejects
+        // the stream ("loading failed" on sources that play fine in clients that apply them).
+        // ALWAYS set all three so the previous file's headers never bleed into this one.
+        var fields: [String] = []
+        var userAgent = ""
+        var referrer = ""
+        for (name, value) in headers ?? [:] {
+            switch name.lowercased() {
+            case "user-agent":         userAgent = value
+            case "referer", "referrer": referrer = value
+            default:                    fields.append("\(name): \(value)")
+            }
+        }
+        setString("user-agent", userAgent.isEmpty ? defaultUserAgent : userAgent)
+        setString("referrer", referrer)
+        setString("http-header-fields", fields.joined(separator: ","))
 
         // Size the read-ahead by where the bytes come from. A torrent plays from the embedded server
         // on 127.0.0.1, which already buffers the file into its OWN disk cache, so a 512 MiB mpv

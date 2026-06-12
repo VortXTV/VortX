@@ -8,6 +8,7 @@ struct MPVMetalPlayerView: UIViewControllerRepresentable {
         let mpv =  MPVMetalViewController()
         mpv.playDelegate = coordinator
         mpv.playUrl = coordinator.playUrl
+        mpv.playHeaders = coordinator.playHeaders
         let coord = context.coordinator
         mpv.onSingleTap = { [weak coord] in coord?.onTap?() }
 
@@ -26,8 +27,9 @@ struct MPVMetalPlayerView: UIViewControllerRepresentable {
         coordinator
     }
     
-    func play(_ url: URL) -> Self {
+    func play(_ url: URL, headers: [String: String]? = nil) -> Self {
         coordinator.playUrl = url
+        coordinator.playHeaders = headers
         return self
     }
     
@@ -46,6 +48,7 @@ struct MPVMetalPlayerView: UIViewControllerRepresentable {
         weak var player: MPVMetalViewController?
         
         var playUrl : URL?
+        var playHeaders: [String: String]?
         var onPropertyChange: ((MPVMetalViewController, String, Any?) -> Void)?
         var onTap: (() -> Void)?
         
