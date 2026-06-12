@@ -40,6 +40,7 @@ struct TVPlayerView: View {
     @State private var panelKind: PanelKind = .audio   // which list the options panel shows
     @State private var subDelay: Double = 0            // manual subtitle sync, seconds
     @State private var audioDelay: Double = 0          // manual audio sync, seconds
+    @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
@@ -63,6 +64,11 @@ struct TVPlayerView: View {
     @State private var autoRetryTask: Task<Void, Never>?
     private let maxAutoRetries = 2                     // transient source hiccups recover; a dead link still falls through fast
     private let autoRetryBackoff = 1.2                 // seconds between auto-retries
+    // Auto-failover: when a source spends its retry / stall / warm-up budget, hop to the
+    // best-ranked UNTRIED source instead of dropping the viewer at the error overlay.
+    @State private var exhaustedURLs: Set<URL> = []    // sources already given up on for this video
+    @State private var sourceHops = 0                  // automatic source switches so far for this video
+    private let maxSourceHops = 4                      // a fully-dead title still errors out, just later
     @State private var skipSegments: [SkipSegment] = []   // resolved skip spans (chapters + crowd timestamps)
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
@@ -97,8 +103,8 @@ struct TVPlayerView: View {
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, sources }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources, settings }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, sources, playerSettings }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -192,6 +198,9 @@ struct TVPlayerView: View {
                             .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     } else if reconnecting {
                         Text("Reconnecting…  (\(autoRetryCount)/\(maxAutoRetries))")
+                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    } else if sourceHops > 0, !hasStartedPlaying {
+                        Text("Source failed, trying another…  (\(sourceHops)/\(maxSourceHops))")
                             .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     }
                 }
@@ -313,7 +322,7 @@ struct TVPlayerView: View {
     /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
     /// bar) are separate rows above this one; up/down moves between the three.
     private var buttonRow: [Control] {
-        var c: [Control] = [.restart, .back]
+        var c: [Control] = [.settings, .restart, .back]
         if allEpisodes.count > 1 && hasPrevEpisode { c.append(.prev) }
         c.append(.play)
         if allEpisodes.count > 1 && hasNextEpisode { c.append(.next) }
@@ -373,6 +382,7 @@ struct TVPlayerView: View {
         case .playback: openPanel(.playback)
         case .episodes: openPanel(.episodes)
         case .sources:  openPanel(.sources)
+        case .settings: openPanel(.playerSettings)
         }
     }
 
@@ -471,6 +481,12 @@ struct TVPlayerView: View {
                         if allEpisodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") }
                         ctrlButton(.fwd, "goforward.10")
                     }
+                    // The right side carries the per-panel buttons; the gear lives alone on the
+                    // left so player-wide settings (handoff, decoder, info, QR) stay uncluttered.
+                    HStack(spacing: Theme.Space.md) {
+                        ctrlButton(.settings, "gearshape.fill")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     HStack(spacing: Theme.Space.md) {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
@@ -570,6 +586,8 @@ struct TVPlayerView: View {
                         OptionRow(label: "Earlier  −0.1s", detail: now) { adjustSubDelay(-0.1) },
                         OptionRow(label: "Later  +0.1s", detail: now) { adjustSubDelay(0.1) }]
             if subDelay != 0 { rows.append(OptionRow(label: "Reset") { adjustSubDelay(-subDelay) }) }
+            rows.append(OptionRow(label: "Font", isHeader: true))
+            for f in SubtitleStyle.fonts { rows.append(OptionRow(label: f.label, isSelected: subFont == f.id) { setSubtitleFont(f.id) }) }
             rows.append(OptionRow(label: "Size", isHeader: true))
             for s in SubtitleStyle.sizes { rows.append(OptionRow(label: s.label, isSelected: subSize == s.id) { setSubtitleSize(s.id) }) }
             rows.append(OptionRow(label: "Colour", isHeader: true))
@@ -593,20 +611,9 @@ struct TVPlayerView: View {
                     coordinator.player?.setSpeed(s)
                 })
             }
-            rows.append(OptionRow(label: "Info", isHeader: true))
-            rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
-                                  isSelected: showStats) {
-                showStats.toggle()
-                withAnimation { showOptions = false }
-            })
-            if shareLink != nil {
-                rows.append(OptionRow(label: isTorrentPlayback ? "Magnet link  ·  QR for your phone"
-                                                               : "Stream link  ·  QR for your phone") {
-                    withAnimation { showOptions = false }
-                    showStreamQR = true
-                })
-            }
             return rows
+        case .playerSettings:
+            return playerSettingsRows()
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
@@ -690,6 +697,49 @@ struct TVPlayerView: View {
         return rows
     }
 
+    /// The gear panel: player-wide settings that aren't tied to one media kind. Handoff to an
+    /// installed external player (direct/debrid URLs only; a torrent's local-server URL dies when
+    /// this app suspends), the decoder choice, and the info/QR rows that used to crowd Playback.
+    private func playerSettingsRows() -> [OptionRow] {
+        var rows: [OptionRow] = []
+        if !isTorrentPlayback, let url = curURL {
+            let players = ExternalPlayers.installed()
+            if !players.isEmpty {
+                rows.append(OptionRow(label: "Play in", isHeader: true))
+                for player in players {
+                    rows.append(OptionRow(label: player.name, detail: "›") {
+                        saveProgress(at: currentTime)
+                        coordinator.player?.pause()
+                        ExternalPlayers.open(url, in: player)
+                        withAnimation { showOptions = false }
+                    })
+                }
+            }
+        }
+        rows.append(OptionRow(label: "Decoder", isHeader: true))
+        let hw = coordinator.player?.hardwareDecoding ?? true
+        rows.append(OptionRow(label: "Hardware  ·  default", isSelected: hw) {
+            coordinator.player?.setHardwareDecoding(true)
+        })
+        rows.append(OptionRow(label: "Software  ·  if video misbehaves", isSelected: !hw) {
+            coordinator.player?.setHardwareDecoding(false)
+        })
+        rows.append(OptionRow(label: "Info", isHeader: true))
+        rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
+                              isSelected: showStats) {
+            showStats.toggle()
+            withAnimation { showOptions = false }
+        })
+        if shareLink != nil {
+            rows.append(OptionRow(label: isTorrentPlayback ? "Magnet link  ·  QR for your phone"
+                                                           : "Stream link  ·  QR for your phone") {
+                withAnimation { showOptions = false }
+                showStreamQR = true
+            })
+        }
+        return rows
+    }
+
     /// A concise one-line label for a source: the first line of its name, else its description.
     private func sourceLabel(_ s: CoreStream) -> String {
         func firstLine(_ t: String?) -> String {
@@ -704,12 +754,18 @@ struct TVPlayerView: View {
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position (via `resumeSeconds`), so a buffering or low-quality source can be swapped without
     /// leaving the player. Resets the auto-recovery budget for the fresh source.
-    private func switchStream(to stream: CoreStream) {
-        guard let newURL = stream.playableURL, newURL != curURL else { closePanel(); return }
-        closePanel()
+    private func switchStream(to stream: CoreStream, userInitiated: Bool = true) {
+        guard let newURL = stream.playableURL, newURL != curURL else {
+            if userInitiated { closePanel() }
+            return
+        }
+        // closePanel forces the control bar up and teleports the highlight; right for a manual
+        // pick, hostile when an automatic hop fires while the viewer is browsing a panel.
+        if userInitiated { closePanel() }
         curURL = newURL
         curIsTorrent = stream.isTorrent
         curBinge = stream.behaviorHints?.bingeGroup
+        sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         prepareTorrent(stream)   // mid-playback switches never announced the torrent before
         resumeSeconds = currentTime
@@ -718,6 +774,40 @@ struct TVPlayerView: View {
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         coordinator.player?.loadFile(newURL)
         startLoadTimeout()
+    }
+
+    /// The best playable stream not yet tried (and failed) for this video. Goes through
+    /// StreamRanking.best so the pick honours the user's source-type order, the add-on-order
+    /// toggle, and the continuity / binge hints, exactly like the original auto-pick did.
+    private func nextUntriedStream() -> CoreStream? {
+        let remaining = core.streamGroups().map { group in
+            CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
+                guard let url = s.playableURL else { return false }
+                return url != curURL && !exhaustedURLs.contains(url)
+            })
+        }
+        return StreamRanking.best(remaining, continuity: curHint, binge: curBinge)
+    }
+
+    /// The playing source is dead (its retry, stall, or warm-up budget ran out): mark it
+    /// exhausted and hop to the next-best untried source automatically. Returns false when the
+    /// hop budget is spent or nothing untried remains; the caller then shows the error overlay.
+    @discardableResult
+    private func hopToNextSource(reason: String) -> Bool {
+        guard sourceHops < maxSourceHops, let stream = nextUntriedStream() else { return false }
+        // switchStream clears the budget (it doubles as the manual-pick path) and resumes at
+        // currentTime; snapshot both around the call so the hop keeps its own bookkeeping and a
+        // pre-start failure keeps the original resume offset.
+        var tried = exhaustedURLs
+        if let dead = curURL { tried.insert(dead) }
+        let hops = sourceHops + 1
+        let resume: Double? = hasStartedPlaying ? currentTime : resumeSeconds
+        DiagnosticsLog.log("player", "source hop \(hops)/\(maxSourceHops) (\(reason)) -> \(sourceLabel(stream).prefix(40))")
+        switchStream(to: stream, userInitiated: false)
+        exhaustedURLs = tried
+        sourceHops = hops
+        resumeSeconds = resume
+        return true
     }
 
     /// Nudge subtitle sync by `delta` seconds (rounded to 0.1); keeps the panel open to repeat.
@@ -729,6 +819,7 @@ struct TVPlayerView: View {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
         coordinator.player?.setAudioDelay(audioDelay)
     }
+    private func setSubtitleFont(_ id: String) { subFont = id; coordinator.player?.applySubtitleStyle() }
     private func setSubtitleSize(_ id: String) { subSize = id; coordinator.player?.applySubtitleStyle() }
     private func setSubtitleColor(_ id: String) { subColor = id; coordinator.player?.applySubtitleStyle() }
     private func setSubtitleBackground(_ id: String) { subBackground = id; coordinator.player?.applySubtitleStyle() }
@@ -743,6 +834,7 @@ struct TVPlayerView: View {
         case .playback:         return "Playback"
         case .episodes:         return "Episodes"
         case .sources:          return "Sources"
+        case .playerSettings:   return "Player Settings"
         }
     }
 
@@ -829,7 +921,11 @@ struct TVPlayerView: View {
         refreshTracks()
         scheduleHide()   // loop won't hide while showOptions; this just keeps the deadline fresh
         panelRows = optionRows
-        optionRow = panelRows.firstIndex { $0.isSelected } ?? panelRows.firstIndex { !$0.isHeader } ?? 0
+        // Single-choice panels open on the current selection; the mixed settings panel opens
+        // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
+        let seedOnSelection = kind != .playerSettings
+        optionRow = (seedOnSelection ? panelRows.firstIndex { $0.isSelected } : nil)
+            ?? panelRows.firstIndex { !$0.isHeader } ?? 0
         withAnimation { showOptions = true }
     }
     private func closePanel() {
@@ -860,7 +956,7 @@ struct TVPlayerView: View {
             Theme.Palette.canvas.opacity(0.94).ignoresSafeArea()
             VStack(spacing: Theme.Space.md) {
                 Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 60)).foregroundStyle(Theme.Palette.danger)
-                Text("This source didn't load")
+                Text(sourceHops > 0 ? "Tried \(sourceHops + 1) sources, none worked" : "This source didn't load")
                     .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
                 Text(loadErrorMsg.isEmpty
                      ? "It may still be downloading on your source, offline, or an unsupported link."
@@ -906,7 +1002,10 @@ struct TVPlayerView: View {
         guard stallRecoveries < 3 else {
             // Repeated stalls on the same source: stop reloading and let the viewer
             // pick another source from the error overlay.
-            DiagnosticsLog.log("player", "stall recovery exhausted, showing error overlay")
+            // Repeated stalls on one source: hop to another at the current position,
+            // falling back to the error overlay once candidates run out.
+            DiagnosticsLog.log("player", "stall recovery exhausted")
+            if hopToNextSource(reason: "stall budget exhausted") { return }
             loadErrorMsg = "Playback kept stalling on this source."
             withAnimation { loadFailed = true }
             return
@@ -929,6 +1028,7 @@ struct TVPlayerView: View {
                 warmUpTorrent()
                 return
             }
+            if hopToNextSource(reason: "load timeout") { return }
             if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
             withAnimation { loadFailed = true }
         }
@@ -965,8 +1065,9 @@ struct TVPlayerView: View {
     /// down, narrating peer count and speed, then hand mpv the URL again.
     private func warmUpTorrent() {
         guard torrentWarmupsUsed < 2, let u = curURL, u.pathComponents.count >= 2 else {
-            if loadErrorMsg.isEmpty { loadErrorMsg = "The torrent never started sending data. Try another source." }
             reconnecting = false; torrentStatus = nil
+            if hopToNextSource(reason: "torrent warm-up exhausted") { return }
+            if loadErrorMsg.isEmpty { loadErrorMsg = "The torrent never started sending data. Try another source." }
             withAnimation { loadFailed = true }
             return
         }
@@ -1038,6 +1139,7 @@ struct TVPlayerView: View {
         }
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
+            if hopToNextSource(reason: "load failed: \(msg)") { return }
             withAnimation { loadFailed = true }
             return
         }
@@ -1160,6 +1262,7 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        sourceHops = 0; exhaustedURLs = []   // fresh episode, fresh failover budget
         let newMeta = PlaybackMeta(libraryId: m.libraryId, videoId: v.id, type: "series",
                                    name: m.name, poster: m.poster, season: v.season, episode: v.episode)
         curMeta = newMeta

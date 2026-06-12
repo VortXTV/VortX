@@ -7,9 +7,21 @@ import os
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
 // Edit Scheme -> Run -> Diagnostics -> Metal API Validation -> Turn it off
 // https://github.com/KhronosGroup/MoltenVK/issues/2226
+
+/// The context object mpv's wakeup callback receives. mpv holds it retained (+1); the weak
+/// controller reference inside means a callback racing teardown resolves to nil instead of
+/// dereferencing a freed controller. Released only after `mpv_terminate_destroy` returns,
+/// at which point mpv guarantees no further callbacks.
+private final class WakeupRelay {
+    weak var controller: MPVMetalViewController?
+    init(_ controller: MPVMetalViewController) { self.controller = controller }
+}
+
 final class MPVMetalViewController: UIViewController {
     var metalLayer = MetalLayer()
     var mpv: OpaquePointer!
+    /// The +1 relay currently registered with mpv; balanced with release() after terminate.
+    private var wakeupRelay: Unmanaged<WakeupRelay>?
     var playDelegate: MPVPlayerDelegate?
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     
@@ -149,11 +161,10 @@ final class MPVMetalViewController: UIViewController {
             let fontsSubdir = res + "/fonts"
             let fontsDir = FileManager.default.fileExists(atPath: fontsSubdir) ? fontsSubdir : res
             checkError(mpv_set_option_string(mpv, "sub-fonts-dir", fontsDir))
-            let hasCJK = FileManager.default.fileExists(atPath: fontsDir + "/NotoSansCJK.otf")
-            checkError(mpv_set_option_string(mpv, "sub-font", hasCJK ? "Noto Sans CJK KR" : "Noto Sans"))
         }
         checkError(mpv_set_option_string(mpv, "embeddedfonts", "yes"))
-        // User-configured subtitle appearance (size / colour / background), see SubtitleStyle.
+        // User-configured subtitle appearance (font / size / colour / background), see SubtitleStyle.
+        // sub-font is part of mpvOptions; the bundled Noto fonts above stay the non-Latin fallback.
         for (name, value) in SubtitleStyle.mpvOptions {
             checkError(mpv_set_option_string(mpv, name, value))
         }
@@ -222,10 +233,15 @@ final class MPVMetalViewController: UIViewController {
         mpv_observe_property(mpv, 0, MPVProperty.duration, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.pause, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.trackList, MPV_FORMAT_NONE)
-        mpv_set_wakeup_callback(self.mpv, { (ctx) in
-            let client = unsafeBitCast(ctx, to: MPVMetalViewController.self)
-            client.readEvents()
-        }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
+        // mpv gets a retained relay holding a WEAK controller reference, never the controller
+        // itself: an unretained `self` was a use-after-free if the wakeup fired (on mpv's
+        // internal thread) while the controller was mid-dealloc.
+        let relay = Unmanaged.passRetained(WakeupRelay(self))
+        wakeupRelay = relay
+        mpv_set_wakeup_callback(self.mpv, { ctx in
+            guard let ctx else { return }
+            Unmanaged<WakeupRelay>.fromOpaque(ctx).takeUnretainedValue().controller?.readEvents()
+        }, relay.toOpaque())
 
         setupNotification()
     }
@@ -259,15 +275,21 @@ final class MPVMetalViewController: UIViewController {
 #endif
         appliedDynamicRange = .sdr
         guard let handle = mpv else { return }
+        // Nil the handle SYNCHRONOUSLY so exactly one owner destroys it: deinit's safety net
+        // sees nil (no double terminate when dealloc beats the queued block), the event drain
+        // stops picking it up, and every property accessor becomes a guarded no-op.
+        mpv = nil
         mpv_set_wakeup_callback(handle, nil, nil)
         // Tell the core to wind down NOW (mpv_command_string is thread-safe): decode and network
         // stop immediately. Without this, destruction waited its turn on the event queue, and a
         // stalled network read kept a ZOMBIE core decoding 4K invisibly for over a minute after
         // close (seen live), starving the UI hard enough to wedge the tab bar.
         mpv_command_string(handle, "quit")
-        queue.async { [weak self] in
-            self?.mpv = nil
+        let relay = wakeupRelay
+        wakeupRelay = nil
+        queue.async {
             mpv_terminate_destroy(handle)
+            relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
         }
     }
 
@@ -279,6 +301,7 @@ final class MPVMetalViewController: UIViewController {
             mpv = nil
             mpv_terminate_destroy(handle)
         }
+        wakeupRelay?.release()
     }
 
     func loadFile(
@@ -499,6 +522,18 @@ final class MPVMetalViewController: UIViewController {
 
     func setSpeed(_ speed: Double) { setString(MPVProperty.speed, String(format: "%.2f", speed)) }
 
+    /// Whether VideoToolbox hardware decoding is currently requested (the player's Decoder option).
+    private(set) var hardwareDecoding = true
+
+    /// Switch between hardware (VideoToolbox) and software decoding at runtime. mpv re-probes the
+    /// decoder on the property change, so this takes effect on the playing file without a reload.
+    /// Software decode is a rescue path for clips whose hardware decode misbehaves (artifacts,
+    /// green frames, unsupported profile); it costs CPU, so hardware stays the default.
+    func setHardwareDecoding(_ on: Bool) {
+        hardwareDecoding = on
+        setString("hwdec", on ? "videotoolbox" : "no")
+    }
+
     /// Live numbers for the player's "Playback info" overlay.
     func playbackStats() -> [(String, String)] {
         guard mpv != nil else { return [] }
@@ -585,8 +620,12 @@ final class MPVMetalViewController: UIViewController {
         queue.async { [weak self] in
             guard let self else { return }
             
-            while self.mpv != nil {
-                let event = mpv_wait_event(self.mpv, 0)
+            while true {
+                // Re-check per iteration and hold a local: stop() nils `mpv` from the main
+                // thread mid-drain, and the handle itself stays valid until stop()'s destroy
+                // block, which is queued BEHIND this drain on the same serial queue.
+                guard let handle = self.mpv else { break }
+                let event = mpv_wait_event(handle, 0)
                 if event?.pointee.event_id == MPV_EVENT_NONE {
                     break
                 }
@@ -652,10 +691,10 @@ final class MPVMetalViewController: UIViewController {
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:
-                    print("event: shutdown\n");
-                    mpv_terminate_destroy(mpv);
-                    mpv = nil;
-                    break;
+                    // "quit" landed (only stop() sends it). Destruction belongs to stop()'s
+                    // queued block, which runs after this drain on the same serial queue;
+                    // destroying here too was a double terminate. Just stop draining.
+                    return
                 case MPV_EVENT_LOG_MESSAGE:
                     if let msg = UnsafeMutablePointer<mpv_event_log_message>(OpaquePointer(event!.pointee.data)) {
                         let prefix = String(cString: msg.pointee.prefix)

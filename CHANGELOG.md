@@ -9,12 +9,20 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 ### Fixed
 - Add to Library now reflects immediately. After tapping the button the page updates to show the title is saved, without requiring a reload. Affected all profiles.
 - Stream ranking no longer penalises cached streams from debrid services. A bad penalty was knocking cached debrid streams below uncached torrents of the same quality; Watch Now and the 4K button now correctly prefer the faster source.
+- Two rare crash paths in the player and engine teardown are hardened: a remote-control event arriving at the exact moment the player closes, and an engine event racing app shutdown, can no longer touch freed memory.
 
 ### Added
+- Auto-failover between sources. When a stream times out, keeps stalling, or dies before starting, the player now hops to the next-best source on its own (up to four hops) instead of dropping you at an error screen. A deliberate source pick or episode change resets the budget.
+- Player settings panel. A gear button on the left of the control bar opens a new panel holding: handoff of the playing stream to an installed external player app, a hardware/software decoder switch for clips whose video misbehaves, the playback info overlay, and the QR link share. The speed button now holds only speed.
+- Subtitle font choice. A new Modern style (clean sans with a thin outline and soft shadow) is the default; Classic keeps the previous heavier look. In Settings and in the player's subtitle options.
 - Source type priority in Settings, Streams. A reorderable list lets you put debrid, Usenet, torrent, or direct streams at the top. The default order is Debrid, Usenet, Torrent, Direct.
 - Use add-on ranking order toggle. Turning it on passes stream order through unchanged, useful if you use a ranking add-on that already sorts sources the way you want.
+- Smarter ranking signals. Theatrical rips and fake upscales (CAM, telesync, screener families) now sink below every legitimate stream and are labelled in the source list; AV1 video is demoted at 4K where the hardware cannot decode it; 3D releases, broadcast captures, and hardcoded-subtitle rips rank below clean releases; raw torrent health (seeder count) breaks ties within the torrent tier.
 - Browse backdrops restored on all hardware. The moving artwork on the Home and catalog pages is no longer suppressed on the Apple TV HD; only the player-side buffers and animation rate remain lighter on that model.
-- Lite build no longer bundles the CJK subtitle font (~14 MB compressed). Non-CJK scripts (Latin, Arabic, Devanagari, Hebrew, Thai) are unaffected; the Full build keeps full CJK support.
+
+### Changed
+- The CJK subtitle font is trimmed to its practically-used coverage: 7.6 MB instead of 16 MB, with identical rendering for real-world subtitles. Every build gets smaller; the Lite build drops the CJK face entirely and saves the most.
+- Vendor downloads in the build script are now checksum-pinned, so a tampered or corrupted dependency fails the build instead of shipping.
 
 ## 0.2.44 - 2026-06-11
 

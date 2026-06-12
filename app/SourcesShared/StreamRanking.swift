@@ -56,8 +56,16 @@ enum StreamRanking {
     static func score(_ s: CoreStream) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
+        // Source ladder, the consensus ordering every parser converges on:
+        // remux > bluray > web-dl > webrip > hdtv > dvdrip > tv captures.
         if text.contains("remux") { score += 250 }
-        else if text.contains("bluray") || text.contains("blu-ray") { score += 120 }
+        else if text.contains("bluray") || text.contains("blu-ray") || boundedMatch(text, #"b[dr][ .\-_]?rip"#) { score += 120 }
+        else if boundedMatch(text, #"web[ .\-_]?dl"#) { score += 100 }
+        else if boundedMatch(text, #"web[ .\-_]?rip"#) { score += 40 }
+        else if boundedMatch(text, "web") { score += 100 }   // scene bare "WEB" tag = WEB-DL
+        else if text.contains("hdtv") { score -= 150 }
+        else if boundedMatch(text, #"dvd[ .\-_]?rip"#) { score -= 200 }
+        else if text.contains("tvrip") || text.contains("satrip") || boundedMatch(text, #"pdtv"#) { score -= 300 }
         if text.contains("hdr") || text.contains("dolby vision") || text.contains("dolbyvision") || text.contains("dovi") {
             score += 80
         }
@@ -71,23 +79,125 @@ enum StreamRanking {
         if text.contains("atmos") || text.contains("truehd") || text.contains("true-hd") { score += 70 }
         else if text.contains("dts-hd") || text.contains("dts hd") || text.contains("dts-ma") { score += 50 }
         else if text.contains("dts") { score += 20 }
+        // Apple TV has no AV1 hardware decode on any model, so 4K AV1 lands on software decode
+        // and struggles; 1080p AV1 is fine but still worth a nudge toward HEVC/H.264 peers.
+        if boundedMatch(text, "av1") {
+            score -= (text.contains("2160") || text.contains("4k") || text.contains("uhd")) ? 1500 : 150
+        }
+        // 3D releases render as a split frame on a flat TV. Bare "sbs" is NOT matched: it is
+        // also a broadcaster tag on perfectly flat TV releases; the 3D forms below suffice.
+        if boundedMatch(text, "3d") || boundedMatch(text, #"hsbs|half[ .\-_]?sbs|sbs[ .\-_]?3d"#) { score -= 2000 }
+        // Hardcoded subtitle rips are watchable but defaced; nudge below clean peers.
+        if text.contains("korsub") || boundedMatch(text, "hc") { score -= 200 }
         if isCached(s, text) { score += 8000 }   // cached / direct = instant; outranks any non-cached quality
         // Source type is the dominant sort key: user-ranked tier (debrid > usenet > torrent > direct
         // by default) contributes a 15k-spaced weight that always overrules quality within a tier.
-        score += SourcePreferences.shared.tierWeight(for: sourceType(s, text))
+        let type = sourceType(s, text)
+        score += SourcePreferences.shared.tierWeight(for: type)
+        // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
+        // providers without ever crossing a quality or tier boundary.
+        score += providerOffset(for: provider(text))
+        // Raw torrents live or die by swarm health; cached/debrid streams don't care. A dead
+        // swarm sinks within its tier, a hot one earns a capped tiebreak bonus.
+        if type == .torrent, let seeders = seederCount(text) {
+            score += seeders == 0 ? -800 : min(seeders * 8, 400)
+        }
+        // Theatrical rips and fake "quality" releases rank below every legitimate stream of any
+        // tier. The shift is uniform, so if only junk exists the least-bad junk still wins.
+        if junkClass(text) != nil { score -= 100_000 }
         return score
+    }
+
+    /// `pattern` matched only at delimiter boundaries: no alphanumeric on either side, so "ts"
+    /// can't fire inside DTS, "cam" inside camera, or "hc" inside HEVC tags. Text is lowercase.
+    static func boundedMatch(_ text: String, _ pattern: String) -> Bool {
+        text.range(of: "(?<![a-z0-9])(?:\(pattern))(?![a-z0-9])", options: .regularExpression) != nil
+    }
+
+    /// Theatrical-rip / fake-release class parsed from the stream text, nil for anything
+    /// legitimate. Two pattern lists, after the Radarr / parse-torrent-title playbook:
+    /// long unambiguous forms always match; bare ambiguous tokens (cam/ts/tc/scr) only count
+    /// when NO good-source marker is present, so "Cam.2018.1080p.WEB-DL" stays a WEB-DL.
+    static func junkClass(_ text: String) -> String? {
+        if boundedMatch(text, #"h[dq][ .\-_]?cam(rip)?|cam[ .\-_]?rip|s[ .\-]+print"#) { return "CAM" }
+        if boundedMatch(text, #"telesynch?|hd[ .\-_]?ts(rip)?|ts[ .\-_]?rip"#) { return "TS" }
+        if boundedMatch(text, #"telecine|hd[ .\-_]?tc"#) { return "TC" }
+        // "screener" by substring: run-together compounds (DVDScreener) defeat the boundary check.
+        if text.contains("screener") || boundedMatch(text, #"(dvd|bd|br|web|hd)[ .\-_]?scr|p(re)?dvd(rip)?"#) { return "SCR" }
+        if text.contains("workprint") { return "Workprint" }
+        if boundedMatch(text, "r5") { return "R5" }
+        // Negation guard: "real 4K, NOT upscaled" advertises the opposite.
+        if boundedMatch(text, #"1xbet|read[ .\-_]?note|(?<!not[ .\-_])(?<!non[ .\-_])(upscaled?|up[ .\-_]?rez)|ai[ .\-_]?(upscaled?|enhanced?)|re[ .\-_]?graded?"#) {
+            return "Upscaled"
+        }
+        // Bare tokens: honoured only when nothing marks the release as a real source.
+        // Substring checks for remux/bluray on purpose: compounds like BDRemux must count.
+        let hasGoodSource = text.contains("remux") || text.contains("bluray") || text.contains("blu-ray")
+            || boundedMatch(text, #"b[dr][ .\-_]?rip|web[ .\-_]?(dl|rip)?|hdtv|dvd[ .\-_]?rip"#)
+        guard !hasGoodSource else { return nil }
+        if boundedMatch(text, "cam") { return "CAM" }
+        if boundedMatch(text, "ts") { return "TS" }
+        if boundedMatch(text, "scr") { return "SCR" }
+        return nil
+    }
+
+    /// Seeder count parsed from the stream text, where torrent add-ons print it
+    /// (e.g. "👤 47" or "Seeders: 47"). The emoji form wins over the worded form, and the
+    /// worded form requires its colon, so a title like "The Bad Seed 2018" can't supply a
+    /// phantom count. nil when absent.
+    static func seederCount(_ text: String) -> Int? {
+        let patterns = [#"👤[:\s]*([0-9]+)"#, #"(?<![a-z0-9])seed(er)?s?\s*:\s*([0-9]+)"#]
+        for pattern in patterns {
+            if let m = text.range(of: pattern, options: .regularExpression) {
+                return Int(text[m].filter(\.isNumber))
+            }
+        }
+        return nil
     }
 
     /// Classify a stream into the four source categories used for user-rankable tier scoring.
     static func sourceType(_ s: CoreStream, _ text: String) -> SourceType {
         if text.contains("debrid") || text.contains("premiumize") || text.contains("torbox")
-            || text.contains("alldebrid") || text.contains("[rd") || text.contains("[ad+]")
-            || text.contains("[pm+]") || text.contains("[tb+]") || text.contains("[dl+]") {
+            || text.contains("offcloud") || text.contains("[rd") || text.contains("[ad+]")
+            || text.contains("[pm+]") || text.contains("[tb+]") || text.contains("[dl+]")
+            || text.contains("[oc+]") {
             return .debrid
         }
-        if text.contains("usenet") || text.contains("nzb") { return .usenet }
+        if text.contains("usenet") || text.contains("nzb") || text.contains("easynews") { return .usenet }
         if s.isTorrent { return .torrent }
         return .direct
+    }
+
+    /// Known debrid / usenet services detected from the stream text. Foundation for a future
+    /// user-rankable provider order (like the source-type order); for now only the default
+    /// offsets below apply.
+    enum ServiceProvider {
+        case realDebrid, allDebrid, premiumize, torbox, debridLink, offcloud, easynews, unknown
+    }
+
+    static func provider(_ text: String) -> ServiceProvider {
+        if isRealDebrid(text) { return .realDebrid }
+        if text.contains("alldebrid") || text.contains("all-debrid") || text.contains("[ad+]")
+            || text.range(of: #"\bad\+?\b"#, options: .regularExpression) != nil { return .allDebrid }
+        if text.contains("premiumize") || text.contains("[pm+]")
+            || text.range(of: #"\bpm\+?\b"#, options: .regularExpression) != nil { return .premiumize }
+        if text.contains("torbox") || text.contains("[tb+]")
+            || text.range(of: #"\btb\+?\b"#, options: .regularExpression) != nil { return .torbox }
+        if text.contains("debrid-link") || text.contains("debridlink") || text.contains("[dl+]") { return .debridLink }
+        if text.contains("offcloud") || text.contains("[oc+]") { return .offcloud }
+        if text.contains("easynews") { return .easynews }
+        return .unknown
+    }
+
+    /// Small intra-tier provider preference. Real-Debrid sinks slightly (cache purges plus
+    /// throttling make it the least reliable of the majors), so at EQUAL quality any other
+    /// provider wins, while a better-quality RD stream still beats a worse one elsewhere.
+    /// When per-provider ranking becomes user-configurable this table becomes the default.
+    static func providerOffset(for provider: ServiceProvider) -> Int {
+        switch provider {
+        case .realDebrid: return -150
+        default:          return 0
+        }
     }
 
     /// File size in GB parsed from the add-on's stream text (name / description / filename),
@@ -101,10 +211,9 @@ enum StreamRanking {
         return Double(digits) ?? 0
     }
 
-    /// Real-Debrid sources sink below every other option (the service purged its cache and now
-    /// blocks/throttles aggressively), so they only play when nothing else exists. Matches the
-    /// service name plus the bracketed/delimited "RD"/"RD+" tags add-ons put in stream names; the
-    /// word-boundary regex cannot match inside words like HDR.
+    /// Matches the Real-Debrid service name plus the bracketed/delimited "RD"/"RD+" tags add-ons
+    /// put in stream names; the word-boundary regex cannot match inside words like HDR. Feeds the
+    /// provider() detection, where RD carries a small intra-tier penalty.
     static func isRealDebrid(_ qualityText: String) -> Bool {
         if qualityText.contains("realdebrid") || qualityText.contains("real-debrid")
             || qualityText.contains("real debrid") { return true }
@@ -248,6 +357,7 @@ enum StreamRanking {
         if t.contains("hevc") || t.contains("x265") || t.contains("h265") || t.contains("h.265") { tags.append("HEVC") }
         else if t.contains("av1") { tags.append("AV1") }
         if isCached(s, t) { tags.append("Cached") }
+        if let junk = junkClass(t) { tags.append(junk) }   // why this source sits at the bottom
         var size: String?
         if let m = t.range(of: #"(\d+(?:\.\d+)?)\s*(gb|gib)"#, options: .regularExpression) {
             size = String(t[m]).uppercased().replacingOccurrences(of: "GIB", with: "GB")
@@ -269,7 +379,14 @@ enum StreamRanking {
     }
 
     private static func qualityText(_ s: CoreStream) -> String {
-        [s.name, s.description, s.behaviorHints?.filename].compactMap { $0 }.joined(separator: " ").lowercased()
+        // Container extensions are stripped from the WHOLE text, not just the filename field:
+        // add-ons embed file names in the stream name or description too, and a plain ".ts"
+        // (MPEG-TS) must never read as a TeleSync marker to the junk detector. Boundary-checked
+        // so only a real dot-extension token disappears.
+        [s.name, s.description, s.behaviorHints?.filename]
+            .compactMap { $0 }.joined(separator: " ").lowercased()
+            .replacingOccurrences(of: #"\.(ts|m2ts|mkv|mp4|avi|webm|mov)(?![a-z0-9])"#,
+                                  with: "", options: .regularExpression)
     }
 
     private static func resolution(_ t: String) -> Int {

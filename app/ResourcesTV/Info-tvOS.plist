@@ -10,5 +10,13 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- Schemes the player's "Play in" handoff may probe with canOpenURL; keep in sync
+	     with ExternalPlayers.candidates. -->
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>vlc-x-callback</string>
+		<string>infuse</string>
+		<string>senplayer</string>
+	</array>
 </dict>
 </plist>

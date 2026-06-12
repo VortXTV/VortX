@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
+    @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
@@ -321,15 +322,17 @@ struct SettingsView: View {
                                 Button {
                                     sourcePrefs.moveType(at: index, direction: -1)
                                 } label: {
-                                    Image(systemName: "chevron.up").frame(width: 36, height: 36)
+                                    Image(systemName: "chevron.up")
                                 }
+                                .buttonStyle(ChipButtonStyle(selected: false))
                                 .opacity(index == 0 ? 0.3 : 1)
                                 .disabled(index == 0)
                                 Button {
                                     sourcePrefs.moveType(at: index, direction: 1)
                                 } label: {
-                                    Image(systemName: "chevron.down").frame(width: 36, height: 36)
+                                    Image(systemName: "chevron.down")
                                 }
+                                .buttonStyle(ChipButtonStyle(selected: false))
                                 .opacity(index == sourcePrefs.typeOrder.count - 1 ? 0.3 : 1)
                                 .disabled(index == sourcePrefs.typeOrder.count - 1)
                             }
@@ -360,6 +363,7 @@ struct SettingsView: View {
 
     private var subtitleSection: some View {
         section("Subtitle Style") {
+            choiceRow("Font", SubtitleStyle.fonts.map { ($0.id, $0.label) }, selection: $subFont)
             choiceRow("Size", SubtitleStyle.sizes.map { ($0.id, $0.label) }, selection: $subSize)
             choiceRow("Color", SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)

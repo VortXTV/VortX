@@ -47,6 +47,9 @@ final class CoreBridge: ObservableObject {
         started = true
         let storageDir = Self.makeDir(.applicationSupportDirectory, "stremio-core")
         let cacheDir = Self.makeDir(.cachesDirectory, "stremio-core-http")
+        // The pointer is passed through but never dereferenced on the way back: the C callback
+        // resolves `CoreBridge.shared` directly. An unretained pointer round-tripped through a
+        // Rust worker thread would dangle if this object were ever deallocated.
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         let ok = storageDir.withCString { storage in
             cacheDir.withCString { cache in
@@ -781,11 +784,11 @@ final class CoreBridge: ObservableObject {
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.
-            if metaDetails != nil {
-                let details = decode(CoreMetaDetails.self, field: "meta_details")
-                DispatchQueue.main.async { [weak self] in
-                    if self?.metaDetails != nil { self?.metaDetails = details }
-                }
+            // Decoded unconditionally: reading the @Published var on this Rust worker thread
+            // would race main-thread writes; the main-queue guard below decides alone.
+            let details = decode(CoreMetaDetails.self, field: "meta_details")
+            DispatchQueue.main.async { [weak self] in
+                if self?.metaDetails != nil { self?.metaDetails = details }
             }
         }
         if fields.contains("search") {
@@ -881,9 +884,12 @@ final class CoreBridge: ObservableObject {
     }
 }
 
-/// Top-level C callback (no captures allowed). Recovers the `CoreBridge` from the opaque `ctx`.
+/// Top-level C callback (no captures allowed). `ctx` is deliberately unused: resolving the
+/// process-lifetime singleton directly is always safe, while dereferencing an unretained
+/// pointer from a Rust worker thread would be a use-after-free if the bridge were ever
+/// deallocated.
 private func coreEventCallback(ctx: UnsafeMutableRawPointer?, data: UnsafePointer<UInt8>?, len: Int) {
-    guard let ctx, let data, len > 0 else { return }
+    guard let data, len > 0 else { return }
     let bytes = Data(bytes: data, count: len) // copy synchronously, `data` is only valid during this call
-    Unmanaged<CoreBridge>.fromOpaque(ctx).takeUnretainedValue().handleEvent(bytes)
+    CoreBridge.shared.handleEvent(bytes)
 }
