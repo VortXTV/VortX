@@ -4,56 +4,37 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
-## 0.2.48 (prerelease) - 2026-06-12
+## 0.2.48 - 2026-06-12
+
+The 0.2.45 through 0.2.48 prereleases, consolidated.
 
 ### Added
-- Live streams play properly. Live TV and event streams no longer end a few seconds in at each segment boundary: the player tunes its buffering for live playlists and reconnects on the brief gaps live providers produce. Contributed by the community.
-- Subtitles from add-ons. The player's subtitles panel now lists subtitles offered by your installed subtitle add-ons next to the file's embedded tracks; pick one and it loads on the spot.
-- Swipe to navigate in the player. The remote's touch surface now moves the selection across the controls and panels, exactly like the arrow presses.
-- App text size setting. UI text sits one step larger by default, and Settings, Appearance has a Smaller / Default / Larger control; takes effect after a relaunch. Subtitle sizes are back to their original values, this setting is for the app's own text.
-
-### Changed
-- Your source-type order is in charge again. Cached streams now get a strong boost WITHIN each source type instead of overriding the order entirely, so ranking Usenet or Torrent above Debrid behaves as configured; within any type, cached still always beats uncached.
-
-## 0.2.47 (prerelease) - 2026-06-12
-
-### Fixed
-- Streams that require special request headers now play. Some add-ons front servers that reject requests without a specific referer or browser identity; the player now sends the headers the add-on declares, the same way the official clients do. Fixes "This source didn't load" on add-ons whose streams play fine elsewhere.
-- The detail page stays inside the TV-safe area. On TVs that crop the picture edges (overscan), the top of the detail page could be cut off; content now respects the safe margins while the backdrop artwork still fills the screen.
-
-## 0.2.46 (prerelease) - 2026-06-12
+- Auto-failover between sources. When a stream times out, keeps stalling, or dies before starting, the player hops to the next-best source on its own (up to four hops) and keeps your position, instead of dropping you at an error screen. A deliberate source pick or episode change resets the budget.
+- Player settings panel. A gear button on the left of the control bar holds the player-wide tools: handoff of the playing stream to an installed external player app, a hardware/software decoder switch for clips whose video misbehaves, the playback info overlay, and the QR link share. The speed button now holds only speed.
+- Live streams play properly. Live TV and event streams no longer end a few seconds in at each segment boundary: the player tunes its buffering for live playlists and reconnects over the brief gaps live providers produce. Contributed by the community.
+- Subtitles from add-ons. The player's subtitles panel lists subtitles offered by your installed subtitle add-ons next to the file's embedded tracks; pick one and it loads on the spot, labelled with the add-on it came from.
+- Swipe to navigate in the player. The remote's touch surface moves the selection across the controls and panels, exactly like the arrow presses.
+- Source type priority in Settings, Streams. A reorderable list puts debrid, Usenet, torrent, or direct streams at the top (default Debrid, Usenet, Torrent, Direct). Your order is the top-level ranking key; cached streams get a strong boost within each type, so cached always beats uncached of the same type without overriding your order.
+- Use add-on ranking order toggle. Passes stream order through unchanged, useful if a ranking add-on already sorts sources the way you want.
+- Smarter ranking signals. Theatrical rips and fake upscales (CAM, telesync, screener families) sink below every legitimate stream and are labelled in the source list; AV1 video is demoted at 4K where the hardware cannot decode it; 3D releases, broadcast captures, and hardcoded-subtitle rips rank below clean releases; raw torrent health (seeder count) breaks ties within the torrent tier.
+- Subtitle font choice. A new Modern style (clean sans with a thin outline and soft shadow) is the default; Classic keeps the previous heavier look. In Settings and in the player's subtitle options.
+- App text size setting. UI text sits one step larger by default, and Settings, Appearance has a Smaller / Default / Larger control; takes effect after a relaunch.
+- Languages follow the profile. Audio language, subtitle language, and the subtitle style belong to each profile, apply on switch, and sync across devices. Requested by a contributor.
+- Profile edit guardrail. A profile with a PIN asks for that PIN before anyone else can edit it, so a kids profile cannot rename the parent profile or strip its PIN.
+- Browse backdrops restored on all hardware. The moving artwork on the Home and catalog pages is no longer suppressed on the Apple TV HD; only the player-side buffers and animation rate remain lighter on that model.
 
 ### Fixed
 - Add to Library genuinely works now. The save action was silently doing nothing (a wrong key when reading the page state), which is why no profile could save. Both the save and the immediate button update now happen everywhere.
+- Stream ranking stops picking failures. Cached debrid streams no longer lose to uncached torrents of the same quality; cache tags are detected across every major add-on's format, including a variation-selector emoji form that previously never matched; uncached results that resolve through a debrid are no longer mistaken for cached ones; and debrid streams with unbracketed tags no longer fall into the direct tier and lose to raw torrents.
+- The Watch button tells the truth. An explicit resolution in the name beats marketing tokens, so a 1080p encode of a UHD disc no longer reads or ranks as 4K, and the label carries the full picture, like "Watch in 4K · HDR · Remux", derived from the exact stream it plays.
+- Streams that require special request headers now play. Some add-ons front servers that reject requests without a specific referer or browser identity; the player sends the headers the add-on declares, the same way the official clients do. Fixes "This source didn't load" on add-ons whose streams play fine elsewhere.
+- Subtitles can no longer silently vanish. Both subtitle styles name fonts bundled with the app; naming a system-only font could fail on some devices and render no subtitles at all.
 - The Continue Watching long-press menu is back on secondary profiles, and removing a title there touches only that profile's own history, never the main account's library.
-- Cached streams are detected across every major add-on's tag format, including a variation-selector emoji form that previously never matched, and uncached results that resolve through a debrid are no longer mistaken for cached ones. Debrid streams with unbracketed tags no longer fall into the direct tier and lose to raw torrents.
-- The Watch button tells the truth. An explicit resolution in the name now beats marketing tokens, so a 1080p encode of a UHD disc no longer reads or ranks as 4K, and the label carries the full picture, like "Watch in 4K · HDR · Remux", derived from the exact stream it plays.
-- Subtitles can no longer silently vanish. Both subtitle styles now name fonts bundled with the app; naming a system-only font could fail on some devices and render no subtitles at all.
-
-### Performance
-- The 0.2.45 sluggishness is fixed. Ranking patterns now compile once and each stream's score is computed once and remembered; a long source list re-ranked on every refresh had been doing thousands of pattern compilations on the main thread. Detail pages also stop re-ranking on every periodic progress save, and an idle sources panel does no work at all.
-
-### Added
-- Cached always wins. A cached or instant stream now outranks any uncached stream of any type or quality; your source-type order and quality decide within the cached and uncached halves.
-- Languages follow the profile. Audio language, subtitle language, and the subtitle style now belong to each profile, apply on switch, and sync across devices. Requested by a contributor.
-- Profile edit guardrail. A profile with a PIN asks for that PIN before anyone else can edit it, so a kids profile can no longer rename the parent profile or strip its PIN.
-- Bigger subtitles. The default size is recalibrated to TV-distance legibility and the whole size ladder moves up; adjust under Settings, Subtitle Style.
-
-## 0.2.45 (prerelease) - 2026-06-12
-
-### Fixed
-- Add to Library now reflects immediately. After tapping the button the page updates to show the title is saved, without requiring a reload. Affected all profiles.
-- Stream ranking no longer penalises cached streams from debrid services. A bad penalty was knocking cached debrid streams below uncached torrents of the same quality; Watch Now and the 4K button now correctly prefer the faster source.
+- The detail page stays inside the TV-safe area. On TVs that crop the picture edges (overscan), the top of the detail page could be cut off; content now respects the safe margins while the backdrop artwork still fills the screen.
 - Two rare crash paths in the player and engine teardown are hardened: a remote-control event arriving at the exact moment the player closes, and an engine event racing app shutdown, can no longer touch freed memory.
 
-### Added
-- Auto-failover between sources. When a stream times out, keeps stalling, or dies before starting, the player now hops to the next-best source on its own (up to four hops) instead of dropping you at an error screen. A deliberate source pick or episode change resets the budget.
-- Player settings panel. A gear button on the left of the control bar opens a new panel holding: handoff of the playing stream to an installed external player app, a hardware/software decoder switch for clips whose video misbehaves, the playback info overlay, and the QR link share. The speed button now holds only speed.
-- Subtitle font choice. A new Modern style (clean sans with a thin outline and soft shadow) is the default; Classic keeps the previous heavier look. In Settings and in the player's subtitle options.
-- Source type priority in Settings, Streams. A reorderable list lets you put debrid, Usenet, torrent, or direct streams at the top. The default order is Debrid, Usenet, Torrent, Direct.
-- Use add-on ranking order toggle. Turning it on passes stream order through unchanged, useful if you use a ranking add-on that already sorts sources the way you want.
-- Smarter ranking signals. Theatrical rips and fake upscales (CAM, telesync, screener families) now sink below every legitimate stream and are labelled in the source list; AV1 video is demoted at 4K where the hardware cannot decode it; 3D releases, broadcast captures, and hardcoded-subtitle rips rank below clean releases; raw torrent health (seeder count) breaks ties within the torrent tier.
-- Browse backdrops restored on all hardware. The moving artwork on the Home and catalog pages is no longer suppressed on the Apple TV HD; only the player-side buffers and animation rate remain lighter on that model.
+### Performance
+- Ranking patterns compile once and each stream's score is computed once and remembered; a long source list re-ranked on every refresh had been doing thousands of pattern compilations on the thread that drives the remote. Detail pages also stop re-ranking on every periodic progress save, and an idle sources panel does no work at all.
 
 ### Changed
 - The CJK subtitle font is trimmed to its practically-used coverage: 7.6 MB instead of 16 MB, with identical rendering for real-world subtitles. Every build gets smaller, and every build keeps full CJK subtitle support.
