@@ -15,10 +15,7 @@ enum SkipTimestampService {
 
     static func candidates(imdbId: String, season: Int?, episode: Int?,
                            durationSeconds: Double) async -> [SegmentCandidate] {
-        guard let idItem = queryItem(for: imdbId) else {
-            log.info("unsupported id scheme: \(imdbId, privacy: .public)")
-            return []
-        }
+        guard let idItem = queryItem(for: imdbId) else { return [] }
         let key = "\(imdbId):\(season ?? 0):\(episode ?? 0)"
         if let cached = await SkipTimestampStore.shared.entry(for: key) {
             log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
@@ -77,6 +74,10 @@ enum SkipTimestampService {
             return URLQueryItem(name: "tvdb_id", value: String(id))
         }
         return nil
+    }
+
+    static func supports(metaId: String) -> Bool {
+        queryItem(for: metaId) != nil
     }
 
     private static func candidates(from spans: [StoredSpan], duration: Double) -> [SegmentCandidate] {

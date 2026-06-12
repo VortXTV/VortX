@@ -148,12 +148,14 @@ enum StreamRanking {
         if boundedMatch(text, "3d") || boundedMatch(text, #"hsbs|half[ .\-_]?sbs|sbs[ .\-_]?3d"#) { score -= 2000 }
         // Hardcoded subtitle rips are watchable but defaced; nudge below clean peers.
         if text.contains("korsub") || boundedMatch(text, "hc") { score -= 200 }
-        // CACHED IS KING: an instant stream beats ANY uncached stream of any type or quality.
-        // This is the split every serious ranking tool makes first; quality and the type tiers
-        // below then order sources WITHIN the cached and uncached halves.
-        if isCached(s, text) { score += 100_000 }
-        // Source type is the next sort key: user-ranked tier (debrid > usenet > torrent > direct
-        // by default) contributes a 15k-spaced weight that always overrules quality within a half.
+        // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (~5800), so
+        // a cached stream always beats an uncached one of the same source type, which is the
+        // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
+        // the user's source-type order is the top-level key, so someone who ranks Torrent or
+        // Usenet above Debrid genuinely gets that order, cached or not.
+        if isCached(s, text) { score += 8000 }
+        // Source type is the dominant sort key: user-ranked tier (debrid > usenet > torrent >
+        // direct by default) contributes a 15k-spaced weight that overrules quality and cache.
         let type = sourceType(s, text)
         score += SourcePreferences.shared.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
@@ -165,9 +167,9 @@ enum StreamRanking {
             score += seeders == 0 ? -800 : min(seeders * 8, 400)
         }
         // Theatrical rips and fake "quality" releases rank below every legitimate stream of any
-        // tier, cached or not (cached ceiling is ~160k, so -250k clears it). The shift is
-        // uniform, so if only junk exists the least-bad junk still wins.
-        if junkClass(text) != nil { score -= 250_000 }
+        // tier, cached or not (the legit ceiling is ~60k). The shift is uniform, so if only
+        // junk exists the least-bad junk still wins.
+        if junkClass(text) != nil { score -= 100_000 }
         return score
     }
 

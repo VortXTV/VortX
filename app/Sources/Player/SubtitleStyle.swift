@@ -30,13 +30,8 @@ enum SubtitleStyle {
         ("modern", "Modern"),
         ("classic", "Classic"),
     ]
-    /// mpv's sub-font-size is relative to a 720-line canvas, and libass sizes VSFilter-style
-    /// (rendered em = fontsize × unitsPerEm / winAscent+Descent), so the values are calibrated
-    /// to the bundled Noto Sans metrics: Medium lands at ~5.4% cap height of screen height,
-    /// the neighbourhood TV streaming services use. The old 55 rendered ~3.6% (too small at
-    /// ten feet, the most-reported complaint).
     static let sizes: [(id: String, label: String, fontSize: Int)] = [
-        ("s", "Small", 64), ("m", "Medium", 82), ("l", "Large", 100), ("xl", "Extra Large", 120),
+        ("s", "Small", 40), ("m", "Medium", 55), ("l", "Large", 72), ("xl", "Extra Large", 92),
     ]
     static let colors: [(id: String, label: String, hex: String)] = [
         ("white", "White", "#FFFFFF"), ("yellow", "Yellow", "#FFFF00"), ("soft", "Soft", "#F2F2F2"),
