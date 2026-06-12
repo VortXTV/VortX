@@ -113,7 +113,9 @@ Everything the Apple TV app does today:
 - **Seamless binge**: the next episode is fetched and ranked in the background at the halfway mark, its source is woken up just before the credits so there is no provider cold start, and it locks to the same release group the current stream advertised, so episode two never jumps quality or edition mid-binge.
 - **Per-series quality memory**: Watch Now remembers, per series and per profile, the quality you last played and opens in it again. Cached and instant sources still win.
 - **Stall recovery**: if the picture freezes while it is not buffering, the player reloads the stream in place at your position; if a source keeps stalling, you land on the source list instead of a dead screen. You can also switch to another source mid-playback, and a failed stream offers the source list in one press.
-- **Stream link QR**: the Playback panel shows the playing stream as a QR code (a magnet for torrents), to scan with your phone and keep watching there.
+- **Live streams play properly**: live TV and event streams keep playing across segment boundaries instead of ending a few seconds in, with buffering tuned for live playlists. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
+- **Subtitles from your add-ons**: the subtitles panel lists what your installed subtitle add-ons offer next to the file's embedded tracks; pick one and it loads on the spot.
+- **Stream link QR**: the player settings panel shows the playing stream as a QR code (a magnet for torrents), to scan with your phone and keep watching there.
 - Playback speed control, a live playback-info overlay (resolution, codec, hardware decode, FPS, dropped frames, buffer), skip intro / recap / credits (crowd-sourced timestamps merged with the file's chapter markers, with sanity guards), smart audio and subtitle selection from your preferred languages, language-grouped track pickers, subtitle styling and sync, bundled fonts for every script, a seekable scrubber with accelerating hold-to-seek, fit / zoom / stretch aspect modes, and resume across sessions.
 - Live progress flows back to your account while you watch, so Continue Watching is correct on every device, and the watched marker flips automatically near the end.
 
@@ -122,7 +124,8 @@ Everything the Apple TV app does today:
 - A "Who's watching?" picker at launch when more than one profile exists, with no flash of the wrong profile's Home before it.
 - Each profile keeps its own name, avatar, accent theme, and background; switching re-themes the whole app instantly.
 - Each profile keeps its OWN watch history: its own Continue Watching, resume positions, and watched markers, invisible to the others.
-- An optional 4-digit PIN gates any profile, stored as a salted hash so it can be changed but never read back.
+- An optional 4-digit PIN gates any profile, stored as a salted hash so it can be changed but never read back; editing another profile that has a PIN asks for that PIN first.
+- Audio language, subtitle language, and subtitle style follow the profile: set once per viewer, applied on switch, synced across devices. Requested by [heinzgruber](https://github.com/heinzgruber).
 - A profile can share the main account or sign into its own; switching keeps every session valid.
 - Sign in by scanning a QR code with your phone instead of typing a password with the remote; password sign-in stays as a fallback. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
 - Profiles and their history are per-device for now; cross-device sync returns once StremioX has its own sync channel, planned on the roadmap.
@@ -254,7 +257,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 - [mpv](https://mpv.io/) and [MPVKit](https://github.com/mpvkit/MPVKit), for the player.
 - [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile), for the embedded server runtime.
 - Claude (Anthropic) wrote the code.
-- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the StremioX Lite build, and the build-from-source report that made a fresh clone work for everyone.
+- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the StremioX Lite build, the stream-ranking reports that drove the cached-first fixes, and the build-from-source report that made a fresh clone work for everyone.
 
 See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
 
