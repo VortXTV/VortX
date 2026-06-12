@@ -29,10 +29,10 @@ struct HomeView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         if !continueWatching.isEmpty {
-                            CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel,
-                                                    // the long-press menu mutates the ACCOUNT library;
-                                                    // overlay rails manage their own history
-                                                    menu: profiles.activeUsesEngineHistory ? .continueWatching : .none)
+                            // The long-press menu is safe on every profile now: Details is pure
+                            // navigation, and the dismiss routes into the overlay profile's own
+                            // history inside CoreBridge.removeFromLibrary.
+                            CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
                         }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)

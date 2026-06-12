@@ -44,6 +44,7 @@ final class SourcePreferences: ObservableObject {
                 typeOrder.map(\.rawValue).joined(separator: ","),
                 forKey: Self.orderKey
             )
+            StreamRanking.invalidateCaches()   // memoized scores embed the tier weights
         }
     }
 

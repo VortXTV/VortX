@@ -819,10 +819,19 @@ struct TVPlayerView: View {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
         coordinator.player?.setAudioDelay(audioDelay)
     }
-    private func setSubtitleFont(_ id: String) { subFont = id; coordinator.player?.applySubtitleStyle() }
-    private func setSubtitleSize(_ id: String) { subSize = id; coordinator.player?.applySubtitleStyle() }
-    private func setSubtitleColor(_ id: String) { subColor = id; coordinator.player?.applySubtitleStyle() }
-    private func setSubtitleBackground(_ id: String) { subBackground = id; coordinator.player?.applySubtitleStyle() }
+    // In-player style tweaks also stick to the active profile (Settings does the same).
+    private func setSubtitleFont(_ id: String) {
+        subFont = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
+    private func setSubtitleSize(_ id: String) {
+        subSize = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
+    private func setSubtitleColor(_ id: String) {
+        subColor = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
+    private func setSubtitleBackground(_ id: String) {
+        subBackground = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+    }
 
     private var panelTitle: String {
         switch panelKind {
@@ -890,11 +899,15 @@ struct TVPlayerView: View {
         .task(id: showOptions) {
             // Sources and episodes keep arriving after the panel opens (add-ons
             // answer at their own pace; direct-resume loads meta in the background).
-            // Refresh the cached rows once a second while those panels are up:
-            // live arrival without per-frame re-ranking.
+            // Refresh the cached rows once a second while those panels are up, but only
+            // when the engine actually emitted something since the last tick: an idle
+            // panel does zero ranking work.
+            var seenRevision = -1
             while showOptions, !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard showOptions, panelKind == .sources || panelKind == .episodes else { continue }
+                guard core.revision != seenRevision else { continue }
+                seenRevision = core.revision
                 panelRows = optionRows
             }
         }

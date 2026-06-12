@@ -16,6 +16,23 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// The account's main profile (the one created by migration). It uses the account's own watch
     /// history, exactly like before profiles existed. Every other shared profile keeps its own.
     var isOwner: Bool = false
+    /// Per-profile playback preferences (audio/subtitle language plus subtitle style), mirrored
+    /// into the flat UserDefaults keys the player reads when this profile becomes active.
+    /// nil = never customized (pre-feature roster); seeded from the flat values on first load.
+    var playback: PlaybackPrefs? = nil
+
+    /// What follows a viewer between profiles: track languages and the subtitle look. Synced
+    /// with the roster, so a profile keeps its preferences across devices. Raw-string fields
+    /// mirror the UserDefaults representations one-to-one.
+    struct PlaybackPrefs: Codable, Equatable {
+        var audioLang: String
+        var subtitleLang: String
+        var forcedPolicy: String
+        var subFont: String
+        var subSize: String
+        var subColor: String
+        var subBackground: String
+    }
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
 
@@ -50,14 +67,15 @@ struct UserProfile: Codable, Identifiable, Equatable {
         usesOwnAccount = try c.decodeIfPresent(Bool.self, forKey: .usesOwnAccount) ?? false
         email = try c.decodeIfPresent(String.self, forKey: .email)
         isOwner = try c.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
+        playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, pin: String? = nil, usesOwnAccount: Bool = false,
-         email: String? = nil, isOwner: Bool = false) {
+         email: String? = nil, isOwner: Bool = false, playback: PlaybackPrefs? = nil) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.pin = pin; self.usesOwnAccount = usesOwnAccount
-        self.email = email; self.isOwner = isOwner
+        self.email = email; self.isOwner = isOwner; self.playback = playback
     }
 }
 
@@ -107,6 +125,16 @@ final class ProfileStore: ObservableObject {
             ThemeManager.shared.accentID = active.accentID
             ThemeManager.shared.oled = active.oled
         }
+        // One-time seed: pre-feature rosters share one flat set of playback preferences, so
+        // copying it into every profile preserves today's behavior exactly; from then on each
+        // profile diverges as its viewer customizes.
+        if profiles.contains(where: { $0.playback == nil }) {
+            let seed = currentPlaybackPrefs()
+            for index in profiles.indices where profiles[index].playback == nil {
+                profiles[index].playback = seed
+            }
+            persist(touch: false)
+        }
         loadWatchCache()
     }
 
@@ -143,6 +171,7 @@ final class ProfileStore: ObservableObject {
         persist(touch: false)   // selection is per-device, not a roster edit
         ThemeManager.shared.accentID = profile.accentID
         ThemeManager.shared.oled = profile.oled
+        applyPlayback(profile)
         loadWatchCache()
         refreshWatchFromServer()
         let nowAccount = keychainAccount(for: profile)
@@ -163,6 +192,7 @@ final class ProfileStore: ObservableObject {
         if profile.id == activeID {
             ThemeManager.shared.accentID = profile.accentID
             ThemeManager.shared.oled = profile.oled
+            applyPlayback(profile)
         }
     }
 
@@ -186,6 +216,56 @@ final class ProfileStore: ObservableObject {
         guard profile.accentID != ThemeManager.shared.accentID || profile.oled != ThemeManager.shared.oled else { return }
         profile.accentID = ThemeManager.shared.accentID
         profile.oled = ThemeManager.shared.oled
+        update(profile)
+    }
+
+    // MARK: Per-profile playback preferences (languages + subtitle style)
+
+    /// The flat-key values as a PlaybackPrefs snapshot, using the same fallbacks the readers use.
+    private func currentPlaybackPrefs() -> UserProfile.PlaybackPrefs {
+        let d = UserDefaults.standard
+        let lang = TrackPreferences.deviceLanguages.first ?? "en"
+        return UserProfile.PlaybackPrefs(
+            audioLang: d.string(forKey: TrackPreferences.Key.audio) ?? lang,
+            subtitleLang: d.string(forKey: TrackPreferences.Key.subtitle) ?? lang,
+            forcedPolicy: d.string(forKey: TrackPreferences.Key.forced) ?? TrackPreferences.ForcedPolicy.forced.rawValue,
+            subFont: d.string(forKey: SubtitleStyle.Key.font) ?? SubtitleStyle.defaultFont,
+            subSize: d.string(forKey: SubtitleStyle.Key.size) ?? SubtitleStyle.defaultSize,
+            subColor: d.string(forKey: SubtitleStyle.Key.color) ?? SubtitleStyle.defaultColor,
+            subBackground: d.string(forKey: SubtitleStyle.Key.background) ?? SubtitleStyle.defaultBackground)
+    }
+
+    /// Write `profile`'s playback preferences into the flat UserDefaults keys that
+    /// TrackPreferences, SubtitleStyle, and the @AppStorage bindings all read. The player and
+    /// Settings need no changes: the flat keys simply always reflect the active profile.
+    private func applyPlayback(_ profile: UserProfile) {
+        let d = UserDefaults.standard
+        if let p = profile.playback {
+            d.set(p.audioLang, forKey: TrackPreferences.Key.audio)
+            d.set(p.subtitleLang, forKey: TrackPreferences.Key.subtitle)
+            d.set(p.forcedPolicy, forKey: TrackPreferences.Key.forced)
+            d.set(p.subFont, forKey: SubtitleStyle.Key.font)
+            d.set(p.subSize, forKey: SubtitleStyle.Key.size)
+            d.set(p.subColor, forKey: SubtitleStyle.Key.color)
+            d.set(p.subBackground, forKey: SubtitleStyle.Key.background)
+        } else {
+            for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
+                        TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,
+                        SubtitleStyle.Key.color, SubtitleStyle.Key.background] {
+                d.removeObject(forKey: key)
+            }
+        }
+    }
+
+    /// Mirror of captureTheme for playback preferences: Settings and the in-player options write
+    /// the flat keys; this folds the result back into the active profile so it survives a switch
+    /// and follows the profile across devices. The equality guard stops select()'s own flat-key
+    /// writes from echoing back as roster edits.
+    func capturePlayback() {
+        guard var profile = active else { return }
+        let now = currentPlaybackPrefs()
+        guard profile.playback != now else { return }
+        profile.playback = now
         update(profile)
     }
 
@@ -298,6 +378,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             ThemeManager.shared.accentID = active.accentID
             ThemeManager.shared.oled = active.oled
+            applyPlayback(active)
         }
         persist(touch: false)
         loadWatchCache()
@@ -408,6 +489,14 @@ final class ProfileStore: ObservableObject {
         guard var entry = watch[metaId] else { return }
         entry.timeOffsetMs = 0
         watch[metaId] = entry
+        saveWatchCache()
+        schedulePushWatch()
+    }
+
+    /// The Continue Watching "dismiss" for overlay profiles: drop the whole entry. Zeroing the
+    /// offset is not enough, because the rail keeps anything with watched episode ids.
+    func removeWatchEntry(metaId: String) {
+        guard watch.removeValue(forKey: metaId) != nil else { return }
         saveWatchCache()
         schedulePushWatch()
     }

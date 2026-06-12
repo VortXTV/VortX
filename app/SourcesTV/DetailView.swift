@@ -588,7 +588,9 @@ struct CoreStreamList: View {
                     // add-ons settle, then the same focused button springs alive in place.
                     Button { if watchReady { play(best) } } label: {
                         if watchReady {
-                            Label("Watch in \(StreamRanking.qualityLabel(best))", systemImage: "play.fill")
+                            // watchLabel derives from the EXACT stream this button plays, so it
+                            // can never promise a quality it doesn't deliver.
+                            Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
                         } else {
                             HStack(spacing: Theme.Space.sm) {
                                 ProgressView().tint(Theme.Palette.onAccent)

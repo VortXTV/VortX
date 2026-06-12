@@ -11,8 +11,6 @@ struct ProfilePickerView: View {
     @EnvironmentObject private var theme: ThemeManager
 
     @State private var pinTarget: UserProfile?
-    @State private var pinInput = ""
-    @State private var pinWrong = false
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
 
@@ -40,7 +38,11 @@ struct ProfilePickerView: View {
             // remote, focus will not enter an overlay while anything beneath stays focusable).
             .disabled(pinTarget != nil)
 
-            if pinTarget != nil { pinGate }
+            if let target = pinTarget {
+                PinGateOverlay(profile: target,
+                               onUnlock: { commit(target) },
+                               onCancel: { pinTarget = nil })
+            }
         }
         .fullScreenCover(item: $editorProfile) { profile in
             ProfileEditorView(original: profile)
@@ -52,7 +54,7 @@ struct ProfilePickerView: View {
 
     private func pick(_ profile: UserProfile) {
         if profile.hasPin {
-            pinInput = ""; pinWrong = false; pinTarget = profile
+            pinTarget = profile
         } else {
             commit(profile)
         }
@@ -72,33 +74,43 @@ struct ProfilePickerView: View {
         }
     }
 
-    /// Centered 4-digit gate over a dimmed picker.
-    private var pinGate: some View {
+}
+
+/// Centered 4-digit gate over dimmed content. Owns its own input state; the caller decides
+/// what unlocking means (switch profiles in the picker, unlock the editor). The content
+/// underneath must be `.disabled` while this shows, so the focus engine enters the overlay.
+struct PinGateOverlay: View {
+    let profile: UserProfile
+    let onUnlock: () -> Void
+    let onCancel: () -> Void
+    @State private var input = ""
+    @State private var wrong = false
+
+    var body: some View {
         ZStack {
             Color.black.opacity(0.72).ignoresSafeArea()
             VStack(spacing: Theme.Space.lg) {
-                Text("Enter PIN for \(pinTarget?.name ?? "")")
+                Text("Enter PIN for \(profile.name)")
                     .font(Theme.Typography.sectionTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                SecureField("PIN", text: $pinInput)
+                SecureField("PIN", text: $input)
                     .font(Theme.Typography.body)
                     .keyboardType(.numberPad)
                     .frame(width: 360)
-                    .onChange(of: pinInput) {
-                        pinInput = String(pinInput.filter(\.isNumber).prefix(4))
-                        pinWrong = false
+                    .onChange(of: input) {
+                        input = String(input.filter(\.isNumber).prefix(4))
+                        wrong = false
                     }
-                if pinWrong {
+                if wrong {
                     Text("Wrong PIN").font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
                 }
                 HStack(spacing: Theme.Space.md) {
                     Button("Unlock") {
-                        guard let target = pinTarget else { return }
-                        if target.pinMatches(pinInput) { commit(target) } else { pinWrong = true }
+                        if profile.pinMatches(input) { onUnlock() } else { wrong = true }
                     }
                     .buttonStyle(PrimaryActionStyle())
-                    .disabled(pinInput.count != 4)
-                    Button("Cancel") { pinTarget = nil }
+                    .disabled(input.count != 4)
+                    Button("Cancel", action: onCancel)
                         .buttonStyle(ChipButtonStyle(selected: false))
                 }
             }
@@ -207,8 +219,16 @@ struct ProfileEditorView: View {
     @State private var pinText: String
     @State private var customAvatar = ""
     @State private var confirmDelete = false
+    @State private var unlocked = false
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
+
+    /// The guardrail: editing someone ELSE's PIN-protected profile requires that profile's PIN
+    /// first. Your own profile and PIN-less profiles open freely (a parent edits the kids
+    /// profile without friction; the kids profile cannot strip the parent's PIN).
+    private var isLocked: Bool {
+        !isNew && original.id != store.activeID && original.hasPin && !unlocked
+    }
     private static let avatars = ["🍿", "🎬", "👑", "🦊", "🐼", "🚀", "🌊", "🔥",
                                   "🎮", "🐉", "👻", "🤖", "🎧", "🌸", "🦁", "⚡️"]
 
@@ -317,6 +337,15 @@ struct ProfileEditorView: View {
                     .focusSection()
                 }
                 .padding(Theme.Space.screenEdge)
+            }
+            // Unfocusable while the gate is up, so the remote lands in the gate (same trick as
+            // the picker; tvOS focus won't enter an overlay while anything beneath is focusable).
+            .disabled(isLocked)
+
+            if isLocked {
+                PinGateOverlay(profile: original,
+                               onUnlock: { unlocked = true },
+                               onCancel: { dismiss() })
             }
         }
         .confirmationDialog("Delete \(original.name)? Its settings and sign-in are removed.",

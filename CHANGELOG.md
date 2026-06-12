@@ -4,6 +4,24 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.2.46 (prerelease) - 2026-06-12
+
+### Fixed
+- Add to Library genuinely works now. The save action was silently doing nothing (a wrong key when reading the page state), which is why no profile could save. Both the save and the immediate button update now happen everywhere.
+- The Continue Watching long-press menu is back on secondary profiles, and removing a title there touches only that profile's own history, never the main account's library.
+- Cached streams are detected across every major add-on's tag format, including a variation-selector emoji form that previously never matched, and uncached results that resolve through a debrid are no longer mistaken for cached ones. Debrid streams with unbracketed tags no longer fall into the direct tier and lose to raw torrents.
+- The Watch button tells the truth. An explicit resolution in the name now beats marketing tokens, so a 1080p encode of a UHD disc no longer reads or ranks as 4K, and the label carries the full picture, like "Watch in 4K · HDR · Remux", derived from the exact stream it plays.
+- Subtitles can no longer silently vanish. Both subtitle styles now name fonts bundled with the app; naming a system-only font could fail on some devices and render no subtitles at all.
+
+### Performance
+- The 0.2.45 sluggishness is fixed. Ranking patterns now compile once and each stream's score is computed once and remembered; a long source list re-ranked on every refresh had been doing thousands of pattern compilations on the main thread. Detail pages also stop re-ranking on every periodic progress save, and an idle sources panel does no work at all.
+
+### Added
+- Cached always wins. A cached or instant stream now outranks any uncached stream of any type or quality; your source-type order and quality decide within the cached and uncached halves.
+- Languages follow the profile. Audio language, subtitle language, and the subtitle style now belong to each profile, apply on switch, and sync across devices. Requested by a contributor.
+- Profile edit guardrail. A profile with a PIN asks for that PIN before anyone else can edit it, so a kids profile can no longer rename the parent profile or strip its PIN.
+- Bigger subtitles. The default size is recalibrated to TV-distance legibility and the whole size ladder moves up; adjust under Settings, Subtitle Style.
+
 ## 0.2.45 (prerelease) - 2026-06-12
 
 ### Fixed

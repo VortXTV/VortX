@@ -44,6 +44,17 @@ struct SettingsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
+        // Track-language and subtitle-style edits belong to the ACTIVE profile: fold every
+        // flat-key change back into it (the captureTheme pattern, RootTabView does the same for
+        // the theme). The equality guard inside capturePlayback stops a profile switch's own
+        // flat-key writes from echoing back as roster edits.
+        .onChange(of: prefAudioLang) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: prefSubLang) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: prefForced) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subFont) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subColor) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: subBackground) { ProfileStore.shared.capturePlayback() }
         .task {
             // Live server monitor that NEVER gives up. The embedded server cold-starts well after
             // launch on a real Apple TV (node boots while the engine and sync are also busy), and
@@ -97,7 +108,7 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, Theme.Space.xs / 2)
             }
-            Text("Select a profile to edit it. Each profile keeps its own look, PIN, and optionally its own Stremio account.")
+            Text("Select a profile to edit it. Each profile keeps its own look, languages, PIN, and optionally its own Stremio account. A profile with a PIN asks for it before it can be edited.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
         }
         .fullScreenCover(item: $editingProfile) { profile in

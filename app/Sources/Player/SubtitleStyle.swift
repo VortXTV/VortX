@@ -30,8 +30,13 @@ enum SubtitleStyle {
         ("modern", "Modern"),
         ("classic", "Classic"),
     ]
+    /// mpv's sub-font-size is relative to a 720-line canvas, and libass sizes VSFilter-style
+    /// (rendered em = fontsize × unitsPerEm / winAscent+Descent), so the values are calibrated
+    /// to the bundled Noto Sans metrics: Medium lands at ~5.4% cap height of screen height,
+    /// the neighbourhood TV streaming services use. The old 55 rendered ~3.6% (too small at
+    /// ten feet, the most-reported complaint).
     static let sizes: [(id: String, label: String, fontSize: Int)] = [
-        ("s", "Small", 40), ("m", "Medium", 55), ("l", "Large", 72), ("xl", "Extra Large", 92),
+        ("s", "Small", 64), ("m", "Medium", 82), ("l", "Large", 100), ("xl", "Extra Large", 120),
     ]
     static let colors: [(id: String, label: String, hex: String)] = [
         ("white", "White", "#FFFFFF"), ("yellow", "Yellow", "#FFFF00"), ("soft", "Soft", "#F2F2F2"),
@@ -49,11 +54,15 @@ enum SubtitleStyle {
     static var colorHex: String { (colors.first { $0.id == current(Key.color, defaultColor) } ?? colors[0]).hex }
     static var backgroundId: String { current(Key.background, defaultBackground) }
 
-    /// The mpv face name for the chosen style. Classic prefers the bundled CJK Noto; if a build
-    /// ever ships without it (fonts are an optional resource), Classic degrades to plain Noto
-    /// Sans instead of naming a missing face.
+    /// The mpv face name for the chosen style. BOTH styles name a BUNDLED face on purpose:
+    /// libass base-font selection is strictly name-based with no wildcard last resort, so a
+    /// face that only exists through the CoreText provider (e.g. "Helvetica Neue") can fail
+    /// per-device and silently render NO subtitles at all (seen in the field on 0.2.45, where
+    /// Modern briefly named it). Bundled fonts load as libass memory fonts and cannot fail;
+    /// CoreText then only serves per-glyph fallback, whose worst case is tofu, never absence.
+    /// The Modern look comes from the thin-outline + shadow treatment, not the face.
     static var mpvFontName: String {
-        if fontId == "modern" { return "Helvetica Neue" }
+        if fontId == "modern" { return "Noto Sans" }
         return cjkFontBundled ? "Noto Sans CJK KR" : "Noto Sans"
     }
 

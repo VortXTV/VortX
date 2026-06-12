@@ -7,6 +7,52 @@ import Foundation
 /// from the stream's name + description + filename, where add-ons put their tags. Deliberately simple:
 /// seeders matter mainly for raw torrents, which a debrid user rarely lands on.
 enum StreamRanking {
+    // MARK: - Caches
+
+    /// `String.range(of:options:.regularExpression)` recompiles the ICU pattern on EVERY call,
+    /// and one score() runs ~15 patterns; a long stream list re-ranked per render meant
+    /// thousands of regex compilations per pass (the 0.2.45 sluggishness). Patterns compile
+    /// once, and each stream's parsed text and final score are memoized.
+    private static let cacheLock = NSLock()
+    private static var regexCache: [String: NSRegularExpression] = [:]
+    private static var textCache: [Int: String] = [:]
+    private static var scoreCache: [Int: Int] = [:]
+
+    private static func regex(_ pattern: String) -> NSRegularExpression? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if let hit = regexCache[pattern] { return hit }
+        guard let compiled = try? NSRegularExpression(pattern: pattern) else { return nil }
+        regexCache[pattern] = compiled
+        return compiled
+    }
+
+    /// Whether `pattern` matches anywhere in `text`, via the compiled-pattern cache.
+    static func matches(_ text: String, _ pattern: String) -> Bool {
+        guard let re = regex(pattern) else { return false }
+        return re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    /// The first match of `pattern` in `text`, via the compiled-pattern cache.
+    private static func firstMatch(_ text: String, _ pattern: String) -> String? {
+        guard let re = regex(pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let r = Range(m.range, in: text) else { return nil }
+        return String(text[r])
+    }
+
+    /// Per-stream memoization key over every field that feeds the text parse.
+    private static func streamKey(_ s: CoreStream) -> Int {
+        var hasher = Hasher()
+        hasher.combine(s.url); hasher.combine(s.infoHash); hasher.combine(s.name)
+        hasher.combine(s.description); hasher.combine(s.behaviorHints?.filename)
+        return hasher.finalize()
+    }
+
+    /// Drop memoized scores; called when ranking preferences change (scores embed them).
+    static func invalidateCaches() {
+        cacheLock.lock(); scoreCache.removeAll(); cacheLock.unlock()
+    }
+
     /// The stream's quality text, exposed for source-continuity hints.
     static func signature(_ s: CoreStream) -> String { qualityText(s) }
 
@@ -54,6 +100,19 @@ enum StreamRanking {
     }
 
     static func score(_ s: CoreStream) -> Int {
+        let key = streamKey(s)
+        cacheLock.lock()
+        if let hit = scoreCache[key] { cacheLock.unlock(); return hit }
+        cacheLock.unlock()
+        let value = computeScore(s)
+        cacheLock.lock()
+        if scoreCache.count > 4096 { scoreCache.removeAll() }   // runaway guard, never hit in practice
+        scoreCache[key] = value
+        cacheLock.unlock()
+        return value
+    }
+
+    private static func computeScore(_ s: CoreStream) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
         // Source ladder, the consensus ordering every parser converges on:
@@ -89,9 +148,12 @@ enum StreamRanking {
         if boundedMatch(text, "3d") || boundedMatch(text, #"hsbs|half[ .\-_]?sbs|sbs[ .\-_]?3d"#) { score -= 2000 }
         // Hardcoded subtitle rips are watchable but defaced; nudge below clean peers.
         if text.contains("korsub") || boundedMatch(text, "hc") { score -= 200 }
-        if isCached(s, text) { score += 8000 }   // cached / direct = instant; outranks any non-cached quality
-        // Source type is the dominant sort key: user-ranked tier (debrid > usenet > torrent > direct
-        // by default) contributes a 15k-spaced weight that always overrules quality within a tier.
+        // CACHED IS KING: an instant stream beats ANY uncached stream of any type or quality.
+        // This is the split every serious ranking tool makes first; quality and the type tiers
+        // below then order sources WITHIN the cached and uncached halves.
+        if isCached(s, text) { score += 100_000 }
+        // Source type is the next sort key: user-ranked tier (debrid > usenet > torrent > direct
+        // by default) contributes a 15k-spaced weight that always overrules quality within a half.
         let type = sourceType(s, text)
         score += SourcePreferences.shared.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
@@ -103,15 +165,16 @@ enum StreamRanking {
             score += seeders == 0 ? -800 : min(seeders * 8, 400)
         }
         // Theatrical rips and fake "quality" releases rank below every legitimate stream of any
-        // tier. The shift is uniform, so if only junk exists the least-bad junk still wins.
-        if junkClass(text) != nil { score -= 100_000 }
+        // tier, cached or not (cached ceiling is ~160k, so -250k clears it). The shift is
+        // uniform, so if only junk exists the least-bad junk still wins.
+        if junkClass(text) != nil { score -= 250_000 }
         return score
     }
 
     /// `pattern` matched only at delimiter boundaries: no alphanumeric on either side, so "ts"
     /// can't fire inside DTS, "cam" inside camera, or "hc" inside HEVC tags. Text is lowercase.
     static func boundedMatch(_ text: String, _ pattern: String) -> Bool {
-        text.range(of: "(?<![a-z0-9])(?:\(pattern))(?![a-z0-9])", options: .regularExpression) != nil
+        matches(text, "(?<![a-z0-9])(?:\(pattern))(?![a-z0-9])")
     }
 
     /// Theatrical-rip / fake-release class parsed from the stream text, nil for anything
@@ -148,22 +211,38 @@ enum StreamRanking {
     static func seederCount(_ text: String) -> Int? {
         let patterns = [#"👤[:\s]*([0-9]+)"#, #"(?<![a-z0-9])seed(er)?s?\s*:\s*([0-9]+)"#]
         for pattern in patterns {
-            if let m = text.range(of: pattern, options: .regularExpression) {
-                return Int(text[m].filter(\.isNumber))
+            if let m = firstMatch(text, pattern) {
+                return Int(m.filter(\.isNumber))
             }
         }
         return nil
     }
 
     /// Classify a stream into the four source categories used for user-rankable tier scoring.
+    /// The tag grammar below is verified against the formatter source of the four major
+    /// stream add-ons; missing a form here drops a debrid stream into the DIRECT tier
+    /// (weight 0, below raw torrents), which is exactly the "played a torrent over my
+    /// debrid" failure.
     static func sourceType(_ s: CoreStream, _ text: String) -> SourceType {
-        if text.contains("debrid") || text.contains("premiumize") || text.contains("torbox")
-            || text.contains("offcloud") || text.contains("[rd") || text.contains("[ad+]")
-            || text.contains("[pm+]") || text.contains("[tb+]") || text.contains("[dl+]")
-            || text.contains("[oc+]") {
+        // Usenet first: a debrid service's usenet results carry the same service code.
+        if text.contains("usenet") || text.contains("nzb") || text.contains("easynews")
+            || text.contains("📰") { return .usenet }
+        // Bracketed service tag with any cache suffix: [RD+], [AD⚡], [TB⏳], [PM download],
+        // [RD⬇], [RD C]/[RD U] (kodi forms), [RD🔄].
+        if matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)([+⚡⏳⬇🔄]|\s+download|\s+[cu])?\]"#) {
             return .debrid
         }
-        if text.contains("usenet") || text.contains("nzb") || text.contains("easynews") { return .usenet }
+        // Unbracketed short code adjacent to a cache marker: "RD ⚡" / "AD ⏳" (MediaFusion),
+        // "(Instant RD)" / "(RD)" (AIOStreams torbox format).
+        if matches(text, #"(?<![a-z0-9])(rd|ad|pm|tb|dl|oc|ed|st|db|pp)(?![a-z0-9])\s*[⚡⏳⬇)]"#)
+            || matches(text, #"\(instant\s+(rd|ad|pm|tb|dl|oc|ed|st|db|pp)\)"#) {
+            return .debrid
+        }
+        // Full service names ("debrid" covers realdebrid / alldebrid / debrid-link / easydebrid).
+        if text.contains("debrid") || text.contains("premiumize") || text.contains("torbox")
+            || text.contains("offcloud") || text.contains("pikpak") || text.contains("put.io") {
+            return .debrid
+        }
         if s.isTorrent { return .torrent }
         return .direct
     }
@@ -175,14 +254,18 @@ enum StreamRanking {
         case realDebrid, allDebrid, premiumize, torbox, debridLink, offcloud, easynews, unknown
     }
 
+    /// Service detection. The two-letter tags are only honoured with their "+" suffix or in
+    /// brackets: bare "ad" is an Audio Description tag and bare "tb" is a terabyte size, so the
+    /// loose forms misclassified ordinary streams as debrid. "rd" alone stays matched (no
+    /// release-name collision in practice, and AIOStreams prints it unbracketed).
     static func provider(_ text: String) -> ServiceProvider {
         if isRealDebrid(text) { return .realDebrid }
         if text.contains("alldebrid") || text.contains("all-debrid") || text.contains("[ad+]")
-            || text.range(of: #"\bad\+?\b"#, options: .regularExpression) != nil { return .allDebrid }
+            || matches(text, #"\bad\+"#) { return .allDebrid }
         if text.contains("premiumize") || text.contains("[pm+]")
-            || text.range(of: #"\bpm\+?\b"#, options: .regularExpression) != nil { return .premiumize }
+            || matches(text, #"\bpm\+"#) { return .premiumize }
         if text.contains("torbox") || text.contains("[tb+]")
-            || text.range(of: #"\btb\+?\b"#, options: .regularExpression) != nil { return .torbox }
+            || matches(text, #"\btb\+"#) { return .torbox }
         if text.contains("debrid-link") || text.contains("debridlink") || text.contains("[dl+]") { return .debridLink }
         if text.contains("offcloud") || text.contains("[oc+]") { return .offcloud }
         if text.contains("easynews") { return .easynews }
@@ -203,8 +286,8 @@ enum StreamRanking {
     /// File size in GB parsed from the add-on's stream text (name / description / filename),
     /// where most add-ons print it (e.g. "💾 54.3 GB"). 0 when absent or only MB-sized.
     private static func sizeGB(_ t: String) -> Double {
-        guard let m = t.range(of: #"(\d+(?:\.\d+)?)\s*g(i)?b"#, options: .regularExpression) else { return 0 }
-        let digits = t[m].lowercased()
+        guard let m = firstMatch(t, #"(\d+(?:\.\d+)?)\s*g(i)?b"#) else { return 0 }
+        let digits = m.lowercased()
             .replacingOccurrences(of: "gib", with: "")
             .replacingOccurrences(of: "gb", with: "")
             .trimmingCharacters(in: .whitespaces)
@@ -217,7 +300,7 @@ enum StreamRanking {
     static func isRealDebrid(_ qualityText: String) -> Bool {
         if qualityText.contains("realdebrid") || qualityText.contains("real-debrid")
             || qualityText.contains("real debrid") { return true }
-        return qualityText.range(of: #"\brd\+?\b"#, options: .regularExpression) != nil
+        return matches(qualityText, #"\brd\+?\b"#)
     }
 
     /// Each group's streams sorted best-first, stable within equal scores (so add-on order is preserved
@@ -349,7 +432,7 @@ enum StreamRanking {
         else if t.contains("bluray") || t.contains("blu-ray") { tags.append("BluRay") }
         else if t.contains("web") { tags.append("WEB") }
         if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi")
-            || t.range(of: #"\bdv\b"#, options: .regularExpression) != nil { tags.append("DV") }
+            || matches(t, #"\bdv\b"#) { tags.append("DV") }
         else if t.contains("hdr") { tags.append("HDR") }
         if t.contains("atmos") { tags.append("Atmos") }
         else if t.contains("dts-hd") || t.contains("dts hd") { tags.append("DTS-HD") }
@@ -359,49 +442,98 @@ enum StreamRanking {
         if isCached(s, t) { tags.append("Cached") }
         if let junk = junkClass(t) { tags.append(junk) }   // why this source sits at the bottom
         var size: String?
-        if let m = t.range(of: #"(\d+(?:\.\d+)?)\s*(gb|gib)"#, options: .regularExpression) {
-            size = String(t[m]).uppercased().replacingOccurrences(of: "GIB", with: "GB")
-        } else if let m = t.range(of: #"(\d+(?:\.\d+)?)\s*(mb|mib)"#, options: .regularExpression) {
-            size = String(t[m]).uppercased().replacingOccurrences(of: "MIB", with: "MB")
+        if let m = firstMatch(t, #"(\d+(?:\.\d+)?)\s*(gb|gib)"#) {
+            size = m.uppercased().replacingOccurrences(of: "GIB", with: "GB")
+        } else if let m = firstMatch(t, #"(\d+(?:\.\d+)?)\s*(mb|mib)"#) {
+            size = m.uppercased().replacingOccurrences(of: "MIB", with: "MB")
         }
         return (tags.joined(separator: " · "), size)
+    }
+
+    /// Explicit numeric resolution token ("1080p", "2160p", ...) parsed boundary-checked.
+    /// It must WIN over the marketing tokens ("UHD", "4K"): a "UHD.BluRay.1080p.Remux" is a
+    /// 1080p encode OF a UHD disc, and reading it as 4K both mislabelled the Watch button
+    /// and made best() pick that 1080p file over genuine peers.
+    private static func explicitResolution(_ t: String) -> Int? {
+        for (token, value) in [("2160", 4000), ("1440", 1440), ("1080", 1080),
+                               ("720", 720), ("576", 540), ("540", 540), ("480", 480)] {
+            if boundedMatch(t, "\(token)p?") { return value }
+        }
+        return nil
     }
 
     /// A short resolution tag for the Watch-Now button ("4K" / "1080p" / …), or "Best" when unknown.
     static func qualityLabel(_ s: CoreStream) -> String {
         let t = qualityText(s)
-        if t.contains("2160") || t.contains("4k") || t.contains("uhd") { return "4K" }
-        if t.contains("1440") { return "1440p" }
-        if t.contains("1080") { return "1080p" }
-        if t.contains("720") { return "720p" }
-        if t.contains("480") { return "480p" }
+        if let r = explicitResolution(t) { return r >= 4000 ? "4K" : "\(r)p" }
+        if boundedMatch(t, "4k") || boundedMatch(t, "uhd") { return "4K" }
         return "Best"
     }
 
+    /// Enriched label for the Watch-Now button, derived from the EXACT stream best() will
+    /// play so the button can never promise a quality it doesn't deliver:
+    /// "4K · HDR · Remux", "1080p · WEB".
+    static func watchLabel(_ s: CoreStream) -> String {
+        let t = qualityText(s)
+        var tags = [qualityLabel(s)]
+        if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi")
+            || matches(t, #"\bdv\b"#) { tags.append("DV") }
+        else if t.contains("hdr") { tags.append("HDR") }
+        if t.contains("remux") { tags.append("Remux") }
+        else if t.contains("bluray") || t.contains("blu-ray") { tags.append("BluRay") }
+        else if boundedMatch(t, #"web[ .\-_]?(dl|rip)?"#) { tags.append("WEB") }
+        return tags.joined(separator: " · ")
+    }
+
     private static func qualityText(_ s: CoreStream) -> String {
+        let key = streamKey(s)
+        cacheLock.lock()
+        if let hit = textCache[key] { cacheLock.unlock(); return hit }
+        cacheLock.unlock()
         // Container extensions are stripped from the WHOLE text, not just the filename field:
         // add-ons embed file names in the stream name or description too, and a plain ".ts"
         // (MPEG-TS) must never read as a TeleSync marker to the junk detector. Boundary-checked
         // so only a real dot-extension token disappears.
-        [s.name, s.description, s.behaviorHints?.filename]
+        // The variation selector comes off first: add-ons emit "⚡️" (U+26A1 U+FE0F), and Swift's
+        // grapheme-cluster contains() would never match a bare "⚡" against it.
+        var text = [s.name, s.description, s.behaviorHints?.filename]
             .compactMap { $0 }.joined(separator: " ").lowercased()
-            .replacingOccurrences(of: #"\.(ts|m2ts|mkv|mp4|avi|webm|mov)(?![a-z0-9])"#,
-                                  with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\u{FE0F}", with: "")
+        if let re = regex(#"\.(ts|m2ts|mkv|mp4|avi|webm|mov)(?![a-z0-9])"#) {
+            text = re.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
+                                               withTemplate: "")
+        }
+        cacheLock.lock()
+        if textCache.count > 4096 { textCache.removeAll() }
+        textCache[key] = text
+        cacheLock.unlock()
+        return text
     }
 
     private static func resolution(_ t: String) -> Int {
-        if t.contains("2160") || t.contains("4k") || t.contains("uhd") { return 4000 }
-        if t.contains("1440") { return 1440 }
-        if t.contains("1080") { return 1080 }
-        if t.contains("720") { return 720 }
-        if t.contains("540") { return 540 }
-        if t.contains("480") { return 480 }
+        if let r = explicitResolution(t) { return r }
+        if boundedMatch(t, "4k") || boundedMatch(t, "uhd") { return 4000 }
         return 100   // unknown resolution: below any labelled stream, above nothing
     }
 
-    private static func isCached(_ s: CoreStream, _ text: String) -> Bool {
-        if s.url != nil && s.infoHash == nil { return true }   // a direct / debrid URL plays instantly
-        return text.contains("cached") || text.contains("⚡") || text.contains("instant")
-            || text.contains("[rd+]") || text.contains("[pm+]") || text.contains("[ad+]") || text.contains("[tb+]")
+    /// Whether this stream plays instantly. Explicit add-on markers override the URL-shape
+    /// heuristic: an UNCACHED debrid result is ALSO a plain URL (the resolve link), which the
+    /// old shape-only check happily called cached, so Watch Now kept picking sources that then
+    /// had to download into the debrid first (the "first pick always fails" reports).
+    /// Marker sets verified against the four major add-ons' formatter source.
+    /// Order matters: "uncached" contains "cached", so the negative markers test first.
+    static func isCached(_ s: CoreStream, _ text: String) -> Bool {
+        // "[RD download]" forms, "⏳" hourglass, "⬇" download arrow, "❌ not ready", "🎟" ticket.
+        if text.contains("⏳") || text.contains("⬇") || text.contains("uncached")
+            || text.contains("not ready") || text.contains("🎟")
+            || boundedMatch(text, "download") {
+            return false
+        }
+        // "[RD+]"-style plus tags, "⚡" bolt, "(Instant RD)", plain "cached", "🎫" ticket.
+        if text.contains("⚡") || text.contains("+]") || text.contains("instant")
+            || text.contains("cached") || text.contains("🎫") {
+            return true
+        }
+        return s.url != nil && s.infoHash == nil   // plain URL with no contrary marker
     }
 }

@@ -505,6 +505,12 @@ final class CoreBridge: ObservableObject {
     /// removal, matching the reference apps) and the Library tab's "Remove from Library". The engine
     /// re-emits `continue_watching_preview` + `library`, so both rails update on their own.
     func removeFromLibrary(id: String) {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: dismissing CW must touch only the profile's private history,
+            // never the owner account's library.
+            ProfileStore.shared.removeWatchEntry(metaId: id)
+            return
+        }
         dispatchCtx(["action": "RemoveFromLibrary", "args": id])
     }
 
@@ -547,12 +553,18 @@ final class CoreBridge: ObservableObject {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let metaItems = object["metaItems"] as? [[String: Any]] else { return }
         for entry in metaItems {
-            if let content = entry["content"] as? [String: Any],
-               let ready = content["ready"] as? [String: Any] {
-                dispatchCtx(["action": "AddToLibrary", "args": ready])
+            // Loadable serializes adjacently tagged: {"type":"Ready","content":{...meta...}}.
+            // (Looking for a lowercase "ready" key here made this function a silent no-op,
+            // which is why the Library button never saved from a detail page.)
+            if let loadable = entry["content"] as? [String: Any],
+               loadable["type"] as? String == "Ready",
+               let meta = loadable["content"] as? [String: Any] {
+                dispatchCtx(["action": "AddToLibrary", "args": meta])
+                NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
                 return
             }
         }
+        NSLog("[CoreBridge] AddToLibrary found no ready meta in meta_details")
     }
 
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id
@@ -785,10 +797,18 @@ final class CoreBridge: ObservableObject {
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.
             // Decoded unconditionally: reading the @Published var on this Rust worker thread
-            // would race main-thread writes; the main-queue guard below decides alone.
+            // would race main-thread writes; the main-queue guard below decides alone, and it
+            // republishes only when the library-derived bits actually changed, because `library`
+            // also fires on every ~20s progress save and re-ranking a detail page that often
+            // was its own performance bug.
             let details = decode(CoreMetaDetails.self, field: "meta_details")
             DispatchQueue.main.async { [weak self] in
-                if self?.metaDetails != nil { self?.metaDetails = details }
+                guard let self, let current = self.metaDetails else { return }
+                let changed = current.libraryItem?.id != details?.libraryItem?.id
+                    || current.libraryItem?.removed != details?.libraryItem?.removed
+                    || current.libraryItem?.temp != details?.libraryItem?.temp
+                    || (current.watchedVideoIds?.count ?? 0) != (details?.watchedVideoIds?.count ?? 0)
+                if changed { self.metaDetails = details }
             }
         }
         if fields.contains("search") {
