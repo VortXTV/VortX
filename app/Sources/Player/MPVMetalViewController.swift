@@ -535,6 +535,13 @@ final class MPVMetalViewController: UIViewController {
     func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
     func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
 
+    /// Load an external subtitle (an add-on URL) and select it. mpv fetches the file itself
+    /// and the new track joins track-list, so the subtitles panel lists it like any embedded
+    /// one from then on; `title`/`lang` label it there.
+    func addExternalSubtitle(url: String, title: String, lang: String) {
+        command("sub-add", args: [url, "select", title, lang])
+    }
+
     /// Manual subtitle sync, in seconds (positive = subtitles appear later). Maps to mpv `sub-delay`.
     func setSubDelay(_ seconds: Double) { setString("sub-delay", String(format: "%.2f", seconds)) }
 

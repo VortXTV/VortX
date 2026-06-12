@@ -56,15 +56,31 @@ enum Theme {
 
     // MARK: Typography (system only: New York serif for editorial moments, SF Pro for UI)
 
+    /// User-tunable UI text scale (Settings, Appearance). Read once at launch: live font
+    /// changes would need every screen to re-render, so a relaunch applies it, like the
+    /// Performance setting. Base sizes sit one step up from the original ramp (field
+    /// feedback: UI text read small at ten feet).
+    enum TextScale {
+        static let key = "stremiox.ui.textScale"
+        static let choices: [(id: String, label: String, factor: CGFloat)] = [
+            ("s", "Smaller", 0.92), ("m", "Default", 1.0), ("l", "Larger", 1.12),
+        ]
+        static let current: CGFloat = {
+            let id = UserDefaults.standard.string(forKey: key) ?? "m"
+            return choices.first { $0.id == id }?.factor ?? 1.0
+        }()
+    }
+
     enum Typography {
-        static let hero        = Font.system(size: 64, weight: .heavy, design: .serif)
-        static let wordmark    = Font.system(size: 38, weight: .bold, design: .serif)
-        static let screenTitle = Font.system(size: 52, weight: .heavy)
-        static let sectionTitle = Font.system(size: 30, weight: .semibold)
-        static let cardTitle   = Font.system(size: 22, weight: .semibold)
-        static let body        = Font.system(size: 24, weight: .regular)
-        static let label       = Font.system(size: 20, weight: .medium)
-        static let eyebrow     = Font.system(size: 15, weight: .bold)
+        private static func scaled(_ size: CGFloat) -> CGFloat { (size * TextScale.current).rounded() }
+        static let hero        = Font.system(size: scaled(64), weight: .heavy, design: .serif)
+        static let wordmark    = Font.system(size: scaled(38), weight: .bold, design: .serif)
+        static let screenTitle = Font.system(size: scaled(53), weight: .heavy)
+        static let sectionTitle = Font.system(size: scaled(31), weight: .semibold)
+        static let cardTitle   = Font.system(size: scaled(23), weight: .semibold)
+        static let body        = Font.system(size: scaled(25), weight: .regular)
+        static let label       = Font.system(size: scaled(21), weight: .medium)
+        static let eyebrow     = Font.system(size: scaled(16), weight: .bold)
     }
 }
 

@@ -4,6 +4,17 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.2.48 (prerelease) - 2026-06-12
+
+### Added
+- Live streams play properly. Live TV and event streams no longer end a few seconds in at each segment boundary: the player tunes its buffering for live playlists and reconnects on the brief gaps live providers produce. Contributed by the community.
+- Subtitles from add-ons. The player's subtitles panel now lists subtitles offered by your installed subtitle add-ons next to the file's embedded tracks; pick one and it loads on the spot.
+- Swipe to navigate in the player. The remote's touch surface now moves the selection across the controls and panels, exactly like the arrow presses.
+- App text size setting. UI text sits one step larger by default, and Settings, Appearance has a Smaller / Default / Larger control; takes effect after a relaunch. Subtitle sizes are back to their original values, this setting is for the app's own text.
+
+### Changed
+- Your source-type order is in charge again. Cached streams now get a strong boost WITHIN each source type instead of overriding the order entirely, so ranking Usenet or Torrent above Debrid behaves as configured; within any type, cached still always beats uncached.
+
 ## 0.2.47 (prerelease) - 2026-06-12
 
 ### Fixed

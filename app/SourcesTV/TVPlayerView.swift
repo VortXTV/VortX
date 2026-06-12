@@ -37,6 +37,12 @@ struct TVPlayerView: View {
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var appliedAutoTracks = false       // auto-select audio/subtitle once per load
+    // External subtitles from the account's subtitle add-ons (e.g. OpenSubtitles), listed in the
+    // subtitles panel next to the file's embedded tracks. Picking one sub-adds it into mpv, after
+    // which it lives in the normal track list; addedSubURLs hides its add-on row.
+    @State private var addonSubs: [AddonSubtitle] = []
+    @State private var addedSubURLs: Set<String> = []
+    @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
     @State private var showOptions = false             // options panel (audio / subtitles / aspect / episodes)
     @State private var panelKind: PanelKind = .audio   // which list the options panel shows
     @State private var subDelay: Double = 0            // manual subtitle sync, seconds
@@ -169,7 +175,7 @@ struct TVPlayerView: View {
                     case MPVProperty.videoParamsSigPeak:
                         if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
                     case MPVProperty.duration:
-                        if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps() }
+                        if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles() }
                     case MPVProperty.trackList:
                         refreshTracks()
                         let s = coordinator.player?.mediaSummary()
@@ -586,6 +592,21 @@ struct TVPlayerView: View {
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
             }]
             rows += groupedTrackRows(subtitleTracks) { coordinator.player?.setSubtitleTrack($0); refreshTracksSoon() }
+            // External subtitles from the account's subtitle add-ons. Picking one sub-adds it
+            // into mpv and it joins the embedded list above; its add-on row disappears.
+            let available = addonSubs.filter { !addedSubURLs.contains($0.url) }
+            if !available.isEmpty {
+                rows.append(OptionRow(label: "From add-ons", isHeader: true))
+                for sub in available.prefix(30) {
+                    rows.append(OptionRow(label: langName(sub.lang), detail: sub.addonName) {
+                        coordinator.player?.addExternalSubtitle(url: sub.url,
+                                                                title: sub.addonName,
+                                                                lang: sub.lang)
+                        addedSubURLs.insert(sub.url)
+                        refreshTracksSoon()
+                    })
+                }
+            }
             rows.append(OptionRow(label: "Subtitle Settings", detail: "›") { openPanel(.subtitleSettings) })
             return rows
         case .subtitleSettings:
@@ -1214,6 +1235,24 @@ struct TVPlayerView: View {
         }
     }
 
+    /// Pull external subtitles for the playing title from the account's subtitle add-ons,
+    /// once per episode. Movies query by their id; episodes by id:season:episode.
+    private func fetchAddonSubtitles() {
+        guard let m = curMeta else { return }
+        let key = "\(m.type):\(m.videoId)"
+        guard key != addonSubsKey else { return }
+        addonSubsKey = key
+        addonSubs = []
+        addedSubURLs = []
+        let addons = account.addons
+        Task { @MainActor in
+            let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: m.videoId)
+            guard addonSubsKey == key else { return }   // episode changed mid-fetch
+            addonSubs = subs
+            if showOptions, panelKind == .subtitles { panelRows = optionRows }
+        }
+    }
+
     private var isCurrentLiveStream: Bool { curIsLive && !isTorrentPlayback }
     private var initialLiveMode: Bool { !torrent && isLiveMeta(meta) }
 
@@ -1675,8 +1714,36 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             return super.shouldUpdateFocus(in: context)
         }
 
+        /// Swipes both wake the controls AND navigate them: the pan accumulates into
+        /// discrete directional presses (one per threshold crossing, dominant axis wins),
+        /// so the touch surface moves the selection exactly like the arrow buttons do.
+        private var panAccumulator = CGPoint.zero
+
         @objc private func handleSurfaceTouch(_ g: UIPanGestureRecognizer) {
-            if g.state == .began { onSwipe?() }
+            switch g.state {
+            case .began:
+                panAccumulator = .zero
+                onSwipe?()
+            case .changed:
+                let t = g.translation(in: view)
+                panAccumulator.x += t.x
+                panAccumulator.y += t.y
+                g.setTranslation(.zero, in: view)
+                let threshold: CGFloat = 300   // a deliberate flick, not a resting thumb
+                while abs(panAccumulator.x) >= threshold || abs(panAccumulator.y) >= threshold {
+                    if abs(panAccumulator.x) >= abs(panAccumulator.y) {
+                        onPress?(panAccumulator.x > 0 ? .rightArrow : .leftArrow)
+                        panAccumulator.x -= panAccumulator.x > 0 ? threshold : -threshold
+                        panAccumulator.y = 0
+                    } else {
+                        onPress?(panAccumulator.y > 0 ? .downArrow : .upArrow)
+                        panAccumulator.y -= panAccumulator.y > 0 ? threshold : -threshold
+                        panAccumulator.x = 0
+                    }
+                }
+            default:
+                panAccumulator = .zero
+            }
         }
 
         // Hold an arrow → repeat the press, so you can hold to seek (the scrubber) or scroll a long list.

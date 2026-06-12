@@ -21,6 +21,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
+    @AppStorage(Theme.TextScale.key) private var textScale = "m"
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {
@@ -295,6 +296,10 @@ struct SettingsView: View {
             .toggleStyle(.switch)
             .tint(Theme.Palette.accent)
             Text("Tone-maps HDR and Dolby Vision to SDR. Turn this on only if 4K Dolby Vision remuxes look washed out, green, or purple on your TV; most TVs should leave it off.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow("App text size", Theme.TextScale.choices.map { ($0.id, $0.label) }, selection: $textScale)
+            Text("Scales the text across the app's screens. Takes effect after a relaunch.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow("Performance", [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
