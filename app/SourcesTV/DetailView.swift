@@ -27,7 +27,10 @@ struct DetailView: View {
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .ignoresSafeArea(edges: .top)            // let the backdrop bleed to the top edge
+        // NO ignoresSafeArea on the content: tvOS's safe-area insets exist to keep UI out of
+        // TV overscan, and pushing the whole page into them clipped the top of the detail page
+        // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
+        // the safe area itself), so only text and controls moved back inside the safe zone.
         .onAppear { core.loadMeta(type: type, id: id); captureHero() }
         .onChange(of: core.metaDetails?.meta?.id) { captureHero() }
     }
@@ -708,7 +711,8 @@ struct CoreStreamList: View {
         prepareTorrent(stream)
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
-                                            bingeGroup: stream.behaviorHints?.bingeGroup)
+                                            bingeGroup: stream.behaviorHints?.bingeGroup,
+                                            headers: stream.requestHeaders)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

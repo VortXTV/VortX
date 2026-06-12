@@ -4,6 +4,12 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.2.47 (prerelease) - 2026-06-12
+
+### Fixed
+- Streams that require special request headers now play. Some add-ons front servers that reject requests without a specific referer or browser identity; the player now sends the headers the add-on declares, the same way the official clients do. Fixes "This source didn't load" on add-ons whose streams play fine elsewhere.
+- The detail page stays inside the TV-safe area. On TVs that crop the picture edges (overscan), the top of the detail page could be cut off; content now respects the safe margins while the backdrop artwork still fills the screen.
+
 ## 0.2.46 (prerelease) - 2026-06-12
 
 ### Fixed
