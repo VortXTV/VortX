@@ -8,7 +8,7 @@ struct iOSRootView: View {
         TabView {
             iOSHomeView()
                 .tabItem { Label("Home", systemImage: "house.fill") }
-            placeholder("Discover", "safari.fill")
+            iOSDiscoverView()
                 .tabItem { Label("Discover", systemImage: "safari.fill") }
             iOSLibraryView()
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }
@@ -18,14 +18,6 @@ struct iOSRootView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
         }
         .tint(Theme.Palette.accent)
-    }
-
-    private func placeholder(_ title: String, _ icon: String) -> some View {
-        NavigationStack {
-            ContentUnavailableViewCompat(title: title, systemImage: icon,
-                                         message: "Coming in the 0.3.0 native build.")
-                .navigationTitle(title)
-        }
     }
 }
 
@@ -154,6 +146,62 @@ struct iOSSearchView: View {
             guard !Task.isCancelled else { return }
             core.search(q)
         }
+    }
+}
+
+/// Discover, driven by the stremio-core engine (CatalogWithFilters): type, catalog, and genre
+/// chips carrying the engine's own request, dispatched back on tap, over a poster grid.
+struct iOSDiscoverView: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    if let discover = core.discover {
+                        chipScroll { ForEach(discover.selectable.types) { t in
+                            chip(t.type.capitalized, t.selected) { core.selectDiscover(t.request) } } }
+                        chipScroll { ForEach(discover.selectable.catalogs) { c in
+                            chip(c.catalog, c.selected) { core.selectDiscover(c.request) } } }
+                        if let genre = discover.selectable.extra.first(where: { $0.name.caseInsensitiveCompare("genre") == .orderedSame }),
+                           !genre.options.isEmpty {
+                            chipScroll { ForEach(genre.options) { o in
+                                chip(o.label, o.selected) { core.selectDiscover(o.request) } } }
+                        }
+                        PosterGrid(items: discover.items.map {
+                            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+                        })
+                        .padding(.top, Theme.Space.sm)
+                    } else if account.isSignedIn {
+                        ProgressView().frame(maxWidth: .infinity).padding(.top, 100)
+                    } else {
+                        ContentUnavailableViewCompat(title: "Discover", systemImage: "safari",
+                            message: "Sign in to browse your add-ons' catalogs.").frame(minHeight: 420)
+                    }
+                }
+                .padding(.vertical, Theme.Space.md)
+            }
+            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationTitle("Discover")
+            .onAppear { if core.discover == nil { core.loadDiscover() } }
+        }
+    }
+
+    private func chipScroll<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.sm) { content() }
+                .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.xs)
+        }
+    }
+
+    private func chip(_ label: String, _ selected: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label).lineLimit(1).font(Theme.Typography.label)
+                .padding(.horizontal, Theme.Space.md).padding(.vertical, 8)
+                .background(selected ? Theme.Palette.accent : Theme.Palette.surface2, in: Capsule())
+                .foregroundStyle(selected ? .white : Theme.Palette.textSecondary)
+        }
+        .buttonStyle(.plain)
     }
 }
 
