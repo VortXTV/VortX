@@ -7,15 +7,15 @@
 
 # StremioX
 
-Stremio for iPhone, iPad, and Apple TV. An independent, actively updated client for Apple devices, with a fully native Apple TV app built on stremio-core.
+The modern, native Stremio client for Apple devices. Fully native apps for Apple TV, iPhone, iPad, and Mac, all built on stremio-core and the libmpv player. Desktop and Android are next.
 
 ## Why this exists
 
-Apple pulled Stremio from the App Store, and Stremio's answer was to go the sideload route: in February 2026 they released sideloadable IPAs for iPhone, iPad, and Apple TV (the v1.3.6 build most people are still running). For a long stretch after that those Apple builds sat untouched while Android, Windows, and the web kept getting features, and the download links quietly disappeared from the site. A newer iPhone build has since appeared, but on **Apple TV** the official option remains "Stremio Lite," which is deliberately feature limited, so Apple TV users in particular are still stuck.
+Stremio is a great engine and a great protocol, and StremioX is built on it. But the Apple apps fell behind. Stremio's Apple TV, iPhone, and iPad builds stopped getting updates and went stale while the platform moved on, and the Apple TV option stayed feature limited. Apple users, and Apple TV users especially, were left on an old build.
 
-That is the gap StremioX closes. It is a native Apple TV client built on stremio-core (the same Rust engine the official apps use), with an iPhone and iPad build alongside it. It is not a replacement for the official apps, it is not affiliated with anyone, and it takes nothing away. It is just a way for Apple users, and Apple TV users especially, to stop waiting.
+StremioX picks that up and carries it forward. It is the modern, native, actively developed Stremio client for Apple devices, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best Stremio experience on Apple hardware, and the foundation for the best one anywhere. It builds *on* Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
 
-One thing worth being straight about: I didn't hand-write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own Apple TV, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was genuinely good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo. A small but growing group of community contributors has since pitched in too (see Credits).
+One thing worth being straight about: I didn't hand-write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own devices, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was genuinely good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo. A small but growing group of community contributors has since pitched in too (see Credits).
 
 ## Two builds: Full and Lite
 
@@ -71,16 +71,20 @@ Add-ons you have installed are listed and removable right in the app.
 
 ## What you get
 
-**Apple TV.** There is no WebKit on tvOS, so this is a fully native SwiftUI app running on stremio-core, the same Rust engine the official apps use, compiled straight in. Because the real engine does the work, your catalogs, library, and Continue Watching come out right instead of being stitched together by hand. The player is native libmpv (MPVKit-GPL); torrents stream through the embedded server.
+Every Apple app is fully native and runs on stremio-core, the same Rust engine the official apps use, compiled straight in. There is no web wrapper anywhere: Apple TV, iPhone, iPad, and Mac are all the real engine, the real native UI, and the native libmpv player (MPVKit-GPL). Because the real engine does the work, your catalogs, library, and Continue Watching come out right instead of being stitched together by hand. Torrents stream through the embedded streaming server, which now ships on the Mac too.
 
-**iPhone and iPad.** The current iOS build hosts Stremio's live web interface in a WKWebView and plays through the same native libmpv player so codecs and HDR work, with the streaming server running through nodejs-mobile for torrents and a "Play in" hand-off to external players. Because it follows the live web, a web update can occasionally disrupt it; a fully native iPhone and iPad client on stremio-core, like the Apple TV app, is the next major piece of work on the roadmap.
+**Apple TV, iPhone, iPad, and Mac are at parity.** The cinematic detail page, ranked Watch Now with the two-level quality picker, per-add-on source grouping, an interactive auto-rotating featured hero with a muted in-hero trailer, full Settings, profiles, themes, subtitle styling, and **Live TV** are on every Apple device. Where a platform has a natural extra, it gets it: trailers play through the embedded server on Apple TV and an in-app player on iPhone, iPad, and Mac.
 
-Everything the Apple TV app does today:
+**Desktop and Android are in active development** on the same shared engine: a native desktop app for Windows, Linux, and Mac (via Tauri, with its own embedded torrent server), and an Android app for phone and TV. These are not shipped yet; the Apple apps are.
+
+Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parity unless noted):
 
 **Browsing**
 
 - Home with your real Continue Watching and every catalog from every installed add-on, built by the official engine so they match the official apps.
+- An interactive auto-rotating featured hero on Home, Library, and Discover: it cycles the top titles, shows the logo, rating, year, runtime, genres, and synopsis over the artwork, and plays a muted trailer behind it; focus or tap a poster to feature it, again to open. Reduced-motion aware.
 - A living backdrop on Home, Discover, and Library: whichever title you focus fills the screen with its real backdrop art, year, rating, runtime, genres, and synopsis, with rows tucking away underneath as you browse deeper.
+- **Live TV**: channels from your installed tv / IPTV add-ons get their own tab, rendered as logo channel tiles with the same living backdrop, with a now/next strip from the channel's EPG schedule on the detail page and live-tuned playback. (A full channel guide and M3U import are on the roadmap.)
 - A theme-colored focus glow on every poster across Home, Discover, and Library, so the focused card reads at a glance from across the room.
 - Full-bleed movie and episode pages: the artwork owns the screen, details sit over it, episode pages show the still, air date, runtime, rating, and synopsis.
 - Series pages open ready to play: a Resume or Play button on the hero jumps to the right episode (in progress, or first unwatched), and the episode list opens on that season. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
@@ -114,6 +118,7 @@ Everything the Apple TV app does today:
 - **Per-series quality memory**: Watch Now remembers, per series and per profile, the quality you last played and opens in it again. Cached and instant sources still win.
 - **Stall recovery**: if the picture freezes while it is not buffering, the player reloads the stream in place at your position; if a source keeps stalling, you land on the source list instead of a dead screen. You can also switch to another source mid-playback, and a failed stream offers the source list in one press.
 - **Live streams play properly**: live TV and event streams keep playing across segment boundaries instead of ending a few seconds in, with buffering tuned for live playlists. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
+- **Trailers on every device**: a Trailer button on the detail page, plus the muted autoplay behind the featured hero. Apple TV plays trailers through the embedded server; iPhone, iPad, and Mac use an in-app player. (Full build.)
 - **Subtitles from your add-ons**: the subtitles panel lists what your installed subtitle add-ons offer next to the file's embedded tracks; pick one and it loads on the spot.
 - **Stream link QR**: the player settings panel shows the playing stream as a QR code (a magnet for torrents), to scan with your phone and keep watching there.
 - Playback speed control, a live playback-info overlay (resolution, codec, hardware decode, FPS, dropped frames, buffer), skip intro / recap / credits (crowd-sourced timestamps merged with the file's chapter markers, with sanity guards), smart audio and subtitle selection from your preferred languages, language-grouped track pickers, subtitle styling and sync, bundled fonts for every script, a seekable scrubber with accelerating hold-to-seek, fit / zoom / stretch aspect modes, and resume across sessions.
@@ -142,7 +147,7 @@ Everything the Apple TV app does today:
 
 The builds are attached to the [latest release](../../releases/latest). They are unsigned because this is a third-party client distributed outside the App Store, so you re-sign them yourself with one of the methods below. None require a jailbreak.
 
-Grab the IPA you need from the latest release. For Apple TV, decide between the **Full** build (`StremioX-tvOS-x.y.z.ipa`, torrents included) and the smaller **Lite** build (`StremioX-tvOS-lite-x.y.z.ipa`, debrid and direct links only); see "Two builds" above. The iOS IPA covers iPhone and iPad.
+Grab the build you need from the latest release. For Apple TV, decide between the **Full** build (`StremioX-tvOS-x.y.z.ipa`, torrents included) and the smaller **Lite** build (`StremioX-tvOS-lite-x.y.z.ipa`, debrid and direct links only); see "Two builds" above. The iOS IPA covers iPhone and iPad. The Mac app is attached to the same release as a `.dmg`; because it is distributed outside the App Store, the release notes cover opening it the first time (right-click Open, or clearing the quarantine attribute).
 
 ### The trade-off to understand first
 
@@ -202,7 +207,7 @@ You sign in with your own account and bring your own add-ons. No content is bund
 
 ## Building it yourself
 
-You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), Node and pnpm (for the iOS web bundle), and Rust nightly with rust-src (for the tvOS engine). MPVKit comes in over Swift Package Manager. No local Stremio install is needed: the fetch script downloads everything it cannot find.
+You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust nightly with rust-src (the native engine now powers Apple TV, iPhone, iPad, and Mac). MPVKit comes in over Swift Package Manager. No local Stremio install is needed: the fetch script downloads everything it cannot find.
 
 ```bash
 # 1) Streaming-server deps: NodeMobile (tvOS-enabled build from this repo's vendor
@@ -210,24 +215,26 @@ You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 #    public CDN), and the bundled subtitle fallback fonts.
 ./scripts/fetch-server-deps.sh
 
-# 2) iOS only: build the stremio-web bundle
-./scripts/build-web.sh
-
-# 3) tvOS only: build the stremio-core engine into an xcframework (needs Rust nightly + rust-src)
+# 2) Build the stremio-core engine into an xcframework (needs Rust nightly + rust-src).
+#    Produces the tvOS, iOS, and macOS slices the native apps link.
 ./scripts/build-core-xcframework.sh
 
-# 4) Generate the project and build (unsigned, for sideloading)
+# 3) Generate the project and build (unsigned, for sideloading)
 cd app && xcodegen generate
 # Full Apple TV build (with torrents):
-xcodebuild -scheme StremioXTV       -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme StremioXTV         -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
 # Lite Apple TV build (no embedded server):
-xcodebuild -scheme StremioXTVLite -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
-# iOS build:
-xcodebuild -scheme StremioX         -sdk iphoneos  -destination 'generic/platform=iOS'  -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme StremioXTVLite     -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
+# Native iPhone and iPad build:
+xcodebuild -scheme StremioXiOSNative  -sdk iphoneos  -destination 'generic/platform=iOS'  -configuration Release CODE_SIGNING_ALLOWED=NO build
+# Native Mac build:
+xcodebuild -scheme StremioXMac        -destination 'platform=macOS,arch=arm64'            -configuration Release CODE_SIGNING_ALLOWED=NO build
 
-# 5) Wrap the built .app into an .ipa
+# 4) Wrap a built .app into an .ipa (Apple TV / iOS)
 ./scripts/repackage-ipa.sh <dir-with-Payload> build/StremioX.ipa
 ```
+
+(The legacy `StremioX` iOS web-host target and its `./scripts/build-web.sh` bundle step still build for now, but the native `StremioXiOSNative` app has replaced it.)
 
 `server.js` is not committed here because it is the streaming server's own proprietary file. The script prefers a copy from a local Stremio.app (set `STREMIO_APP` to point at one) and otherwise downloads the standard desktop build from the public CDN, so a fresh clone builds without any local install.
 
@@ -237,14 +244,14 @@ It started out talking to add-ons by hand, and that kept getting small things wr
 
 ## What's next
 
-The plan for upcoming work (the native iPhone and iPad client on the engine, offline downloads, our own streaming server with Usenet and live TV, richer per-profile add-on sets, and more) is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
+With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and — on the path to 1.0 — StremioX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/mamaclapper/StremioX/issues). Requests genuinely shape the roadmap.
 
 ## Known issues
 
 - **Profiles are per-device for now.** The roster and each profile's watch history live on the device. An early build (0.2.7 to 0.2.9 build 30) tried to sync them through the account's library storage; that could break library sync in official apps with a "Serialization error: state.watched" message. Current builds scrub those documents from the account automatically on launch, which fixes the official apps too. If you saw that error, open StremioX once on this version and give the official app a minute to resync.
-- **iPhone and iPad follow the live web.** The iOS app hosts the live web interface, so a web update can occasionally disrupt it. The native iOS client on the roadmap removes this dependency.
+- **Desktop and Android are still in development.** They run the shared engine but are not yet at the Apple apps' level of polish, and are not part of the released builds yet.
 - **Unsigned builds.** You re-sign the IPA yourself, and depending on the signing method, reinstalling can require signing in again.
 
 ## Not affiliated
