@@ -25,6 +25,14 @@ struct TrailerLaunch: Identifiable {
     }
 }
 
+/// The muted/looping embed URL for the Netflix-style hero autoplay layer. `mute=1` is required for
+/// autoplay to be honored without a user gesture; `loop=1` only loops when paired with
+/// `playlist=<id>` (a single-video playlist of the same id); `controls=0` hides the chrome so the
+/// art reads cleanly behind the hero overlay.
+func mutedLoopingEmbedURL(forYouTubeID id: String) -> URL? {
+    URL(string: "https://www.youtube.com/embed/\(id)?autoplay=1&mute=1&loop=1&controls=0&playsinline=1&rel=0&modestbranding=1&playlist=\(id)")
+}
+
 /// Full-screen trailer cover: the YouTube embed on a black canvas with a close affordance and a
 /// browser fallback. Reused by `iOSDetailView` via `platformFullScreenCover`.
 struct TrailerPlayerScreen: View {
@@ -146,6 +154,88 @@ struct YouTubeWebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate {
         let onFailure: () -> Void
         init(onFailure: @escaping () -> Void) { self.onFailure = onFailure }
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { onFailure() }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { onFailure() }
+    }
+}
+#endif
+
+/// Muted, looping, controls-less `WKWebView` host for the Netflix-style autoplay layer that plays
+/// behind the featured hero art. It is a sibling of `YouTubeWebView` (kept separate so the
+/// full-screen Trailer chip path stays untouched) with two differences that the graceful-fallback
+/// logic relies on:
+///   • `onStarted` fires on the first committed navigation, so the hero can distinguish "the embed
+///     began loading" from "it never started" (the timeout case).
+///   • `onFailure` fires on a hard navigation error, so the hero can remove the layer silently and
+///     keep the still backdrop.
+/// The view never shows its own chrome or fallback UI — on any failure the *hero* simply drops the
+/// layer back to the still backdrop, so a broken player can never be visible.
+#if canImport(UIKit)
+struct AutoplayTrailerWebView: UIViewRepresentable {
+    let url: URL
+    var onStarted: () -> Void = {}
+    var onFailure: () -> Void = {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onStarted: onStarted, onFailure: onFailure) }
+
+    func makeUIView(context: Context) -> WKWebView {
+        let webView = Self.makeConfiguredWebView()
+        webView.navigationDelegate = context.coordinator
+        webView.isUserInteractionEnabled = false   // belt-and-braces; the hero also disables hit testing
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+    func updateUIView(_ webView: WKWebView, context: Context) {}
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        let onStarted: () -> Void
+        let onFailure: () -> Void
+        init(onStarted: @escaping () -> Void, onFailure: @escaping () -> Void) {
+            self.onStarted = onStarted; self.onFailure = onFailure
+        }
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) { onStarted() }
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { onFailure() }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { onFailure() }
+    }
+
+    private static func makeConfiguredWebView() -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []   // honor autoplay=1 + mute=1
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.scrollView.isScrollEnabled = false
+        return webView
+    }
+}
+#elseif canImport(AppKit)
+struct AutoplayTrailerWebView: NSViewRepresentable {
+    let url: URL
+    var onStarted: () -> Void = {}
+    var onFailure: () -> Void = {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onStarted: onStarted, onFailure: onFailure) }
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.mediaTypesRequiringUserActionForPlayback = []   // honor autoplay=1 + mute=1
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.setValue(false, forKey: "drawsBackground")     // transparent over the hero art
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+    func updateNSView(_ webView: WKWebView, context: Context) {}
+
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        let onStarted: () -> Void
+        let onFailure: () -> Void
+        init(onStarted: @escaping () -> Void, onFailure: @escaping () -> Void) {
+            self.onStarted = onStarted; self.onFailure = onFailure
+        }
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) { onStarted() }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { onFailure() }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { onFailure() }
     }

@@ -28,6 +28,17 @@ final class FeaturedHeroModel: ObservableObject {
     /// How many candidates the rotating pool holds at most.
     static let heroPoolCap = 5
 
+    /// Dwell before the muted trailer autoplay fades in once the hero settles on a title that has a
+    /// trailer. Long enough that fast rotating/tapping through items never starts a stale player
+    /// (the dwell timer is cancelled the instant the featured item changes), short enough to feel
+    /// like Netflix's ambient preview.
+    static let trailerAutoplayDwell: Duration = .seconds(1.3)
+    /// If the embed hasn't reported that it began loading within this window after it mounts, treat
+    /// it as a failure and silently drop the autoplay layer back to the still backdrop.
+    static let trailerAutoplayLoadTimeout: Duration = .seconds(6)
+    /// Cross-fade for the autoplay layer fading in over the still backdrop.
+    static let trailerAutoplayFade: Double = 0.6
+
     /// The randomized rotation pool (seed-grade items; each is enriched lazily when shown).
     private var pool: [FeaturedHeroItem] = []
     private var rotationIndex = 0
