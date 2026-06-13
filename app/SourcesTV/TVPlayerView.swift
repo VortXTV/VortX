@@ -1432,7 +1432,11 @@ struct TVPlayerView: View {
             plog.info("episode switch: playing preloaded best source")
             prepareTorrent(pre.stream)
             curURL = u
-            Task {
+            // @MainActor: the synchronous CoreBridge calls below (loadMeta / streamGroups ->
+            // addonNamesByBase, which lazily mutates addonNamesCache) are main-actor-only. A bare
+            // Task runs its pre-await body on a background thread, racing the dictionary against
+            // the player/DetailView reads.
+            Task { @MainActor in
                 core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
                 resumeSeconds = await account.resumeOffset(for: newMeta)
                 loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
@@ -1450,7 +1454,7 @@ struct TVPlayerView: View {
             return
         }
 
-        Task {
+        Task { @MainActor in
             core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
             // Wait for THIS episode's streams (matched by id), then take the RANKED best across
             // add-ons: either every add-on has answered, or the first playable landed a few seconds

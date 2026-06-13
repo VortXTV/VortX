@@ -4,6 +4,7 @@ import SwiftUI
 /// (add-ons + library). QR sign-in and Sign in with Apple come in later 0.3.0 iterations.
 struct iOSSignInView: View {
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var core: CoreBridge
     @Environment(\.dismiss) private var dismiss
     @State private var email = ""
     @State private var password = ""
@@ -47,6 +48,10 @@ struct iOSSignInView: View {
         busy = false
         if account.isSignedIn {
             account.reloadForActiveProfile()
+            // Seed the engine with the freshly written authKey. CoreBridge booted signed-out at
+            // launch, so without this the Home rails (boardRows / continueWatching) stay empty
+            // until the next cold launch. tvOS LoginView does the same right after sign-in.
+            core.signedInWithLegacyAuthKey()
             dismiss()
         } else {
             error = "Sign in failed. Check your email and password."

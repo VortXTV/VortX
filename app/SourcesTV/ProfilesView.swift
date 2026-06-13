@@ -219,15 +219,14 @@ struct ProfileEditorView: View {
     @State private var pinText: String
     @State private var customAvatar = ""
     @State private var confirmDelete = false
-    @State private var unlocked = false
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
 
-    /// The guardrail: editing someone ELSE's PIN-protected profile requires that profile's PIN
-    /// first. Your own profile and PIN-less profiles open freely (a parent edits the kids
-    /// profile without friction; the kids profile cannot strip the parent's PIN).
+    /// The guardrail: a profile can ONLY be edited while it is the one in use. You cannot change
+    /// another profile from yours, with or without a PIN (the PIN bypass was the hole in the
+    /// 0.2.46 version). To edit profile B, switch to B first. New-profile creation is exempt.
     private var isLocked: Bool {
-        !isNew && original.id != store.activeID && original.hasPin && !unlocked
+        !isNew && original.id != store.activeID
     }
     private static let avatars = ["🍿", "🎬", "👑", "🦊", "🐼", "🚀", "🌊", "🔥",
                                   "🎮", "🐉", "👻", "🤖", "🎧", "🌸", "🦁", "⚡️"]
@@ -338,15 +337,11 @@ struct ProfileEditorView: View {
                 }
                 .padding(Theme.Space.screenEdge)
             }
-            // Unfocusable while the gate is up, so the remote lands in the gate (same trick as
-            // the picker; tvOS focus won't enter an overlay while anything beneath is focusable).
+            // Unfocusable while the lock is up, so the remote lands in the lock panel (tvOS focus
+            // won't enter an overlay while anything beneath stays focusable).
             .disabled(isLocked)
 
-            if isLocked {
-                PinGateOverlay(profile: original,
-                               onUnlock: { unlocked = true },
-                               onCancel: { dismiss() })
-            }
+            if isLocked { lockedPanel }
         }
         .confirmationDialog("Delete \(original.name)? Its settings and sign-in are removed.",
                             isPresented: $confirmDelete, titleVisibility: .visible) {
@@ -354,6 +349,28 @@ struct ProfileEditorView: View {
                 store.remove(original)
                 dismiss()
             }
+        }
+    }
+
+    /// Shown instead of the form for a non-active profile: editing is only allowed from within
+    /// that profile, so the door is closed here with no bypass.
+    private var lockedPanel: some View {
+        ZStack {
+            Color.black.opacity(0.72).ignoresSafeArea()
+            VStack(spacing: Theme.Space.lg) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 48)).foregroundStyle(Theme.Palette.accent)
+                Text("\(original.name) can only be edited from that profile")
+                    .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                Text("Switch to \(original.name) first (Settings, Profiles, Switch Profile), then edit its settings.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 640)
+                Button("OK") { dismiss() }.buttonStyle(PrimaryActionStyle())
+            }
+            .padding(Theme.Space.xxl)
+            .background(Theme.Palette.surface1,
+                        in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
     }
 

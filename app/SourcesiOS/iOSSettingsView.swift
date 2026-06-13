@@ -38,6 +38,10 @@ struct iOSSettingsView: View {
             }
             .navigationTitle("Settings")
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
+            // Text size is per-profile (mirrored into ThemeManager); fold the stepper's change back
+            // into the active profile so it survives a switch/relaunch, same as tvOS RootTabView.
+            // Single-param onChange: the zero-/two-param forms are iOS 17+, target here is iOS 16.
+            .onChange(of: theme.textScale) { _ in ProfileStore.shared.captureTheme() }
         }
     }
 }

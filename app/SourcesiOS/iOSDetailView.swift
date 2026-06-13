@@ -37,7 +37,14 @@ struct iOSDetailView: View {
         .navigationTitle(meta?.name ?? title)
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { core.loadMeta(type: type, id: id) }
+        .onDisappear { core.unloadMeta() }
     }
 
-    private var meta: CoreMetaItem? { core.metaDetails?.meta }
+    // metaDetails is a single shared @Published on the CoreBridge singleton. Guard on the id so a
+    // previous page's still-resident meta (A -> back -> B) can't render A's hero/title under B.
+    // Mirrors tvOS DetailView.
+    private var meta: CoreMetaItem? {
+        let m = core.metaDetails?.meta
+        return m?.id == id ? m : nil
+    }
 }
