@@ -1,7 +1,9 @@
 import AVFoundation
 import AVKit
 import CoreMedia
-import UIKit
+#if canImport(UIKit)
+import UIKit   // all UIKit/UIWindow usage below is inside #if os(tvOS); macOS just needs the import gated
+#endif
 import os
 
 /// The dynamic range mpv reports for the playing file, reduced to the modes the

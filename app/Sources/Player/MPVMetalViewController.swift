@@ -853,7 +853,11 @@ final class MPVMetalViewController: PlatformViewController {
                             if let sigPeak = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 DispatchQueue.main.async { [weak self] in
                                     guard let self, let mpv = self.mpv else { return }   // dropped if torn down
+                                    #if canImport(UIKit)
                                     let maxEDRRange = self.view.window?.screen.potentialEDRHeadroom ?? 1.0
+                                    #elseif canImport(AppKit)
+                                    let maxEDRRange = self.view.window?.screen?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 1.0
+                                    #endif
                                     // display screen support HDR and current playing HDR video
                                     self.hdrAvailable = maxEDRRange > 1.0 && sigPeak > 1.0
                                     self.syncDisplayDynamicRange(sigPeak: sigPeak)

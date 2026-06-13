@@ -16,8 +16,7 @@ struct iOSSignInView: View {
             Form {
                 Section("Stremio account") {
                     TextField("Email", text: $email)
-                        .textContentType(.username).keyboardType(.emailAddress)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        .textContentType(.username).emailFieldStyle().autocorrectionDisabled()
                     SecureField("Password", text: $password).textContentType(.password)
                 }
                 if let error {
@@ -37,8 +36,8 @@ struct iOSSignInView: View {
                 }
             }
             .navigationTitle("Sign In")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Cancel") { dismiss() } } }
+            .inlineNavigationTitle()
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
         }
     }
 

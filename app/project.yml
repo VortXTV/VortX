@@ -94,11 +94,41 @@ targets:
         INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
-  # macOS: deferred. Mac Catalyst is blocked because MPVKit 0.41.0's Libuavs3d (and Libluajit)
-  # ship no maccatalyst slice, so neither MPVKit product links under Catalyst. The viable path is a
-  # NATIVE macOS app (the macos-arm64 MPVKit slices are complete) which needs MPVMetalViewController
-  # ported from UIViewController to NSViewController plus an aarch64-apple-darwin core slice. Tracked
-  # for a dedicated effort; see docs and the Brain note.
+  # Native macOS app (NOT Catalyst, which MPVKit can't link). Reuses the same native SwiftUI UI
+  # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Server-less
+  # (STREMIOX_NO_EMBEDDED_SERVER): NodeMobile has no macOS slice, so Mac plays direct/debrid like the
+  # tvOS Lite build. MPVKit's macos-arm64 slices and the stremio-core macOS slice are complete.
+  StremioXMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"   # MPVKit's macOS slices (Libuavs3d) require macOS 14
+    sources:
+      - SourcesiOS                   # the native SwiftUI UI also runs on macOS
+      - SourcesShared
+      - Sources/Player
+      - Sources/PlayerScreen.swift
+      - Sources/ShareSheet.swift
+      - Sources/ExternalPlayer.swift
+      - Resources/Assets.xcassets
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL          # macos-arm64_x86_64 slice
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false                 # now carries an aarch64-apple-darwin slice
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
+        MARKETING_VERSION: "0.3.0"
+        CURRENT_PROJECT_VERSION: "84"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: StremioX
+        CODE_SIGNING_ALLOWED: "NO"
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
   StremioXTV:

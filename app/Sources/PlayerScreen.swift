@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Full-screen native libmpv player with controls (play/pause, seek, video size,
 /// playback speed, audio/subtitle tracks via a custom selection sheet).
@@ -118,8 +121,10 @@ struct PlayerScreen: View {
 
             if loadFailed { loadErrorOverlay }
         }
+        #if os(iOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
+        #endif
         .onAppear { scheduleHide(); startLoadTimeout() }
         .onDisappear { hideTask?.cancel(); loadTimeout?.cancel() }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -133,7 +138,13 @@ struct PlayerScreen: View {
                 }
             }
             Button("Share or open in…") { showShare = true }
-            Button("Copy stream link") { UIPasteboard.general.url = url }
+            Button("Copy stream link") {
+                #if canImport(UIKit)
+                UIPasteboard.general.url = url
+                #elseif canImport(AppKit)
+                NSPasteboard.general.clearContents(); NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                #endif
+            }
             Button("Cancel", role: .cancel) { scheduleHide() }
         } message: {
             Text(externalChooserMessage)
@@ -218,12 +229,15 @@ struct PlayerScreen: View {
                             onNext()
                         }
                     }
+                    #if os(iOS)
+                    // Manual landscape lock is an iOS-only affordance (macOS windows don't rotate).
                     iconButton(forcedLandscape ? "arrow.down.right.and.arrow.up.left"
                                                : "arrow.up.left.and.arrow.down.right") {
                         forcedLandscape.toggle()
                         coordinator.player?.setOrientation(landscape: forcedLandscape)
                         scheduleHide()
                     }
+                    #endif
                     iconButton("arrow.up.forward.app") {       // hand off to Infuse / VLC / Share
                         hideTask?.cancel()
                         showExternalChooser = true

@@ -58,7 +58,7 @@ struct iOSHomeView: View {
             .navigationTitle("StremioX")
             .toolbar {
                 if !account.isSignedIn {
-                    ToolbarItem(placement: .topBarTrailing) {
+                    ToolbarItem(placement: .primaryAction) {
                         Button("Sign In") { showSignIn = true }
                     }
                 }
