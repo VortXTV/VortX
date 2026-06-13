@@ -204,6 +204,11 @@ struct iOSHomeView: View {
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
         // by routine engine re-emits.
         .onAppear {
+            // Populate the board on appear (mirrors Discover/Library) so the default Cinemeta catalogs
+            // fill Home even when SIGNED OUT — the landing screen shows a real backdrop hero + rails
+            // instead of a bare empty state. The Sign In button stays in the toolbar. Guarded on empty
+            // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
+            if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
         }
@@ -1064,6 +1069,13 @@ extension View {
                             Text("X").foregroundStyle(Theme.Palette.accent)
                         }
                         .font(Theme.Typography.wordmark)
+                        // macOS hoists the principal item into the unified titlebar and wraps it in a
+                        // system capsule sized to the text's LAYOUT width — but a bold New York (serif)
+                        // wordmark's ink overshoots that box (S side-bearing + X/o terminals), so it
+                        // spilled past the pill. fixedSize stops the bar squeezing it; the horizontal
+                        // padding widens the measured bounds so the capsule clears the serif overhang.
+                        .fixedSize()
+                        .padding(.horizontal, Theme.Space.xs)
                         .accessibilityAddTraits(.isHeader)
                         .accessibilityLabel("StremioX")
                     }

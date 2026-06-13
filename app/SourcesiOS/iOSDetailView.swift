@@ -17,7 +17,17 @@ private func prepareTorrentStream(_ stream: CoreStream) {
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.httpBody = data
-    URLSession.shared.dataTask(with: request).resume()
+    request.timeoutInterval = 5
+    // Retry the prime a few times: the embedded server can still be cold-starting (notably the macOS
+    // child `node` process), and a single fire-and-forget POST sent before it's listening is silently
+    // dropped — leaving the torrent un-primed and the player hanging on a peerless swarm. A round-trip
+    // that doesn't throw means the server received the create; connection-refused retries with backoff.
+    Task {
+        for attempt in 0..<5 {
+            if (try? await URLSession.shared.data(for: request)) != nil { return }
+            try? await Task.sleep(for: .seconds(Double(attempt + 1)))   // 1s,2s,3s,4s backoff over cold-start
+        }
+    }
 }
 
 /// Touch / Mac detail page. Loads meta through the shared engine, then presents the same cinematic
@@ -53,11 +63,14 @@ struct iOSDetailView: View {
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
         case player(PlayerLaunch)
-        case trailer(TrailerLaunch)
+        /// A trailer plays in the SAME native mpv player as a stream (resolved via the embedded
+        /// server's `/yt` route), not a WKWebView IFrame — so no YouTube Error 153. recordMeta is
+        /// nil for these so a trailer never lands in Continue Watching.
+        case trailerPlayer(url: URL, title: String)
         var id: String {
             switch self {
             case .player(let l): "player-\(l.id)"
-            case .trailer(let l): "trailer-\(l.youTubeID)"
+            case .trailerPlayer(_, let t): "trailer-\(t)"
             }
         }
     }
@@ -125,23 +138,36 @@ struct iOSDetailView: View {
                     onClose: { presentation = nil }
                 )
                 .ignoresSafeArea()
-            case .trailer(let launch):
-                TrailerPlayerScreen(launch: launch, onClose: { presentation = nil })
+            case .trailerPlayer(let url, let title):
+                PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
+                             recordMeta: nil, onClose: { presentation = nil })
+                    .ignoresSafeArea()
             }
         }
     }
 
-    /// Open the meta's YouTube trailer in the in-app cover (or the system browser if the embed
-    /// itself fails, handled inside `TrailerPlayerScreen`).
+    /// Open the meta's trailer in the native mpv player via the embedded server's `/yt` route — the
+    /// same path tvOS uses, so it plays a real video stream instead of a WKWebView IFrame (which
+    /// YouTube rejected with Error 153). Falls back to the public YouTube link externally if no
+    /// playable URL resolves (e.g. server still cold-starting, or a no-server build).
     private func playTrailer() {
-        guard let yt = meta?.trailerYouTubeID else { return }
-        presentation = .trailer(TrailerLaunch(youTubeID: yt, title: meta?.name ?? title))
+        guard let m = meta, let req = TrailerRequest.from(meta: m) else { return }
+        if let direct = req.directURL {
+            // A real (non-YouTube) trailer stream plays natively in mpv.
+            presentation = .trailerPlayer(url: direct, title: "\(m.name) — Trailer")
+        } else if let watch = req.watchURL {
+            // YouTube trailers open in the YouTube app / browser. The in-app `/yt` resolver (ytdl-core)
+            // currently 403s — YouTube changed its player and broke extraction — so external open is the
+            // reliable path; it never hits the old WKWebView "Error 153". In-app YouTube playback is
+            // tracked for a follow-up (server-side resolver update).
+            TrailerOpener.open(watch)
+        }
     }
 
-    /// A standalone Trailer chip, shown only when the meta carries a YouTube trailer. Used in both the
-    /// movie Watch row and the series hero.
+    /// A standalone Trailer chip, shown whenever the meta carries a trailer (direct stream or a YouTube
+    /// link). Used in both the movie Watch row and the series hero.
     @ViewBuilder private var trailerButton: some View {
-        if meta?.trailerYouTubeID != nil {
+        if let m = meta, TrailerRequest.from(meta: m) != nil {
             Button { playTrailer() } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }

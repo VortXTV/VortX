@@ -137,6 +137,8 @@ struct PlayerScreen: View {
     @State private var curURL: URL?
     @State private var curHeaders: [String: String]?
     @State private var curIsTorrent = false
+    @State private var torrentWarmupsUsed = 0          // bounded torrent peer-discovery warm-up rounds
+    @State private var torrentStatus: String?          // "Connecting to peers · N connected" shown during warm-up
     // Auto-failover: when a source spends its retry / stall budget, hop to the best-ranked UNTRIED
     // source instead of dropping the viewer at the error overlay (parity with tvOS).
     @State private var exhaustedURLs: Set<URL> = []
@@ -187,6 +189,30 @@ struct PlayerScreen: View {
             if let panel { selectionSheet(panel) }
 
             if loadFailed { loadErrorOverlay }
+
+            // Always-present escape hatch until the first frame arrives: a top-most close button so the
+            // player is NEVER a trap, even with controls auto-hidden and the spinner covering the
+            // tap-to-restore layer. macOS has no Esc/▶︎ remote fallback, so this is the only reliable
+            // way out of a stuck load. Disappears once playback starts (the normal controls take over).
+            if !hasStartedPlaying {
+                VStack {
+                    HStack {
+                        Button { leavePlayback() } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                                .padding(12).background(.black.opacity(0.55), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
+                        .accessibilityLabel("Close player")
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal).padding(.top, 12)
+                .transition(.opacity)
+                .zIndex(100)
+            }
         }
         #if os(iOS)
         .statusBarHidden(true)
@@ -196,10 +222,16 @@ struct PlayerScreen: View {
         .onAppear {
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             scheduleHide(); startLoadTimeout()
+            #if os(iOS)
+            UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
+            #endif
         }
         .onDisappear {
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+            #if os(iOS)
+            UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
+            #endif
         }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
                             titleVisibility: .visible) {
@@ -345,13 +377,20 @@ struct PlayerScreen: View {
     }
 
     /// A pre-playback failure (an endFileError before the first frame). For a torrent, the engine simply
-    /// isn't warm yet so a quick retry won't help — fall straight to a source hop. Otherwise auto-retry a
-    /// couple of times, then hop to another source, then show the manual error overlay. Parity with tvOS
-    /// `handleLoadFailure` minus the embedded-server torrent warm-up the iOS app doesn't run.
+    /// isn't warm yet so a quick retry won't help — warm it up (poll peers/bytes) then reload. Otherwise
+    /// auto-retry a couple of times, then hop to another source, then show the manual error overlay.
+    /// Now at full parity with tvOS `handleLoadFailure`, including the embedded-server torrent warm-up.
     private func handleLoadFailure(_ msg: String) {
         guard !hasStartedPlaying, !loadFailed else { return }
         loadErrorMsg = msg
         loadTimeout?.cancel()
+        if curIsTorrent {
+            // A torrent that errors (or never starts) before the first frame usually just isn't warm
+            // yet — no peers / no data. mpv's reconnect=1 would otherwise buffer it forever. Warm the
+            // engine, then hand back to mpv. Bounded + capped, so a dead torrent still errors.
+            warmUpTorrent()
+            return
+        }
         if isLive {
             scheduleReconnect(reason: "live load failure", message: "Reconnecting live stream…", backoff: 0.5)
             return
@@ -403,10 +442,79 @@ struct PlayerScreen: View {
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
             guard !hasStartedPlaying, !loadFailed else { return }
+            // THE HANG: a cold torrent never emits an end-file error (mpv reconnect=1 keeps retrying the
+            // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
+            // hopping/failing. Non-torrents time out to a hop/error as before.
+            if curIsTorrent { warmUpTorrent(); return }
             if hopToNextSource(reason: "load timeout") { return }
             if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
             withAnimation { loadFailed = true }
         }
+    }
+
+    /// Warm a cold torrent before handing back to mpv: poll the embedded server's stats.json for peer
+    /// connections + bytes downloaded. mpv with reconnect=1 buffers a peerless torrent forever instead of
+    /// erroring, so without this a torrent movie hangs at "loading" with no recovery. Bounded to 2 rounds
+    /// × 90s and capped by the overall recovery deadline, so a genuinely dead torrent still surfaces the
+    /// error overlay. Ported from tvOS `warmUpTorrent`.
+    private func warmUpTorrent() {
+        guard torrentWarmupsUsed < 2, let u = curURL, u.pathComponents.count >= 2 else {
+            reconnecting = false; torrentStatus = nil
+            if hopToNextSource(reason: "torrent warm-up exhausted") { return }
+            if loadErrorMsg.isEmpty { loadErrorMsg = "The torrent never started sending data. Try another source." }
+            withAnimation { loadFailed = true }
+            return
+        }
+        torrentWarmupsUsed += 1
+        let hash = u.pathComponents[1]
+        buffering = true
+        reconnectMsg = "Starting torrent…"
+        withAnimation { reconnecting = true }
+        torrentStatus = "Starting torrent…"
+        NSLog("[Player] torrent warm-up round \(torrentWarmupsUsed) for \(hash)")
+        loadTimeout?.cancel()
+        autoRetryTask?.cancel()
+        autoRetryTask = Task { @MainActor in
+            let deadline = Date().addingTimeInterval(90)
+            var warm = false
+            while Date() < deadline, !Task.isCancelled, !hasStartedPlaying {
+                if let stats = await Self.torrentStats(hash: hash) {
+                    let peers = stats.swarmConnections ?? stats.peers ?? 0
+                    let speed = stats.downloadSpeed ?? 0
+                    var line = "Connecting to peers · \(peers) connected"
+                    if speed > 10_000 { line += String(format: " · %.1f MB/s", speed / 1_048_576) }
+                    torrentStatus = line
+                    if (stats.downloaded ?? 0) > 3_000_000 { warm = true; break }   // a few MB down = mpv can demux
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+            guard !Task.isCancelled, !hasStartedPlaying else { torrentStatus = nil; return }
+            torrentStatus = nil
+            if warm {
+                retryLoad(resetAutoRetries: true)   // hand the now-warm torrent back to mpv
+            } else {
+                loadErrorMsg = "The torrent never started sending data. Try another source."
+                reconnecting = false
+                withAnimation { loadFailed = true }
+            }
+        }
+    }
+
+    private struct TorrentStats: Decodable {
+        let peers: Int?
+        let swarmConnections: Int?
+        let downloaded: Double?
+        let downloadSpeed: Double?
+    }
+
+    /// Poll the embedded server's per-hash stats.json (peers + bytes), short timeout so a stalled
+    /// request doesn't block the warm-up loop.
+    private static func torrentStats(hash: String) async -> TorrentStats? {
+        guard let url = URL(string: "\(StremioServer.base)/\(hash)/stats.json") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 4
+        guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
+        return try? JSONDecoder().decode(TorrentStats.self, from: data)
     }
 
     /// One wall-clock cap over the WHOLE pre-start recovery sequence (30s timeout × retries × 4 hops
@@ -534,6 +642,7 @@ struct PlayerScreen: View {
         appliedSize = false; appliedAutoTracks = false
         hasStartedPlaying = false; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
+        torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
         reconnectMsg = "Switching source…"
         loadIntoPlayer(newURL, headers: curHeaders, live: isLive)
         startLoadTimeout()
@@ -543,7 +652,9 @@ struct PlayerScreen: View {
     private var bufferingOverlay: some View {
         VStack(spacing: 14) {
             ProgressView().controlSize(.large).tint(.white)
-            if reconnecting {
+            if let status = torrentStatus {   // live peer/byte progress during torrent warm-up
+                Text(status).font(.callout.weight(.medium)).foregroundStyle(.white.opacity(0.9))
+            } else if reconnecting {
                 Text(reconnectMsg).font(.callout.weight(.medium)).foregroundStyle(.white.opacity(0.9))
             }
         }
@@ -564,7 +675,7 @@ struct PlayerScreen: View {
                         Button { openPanel(.sources) } label: { Label("Other sources", systemImage: "rectangle.stack").padding(6) }
                     }
                     Button { retryLoad() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
-                    Button { onClose() } label: { Label("Back", systemImage: "chevron.left").padding(6) }
+                    Button { leavePlayback() } label: { Label("Back", systemImage: "chevron.left").padding(6) }
                 }
                 .buttonStyle(.borderedProminent).tint(Theme.Palette.accent).foregroundStyle(.white).padding(.top, 6)
             }
@@ -598,10 +709,7 @@ struct PlayerScreen: View {
 
     private var topBar: some View {
         HStack(spacing: 12) {
-            iconButton("chevron.down") {
-                if !isLive, duration > 0 { onProgress(currentTime, duration) }   // final progress before exit (never for live)
-                onClose()
-            }
+            iconButton("chevron.down") { leavePlayback() }
             if !title.isEmpty {
                 Text(title).font(.headline.weight(.semibold)).foregroundStyle(.white)
                     .lineLimit(1).shadow(radius: 3)
@@ -687,7 +795,7 @@ struct PlayerScreen: View {
                 controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed)) { openPanel(.speed) }
                 Spacer()
                 controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) }
-                if audioTracks.count > 1 {
+                if !audioTracks.isEmpty {   // parity with tvOS: open the Audio panel for ANY track, not only when >1
                     Spacer()
                     controlButton("waveform", "Audio") { openPanel(.audio) }
                 }
@@ -1054,6 +1162,17 @@ struct PlayerScreen: View {
         scheduleHide()
     }
 
+    /// The single, always-safe way to LEAVE the player. Cancels every in-flight recovery/hide task on
+    /// the main actor, flushes a final progress tick, then hands control back to the presenter to tear
+    /// the cover down — so a stuck load can never trap the user with a Task still spinning. Routed from
+    /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
+    @MainActor private func leavePlayback() {
+        hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
+        stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+        if !isLive, duration > 0 { onProgress(currentTime, duration) }
+        onClose()
+    }
+
     private func refreshTracks() {
         audioTracks = coordinator.player?.tracks(ofType: "audio") ?? []
         subtitleTracks = coordinator.player?.tracks(ofType: "sub") ?? []
@@ -1089,7 +1208,10 @@ struct PlayerScreen: View {
         controlsVisible = true
         hideTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled, !scrubbing, panel == nil, !isPaused else { return }
+            // Never auto-hide before the first frame arrives: a stuck pre-start load must KEEP its
+            // controls (and their close button) on screen so the player is never a trap. Also hold
+            // while scrubbing, a panel is open, or paused.
+            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
         }
     }
