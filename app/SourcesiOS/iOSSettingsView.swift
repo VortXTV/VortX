@@ -48,6 +48,12 @@ struct iOSSettingsView: View {
                 aboutSection
                 engineSection
             }
+            // Grouped form style renders proper inset section cards + headers and a centered column
+            // on macOS (the default macOS form style is the ugly full-width label-left layout). On the
+            // brand canvas instead of the system gray, so it reads like the rest of the app.
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(Theme.Palette.canvas.ignoresSafeArea())
             .navigationTitle("Settings")
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .platformFullScreenCover(item: $editingProfile) { profile in
