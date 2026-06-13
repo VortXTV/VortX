@@ -183,3 +183,46 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running the StremioX desktop app");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end proof that the embedded engine fetches real catalogs on desktop: init, dispatch the
+    /// same board-load the Apple app uses (Load CatalogsWithExtra + LoadRange), and poll until the
+    /// board state is populated from the default add-ons (Cinemeta). Hits the network, so it is
+    /// `#[ignore]`d in normal/CI runs. Run it with:
+    ///   cargo test --manifest-path desktop/src-tauri/Cargo.toml engine_fetches_real_board -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn engine_fetches_real_board() {
+        let dir = std::env::temp_dir()
+            .join("stremiox-engine-smoke")
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        init_engine(dir, |_json| {});
+
+        // Load every catalog of every installed add-on, then fetch the first 30 rows.
+        engine_dispatch(
+            r#"{"field":"board","action":{"action":"Load","args":{"model":"CatalogsWithExtra","args":{"type":null,"extra":[]}}}}"#.to_owned(),
+        );
+        engine_dispatch(
+            r#"{"field":"board","action":{"action":"CatalogsWithExtra","args":{"action":"LoadRange","args":{"start":0,"end":30}}}}"#.to_owned(),
+        );
+
+        let mut board = String::from("null");
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            board = engine_get_state(r#""board""#.to_owned());
+            if board.contains("\"poster\"") {
+                break;
+            }
+        }
+        println!("board state ({} bytes): {}", board.len(), &board[..board.len().min(800)]);
+        assert!(
+            board.contains("\"poster\""),
+            "board should populate with real catalog items (posters) from the default add-ons"
+        );
+    }
+}
