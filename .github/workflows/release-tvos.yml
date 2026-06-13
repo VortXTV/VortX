@@ -103,21 +103,16 @@ jobs:
           (cd out/full && zip -qry ../StremioX-tvOS-ci.ipa Payload)
           (cd out/lite && zip -qry ../StremioX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../StremioX-iOS-ci.ipa Payload)
-          # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it first
-          # (every nested binary gets a valid signature -> the kernel will run it). Then ship a
-          # drag-to-install .dmg (with an /Applications symlink) instead of a bare zip. We can't
-          # notarize without an Apple Developer ID, so a freshly downloaded build is still quarantined
-          # by the browser -- the release notes give the one-time un-quarantine step (right-click Open
-          # or `xattr -dr com.apple.quarantine`), the same friction as sideloading the IPAs.
-          MAC_APP="app/build/ci-mac/Build/Products/Release/StremioX.app"
+          # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
+          # (every nested binary gets a valid signature -> the kernel will run it), then zip the
+          # bundle as StremioXMac.app. Shipped as a zip so the documented run step (unzip ->
+          # xattr + codesign) works copy-paste. We can't notarize without an Apple Developer ID, so a
+          # downloaded build is still quarantined -- the release notes give the one-time fix.
+          MAC_APP="app/build/ci-mac/Build/Products/Release/StremioXMac.app"
           codesign --force --deep --sign - "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
-          STAGE="$RUNNER_TEMP/dmg/StremioX"
-          rm -rf "$RUNNER_TEMP/dmg" && mkdir -p "$STAGE"
-          cp -R "$MAC_APP" "$STAGE/"
-          ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "StremioX" -srcfolder "$STAGE" -ov -format UDZO out/StremioX-macOS-ci.dmg
-          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa out/StremioX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
+          ditto -c -k --keepParent "$MAC_APP" out/StremioX-macOS-ci.zip
+          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa out/StremioX-macOS-ci.zip | tee out/SHA256SUMS-ci.txt
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
@@ -128,7 +123,7 @@ jobs:
             out/StremioX-tvOS-ci.ipa
             out/StremioX-tvOS-lite-ci.ipa
             out/StremioX-iOS-ci.ipa
-            out/StremioX-macOS-ci.dmg
+            out/StremioX-macOS-ci.zip
             out/SHA256SUMS-ci.txt
 
       - name: Attach the CI builds to the release
@@ -140,12 +135,12 @@ jobs:
           mv out/StremioX-tvOS-ci.ipa "out/StremioX-tvOS-$TAG-ci.ipa"
           mv out/StremioX-tvOS-lite-ci.ipa "out/StremioX-tvOS-lite-$TAG-ci.ipa"
           mv out/StremioX-iOS-ci.ipa "out/StremioX-iOS-$TAG-ci.ipa"
-          mv out/StremioX-macOS-ci.dmg "out/StremioX-macOS-$TAG-ci.dmg"
-          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" "out/StremioX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
+          mv out/StremioX-macOS-ci.zip "out/StremioX-macOS-$TAG-ci.zip"
+          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" "out/StremioX-macOS-$TAG-ci.zip" > out/SHA256SUMS-ci.txt
           gh release upload "$TAG" \
             "out/StremioX-tvOS-$TAG-ci.ipa" \
             "out/StremioX-tvOS-lite-$TAG-ci.ipa" \
             "out/StremioX-iOS-$TAG-ci.ipa" \
-            "out/StremioX-macOS-$TAG-ci.dmg" \
+            "out/StremioX-macOS-$TAG-ci.zip" \
             out/SHA256SUMS-ci.txt \
             --clobber
