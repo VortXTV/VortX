@@ -86,6 +86,14 @@ struct FeaturedHeroView: View {
         .onChange(of: model.hero?.trailerYouTubeID) { _ in scheduleAutoplay() }
         // Honor a live Reduce Motion toggle: switching it on immediately drops the autoplay layer.
         .onChange(of: reduceMotion) { _ in scheduleAutoplay() }
+        // Pin the hero while a trailer is actually mounted, and release the moment it tears down.
+        // Keying off `autoplayYouTubeID` (the layer's real mount/unmount signal) keeps pause/resume
+        // perfectly balanced: a dwell that fails before ever mounting never sets this, so it never
+        // pauses; every teardown (item change, load fail, timeout, reduce-motion, disappear) routes
+        // through `cancelAutoplay` which nils it, firing the resume.
+        .onChange(of: autoplayYouTubeID) { id in
+            if id != nil { model.pauseRotation() } else { model.resumeRotation() }
+        }
         // Arm autoplay for the first settled hero once the view appears.
         .onAppear { scheduleAutoplay() }
         // Stop + remove the autoplay layer when the hero leaves the screen.
