@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -21,10 +20,31 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MetaItem
+
+/// Eyebrow kicker + section title, the shared header for every rail — the same two-line editorial
+/// header the tvOS `RailHeader` uses, so rows read with hierarchy, not a flat list of titles.
+@Composable
+fun RailHeader(title: String, eyebrow: String? = null, modifier: Modifier = Modifier) {
+    Column(modifier = modifier.padding(start = 16.dp, bottom = 10.dp)) {
+        if (eyebrow != null) {
+            Text(
+                text = eyebrow.uppercase(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+    }
+}
 
 /// A 2:3 poster. Until the engine supplies real poster URLs, each card renders a deterministic
 /// brand-tinted gradient derived from the item id, so a rail of cards reads as intentional and
@@ -60,16 +80,17 @@ fun PosterCard(item: MetaItem, onClick: () -> Unit, modifier: Modifier = Modifie
     }
 }
 
-/// A titled horizontal rail of posters, the core building block of Home and Discover.
+/// A titled horizontal rail of posters, the core building block of Home and Discover. [eyebrow] adds
+/// the editorial kicker over the title (e.g. "Pick up where you left off" on Continue Watching).
 @Composable
-fun PosterRail(catalog: Catalog, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun PosterRail(
+    catalog: Catalog,
+    onItem: (MetaItem) -> Unit,
+    eyebrow: String? = null,
+    modifier: Modifier = Modifier,
+) {
     Column(modifier = modifier) {
-        Text(
-            text = catalog.title,
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.padding(start = 16.dp, bottom = 10.dp),
-        )
+        RailHeader(title = catalog.title, eyebrow = eyebrow)
         LazyRow(contentPadding = PaddingValues(horizontal = 16.dp)) {
             items(catalog.items, key = { it.id }) { item ->
                 PosterCard(
@@ -80,6 +101,43 @@ fun PosterRail(catalog: Catalog, onItem: (MetaItem) -> Unit, modifier: Modifier 
             }
         }
     }
+}
+
+/// Skeleton rail shown while add-ons are still answering — calmer than a spinner, the same intent as
+/// the tvOS `LoadingRail`. Placeholder cards use the surface tone, not the brand gradient, so they
+/// read as "not yet loaded" rather than real content.
+@Composable
+fun LoadingRail(title: String = "Loading your library", modifier: Modifier = Modifier) {
+    Column(modifier = modifier) {
+        RailHeader(title = title)
+        LazyRow(contentPadding = PaddingValues(horizontal = 16.dp)) {
+            items(List(6) { it }) {
+                Box(
+                    modifier = Modifier
+                        .width(124.dp)
+                        .padding(end = 12.dp)
+                        .aspectRatio(2f / 3f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                )
+            }
+        }
+    }
+}
+
+/// A small capsule label, e.g. the add-on name or a "TORRENT" tag on a source row — mirrors the
+/// tvOS `badge`.
+@Composable
+fun Badge(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text = text.uppercase(),
+        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier
+            .clip(RoundedCornerShape(50))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+    )
 }
 
 /// Deterministic two-stop gradient from an id, biased toward the violet brand family so the whole

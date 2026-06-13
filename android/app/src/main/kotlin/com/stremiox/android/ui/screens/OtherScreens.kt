@@ -26,27 +26,29 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import com.stremiox.android.data.CatalogRepository
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaItem
+import com.stremiox.android.ui.UiState
+import com.stremiox.android.ui.components.EmptyState
+import com.stremiox.android.ui.components.ErrorState
+import com.stremiox.android.ui.components.LoadingRail
 import com.stremiox.android.ui.components.PosterCard
 import com.stremiox.android.ui.components.PosterRail
+import com.stremiox.android.ui.viewmodel.DiscoverViewModel
+import com.stremiox.android.ui.viewmodel.LibraryViewModel
+import com.stremiox.android.ui.viewmodel.SearchViewModel
 
 /// Discover: a type filter (Movie/Series/...) over add-on catalog rails for that type.
 @Composable
-fun DiscoverScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    var type by remember { mutableStateOf(MediaType.MOVIE) }
-    val catalogs by produceState(initialValue = emptyList<Catalog>(), type) {
-        value = repo.discover(type).getOrDefault(emptyList())
-    }
+fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+    val type by viewModel.type.collectAsStateWithLifecycle()
+    val state by viewModel.state.collectAsStateWithLifecycle()
+
     Column(modifier = modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -57,50 +59,69 @@ fun DiscoverScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier
             MediaType.entries.forEach { t ->
                 FilterChip(
                     selected = t == type,
-                    onClick = { type = t },
+                    onClick = { viewModel.selectType(t) },
                     label = { Text(t.label) },
                 )
             }
         }
-        LazyColumn(
-            contentPadding = PaddingValues(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(24.dp),
-        ) {
-            items(catalogs, key = { it.id }) { catalog -> PosterRail(catalog = catalog, onItem = onItem) }
+        when (val s = state) {
+            is UiState.Loading -> LazyColumn(
+                contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(24.dp),
+            ) { items(List(2) { it }) { LoadingRail() } }
+            is UiState.Error -> ErrorState(s.message)
+            is UiState.Success -> LazyColumn(
+                contentPadding = PaddingValues(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(24.dp),
+            ) {
+                items(s.data, key = { it.id }) { catalog: Catalog ->
+                    PosterRail(catalog = catalog, onItem = onItem)
+                }
+            }
         }
     }
 }
 
 /// Library: the user's saved titles in a poster grid.
 @Composable
-fun LibraryScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    val items by produceState(initialValue = emptyList<MetaItem>(), repo) {
-        value = repo.library().getOrDefault(emptyList())
+fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    when (val s = state) {
+        is UiState.Loading -> EmptyState("Loading your library…", modifier)
+        is UiState.Error -> ErrorState(s.message, modifier = modifier)
+        is UiState.Success -> PosterGrid(
+            items = s.data,
+            onItem = onItem,
+            modifier = modifier,
+            emptyHint = "Titles you save appear here.",
+        )
     }
-    PosterGrid(items = items, onItem = onItem, modifier = modifier, emptyHint = "Titles you save appear here.")
 }
 
 /// Search: a query field over a poster grid of matches across every installed add-on.
 @Composable
-fun SearchScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    var query by remember { mutableStateOf("") }
-    val results by produceState(initialValue = emptyList<MetaItem>(), query) {
-        value = repo.search(query).getOrDefault(emptyList())
-    }
+fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+    val query by viewModel.query.collectAsStateWithLifecycle()
+    val state by viewModel.state.collectAsStateWithLifecycle()
+
     Column(modifier = modifier.fillMaxSize()) {
         OutlinedTextField(
             value = query,
-            onValueChange = { query = it },
+            onValueChange = viewModel::onQueryChange,
             leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
             placeholder = { Text("Search movies, series, channels") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(16.dp),
         )
-        PosterGrid(
-            items = results,
-            onItem = onItem,
-            emptyHint = if (query.isBlank()) "Type to search across your add-ons." else "No matches.",
-        )
+        when (val s = state) {
+            is UiState.Loading -> EmptyState("Searching your add-ons…")
+            is UiState.Error -> ErrorState(s.message)
+            is UiState.Success -> PosterGrid(
+                items = s.data,
+                onItem = onItem,
+                emptyHint = if (query.isBlank()) "Type to search across your add-ons." else "No matches.",
+            )
+        }
     }
 }
 
@@ -133,9 +154,7 @@ private fun SettingRow(icon: ImageVector, title: String, value: String) {
 @Composable
 private fun PosterGrid(items: List<MetaItem>, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier, emptyHint: String) {
     if (items.isEmpty()) {
-        Column(modifier = modifier.fillMaxSize().padding(32.dp)) {
-            Text(emptyHint, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
+        EmptyState(emptyHint, modifier)
         return
     }
     LazyVerticalGrid(
