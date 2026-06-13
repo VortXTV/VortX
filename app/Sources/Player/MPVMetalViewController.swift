@@ -56,11 +56,18 @@ final class MPVMetalViewController: PlatformViewController {
         super.viewDidLoad()
         
         metalLayer.frame = view.bounds
-        metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.framebufferOnly = true
+        #if canImport(UIKit)
+        metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.backgroundColor = UIColor.black.cgColor
-        
         view.layer.addSublayer(metalLayer)
+        #elseif canImport(AppKit)
+        // NSView is not layer-backed by default and its `layer` is optional, so opt in first.
+        metalLayer.contentsScale = view.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        metalLayer.backgroundColor = NSColor.black.cgColor
+        view.wantsLayer = true
+        view.layer?.addSublayer(metalLayer)
+        #endif
 
         // iOS only: a tap toggles the touch controls. On tvOS this UIKit recognizer would swallow
         // the Siri-remote Select press before SwiftUI's player controls see it, so don't add it,         // the tvOS player drives everything through SwiftUI focus + command modifiers.
@@ -78,8 +85,21 @@ final class MPVMetalViewController: PlatformViewController {
     
     private var lastLaidOutSize: CGSize = .zero
 
+    #if canImport(UIKit)
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        layoutDrawable()
+    }
+    #elseif canImport(AppKit)
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        layoutDrawable()
+    }
+    #endif
+
+    /// Pin the Metal drawable to the current bounds on every layout (the platform layout callbacks
+    /// above forward here). Shared across UIKit and AppKit.
+    private func layoutDrawable() {
         let size = view.bounds.size
         guard size.width > 1, size.height > 1 else { return }
         let didResize = lastLaidOutSize != .zero && size != lastLaidOutSize
