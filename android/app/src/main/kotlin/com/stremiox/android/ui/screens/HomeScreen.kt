@@ -11,32 +11,41 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.stremiox.android.data.CatalogRepository
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MetaItem
+import com.stremiox.android.ui.UiState
+import com.stremiox.android.ui.components.ErrorState
+import com.stremiox.android.ui.components.LoadingRail
 import com.stremiox.android.ui.components.PosterRail
+import com.stremiox.android.ui.viewmodel.HomeViewModel
 
 /// Home: a featured hero (the first Continue Watching / Popular item) over the add-on catalog rails,
-/// the same composition the iOS and Apple TV apps lead with.
+/// the same composition the iOS and Apple TV apps lead with. Driven by [HomeViewModel] so loading
+/// and error are first-class states, not an empty screen.
 @Composable
-fun HomeScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    val catalogs by produceState(initialValue = emptyList<Catalog>(), repo) {
-        value = repo.home().getOrDefault(emptyList())
-    }
-    val hero = catalogs.firstOrNull()?.items?.firstOrNull()
+fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
 
+    when (val s = state) {
+        is UiState.Loading -> LoadingColumn(modifier)
+        is UiState.Error -> ErrorState(s.message, onRetry = viewModel::load, modifier = modifier)
+        is UiState.Success -> HomeContent(s.data, onItem, modifier)
+    }
+}
+
+@Composable
+private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
+    val hero = catalogs.firstOrNull()?.items?.firstOrNull()
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = 24.dp),
@@ -46,8 +55,21 @@ fun HomeScreen(repo: CatalogRepository, onItem: (MetaItem) -> Unit, modifier: Mo
             item { HeroHeader(hero) }
         }
         items(catalogs, key = { it.id }) { catalog ->
-            PosterRail(catalog = catalog, onItem = onItem)
+            // The leading Continue Watching rail carries the editorial kicker, like tvOS.
+            val eyebrow = if (catalog.id == "continue") "Pick up where you left off" else null
+            PosterRail(catalog = catalog, onItem = onItem, eyebrow = eyebrow)
         }
+    }
+}
+
+@Composable
+private fun LoadingColumn(modifier: Modifier) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(top = 24.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(24.dp),
+    ) {
+        items(List(3) { it }) { LoadingRail() }
     }
 }
 
