@@ -1,0 +1,21 @@
+{
+  "name": "stremiox-desktop",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "description": "StremioX desktop (Windows, Linux, macOS) on Tauri 2. Native shell over the shared stremio-core engine and libmpv, matching the iOS and Apple TV apps.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}

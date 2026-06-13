@@ -1,0 +1,26 @@
+[package]
+name = "stremiox-desktop"
+version = "0.3.0"
+description = "StremioX desktop shell (Tauri 2)"
+authors = ["StremioX"]
+edition = "2021"
+# Tauri 2's minimum; keeps us on stable, separate from the nightly core/ crate.
+rust-version = "1.77.2"
+
+[lib]
+# Tauri 2 splits the app into a lib (the app logic) plus a thin main.rs binary, so the same code can
+# host mobile targets later. The cdylib is what those mobile shells load.
+name = "stremiox_desktop_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Used by the default tauri-build setup; harmless when empty.
+custom-protocol = ["tauri/custom-protocol"]

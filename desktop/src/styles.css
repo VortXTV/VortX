@@ -1,0 +1,71 @@
+/* StremioX desktop shell. Dark by intent (a media app used in a dim room at night), neutrals
+   tinted toward the violet brand hue, one vivid accent. Matches the iOS/tvOS/Android palette so the
+   apps feel like one product. */
+:root {
+  --bg: #0e0b14;
+  --surface: #16121f;
+  --accent: #7b5bff;
+  --text: #ece9f2;
+  --muted: #9a93ad;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  margin: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  color: var(--text);
+  background:
+    radial-gradient(80% 60% at 50% 0%, #1c1530 0%, var(--bg) 60%),
+    var(--bg);
+  display: grid;
+  place-items: center;
+  -webkit-font-smoothing: antialiased;
+}
+
+.shell {
+  text-align: center;
+  padding: 2rem;
+  max-width: 38rem;
+}
+
+.wordmark {
+  font-size: clamp(3rem, 1.5rem + 5vw, 5.5rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.accent {
+  color: var(--accent);
+}
+
+.tagline {
+  margin-top: 1rem;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.status {
+  margin-top: 0.75rem;
+  font-size: 1rem;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.version {
+  margin-top: 2.5rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  opacity: 0.7;
+}
