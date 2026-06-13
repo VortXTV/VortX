@@ -10,6 +10,9 @@ struct UserProfile: Codable, Identifiable, Equatable {
     var avatar: String                 // an emoji
     var accentID: String = "ember"
     var oled: Bool = false
+    /// App UI text scale (0.80 to 1.40). Per-profile appearance, mirrored into ThemeManager on
+    /// switch alongside accent/oled, so a Kids profile can run big text without changing an adult's.
+    var textScale: Double = 1.0
     var pin: String? = nil             // 4-digit parental gate, nil = open
     var usesOwnAccount: Bool = false   // true = its own Stremio session in its own Keychain slot
     var email: String? = nil           // bound account email, display only
@@ -33,6 +36,10 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var subColor: String
         var subBackground: String
         var subSizeScale: Double? = nil   // optional so older rosters decode
+        /// Stream source-ranking taste (Debrid-first vs Torrent-first, trust add-on order vs app
+        /// order). Optional so older rosters decode; nil means "leave the flat keys as they are".
+        var sourceTypeOrder: [String]? = nil   // raw SourceType values, top priority first
+        var useAddonOrder: Bool? = nil
     }
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
@@ -64,6 +71,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
         avatar = try c.decodeIfPresent(String.self, forKey: .avatar) ?? "🍿"
         accentID = try c.decodeIfPresent(String.self, forKey: .accentID) ?? "ember"
         oled = try c.decodeIfPresent(Bool.self, forKey: .oled) ?? false
+        textScale = try c.decodeIfPresent(Double.self, forKey: .textScale) ?? 1.0
         pin = try c.decodeIfPresent(String.self, forKey: .pin)
         usesOwnAccount = try c.decodeIfPresent(Bool.self, forKey: .usesOwnAccount) ?? false
         email = try c.decodeIfPresent(String.self, forKey: .email)
@@ -72,10 +80,10 @@ struct UserProfile: Codable, Identifiable, Equatable {
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
-         oled: Bool = false, pin: String? = nil, usesOwnAccount: Bool = false,
+         oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
          email: String? = nil, isOwner: Bool = false, playback: PlaybackPrefs? = nil) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
-        self.oled = oled; self.pin = pin; self.usesOwnAccount = usesOwnAccount
+        self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.playback = playback
     }
 }
@@ -122,10 +130,7 @@ final class ProfileStore: ObservableObject {
             activeID = profiles.first?.id
         }
         // The active profile owns the theme; resync in case the stored values drifted.
-        if let active {
-            ThemeManager.shared.accentID = active.accentID
-            ThemeManager.shared.oled = active.oled
-        }
+        if let active { applyTheme(active) }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
         // copying it into every profile preserves today's behavior exactly; from then on each
         // profile diverges as its viewer customizes.
@@ -170,9 +175,9 @@ final class ProfileStore: ObservableObject {
         activeID = profile.id
         pickedThisLaunch = true
         persist(touch: false)   // selection is per-device, not a roster edit
-        ThemeManager.shared.accentID = profile.accentID
-        ThemeManager.shared.oled = profile.oled
+        applyTheme(profile)
         applyPlayback(profile)
+        SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on a switch
         loadWatchCache()
         refreshWatchFromServer()
         let nowAccount = keychainAccount(for: profile)
@@ -191,8 +196,7 @@ final class ProfileStore: ObservableObject {
         profiles[index] = profile
         persist()
         if profile.id == activeID {
-            ThemeManager.shared.accentID = profile.accentID
-            ThemeManager.shared.oled = profile.oled
+            applyTheme(profile)
             applyPlayback(profile)
         }
     }
@@ -210,13 +214,26 @@ final class ProfileStore: ObservableObject {
         return nil
     }
 
+    /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
+    /// The single place every switch/update/sync site goes through, so adding a per-profile
+    /// appearance field only touches here and captureTheme().
+    private func applyTheme(_ profile: UserProfile) {
+        let tm = ThemeManager.shared
+        tm.accentID = profile.accentID
+        tm.oled = profile.oled
+        tm.textScale = min(max(profile.textScale, ThemeManager.textScaleRange.lowerBound),
+                           ThemeManager.textScaleRange.upperBound)
+    }
+
     /// The Settings appearance controls write to ThemeManager; mirror the result into the active
     /// profile so it survives a switch and a relaunch.
     func captureTheme() {
         guard var profile = active else { return }
-        guard profile.accentID != ThemeManager.shared.accentID || profile.oled != ThemeManager.shared.oled else { return }
-        profile.accentID = ThemeManager.shared.accentID
-        profile.oled = ThemeManager.shared.oled
+        let tm = ThemeManager.shared
+        guard profile.accentID != tm.accentID || profile.oled != tm.oled || profile.textScale != tm.textScale else { return }
+        profile.accentID = tm.accentID
+        profile.oled = tm.oled
+        profile.textScale = tm.textScale
         update(profile)
     }
 
@@ -234,7 +251,9 @@ final class ProfileStore: ObservableObject {
             subSize: d.string(forKey: SubtitleStyle.Key.size) ?? SubtitleStyle.defaultSize,
             subColor: d.string(forKey: SubtitleStyle.Key.color) ?? SubtitleStyle.defaultColor,
             subBackground: d.string(forKey: SubtitleStyle.Key.background) ?? SubtitleStyle.defaultBackground,
-            subSizeScale: d.object(forKey: SubtitleStyle.Key.sizeScale) as? Double ?? 1.0)
+            subSizeScale: d.object(forKey: SubtitleStyle.Key.sizeScale) as? Double ?? 1.0,
+            sourceTypeOrder: SourcePreferences.shared.typeOrder.map(\.rawValue),
+            useAddonOrder: SourcePreferences.shared.useAddonOrder)
     }
 
     /// Write `profile`'s playback preferences into the flat UserDefaults keys that
@@ -251,15 +270,28 @@ final class ProfileStore: ObservableObject {
             d.set(p.subColor, forKey: SubtitleStyle.Key.color)
             d.set(p.subBackground, forKey: SubtitleStyle.Key.background)
             d.set(p.subSizeScale ?? 1.0, forKey: SubtitleStyle.Key.sizeScale)
+            // Source-ranking taste (older rosters have nil here, so leave the flat keys untouched).
+            if let order = p.sourceTypeOrder {
+                d.set(order.joined(separator: ","), forKey: "stremiox.streaming.sourceTypeOrder")
+            }
+            if let addon = p.useAddonOrder {
+                d.set(addon, forKey: "stremiox.streaming.useAddonOrder")
+            }
         } else {
             for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
                         TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,
-                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale] {
+                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale,
+                        "stremiox.streaming.sourceTypeOrder", "stremiox.streaming.useAddonOrder"] {
                 d.removeObject(forKey: key)
             }
         }
-        // Stream scores embed the preferred audio language (the language demotion), so a profile
-        // switch that changes it must drop the memoized scores.
+        // Stream scores embed the preferred audio language (the language demotion) and source-type
+        // tier weights, so any flat-key change here must drop the memoized scores. NOTE: the
+        // SourcePreferences singleton is re-synced (reload()) only on an actual profile SWITCH
+        // (select / adoptRemoteRoster), NOT here. applyPlayback also runs from the capture path
+        // (capturePlayback -> update -> applyPlayback), where SourcePreferences is already the
+        // source of truth; reloading there would re-fire its @Published didSet and the
+        // SettingsView .onChange(typeOrder) observer, echoing back into capturePlayback.
         StreamRanking.invalidateCaches()
     }
 
@@ -285,6 +317,7 @@ final class ProfileStore: ObservableObject {
         let first = UserProfile(name: name, avatar: "🍿",
                                 accentID: ThemeManager.shared.accentID,
                                 oled: ThemeManager.shared.oled,
+                                textScale: ThemeManager.shared.textScale,
                                 usesOwnAccount: false, email: email, isOwner: true)
         profiles = [first]
         activeID = first.id
@@ -382,9 +415,9 @@ final class ProfileStore: ObservableObject {
         normalizeOwner()
         if !profiles.contains(where: { $0.id == activeID }) { activeID = profiles.first?.id }
         if let active {
-            ThemeManager.shared.accentID = active.accentID
-            ThemeManager.shared.oled = active.oled
+            applyTheme(active)
             applyPlayback(active)
+            SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on adopt
         }
         persist(touch: false)
         loadWatchCache()

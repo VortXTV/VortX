@@ -53,11 +53,27 @@ final class SourcePreferences: ObservableObject {
     }
 
     private init() {
-        let saved   = UserDefaults.standard.string(forKey: Self.orderKey) ?? ""
-        var order   = saved.split(separator: ",").compactMap { SourceType(rawValue: String($0)) }
-        for t in SourceType.allCases where !order.contains(t) { order.append(t) }
-        typeOrder     = order
+        typeOrder     = Self.readOrder()
         useAddonOrder = UserDefaults.standard.bool(forKey: Self.addonOrderKey)
+    }
+
+    private static func readOrder() -> [SourceType] {
+        let saved = UserDefaults.standard.string(forKey: orderKey) ?? ""
+        var order = saved.split(separator: ",").compactMap { SourceType(rawValue: String($0)) }
+        for t in SourceType.allCases where !order.contains(t) { order.append(t) }
+        return order
+    }
+
+    /// Re-read both keys from UserDefaults into the published props. The singleton reads them only
+    /// at init, so a profile switch (which rewrites the flat keys) must call this to take effect
+    /// live. The didSet observers re-persist the same values (a no-op write) and invalidate the
+    /// ranking cache, which is exactly what a source-preference change needs. Call on the main
+    /// thread (same contract as the rest of the profile/theme switch path).
+    func reload() {
+        let order = Self.readOrder()
+        if typeOrder != order { typeOrder = order }
+        let addon = UserDefaults.standard.bool(forKey: Self.addonOrderKey)
+        if useAddonOrder != addon { useAddonOrder = addon }
     }
 
     /// Dominant-tier score added to a stream so its source type is the primary sort key.

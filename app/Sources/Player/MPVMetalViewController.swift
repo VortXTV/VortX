@@ -122,11 +122,19 @@ final class MPVMetalViewController: UIViewController {
     /// hardware has sound in other players). A video player must claim `.playback`; `.moviePlayback`
     /// mode also lets multichannel PCM (decoded TrueHD / DTS-HD / Atmos) reach the receiver. Set
     /// before mpv's audio output is created.
+    /// Output channels the active audio route can take. Read after the session is active so the
+    /// mpv channel-layout policy can be chosen: a stereo endpoint must get a DOWNMIX or a
+    /// multichannel (5.1/Atmos) stream renders into a 2-channel sink as SILENCE (the "UI sounds
+    /// play but the movie is silent" report). A real receiver advertising >2 still gets native
+    /// multichannel PCM, preserving the 0.2.43 eARC fix.
+    private var outputChannels = 2
+
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .moviePlayback, options: [])
             try session.setActive(true)
+            outputChannels = max(session.maximumOutputNumberOfChannels, 2)
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -227,7 +235,23 @@ final class MPVMetalViewController: UIViewController {
 //        checkError(mpv_set_option_string(mpv, "tone-mapping-visualize", "yes"))  // only for debugging purposes
 //        checkError(mpv_set_option_string(mpv, "profile", "fast"))   // can fix frame drop in poor device when play 4k
 
-        
+        // Audio channel policy. A 5.1/EAC3/Atmos stream rendered into a 2-channel sink with no
+        // downmix is SILENT (the "movie has no sound but the app's own UI sounds play, and the
+        // same stream has audio in official Stremio" report). UI sounds are already stereo, so
+        // they survive; a multichannel movie does not. mpv's default `auto-safe` negotiates a
+        // layout against what the route reports, which on built-in / ARC / stereo-soundbar paths
+        // can advertise multichannel yet deliver nothing. So: gate on the route's real output
+        // channel count (captured in configureAudioSession after the session went active). A true
+        // receiver advertising >2 keeps native multichannel PCM, preserving the 0.2.43 eARC fix;
+        // anything <=2 is forced to a stereo DOWNMIX so the endpoint always gets sound.
+        let channelPolicy = outputChannels > 2 ? "auto-safe" : "stereo"
+        checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
+        // Never let an AO-open failure fall through to the null AO: that is silent death with no
+        // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
+        // the next silent-audio report is actually diagnosable instead of a guess.
+        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
+        mpvLog.log("audio-channels = \(channelPolicy, privacy: .public) (route reports \(self.outputChannels) ch)")
+
         checkError(mpv_initialize(mpv))
         
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsSigPeak, MPV_FORMAT_DOUBLE)
@@ -252,18 +276,49 @@ final class MPVMetalViewController: UIViewController {
     public func setupNotification() {
         NotificationCenter.default.addObserver(self, selector: #selector(enterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        // The output route can change AFTER the channel policy was chosen: a receiver powers on,
+        // an eARC handshake finishes, the user swaps to a different output. mpv's AO stays
+        // negotiated against the old route, which can strand audio on a layout the new endpoint
+        // can't play. Re-evaluate the channel count and reapply the policy on any route change.
+        NotificationCenter.default.addObserver(self, selector: #selector(audioRouteChanged), name: AVAudioSession.routeChangeNotification, object: nil)
     }
-    
+
     @objc public func enterBackground() {
         // fix black screen issue when app enter foreground again
         pause()
         checkError(mpv_set_option_string(mpv, "vid", "no"))
     }
-    
+
     @objc public func enterForeground() {
+        // Reclaim the session in case another app deactivated it while we were backgrounded,
+        // then re-evaluate the audio route (it may have changed off-screen).
+        do { try AVAudioSession.sharedInstance().setActive(true) } catch {
+            mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
+        }
+        applyChannelPolicy()
         checkError(mpv_set_option_string(mpv, "vid", "auto"))
         applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         play()
+    }
+
+    /// Re-read the active route's output channel count and reapply mpv's downmix policy. Safe to
+    /// call mid-playback: setting `audio-channels` as a PROPERTY (not an option) reinitializes the
+    /// AO against the new layout. `mpv_set_option_string` is only valid before `mpv_initialize`;
+    /// after init the same name must go through `mpv_set_property_string` (the setString helper) or
+    /// it is a silent no-op, which is why the route-change/foreground reapply has to use setString.
+    private func applyChannelPolicy() {
+        guard mpv != nil else { return }
+        outputChannels = max(AVAudioSession.sharedInstance().maximumOutputNumberOfChannels, 2)
+        let channelPolicy = outputChannels > 2 ? "auto-safe" : "stereo"
+        setString("audio-channels", channelPolicy)
+        mpvLog.log("audio-channels reapplied = \(channelPolicy, privacy: .public) (route reports \(self.outputChannels) ch)")
+    }
+
+    @objc private func audioRouteChanged(_ note: Notification) {
+        // Hop to the main actor: the notification can arrive on an arbitrary thread and we touch
+        // the mpv handle. (mpv option-set is thread-safe, but keep the AVAudioSession read + log
+        // ordering deterministic.)
+        DispatchQueue.main.async { [weak self] in self?.applyChannelPolicy() }
     }
 
     /// Tear mpv down safely when the player closes. Clearing the wakeup callback first

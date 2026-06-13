@@ -56,6 +56,10 @@ struct SettingsView: View {
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subColor) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subBackground) { ProfileStore.shared.capturePlayback() }
+        // Source-ranking taste is per-profile too: the toggle and the up/down reorder mutate
+        // SourcePreferences.shared, so fold those into the active profile the same way.
+        .onChange(of: sourcePrefs.useAddonOrder) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: sourcePrefs.typeOrder) { ProfileStore.shared.capturePlayback() }
         .task {
             // Live server monitor that NEVER gives up. The embedded server cold-starts well after
             // launch on a real Apple TV (node boots while the engine and sync are also busy), and

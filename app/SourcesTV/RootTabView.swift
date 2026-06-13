@@ -141,6 +141,7 @@ struct RootTabView: View {
         // The active profile owns the theme: mirror Settings changes into it so they survive a switch.
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.oled) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
+        .onChange(of: theme.textScale) { ProfileStore.shared.captureTheme() }
     }
 
     /// The focused / selected tab pill is system white by default; recolor it to the active accent
