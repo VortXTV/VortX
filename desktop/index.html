@@ -7,16 +7,12 @@
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="wordmark">
-        <span class="mark">Stremio</span><span class="mark accent">X</span>
+    <main class="app">
+      <header class="topbar">
+        <span class="wordmark"><span>Stremio</span><span class="accent">X</span></span>
+        <span class="status" id="status">Loading your catalogs…</span>
       </header>
-      <p class="tagline">Desktop for Windows, Linux, and macOS.</p>
-      <p class="status">
-        Native Tauri shell. The shared stremio-core engine and the libmpv player,
-        the same as the iOS and Apple TV apps, land next.
-      </p>
-      <footer class="version" id="version"></footer>
+      <div class="content" id="content"></div>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>
