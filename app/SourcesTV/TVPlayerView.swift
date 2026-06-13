@@ -283,7 +283,16 @@ struct TVPlayerView: View {
             if !isCurrentLiveStream {
                 core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
             }
-            if let hash = currentTorrentHash { closeTorrent(hash: hash) }   // free the engine when the player closes
+            // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
+            // path that mints a fresh PlaybackRequest id rebuilds the player → onDisappear → would
+            // destroy an engine that's about to be reused. (In-player source picks go through switchStream
+            // in place and never rebuild, but tearing the engine down on every disappear is still wrong.)
+            // Teardown happens only on genuine exits (see leavePlayback()), which onClose routes through.
+            // App-backgrounding is deliberately NOT a teardown trigger: tvOS suspends the app AND the
+            // embedded server together, the same player stays mounted, and returning to .active resumes
+            // on the same engine — closing it on .background would kill background-resume without
+            // preventing any leak (an app the system kills while suspended takes the server, and every
+            // engine with it, down too). In-session leaks are covered by the switch / advance / exit paths.
             UIApplication.shared.isIdleTimerDisabled = false   // let the screensaver resume once the player closes
         }
     }
@@ -297,7 +306,7 @@ struct TVPlayerView: View {
         }
         if loadFailed {
             switch type {
-            case .menu: saveProgress(at: currentTime); onClose()
+            case .menu: saveProgress(at: currentTime); leavePlayback()
             case .select:
                 if !core.streamGroups().isEmpty {     // jump straight to another source
                     withAnimation { loadFailed = false }
@@ -325,7 +334,7 @@ struct TVPlayerView: View {
         }
         if controlsHidden {
             switch type {
-            case .menu: saveProgress(at: currentTime); onClose()
+            case .menu: saveProgress(at: currentTime); leavePlayback()
             case .playPause: toggle()
             case .select:
                 if let seg = currentSkip { skipTo(seg) } else { showControls() }   // pill up → skip, else reveal
@@ -337,7 +346,7 @@ struct TVPlayerView: View {
         // left/right seeks on the scrubber or moves within the button row.
         switch type {
         case .menu:
-            if scrubbing { cancelScrub() } else { saveProgress(at: currentTime); onClose() }
+            if scrubbing { cancelScrub() } else { saveProgress(at: currentTime); leavePlayback() }
         case .playPause: toggle()
         case .select: activate(selected)
         case .leftArrow: horizontal(-1)
@@ -407,7 +416,7 @@ struct TVPlayerView: View {
 
     private func activate(_ c: Control) {
         switch c {
-        case .close:   saveProgress(at: currentTime); onClose()
+        case .close:   saveProgress(at: currentTime); leavePlayback()
         case .scrub:   scrubbing ? commitScrub() : toggle()
         case .restart: restart()
         case .back:    seek(-10)
@@ -1468,7 +1477,7 @@ struct TVPlayerView: View {
         // finished title lingers at its end position forever.
         saveProgress(at: currentTime)
         if let m = curMeta { core.finishedWatching(libraryId: m.libraryId) }
-        onClose()
+        leavePlayback()   // terminal: free the engine, then dismiss
     }
 
     /// Switch to another episode in place: flush progress, resolve a stream through the ENGINE (same path
@@ -1477,7 +1486,20 @@ struct TVPlayerView: View {
     private func play(episode v: CoreVideo) {
         guard let m = curMeta else { return }
         saveProgress(at: currentTime)
-        if let oldHash = currentTorrentHash { closeTorrent(hash: oldHash) }   // release the finished episode's engine
+        // Snapshot the engine we're leaving so a DIFFERENT-hash next source can free it — but only
+        // ONCE the real next hash is known, never speculatively here. Destroying a SAME-hash engine
+        // is the harmful case (a season-pack torrent shares one infoHash across every episode, just a
+        // different file index; recreate is a harmless no-op since the server is first-create-wins, but
+        // destroy-then-recreate leaves warm-up seeing 0 peers / 0 bytes). So the close moves to wherever
+        // the next stream is resolved:
+        //   • PRELOAD path: the next stream is known synchronously below → close right there if its hash
+        //     differs. A same-hash preload (manual ep switch on a season pack) keeps the live engine.
+        //   • ENGINE-resolved FALLBACK (manual nav with no preload — episodes panel, Prev, an early Next):
+        //     the hash isn't known until the async resolve, so we do NOT pre-close; the fallback closes
+        //     the old engine after it resolves a different-hash stream, mirroring switchStream's guard.
+        // A genuinely different-hash old engine is still always freed (the resolved-stream close below,
+        // or leavePlayback() on a real exit), so nothing piles up.
+        let leavingHash = currentTorrentHash
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
@@ -1502,6 +1524,10 @@ struct TVPlayerView: View {
             torrentWarmupsUsed = 0; torrentStatus = nil
             stallRecoveries = 0
             plog.info("episode switch: playing preloaded best source")
+            // Now the real next hash is known: free the engine we're leaving only if it's a DIFFERENT
+            // torrent. A same-hash preload (season pack) keeps the live engine — recreate would be a
+            // no-op but destroy-then-recreate cold-starts it (0 peers). Mirrors switchStream's guard.
+            if let oldHash = leavingHash, oldHash != pre.stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
             prepareTorrent(pre.stream)
             curURL = u
             // @MainActor: the synchronous CoreBridge calls below (loadMeta / streamGroups ->
@@ -1545,6 +1571,11 @@ struct TVPlayerView: View {
                     curBinge = s.behaviorHints?.bingeGroup
                     curHint = StreamRanking.signature(s)
                     curHeaders = s.requestHeaders
+                    // The real next hash is finally known: free the engine we left only if this is a
+                    // DIFFERENT torrent. On a season pack (same infoHash, different fileIdx — the common
+                    // manual-nav case: episodes panel, Prev, an early Next) this leaves the live engine
+                    // untouched instead of cold-recreating it. Mirrors switchStream's different-hash guard.
+                    if let oldHash = leavingHash, oldHash != s.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
                     core.loadEnginePlayer(for: s)
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
@@ -1660,6 +1691,16 @@ struct TVPlayerView: View {
         guard h.count == 40, let url = URL(string: "\(StremioServer.base)/\(h)/remove") else { return }
         DiagnosticsLog.log("torrent", "remove engine \(h.prefix(8))")
         URLSession.shared.dataTask(with: url).resume()
+    }
+
+    /// The single "user really left playback" exit. Destroys the live torrent engine (no-op for
+    /// direct/debrid) right before dismissing, so the engine is freed on a GENUINE exit but never on
+    /// a SwiftUI `.id(req.id)` rebuild — onDisappear no longer tears it down (see Fix B). Every real
+    /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
+    /// engine is leaked.
+    private func leavePlayback() {
+        if let hash = currentTorrentHash { closeTorrent(hash: hash) }
+        onClose()
     }
 
     /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream.
