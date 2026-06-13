@@ -152,6 +152,10 @@ enum NodeServer {
                 NSLog("StremioX: server.js not found in bundle, streaming server disabled")
                 return
             }
+            // A prior run that was force-killed / crashed before `stop()` could fire may have left a
+            // node child reparented to launchd, still holding 11470. Clear that stale orphan before we
+            // spawn, so this launch gets a free port instead of a server that can't bind.
+            reclaimStalePort()
             started = true
             spawn(nodeBin: nodeBin, scriptPath: serverJs)
         }
@@ -227,6 +231,64 @@ enum NodeServer {
         (serverHome as NSString).appendingPathComponent("stremio-server.log")
     }
 
+    // MARK: - Stale-port reclaim
+
+    /// Reclaim port 11470 if a STALE copy of OUR OWN node server is still holding it — e.g. a prior
+    /// run that was force-killed / crashed before `stop()` could fire, leaving the child reparented to
+    /// launchd (PPID 1). The preload's parent-death watchdog stops new orphans from forming; this
+    /// clears any that predate it (or slipped through its ~1s poll window). We match "ours" narrowly —
+    /// a process whose argv references the `stremiox-preload.js` we inject, a marker nothing else uses
+    /// — so an unrelated process that merely happens to hold the port is left untouched (we log it and
+    /// let server.js fail to bind, surfacing the exit in Settings, rather than killing a stranger).
+    /// SIGTERM first, escalate to SIGKILL, mirroring `stop()`. Cheap on the common path: a free port
+    /// costs one `lsof` that returns nothing.
+    private static func reclaimStalePort() {
+        for pid in listeners(onPort: 11470) where isOurNodeServer(pid) {
+            NSLog("StremioX: reclaiming port 11470 from a stale node server (pid \(pid))")
+            kill(pid, SIGTERM)
+            let deadline = Date().addingTimeInterval(terminateGrace)
+            while pidIsAlive(pid) && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+            if pidIsAlive(pid) { kill(pid, SIGKILL) }
+        }
+    }
+
+    /// PIDs holding a LISTEN socket on `port` (via `lsof`); empty when the port is free. Any failure to
+    /// run or parse `lsof` yields no PIDs, so we simply skip reclaiming.
+    private static func listeners(onPort port: Int) -> [pid_t] {
+        let out = runTool("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]) ?? ""
+        return out.split(whereSeparator: \.isNewline)
+            .compactMap { pid_t(String($0).trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// True if `pid` is one of our embedded node servers, identified by the `stremiox-preload.js`
+    /// marker in its argv (read via `ps -o command=`).
+    private static func isOurNodeServer(_ pid: pid_t) -> Bool {
+        (runTool("/bin/ps", ["-o", "command=", "-p", String(pid)]) ?? "").contains("stremiox-preload.js")
+    }
+
+    /// `kill(pid, 0)` probes for existence without delivering a signal: success ⇒ the process is alive.
+    private static func pidIsAlive(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 }
+
+    /// Run a short helper tool to completion and return its stdout (nil on launch failure). Used only
+    /// for the small, bounded `lsof`/`ps` probes above — output is tiny, so reading then waiting can't
+    /// deadlock on a full pipe.
+    private static func runTool(_ launchPath: String, _ args: [String]) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launchPath)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return String(data: data, encoding: .utf8)
+    }
+
     private static func spawn(nodeBin: String, scriptPath: String) {
         let home = serverHome
         let serverData = (home as NSString).appendingPathComponent("stremio-server")
@@ -242,6 +304,12 @@ enum NodeServer {
         // pinned to 127.0.0.1 (loopback only, the original private behaviour). When sharing is
         // ON we leave Node's default, so the Mac serves the whole LAN. The server still computes
         // its own enginefs.baseUrl from ip.address(), which we surface in Settings as the LAN URL.
+        //
+        // Third, it installs a parent-death watchdog. `applicationWillTerminate` -> stop() only fires
+        // on a CLEAN quit; on a crash / Force Quit / SIGKILL the app dies without it, and Foundation
+        // does NOT signal this child, so it gets reparented to launchd and keeps holding 11470 forever
+        // (the orphaned-:11470 leak). The watchdog records our parent pid and exits the child the
+        // moment it changes — i.e. once we've been reparented — releasing the port within ~1s.
         let bindHost = sharedOnLAN ? "0.0.0.0" : "127.0.0.1"
         let preloadPath = (home as NSString).appendingPathComponent("stremiox-preload.js")
         let preload = """
@@ -263,6 +331,12 @@ enum NodeServer {
           };
           w('[boot]',['mac preload active; bind='+HOST]);
         }catch(e){w('[bind-err]',[e&&e.stack||e]);}
+        // parent-death watchdog (see the Swift note above): if the app dies WITHOUT calling stop()
+        // (crash / Force Quit / SIGKILL), Foundation reparents us to launchd and we'd keep holding
+        // 11470. Exit once our parent pid changes so the orphaned port is always released. .unref()
+        // keeps this poll timer from holding the process open on its own.
+        const PPID0=process.ppid;
+        setInterval(function(){if(process.ppid!==PPID0){w('[watchdog]',['parent gone; exiting']);process.exit(0);}},1000).unref();
         """
         try? preload.write(toFile: preloadPath, atomically: true, encoding: .utf8)
 

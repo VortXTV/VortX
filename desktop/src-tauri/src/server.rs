@@ -168,10 +168,14 @@ fn ffmpeg_binaries() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
-/// The preload JS injected with `node -r`. It (a) tees uncaught errors to a log file and (b) pins
-/// every host-less `server.listen(port)` to loopback (127.0.0.1). server.js listens with no host,
-/// which Node treats as 0.0.0.0 (every interface) — i.e. LAN-reachable; the desktop app wants it
-/// private, so we monkeypatch `net.Server.prototype.listen` exactly like MacNodeServer's preload.
+/// The preload JS injected with `node -r`. It (a) tees uncaught errors to a log file, (b) pins every
+/// host-less `server.listen(port)` to loopback (127.0.0.1), and (c) installs a parent-death watchdog
+/// that exits the child once its parent pid changes — i.e. once it has been reparented. `stop()` only
+/// kills the child on a GRACEFUL app exit; on a crash / SIGKILL / Force-Quit the Tauri exit hook never
+/// runs and the OS reparents the child (to launchd/init), where it would keep holding the port as an
+/// orphan. The watchdog closes that gap (ported from MacNodeServer.swift's preload). server.js listens
+/// with no host, which Node treats as 0.0.0.0 (every interface) — i.e. LAN-reachable; the desktop app
+/// wants it private, so we monkeypatch `net.Server.prototype.listen` exactly like MacNodeServer.
 fn write_preload(home: &Path) -> std::io::Result<PathBuf> {
     let preload_path = home.join("stremiox-preload.js");
     let log_path = home.join("stremio-server.log");
@@ -194,6 +198,11 @@ try{{
   }};
   w('[boot]',['desktop preload active; bind='+HOST]);
 }}catch(e){{w('[bind-err]',[e&&e.stack||e]);}}
+// parent-death watchdog (see fn doc): exit once our parent pid changes (we've been reparented) so a
+// crash / SIGKILL of the app can't leave us orphaned on the port. .unref() keeps this poll timer from
+// holding the process open by itself.
+const PPID0=process.ppid;
+setInterval(function(){{if(process.ppid!==PPID0){{w('[watchdog]',['parent gone; exiting']);process.exit(0);}}}},1000).unref();
 "#,
         log = log_js,
         host = host_js,
@@ -245,6 +254,83 @@ fn spawn_child(node_bin: &Path, server_js: &Path, home: &Path) -> std::io::Resul
     cmd.spawn()
 }
 
+/// Before the first spawn, reclaim the port if a STALE copy of OUR OWN node server is still holding it
+/// — e.g. a prior run force-killed / crashed before `stop()` could fire, leaving the child reparented
+/// (to launchd/init) and still bound. The preload's parent-death watchdog stops new orphans from
+/// forming; this clears any that predate it (or slipped through its ~1s poll window). We match "ours"
+/// narrowly — a process whose argv references the `stremiox-preload.js` we inject, a marker nothing
+/// else uses — so an unrelated process that merely happens to hold the port is left alone (server.cjs
+/// then fails to bind and the monitor surfaces it, rather than us killing a stranger). SIGTERM first,
+/// escalate to SIGKILL, mirroring `kill_child`. Best-effort: a missing/failing tool just skips the
+/// reclaim. Unix-only (lsof/ps/kill); a no-op elsewhere.
+#[cfg(unix)]
+fn reclaim_stale_port() {
+    for pid in port_listeners(PORT) {
+        if !is_our_node_server(&pid) {
+            continue;
+        }
+        eprintln!("stremiox: reclaiming port {PORT} from a stale node server (pid {pid})");
+        let _ = Command::new("kill").arg(&pid).status(); // SIGTERM — ask it to exit cleanly
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_alive(&pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if pid_alive(&pid) {
+            let _ = Command::new("kill").args(["-9", &pid]).status(); // SIGKILL — guarantee release
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn reclaim_stale_port() {}
+
+/// PIDs holding a LISTEN socket on `port` (via `lsof -t`); empty when the port is free or `lsof` is
+/// unavailable. Kept as strings since we only ever feed them back to `ps`/`kill`.
+#[cfg(unix)]
+fn port_listeners(port: u16) -> Vec<String> {
+    run_tool("lsof", &["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .map(|out| {
+            out.lines()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True if `pid`'s argv references our injected `stremiox-preload.js` — the marker that identifies one
+/// of our embedded node servers (read via `ps -o command=`).
+#[cfg(unix)]
+fn is_our_node_server(pid: &str) -> bool {
+    run_tool("ps", &["-o", "command=", "-p", pid])
+        .map(|cmd| cmd.contains("stremiox-preload.js"))
+        .unwrap_or(false)
+}
+
+/// `kill -0` probes for existence without delivering a signal: success ⇒ the process is alive.
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Run a short helper tool and capture its stdout (None if it can't be launched). Used only for the
+/// tiny, bounded `lsof`/`ps` probes above.
+#[cfg(unix)]
+fn run_tool(bin: &str, args: &[&str]) -> Option<String> {
+    Command::new(bin)
+        .args(args)
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
 /// Start the embedded server once. Idempotent: a second call while running is a no-op. `resource_dir`
 /// is the bundled resources directory (node binary + server.js live directly under it); `cache_dir`
 /// is a writable per-user dir the server uses as HOME (its torrent cache + settings). Called from the
@@ -286,6 +372,11 @@ pub fn start(resource_dir: &Path, cache_dir: &Path) {
         });
         return;
     }
+
+    // A prior run that was force-killed / crashed before `stop()` could fire may have left a node child
+    // reparented and still holding the port. Clear that stale orphan (only if it's ours) before we
+    // spawn, so this launch can bind instead of failing. The preload watchdog prevents new orphans.
+    reclaim_stale_port();
 
     match spawn_child(&node_bin, &server_js, &home) {
         Ok(child) => {
@@ -677,6 +768,37 @@ mod tests {
         assert!(
             shutdown.load(Ordering::SeqCst),
             "stop() must set the shutdown flag so the monitor does not restart the killed child"
+        );
+    }
+
+    /// The injected preload must carry the parent-death watchdog (the orphan fix) with the `format!`
+    /// brace-escaping correctly resolved, and must still carry the loopback pin. Pure string check —
+    /// no node runtime needed.
+    #[test]
+    fn write_preload_carries_the_parent_death_watchdog() {
+        let dir = std::env::temp_dir().join(format!("stremiox-preload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk tmp dir");
+        let path = write_preload(&dir).expect("write preload");
+        let js = std::fs::read_to_string(&path).expect("read preload");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            js.contains("const PPID0=process.ppid;"),
+            "watchdog records the initial parent pid"
+        );
+        // Opening + closing braces must have resolved from `{{`/`}}` to single JS braces.
+        assert!(
+            js.contains("setInterval(function(){if(process.ppid!==PPID0){"),
+            "watchdog opening braces resolved by format!"
+        );
+        assert!(
+            js.contains("process.exit(0);}},1000).unref();"),
+            "watchdog closing braces resolved by format! and the timer is unref'd"
+        );
+        // The loopback pin still coexists with the new watchdog.
+        assert!(
+            js.contains("net.Server.prototype.listen"),
+            "loopback-pin preload still present alongside the watchdog"
         );
     }
 }
