@@ -95,21 +95,28 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
   # Native macOS app (NOT Catalyst, which MPVKit can't link). Reuses the same native SwiftUI UI
-  # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Server-less
-  # (STREMIOX_NO_EMBEDDED_SERVER): NodeMobile has no macOS slice, so Mac plays direct/debrid like the
-  # tvOS Lite build. MPVKit's macos-arm64 slices and the stremio-core macOS slice are complete.
+  # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Streaming server:
+  # nodejs-mobile has no macOS slice, so instead of embedding node as a library (iOS/tvOS), the Mac
+  # bundles a standalone `node` binary (Resources/node-darwin-arm64, fetched by the pre-build script)
+  # and spawns server.js in a child process (SourcesShared/MacNodeServer.swift). This restores TORRENT
+  # playback on the Mac — it is no longer Direct-Links-Only. MPVKit's macos-arm64 slices and the
+  # stremio-core macOS slice are complete.
   StremioXMac:
     type: application
     platform: macOS
     deploymentTarget: "14.0"   # MPVKit's macOS slices (Libuavs3d) require macOS 14
     sources:
       - SourcesiOS                   # the native SwiftUI UI also runs on macOS
-      - SourcesShared
+      - SourcesShared                # includes MacNodeServer.swift (the child-process node server)
       - Sources/Player
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
       - Resources/Assets.xcassets
+      - path: Resources/server.js    # Stremio streaming server, run by the bundled node binary
+        buildPhase: resources
+      - path: Resources/node-darwin-arm64   # standalone node executable (fetched pre-build)
+        buildPhase: resources
       - path: Resources/fonts
         optional: true
         type: folder
@@ -119,11 +126,17 @@ targets:
         product: MPVKit-GPL          # macos-arm64_x86_64 slice
       - framework: Vendor/StremioXCore.xcframework
         embed: false                 # now carries an aarch64-apple-darwin slice
+    preBuildScripts:
+      # Download the standalone node binary before the resource copy phase runs. Idempotent:
+      # skips the ~95MB download when the right version is already present.
+      - script: "\"${SRCROOT}/scripts/fetch-node-macos.sh\""
+        name: Fetch node binary (macOS streaming server)
+        outputFiles:
+          - "$(SRCROOT)/Resources/node-darwin-arm64"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.0"
         CURRENT_PROJECT_VERSION: "87"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
