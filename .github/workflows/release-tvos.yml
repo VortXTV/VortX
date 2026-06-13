@@ -64,6 +64,12 @@ jobs:
       - name: Fetch server deps (NodeMobile, server.js, subtitle fonts)
         run: ./scripts/fetch-server-deps.sh
 
+      - name: Fetch the macOS node runtime
+        # StremioXMac bundles node + server.js as its streaming server. The binary is gitignored, so
+        # it must be fetched BEFORE xcodegen runs — xcodegen validates that the
+        # Resources/node-darwin-arm64 source path exists, and fails project generation if it's absent.
+        run: ./app/scripts/fetch-node-macos.sh
+
       - name: Cache stremio-core xcframework
         id: cache-core-xcframework
         uses: actions/cache@v4

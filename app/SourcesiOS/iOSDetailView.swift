@@ -19,6 +19,7 @@ struct iOSDetailView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
 
     @State private var player: PlayerLaunch?
+    @State private var trailer: TrailerLaunch?           // Netflix-style trailer cover
     @State private var preparing = false                 // movie Watch Now is resolving
     @State private var preparingEpisodeID: String?       // which episode row is resolving
     @State private var season = 1
@@ -67,6 +68,27 @@ struct iOSDetailView: View {
             )
             .ignoresSafeArea()
         }
+        .platformFullScreenCover(item: $trailer) { launch in
+            TrailerPlayerScreen(launch: launch, onClose: { trailer = nil })
+        }
+    }
+
+    /// Open the meta's YouTube trailer in the in-app cover (or the system browser if the embed
+    /// itself fails, handled inside `TrailerPlayerScreen`).
+    private func playTrailer() {
+        guard let yt = meta?.trailerYouTubeID else { return }
+        trailer = TrailerLaunch(youTubeID: yt, title: meta?.name ?? title)
+    }
+
+    /// A standalone Trailer chip, shown only when the meta carries a YouTube trailer. Used in both the
+    /// movie Watch row and the series hero.
+    @ViewBuilder private var trailerButton: some View {
+        if meta?.trailerYouTubeID != nil {
+            Button { playTrailer() } label: {
+                Label("Trailer", systemImage: "play.rectangle.fill")
+            }
+            .buttonStyle(ChipButtonStyle())
+        }
     }
 
     // MARK: Hero (full-bleed backdrop + scrim + meta), mirrors tvOS DetailView.hero
@@ -77,7 +99,18 @@ struct iOSDetailView: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 titleOrLogo
                 metaRow
-                if type == "movie" { watchNow }
+                if type == "movie" {
+                    watchNow
+                } else {
+                    // Series have their actions in the episode list below; surface only the trailer
+                    // chip here (when present) so the hero still offers a quick first action.
+                    HStack(spacing: Theme.Space.sm) {
+                        trailerButton
+                        iOSLibraryChip()
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.top, Theme.Space.xs)
+                }
                 if let overview = meta?.description, !overview.isEmpty {
                     Text(overview)
                         .font(Theme.Typography.body)
@@ -183,50 +216,23 @@ struct iOSDetailView: View {
             .disabled(!movieReady || preparing)
             .opacity(movieReady || preparing ? 1 : 0.55)
 
+            trailerButton
             iOSLibraryChip()
         }
         .padding(.top, Theme.Space.xs)
     }
 
-    /// The full source list for a movie, styled like the tvOS stream list (surface cards, source labels).
+    /// The full source list for a movie. The presentation now mirrors tvOS: a quality picker, an
+    /// "All sources" toggle, per-add-on filter chips, and the streams grouped under collapsible
+    /// per-add-on headers (so a title returning thousands of sources doesn't bury one add-on). The
+    /// component owns the filter / collapse state; it plays a chosen source through `playStream`.
     @ViewBuilder private var sourceSection: some View {
-        let groups = StreamRanking.rankedGroups(core.streamGroups())
-        let progress = core.streamLoadProgress()
-        let loading = progress.total == 0 || progress.loaded < progress.total
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            iOSRailHeader(eyebrow: sourceEyebrow(count: streamCount(groups), loading: loading), title: "Sources")
-            if groups.isEmpty {
-                if loading {
-                    iOSLoadingRow(text: progress.total > 0 ? "Finding sources…  \(progress.loaded)/\(progress.total)" : "Finding sources…")
-                } else {
-                    iOSEmptyRow(text: "None of your add-ons returned a playable source for this title.")
-                }
-            } else {
-                LazyVStack(spacing: Theme.Space.sm) {
-                    ForEach(groups) { group in
-                        ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
-                            movieStreamRow(group.addon, stream)
-                        }
-                    }
-                }
-            }
-        }
+        iOSSourceList(
+            groups: StreamRanking.rankedGroups(core.streamGroups()),
+            progress: core.streamLoadProgress(),
+            play: { stream, url in Task { await playStream(stream, url: url) } }
+        )
         .padding(.horizontal, Theme.Space.md)
-    }
-
-    @ViewBuilder private func movieStreamRow(_ addon: String, _ stream: CoreStream) -> some View {
-        if let url = stream.playableURL {
-            Button {
-                Task { await playStream(stream, url: url) }
-            } label: {
-                iOSStreamLabel(addon: addon, stream: stream, enabled: true)
-            }
-            .buttonStyle(RowFocusStyle())
-        } else {
-            iOSStreamLabel(addon: addon, stream: stream, enabled: false)
-                .background(Theme.Palette.surface1.opacity(0.5),
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-        }
     }
 
     private var movieReady: Bool { meta != nil && StreamRanking.best(core.streamGroups()) != nil }
@@ -368,15 +374,6 @@ struct iOSDetailView: View {
 
     // MARK: Shared
 
-    private func streamCount(_ groups: [CoreStreamSourceGroup]) -> Int {
-        groups.reduce(0) { $0 + $1.streams.count }
-    }
-
-    private func sourceEyebrow(count: Int, loading: Bool) -> String {
-        if count == 0 { return loading ? "Searching" : "None found" }
-        return loading ? "\(count) so far" : "\(count) source\(count == 1 ? "" : "s")"
-    }
-
     /// Engine-history profiles resume from the engine; everyone else from the account/overlay.
     private func resume(_ pm: PlaybackMeta) async -> Double {
         if let engine = core.engineResumeSeconds(for: pm) { return engine }
@@ -411,6 +408,194 @@ private struct iOSRailHeader: View {
                 .foregroundStyle(Theme.Palette.textPrimary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The grouped, filterable source list for the touch / Mac detail page — the twin of tvOS
+/// `CoreStreamList`. Instead of a flat list of potentially thousands of streams, it offers:
+///   • a **Watch in <quality>** primary button (best ranked source) + a **Quality** picker
+///     (resolution tier → flavour variants, the same two-level model tvOS uses),
+///   • an **All sources** toggle that reveals the full ranked list on demand,
+///   • per-add-on **filter chips**, and
+///   • the streams grouped under **collapsible per-add-on headers**, styled with Theme surface
+///     cards, so reaching one add-on never means scrolling past every other add-on's sources.
+///
+/// It owns its own filter / collapse / picker UI state and plays a chosen source through the `play`
+/// closure handed in by `iOSDetailView` (which resolves resume + presents the native player).
+struct iOSSourceList: View {
+    let groups: [CoreStreamSourceGroup]
+    let progress: (loaded: Int, total: Int)
+    let play: (CoreStream, URL) -> Void
+
+    @State private var sourceFilter: String? = nil      // nil = all add-ons
+    @State private var showAllSources = false           // the full ranked list is revealed on demand
+    @State private var collapsed: Set<String> = []      // per-add-on sections the user folded away
+    @State private var qualityTier: String? = nil       // second-level quality sheet (a resolution tier)
+
+    private var streamCount: Int { groups.reduce(0) { $0 + $1.streams.count } }
+    private var loading: Bool { progress.total == 0 || progress.loaded < progress.total }
+    private var visibleGroups: [CoreStreamSourceGroup] {
+        groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            iOSRailHeader(eyebrow: eyebrow, title: "Sources")
+
+            if groups.isEmpty {
+                if loading {
+                    iOSLoadingRow(text: progress.total > 0
+                                  ? "Finding sources…  \(progress.loaded)/\(progress.total)"
+                                  : "Finding sources…")
+                } else {
+                    iOSEmptyRow(text: "None of your add-ons returned a playable source for this title.")
+                }
+            } else {
+                controlBar
+                if loading && progress.total > 0 {
+                    Text("Still finding more · \(progress.loaded)/\(progress.total) add-ons")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                }
+                if showAllSources {
+                    if groups.count > 1 { filterBar }
+                    groupedList
+                }
+            }
+        }
+    }
+
+    // MARK: Controls (Watch-in-X · Quality picker · All sources)
+
+    @ViewBuilder private var controlBar: some View {
+        // The flow layout (HStack that wraps) is simulated with two rows so it stays tidy on a phone.
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            if let best = StreamRanking.best(groups), let url = best.playableURL {
+                HStack(spacing: Theme.Space.sm) {
+                    Button { play(best, url) } label: {
+                        Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+
+                    qualityMenu
+                }
+            }
+            HStack(spacing: Theme.Space.sm) {
+                Button { withAnimation { showAllSources.toggle() } } label: {
+                    Label(showAllSources ? "Hide sources" : "All sources · \(streamCount)",
+                          systemImage: showAllSources ? "chevron.up" : "list.bullet")
+                }
+                .buttonStyle(ChipButtonStyle(selected: showAllSources))
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    /// The visible quality dropdown, two levels like tvOS: resolution tier first (4K / 1080p / 720p /
+    /// Others), then the flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A native
+    /// `Menu` with submenus is the touch / Mac idiom for the tvOS two-step `confirmationDialog`.
+    @ViewBuilder private var qualityMenu: some View {
+        let tiers = StreamRanking.tiers(groups)
+        if !tiers.isEmpty {
+            Menu {
+                ForEach(tiers, id: \.self) { tier in
+                    Menu(tier) {
+                        ForEach(StreamRanking.variantOptions(groups, tier: tier), id: \.label) { option in
+                            if let url = option.stream.playableURL {
+                                Button(option.label) { play(option.stream, url) }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("Quality", systemImage: "chevron.up.chevron.down")
+            }
+            .buttonStyle(ChipButtonStyle())
+        }
+    }
+
+    // MARK: Per-add-on filter chips
+
+    private var filterBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.sm) {
+                Button { sourceFilter = nil } label: { Text("All (\(streamCount))") }
+                    .buttonStyle(ChipButtonStyle(selected: sourceFilter == nil))
+                ForEach(groups) { group in
+                    Button { sourceFilter = group.addon } label: { Text("\(group.addon) (\(group.streams.count))") }
+                        .buttonStyle(ChipButtonStyle(selected: sourceFilter == group.addon))
+                }
+            }
+            .padding(.vertical, Theme.Space.xs)
+        }
+    }
+
+    // MARK: Grouped, collapsible streams
+
+    /// One collapsible section per add-on. LazyVStack so only on-screen rows are built — a popular
+    /// title can return thousands of sources, and instantiating them all at once OOM-crashed on tvOS.
+    private var groupedList: some View {
+        LazyVStack(spacing: Theme.Space.sm) {
+            ForEach(visibleGroups) { group in
+                Section {
+                    if !collapsed.contains(group.addon) {
+                        ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
+                            streamRow(group.addon, stream)
+                        }
+                    }
+                } header: {
+                    sectionHeader(group)
+                }
+            }
+        }
+    }
+
+    /// Tappable add-on header: name + source count + a chevron that folds the section away. Styled as
+    /// a Theme surface card so the grouping reads as a clean, deliberate section like tvOS.
+    private func sectionHeader(_ group: CoreStreamSourceGroup) -> some View {
+        let isCollapsed = collapsed.contains(group.addon)
+        return Button {
+            withAnimation(Theme.Motion.state) {
+                if isCollapsed { collapsed.remove(group.addon) } else { collapsed.insert(group.addon) }
+            }
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                Text(group.addon.uppercased())
+                    .font(Theme.Typography.eyebrow).tracking(1.5)
+                    .foregroundStyle(Theme.Palette.accent)
+                Text("\(group.streams.count)")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                Spacer(minLength: 0)
+                Image(systemName: isCollapsed ? "chevron.down" : "chevron.up")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.Palette.surface2.opacity(0.6),
+                        in: RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
+        if let url = stream.playableURL {
+            Button { play(stream, url) } label: {
+                iOSStreamLabel(addon: addon, stream: stream, enabled: true)
+            }
+            .buttonStyle(RowFocusStyle())
+        } else {
+            iOSStreamLabel(addon: addon, stream: stream, enabled: false)
+                .background(Theme.Palette.surface1.opacity(0.5),
+                            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        }
+    }
+
+    private var eyebrow: String {
+        let count = streamCount
+        if count == 0 { return loading ? "Searching" : "None found" }
+        return loading ? "\(count) so far" : "\(count) source\(count == 1 ? "" : "s")"
     }
 }
 
