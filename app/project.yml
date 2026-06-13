@@ -59,6 +59,9 @@ targets:
       - SourcesShared             # shared engine bridge, models, account, ranking, profiles, themes
       - Sources/Player            # libmpv player core (shared with tvOS)
       - Sources/NodeServer.swift  # embedded streaming server
+      - Sources/PlayerScreen.swift   # full native touch player (controls, tracks, resume), reused by the native UI
+      - Sources/ShareSheet.swift     # share sheet used by the player handoff
+      - Sources/ExternalPlayer.swift # external-player handoff used by the player
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources
