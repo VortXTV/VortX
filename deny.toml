@@ -1,0 +1,39 @@
+# cargo-deny advisory policy. Consumed by .github/workflows/security.yml, which runs
+# `cargo deny check advisories` against the Rust crates so that REAL security vulnerabilities and
+# yanked crates fail CI automatically. Documented, non-actionable transitive advisories from Tauri's
+# Linux GTK3 webview stack (and the stremio-core engine tree) are accepted explicitly below.
+#
+# Run locally:  cargo deny --manifest-path desktop/src-tauri/Cargo.toml --config deny.toml check advisories
+
+[advisories]
+version = 2
+# Yanked crates fail CI. (Actual `vulnerability`-class advisories always fail unless ignored below;
+# we ignore NONE — there are currently zero real vulnerabilities in the tree.)
+yanked = "deny"
+# "unmaintained" advisories here are all deep transitive deps we cannot action: the gtk-rs GTK3
+# bindings (atk/gdk/gtk/gdkx11/gdkwayland/... — pulled by Tauri's Linux webkit2gtk webview), plus
+# derivative / fxhash / proc-macro-error / unic-* from the stremio-core engine tree. They are not
+# vulnerabilities. Gate only on unmaintained crates we depend on DIRECTLY, not on this transitive
+# noise (which would also churn every time the dependency tree shifts).
+unmaintained = "workspace"
+ignore = [
+  # glib::VariantStrIter unsoundness — GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429 (the one Dependabot
+  # alert). Accepted, with rationale:
+  #  * Linux-only + transitive: glib enters the graph ONLY through Tauri's gtk3/webkit2gtk webview
+  #    backend (wry/tao -> gtk 0.18 -> glib 0.18.5). It is not compiled on macOS (WKWebView) or
+  #    Windows (WebView2) at all.
+  #  * Not bump-fixable today: gtk 0.18.2 pins `glib = "^0.18"`, and no stable wry/tao/Tauri release
+  #    ships a glib >= 0.20 (gtk4-rs) stack yet (tracking tauri-apps/tauri#12561, #12563).
+  #  * Not a vulnerability: classified unsound — a NULL-deref (DoS-class) crash in optimized builds
+  #    that needs NO malicious input; attacker-controlled data cannot trigger it.
+  #  * Unreachable in our code: zero glib/GVariant/VariantStrIter usage; all untrusted data flows
+  #    through reqwest + serde_json (DesktopEnv), never a GVariant iterator.
+  # Note: cargo-deny may print "advisory-not-detected" for this id. That is EXPECTED and reassuring:
+  # the advisory is function-scoped ([affected.functions] = VariantStrIter::next/nth/last/...), and
+  # cargo-deny's function-aware matching confirms none of those functions are reached in our build,
+  # so it never raises it (cargo-audit, which matches by crate version, does — hence the Dependabot
+  # alert). We keep the entry as an explicit, auditable record of the accepted advisory.
+  # REMOVE it when Tauri's Linux stack migrates to gtk4-rs + webkitgtk-6.0 (glib >= 0.20), then
+  # `cargo update` to pull the patched glib.
+  "RUSTSEC-2024-0429",
+]

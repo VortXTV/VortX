@@ -1,0 +1,47 @@
+name: Security Audit (Rust)
+
+# Gates the Rust dependency tree on security advisories via cargo-deny, using the root deny.toml
+# policy. Real `vulnerability`-class advisories and yanked crates fail CI; documented, non-actionable
+# transitive advisories (Tauri's Linux GTK3 stack, the stremio-core engine tree) are accepted in
+# deny.toml. Auditing the desktop crate covers BOTH the Tauri stack and the embedded stremio-core
+# engine, since desktop/src-tauri depends on stremio-core. Runs weekly so newly-published advisories
+# against unchanged dependencies are caught even with no code change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # cargo-deny walks up from the manifest to find the root deny.toml. Auditing the desktop crate
+      # covers the Tauri Linux stack + the embedded stremio-core engine tree in one pass.
+      - name: Rust advisory audit
+        run: cargo deny --manifest-path desktop/src-tauri/Cargo.toml check advisories
