@@ -1,11 +1,13 @@
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
-/// Hands a captured Stremio stream off to a third-party iOS player (Infuse, VLC) via its
-/// documented URL scheme, for users who prefer an external player to the built-in libmpv one.
-///
-/// iOS-only by design: this file lives in `Sources/` (not `Sources/Player/`), so it is compiled
-/// into the iOS target only. tvOS cannot launch other apps, so there is deliberately no tvOS
-/// equivalent.
+/// Hands a captured Stremio stream off to a third-party player (Infuse, VLC) via its documented
+/// URL scheme, for users who prefer an external player to the built-in libmpv one. Works on iOS
+/// (UIApplication) and macOS (NSWorkspace); tvOS does not compile this file (it cannot launch other
+/// apps and uses SourcesTV/ExternalPlayers.swift's own curated handoff instead).
 enum ExternalPlayer {
     /// A supported external player and how to deep-link a stream into it.
     struct Target: Identifiable {
@@ -15,8 +17,17 @@ enum ExternalPlayer {
         fileprivate let probe: URL          // scheme URL used for `canOpenURL`
         fileprivate let make: (URL) -> URL? // builds the deep link for a given stream URL
 
-        /// Is the app installed? Requires the scheme to be listed in `LSApplicationQueriesSchemes`.
-        @MainActor var isInstalled: Bool { UIApplication.shared.canOpenURL(probe) }
+        /// Is the app installed? On iOS the scheme must be listed in `LSApplicationQueriesSchemes`;
+        /// on macOS NSWorkspace resolves a handler for the scheme.
+        @MainActor var isInstalled: Bool {
+            #if canImport(UIKit)
+            UIApplication.shared.canOpenURL(probe)
+            #elseif canImport(AppKit)
+            NSWorkspace.shared.urlForApplication(toOpen: probe) != nil
+            #else
+            false
+            #endif
+        }
 
         func deepLink(for stream: URL) -> URL? { make(stream) }
     }
@@ -43,7 +54,11 @@ enum ExternalPlayer {
     @discardableResult
     @MainActor static func open(_ target: Target, stream: URL) -> Bool {
         guard target.isInstalled, let link = target.deepLink(for: stream) else { return false }
+        #if canImport(UIKit)
         UIApplication.shared.open(link)
+        #elseif canImport(AppKit)
+        NSWorkspace.shared.open(link)
+        #endif
         return true
     }
 

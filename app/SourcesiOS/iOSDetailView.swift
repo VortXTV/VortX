@@ -49,10 +49,10 @@ struct iOSDetailView: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .navigationTitle(meta?.name ?? title)
-        .navigationBarTitleDisplayMode(.inline)
+        .inlineNavigationTitle()
         .onAppear { core.loadMeta(type: type, id: id) }
         .onDisappear { core.unloadMeta() }
-        .fullScreenCover(item: $player) { launch in
+        .platformFullScreenCover(item: $player) { launch in
             PlayerScreen(
                 url: launch.url, title: launch.title, resumeSeconds: launch.resume,
                 onProgress: { pos, dur in Task { await account.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
