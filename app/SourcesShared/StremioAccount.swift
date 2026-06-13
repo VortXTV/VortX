@@ -161,12 +161,13 @@ final class StremioAccount: ObservableObject {
         streamSources = []
         addons = []
         email = Self.displayEmail()
-        if authKey != nil {
-            isSignedIn = true
-            Task { await loadAddons() }
-        } else {
-            isSignedIn = false
-        }
+        // Only publish when the value actually changes. `@Published` re-fires its publisher on every
+        // assignment (even true→true), so an unconditional write here can re-enter any
+        // `.onReceive($isSignedIn)` sink that calls back into this method — the loop that froze the
+        // iOS sign-in. Assigning only on change keeps this method safe for any observer.
+        let signedIn = authKey != nil
+        if isSignedIn != signedIn { isSignedIn = signedIn }
+        if signedIn { Task { await loadAddons() } }
     }
 
     /// Own-account profiles carry their email; shared profiles show the primary account's.

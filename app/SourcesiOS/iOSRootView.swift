@@ -289,7 +289,11 @@ struct iOSLibraryView: View {
                     // filter chip rows (#15) sit between the hero and the grid, mirroring the Discover
                     // chips and the tvOS Library filters; long-press on a card offers the engine's
                     // library actions (#14). A clean gap separates the hero from the chips (#52).
-                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    // LazyVStack (not VStack): the nested horizontal filter-chip ScrollView would let a
+                    // plain VStack adopt the chips' wider-than-screen content width and shift the whole
+                    // column left/clipped (the beta7 "weird viewport"). Greedy-width LazyVStack pins it
+                    // to the viewport, matching Home. See the iOSDiscoverView note for the full rationale.
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
                             filterChips(lib.selectable)
@@ -516,7 +520,14 @@ struct iOSDiscoverView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.md) {
+                // LazyVStack (not VStack): a vertical ScrollView proposes the viewport width, but a
+                // plain VStack sizes to its WIDEST child — and the nested horizontal chip ScrollViews
+                // below let it adopt their (wider-than-screen) content width, pushing the whole column
+                // off-axis so the hero + chips + grid render shifted-left and clipped on both edges
+                // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
+                // on the cross axis — it always takes the full viewport width — so it can't overflow.
+                // Home already uses LazyVStack and never exhibited the shift.
+                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
                     if let discover = core.discover {
                         // Hero is an ambient billboard scroll-header above the chips + grid, shown once
                         // a catalog has loaded; its Play / Trailer buttons stay tappable. It fades

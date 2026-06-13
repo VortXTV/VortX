@@ -11,6 +11,10 @@ struct LoginView: View {
     @State private var email = ""
     @State private var password = ""
     @State private var passwordBusy = false
+    // Run the sign-in handoff exactly once. `@Published` re-publishes on every assignment, so a
+    // future unconditional `isSignedIn = true` could otherwise re-enter this sink in a loop (the bug
+    // that froze the iOS sign-in). Parity with iOSSignInView's latch — defensive, costs nothing.
+    @State private var didHandleSignIn = false
 
     private enum Mode { case link, password }
 
@@ -45,10 +49,10 @@ struct LoginView: View {
             .padding(Theme.Space.screenEdge)
         }
         .onReceive(account.$isSignedIn) { signedIn in
-            if signedIn {
-                core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
-                dismiss()
-            }
+            guard signedIn, !didHandleSignIn else { return }
+            didHandleSignIn = true
+            core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
+            dismiss()
         }
     }
 

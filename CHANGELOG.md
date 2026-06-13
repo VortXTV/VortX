@@ -4,6 +4,20 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 8 (prerelease) - 2026-06-13
+
+The one that fixes the phone. beta 7's real-device testing surfaced an app-freezing sign-in bug and a cluster of iPhone-only layout breakage — this is the fix pass for all of it.
+
+### Fixed
+- **QR / link sign-in no longer freezes and crashes the app.** On iPhone and iPad, finishing a QR sign-in could hang the whole app (no buttons, the phone itself lagging) and then crash. Root cause: the sign-in handler wrote a value that re-triggered itself in an unbounded loop on the main thread. It now runs exactly once. (macOS was unaffected — it has no main-thread watchdog — which is why it only showed on the phone.)
+- **Discover and Library no longer render shifted off the left edge.** On iPhone the whole screen (hero, filter chips, poster grid) could be pushed left and clipped on both edges, intermittently. The content column now pins to the screen width instead of stretching to its widest row. Verified on device.
+- **The streaming server stops crashing seconds after launch on iPhone.** The embedded server was starting subsystems the phone build never needs (a second HTTPS server and its certificate stack), inflating its memory footprint until iOS killed it. The iPhone/iPad build now runs the same lean configuration the official Stremio iOS app uses.
+- **The Add-ons screen and Streaming Server screen fit the phone.** They were using the 10-foot Apple TV screen inset and a fixed 1000pt-wide field, so content spilled off the edge and the "Remove" button was squeezed to one letter per line. They now use a phone-appropriate inset, the field fits, and the button keeps its width.
+- **The featured hero no longer shows a flat black band** while its backdrop loads or if that image fails — it falls back to the poster art underneath.
+
+### Notes
+- "None of the add-ons returned a playable source": this means no streaming/debrid add-on is installed — the metadata add-ons (Debridio TMDB, AIOMetamax, etc.) don't provide playable streams. Install a stream provider (Torrentio, Comet, MediaFusion, or an AIOStreams config) from the Stremio web/mobile app and it syncs down.
+
 ## 0.3.0 beta 7 (prerelease) - 2026-06-13
 
 The one that actually plays. beta 6 shipped with a macOS player deadlock — this fixes it.

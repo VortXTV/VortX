@@ -60,14 +60,23 @@ struct FeaturedHeroView: View {
     // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)
 
     private var backdrop: some View {
-        AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.canvas
+        ZStack {
+            // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
+            // band (the iPhone "no backdrop" report — AsyncImage fell straight to the black canvas on
+            // a load miss while the iPad had it cached). The poster is the catalog art the screen
+            // already loaded, so it's almost always available; the backdrop paints over it on success.
+            posterFallback
+            AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
+                switch phase {
+                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+                default: Color.clear   // transparent while loading / on failure so the poster shows through
+                }
             }
         }
         .frame(height: heroHeight)
-        .frame(maxWidth: .infinity)
+        // Leading-anchored full width so the band's leading edge is the screen's (mirrors the proven
+        // iOSDetailView hero width-anchor) and a wide child can't shift the ZStack to negative x.
+        .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         // Cross-fade the artwork itself on id change so a new featured title dissolves in.
         .id(model.hero?.id)
@@ -87,6 +96,22 @@ struct FeaturedHeroView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+    }
+
+    /// The poster painted behind the backdrop so the band is never flat black. Falls to canvas only
+    /// when there is no poster at all (rare; the catalog/CW seed almost always carries one).
+    @ViewBuilder private var posterFallback: some View {
+        if let poster = model.hero?.poster, let url = URL(string: poster) {
+            AsyncImage(url: url) { phase in
+                if case .success(let img) = phase {
+                    img.resizable().aspectRatio(contentMode: .fill)
+                } else {
+                    Theme.Palette.canvas
+                }
+            }
+        } else {
+            Theme.Palette.canvas
+        }
     }
 
     // MARK: Overlay (logo-or-title · meta row · synopsis · actions)

@@ -69,6 +69,19 @@ enum NodeServer {
         // can saturate it and stall the engine. 16 threads relieves that contention. Cheap
         // and harmless; the heartbeat in the preload tells us if the loop still freezes.
         setenv("UV_THREADPOOL_SIZE", "16", 1)
+        #if os(iOS)
+        // iPhone/iPad only: match the configuration the official Stremio iOS app ships. Drop the
+        // secondary :12470 HTTPS server + local.strem.io cert subsystem (NO_HTTPS_SERVER) and HLSv2.
+        // On a real iPhone the embedded node server shares ONE tight per-app memory budget with the
+        // Rust core + libmpv + SwiftUI, and these unused subsystems inflate the in-process footprint
+        // enough that iOS jetsam-killed the server ~5s after launch ("streaming server crashed", beta7).
+        // The simulator has no jetsam enforcement, so it only reproduced on device. Set as discrete
+        // flags rather than IOS_APP on purpose: IOS_APP would also try `_linkedBinding("apple_bridge")`,
+        // which isn't linked in this NodeMobile build and could throw. tvOS keeps the default config
+        // (larger budget, unaffected — same reason CASTING_DISABLED above is set directly, not via IOS_APP).
+        setenv("NO_HTTPS_SERVER", "1", 1)
+        setenv("HLS_V2_DISABLED", "1", 1)
+        #endif
         // Memory: the server defaults its torrent cache to 2 GB, which is a lot for the
         // Apple TV's per-app memory budget. We do NOT disable caching (that thins the
         // torrent buffer); instead the app caps it to a TV-safe size via a /settings

@@ -46,7 +46,8 @@ struct ServerConfigView: View {
                 Text("Currently using: \(StremioServer.base)\(StremioServer.isCustom ? "" : "  (embedded)")")
                     .font(.system(size: 18, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
             }
-            .padding(Theme.Space.screenEdge)
+            .padding(.horizontal, Theme.Space.screenInset)
+            .padding(.vertical, Theme.Space.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
@@ -61,14 +62,14 @@ struct ServerConfigView: View {
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
             .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
-            .frame(width: 1000)
+            .frame(maxWidth: 1000)
         #else
         TextField("http://192.168.1.50:11470", text: $url)
             .textContentType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
             .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
-            .frame(width: 1000)
+            .frame(maxWidth: 1000)
         #endif
     }
 

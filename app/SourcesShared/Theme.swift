@@ -38,7 +38,18 @@ enum Theme {
         static let lg: CGFloat = 32
         static let xl: CGFloat = 48
         static let xxl: CGFloat = 72
+        // 10-foot tvOS screen inset. Do NOT use this directly as horizontal padding on shared views
+        // that also render on iPhone — 60pt eats ~120pt of a 390pt phone and clips content off the
+        // edges (the beta7 server-config / add-ons clipping). Use `screenInset` instead.
         static let screenEdge: CGFloat = 60
+        // Platform-aware screen inset: the tvOS 10-foot value on TV, an arm's-length value on
+        // phone / iPad / Mac. Shared screens (ServerConfig, Add-ons, Profiles) use this so one token
+        // keeps tvOS spacious without clipping the phone.
+        #if os(tvOS)
+        static let screenInset: CGFloat = screenEdge
+        #else
+        static let screenInset: CGFloat = md
+        #endif
     }
 
     enum Radius {

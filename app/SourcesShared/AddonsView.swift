@@ -20,7 +20,7 @@ struct AddonsView: View {
                         ForEach(core.addons) { addon in addonRow(addon) }
                     }
                 }
-                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.horizontal, Theme.Space.screenInset)
                 .padding(.vertical, Theme.Space.xl)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -38,11 +38,13 @@ struct AddonsView: View {
                 Text(addon.manifest.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
                 Text(addon.capabilities).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 Text(addon.host).font(.system(size: 16, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1).truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: Theme.Space.sm)
             if !addon.isProtected {
                 Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
                     .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                    .fixedSize()   // keep the Remove chip at its intrinsic width so a narrow phone row can't squeeze the label to one glyph per line
             }
         }
         .padding(Theme.Space.md)

@@ -83,7 +83,7 @@ struct ProfilePickerView: View {
                     }
                 }
             }
-            .padding(Theme.Space.screenEdge)
+            .padding(Theme.Space.screenInset)
             // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
             // remote, focus will not enter an overlay while anything beneath stays focusable).
             .disabled(pinTarget != nil)
@@ -398,7 +398,7 @@ struct ProfileEditorView: View {
                     .padding(.top, Theme.Space.md)
                     .profileFocusSection()
                 }
-                .padding(Theme.Space.screenEdge)
+                .padding(Theme.Space.screenInset)
             }
             // Unfocusable while the lock is up, so the remote lands in the lock panel (tvOS focus
             // won't enter an overlay while anything beneath stays focusable).
