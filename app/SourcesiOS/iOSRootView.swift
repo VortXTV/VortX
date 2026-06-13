@@ -10,9 +10,9 @@ struct iOSRootView: View {
                 .tabItem { Label("Home", systemImage: "house.fill") }
             placeholder("Discover", "safari.fill")
                 .tabItem { Label("Discover", systemImage: "safari.fill") }
-            placeholder("Library", "books.vertical.fill")
+            iOSLibraryView()
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }
-            placeholder("Search", "magnifyingglass")
+            iOSSearchView()
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
             iOSSettingsView()
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
@@ -90,8 +90,94 @@ struct iOSHomeView: View {
     }
 }
 
-/// One catalog row of tappable posters that push the (stub) detail page.
+/// Library: the user's saved titles from the engine, as a poster grid. Refreshes as the library
+/// changes; reloads while empty since it syncs asynchronously after sign-in.
+struct iOSLibraryView: View {
+    @EnvironmentObject private var core: CoreBridge
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                if let lib = core.library, !lib.catalog.isEmpty {
+                    PosterGrid(items: lib.catalog.map {
+                        RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
+                    })
+                    .padding(.vertical, Theme.Space.md)
+                } else {
+                    ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
+                        message: "Titles you add to your library in Stremio show up here.")
+                        .frame(minHeight: 420)
+                }
+            }
+            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationTitle("Library")
+            .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
+        }
+    }
+}
+
+/// Search across every installed add-on, on the engine (debounced), as a poster grid.
+struct iOSSearchView: View {
+    @EnvironmentObject private var core: CoreBridge
+    @State private var query = ""
+    @State private var searchTask: Task<Void, Never>?
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                    ContentUnavailableViewCompat(title: "Search", systemImage: "magnifyingglass",
+                        message: "Search across everything your add-ons cover.").frame(minHeight: 420)
+                } else if core.searchResults.isEmpty {
+                    ContentUnavailableViewCompat(title: core.searchIsLoading ? "Searching…" : "No results",
+                        systemImage: "magnifyingglass",
+                        message: core.searchIsLoading ? "" : "Nothing matched what you typed.").frame(minHeight: 420)
+                } else {
+                    PosterGrid(items: core.searchResults.map {
+                        RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+                    })
+                    .padding(.vertical, Theme.Space.md)
+                }
+            }
+            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationTitle("Search")
+            .searchable(text: $query, prompt: "Movies or series")
+            .onChange(of: query) { value in scheduleSearch(value) }   // iOS 16 single-param onChange
+            .onDisappear { searchTask?.cancel() }
+        }
+    }
+
+    private func scheduleSearch(_ value: String) {
+        searchTask?.cancel()
+        let q = value.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { core.search(""); return }
+        searchTask = Task {
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            core.search(q)
+        }
+    }
+}
+
+/// One catalog row of tappable posters that push the detail page.
 private struct RailItem: Identifiable { let id: String; let type: String; let name: String; let poster: String?; let progress: Double }
+
+/// A poster grid (Library, Search) reusing the same card + detail navigation as the rails.
+private struct PosterGrid: View {
+    let items: [RailItem]
+    private let columns = [GridItem(.adaptive(minimum: 116), spacing: Theme.Space.sm)]
+    var body: some View {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: Theme.Space.md) {
+            ForEach(items) { item in
+                NavigationLink {
+                    iOSDetailView(id: item.id, type: item.type, title: item.name)
+                } label: {
+                    PosterCardiOS(name: item.name, poster: item.poster, progress: item.progress)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, Theme.Space.md)
+    }
+}
 
 private struct PosterRail: View {
     let title: String
