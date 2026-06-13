@@ -43,6 +43,50 @@ targets:
         INFOPLIST_KEY_UIRequiresFullScreen: "YES"
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+  # Native iPhone/iPad client on stremio-core + libmpv (0.3.0), the same engine + player as the
+  # Apple TV app, with a touch UI in SourcesiOS. Replaces the web-host StremioX target once it
+  # reaches parity (see docs/REBASE-iOS.md). Built alongside it so the web host keeps working
+  # until cutover. Mirrors the proven tvOS native target's settings.
+  StremioXiOSNative:
+    type: application
+    platform: iOS
+    sources:
+      - SourcesiOS                # touch UI
+      - SourcesShared             # shared engine bridge, models, account, ranking, profiles, themes
+      - Sources/Player            # libmpv player core (shared with tvOS)
+      - Sources/NodeServer.swift  # embedded streaming server
+      - Resources/Assets.xcassets
+      - path: Resources/server.js
+        buildPhase: resources
+      - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      - framework: Vendor/nodejs-mobile/NodeMobile.xcframework
+        embed: true
+        codeSign: true
+      # The Rust stremio-core engine (staticlib xcframework, iOS slices), linked, not embedded.
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        MARKETING_VERSION: "0.2.49"
+        CURRENT_PROJECT_VERSION: "79"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: Resources/Info-iOS.plist
+        INFOPLIST_KEY_CFBundleDisplayName: StremioX
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
   StremioXTV:
@@ -131,6 +175,14 @@ schemes:
     build:
       targets:
         StremioX: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  StremioXiOSNative:
+    build:
+      targets:
+        StremioXiOSNative: all
     run:
       config: Debug
     archive:
