@@ -909,8 +909,11 @@ struct CoreStreamList: View {
         guard !PlaybackSettings.torrentsDisabled else { return }
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
               let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
-        var sources = stream.sources ?? []
-        sources.append("dht:\(hash)")
+        // The server's first-create-wins contract means the FIRST /create's source list sticks for
+        // the engine's life, and this is the PRIMARY play path — so it must carry the TCP/TLS
+        // trackers (UDP/DHT alone is unreliable in the tvOS sandbox), exactly like every other
+        // create path. The old `dht:` + addon-udp-only list left a sandboxed swarm unable to form.
+        let sources = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)
         let body: [String: Any] = ["torrent": ["infoHash": hash],
                                    "peerSearch": ["sources": sources, "min": 40, "max": 150]]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
