@@ -21,6 +21,23 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The real Stremio engine, the same one the Apple and Android cores use. The Tauri backend is Rust,
+# so stremio-core embeds directly (no FFI). Features match the Apple core (core/Cargo.toml):
+#  - derive          : the #[derive(Model)] proc-macro used by DesktopModel.
+#  - env-future-send : EnvFuture = Send BoxFuture, so Runtime's Send+Sync bounds hold on a
+#                      multi-threaded desktop host (wasm-incompatible, but we are native).
+stremio-core = { git = "https://github.com/Stremio/stremio-core", branch = "development", features = ["derive", "env-future-send"] }
+serde_path_to_error = "0.1"
+once_cell = "1"
+futures = "0.3"
+chrono = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
+http = "1"
+# Default (native-tls): SChannel on Windows, SecureTransport on macOS, OpenSSL on Linux. A desktop
+# app should use the OS trust store, and this avoids the aws-lc-rs/NASM toolchain that rustls needs
+# on Windows CI. (The Apple core uses rustls only to stay a self-contained static lib.)
+reqwest = "0.12"
+
 [features]
 # Used by the default tauri-build setup; harmless when empty.
 custom-protocol = ["tauri/custom-protocol"]
