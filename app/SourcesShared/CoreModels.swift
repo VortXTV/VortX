@@ -233,6 +233,11 @@ struct CoreMetaItem: Decodable {
     /// Each is a full `Stream`, so a YouTube trailer flattens to a top-level `ytId` (see
     /// `meta_item.rs` / `serialize_meta_details.rs`). Optional so sparser add-ons still decode.
     let trailerStreams: [CoreStream]?
+    /// Meta-level behaviorHints (camelCase `behaviorHints` in the engine JSON; the bridge decoder
+    /// uses the default key strategy, same as `trailerStreams`). Distinct from the per-STREAM
+    /// `CoreStreamBehaviorHints`. Live/EPG add-ons set `hasScheduledVideos` here to flag that
+    /// `videos[]` is a now/next schedule rather than an episode list. Optional so sparse add-ons decode.
+    let behaviorHints: CoreMetaBehaviorHints?
 
     var genres: [String] {
         (links ?? []).filter { $0.category.caseInsensitiveCompare("Genre") == .orderedSame }.map(\.name)
@@ -281,6 +286,34 @@ struct CoreMetaItem: Decodable {
     }
 }
 
+/// Meta-level `behaviorHints` (NOT the per-stream `CoreStreamBehaviorHints`). All fields optional so
+/// sparse add-ons decode. `hasScheduledVideos` marks a live channel whose `videos[]` is a now/next
+/// EPG schedule; `featuredVideoId` (when present) names the currently-airing program directly.
+struct CoreMetaBehaviorHints: Decodable {
+    let hasScheduledVideos: Bool?
+    let featuredVideoId: String?
+}
+
+/// Pure, engine-free now/next selection over a live channel's scheduled `videos[]`. Mirrors the
+/// reference serializer's now/next rule: NOW is the latest program that has already started
+/// (`released <= reference`), NEXT is the earliest program still to come (`released > reference`).
+/// Unit-testable in isolation: inject `reference` for deterministic results. Returns nil (so callers
+/// fall back to the description / hide the strip) unless the meta is flagged scheduled AND at least
+/// one dated program resolves to now or next.
+struct EPGSchedule {
+    let now: CoreVideo?
+    let next: CoreVideo?
+
+    init?(meta: CoreMetaItem, reference: Date = Date()) {
+        guard meta.behaviorHints?.hasScheduledVideos == true, let videos = meta.videos else { return nil }
+        let dated = videos.compactMap { v -> (CoreVideo, Date)? in v.releasedDate.map { (v, $0) } }
+        guard !dated.isEmpty else { return nil }
+        now  = dated.filter { $0.1 <= reference }.max { $0.1 < $1.1 }?.0
+        next = dated.filter { $0.1 >  reference }.min { $0.1 < $1.1 }?.0
+        guard now != nil || next != nil else { return nil }
+    }
+}
+
 struct CoreLink: Decodable {
     let name: String
     let category: String
@@ -301,6 +334,26 @@ struct CoreVideo: Decodable, Identifiable {
         if let title, !title.isEmpty { return title }
         return "Episode \(episode ?? 0)"
     }
+
+    /// The `released` string parsed as a `Date` (non-breaking — display still uses the raw string).
+    /// Live/EPG schedules carry an ISO-8601 UTC timestamp here; try the plain form first, then the
+    /// fractional-seconds variant some add-ons emit. Returns nil when absent or unparseable.
+    var releasedDate: Date? {
+        guard let released else { return nil }
+        return ISO8601DateFormatter.epg.date(from: released)
+            ?? ISO8601DateFormatter.epgFractional.date(from: released)
+    }
+}
+
+extension ISO8601DateFormatter {
+    /// Shared formatters for parsing `CoreVideo.released` — `static let` so the EPG now/next pass
+    /// reuses one instance per form instead of allocating a formatter per video (they're costly).
+    static let epg = ISO8601DateFormatter()
+    static let epgFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 }
 
 /// One addon's stream response for the selected meta/episode (`ResourceLoadable<Vec<Stream>>`).

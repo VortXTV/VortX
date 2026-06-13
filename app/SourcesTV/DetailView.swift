@@ -115,9 +115,10 @@ struct DetailView: View {
 
     /// Live channel page: the same full-bleed cinematic backdrop as a movie, but stripped of VOD chrome —
     /// no trailer chip, no movie-style synopsis paragraph, no skip/chapter UI. A red "LIVE" badge sits
-    /// beside the title, and the channel's full source list lets the user pick a stream. The stream list
-    /// carries the channel's live `type` in its `PlaybackMeta`, which the player reads via `LiveTypes` to
-    /// engage live tuning and NO-OP resume/progress.
+    /// beside the title, then a now/next EPG strip (when the channel carries a schedule), and the
+    /// channel's full source list lets the user pick a stream. The stream list carries the channel's
+    /// live `type` in its `PlaybackMeta`, which the player reads via `LiveTypes` to engage live tuning
+    /// and NO-OP resume/progress.
     private func livePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
@@ -135,6 +136,7 @@ struct DetailView: View {
                         }
                         metaRow(m)
                     }
+                    epgStrip(m)
                     CoreStreamList(title: m.name,
                                    meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
                                                       name: m.name, poster: m.poster,
@@ -145,6 +147,65 @@ struct DetailView: View {
             }
         }
     }
+
+    /// Now/Next EPG strip for a live channel (tvOS twin of the iOS one; reuses the SAME `EPGSchedule`
+    /// type, no duplicated selection logic). The schedule already rides in the meta JSON
+    /// (`behaviorHints.hasScheduledVideos` + dated `videos[]`) — no XMLTV/networking on the client.
+    /// When `EPGSchedule` resolves, show a NOW row (title + "until <next start>") and a NEXT row
+    /// (title + start time); otherwise fall back to the channel description. Display-only and
+    /// non-focusable, so the focus order (title → source list) is unchanged. Times use the device
+    /// LOCALE (short time), turning the UTC `released` into a local clock reading.
+    @ViewBuilder private func epgStrip(_ m: CoreMetaItem) -> some View {
+        if let schedule = EPGSchedule(meta: m) {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                if let now = schedule.now {
+                    epgRow(eyebrow: "NOW",
+                           title: now.episodeTitle,
+                           detail: schedule.next?.releasedDate.map { "until \(Self.epgTime.string(from: $0))" })
+                }
+                if let next = schedule.next {
+                    epgRow(eyebrow: "NEXT",
+                           title: next.episodeTitle,
+                           detail: next.releasedDate.map { Self.epgTime.string(from: $0) })
+                }
+            }
+            .frame(maxWidth: 1000, alignment: .leading)
+        } else if let d = m.description, !d.isEmpty {
+            Text(d)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(3)
+                .frame(maxWidth: 1000, alignment: .leading)
+        }
+    }
+
+    /// One EPG row: an eyebrow tag (NOW / NEXT), the program title, and an optional time detail.
+    private func epgRow(eyebrow: String, title: String, detail: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+            Text(eyebrow)
+                .font(Theme.Typography.eyebrow).tracking(1.5)
+                .foregroundStyle(Theme.Palette.accent)
+            Text(title)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(1)
+            if let detail {
+                Text(detail)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    /// Device-locale short-time formatter (UTC `released` → local clock reading). `static let` to
+    /// avoid per-row allocation; locale/time-zone default to the device's current settings.
+    private static let epgTime: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f
+    }()
 
     /// The red "LIVE" pill that marks a live channel (the live counterpart to the VOD trailer / Watch
     /// affordances this page drops).

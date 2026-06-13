@@ -454,7 +454,8 @@ struct iOSDetailView: View {
 
     /// The Live channel page: the same cinematic backdrop + title block as a movie, but stripped of
     /// VOD chrome — no trailer chip, no movie-style synopsis paragraph, no skip/chapter UI. A "LIVE"
-    /// badge sits beside the title, and the full channel source list lets the user pick a stream.
+    /// badge sits beside the title, then a now/next EPG strip (when the channel carries a schedule),
+    /// and the full channel source list lets the user pick a stream.
     @ViewBuilder private var livePage: some View {
         ZStack(alignment: .bottomLeading) {
             backdrop
@@ -469,8 +470,72 @@ struct iOSDetailView: View {
             .padding(.bottom, Theme.Space.lg)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        epgStrip
         liveSourceSection
     }
+
+    /// Now/Next EPG strip for a live channel. The schedule already rides in the meta JSON
+    /// (`behaviorHints.hasScheduledVideos` + dated `videos[]`) — no XMLTV/networking on the client.
+    /// When `EPGSchedule` resolves, show a NOW row (program title + "until <next start>") and a NEXT
+    /// row (title + start time). Otherwise, if the meta has a description, show it (lower-fidelity
+    /// add-ons that only put Now/Next text in `description`). Times format with the device LOCALE
+    /// (short time), turning the UTC `released` into a local clock reading. Display-only; reuses the
+    /// existing eyebrow / label / body tokens.
+    @ViewBuilder private var epgStrip: some View {
+        if let m = meta {
+            if let schedule = EPGSchedule(meta: m) {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    if let now = schedule.now {
+                        epgRow(eyebrow: "NOW",
+                               title: now.episodeTitle,
+                               detail: schedule.next?.releasedDate.map { "until \(Self.epgTime.string(from: $0))" })
+                    }
+                    if let next = schedule.next {
+                        epgRow(eyebrow: "NEXT",
+                               title: next.episodeTitle,
+                               detail: next.releasedDate.map { Self.epgTime.string(from: $0) })
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Theme.Space.md)
+            } else if let d = m.description, !d.isEmpty {
+                Text(d)
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Theme.Space.md)
+            }
+        }
+    }
+
+    /// One EPG row: an eyebrow tag (NOW / NEXT), the program title, and an optional time detail.
+    private func epgRow(eyebrow: String, title: String, detail: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+            Text(eyebrow)
+                .font(Theme.Typography.eyebrow).tracking(1.5)
+                .foregroundStyle(Theme.Palette.accent)
+            Text(title)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(1)
+            if let detail {
+                Text(detail)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    /// Device-locale short-time formatter (UTC `released` → local clock reading). `static let` to
+    /// avoid per-row allocation; locale/time-zone default to the device's current settings.
+    private static let epgTime: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f
+    }()
 
     /// The red "LIVE" pill that marks a live channel (the live counterpart to the VOD trailer/Watch
     /// affordances this page drops).
