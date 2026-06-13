@@ -177,6 +177,9 @@ final class MPVMetalViewController: PlatformViewController {
     private var outputSampleRate: Double = 0
 
     private func configureAudioSession() {
+        // AVAudioSession is iOS/tvOS only; on macOS mpv's coreaudio AO owns audio routing, so this
+        // is a no-op there.
+        #if canImport(UIKit)
         do {
             let session = AVAudioSession.sharedInstance()
             // .playback + setActive is the issue-20 eARC fix (audio routes to the receiver instead
@@ -192,6 +195,7 @@ final class MPVMetalViewController: PlatformViewController {
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }
+        #endif
     }
 
     /// mpv `audio-samplerate` for the current route, or nil to leave mpv on the content rate.
@@ -311,6 +315,11 @@ final class MPVMetalViewController: PlatformViewController {
         // receiver advertising >2 keeps native multichannel PCM, preserving the 0.2.43 eARC fix;
         // anything <=2 is forced to a stereo DOWNMIX so the endpoint always gets sound. The viewer
         // can override the whole policy with the Audio Output setting (Auto / Stereo / Surround).
+        // Audio output policy is iOS/tvOS only: mpv there uses the low-level audiounit AO that does
+        // not resample or downmix to the route on its own, so we drive it (the soundbar fixes). On
+        // macOS mpv uses the coreaudio AO, which negotiates rate, channels, and routing natively
+        // like desktop mpv, so we leave audio at mpv's defaults.
+        #if canImport(UIKit)
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
         // Never let an AO-open failure fall through to the null AO: that is silent death with no
         // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
@@ -323,6 +332,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         appliedAudioPolicy = (channelPolicy, sampleRatePolicy ?? 0)   // baseline so reapply only fires on a real change
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
+        #endif
 
         checkError(mpv_initialize(mpv))
         
@@ -346,6 +356,10 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     public func setupNotification() {
+        // App-lifecycle + audio-route observers are iOS/tvOS only (UIApplication notifications and
+        // AVAudioSession both exist there). On macOS mpv's coreaudio AO handles routing and the app
+        // is a window, so there is nothing to observe here.
+        #if canImport(UIKit)
         NotificationCenter.default.addObserver(self, selector: #selector(enterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
         // The output route can change AFTER the channel policy was chosen: a receiver powers on,
@@ -353,8 +367,10 @@ final class MPVMetalViewController: PlatformViewController {
         // negotiated against the old route, which can strand audio on a layout the new endpoint
         // can't play. Re-evaluate the channel count and reapply the policy on any route change.
         NotificationCenter.default.addObserver(self, selector: #selector(audioRouteChanged), name: AVAudioSession.routeChangeNotification, object: nil)
+        #endif
     }
 
+    #if canImport(UIKit)
     @objc public func enterBackground() {
         // fix black screen issue when app enter foreground again
         pause()
@@ -403,6 +419,7 @@ final class MPVMetalViewController: PlatformViewController {
         // ordering deterministic.)
         DispatchQueue.main.async { [weak self] in self?.applyChannelPolicy() }
     }
+    #endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only
 
     /// Tear mpv down safely when the player closes. Clearing the wakeup callback first
     /// prevents it from firing into a deallocated controller (the crash on close), and
