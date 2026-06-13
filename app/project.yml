@@ -94,6 +94,11 @@ targets:
         INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+  # macOS: deferred. Mac Catalyst is blocked because MPVKit 0.41.0's Libuavs3d (and Libluajit)
+  # ship no maccatalyst slice, so neither MPVKit product links under Catalyst. The viable path is a
+  # NATIVE macOS app (the macos-arm64 MPVKit slices are complete) which needs MPVMetalViewController
+  # ported from UIViewController to NSViewController plus an aarch64-apple-darwin core slice. Tracked
+  # for a dedicated effort; see docs and the Brain note.
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
   StremioXTV:

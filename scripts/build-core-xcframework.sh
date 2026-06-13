@@ -29,6 +29,10 @@ echo "▸ iOS simulator (aarch64-apple-ios-sim)"
 SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
   cargo +nightly build --target aarch64-apple-ios-sim --release
 
+# macOS slice is intentionally omitted for now: Mac Catalyst is blocked upstream (MPVKit 0.41.0
+# ships no maccatalyst slice for Libuavs3d/Libluajit), and the native-macOS path (aarch64-apple-
+# darwin slice + an AppKit player port) is a separate tracked effort. Add the darwin slice here
+# when that work starts.
 echo "▸ packaging $OUT"
 rm -rf "$OUT"
 xcodebuild -create-xcframework \
