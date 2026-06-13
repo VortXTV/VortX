@@ -35,6 +35,14 @@ SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
 # unwinding-std core. A panic=abort std core does not emit the conflicting personality.
 echo "▸ macOS (aarch64-apple-darwin)"
 cargo +nightly build $BUILDSTD --target aarch64-apple-darwin --release
+# MPVKit's Libdovi (also Rust) defines _rust_eh_personality too, and the macOS linker rejects the
+# duplicate against our core's global copy (iOS tolerates it). Partial-link the darwin archive into
+# one object with that symbol made LOCAL, then re-archive: our refs still resolve in-archive, but it
+# no longer exports a clashing global. Only the macOS slice needs this.
+DARWIN="target/aarch64-apple-darwin/release"
+ld -r -arch arm64 -platform_version macos 14.0 14.0 -all_load "$DARWIN/$LIB" -unexported_symbol _rust_eh_personality -o "$DARWIN/core_localized.o"
+rm -f "$DARWIN/$LIB"
+libtool -static -o "$DARWIN/$LIB" "$DARWIN/core_localized.o"
 
 echo "▸ packaging $OUT"
 rm -rf "$OUT"
