@@ -115,6 +115,10 @@ final class CoreBridge: ObservableObject {
         }
         guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
             NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
+            // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
+            // profile) so a signed-out Home is a real, browsable landing screen — backdrop hero + rails
+            // — not an empty "please sign in" page. Discover already loads signed-out; Home should too.
+            loadBoard()
             return
         }
         awaitingAuthMigration = true

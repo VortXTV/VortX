@@ -20,9 +20,6 @@ struct FeaturedHeroView: View {
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// A trailer to present in the in-app cover, when the user taps the Trailer chip. (Detail-page
-    /// trailers live here only as an explicit, user-initiated full-screen cover — never inline.)
-    @State private var trailer: TrailerLaunch?
 
     /// Hero band height: a touch shorter on phones, taller on the Mac — matches `iOSDetailView`.
     static var heroHeight: CGFloat {
@@ -58,9 +55,6 @@ struct FeaturedHeroView: View {
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
-        .platformFullScreenPlayerCover(item: $trailer) { launch in
-            TrailerPlayerScreen(launch: launch, onClose: { trailer = nil })
-        }
     }
 
     // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)
@@ -177,10 +171,11 @@ struct FeaturedHeroView: View {
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
     /// Tapping it opens an explicit full-screen player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
-        if let yt = hero.trailerYouTubeID,
-           TrailerRequest(title: hero.name, youTubeID: yt, directURL: nil).playableURL != nil {
+        if let yt = hero.trailerYouTubeID, let watch = URL(string: "https://www.youtube.com/watch?v=\(yt)") {
             Button {
-                trailer = TrailerLaunch(youTubeID: yt, title: hero.name)
+                // Open the trailer in the YouTube app / browser. The in-app `/yt` resolver (ytdl-core)
+                // currently 403s, so external open is the reliable path (no WKWebView "Error 153").
+                TrailerOpener.open(watch)
             } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }

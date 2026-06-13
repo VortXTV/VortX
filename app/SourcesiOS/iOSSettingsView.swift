@@ -43,16 +43,21 @@ struct iOSSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                profilesSection
-                accountSection
-                playbackSection
-                streamsSection
-                serverSection
-                appearanceSection
-                audioSubtitleSection
-                subtitleSection
-                aboutSection
-                engineSection
+                // Each section's row cards use the brand surface, not the system grouped grey (#49
+                // follow-up): `.listRowBackground` on a Section repaints all its rows. Combined with
+                // `.scrollContentBackground(.hidden)` + the canvas background below, the cards now read
+                // as warm dark surfaces with canvas showing between them, matching the rest of the app
+                // (and identical on iPadOS, which shares this view).
+                profilesSection.listRowBackground(Theme.Palette.surface1)
+                accountSection.listRowBackground(Theme.Palette.surface1)
+                playbackSection.listRowBackground(Theme.Palette.surface1)
+                streamsSection.listRowBackground(Theme.Palette.surface1)
+                serverSection.listRowBackground(Theme.Palette.surface1)
+                appearanceSection.listRowBackground(Theme.Palette.surface1)
+                audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
+                subtitleSection.listRowBackground(Theme.Palette.surface1)
+                aboutSection.listRowBackground(Theme.Palette.surface1)
+                engineSection.listRowBackground(Theme.Palette.surface1)
             }
             // Grouped form style renders proper inset section cards + headers and a centered column
             // on macOS (the default macOS form style is the ugly full-width label-left layout). On the
