@@ -86,25 +86,28 @@ struct iOSDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
-                // fallback: backdrop + name + LIVE badge + the channel's source list, with no VOD
-                // chrome (no trailer chip, no movie synopsis framing, no skip/chapter UI). It still
-                // builds the player launch with the meta `type` preserved so the player's live path
-                // engages (see PlayerScreen + MPVMetalViewController.configureLiveMode).
-                if LiveTypes.contains(type) {
-                    livePage
-                } else {
-                    hero
-                    if type == "series" {
-                        episodeList
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
+                    // fallback: backdrop + name + LIVE badge + the channel's source list, with no VOD
+                    // chrome (no trailer chip, no movie synopsis framing, no skip/chapter UI). It still
+                    // builds the player launch with the meta `type` preserved so the player's live path
+                    // engages (see PlayerScreen + MPVMetalViewController.configureLiveMode).
+                    if LiveTypes.contains(type) {
+                        livePage
                     } else {
-                        sourceSection
+                        // The Sources action in the hero row scrolls to this anchor.
+                        hero { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
+                        if type == "series" {
+                            episodeList
+                        } else {
+                            sourceSection.id(Self.sourcesAnchor)
+                        }
                     }
                 }
+                .padding(.bottom, Theme.Space.xl)
             }
-            .padding(.bottom, Theme.Space.xl)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .navigationTitle(meta?.name ?? title)
@@ -148,14 +151,19 @@ struct iOSDetailView: View {
 
     // MARK: Hero (full-bleed backdrop + scrim + meta), mirrors tvOS DetailView.hero
 
-    private var hero: some View {
+    /// Scroll-anchor id for the source section, so the hero's "Sources" action can jump to it.
+    private static let sourcesAnchor = "iOSDetailSources"
+
+    /// Hero: full-bleed backdrop + scrim + title / meta / action row / synopsis. `scrollToSources`
+    /// is wired into the movie action row's "Sources" button (the tvOS 3-action twin).
+    private func hero(scrollToSources: @escaping () -> Void) -> some View {
         ZStack(alignment: .bottomLeading) {
             backdrop
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 titleOrLogo
                 metaRow
                 if type == "movie" {
-                    watchNow
+                    watchNow(scrollToSources: scrollToSources)
                 } else {
                     seriesHeroActions
                 }
@@ -184,7 +192,11 @@ struct iOSDetailView: View {
             }
         }
         .frame(height: backdropHeight)
-        .frame(maxWidth: .infinity)
+        // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
+        // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
+        // this, the oversized serif hero title made the ZStack wider than the screen and `.bottomLeading`
+        // pushed the whole block to a negative x — clipping the title / Watch / synopsis off the left.
+        .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         .overlay(
             LinearGradient(stops: [
@@ -220,11 +232,17 @@ struct iOSDetailView: View {
     }
 
     private var heroTitle: some View {
+        // No `.fixedSize` here: the serif `Theme.Typography.hero` type has a large intrinsic width,
+        // and forcing the text to its intrinsic size made the ZStack (which sizes to its WIDEST child)
+        // wider than the viewport, which `.bottomLeading` then pushed off the left edge. Clamping to
+        // `maxWidth: .infinity, alignment: .leading` lets the title WRAP/scale within the available
+        // width instead — so the title can never make the ZStack exceed the screen. Mirrors tvOS,
+        // whose hero title wraps inside a width-bounded VStack with no horizontal fixedSize.
         Text(meta?.name ?? title)
             .font(Theme.Typography.hero).tracking(-1)
             .foregroundStyle(Theme.Palette.textPrimary)
             .lineLimit(3).minimumScaleFactor(0.6)
-            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
     }
 
@@ -360,25 +378,67 @@ struct iOSDetailView: View {
 
     // MARK: Movie — Watch Now + sources
 
-    @ViewBuilder private var watchNow: some View {
-        HStack(spacing: Theme.Space.sm) {
-            Button {
-                Task { await playMovie() }
-            } label: {
-                HStack(spacing: Theme.Space.sm) {
-                    if preparing { ProgressView().tint(Theme.Palette.onAccent) }
-                    else { Image(systemName: "play.fill") }
-                    Text(movieLabel)
+    /// The movie hero action row — the touch/Mac twin of the tvOS detail action set: a **Watch**
+    /// button (best ranked source), a **Quality** picker (resolution tier → flavour variants), a
+    /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
+    /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
+    @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()))
+        let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack(spacing: Theme.Space.sm) {
+                Button {
+                    Task { await playMovie() }
+                } label: {
+                    HStack(spacing: Theme.Space.sm) {
+                        if preparing { ProgressView().tint(Theme.Palette.onAccent) }
+                        else { Image(systemName: "play.fill") }
+                        Text(movieLabel)
+                    }
                 }
-            }
-            .buttonStyle(PrimaryActionStyle())
-            .disabled(!movieReady || preparing)
-            .opacity(movieReady || preparing ? 1 : 0.55)
+                .buttonStyle(PrimaryActionStyle())
+                .disabled(!movieReady || preparing)
+                .opacity(movieReady || preparing ? 1 : 0.55)
 
-            trailerButton
-            iOSLibraryChip()
+                qualityMenu(groups)
+            }
+            HStack(spacing: Theme.Space.sm) {
+                Button { scrollToSources() } label: {
+                    Label(sourceTotal > 0 ? "Sources · \(sourceTotal)" : "Sources",
+                          systemImage: "list.bullet")
+                }
+                .buttonStyle(ChipButtonStyle())
+
+                trailerButton
+                iOSLibraryChip()
+                Spacer(minLength: 0)
+            }
         }
         .padding(.top, Theme.Space.xs)
+    }
+
+    /// Two-level Quality picker for the hero action row: resolution tier (4K / 1080p / 720p / Others),
+    /// then the flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A native `Menu` with
+    /// submenus is the touch/Mac idiom for the tvOS two-step quality `confirmationDialog`. Plays the
+    /// chosen source straight through `playStream`. Hidden until at least one tier resolves.
+    @ViewBuilder private func qualityMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
+        let tiers = StreamRanking.tiers(groups)
+        if !tiers.isEmpty {
+            Menu {
+                ForEach(tiers, id: \.self) { tier in
+                    Menu(tier) {
+                        ForEach(StreamRanking.variantOptions(groups, tier: tier), id: \.label) { option in
+                            if let url = option.stream.playableURL {
+                                Button(option.label) { Task { await playStream(option.stream, url: url) } }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("Quality", systemImage: "chevron.up.chevron.down")
+            }
+            .buttonStyle(ChipButtonStyle())
+        }
     }
 
     /// The full source list for a movie. The presentation now mirrors tvOS: a quality picker, an
@@ -818,7 +878,9 @@ struct iOSEpisodeStreams: View {
                     .font(Theme.Typography.hero).tracking(-1)
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .lineLimit(3).minimumScaleFactor(0.6)
-                    .fixedSize(horizontal: false, vertical: true)
+                    // Same left-clip guard as iOSDetailView.heroTitle: clamp to the available width so
+                    // the serif title wraps instead of forcing the ZStack wider than the viewport.
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                 metaRow
                 if let overview = video.overview, !overview.isEmpty {
@@ -844,7 +906,8 @@ struct iOSEpisodeStreams: View {
             }
         }
         .frame(height: backdropHeight)
-        .frame(maxWidth: .infinity)
+        // Width anchor for the episode hero ZStack — full viewport width, pinned leading (see iOSDetailView.backdrop).
+        .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         .overlay(
             LinearGradient(stops: [
@@ -1150,31 +1213,50 @@ struct iOSSourceList: View {
     }
 }
 
-/// A source row styled like the tvOS stream list: an icon, the addon + torrent badges, the addon's
-/// own name, and its full description.
+/// A CLEAN source row, mirroring the tvOS stream list's parsed labelling instead of dumping the
+/// add-on's raw verbose blurb (e.g. "Stream Expression (308) / Included Reasons / Removal Reasons /
+/// digitalRelease Bypass"). It shows: a leading play/torrent icon, a quality badge (4K / 1080p / …)
+/// next to the add-on + TORRENT badges, the parsed flavour tags (Remux · HDR · Atmos · HEVC · Cached)
+/// + file size, and a single trimmed title line for human context — built from `StreamRanking.sourceDetail`
+/// and `StreamRanking.qualityLabel`, the same parse that powers the Watch / Quality affordances.
 private struct iOSStreamLabel: View {
     let addon: String
     let stream: CoreStream
     let enabled: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: Theme.Space.md) {
+        let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
+        let detail = StreamRanking.sourceDetail(stream)          // parsed (tags, size) — NOT the raw blurb
+        return HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 26))
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
+                    badge(quality, prominent: true)
                     badge(addon.uppercased())
                     if stream.isTorrent { badge("TORRENT") }
                 }
-                if let name = stream.name, !name.isEmpty {
-                    Text(name).font(Theme.Typography.cardTitle)
+                // Parsed flavour tags + size — the clean line tvOS shows, not the add-on's raw dump.
+                HStack(spacing: 8) {
+                    Text(detail.tags)
+                        .font(Theme.Typography.label)
                         .foregroundStyle(enabled ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(1)
+                    if let size = detail.size {
+                        Text(size)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .lineLimit(1)
+                    }
                 }
-                if let desc = stream.description, !desc.isEmpty {
-                    Text(desc).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                // One trimmed human-readable line for context (the release title), collapsed to a
+                // single line so a verbose multi-line add-on blurb can't bloat the row.
+                if let title = cleanTitle {
+                    Text(title)
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .lineLimit(1).truncationMode(.middle)
                 }
             }
             Spacer(minLength: 0)
@@ -1183,11 +1265,22 @@ private struct iOSStreamLabel: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    private func badge(_ text: String) -> some View {
+    /// A single trimmed context line: the add-on's stream `name` (its short release title) with
+    /// newlines collapsed to spaces, or the first line of `description` as a fallback. Never the full
+    /// multi-line blurb — that verbose dump is exactly what this row replaces.
+    private var cleanTitle: String? {
+        let raw = stream.name?.isEmpty == false ? stream.name : stream.description
+        guard let raw, !raw.isEmpty else { return nil }
+        let firstLine = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? raw
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func badge(_ text: String, prominent: Bool = false) -> some View {
         Text(text).font(Theme.Typography.eyebrow).tracking(1)
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Theme.Palette.surface3, in: Capsule())
-            .foregroundStyle(Theme.Palette.textSecondary)
+            .background(prominent ? Theme.Palette.accent.opacity(0.22) : Theme.Palette.surface3, in: Capsule())
+            .foregroundStyle(prominent ? Theme.Palette.accent : Theme.Palette.textSecondary)
     }
 }
 

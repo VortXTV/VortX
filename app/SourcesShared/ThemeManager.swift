@@ -26,11 +26,25 @@ final class ThemeManager: ObservableObject {
 
     @Published var accentID: String { didSet { UserDefaults.standard.set(accentID, forKey: Self.accentKey) } }
     @Published var oled: Bool { didSet { UserDefaults.standard.set(oled, forKey: Self.oledKey) } }
-    /// UI text scale, 0.80 to 1.40. @Published so a change repaints the whole app LIVE (the
-    /// screens observe ThemeManager), the same path the accent uses; Theme.Typography reads it
-    /// per render. Static-let typography never updated because tvOS "Restart App" can't relaunch
-    /// the process, so the frozen sizes stuck.
-    @Published var textScale: Double { didSet { UserDefaults.standard.set(textScale, forKey: Self.textScaleKey) } }
+    /// UI text scale, 0.80 to 1.40. @Published so a change repaints the whole app LIVE (every screen
+    /// that observes ThemeManager), the same path the accent uses; Theme.Typography reads it per
+    /// render via `Theme.scaled`. Static-let typography never updated because tvOS "Restart App"
+    /// can't relaunch the process, so the frozen sizes stuck.
+    ///
+    /// The setter explicitly fans `objectWillChange` out FIRST and clamps in one place, so a write
+    /// from any path (the iOS Stepper's `$theme.textScale` binding, the tvOS +/- buttons via
+    /// `adjustTextScale`, a profile switch via `applyTheme`) invalidates observers deterministically.
+    /// Reading `textScale` through `Theme.Typography` alone does NOT subscribe a view — a view must
+    /// observe ThemeManager (`@EnvironmentObject theme`) for its fonts to repaint on change.
+    @Published var textScale: Double {
+        didSet {
+            let clamped = min(max(textScale, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound)
+            // Re-entrancy guard: only correct out-of-range writes (clamping fires didSet once more,
+            // then the value already equals `clamped` and we stop), never loop on an in-range write.
+            if clamped != textScale { textScale = clamped; return }
+            UserDefaults.standard.set(textScale, forKey: Self.textScaleKey)
+        }
+    }
 
     static let textScaleRange: ClosedRange<Double> = 0.80...1.40
     static let textScaleStep: Double = 0.05
@@ -46,10 +60,12 @@ final class ThemeManager: ObservableObject {
         textScale = saved.map { min(max($0, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound) } ?? 1.0
     }
 
-    /// Nudge the text scale one step within range (Settings +/- buttons).
+    /// Nudge the text scale one step within range (the tvOS Settings +/- buttons; the iOS Settings
+    /// Stepper writes `$theme.textScale` directly). Rounds to whole percent; the `textScale` setter
+    /// clamps to range and publishes, so observers repaint live.
     func adjustTextScale(_ direction: Int) {
-        let next = (textScale + Double(direction) * Self.textScaleStep)
-        textScale = (min(max(next, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound) * 100).rounded() / 100
+        let next = textScale + Double(direction) * Self.textScaleStep
+        textScale = (next * 100).rounded() / 100
     }
 
     /// Eight curated accents. Ember is the default and matches the original ember design.

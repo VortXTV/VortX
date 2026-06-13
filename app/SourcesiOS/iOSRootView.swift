@@ -44,11 +44,15 @@ struct iOSRootView: View {
             // screen's own state (scroll position, search query, engine subscriptions) survives a
             // tab switch instead of being torn down and rebuilt every time.
             ZStack {
-                iOSHomeView().opacity(tab == .home ? 1 : 0)
-                iOSDiscoverView().opacity(tab == .discover ? 1 : 0)
+                // `isActive` gates each browse screen's `.principal` wordmark: on macOS a principal
+                // toolbar item is hoisted into the shared window titlebar, and every mounted
+                // NavigationStack would otherwise stamp its own — tiling "StremioX" once per screen.
+                // Only the visible tab contributes its wordmark (#46 regression).
+                iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
+                iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0)
                 iOSLiveView().opacity(tab == .live ? 1 : 0)
-                iOSLibraryView().opacity(tab == .library ? 1 : 0)
-                iOSSearchView().opacity(tab == .search ? 1 : 0)
+                iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0)
+                iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0)
                 AddonsView().opacity(tab == .addons ? 1 : 0)
                 iOSSettingsView().opacity(tab == .settings ? 1 : 0)
             }
@@ -110,6 +114,8 @@ struct iOSRootView: View {
 /// engine, under the interactive featured hero. Signed-out shows a sign-in prompt; the rails populate
 /// as the engine hydrates.
 struct iOSHomeView: View {
+    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -143,20 +149,20 @@ struct iOSHomeView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            // The hero is the first scrolling element (an interactive header), not a behind-the-scroll
-            // backdrop: that keeps its Play / Trailer buttons + the tappable poster cards reachable
-            // (a ScrollView layered over a hero would otherwise eat the hero's taps). Its bottom fades
-            // into canvas, so the first rail still reads as tucking under the art as it scrolls.
+            // The hero is the first scrolling element (an ambient billboard header), not a
+            // behind-the-scroll backdrop: that keeps its Play / Trailer buttons + the tappable poster
+            // cards reachable (a ScrollView layered over a hero would otherwise eat the hero's taps).
+            // Its bottom fades cleanly into canvas with a small gap before the first rail (#52) — the
+            // old negative-overlap tuck made the hero bleed into Continue Watching.
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                     FeaturedHeroView(model: hero, onOpen: { path.append($0) })
-                        .padding(.bottom, -FeaturedHeroView.contentOverlap)
                     if !continueWatchingItems.isEmpty {
                         // A CW card tap resumes the exact last-played stream straight into the player
-                        // (#11), falling back to feature/open when no remembered link fits. Long-press
+                        // (#11), falling back to opening detail when no remembered link fits. Long-press
                         // offers the engine's "Remove from Continue Watching" (#14).
                         PosterRail(title: "Continue Watching", items: continueWatchingItems,
-                                   model: hero, onTap: handleContinueWatchingTap, menu: .continueWatching)
+                                   onTap: handleContinueWatchingTap, menu: .continueWatching)
                     }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
@@ -168,7 +174,7 @@ struct iOSHomeView: View {
                                                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
                                                     genres: $0.genres)
                                        },
-                                       model: hero, onTap: handleTap)
+                                       onTap: handleTap)
                         }
                     }
                     if core.boardRows.isEmpty && core.continueWatching.isEmpty {
@@ -177,8 +183,11 @@ struct iOSHomeView: View {
                 }
                 .padding(.bottom, Theme.Space.md)
             }
+            // A scroll gesture quiets the ambient hero rotation (resumes after inactivity) — the
+            // billboard never yanks the page while the user is browsing (#53).
+            .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .navigationTitle("StremioX")
+            .stremioWordmarkTitle("Home", isActive: isActive)
             .toolbar {
                 if !account.isSignedIn {
                     ToolbarItem(placement: .primaryAction) {
@@ -202,25 +211,27 @@ struct iOSHomeView: View {
         .onDisappear { hero.stop() }
     }
 
-    /// First tap on a card features it (pausing rotation); a second tap on the already-featured card
-    /// opens its detail. Mirrors the tvOS focus → select gesture for a focus-less platform.
+    /// Tapping a poster opens that title's detail through normal navigation — it does NOT "feature" it
+    /// in the hero. The hero is a decoupled ambient billboard (#53); the only side effect of a tap is
+    /// quieting its rotation for a beat.
     private func handleTap(_ item: RailItem) {
-        let heroItem = FeaturedHeroItem.from(rail: item)
-        if !hero.feature(heroItem) { path.append(heroItem) }
+        hero.noteInteraction()
+        path.append(FeaturedHeroItem.from(rail: item))
     }
 
     /// Continue-Watching one-tap direct resume (#11): play the exact last-played stream straight away
-    /// when one is remembered for this title/episode; otherwise fall back to the normal feature/open
-    /// router so the user reaches the detail page and picks a source. (Direct resume needs a remembered
-    /// link, which the player records as it plays; the first watch from the detail page seeds it.)
+    /// when one is remembered for this title/episode; otherwise fall back to opening the detail page so
+    /// the user picks a source. (Direct resume needs a remembered link, which the player records as it
+    /// plays; the first watch from the detail page seeds it.)
     private func handleContinueWatchingTap(_ item: RailItem) {
+        hero.noteInteraction()
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
-        // Task; fall back to the normal feature/open router when no remembered link fits.
+        // Task; fall back to opening detail when no remembered link fits.
         Task {
             if let launch = await iOSDirectResume(for: item, core: core, account: account) {
                 player = launch
             } else {
-                handleTap(item)
+                path.append(FeaturedHeroItem.from(rail: item))
             }
         }
     }
@@ -244,6 +255,8 @@ struct iOSHomeView: View {
 /// hero. Refreshes as the library changes; reloads while empty since it syncs asynchronously after
 /// sign-in.
 struct iOSLibraryView: View {
+    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -266,17 +279,16 @@ struct iOSLibraryView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 if let lib = core.library, !lib.catalog.isEmpty {
-                    // Hero is an interactive scroll-header above the grid (shown only when there are
-                    // saved titles), so its Play / Trailer buttons stay tappable. Type + sort filter
-                    // chip rows (#15) sit between the hero and the grid, mirroring the Discover chips
-                    // and the tvOS Library filters; long-press on a card offers the engine's library
-                    // actions (#14).
+                    // Hero is an ambient billboard scroll-header above the grid (shown only when there
+                    // are saved titles), so its Play / Trailer buttons stay tappable. Type + sort
+                    // filter chip rows (#15) sit between the hero and the grid, mirroring the Discover
+                    // chips and the tvOS Library filters; long-press on a card offers the engine's
+                    // library actions (#14). A clean gap separates the hero from the chips (#52).
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
                         FeaturedHeroView(model: hero, onOpen: { path.append($0) })
-                            .padding(.bottom, -FeaturedHeroView.contentOverlap)
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
                             filterChips(lib.selectable)
-                            PosterGrid(items: libraryItems, model: hero, onTap: handleTap, menu: .library)
+                            PosterGrid(items: libraryItems, onTap: handleTap, menu: .library)
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -286,8 +298,9 @@ struct iOSLibraryView: View {
                         .frame(minHeight: 420)
                 }
             }
+            .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .navigationTitle("Library")
+            .stremioWordmarkTitle("Library", isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
@@ -301,9 +314,10 @@ struct iOSLibraryView: View {
         .onDisappear { hero.stop() }
     }
 
+    /// Tapping a card opens its detail (decoupled hero, #53); it only quiets the billboard rotation.
     private func handleTap(_ item: RailItem) {
-        let heroItem = FeaturedHeroItem.from(rail: item)
-        if !hero.feature(heroItem) { path.append(heroItem) }
+        hero.noteInteraction()
+        path.append(FeaturedHeroItem.from(rail: item))
     }
 
     /// Type + sort chip rows (#15), mirroring the tvOS `LibraryView.filters`: each chip carries the
@@ -341,6 +355,8 @@ struct iOSLibraryView: View {
 /// engine's `CoreBridge.search` hard-gates at 2 chars, so a single-char query would otherwise read as
 /// a misleading empty state).
 struct iOSSearchView: View {
+    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @State private var query = ""
@@ -366,7 +382,7 @@ struct iOSSearchView: View {
                 .padding(.vertical, Theme.Space.md)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .navigationTitle("Search")
+            .stremioWordmarkTitle("Search", isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
@@ -477,6 +493,8 @@ struct iOSSearchView: View {
 /// chips carrying the engine's own request, dispatched back on tap, over a poster grid — under the
 /// interactive featured hero (shown once a catalog has loaded).
 struct iOSDiscoverView: View {
+    /// True only when this is the visible tab — gates the macOS window-titlebar wordmark (#46).
+    var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -493,27 +511,32 @@ struct iOSDiscoverView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                VStack(alignment: .leading, spacing: Theme.Space.md) {
                     if let discover = core.discover {
-                        // Hero is an interactive scroll-header above the chips + grid, shown once a
-                        // catalog has loaded; its Play / Trailer buttons stay tappable.
+                        // Hero is an ambient billboard scroll-header above the chips + grid, shown once
+                        // a catalog has loaded; its Play / Trailer buttons stay tappable. It fades
+                        // cleanly into the chip rows below — no negative overlap, so the filter pills
+                        // no longer ride up into the hero's title/synopsis band (#52, #7).
                         FeaturedHeroView(model: hero, onOpen: { path.append($0) })
-                            .padding(.bottom, -FeaturedHeroView.contentOverlap)
-                        chipScroll { ForEach(discover.selectable.types) { t in
-                            chip(t.type.capitalized, t.selected) { core.selectDiscover(t.request) } } }
-                        chipScroll { ForEach(discover.selectable.catalogs) { c in
-                            chip(c.catalog, c.selected) { core.selectDiscover(c.request) } } }
-                        if let genre = discover.selectable.extra.first(where: { $0.name.caseInsensitiveCompare("genre") == .orderedSame }),
-                           !genre.options.isEmpty {
-                            chipScroll { ForEach(genre.options) { o in
-                                chip(o.label, o.selected) { core.selectDiscover(o.request) } } }
+                        // The filter rows are their own vertically-stacked band: each chip row gets its
+                        // own line with consistent spacing so a row's pills can never be drawn on top
+                        // of the row above it (#7).
+                        VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                            chipScroll { ForEach(discover.selectable.types) { t in
+                                chip(t.type.capitalized, t.selected) { core.selectDiscover(t.request) } } }
+                            chipScroll { ForEach(discover.selectable.catalogs) { c in
+                                chip(c.catalog, c.selected) { core.selectDiscover(c.request) } } }
+                            if let genre = discover.selectable.extra.first(where: { $0.name.caseInsensitiveCompare("genre") == .orderedSame }),
+                               !genre.options.isEmpty {
+                                chipScroll { ForEach(genre.options) { o in
+                                    chip(o.label, o.selected) { core.selectDiscover(o.request) } } }
+                            }
                         }
                         PosterGrid(items: discover.items.map {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, model: hero, onTap: handleTap)
-                        .padding(.top, Theme.Space.sm)
+                        }, onTap: handleTap)
                     } else if account.isSignedIn {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 100)
                     } else {
@@ -524,8 +547,9 @@ struct iOSDiscoverView: View {
                 .padding(.top, core.discover != nil ? 0 : Theme.Space.md)
                 .padding(.bottom, Theme.Space.md)
             }
+            .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .navigationTitle("Discover")
+            .stremioWordmarkTitle("Discover", isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
@@ -541,9 +565,10 @@ struct iOSDiscoverView: View {
         .onDisappear { hero.stop() }
     }
 
+    /// Tapping a card opens its detail (decoupled hero, #53); it only quiets the billboard rotation.
     private func handleTap(_ item: RailItem) {
-        let heroItem = FeaturedHeroItem.from(rail: item)
-        if !hero.feature(heroItem) { path.append(heroItem) }
+        hero.noteInteraction()
+        path.append(FeaturedHeroItem.from(rail: item))
     }
 
     private func chipScroll<C: View>(@ViewBuilder _ content: () -> C) -> some View {
@@ -564,11 +589,11 @@ struct iOSDiscoverView: View {
     }
 }
 
-/// One catalog row's tappable poster. Beyond the poster + progress the card needs, it now carries the
-/// catalog preview fields (`background`, `description`, `releaseInfo`, `imdbRating`, `genres`) so a
-/// tapped card can seed the featured hero immediately, before enrichment — they're present on
-/// `CoreMeta` but were previously dropped at the `.map`. Continue Watching / Library entries lack a
-/// `background`, so the hero derives 16:9 art from metahub-by-IMDB-id (see `FeaturedHeroItem.from`).
+/// One catalog row's tappable poster. Beyond the poster + progress the card needs, it carries the
+/// catalog preview fields (`background`, `description`, `releaseInfo`, `imdbRating`, `genres`) so the
+/// detail route opened on tap arrives with rich seed data — they're present on `CoreMeta` but were
+/// previously dropped at the `.map`. Continue Watching / Library entries lack a `background`, so the
+/// hero derives 16:9 art from metahub-by-IMDB-id (see `FeaturedHeroItem.from`).
 struct RailItem: Identifiable {
     let id: String
     let type: String
@@ -844,30 +869,36 @@ private enum OpenLinkMagnet {
     }
 }
 
-/// A poster grid (Library, Search, Discover) of tappable cards. Cards are now `Button`s wired to an
+/// A poster grid (Library, Search, Discover) of tappable cards. Cards are `Button`s wired to an
 /// `onTap(item)` router (instead of pushing a `NavigationLink` directly), so the SCREEN decides what a
-/// tap means: first tap on a card features it in the hero (pausing auto-rotation); a second tap on the
-/// already-featured card opens its detail. The featured card gets a subtle ember ring + lift. `model`
-/// is optional so Search (which has no hero) keeps a plain tap-to-open behaviour.
+/// tap means — across all three surfaces it now opens the title's detail (the hero is a decoupled
+/// ambient billboard, #53), so there is no featured ring here.
+///
+/// Centering (#47): the adaptive columns are CENTER-aligned and the grid is constrained to the same
+/// row width that gives even, balanced columns — a `.leading`-aligned adaptive grid bunched cards to
+/// the left and left a ragged right gutter, which read as "left-aligned". Centering the columns and
+/// the trailing remainder keeps the grid even across the width at every breakpoint (iPhone → Mac).
 private struct PosterGrid: View {
     let items: [RailItem]
-    var model: FeaturedHeroModel? = nil
     let onTap: (RailItem) -> Void
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
-    /// where no engine action applies (e.g. the hero-less Search grid keeps `.catalog`).
+    /// where no engine action applies.
     var menu: iOSPosterMenu = .none
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    private let columns = [GridItem(.adaptive(minimum: 116), spacing: Theme.Space.sm)]
+    // Center the adaptive tracks so the cards distribute evenly across the available width instead of
+    // packing to the leading edge. Min track matches the 120pt card + a little breathing room.
+    private let columns = [GridItem(.adaptive(minimum: 116), spacing: Theme.Space.sm, alignment: .center)]
     var body: some View {
-        LazyVGrid(columns: columns, alignment: .leading, spacing: Theme.Space.md) {
+        LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button { onTap(item) } label: {
-                    PosterCardiOS(id: item.id, name: item.name, poster: item.poster, progress: item.progress,
-                                  featured: model?.isFeatured(item.id) ?? false, menu: menu)
+                    PosterCardiOS(id: item.id, name: item.name, poster: item.poster,
+                                  progress: item.progress, menu: menu)
                 }
                 .buttonStyle(.plain)
             }
         }
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, Theme.Space.md)
     }
 }
@@ -875,7 +906,6 @@ private struct PosterGrid: View {
 private struct PosterRail: View {
     let title: String
     let items: [RailItem]
-    var model: FeaturedHeroModel? = nil
     let onTap: (RailItem) -> Void
     /// Which long-press context menu each card shows on this surface (#14).
     var menu: iOSPosterMenu = .none
@@ -888,8 +918,8 @@ private struct PosterRail: View {
                 LazyHStack(spacing: Theme.Space.sm) {
                     ForEach(items) { item in
                         Button { onTap(item) } label: {
-                            PosterCardiOS(id: item.id, name: item.name, poster: item.poster, progress: item.progress,
-                                          featured: model?.isFeatured(item.id) ?? false, menu: menu)
+                            PosterCardiOS(id: item.id, name: item.name, poster: item.poster,
+                                          progress: item.progress, menu: menu)
                         }
                         .buttonStyle(.plain)
                     }
@@ -909,13 +939,9 @@ private struct PosterCardiOS: View {
     let name: String
     let poster: String?
     let progress: Double
-    /// True when this card is the one currently filling the hero — gets a subtle ember ring + lift so
-    /// the user can see which title they pinned (and that a second tap will open it).
-    var featured: Bool = false
-    /// Which long-press menu to attach (#14). `.none` attaches none, matching the old behaviour.
+    /// Which long-press menu to attach (#14). `.none` attaches none.
     var menu: iOSPosterMenu = .none
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu))
     }
@@ -942,17 +968,9 @@ private struct PosterCardiOS: View {
                 }
             }
             .frame(width: 120, height: 180)
-            // Featured treatment: an ember ring + soft halo on the pinned card.
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                    .strokeBorder(Theme.Palette.accent, lineWidth: featured ? 3 : 0)
-            )
-            .shadow(color: Theme.Palette.accent.opacity(featured ? 0.5 : 0), radius: featured ? 14 : 0)
-            .scaleEffect(featured && !reduceMotion ? 1.04 : 1)
-            .animation(reduceMotion ? nil : Theme.Motion.focus, value: featured)
             Text(name)
                 .font(Theme.Typography.label)
-                .foregroundStyle(featured ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
+                .foregroundStyle(Theme.Palette.textSecondary)
                 .lineLimit(1).frame(width: 120, alignment: .leading)
         }
     }
@@ -1018,6 +1036,58 @@ private struct PosterContextMenu: ViewModifier {
                 Label("Remove from Library", systemImage: "trash")
             }
         }
+    }
+}
+
+// MARK: - Browse-screen chrome helpers (#46 wordmark, #53 scroll quiets the ambient hero)
+
+extension View {
+    /// The accent-tinted brand wordmark in the navigation bar's principal slot — warm-white "Stremio"
+    /// with an ember "X", in the serif wordmark face — replacing the plain stock `.navigationTitle`
+    /// that fell back to flat white in dark mode (#46). Mirrors the tvOS `HomeView.header` wordmark.
+    /// The `pageTitle` is kept only as the bar's inline accessibility identity (and back-button
+    /// context); the visible principal item is always the wordmark, applied across Home / Discover /
+    /// Library / Search so the brand reads consistently.
+    /// `isActive` is the macOS guard: a `.principal` item is hoisted into the shared window titlebar,
+    /// and all seven tab screens stay mounted at once (opacity-switched to preserve state), so without
+    /// this gate every browse screen stamps its own wordmark and they tile ("StremioX"×4). The
+    /// conditional lives *inside* `@ToolbarContentBuilder` — branching the whole view instead would
+    /// change the NavigationStack's structural identity and reset its scroll/path on every tab switch.
+    func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {
+        navigationTitle(pageTitle)
+            .navigationBarTitleDisplayModeInlineCompat()
+            .toolbar {
+                if isActive {
+                    ToolbarItem(placement: .principal) {
+                        HStack(spacing: 0) {
+                            Text("Stremio").foregroundStyle(Theme.Palette.textPrimary)
+                            Text("X").foregroundStyle(Theme.Palette.accent)
+                        }
+                        .font(Theme.Typography.wordmark)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityLabel("StremioX")
+                    }
+                }
+            }
+    }
+
+    /// A scroll/drag on a browse screen quiets the ambient hero rotation; the model resumes it after a
+    /// spell of inactivity (#53). Implemented as a non-blocking `simultaneousGesture` so it observes
+    /// the drag without intercepting the ScrollView's own scrolling.
+    func scrollDismissesHeroRotation(model: FeaturedHeroModel) -> some View {
+        simultaneousGesture(
+            DragGesture(minimumDistance: 8)
+                .onChanged { _ in model.noteInteraction() }
+        )
+    }
+
+    /// `.navigationBarTitleDisplayMode(.inline)` is unavailable on macOS; no-op there.
+    @ViewBuilder fileprivate func navigationBarTitleDisplayModeInlineCompat() -> some View {
+        #if os(iOS)
+        navigationBarTitleDisplayMode(.inline)
+        #else
+        self
+        #endif
     }
 }
 

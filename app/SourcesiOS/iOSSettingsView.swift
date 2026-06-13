@@ -60,6 +60,11 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            // The whole Form follows the app accent (#49): toggles, segmented selections, picker
+            // checkmarks, stepper +/- glyphs, navigation chevrons, and any selected row tint inherit
+            // this instead of the system blue/grey, matching how tvOS SettingsView colors its
+            // controls. Per-control `.tint` overrides below stay (destructive red, etc.).
+            .tint(Theme.Palette.accent)
             .navigationTitle("Settings")
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .platformFullScreenCover(item: $editingProfile) { profile in
@@ -236,10 +241,14 @@ struct iOSSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
+                        // Reorder controls follow the accent (#49), dimmed when disabled at an end —
+                        // the touch twin of tvOS's accent reorder chips.
                         Button {
                             sourcePrefs.moveType(at: index, direction: -1)
                         } label: {
                             Image(systemName: "chevron.up")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(index == 0 ? Theme.Palette.textTertiary : Theme.Palette.accent)
                         }
                         .buttonStyle(.borderless)
                         .disabled(index == 0)
@@ -247,6 +256,8 @@ struct iOSSettingsView: View {
                             sourcePrefs.moveType(at: index, direction: 1)
                         } label: {
                             Image(systemName: "chevron.down")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(index == sourcePrefs.typeOrder.count - 1 ? Theme.Palette.textTertiary : Theme.Palette.accent)
                         }
                         .buttonStyle(.borderless)
                         .disabled(index == sourcePrefs.typeOrder.count - 1)
@@ -326,6 +337,7 @@ struct iOSSettingsView: View {
         )) {
             Label("Share streaming server on this network", systemImage: "wifi")
         }
+        .tint(Theme.Palette.accent)
 
         if shareOnLAN {
             if let url = NodeServer.lanURL {

@@ -57,8 +57,17 @@ enum Theme {
     // MARK: Typography (system only: New York serif for editorial moments, SF Pro for UI)
 
     /// Every size is a computed `static var` that multiplies by the LIVE text scale from
-    /// ThemeManager (Settings, Appearance). Because the screens observe ThemeManager, changing
-    /// the scale repaints the app instantly, the same way the accent does, no relaunch needed.
+    /// ThemeManager (Settings → Appearance → App text size). Because each screen observes
+    /// ThemeManager (`@EnvironmentObject theme`), changing the scale fires the manager's
+    /// `objectWillChange`, those screens re-evaluate `body`, and these getters re-run against the
+    /// new `textScale` — so the app repaints instantly, the same way the accent does, no relaunch.
+    ///
+    /// IMPORTANT reactivity contract: reading `Theme.Typography.*` does NOT by itself subscribe a
+    /// view to text-size changes (the read goes through `ThemeManager.shared`, not the view's
+    /// observed reference). A view (or its nearest observing ancestor) must hold
+    /// `@EnvironmentObject theme: ThemeManager` for its fonts to repaint live. On iOS/Mac the
+    /// browse, detail, player, and Settings screens all declare it; tvOS screens already did, which
+    /// is why text size worked there but not on iOS/Mac (#48).
     enum Typography {
         private static func scaled(_ size: CGFloat) -> CGFloat {
             // Base sizes are tvOS 10-foot dimensions. On phone / iPad / Mac, viewed at arm's length,

@@ -1,63 +1,49 @@
 import SwiftUI
 
-/// The interactive featured hero's per-screen model — the touch/Mac analogue of the tvOS
-/// `FocusedItemModel`, adapted for a focus-less platform. Where tvOS tracks the *focused* card,
-/// touch has two layered behaviours instead:
+/// The ambient billboard hero's per-screen model — the touch/Mac analogue of the tvOS
+/// `FocusedItemModel`, adapted for a focus-less platform. Where tvOS tracks the *focused* card, touch
+/// has no pointer to follow, so the hero is a SELF-DRIVEN ambient billboard (Netflix/Disney+ style):
 ///
-///   1. **Auto-rotate** (ambient, Netflix/Disney+ style): a small randomized pool of featured
-///      candidates (the top items of the screen) cross-fades every `heroRotateInterval`.
-///   2. **Click-to-feature** (override): tapping a poster pins it as the featured hero and PAUSES
-///      rotation; tapping the already-featured poster (or the hero's Play button) opens its detail.
+///   - A small randomized pool of candidates (the top items of the screen) cross-fades every
+///     `heroRotateInterval`, as a still backdrop with the Play + detail overlay.
+///   - The hero is fully DECOUPLED from the catalog grid/rails: it does NOT auto-select, focus, or
+///     ring any poster, and tapping a poster opens that title's detail through normal navigation —
+///     it never "features" the tapped title in the hero.
+///   - Rotation STOPS the moment the user interacts (scroll / hover / select) and resumes only after
+///     a spell of inactivity (`heroResumeAfter`). Reduce Motion disables rotation entirely.
 ///
 /// Each featured item is enriched with logo + trailer + synopsis through a SELF-CONTAINED meta
 /// fetch (Cinemeta + installed meta add-ons), replicating the tvOS enrichment but kept entirely
-/// inside SourcesiOS so the tvOS target is untouched. Enrichment is cached by id so re-showing a
-/// title (rotation looping, or returning to the screen) is instant.
+/// inside SourcesiOS so the tvOS target is untouched. Continue-Watching seeds carry no catalog meta,
+/// so this enrichment is what gives a CW hero its title/rating/year/genres/synopsis. Enrichment is
+/// cached by id so re-showing a title (rotation looping, or returning to the screen) is instant.
 @MainActor
 final class FeaturedHeroModel: ObservableObject {
     /// The item currently filling the hero (seed-grade until enrichment lands, then upgraded in place).
     @Published private(set) var hero: FeaturedHeroItem?
-    /// True once the user has pinned a pick; rotation stays paused until the screen reseeds.
-    @Published private(set) var isUserFeatured = false
 
-    /// Auto-advance cadence. The user asked for "every 3 seconds or something"; we lean slightly above
-    /// 3s so a reader can take in the title + synopsis before the cross-fade.
-    static let heroRotateInterval: Duration = .seconds(3.5)
+    /// Ambient auto-advance cadence. ~7s so a reader can take in the title + synopsis before the
+    /// cross-fade (issue #53; was 3.5s, which churned too fast).
+    static let heroRotateInterval: Duration = .seconds(7)
     /// Cross-fade duration for the backdrop + overlay swap.
     static let heroCrossfade: Double = 0.45
     /// How many candidates the rotating pool holds at most.
     static let heroPoolCap = 5
-
-    /// Dwell before the muted trailer autoplay fades in once the hero settles on a title that has a
-    /// trailer. Long enough that fast rotating/tapping through items never starts a stale player
-    /// (the dwell timer is cancelled the instant the featured item changes), short enough to feel
-    /// like Netflix's ambient preview.
-    static let trailerAutoplayDwell: Duration = .seconds(1.3)
-    /// If the embed hasn't reported that it began loading within this window after it mounts, treat
-    /// it as a failure and silently drop the autoplay layer back to the still backdrop.
-    static let trailerAutoplayLoadTimeout: Duration = .seconds(6)
-    /// Cross-fade for the autoplay layer fading in over the still backdrop.
-    static let trailerAutoplayFade: Double = 0.6
-    /// Maximum time the hero will dwell on one item while its trailer plays before rotation resumes
-    /// and advances anyway. Without this cap a looping trailer would pin the hero on a single title
-    /// forever; this guarantees the carousel always eventually moves on (the advance itself tears the
-    /// trailer down and can autoplay the next item's preview).
-    static let trailerMaxDwell: Duration = .seconds(25)
+    /// After the user interacts (scroll / hover / select), rotation pauses and only resumes once this
+    /// much time has passed with no further interaction — so the billboard never yanks the page out
+    /// from under someone who is reading or browsing.
+    static let heroResumeAfter: Duration = .seconds(12)
 
     /// The randomized rotation pool (seed-grade items; each is enriched lazily when shown).
     private var pool: [FeaturedHeroItem] = []
     private var rotationIndex = 0
     private var rotationTask: Task<Void, Never>?
 
-    /// Set while a trailer is actually mounted/playing behind the art: the rotation loop holds the
-    /// current item instead of advancing, so the viewer can watch the trailer instead of the hero
-    /// rotating away ~1.6s in. Toggled by the view via `pauseRotation()` / `resumeRotation()` as the
-    /// autoplay layer mounts/tears down. Holding does NOT cancel the rotation task or touch the
-    /// rotation order — `rotationIndex` is preserved and the loop continues from it on resume.
-    private var rotationHeld = false
-    /// Caps how long `rotationHeld` may pin the hero: started on pause, it auto-resumes + advances
-    /// after `trailerMaxDwell` so a looping trailer can never freeze the carousel forever.
-    private var holdTask: Task<Void, Never>?
+    /// Set while the user is actively interacting with the screen: the rotation loop holds the current
+    /// item instead of advancing. A pending resume task clears it after `heroResumeAfter` of quiet.
+    private var interactionHeld = false
+    /// The debounced "resume rotation after inactivity" task; restarted on every interaction.
+    private var resumeTask: Task<Void, Never>?
 
     /// Whether motion (auto-rotate + cross-fade) is allowed. Driven by the view's
     /// `accessibilityReduceMotion`; when false, the hero shows a single static featured item.
@@ -99,7 +85,6 @@ final class FeaturedHeroModel: ObservableObject {
             stop()
             pool = []
             rotationIndex = 0
-            isUserFeatured = false
             hero = nil
             return
         }
@@ -109,20 +94,19 @@ final class FeaturedHeroModel: ObservableObject {
 
         pool = capped.shuffled()
         rotationIndex = 0
-        isUserFeatured = false
-        // Fresh content: drop any trailer hold carried over from the previous pool so it can't
-        // suppress the new rotation before the view re-arms autoplay for the new hero.
-        holdTask?.cancel(); holdTask = nil
-        rotationHeld = false
+        // Fresh content: drop any interaction hold carried over from the previous pool so it can't
+        // suppress the new rotation.
+        resumeTask?.cancel(); resumeTask = nil
+        interactionHeld = false
         show(pool[rotationIndex], animated: false)
         startRotation()
     }
 
-    /// Kick off (or restart) the auto-advance loop. No-op when motion is disabled, the pool has a
-    /// single item, or the user has pinned a pick.
+    /// Kick off (or restart) the auto-advance loop. No-op when motion is disabled or the pool has a
+    /// single item.
     private func startRotation() {
         rotationTask?.cancel()
-        guard motionEnabled, pool.count > 1, !isUserFeatured else { return }
+        guard motionEnabled, pool.count > 1 else { return }
         rotationTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.heroRotateInterval)
@@ -132,16 +116,16 @@ final class FeaturedHeroModel: ObservableObject {
         }
     }
 
-    /// One rotation tick: advance unless a trailer is currently held. When held we keep the timer
-    /// alive (so the cadence resumes immediately once the trailer tears down) but leave the hero put
-    /// — the `trailerMaxDwell` hold task is what eventually breaks a long-looping trailer free.
+    /// One rotation tick: advance unless the user is currently interacting. While held we keep the
+    /// timer alive (so the cadence resumes immediately once the inactivity window elapses) but leave
+    /// the hero put.
     private func advanceIfNotHeld() {
-        guard !rotationHeld else { return }
+        guard !interactionHeld else { return }
         advance()
     }
 
     private func advance() {
-        guard motionEnabled, pool.count > 1, !isUserFeatured else { return }
+        guard motionEnabled, pool.count > 1 else { return }
         rotationIndex = (rotationIndex + 1) % pool.count
         show(pool[rotationIndex], animated: true)
     }
@@ -150,70 +134,33 @@ final class FeaturedHeroModel: ObservableObject {
     func stop() {
         rotationTask?.cancel()
         rotationTask = nil
-        // Drop any active hold so a re-seed/disappear can't leave the loop pinned. The flag is
-        // cleared too — without a running task, holding means nothing, and the next `seed` starts
-        // fresh.
-        holdTask?.cancel(); holdTask = nil
-        rotationHeld = false
+        // Drop any pending resume so a re-seed/disappear can't leave the loop pinned.
+        resumeTask?.cancel(); resumeTask = nil
+        interactionHeld = false
     }
 
-    // MARK: Trailer dwell (pause/resume rotation while a trailer is mounted)
+    // MARK: User interaction (pause rotation; resume after inactivity)
 
-    /// Hold the current item: the view calls this the instant the muted-trailer layer actually mounts
-    /// so rotation doesn't advance away mid-trailer. Idempotent — a second pause while already held is
-    /// a no-op (so duplicate mounts can't stack). Does NOT touch the rotation task or `rotationIndex`,
-    /// so the order is preserved and resume continues from where it left off. Never fights a user pin:
-    /// when the user has pinned an item rotation is already stopped, so there's nothing to hold.
-    func pauseRotation() {
-        guard !rotationHeld, !isUserFeatured else { return }
-        rotationHeld = true
-        // Cap the dwell: after `trailerMaxDwell`, resume and advance so a looping trailer can't pin
-        // the hero forever. The advance tears the trailer down and can autoplay the next preview.
-        holdTask?.cancel()
-        holdTask = Task { [weak self] in
-            try? await Task.sleep(for: Self.trailerMaxDwell)
+    /// The user touched the screen (scroll / hover / select). Pause the ambient rotation immediately
+    /// and (re)start the inactivity timer; rotation resumes only once `heroResumeAfter` passes with no
+    /// further interaction. No-op when motion is disabled. Decoupled from selection: this never pins,
+    /// rings, or opens any poster — it only quiets the billboard while the user is busy (issue #53).
+    func noteInteraction() {
+        guard motionEnabled else { return }
+        interactionHeld = true
+        resumeTask?.cancel()
+        resumeTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.heroResumeAfter)
             guard !Task.isCancelled else { return }
-            await self?.resumeAndAdvance()
+            await self?.releaseInteractionHold()
         }
     }
 
-    /// Release the hold so the rotation loop resumes advancing at its normal cadence. Idempotent — a
-    /// resume when not held is a no-op, so a trailer that fails before it ever mounted (and so never
-    /// paused) can't wrongly cancel a hold or leave the loop stuck. The pending `trailerMaxDwell` cap
-    /// is cancelled here since a normal teardown beat it to the punch.
-    func resumeRotation() {
-        guard rotationHeld else { return }
-        rotationHeld = false
-        holdTask?.cancel(); holdTask = nil
+    /// Inactivity elapsed: release the hold so the rotation loop resumes advancing at its cadence.
+    private func releaseInteractionHold() {
+        interactionHeld = false
+        resumeTask?.cancel(); resumeTask = nil
     }
-
-    /// The `trailerMaxDwell` expiry path: release the hold and immediately advance to the next item
-    /// (which tears the current trailer down). No-op if the hold was already released in the meantime.
-    private func resumeAndAdvance() {
-        guard rotationHeld else { return }
-        rotationHeld = false
-        holdTask?.cancel(); holdTask = nil
-        advance()
-    }
-
-    // MARK: Click-to-feature
-
-    /// User tapped a poster: pin it as the featured hero and PAUSE rotation. Returns `true` when this
-    /// is a *new* pick (caller stays on the screen); `false` when the tapped item is ALREADY featured
-    /// (the caller should open detail — the second-tap / Play-button "open" path).
-    @discardableResult
-    func feature(_ item: FeaturedHeroItem) -> Bool {
-        if let hero, hero.id == item.id {
-            return false   // already featured → caller opens detail
-        }
-        isUserFeatured = true
-        stop()
-        show(item, animated: motionEnabled)
-        return true
-    }
-
-    /// Whether the given id is the one currently filling the hero (drives the poster "featured" ring).
-    func isFeatured(_ id: String) -> Bool { hero?.id == id }
 
     // MARK: Showing + enrichment
 
@@ -230,9 +177,10 @@ final class FeaturedHeroModel: ObservableObject {
     }
 
     /// Fill in logo / trailer / synopsis / rating / year / runtime / genres (and better 16:9 art) for
-    /// a seed-grade item by fetching its meta from Cinemeta + the installed meta add-ons. Cached to
-    /// the session cache; applied live only if the title is still the one on screen. Self-contained
-    /// (no dependency on the tvOS `FocusedItemModel`), so tvOS is untouched.
+    /// a seed-grade item by fetching its meta from Cinemeta + the installed meta add-ons. This is what
+    /// gives Continue-Watching heroes — which carry only a name + poster — a real meta row and synopsis
+    /// (issue #54). Cached to the session cache; applied live only if the title is still the one on
+    /// screen. Self-contained (no dependency on the tvOS `FocusedItemModel`), so tvOS is untouched.
     private func enrichIfNeeded(_ item: FeaturedHeroItem) {
         guard Self.enrichmentCache[item.id] == nil else { return }
         let candidates = Self.metaURLs(for: item)
@@ -313,6 +261,7 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
 
     /// Seed from a Continue Watching / library entry, which carries only a poster: real 16:9 art comes
     /// from metahub for IMDB ids, falling back to the poster (mirrors tvOS `CoreCWItem.focusedHero`).
+    /// The title/rating/year/genres/synopsis are filled in by the model's background enrichment (#54).
     static func from(cw: CoreCWItem) -> FeaturedHeroItem {
         FeaturedHeroItem(
             id: cw.id, type: cw.type, name: cw.name, poster: cw.poster,
@@ -322,8 +271,8 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
             trailerYouTubeID: nil)
     }
 
-    /// Build from the lightweight `RailItem` carried through the rails/grid (so a tapped card can pin
-    /// the hero immediately, before any fetch). `RailItem` now carries the catalog preview fields.
+    /// Build from the lightweight `RailItem` carried through the rails/grid (so the hero can seed
+    /// richly from catalog preview fields). `RailItem` now carries the catalog preview fields.
     static func from(rail: RailItem) -> FeaturedHeroItem {
         FeaturedHeroItem(
             id: rail.id, type: rail.type, name: rail.name, poster: rail.poster,

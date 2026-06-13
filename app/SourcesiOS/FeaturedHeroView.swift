@@ -1,36 +1,28 @@
 import SwiftUI
 
-/// The interactive featured hero shown at the top of Home, Library, and Discover — the touch/Mac
-/// twin of the tvOS browse hero. It mirrors the `iOSDetailView` hero's visual language exactly:
-/// a full-bleed `meta.background` backdrop with the same dual-gradient scrim, a logo-or-serif-title,
-/// the ★rating · year · runtime · genres meta row, a 3-line synopsis, and a Play + Trailer action row.
+/// The ambient featured hero shown at the top of Home, Library, and Discover — the touch/Mac twin of
+/// the tvOS browse hero. It mirrors the `iOSDetailView` hero's visual language: a full-bleed
+/// `meta.background` STILL backdrop with the same dual-gradient scrim, a logo-or-serif-title, the
+/// ★rating · year · runtime · genres meta row, a 3-line synopsis, and a Play + Trailer action row.
 ///
-/// Unlike the old image-only `iOSHeroBackdrop`, this hero is INTERACTIVE: it reflects the model's
-/// auto-rotating / user-pinned featured item, cross-fades on change (keyed on the hero id), and its
-/// Play button opens the featured title's detail page. The cross-fade and auto-rotation honour
-/// `accessibilityReduceMotion` (the model is seeded with the flag; the view swaps instantly when set).
+/// This hero is an AMBIENT BILLBOARD, decoupled from the catalog grid: the model rotates it through a
+/// random pool of top items as a still backdrop, and rotation quiets while the user interacts. It does
+/// NOT auto-select / focus / ring any poster, and tapping a poster opens that title via normal
+/// navigation rather than "featuring" it here (issue #53). The hero never plays a trailer inline — the
+/// dead in-hero YouTube autoplay layer (issue #46/#1/#3, "Error 153" widget that occluded the art) was
+/// removed; the Play button opens the title's detail and the Trailer chip plays in a full-screen cover.
+/// The cross-fade and rotation honour `accessibilityReduceMotion` (the view swaps instantly when set).
 struct FeaturedHeroView: View {
     @ObservedObject var model: FeaturedHeroModel
-    /// Open the featured title's detail page (hero Play button / second-tap router).
+    /// Open the featured title's detail page (hero Play button).
     let onOpen: (FeaturedHeroItem) -> Void
 
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// A trailer to present in the in-app cover, when the user taps the Trailer chip.
+    /// A trailer to present in the in-app cover, when the user taps the Trailer chip. (Detail-page
+    /// trailers live here only as an explicit, user-initiated full-screen cover — never inline.)
     @State private var trailer: TrailerLaunch?
-
-    // MARK: Muted autoplay state (Netflix-style ambient preview behind the hero art)
-
-    /// The YouTube id currently authorized to autoplay muted behind the art. Set only after the
-    /// `trailerAutoplayDwell` elapses on a settled, trailer-bearing hero; cleared the instant the
-    /// featured item changes, the view disappears, the embed fails, or it times out — so at most one
-    /// webview is ever mounted, and only for the currently featured item.
-    @State private var autoplayYouTubeID: String?
-    /// Cancels the pending dwell so a fast rotation / poster tap never starts a stale trailer.
-    @State private var dwellTask: Task<Void, Never>?
-    /// Cancels the load-timeout watchdog when the embed reports it started (or on teardown).
-    @State private var loadTimeoutTask: Task<Void, Never>?
 
     /// Hero band height: a touch shorter on phones, taller on the Mac — matches `iOSDetailView`.
     static var heroHeight: CGFloat {
@@ -41,21 +33,13 @@ struct FeaturedHeroView: View {
         #endif
     }
 
-    /// How far the first row beneath the hero tucks UP into the hero's lower, faded band, so content
-    /// reads as layering under the art (the cinematic "scroll over the backdrop" feel) instead of
-    /// starting on a hard edge.
-    static let contentOverlap: CGFloat = 72
-
     private var heroHeight: CGFloat { Self.heroHeight }
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            // Base layer: the still backdrop. Always present, so it stays as the visible art before
-            // dwell, between items, and as the silent fallback whenever autoplay can't run.
+            // The still backdrop image — the only art layer. No trailer webview is ever mounted over
+            // it, so nothing can occlude the artwork (issue #46/#1/#3).
             backdrop
-            // Ambient muted trailer, layered ABOVE the still art but BELOW the scrim + text overlay,
-            // and non-interactive so the hero's Play/Trailer buttons and poster taps still work.
-            autoplayLayer
             if let hero = model.hero {
                 content(hero)
                     .padding(.horizontal, Theme.Space.md)
@@ -69,7 +53,7 @@ struct FeaturedHeroView: View {
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
         // The LazyVStack host has no horizontal padding (each rail insets itself), so the band is
-        // already edge-to-edge — a fixed-height interactive scroll-header.
+        // already edge-to-edge — a fixed-height ambient scroll-header.
         // Animate the swap on the hero id — the model already wraps content changes in the matching
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
@@ -77,117 +61,9 @@ struct FeaturedHeroView: View {
         .platformFullScreenPlayerCover(item: $trailer) { launch in
             TrailerPlayerScreen(launch: launch, onClose: { trailer = nil })
         }
-        // Re-evaluate autoplay whenever the featured item changes (rotation advances OR the user
-        // pins a new poster). This cancels any pending dwell + tears down the current layer first,
-        // so a fast rotation can never start a stale trailer.
-        .onChange(of: model.hero?.id) { _ in scheduleAutoplay() }
-        // Async enrichment fills `trailerYouTubeID` in place on the SAME hero id, so the id observer
-        // above won't re-fire — watch the trailer id too, else the first/static hero never autoplays.
-        .onChange(of: model.hero?.trailerYouTubeID) { _ in scheduleAutoplay() }
-        // Honor a live Reduce Motion toggle: switching it on immediately drops the autoplay layer.
-        .onChange(of: reduceMotion) { _ in scheduleAutoplay() }
-        // Pin the hero while a trailer is actually mounted, and release the moment it tears down.
-        // Keying off `autoplayYouTubeID` (the layer's real mount/unmount signal) keeps pause/resume
-        // perfectly balanced: a dwell that fails before ever mounting never sets this, so it never
-        // pauses; every teardown (item change, load fail, timeout, reduce-motion, disappear) routes
-        // through `cancelAutoplay` which nils it, firing the resume.
-        .onChange(of: autoplayYouTubeID) { id in
-            if id != nil { model.pauseRotation() } else { model.resumeRotation() }
-        }
-        // Arm autoplay for the first settled hero once the view appears.
-        .onAppear { scheduleAutoplay() }
-        // Stop + remove the autoplay layer when the hero leaves the screen.
-        .onDisappear { cancelAutoplay() }
     }
 
-    // MARK: Autoplay layer + lifecycle
-
-    /// The muted, looping trailer playing behind the art — present only for the currently authorized
-    /// featured id. Non-interactive so the hero's buttons/poster taps pass through to the layers
-    /// below; on any load failure or timeout it removes itself (via `cancelAutoplay`) so the still
-    /// backdrop shows through and nothing broken is ever visible.
-    @ViewBuilder private var autoplayLayer: some View {
-        if let id = autoplayYouTubeID, let embed = mutedLoopingEmbedURL(forYouTubeID: id) {
-            AutoplayTrailerWebView(
-                url: embed,
-                onStarted: { loadTimeoutTask?.cancel(); loadTimeoutTask = nil },
-                onFailure: { cancelAutoplay() })
-                .frame(height: heroHeight)
-                .frame(maxWidth: .infinity)
-                .clipped()
-                .allowsHitTesting(false)
-                .transition(.opacity)
-                // Match the still backdrop's gradients so the scrim + text stay readable over video.
-                .overlay(
-                    LinearGradient(stops: [
-                        .init(color: .clear, location: 0.0),
-                        .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.5),
-                        .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.82),
-                        .init(color: Theme.Palette.canvas, location: 1.0),
-                    ], startPoint: .top, endPoint: .bottom)
-                    .allowsHitTesting(false)
-                )
-                .overlay(
-                    LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
-                                   startPoint: .leading, endPoint: .center)
-                    .allowsHitTesting(false)
-                )
-                .id(id)
-        }
-    }
-
-    /// Cancel any in-flight dwell + timeout and, after `trailerAutoplayDwell`, fade in the muted
-    /// trailer for the currently settled hero — but only when motion is allowed AND the hero carries
-    /// a playable trailer. The graceful-fallback gate lives here: no trailer (`trailerYouTubeID` nil
-    /// or no playable URL) or reduced motion → we never start, the still backdrop stays.
-    private func scheduleAutoplay() {
-        // Always tear down first: a change must reset to the still backdrop and never stack webviews.
-        cancelAutoplay()
-
-        guard !reduceMotion else { return }
-        guard let hero = model.hero, let yt = hero.trailerYouTubeID,
-              TrailerRequest(title: hero.name, youTubeID: yt, directURL: nil).playableURL != nil
-        else { return }
-
-        dwellTask = Task { @MainActor in
-            try? await Task.sleep(for: FeaturedHeroModel.trailerAutoplayDwell)
-            guard !Task.isCancelled, !reduceMotion,
-                  model.hero?.id == hero.id, model.hero?.trailerYouTubeID == yt else { return }
-            withAnimation(.easeOut(duration: FeaturedHeroModel.trailerAutoplayFade)) {
-                autoplayYouTubeID = yt
-            }
-            startLoadTimeout()
-        }
-    }
-
-    /// Watchdog: if the embed never reports it began loading within `trailerAutoplayLoadTimeout`,
-    /// treat it as a failure and silently drop back to the still backdrop (no spinner, no black box).
-    private func startLoadTimeout() {
-        loadTimeoutTask?.cancel()
-        loadTimeoutTask = Task { @MainActor in
-            try? await Task.sleep(for: FeaturedHeroModel.trailerAutoplayLoadTimeout)
-            guard !Task.isCancelled else { return }
-            cancelAutoplay()
-        }
-    }
-
-    /// Stop + remove the autoplay layer immediately and cancel both timers. Resets to the still
-    /// backdrop. Called on item change, disappear, reduced-motion, load failure, and timeout.
-    private func cancelAutoplay() {
-        dwellTask?.cancel(); dwellTask = nil
-        loadTimeoutTask?.cancel(); loadTimeoutTask = nil
-        if autoplayYouTubeID != nil {
-            if reduceMotion {
-                autoplayYouTubeID = nil
-            } else {
-                withAnimation(.easeOut(duration: FeaturedHeroModel.trailerAutoplayFade)) {
-                    autoplayYouTubeID = nil
-                }
-            }
-        }
-    }
-
-    // MARK: Backdrop (full-bleed art + dual scrim, lifted from iOSHeroBackdrop / iOSDetailView.backdrop)
+    // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)
 
     private var backdrop: some View {
         AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
@@ -299,6 +175,7 @@ struct FeaturedHeroView: View {
 
     /// The Trailer chip — shown only when the enriched hero carries a trailer whose `playableURL`
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
+    /// Tapping it opens an explicit full-screen player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
         if let yt = hero.trailerYouTubeID,
            TrailerRequest(title: hero.name, youTubeID: yt, directURL: nil).playableURL != nil {

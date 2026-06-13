@@ -162,6 +162,23 @@ struct LinkLoginView: View {
                                 status = "Signing in…"
                                 errorMessage = nil
                             }
+                            // `read` only proves the link service handed back a key — NOT that the
+                            // main account API still honours it. A rejected/expired token is gated
+                            // here: validate against api.strem.io first, and only commit to a
+                            // signed-in state once the session is confirmed. On failure we surface
+                            // the message and leave the panel open (no flip to signed-in, no
+                            // dismiss), so a dead token can never look like a successful sign-in
+                            // with an empty add-on list.
+                            do {
+                                try await LinkAuthService.validate(authKey: token)
+                            } catch {
+                                let message = error.localizedDescription
+                                await MainActor.run {
+                                    status = ""
+                                    errorMessage = message
+                                }
+                                return
+                            }
                             await account.signInWithAuthKey(token)
                             return
                         case .pending:
