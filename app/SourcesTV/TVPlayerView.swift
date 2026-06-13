@@ -594,7 +594,7 @@ struct TVPlayerView: View {
         let bubbleWidth: CGFloat = 480
         let bubbleHeight: CGFloat = 270
         return VStack(spacing: 6) {
-            Image(uiImage: image)
+            Image(platformImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: bubbleWidth, height: bubbleHeight)

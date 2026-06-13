@@ -23,7 +23,7 @@ struct SettingsView: View {
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
-    @AppStorage(TrickplayManifestURLBuilder.serverURLKey) private var trickplayServerURL = ""
+    @AppStorage(PlaybackSettings.Key.trickplayServerURL) private var trickplayServerURL = ""
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {

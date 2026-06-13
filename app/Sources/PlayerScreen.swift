@@ -101,6 +101,8 @@ struct PlayerScreen: View {
     @State private var appliedAutoTracks = false
     @State private var controlsVisible = true
     @State private var scrubbing = false
+    @State private var hoverPreviewTime: Double?
+    @State private var hoverPreviewRatio: CGFloat?
     @State private var panel: Panel?
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
     @State private var forcedLandscape = false
@@ -116,6 +118,7 @@ struct PlayerScreen: View {
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
+    @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
     // External subtitles from the account's subtitle add-ons, listed beside the file's embedded tracks.
     @State private var addonSubs: [AddonSubtitle] = []
     @State private var addedSubURLs: Set<String> = []
@@ -221,6 +224,7 @@ struct PlayerScreen: View {
         .tint(Theme.Palette.accent)
         .onAppear {
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            scrubThumbnails.configure(trickplayManifestURL: TrickplayManifestURLBuilder.makeURL(for: recordMeta))
             scheduleHide(); startLoadTimeout()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
@@ -776,19 +780,61 @@ struct PlayerScreen: View {
                 // indicator. The user pauses/resumes; there's nothing to seek to.
                 liveIndicator
             } else {
-                HStack(spacing: 12) {
-                    Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white)
-                    Slider(value: $currentTime, in: 0...max(duration, 1)) { editing in
-                        scrubbing = editing
-                        if editing { hideTask?.cancel() }
-                        else {
-                            coordinator.player?.seek(to: currentTime)
-                            if duration > 0 { onSeek(currentTime, duration); lastReported = currentTime }
-                            scheduleHide()
+                VStack(spacing: 6) {
+                    HStack(spacing: 12) {
+                        Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                        GeometryReader { geo in
+                            Slider(value: $currentTime, in: 0...max(duration, 1)) { editing in
+                                scrubbing = editing
+                                if editing {
+                                    hideTask?.cancel()
+                                    hoverPreviewTime = nil
+                                    hoverPreviewRatio = nil
+                                    scrubThumbnails.show(time: currentTime)
+                                } else {
+                                    coordinator.player?.seek(to: currentTime)
+                                    if duration > 0 { onSeek(currentTime, duration); lastReported = currentTime }
+                                    if hoverPreviewTime != nil {
+                                        scrubThumbnails.show(time: hoverPreviewTime ?? currentTime)
+                                    } else {
+                                        scrubThumbnails.clear()
+                                    }
+                                    scheduleHide()
+                                }
+                            }
+                            .onChange(of: currentTime) { if scrubbing { scrubThumbnails.show(time: currentTime) } }
+                            .tint(Theme.Palette.accent)
+                            #if os(macOS)
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let location):
+                                    guard !scrubbing else { return }
+                                    let ratio = hoverRatio(for: location.x, sliderWidth: geo.size.width)
+                                    hoverPreviewRatio = ratio
+                                    let time = Double(ratio) * max(duration, 0)
+                                    hoverPreviewTime = time
+                                    scrubThumbnails.show(time: time)
+                                case .ended:
+                                    guard !scrubbing else { return }
+                                    hoverPreviewTime = nil
+                                    hoverPreviewRatio = nil
+                                    scrubThumbnails.clear()
+                                }
+                            }
+                            #endif
+                            .overlay(alignment: .topLeading) {
+                                if showingTrickplayBubble, let image = scrubThumbnails.image {
+                                    trickplayBubble(image)
+                                        .frame(width: 320, height: 180)
+                                        .offset(x: trickplayBubbleX(sliderWidth: geo.size.width), y: -188)
+                                }
+                            }
                         }
-                    }.tint(Theme.Palette.accent)
-                    Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                        .frame(height: 24)
+                        Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    }
                 }
+                .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)
             }
 
             HStack(spacing: 0) {
@@ -809,6 +855,53 @@ struct PlayerScreen: View {
             .padding(.horizontal, 8)
         }
         .padding(.horizontal).padding(.bottom, 22)
+    }
+
+    private func trickplayBubble(_ image: PlatformImage) -> some View {
+        trickplayImage(image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(maxWidth: 320, maxHeight: 180)
+            .background(.black)
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(.white.opacity(0.2), lineWidth: 1))
+            .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+            .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)))
+    }
+
+    private func trickplayImage(_ image: PlatformImage) -> Image {
+        #if canImport(AppKit)
+        return Image(nsImage: image)
+        #else
+        return Image(uiImage: image)
+        #endif
+    }
+
+    private func trickplayBubbleX(sliderWidth: CGFloat) -> CGFloat {
+        let bubbleWidth: CGFloat = 320
+        guard sliderWidth > 0 else { return 0 }
+        let ratio = currentPreviewRatio
+        let centered = ratio * sliderWidth - bubbleWidth / 2
+        let maxX = max(0, sliderWidth - bubbleWidth)
+        return min(max(0, centered), maxX)
+    }
+
+    private var showingTrickplayBubble: Bool {
+        scrubbing || hoverPreviewTime != nil
+    }
+
+    private var currentPreviewRatio: CGFloat {
+        if let hoverPreviewRatio, !scrubbing {
+            return hoverPreviewRatio
+        }
+        guard duration > 0 else { return 0 }
+        return CGFloat(min(max(currentTime / duration, 0), 1))
+    }
+
+    private func hoverRatio(for x: CGFloat, sliderWidth: CGFloat) -> CGFloat {
+        guard sliderWidth > 0 else { return 0 }
+        return min(max(0, x / sliderWidth), 1)
     }
 
     /// The Live position indicator shown in place of the scrubber: a pulsing red dot + "LIVE", and a

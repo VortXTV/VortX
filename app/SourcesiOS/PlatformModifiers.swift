@@ -1,6 +1,14 @@
 import SwiftUI
 #if canImport(AppKit)
 import AppKit
+#elseif canImport(UIKit)
+import UIKit
+#endif
+
+#if canImport(AppKit)
+typealias PlatformImage = NSImage
+#else
+typealias PlatformImage = UIImage
 #endif
 
 /// Cross-platform shims for iOS-only SwiftUI modifiers, so the shared SourcesiOS views compile on
@@ -22,6 +30,21 @@ extension View {
         self.keyboardType(.emailAddress).textInputAutocapitalization(.never)
         #else
         self
+        #endif
+    }
+
+    /// URL-oriented text field tuning: disables correction everywhere, and disables automatic
+    /// capitalization only on iOS where the API exists.
+    @ViewBuilder func urlFieldStyle(alignment: TextAlignment = .leading) -> some View {
+        #if os(iOS)
+        self
+            .autocorrectionDisabled()
+            .textInputAutocapitalization(.never)
+            .multilineTextAlignment(alignment)
+        #else
+        self
+            .autocorrectionDisabled()
+            .multilineTextAlignment(alignment)
         #endif
     }
 

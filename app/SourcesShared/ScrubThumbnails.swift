@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#elseif canImport(UIKit)
 import UIKit
+#endif
 import os
 
 struct ScrubThumbnailCue: Hashable {
@@ -86,7 +90,7 @@ enum ScrubThumbnailManifestParser {
 
 @MainActor
 final class ScrubThumbnailsStore: ObservableObject {
-    @Published private(set) var image: UIImage?
+    @Published private(set) var image: PlatformImage?
     @Published private(set) var available = false
 
     private var trickplayManifestURL: URL?
@@ -96,8 +100,8 @@ final class ScrubThumbnailsStore: ObservableObject {
     private var currentCue: ScrubThumbnailCue?
     private static let log = Logger(subsystem: "com.stremiox.app", category: "trickplay")
 
-    private static let imageCache: NSCache<NSURL, UIImage> = {
-        let c = NSCache<NSURL, UIImage>()
+    private static let imageCache: NSCache<NSURL, PlatformImage> = {
+        let c = NSCache<NSURL, PlatformImage>()
         c.countLimit = 48
         return c
     }()
@@ -216,17 +220,23 @@ final class ScrubThumbnailsStore: ObservableObject {
         return NSURL(string: cue.imageURL.absoluteString + rect) ?? cue.imageURL as NSURL
     }
 
-    private nonisolated static func loadImage(for cue: ScrubThumbnailCue, headers: [String: String]?) async -> UIImage? {
+    private nonisolated static func loadImage(for cue: ScrubThumbnailCue, headers: [String: String]?) async -> PlatformImage? {
         do {
             var request = URLRequest(url: cue.imageURL)
             request.cachePolicy = .returnCacheDataElseLoad
             headers?.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-            guard let image = UIImage(data: data) else { return nil }
+            guard let image = PlatformImage(data: data) else { return nil }
             guard let rect = cue.rect else { return image }
+#if canImport(AppKit)
+            guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let cropped = cgImage.cropping(to: rect.integral) else { return image }
+            return NSImage(cgImage: cropped, size: rect.size)
+#else
             guard let cg = image.cgImage?.cropping(to: rect.integral) else { return image }
             return UIImage(cgImage: cg, scale: image.scale, orientation: image.imageOrientation)
+#endif
         } catch {
             return nil
         }

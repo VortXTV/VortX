@@ -39,6 +39,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
+    @AppStorage(PlaybackSettings.Key.trickplayServerURL) private var trickplayServerURL = ""
 
     var body: some View {
         NavigationStack {
@@ -199,6 +200,10 @@ struct iOSSettingsView: View {
             Picker("Audio output", selection: $audioOutput) {
                 ForEach(AudioOutputMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            LabeledContent("Trickplay Server URL") {
+                TextField("", text: $trickplayServerURL)
+                    .urlFieldStyle(alignment: .trailing)
+            }
         } header: {
             Text("Playback")
         } footer: {
@@ -207,6 +212,8 @@ struct iOSSettingsView: View {
                      ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
                      : "Hide torrent and magnet sources. Only direct and debrid links will play.")
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
+                Text("Trickplay server: scrub previews load from this base URL using the title's IMDb id.")
+                    .foregroundStyle(.secondary)
             }
         }
     }

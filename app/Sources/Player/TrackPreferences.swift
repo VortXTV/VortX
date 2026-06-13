@@ -3,6 +3,7 @@ import Foundation
 enum PlaybackSettings {
     enum Key {
         static let directLinksOnly = "stremiox.directLinksOnly"
+        static let trickplayServerURL = "stremiox.trickplayServerURL"
     }
 
     static var directLinksOnlyForced: Bool {

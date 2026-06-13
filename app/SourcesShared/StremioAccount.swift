@@ -139,11 +139,10 @@ struct PlaybackMeta: Hashable {
 }
 
 enum TrickplayManifestURLBuilder {
-    static let serverURLKey = "stremiox.trickplayServerURL"
     private static let log = Logger(subsystem: "com.stremiox.app", category: "trickplay")
 
     private static var baseURL: URL? {
-        let stored = UserDefaults.standard.string(forKey: serverURLKey) ?? ""
+        let stored = UserDefaults.standard.string(forKey: PlaybackSettings.Key.trickplayServerURL) ?? ""
         guard !stored.isEmpty else { return nil }
         return URL(string: stored)
     }
@@ -162,16 +161,34 @@ enum TrickplayManifestURLBuilder {
             return nil
         }
         let path = trickplayPath(for: meta, imdbId: imdbId)
-        let built = URL(string: path, relativeTo: baseURL)?.absoluteURL
+        let built = buildURL(baseURL: baseURL, relativePath: path)
         log.debug("trickplay URL built imdb=\(imdbId, privacy: .public) type=\(meta.type, privacy: .public) season=\(meta.season ?? -1, privacy: .public) episode=\(meta.episode ?? -1, privacy: .public) url=\(built?.absoluteString ?? "nil", privacy: .public)")
         return built
     }
 
     private static func trickplayPath(for meta: PlaybackMeta, imdbId: String) -> String {
         if meta.type == "series", let season = meta.season, let episode = meta.episode {
-            return "/\(imdbId)/\(season)-\(episode)/storyboard.vtt"
+            return "\(imdbId)/\(season)-\(episode)/storyboard.vtt"
         }
-        return "/\(imdbId)/storyboard.vtt"
+        return "\(imdbId)/storyboard.vtt"
+    }
+
+    /// Appends a relative trickplay path to the configured base URL while preserving any existing
+    /// base path (for example `https://host/subfolder`).
+    private static func buildURL(baseURL: URL, relativePath: String) -> URL? {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        let basePath = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let relPath = relativePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+
+        if basePath.isEmpty {
+            components.path = "/\(relPath)"
+        } else {
+            components.path = "/\(basePath)/\(relPath)"
+        }
+        return components.url
     }
 }
 
