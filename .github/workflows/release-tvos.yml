@@ -1,4 +1,4 @@
-name: Release tvOS IPA
+name: Release IPAs (tvOS + iOS)
 
 # Builds the tvOS IPA from source on GitHub's runners and attaches it to the
 # release, so anyone can verify the published binary really comes from this
@@ -87,15 +87,20 @@ jobs:
           xcodebuild -project StremioX.xcodeproj -scheme StremioXTVLite \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath build/ci-lite CODE_SIGNING_ALLOWED=NO build
+          xcodebuild -project StremioX.xcodeproj -scheme StremioXiOSNative \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ci-ios CODE_SIGNING_ALLOWED=NO build
 
       - name: Package the IPAs
         run: |
-          mkdir -p out/full/Payload out/lite/Payload
+          mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
           cp -R app/build/ci/Build/Products/Release-appletvos/StremioXTV.app out/full/Payload/
           cp -R app/build/ci-lite/Build/Products/Release-appletvos/StremioXTVLite.app out/lite/Payload/
+          cp -R app/build/ci-ios/Build/Products/Release-iphoneos/StremioXiOSNative.app out/ios/Payload/
           (cd out/full && zip -qry ../StremioX-tvOS-ci.ipa Payload)
           (cd out/lite && zip -qry ../StremioX-tvOS-lite-ci.ipa Payload)
-          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa | tee out/SHA256SUMS-ci.txt
+          (cd out/ios && zip -qry ../StremioX-iOS-ci.ipa Payload)
+          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa | tee out/SHA256SUMS-ci.txt
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
@@ -105,6 +110,7 @@ jobs:
           path: |
             out/StremioX-tvOS-ci.ipa
             out/StremioX-tvOS-lite-ci.ipa
+            out/StremioX-iOS-ci.ipa
             out/SHA256SUMS-ci.txt
 
       - name: Attach the CI builds to the release
@@ -115,9 +121,11 @@ jobs:
         run: |
           mv out/StremioX-tvOS-ci.ipa "out/StremioX-tvOS-$TAG-ci.ipa"
           mv out/StremioX-tvOS-lite-ci.ipa "out/StremioX-tvOS-lite-$TAG-ci.ipa"
-          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" > out/SHA256SUMS-ci.txt
+          mv out/StremioX-iOS-ci.ipa "out/StremioX-iOS-$TAG-ci.ipa"
+          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" > out/SHA256SUMS-ci.txt
           gh release upload "$TAG" \
             "out/StremioX-tvOS-$TAG-ci.ipa" \
             "out/StremioX-tvOS-lite-$TAG-ci.ipa" \
+            "out/StremioX-iOS-$TAG-ci.ipa" \
             out/SHA256SUMS-ci.txt \
             --clobber
