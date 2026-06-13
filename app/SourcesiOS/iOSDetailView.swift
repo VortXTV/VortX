@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Touch detail page. Loads meta through the shared engine, shows the hero + synopsis, and plays
-/// the ranked best source through the shared native player (PlayerScreen). Movies play here today;
-/// the series episode picker is the next 0.3.0 iteration.
+/// the ranked best source through the shared native player (PlayerScreen). Movies play via Watch
+/// Now; series show a season/episode list that loads and plays each episode's ranked best source.
 struct iOSDetailView: View {
     let id: String
     let type: String
@@ -11,7 +11,9 @@ struct iOSDetailView: View {
     @EnvironmentObject private var account: StremioAccount
 
     @State private var player: PlayerLaunch?
-    @State private var preparing = false
+    @State private var preparing = false                 // movie Watch Now is resolving
+    @State private var preparingEpisodeID: String?       // which episode row is resolving
+    @State private var season = 1
 
     /// A resolved stream ready to hand to PlayerScreen (Identifiable so fullScreenCover(item:) drives it).
     private struct PlayerLaunch: Identifiable {
@@ -36,10 +38,11 @@ struct iOSDetailView: View {
                     Text(meta?.name ?? title)
                         .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
                     if let info = meta?.releaseInfo { Text(info).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary) }
-                    watchNow
+                    if type == "movie" { watchNow }
                     if let overview = meta?.description {
                         Text(overview).font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     }
+                    if type == "series" { episodeList }
                 }
                 .padding(.horizontal, Theme.Space.md)
             }
@@ -60,56 +63,114 @@ struct iOSDetailView: View {
         }
     }
 
+    // MARK: Movie
+
     @ViewBuilder private var watchNow: some View {
-        if type == "movie" {
-            Button {
-                Task { await prepareAndPlay() }
-            } label: {
-                HStack(spacing: Theme.Space.sm) {
-                    if preparing { ProgressView().tint(.white) } else { Image(systemName: "play.fill") }
-                    Text(watchLabel)
-                }
-                .font(Theme.Typography.cardTitle).foregroundStyle(.white)
-                .frame(maxWidth: .infinity).padding(.vertical, Theme.Space.md)
-                .background(streamsReady ? Theme.Palette.accent : Theme.Palette.surface2,
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        Button {
+            Task { await playMovie() }
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                if preparing { ProgressView().tint(.white) } else { Image(systemName: "play.fill") }
+                Text(movieLabel)
             }
-            .disabled(!streamsReady || preparing)
-            .padding(.vertical, Theme.Space.sm)
-        } else if type == "series" {
-            Label("Series episode picker lands in the next 0.3.0 build", systemImage: "list.and.film")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
-                .padding(.top, Theme.Space.sm)
+            .font(Theme.Typography.cardTitle).foregroundStyle(.white)
+            .frame(maxWidth: .infinity).padding(.vertical, Theme.Space.md)
+            .background(movieReady ? Theme.Palette.accent : Theme.Palette.surface2,
+                        in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
+        .disabled(!movieReady || preparing)
+        .padding(.vertical, Theme.Space.sm)
     }
 
-    /// Streams for THIS title are loaded and at least one is playable.
-    private var streamsReady: Bool {
-        meta != nil && bestStream != nil
-    }
+    private var movieReady: Bool { meta != nil && StreamRanking.best(core.streamGroups()) != nil }
 
-    private var bestStream: CoreStream? {
-        guard meta != nil else { return nil }   // engine state matches this id (see meta guard)
-        return StreamRanking.best(core.streamGroups())
-    }
-
-    private var watchLabel: String {
+    private var movieLabel: String {
         if preparing { return "Finding the best source…" }
-        guard streamsReady, let s = bestStream else { return "Loading sources…" }
+        guard movieReady, let s = StreamRanking.best(core.streamGroups()) else { return "Loading sources…" }
         return "Watch  ·  \(StreamRanking.qualityLabel(s))"
     }
 
-    private func prepareAndPlay() async {
-        guard !preparing, let m = meta, let stream = bestStream, let url = stream.playableURL else { return }
-        preparing = true
-        defer { preparing = false }
+    private func playMovie() async {
+        guard !preparing, let m = meta, let stream = StreamRanking.best(core.streamGroups()),
+              let url = stream.playableURL else { return }
+        preparing = true; defer { preparing = false }
         let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
                               name: m.name, poster: m.poster, season: nil, episode: nil)
-        // Engine-history profiles resume from the engine; everyone else from the account/overlay.
-        let resume: Double
-        if let engine = core.engineResumeSeconds(for: pm) { resume = engine }
-        else { resume = await account.resumeOffset(for: pm) }
-        player = PlayerLaunch(url: url, title: m.name, resume: resume, meta: pm)
+        player = PlayerLaunch(url: url, title: m.name, resume: await resume(pm), meta: pm)
+    }
+
+    // MARK: Series
+
+    @ViewBuilder private var episodeList: some View {
+        if let videos = meta?.videos, !videos.isEmpty {
+            let seasons = Array(Set(videos.compactMap { $0.season })).sorted()
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                if seasons.count > 1 {
+                    Picker("Season", selection: $season) {
+                        ForEach(seasons, id: \.self) { Text("Season \($0)").tag($0) }
+                    }
+                    .pickerStyle(.menu).tint(Theme.Palette.accent)
+                }
+                ForEach(episodes(videos), id: \.id) { v in
+                    Button {
+                        Task { await playEpisode(v) }
+                    } label: {
+                        HStack(spacing: Theme.Space.sm) {
+                            if preparingEpisodeID == v.id { ProgressView() }
+                            else { Image(systemName: "play.circle").foregroundStyle(Theme.Palette.accent) }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(v.episodeNumber). \(v.title ?? "Episode \(v.episodeNumber)")")
+                                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
+                                if let aired = v.released?.prefix(10) {
+                                    Text(String(aired)).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, Theme.Space.xs)
+                    }
+                    .disabled(preparingEpisodeID != nil)
+                    Divider().overlay(Theme.Palette.surface2)
+                }
+            }
+            .padding(.top, Theme.Space.sm)
+            .onAppear { if let first = seasons.first, !seasons.contains(season) { season = first } }
+        }
+    }
+
+    private func episodes(_ videos: [CoreVideo]) -> [CoreVideo] {
+        videos.filter { ($0.season ?? 1) == season }
+            .sorted { $0.episodeNumber < $1.episodeNumber }
+    }
+
+    /// Load the episode's streams (the engine loads per-episode streams on demand), wait for a
+    /// playable source to land, rank the best, and present the player. Mirrors the tvOS flow.
+    private func playEpisode(_ v: CoreVideo) async {
+        guard preparingEpisodeID == nil, let m = meta else { return }
+        preparingEpisodeID = v.id
+        defer { preparingEpisodeID = nil }
+        core.loadMeta(type: "series", id: id, streamType: "series", streamId: v.id)
+        // Poll for this episode's streams (matched by id) for up to ~12s.
+        for _ in 0..<48 {
+            let groups = core.streamGroups(forStreamId: v.id)
+            if let best = StreamRanking.best(groups), let url = best.playableURL {
+                let name = "\(m.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
+                let pm = PlaybackMeta(libraryId: m.id, videoId: v.id, type: "series",
+                                      name: m.name, poster: v.thumbnail ?? m.poster,
+                                      season: v.season, episode: v.episode)
+                player = PlayerLaunch(url: url, title: name, resume: await resume(pm), meta: pm)
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+    }
+
+    // MARK: Shared
+
+    /// Engine-history profiles resume from the engine; everyone else from the account/overlay.
+    private func resume(_ pm: PlaybackMeta) async -> Double {
+        if let engine = core.engineResumeSeconds(for: pm) { return engine }
+        return await account.resumeOffset(for: pm)
     }
 
     // metaDetails is a single shared @Published on the CoreBridge singleton. Guard on the id so a
