@@ -7,9 +7,8 @@
 //!   - executors : two tokio multi-thread runtimes (concurrent + sequential).
 //!   - analytics : stubbed (built without the `analytics` feature).
 //!
-//! Built behind the Tauri backend (Rust↔Rust), so the engine embeds directly with no FFI. The Model
-//! and the Tauri commands that drive the Runtime land on top of this in the next iteration.
-#![allow(dead_code)] // set_storage_dir/block_on are used once the Runtime is wired (next iteration).
+//! Built behind the Tauri backend (Rust↔Rust), so the engine embeds directly with no FFI. The
+//! Runtime that drives this Env lives in lib.rs (the Tauri entry), like the Apple core's lib.rs.
 
 use std::convert::TryFrom;
 use std::future::Future;
