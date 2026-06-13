@@ -1,8 +1,20 @@
 import Foundation
+#if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 import Libmpv
 import AVFoundation
 import os
+
+// The player view controller is UIViewController on iOS/tvOS and NSViewController on macOS. iOS/tvOS
+// resolve PlatformViewController to UIViewController, so their compiled code is unchanged.
+#if canImport(UIKit)
+typealias PlatformViewController = UIViewController
+#elseif canImport(AppKit)
+typealias PlatformViewController = NSViewController
+#endif
 
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
 // Edit Scheme -> Run -> Diagnostics -> Metal API Validation -> Turn it off
@@ -17,7 +29,7 @@ private final class WakeupRelay {
     init(_ controller: MPVMetalViewController) { self.controller = controller }
 }
 
-final class MPVMetalViewController: UIViewController {
+final class MPVMetalViewController: PlatformViewController {
     var metalLayer = MetalLayer()
     var mpv: OpaquePointer!
     /// The +1 relay currently registered with mpv; balanced with release() after terminate.
