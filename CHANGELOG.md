@@ -4,6 +4,13 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 7 (prerelease) - 2026-06-13
+
+The one that actually plays. beta 6 shipped with a macOS player deadlock — this fixes it.
+
+### Fixed
+- **The macOS player no longer freezes the whole app.** Starting a video could hang the entire app (spinning beachball, even Quit dead) and require a force-quit. Root cause: mpv's video-output thread set the layer's HDR/EDR flag via a blocking hop to the main thread *while holding the Metal layer lock*, exactly as the main thread tried to take that same lock to size the drawable — a hard deadlock at the first frame. The EDR flag now updates without blocking the render thread, so playback starts cleanly. Verified end-to-end (open → play → controls → close) with a real video stream.
+
 ## 0.3.0 beta 6 (prerelease) - 2026-06-13
 
 A stability and polish pass over the native iPhone, iPad, and Mac apps, fixing the issues reported on beta 5.

@@ -34,8 +34,18 @@ class MetalLayer: CAMetalLayer {
             if Thread.isMainThread {
                 super.wantsExtendedDynamicRangeContent = newValue
             } else {
-                DispatchQueue.main.sync {
-                    super.wantsExtendedDynamicRangeContent = newValue
+                // CRITICAL: must NOT block the calling thread on the main thread. MoltenVK sets this
+                // property from mpv's video-output (vo) thread WHILE holding the CAMetalLayer's
+                // per-layer lock; the main thread is concurrently mutating the same layer
+                // (drawableSize/frame in layoutDrawable, colorspace in syncDisplayDynamicRange) and so
+                // is waiting to take that same lock. A `DispatchQueue.main.sync` here parks the vo
+                // thread on the main thread while it holds the lock the main thread needs → a hard
+                // two-lock deadlock that froze the whole app (the 743s macOS hang, video stuck at 0:00,
+                // even Quit dead). Hop to main ASYNC so the vo thread returns immediately and releases
+                // the layer lock; EDR activating one runloop later is imperceptible. Re-entering the
+                // setter on the main thread takes the `isMainThread` branch above (no recursion).
+                DispatchQueue.main.async { [weak self] in
+                    self?.wantsExtendedDynamicRangeContent = newValue
                 }
             }
         }

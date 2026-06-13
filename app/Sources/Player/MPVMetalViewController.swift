@@ -57,6 +57,12 @@ final class MPVMetalViewController: PlatformViewController {
         
         metalLayer.frame = view.bounds
         metalLayer.framebufferOnly = true
+        // Insurance against render-thread/main-thread deadlocks: the drawable present must never wait
+        // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default —
+        // made explicit), and nextDrawable() must be able to time out instead of blocking the vo thread
+        // forever if drawables can't be recycled while the main thread is busy.
+        metalLayer.presentsWithTransaction = false
+        metalLayer.allowsNextDrawableTimeout = true
         #if canImport(UIKit)
         metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.backgroundColor = UIColor.black.cgColor
