@@ -736,7 +736,12 @@ struct TVPlayerView: View {
     /// this app suspends), the decoder choice, and the info/QR rows that used to crowd Playback.
     private func playerSettingsRows() -> [OptionRow] {
         var rows: [OptionRow] = []
-        if !isTorrentPlayback, let url = curURL {
+        // Handoff only when the URL is self-contained. A header-gated stream needs specific request
+        // headers (it is either playing through our embedded /proxy/ on a loopback URL, or as a
+        // bare CDN URL whose headers live on mpv); an external player gets neither and cannot
+        // replay it, so it would just fail. Hide handoff in that case.
+        let handoffEligible = !isTorrentPlayback && (curHeaders?.isEmpty ?? true)
+        if handoffEligible, let url = curURL {
             let players = ExternalPlayers.menu()
             if !players.isEmpty {
                 rows.append(OptionRow(label: "Play in", isHeader: true))

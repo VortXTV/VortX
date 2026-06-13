@@ -453,6 +453,13 @@ final class CoreBridge: ObservableObject {
         if let meta = metaDetails?.meta, meta.id == id { return (meta.name, meta.type, meta.poster) }
         if let item = continueWatching.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
         if let item = library?.catalog.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
+        // Fall back to the raw catalog preview (board/discover/search), so an overlay profile can
+        // mark-watched a title straight from a discover row that isn't in any loaded detail/CW/library
+        // state. Without this the toggle was a silent no-op there.
+        if let raw = rawMetaPreview(forId: id),
+           let name = raw["name"] as? String, let type = raw["type"] as? String {
+            return (name, type, raw["poster"] as? String)
+        }
         return nil
     }
 

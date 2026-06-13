@@ -140,21 +140,38 @@ final class MPVMetalViewController: UIViewController {
         }
     }
 
+    /// The active route's hardware output sample rate (e.g. 48000 over HDMI-ARC), read after the
+    /// session is active. 0 = unknown, do not force a rate.
+    private var outputSampleRate: Double = 0
+
     private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            // Stereo mode also drops .moviePlayback: that mode's long-form/multichannel behaviour
-            // can make the audiounit AO advertise a layout a 2.x ARC soundbar cannot render, which
-            // is the most likely cause of the "no sound through my soundbar, fine on the TV"
-            // reports. .default under .playback is the most compatible path. Auto and Surround keep
-            // .moviePlayback for the eARC receiver case (the 0.2.43 fix for issue #20).
+            // .playback + setActive is the issue-20 eARC fix (audio routes to the receiver instead
+            // of soloAmbient). The MODE here is only best-effort: mpv's ao_audiounit re-issues
+            // setCategory(.playback)+setMode(.moviePlayback)+setActive on every AO open (verified in
+            // libmpv 0.41.0 source), so it governs only the brief pre-init window. The REAL
+            // soundbar fix is the sample rate below, not the mode.
             let mode: AVAudioSession.Mode = AudioOutputMode.current == .stereo ? .default : .moviePlayback
             try session.setCategory(.playback, mode: mode, options: [])
             try session.setActive(true)
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
+            outputSampleRate = session.sampleRate
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    /// mpv `audio-samplerate` for the current route, or nil to leave mpv on the content rate.
+    /// THE soundbar fix: mpv's audiounit AO sets its RemoteIO input to the CONTENT rate and never
+    /// resamples to the route, so 44.1k (or hi-res) content over a fixed ~48k HDMI-ARC link is
+    /// silently dropped (no audio on the soundbar, fine on a bare TV, plays in official Stremio
+    /// which resamples). Forcing mpv's own resampler to the route's actual rate before the AO
+    /// hand-off fixes it. Gated to stereo routes (<=2ch) so a true multichannel receiver keeps its
+    /// native-rate PCM path untouched.
+    private var sampleRatePolicy: Int? {
+        guard outputChannels <= 2, outputSampleRate >= 8000 else { return nil }
+        return Int(outputSampleRate.rounded())
     }
 
     func setupMpv() {
@@ -267,7 +284,13 @@ final class MPVMetalViewController: UIViewController {
         // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
         // the next silent-audio report is actually diagnosable instead of a guess.
         checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
-        mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public) (route reports \(self.outputChannels) ch)")
+        // THE soundbar fix: resample to the route's actual rate so a rate mismatch over a fixed-rate
+        // HDMI-ARC link can't drop to silence (mpv's audiounit AO does not resample to the route).
+        if let rate = sampleRatePolicy {
+            checkError(mpv_set_option_string(mpv, "audio-samplerate", String(rate)))
+        }
+        appliedAudioPolicy = (channelPolicy, sampleRatePolicy ?? 0)   // baseline so reapply only fires on a real change
+        mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
 
         checkError(mpv_initialize(mpv))
         
@@ -318,16 +341,28 @@ final class MPVMetalViewController: UIViewController {
         play()
     }
 
-    /// Re-read the active route's output channel count and reapply mpv's downmix policy. Safe to
-    /// call mid-playback: setting `audio-channels` as a PROPERTY (not an option) reinitializes the
-    /// AO against the new layout. `mpv_set_option_string` is only valid before `mpv_initialize`;
-    /// after init the same name must go through `mpv_set_property_string` (the setString helper) or
-    /// it is a silent no-op, which is why the route-change/foreground reapply has to use setString.
+    /// The (channels, sampleRate) last pushed to mpv, so a route-change storm does not reinit the
+    /// AO repeatedly. An eARC handshake emits several routeChange events in a row; reinitialising on
+    /// each (and mpv's own setActive can itself emit one) risks dropouts or a feedback loop, so we
+    /// only reapply when the resolved policy actually changes.
+    private var appliedAudioPolicy: (String, Int)?
+
+    /// Re-read the active route and reapply mpv's downmix + sample-rate policy when it changed. Safe
+    /// mid-playback: setting these as PROPERTIES (via setString, mpv_set_property_string) reinits the
+    /// AO against the new route. `mpv_set_option_string` is only valid before `mpv_initialize` (a
+    /// silent no-op after), which is why the reapply path uses setString. Handles a receiver
+    /// powering on or an HDMI-ARC/eARC handshake settling after the AO was first opened.
     private func applyChannelPolicy() {
         guard mpv != nil else { return }
-        outputChannels = max(AVAudioSession.sharedInstance().maximumOutputNumberOfChannels, 2)
-        setString("audio-channels", channelPolicy)
-        mpvLog.log("audio-channels reapplied = \(self.channelPolicy, privacy: .public) (mode \(AudioOutputMode.current.rawValue, privacy: .public), route \(self.outputChannels) ch)")
+        let session = AVAudioSession.sharedInstance()
+        outputChannels = max(session.maximumOutputNumberOfChannels, 2)
+        outputSampleRate = session.sampleRate
+        let next = (channelPolicy, sampleRatePolicy ?? 0)
+        if let applied = appliedAudioPolicy, applied == next { return }   // no real change: don't churn the AO
+        appliedAudioPolicy = next
+        setString("audio-channels", next.0)
+        if next.1 > 0 { setString("audio-samplerate", String(next.1)) }
+        mpvLog.log("audio reapplied: channels=\(next.0, privacy: .public) samplerate=\(next.1 > 0 ? String(next.1) : "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
     }
 
     @objc private func audioRouteChanged(_ note: Notification) {
