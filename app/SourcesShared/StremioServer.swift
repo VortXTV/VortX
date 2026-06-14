@@ -137,13 +137,22 @@ enum StremioServer {
     /// 2 GB cache, which is too much for the Apple TV's per-app memory budget: a torrent
     /// buffering pieces into it pushes the app past the limit and tvOS jetsam-kills the whole
     /// process (the "server crash" -- nav bar dead, back drops to Home, server offline on
-    /// reopen). 512 MB keeps a healthy streaming buffer without the memory pressure. The player's
-    /// own read-ahead buffer and the binge preload are independent of this and unaffected.
+    /// reopen). The player's own read-ahead buffer and the binge preload are independent of this.
     /// POST /settings merges the value (server.js: saveSettings -> userSettings.extend). Custom
     /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
     static func applyServerConfig() async {
         guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return }
-        let cap = 512 * 1024 * 1024   // 512 MB, vs the 2 GB default (tames the default; not the crash fix)
+        // The cache counts toward the app's OWN memory on iOS/iPadOS/tvOS (the server runs in-process), so
+        // on top of mpv's 4K decode buffers even a 512 MB cache trips iOS jetsam on a real device during
+        // playback (the device-only "server dies" report; the Simulator never hits it because it borrows
+        // the Mac's RAM). Keep it generous only on macOS, where the server is a separate child process
+        // with swap; on the in-process platforms scale it to the device and stay well under the per-app limit.
+        #if os(macOS)
+        let cap = 512 * 1024 * 1024
+        #else
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let cap = Int(min(UInt64(192 * 1024 * 1024), max(UInt64(96 * 1024 * 1024), physical / 32)))
+        #endif
         for _ in 0 ..< 12 {
             if await isOnline() {
                 var req = URLRequest(url: url)
