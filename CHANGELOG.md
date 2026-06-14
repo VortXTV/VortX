@@ -4,6 +4,16 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.2 (prerelease) - 2026-06-15
+
+The player and competitor-parity feature wave. Cut as an iterating prerelease: features land build by build, then it promotes to the latest release.
+
+### Added
+- **Seek-while-hidden on Apple TV.** With the controls hidden, Left/Right now seek backward/forward 10 seconds directly, with a brief time pill, instead of revealing the whole control bar. Up/Down still reveal the controls.
+
+### Landing next in 0.3.2
+A default external-player engine (Infuse/VLC), an Up Next autoplay band with a countdown, an in-player quality picker, tvOS glass buttons, Mac keyboard navigation, new-episode notifications, and more.
+
 ## 0.3.1 - 2026-06-15
 
 A bug-fix and polish pass on top of 0.3.0, driven by on-device testing across iPhone, iPad, Mac, and Apple TV. The headline wins: movies query every add-on again, and the embedded streaming server holds up on iPhone and Apple TV (debrid and torrent).
