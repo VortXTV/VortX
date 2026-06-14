@@ -47,9 +47,11 @@ extension View {
         self.fullScreenCover(item: item, content: content)
         #else
         self.sheet(item: item) { value in
-            content(value).frame(
-                width: Self.macPlayerCoverSize.width,
-                height: Self.macPlayerCoverSize.height)
+            content(value)
+                .frame(width: Self.macPlayerCoverSize.width, height: Self.macPlayerCoverSize.height)
+                // Hide the host window's titlebar + toolbar while the player is up, so the nav chrome
+                // hoisted there (back button, title, the .searchable field) cannot float over the video.
+                .background(MacPlayerChromeHider())
         }
         #endif
     }
@@ -66,3 +68,57 @@ extension View {
     }
     #endif
 }
+
+#if os(macOS)
+/// While a player / trailer cover is presented, strip the HOST window's titlebar + toolbar so the
+/// hoisted navigation chrome (back button, title, the Search field) stops floating in a strip above
+/// the video (the macOS "weird middle way"). The sheet covers the content area; this removes the
+/// strip on top. Everything is restored when the cover dismisses, so browsing chrome returns intact.
+private struct MacPlayerChromeHider: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        // The view is hosted in the SHEET window. A SwiftUI macOS .sheet is NOT an attached NSWindow
+        // sheet, so .sheetParent is nil; the chrome we need to hide lives on the MAIN titled app window.
+        // Find that window directly (the titled, visible window that is not this sheet). Defer one
+        // runloop so the window hierarchy is attached.
+        DispatchQueue.main.async { [weak view] in
+            let sheetWindow = view?.window
+            let host = NSApp.windows.first { w in
+                w != sheetWindow && w.isVisible && w.styleMask.contains(.titled)
+            } ?? sheetWindow
+            guard let host else { return }
+            let c = context.coordinator
+            c.host = host
+            c.savedStyleMask = host.styleMask
+            c.savedTitleVisibility = host.titleVisibility
+            c.savedTitlebarTransparent = host.titlebarAppearsTransparent
+            c.savedToolbarVisible = host.toolbar?.isVisible
+            host.titleVisibility = .hidden
+            host.titlebarAppearsTransparent = true
+            host.styleMask.insert(.fullSizeContentView)
+            host.toolbar?.isVisible = false
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        guard let host = coordinator.host else { return }
+        host.titleVisibility = coordinator.savedTitleVisibility
+        host.titlebarAppearsTransparent = coordinator.savedTitlebarTransparent
+        host.styleMask = coordinator.savedStyleMask
+        if let v = coordinator.savedToolbarVisible { host.toolbar?.isVisible = v }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var host: NSWindow?
+        var savedStyleMask: NSWindow.StyleMask = []
+        var savedTitleVisibility: NSWindow.TitleVisibility = .visible
+        var savedTitlebarTransparent = false
+        var savedToolbarVisible: Bool?
+    }
+}
+#endif
