@@ -1682,14 +1682,22 @@ private struct iOSStreamLabel: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    /// A single trimmed context line: the add-on's stream `name` (its short release title) with
-    /// newlines collapsed to spaces, or the first line of `description` as a fallback. Never the full
-    /// multi-line blurb — that verbose dump is exactly what this row replaces.
+    /// A single trimmed context line: the actual RELEASE NAME. Prefer behaviorHints.filename — it is the
+    /// only field that distinguishes "...Deathly.Hallows.Part.1..." from "Part.2", which a short add-on
+    /// label / quality blurb in `name` drops. Fall back to the stream `name`, then the first line of
+    /// `description`. Newlines collapse to the first line and a trailing container extension is stripped;
+    /// never the full multi-line blurb (the row is lineLimit(2), tail-truncated).
     private var cleanTitle: String? {
-        let raw = stream.name?.isEmpty == false ? stream.name : stream.description
-        guard let raw, !raw.isEmpty else { return nil }
+        let candidates = [stream.behaviorHints?.filename, stream.name, stream.description]
+        guard let raw = candidates.compactMap({ $0 }).first(where: { !$0.isEmpty }) else { return nil }
         let firstLine = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? raw
-        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        var trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        if let dot = trimmed.lastIndex(of: "."), trimmed.distance(from: dot, to: trimmed.endIndex) <= 6 {
+            let ext = trimmed[trimmed.index(after: dot)...].lowercased()
+            if ["mkv", "mp4", "avi", "ts", "m2ts", "webm", "mov", "wmv"].contains(ext) {
+                trimmed = String(trimmed[..<dot]).trimmingCharacters(in: .whitespaces)
+            }
+        }
         return trimmed.isEmpty ? nil : trimmed
     }
 
