@@ -95,7 +95,11 @@ struct iOSSignInView: View {
                     .emailFieldStyle()
                     .autocorrectionDisabled()
             }
-            field { SecureField("Password", text: $password).textContentType(.password) }
+            field {
+                SecureField("Password", text: $password).textContentType(.password)
+                    .submitLabel(.go)
+                    .onSubmit { if !busy && !email.isEmpty && !password.isEmpty { Task { await signIn() } } }
+            }
 
             if let err = account.signInError {
                 Text(err)

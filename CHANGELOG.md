@@ -4,6 +4,20 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 10 (prerelease) - 2026-06-14
+
+Working down the full audit, plus a dedicated macOS pass.
+
+### Fixed
+- **Finished titles now leave Continue Watching.** The player never told the engine a title was watched, so movies and episodes lingered in Continue Watching at their end position forever. It now marks a title watched at ~90% and, when a movie or the last episode finishes, removes it from the rail, matching the Apple TV app.
+- **On macOS, closing the window quits the app.** Before, the red close button / Cmd-W left the app running headless with the streaming server still holding its port and no way to get the window back. Closing the last window now quits cleanly and shuts the server down.
+- **Return submits on Mac.** Pressing Return in the password field or the streaming-server URL field now submits, instead of doing nothing.
+- **Destructive red no longer reads as orange.** The Remove / Log Out / error red was warm enough to look like a leftover orange accent next to a cool theme; it is now a cooler red.
+- **VoiceOver reads poster cards.** Each poster announces its title, that it opens details, and its watch progress.
+
+### Notes
+- Still sequenced for upcoming builds (each is a focused, separately-tested change): the macOS player presentation, in-player next/previous episode, an iPad/Mac wide-screen layout, engine thread-safety hardening, and the rest of the accessibility pass. The full list lives in docs/REVIEW-WORKLIST.md.
+
 ## 0.3.0 beta 9 (prerelease) - 2026-06-13
 
 The one from the full audit. A 7-area review (layout, code, player, theming, server, parity, accessibility) found 97 issues; this build lands the systemic root-cause fixes and every crash.

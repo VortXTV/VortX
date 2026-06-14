@@ -90,6 +90,7 @@ struct PlayerScreen: View {
     @AppStorage("stremiox.videoSize") private var videoSize = "original"   // whole frame, correct aspect
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
+    @State private var markedWatched = false           // ~90%/EOF watched marker fires once per title (mirrors tvOS)
     @State private var buffering = true
     @State private var currentTime = 0.0
     @State private var duration = 0.0
@@ -287,6 +288,12 @@ struct PlayerScreen: View {
                         lastReported = d
                         onProgress(d, duration)
                     }
+                    // ~90% in → flip the engine's watched marker live, so the title leaves Continue
+                    // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
+                    if !markedWatched, !isLive, duration > 0, d / duration >= 0.9, let m = recordMeta {
+                        markedWatched = true
+                        core.markPlaybackWatched(m)
+                    }
                 }
             }
         case MPVProperty.duration:
@@ -322,7 +329,17 @@ struct PlayerScreen: View {
                 handleLoadFailure((data as? String) ?? "")
             }
         case MPVProperty.endFileEof:
-            if hasNext { onNext() } else { onClose() }   // episode ended → auto-play next / exit
+            // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
+            if !markedWatched, !isLive, let m = recordMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            if hasNext {
+                onNext()                                  // episode ended → auto-play next
+            } else {
+                // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
+                // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
+                // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
+                if let m = recordMeta { core.finishedWatching(libraryId: m.libraryId) }
+                onClose()
+            }
         default: break
         }
     }

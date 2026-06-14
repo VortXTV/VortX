@@ -26,7 +26,7 @@ enum Theme {
         static var accentBright: Color { ThemeManager.shared.accentBright } // focus glow highlight
         static var accentSoft: Color { accent.opacity(0.18) }
         static var onAccent: Color { ThemeManager.shared.onAccent } // accent-adaptive ink (was a fixed warm-brown that read orange on every accent)
-        static let danger = rgb(0.851, 0.318, 0.278)            // #D9514C destructive (log out, remove)
+        static let danger = rgb(0.871, 0.282, 0.337)            // #DE4856 destructive (log out, remove) — a cooler red so it doesn't read as "leftover orange" next to a non-warm accent
     }
 
     // MARK: Spacing (8pt base, intentional rhythm)

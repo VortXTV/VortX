@@ -63,6 +63,7 @@ struct ServerConfigView: View {
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
             .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
             .frame(maxWidth: 1000)
+            .onSubmit { save() }   // Return submits (the primary interaction on Mac's hardware keyboard)
         #else
         TextField("http://192.168.1.50:11470", text: $url)
             .textContentType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -70,6 +71,7 @@ struct ServerConfigView: View {
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
             .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
             .frame(maxWidth: 1000)
+            .onSubmit { save() }   // Return submits (the primary interaction on Mac's hardware keyboard)
         #endif
     }
 

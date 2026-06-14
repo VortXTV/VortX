@@ -80,5 +80,11 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         NodeServer.stop()
     }
+
+    /// Closing the only window must QUIT the app (a single-window media app, not a document app).
+    /// Without this, the red close button / Cmd-W left the app running headless with the node server
+    /// still holding port 11470 and no way to get the window back — and applicationWillTerminate above
+    /// never fired, so the server was only reaped on an explicit Quit.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 #endif

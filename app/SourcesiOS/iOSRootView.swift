@@ -914,6 +914,10 @@ private struct PosterGrid: View {
                                   progress: item.progress, menu: menu)
                 }
                 .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(item.name)
+                .accessibilityHint("Opens details")
+                .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
             }
         }
         .frame(maxWidth: .infinity)
@@ -940,6 +944,10 @@ private struct PosterRail: View {
                                           progress: item.progress, menu: menu)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(item.name)
+                        .accessibilityHint("Opens details")
+                        .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
                     }
                 }
                 .padding(.horizontal, Theme.Space.md)
