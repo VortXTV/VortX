@@ -1136,20 +1136,50 @@ struct iOSSourceList: View {
     /// is what surfaces, on-device, WHY a title finds no links (e.g. an iOS-only stream-fetch failure).
     @ViewBuilder private var emptyState: some View {
         let errored = states.filter { $0.error != nil }
-        if errored.isEmpty {
-            iOSEmptyRow(text: "None of your add-ons returned a playable source for this title.")
-        } else {
+        // Stream add-ons that ANSWERED (not still loading) without an error: either genuinely had
+        // nothing (ready == 0) or returned streams that the current filter (e.g. direct-links-only)
+        // removed. Naming them tells the user the add-ons WERE queried and came back empty — which is
+        // the actionable case (add-on offline / config expired) vs StremioX not asking at all.
+        let answeredEmpty = states.filter { $0.error == nil && !$0.loading }
+        if !errored.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.xs) {
                 iOSEmptyRow(text: "\(errored.count) add-on\(errored.count == 1 ? "" : "s") couldn't be reached for this title:")
-                ForEach(errored) { s in
-                    Text("\(s.name): \(s.error ?? "error")")
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, Theme.Space.md)
+                ForEach(errored) { s in addonReasonRow(s.name, s.error ?? "error") }
+            }
+        } else if !answeredEmpty.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                iOSEmptyRow(text: "Your stream add-ons returned no sources for this title:")
+                ForEach(answeredEmpty) { s in
+                    addonReasonRow(s.name, s.ready > 0 ? "\(s.ready) found, hidden by your filters" : "no results")
                 }
+                Text("If this title should have sources, the add-on may be offline or its config expired. Try another stream add-on.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Theme.Space.md)
+            }
+        } else {
+            // Reached "no sources" with NO add-on having produced any stream state — so no STREAM add-on
+            // was even queried (only catalog/metadata add-ons are active). This is the real "no links"
+            // cause: a stream add-on is missing, or the engine dropped it (e.g. lost after a force-quit).
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                iOSEmptyRow(text: "No stream add-ons responded for this title.")
+                Text("Check Add-ons for one that lists \"Streams\" (not just Catalogs or Metadata). If you recently force-quit the app, reopen it so your add-ons reload, or re-add a stream add-on.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Theme.Space.md)
             }
         }
+    }
+
+    /// One "add-on name: reason" line in the empty state (errored or answered-empty).
+    private func addonReasonRow(_ name: String, _ reason: String) -> some View {
+        Text("\(name): \(reason)")
+            .font(Theme.Typography.label)
+            .foregroundStyle(Theme.Palette.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, Theme.Space.md)
     }
 
     var body: some View {
