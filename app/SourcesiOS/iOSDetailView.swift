@@ -972,6 +972,7 @@ struct iOSEpisodeStreams: View {
 
     @State private var player: iOSDetailView.PlayerLaunch?
     @State private var preparing = false
+    @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
 
@@ -1133,6 +1134,7 @@ struct iOSEpisodeStreams: View {
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
         core.loadEnginePlayer(for: stream)
+        lastBinge = stream.behaviorHints?.bingeGroup   // seed the sticky release-group from the user's pick (#3)
         // Cancel any prior torrent prime before storing the new one, so a re-pick can't leave a stale
         // backoff loop running; the stored Task is also cancelled on view disappear.
         torrentPrime?.cancel()
@@ -1180,8 +1182,9 @@ struct iOSEpisodeStreams: View {
             if !groups.isEmpty { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let best = StreamRanking.best(groups, continuity: rememberedQuality),
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge),
               let url = best.playableURL else { return nil }
+        lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         core.loadEnginePlayer(for: best)
         torrentPrime?.cancel(); torrentPrime = prepareTorrentStream(best)
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
