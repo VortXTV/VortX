@@ -4,9 +4,9 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
-## 0.3.1 - 2026-06-14
+## 0.3.1 - 2026-06-15
 
-A bug-fix and polish pass on top of 0.3.0, driven by on-device testing. Cut as a prerelease to verify the streaming-server, movie, and player fixes on real devices before promoting it to the latest release.
+A bug-fix and polish pass on top of 0.3.0, driven by on-device testing across iPhone, iPad, Mac, and Apple TV. The headline wins: movies query every add-on again, and the embedded streaming server holds up on iPhone and Apple TV (debrid and torrent).
 
 ### Fixed
 - **Movies now query ALL your add-ons (iPhone and Mac).** A title from a TMDB-based catalog carries a TMDB id, and stream add-ons keyed to IMDB ids were silently skipped for it, so only a couple answered. StremioX now resolves the title's IMDB id (the same one official Stremio uses) before requesting sources, so every add-on is queried. Apple TV was unaffected. If a movie still shows only a couple of add-ons, the Sources list names the ones that errored or returned nothing.
@@ -30,7 +30,7 @@ A bug-fix and polish pass on top of 0.3.0, driven by on-device testing. Cut as a
 - **The iPhone hero billboard rotates again** instead of occasionally freezing on one title after switching tabs.
 
 ### Notes
-- Still being verified on real devices: streaming-server memory under sustained playback, and movie add-on coverage. More player and competitor-parity features are landing next.
+- A wave of new player and competitor-parity features (seek-while-hidden, an Up Next autoplay band, a default external-player engine, an in-player quality picker, and more) is landing in 0.3.2.
 
 ## 0.3.0 - 2026-06-14
 
