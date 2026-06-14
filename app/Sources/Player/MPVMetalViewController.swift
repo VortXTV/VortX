@@ -530,7 +530,16 @@ final class MPVMetalViewController: PlatformViewController {
         } else if PerformanceMode.reduced {
             readAhead = isLocalStream ? "64MiB" : "256MiB"   // 2 GB Apple TV HD: keep buffers tight
         } else {
+            #if os(macOS)
             readAhead = isLocalStream ? "128MiB" : "512MiB"
+            #else
+            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound, so a remote (debrid /
+            // direct-CDN) file gets a 256 MiB read-ahead instead of 512 MiB — that buffer, stacked on the
+            // in-process server + mpv 4K decode, is what drove the debrid "server died" RSS to ~1.6 GB.
+            // 256 MiB is still ample for a fast debrid link; the Mac (out-of-process server + swap) keeps
+            // the larger buffer for slow-CDN resilience.
+            readAhead = isLocalStream ? "128MiB" : "256MiB"
+            #endif
         }
         mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
 
