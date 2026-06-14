@@ -79,12 +79,12 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, info, playerSettings, sleep
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
-            case .playerSettings: 8; case .sleep: 9
+            case .playerSettings: 8; case .sleep: 9; case .episodes: 10
             }
         }
         var title: String {
@@ -93,7 +93,7 @@ struct PlayerScreen: View {
             case .subtitleSettings: "Subtitle Settings"; case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
-            case .sleep: "Sleep Timer"
+            case .sleep: "Sleep Timer"; case .episodes: "Episodes"
             }
         }
     }
@@ -1013,6 +1013,10 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
                 }
+                if episodes.count > 1 {
+                    Spacer()
+                    controlButton("list.bullet", "Episodes") { openPanel(.episodes) }
+                }
                 Spacer()
                 controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel) { openPanel(.sleep) }
             }
@@ -1240,6 +1244,11 @@ struct PlayerScreen: View {
             return speeds.map { s in Row(label: speedLabel(s), selected: abs(speed - s) < 0.01) {
                 speed = s; coordinator.player?.setSpeed(s)
             } }
+        case .episodes:
+            // The season's episodes, current one highlighted; tapping switches in place (goToEpisode).
+            return episodes.map { ep in
+                Row(label: ep.label, selected: ep.id == curMeta?.videoId) { goToEpisode(ep.id) }
+            }
         case .sleep:
             var rs: [Row] = [Row(label: "Off", selected: sleepMinutes == nil && !sleepAtEpisodeEnd) {
                 armSleep(minutes: nil, atEpisodeEnd: false)
