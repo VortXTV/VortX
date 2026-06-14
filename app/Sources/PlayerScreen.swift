@@ -9,6 +9,25 @@ import AppKit
 /// control, a playback-info overlay, skip-intro/outro pills, accent-themed chrome, and bounded
 /// auto-recovery (stall watchdog + source failover) so a frozen / black-screen stream recovers in
 /// place instead of dying. Observes `ThemeManager` so accent + app-text-size repaint it live.
+/// A season episode the in-player Next / Prev / list navigates between. `label` is the display
+/// string (e.g. "E2 · The Kingsroad"); `id` matches the stream/video id `PlaybackMeta` carries.
+struct PlayerEpisodeRef: Identifiable, Equatable {
+    let id: String
+    let label: String
+}
+
+/// A resolved, ready-to-play episode handed back by the caller's `loadEpisode` closure: the picked
+/// stream + its playable URL, the `PlaybackMeta` to record against, the chrome title, and the saved
+/// resume offset. The caller owns the heavy lifting (load meta, rank, prime torrent, resume); the
+/// player only hot-swaps to it in place, so there is no cover teardown between episodes.
+struct PlayerEpisodeStream {
+    let stream: CoreStream
+    let url: URL
+    let meta: PlaybackMeta
+    let title: String
+    let resume: Double
+}
+
 struct PlayerScreen: View {
     let url: URL
     let title: String
@@ -24,7 +43,15 @@ struct PlayerScreen: View {
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
     var onProgress: (Double, Double) -> Void = { _, _ in }   // periodic forward progress (TimeChanged)
     var onSeek: (Double, Double) -> Void = { _, _ in }       // exact position on user-seek (Seek)
-    var onNext: () -> Void = {}                             // advance to the next episode
+    var onNext: () -> Void = {}                             // advance to the next episode (legacy, non-episode callers)
+    // In-player episode navigation (series only). The ordered season episodes + a closure resolving any
+    // episode id to a ready-to-play stream let the player advance Next / Prev and at end-of-episode IN
+    // PLACE (a smooth source hot-swap, no cover teardown). Empty for movies / ad-hoc plays. The caller
+    // (iOSEpisodeStreams) owns the resolve, so ranking / direct-links / torrent-prime / resume stay in
+    // one place. When `episodes` is non-empty the player derives Next/Prev from the CURRENT episode and
+    // ignores the legacy `hasNext`/`onNext`.
+    var episodes: [PlayerEpisodeRef] = []
+    var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
     let onClose: () -> Void
 
     // CoreBridge / account are injected at the iOS app root; the player reads them for in-player source
@@ -126,6 +153,14 @@ struct PlayerScreen: View {
     @State private var sleepTask: Task<Void, Never>?
     @State private var showExternalChooser = false   // "Play in another app" sheet
     @State private var showShare = false             // system share sheet
+    // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
+    // every Next/Prev/list switch so progress, the watched marker, Continue-Watching, skip timestamps,
+    // and add-on subtitles all key off the episode ACTUALLY playing (not the one first opened).
+    @State private var curMetaState: PlaybackMeta? = nil
+    @State private var curTitleState: String? = nil
+    @State private var switchingEpisode = false       // a Next/Prev/list switch is resolving its stream
+    private var curMeta: PlaybackMeta? { curMetaState ?? recordMeta }
+    private var curTitle: String { curTitleState ?? title }
 
     // Subtitle / audio sync + style (parity with tvOS), persisted per-profile like the tvOS player.
     @State private var subDelay = 0.0
@@ -333,7 +368,7 @@ struct PlayerScreen: View {
                     }
                     // ~90% in → flip the engine's watched marker live, so the title leaves Continue
                     // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if !markedWatched, !isLive, duration > 0, d / duration >= 0.9, let m = recordMeta {
+                    if !markedWatched, !isLive, duration > 0, d / duration >= 0.9, let m = curMeta {
                         markedWatched = true
                         core.markPlaybackWatched(m)
                     }
@@ -376,19 +411,21 @@ struct PlayerScreen: View {
             }
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
-            if !markedWatched, !isLive, let m = recordMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            if !markedWatched, !isLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
                 onClose()
+            } else if canNextEpisode, let i = episodeIndex {
+                goToEpisode(episodes[i + 1].id, autoAdvance: true)   // in-place advance to the next episode
             } else if hasNext {
-                onNext()                                  // episode ended → auto-play next
+                onNext()                                  // legacy non-episode caller
             } else {
                 // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
                 // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
                 // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
-                if let m = recordMeta { core.finishedWatching(libraryId: m.libraryId) }
+                if let m = curMeta { core.finishedWatching(libraryId: m.libraryId) }
                 onClose()
             }
         default: break
@@ -412,9 +449,9 @@ struct PlayerScreen: View {
     /// `initialPlayback` rewrite. No-op for ad-hoc plays with no `recordMeta` (e.g. paste-a-link).
     private func recordLastStream() {
         guard !isLive else { return }   // live has no resumable position → don't seed CW direct-resume
-        guard let m = recordMeta else { return }
+        guard let m = curMeta else { return }
         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
-            videoId: m.videoId, url: (curURL ?? url).absoluteString, title: title,
+            videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
             season: m.season, episode: m.episode, name: m.name,
             poster: m.poster, type: m.type, qualityText: recordQualityText,
             torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
@@ -695,10 +732,10 @@ struct PlayerScreen: View {
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
-    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool) {
+    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool, resumeOverride: Double? = nil) {
         guard newURL != curURL else { if userInitiated { close() }; return }
         if userInitiated { close() }
-        let resume = hasStartedPlaying ? currentTime : resumeSeconds
+        let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         curURL = newURL
         curHeaders = stream.requestHeaders
         curIsTorrent = stream.isTorrent
@@ -707,6 +744,7 @@ struct PlayerScreen: View {
             recoveryDeadline?.cancel(); recoveryDeadline = nil
             stallRecoveries = 0
         }
+        if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock
         appliedSize = false; appliedAutoTracks = false
         hasStartedPlaying = false; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
@@ -715,6 +753,45 @@ struct PlayerScreen: View {
         loadIntoPlayer(newURL, headers: curHeaders, live: isLive)
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
+    }
+
+    // MARK: - Episode navigation (series; `episodes` is the ordered season list, switched in place)
+
+    private var episodeIndex: Int? {
+        guard let id = curMeta?.videoId, !episodes.isEmpty else { return nil }
+        return episodes.firstIndex { $0.id == id }
+    }
+    private var canNextEpisode: Bool { episodeIndex.map { $0 + 1 < episodes.count } ?? false }
+    private var canPrevEpisode: Bool { (episodeIndex ?? -1) > 0 }
+
+    private func goToNextEpisode() { if let i = episodeIndex, i + 1 < episodes.count { goToEpisode(episodes[i + 1].id) } }
+    private func goToPrevEpisode() { if let i = episodeIndex, i > 0 { goToEpisode(episodes[i - 1].id) } }
+
+    /// Switch to another episode in place: flush the current position, resolve the episode through the
+    /// caller, then hot-swap the source and record against the new episode. No cover teardown — the
+    /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
+    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
+        guard let loadEpisode, !switchingEpisode else { return }
+        switchingEpisode = true
+        if duration > 0, currentTime > 0 { onProgress(currentTime, duration) }   // flush the outgoing episode
+        withAnimation { panel = nil }
+        buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
+        Task {
+            let resolved = await loadEpisode(videoId)
+            switchingEpisode = false
+            guard let es = resolved else {
+                reconnecting = false; buffering = false
+                if autoAdvance { onClose() }            // nothing playable on auto-advance: leave, don't hang on a spinner
+                else { loadErrorMsg = "Couldn't load that episode" }
+                return
+            }
+            curMetaState = es.meta
+            curTitleState = es.title
+            markedWatched = false
+            appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
+            lastReported = -1
+            switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume)
+        }
     }
 
     private var bufferingOverlay: some View {
@@ -809,9 +886,9 @@ struct PlayerScreen: View {
     private var topBar: some View {
         HStack(spacing: 12) {
             iconButton("chevron.down", label: "Close player") { leavePlayback() }
-            if !title.isEmpty {
+            if !curTitle.isEmpty {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.headline.weight(.semibold)).foregroundStyle(.white)
+                    Text(curTitle).font(.headline.weight(.semibold)).foregroundStyle(.white)
                         .lineLimit(1).shadow(radius: 3)
                     if !metadataLine.isEmpty {
                         Text(metadataLine).font(.caption.weight(.medium))
@@ -820,7 +897,15 @@ struct PlayerScreen: View {
                 }
             }
             Spacer()
-            if hasNext {
+            if canPrevEpisode {
+                iconButton("backward.end.fill", label: "Previous episode") { goToPrevEpisode() }
+            }
+            if canNextEpisode {
+                iconButton("forward.end.fill", label: "Next episode") {
+                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                    goToNextEpisode()
+                }
+            } else if hasNext {
                 iconButton("forward.end.fill", label: "Next episode") {
                     if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
                     onNext()
@@ -1011,7 +1096,7 @@ struct PlayerScreen: View {
         updateCurrentSkip(at: currentTime)
     }
     private func fetchSkipTimestamps() {
-        guard let m = recordMeta, SkipTimestampService.supports(metaId: m.libraryId) else {
+        guard let m = curMeta, SkipTimestampService.supports(metaId: m.libraryId) else {
             skipFetchTask?.cancel(); apiSkipCandidates = []; skipFetchKey = ""; refreshSkipSegments(); return
         }
         let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
@@ -1032,7 +1117,7 @@ struct PlayerScreen: View {
     // MARK: - Add-on subtitles
 
     private func fetchAddonSubtitles() {
-        guard let m = recordMeta else { return }
+        guard let m = curMeta else { return }
         let key = "\(m.type):\(m.videoId)"
         guard key != addonSubsKey else { return }
         addonSubsKey = key
@@ -1165,7 +1250,7 @@ struct PlayerScreen: View {
                 })
             }
             // Only meaningful for series with a next episode; it stops the auto-advance at the end of this one.
-            if hasNext {
+            if canNextEpisode || hasNext {
                 rs.append(Row(label: "End of episode", selected: sleepAtEpisodeEnd) {
                     armSleep(minutes: nil, atEpisodeEnd: true)
                 })

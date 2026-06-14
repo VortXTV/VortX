@@ -420,7 +420,8 @@ struct iOSDetailView: View {
                 if let m = meta, let primary {
                     VStack(alignment: .leading, spacing: Theme.Space.xs) {
                         NavigationLink {
-                            iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1)
+                            iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
+                                  seasonEpisodes: episodesInSeason(primary.video.season ?? 1))
                         } label: {
                             Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume),
                                   systemImage: "play.fill")
@@ -837,7 +838,8 @@ struct iOSDetailView: View {
     @ViewBuilder private func episodeRow(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
         if let m = meta {
             NavigationLink {
-                iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season)
+                iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season,
+                                  seasonEpisodes: episodes(videos))
             } label: {
                 episodeRowLabel(v, isWatched: isWatched, progress: progress)
             }
@@ -914,6 +916,13 @@ struct iOSDetailView: View {
             .sorted { $0.episodeNumber < $1.episodeNumber }
     }
 
+    /// Ordered episodes of a SPECIFIC season (not the selected-season `episodes(_:)`), for the hero's
+    /// primary play whose resume episode may live in a different season than the one on screen.
+    private func episodesInSeason(_ s: Int) -> [CoreVideo] {
+        (meta?.videos ?? []).filter { ($0.season ?? 1) == s }
+            .sorted { $0.episodeNumber < $1.episodeNumber }
+    }
+
     private func seasonLabel(_ s: Int) -> String { s == 0 ? "Specials" : "Season \(s)" }
 
     // MARK: Shared
@@ -956,6 +965,7 @@ struct iOSEpisodeStreams: View {
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
+    let seasonEpisodes: [CoreVideo]   // ordered episodes of this season, for in-player Next/Prev/list + auto-advance
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
@@ -1019,6 +1029,8 @@ struct iOSEpisodeStreams: View {
             PlayerScreen(
                 url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
                 recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
+                episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "E\($0.episodeNumber) · \($0.episodeTitle)") },
+                loadEpisode: { await loadEpisodeStream($0) },
                 onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                 onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                 onClose: { player = nil }
@@ -1154,6 +1166,29 @@ struct iOSEpisodeStreams: View {
     /// same quality across episodes — the tvOS `LastStreamStore` continuity hint, keyed on the series id.
     private var rememberedQuality: String? {
         LastStreamStore.entry(for: meta.id, profileID: ProfileStore.shared.activeID)?.qualityText
+    }
+
+    /// Resolve an episode to a ready-to-play stream for the player's in-place Next / Prev / list. Reuses
+    /// the same load → rank → direct-links → torrent-prime → resume path as a manual source tap, so the
+    /// player can switch episodes without owning any of that logic. Returns nil when nothing is playable.
+    private func loadEpisodeStream(_ videoId: String) async -> PlayerEpisodeStream? {
+        guard let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
+        core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
+        var groups: [CoreStreamSourceGroup] = []
+        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
+            groups = displayGroups(core.streamGroups(forStreamId: v.id))
+            if !groups.isEmpty { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality),
+              let url = best.playableURL else { return nil }
+        core.loadEnginePlayer(for: best)
+        torrentPrime?.cancel(); torrentPrime = prepareTorrentStream(best)
+        let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
+                              name: meta.name, poster: v.thumbnail ?? meta.poster,
+                              season: v.season, episode: v.episode)
+        let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
+        return PlayerEpisodeStream(stream: best, url: url, meta: pm, title: title, resume: await resume(pm))
     }
 }
 
