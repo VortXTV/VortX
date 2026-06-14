@@ -59,6 +59,13 @@ targets:
   StremioXiOSNative:
     type: application
     platform: iOS
+    # Raise the per-app jetsam ceiling so the in-process node server + mpv 4K buffers don't trip the
+    # memory limit (the device server-death). Applied when the IPA is (re)signed; sideload tools
+    # (AltStore/Sideloadly) carry this entitlement for free Apple IDs, as emulators do.
+    entitlements:
+      path: StremioXiOSNative.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
     sources:
       - SourcesiOS                # touch UI
       - SourcesShared             # shared engine bridge, models, account, ranking, profiles, themes
@@ -157,6 +164,10 @@ targets:
   StremioXTV:
     type: application
     platform: tvOS
+    entitlements:
+      path: StremioXTV.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
     sources:
       - SourcesTV
       - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
@@ -202,6 +213,10 @@ targets:
   StremioXTVLite:
     type: application
     platform: tvOS
+    entitlements:
+      path: StremioXTVLite.entitlements
+      properties:
+        com.apple.developer.kernel.increased-memory-limit: true
     sources:
       - SourcesTV
       - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
