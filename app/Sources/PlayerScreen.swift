@@ -52,12 +52,12 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, info, playerSettings
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, info, playerSettings, sleep
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
-            case .playerSettings: 8
+            case .playerSettings: 8; case .sleep: 9
             }
         }
         var title: String {
@@ -66,6 +66,7 @@ struct PlayerScreen: View {
             case .subtitleSettings: "Subtitle Settings"; case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
+            case .sleep: "Sleep Timer"
             }
         }
     }
@@ -118,6 +119,11 @@ struct PlayerScreen: View {
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
     @State private var forcedLandscape = false
     @State private var hideTask: Task<Void, Never>?
+    // Sleep timer (#5): pause playback after a set time, or stop at the end of the current episode.
+    @State private var sleepMinutes: Int? = nil        // nil = off (unless sleepAtEpisodeEnd)
+    @State private var sleepAtEpisodeEnd = false        // stop at episode end instead of auto-advancing
+    @State private var sleepDeadline: Date? = nil       // when the timed pause fires (for the countdown label)
+    @State private var sleepTask: Task<Void, Never>?
     @State private var showExternalChooser = false   // "Play in another app" sheet
     @State private var showShare = false             // system share sheet
 
@@ -262,7 +268,7 @@ struct PlayerScreen: View {
         .onDisappear {
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-            refreshTask?.cancel()
+            refreshTask?.cancel(); sleepTask?.cancel()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
             #elseif os(macOS)
@@ -371,7 +377,12 @@ struct PlayerScreen: View {
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
             if !markedWatched, !isLive, let m = recordMeta { markedWatched = true; core.markPlaybackWatched(m) }
-            if hasNext {
+            if sleepAtEpisodeEnd {
+                // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
+                // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
+                sleepAtEpisodeEnd = false
+                onClose()
+            } else if hasNext {
                 onNext()                                  // episode ended → auto-play next
             } else {
                 // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
@@ -917,6 +928,8 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
                 }
+                Spacer()
+                controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel) { openPanel(.sleep) }
             }
             .padding(.horizontal, 8)
         }
@@ -1102,6 +1115,36 @@ struct PlayerScreen: View {
 
     /// Rows for a panel, computed once per open / refresh (NOT per clock tick), mirroring tvOS's cached
     /// `panelRows`. Sources / tracks are grouped + sorted, never a flat list.
+    private var sleepArmed: Bool { sleepMinutes != nil || sleepAtEpisodeEnd }
+
+    /// Bottom-bar label for the sleep control: "Sleep", a live "Sleep · 12m" countdown, or "Sleep · End".
+    private var sleepLabel: String {
+        if sleepAtEpisodeEnd { return "Sleep · End" }
+        if let d = sleepDeadline {
+            let mins = max(0, Int(ceil(d.timeIntervalSinceNow / 60)))
+            return "Sleep · \(mins)m"
+        }
+        return "Sleep"
+    }
+
+    /// (Re)arm the sleep timer. `minutes` runs a timed auto-pause; `atEpisodeEnd` lets the current episode
+    /// finish then stops (no auto-advance). Both nil/false = off. Cancels any prior timer.
+    private func armSleep(minutes: Int?, atEpisodeEnd: Bool) {
+        sleepTask?.cancel(); sleepTask = nil
+        sleepAtEpisodeEnd = atEpisodeEnd
+        sleepMinutes = minutes
+        sleepDeadline = nil
+        guard let minutes else { return }
+        let seconds = Double(minutes) * 60
+        sleepDeadline = Date().addingTimeInterval(seconds)
+        sleepTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            if !isPaused { coordinator.player?.togglePause() }
+            sleepMinutes = nil; sleepDeadline = nil
+        }
+    }
+
     private func rows(for p: Panel) -> [Row] {
         switch p {
         case .video:
@@ -1112,6 +1155,22 @@ struct PlayerScreen: View {
             return speeds.map { s in Row(label: speedLabel(s), selected: abs(speed - s) < 0.01) {
                 speed = s; coordinator.player?.setSpeed(s)
             } }
+        case .sleep:
+            var rs: [Row] = [Row(label: "Off", selected: sleepMinutes == nil && !sleepAtEpisodeEnd) {
+                armSleep(minutes: nil, atEpisodeEnd: false)
+            }]
+            for m in [15, 30, 45, 60, 90] {
+                rs.append(Row(label: "\(m) minutes", selected: sleepMinutes == m && !sleepAtEpisodeEnd) {
+                    armSleep(minutes: m, atEpisodeEnd: false)
+                })
+            }
+            // Only meaningful for series with a next episode; it stops the auto-advance at the end of this one.
+            if hasNext {
+                rs.append(Row(label: "End of episode", selected: sleepAtEpisodeEnd) {
+                    armSleep(minutes: nil, atEpisodeEnd: true)
+                })
+            }
+            return rs
         case .subtitles:
             var rs: [Row] = [Row(label: "Off", selected: subtitleTracks.allSatisfy { !$0.selected }) {
                 coordinator.player?.setSubtitleTrack(-1)
