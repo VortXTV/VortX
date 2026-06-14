@@ -96,9 +96,13 @@ struct iOSDetailView: View {
     }
 
     /// The hero artwork height scales with the platform: phones get a shorter band, the Mac a taller one.
+    /// The Mac band is generous so a wide window doesn't squash the 16:9 backdrop into a thin over-cropped
+    /// strip (the "same cut issue on the detail page" report) — kept a fixed (not aspect-ratio) band here
+    /// because the detail hero overlays an unbounded synopsis, which an aspectRatio would fight on narrow
+    /// windows; the pure billboard FeaturedHeroView (clamped synopsis) can safely be aspect-driven.
     private var backdropHeight: CGFloat {
         #if os(macOS)
-        return 460
+        return 560
         #else
         return 320
         #endif
