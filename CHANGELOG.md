@@ -4,6 +4,28 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 - 2026-06-14
+
+StremioX is now a native app on iPhone, iPad, and Mac alongside Apple TV, all on the same stremio-core engine and libmpv player. This milestone retires the old iPhone and iPad web host. The beta entries below list the iPhone polish that led here; the headline additions and fixes are collected here.
+
+### Added
+- **In-player next and previous episode, an episode list, and end-of-episode auto-advance** on iPhone, iPad, and Mac (Apple TV already had it). Episodes switch in place, with no reload flash, and carry the resume position and quality forward.
+- **Sleep timer.** Pause after 15 to 90 minutes, or stop at the end of the current episode.
+- **A native macOS menu bar.** A Go menu with keyboard shortcuts (Command 1 to 5 for the tabs, Command F for Search), Settings on Command comma, and Check for Updates.
+- **A translucent, frosted top bar on iPhone browse screens**, so the hero and content read as scrolling under the chrome.
+- **A streaming-server log in Settings** (iPhone and iPad), so when the embedded server stops you can see and share why.
+- **The launch animation now plays on iPhone, iPad, and Mac**, matching Apple TV.
+
+### Fixed
+- **The streaming server is far less likely to be killed mid-playback on iPhone.** Its torrent cache is now scaled to the device instead of a fixed 512 MB; on iPhone the server shares the app's memory, so an oversized cache plus 4K video could push the app past the system limit and force a restart.
+- **Finishing one episode of a series no longer clears the whole series from Continue Watching.** Only finishing a movie or the last episode clears it.
+- **Series and shows find their sources, not just movies**, and what you watch lands in Continue Watching and resumes where you stopped.
+- **Source rows no longer show the resolution twice** and show a fuller release title.
+- The iPhone detail and episode pages no longer clip at the screen edges; video fills the iPhone screen correctly; ratings and backdrops appear for TMDB-catalog titles; the featured hero shows one clean backdrop; the accent theme persists across relaunches; and upscaled video is sharp again (all detailed in the betas below).
+
+### Notes
+- Up next: next-episode pre-search and sticky release-group auto-play, an animated hero background, an HTTP/HLS quality selector, wider iPad and Mac layouts, a fuller accessibility pass, and more of the quality audit.
+
 ## 0.3.0 beta 15 (prerelease) - 2026-06-14
 
 More iPhone polish, all verified on an iOS build.
