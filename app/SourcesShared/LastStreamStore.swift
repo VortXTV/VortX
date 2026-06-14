@@ -16,6 +16,10 @@ enum LastStreamStore {
         var poster: String?
         var type: String
         var qualityText: String?
+        /// The playing stream's release group (behaviorHints.bingeGroup), so a Continue Watching resume's
+        /// prev/next keeps the SAME release across episodes (the binge continuity the detail page already
+        /// applies in-session). Optional, so old entries decode.
+        var bingeGroup: String? = nil
         var torrent: Bool? = nil
         var savedAt: Date
         /// HTTP headers the stream's add-on requires; without them a direct resume of a

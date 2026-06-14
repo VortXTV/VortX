@@ -40,7 +40,11 @@ struct PlayerScreen: View {
     // which have no library item to key the memory against. Mirrors TVPlayerView.LastStreamStore.record.
     var recordMeta: PlaybackMeta? = nil
     var recordQualityText: String? = nil                    // StreamRanking.signature(stream) of the launching stream
+    var recordBingeGroup: String? = nil                     // behaviorHints.bingeGroup of the launching stream (CW binge continuity)
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
+    /// The release group of the CURRENTLY playing stream, updated on an in-player episode switch so the
+    /// recorded binge group tracks the live episode (not the stale launch value). nil = use recordBingeGroup.
+    @State private var curBingeState: String? = nil
     // In-player episode navigation (series only). The ordered season episodes + a closure resolving any
     // episode id to a ready-to-play stream let the player advance Next / Prev and at end-of-episode IN
     // PLACE (a smooth source hot-swap, no cover teardown). Empty for movies / ad-hoc plays. The caller
@@ -521,6 +525,7 @@ struct PlayerScreen: View {
             videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
             season: m.season, episode: m.episode, name: m.name,
             poster: m.poster, type: m.type, qualityText: recordQualityText,
+            bingeGroup: curBingeState ?? recordBingeGroup,
             torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
             profileID: ProfileStore.shared.activeID)
     }
@@ -854,6 +859,7 @@ struct PlayerScreen: View {
             }
             curMetaState = es.meta
             curTitleState = es.title
+            curBingeState = es.stream.behaviorHints?.bingeGroup   // keep recorded binge group on the live episode
             markedWatched = false
             appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
             lastReported = -1

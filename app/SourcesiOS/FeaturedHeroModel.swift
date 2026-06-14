@@ -94,7 +94,14 @@ final class FeaturedHeroModel: ObservableObject {
         }
 
         let newIds = capped.map(\.id)
-        if newIds == pool.map(\.id) && hero != nil { return }   // same screen content → don't churn
+        if newIds == pool.map(\.id) && hero != nil {
+            // Same screen content, so don't churn the pool or yank the backdrop. BUT a prior stop() (a tab
+            // switch / disappear) cancels rotationTask, and this early-return used to leave it dead, so the
+            // hero froze on one item when the screen reappeared with unchanged content (the "iOS hero stuck,
+            // not rotating like Mac" report). Re-arm the timer if it isn't running.
+            if rotationTask == nil { startRotation() }
+            return
+        }
 
         pool = capped.shuffled()
         rotationIndex = 0

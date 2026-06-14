@@ -734,6 +734,9 @@ struct iOSPlayerLaunch: Identifiable {
     /// playback start so a CW resume refreshes its memory. Carried from the remembered entry on a CW
     /// direct-resume; nil for paste-a-link (which has no `meta`, so nothing is recorded anyway).
     var qualityText: String? = nil
+    /// The launching stream's release group (behaviorHints.bingeGroup), carried from the remembered CW
+    /// entry so a resume's prev/next keeps the same release across episodes (binge continuity).
+    var bingeGroup: String? = nil
     var isTorrent: Bool = false
     /// Series only: the season's ordered episodes + a resolver, so a Continue-Watching resume gets the
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
@@ -749,7 +752,8 @@ extension View {
         platformFullScreenPlayerCover(item: launch) { item in
             PlayerScreen(
                 url: item.url, title: item.title, headers: item.headers, resumeSeconds: item.resume,
-                recordMeta: item.meta, recordQualityText: item.qualityText, recordIsTorrent: item.isTorrent,
+                recordMeta: item.meta, recordQualityText: item.qualityText,
+                recordBingeGroup: item.bingeGroup, recordIsTorrent: item.isTorrent,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
@@ -823,13 +827,14 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 await iOSResolveEpisodeStream(videoId: vid, in: seasonVideos, seriesId: item.id,
                                               seriesName: entry.name, defaultSeason: season,
                                               fallbackPoster: entry.poster, continuity: entry.qualityText,
-                                              core: core, account: account)
+                                              binge: entry.bingeGroup, core: core, account: account)
             }
         }
     }
     return iOSPlayerLaunch(url: url, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
-                           qualityText: entry.qualityText, isTorrent: entry.torrent ?? false,
+                           qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
+                           isTorrent: entry.torrent ?? false,
                            episodes: episodes, loadEpisode: loadEpisode)
 }
 

@@ -52,7 +52,7 @@ func iOSDisplayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGro
 @MainActor
 func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: String,
                              seriesName: String, defaultSeason: Int, fallbackPoster: String?,
-                             continuity: String?, core: CoreBridge,
+                             continuity: String?, binge: String? = nil, core: CoreBridge,
                              account: StremioAccount) async -> PlayerEpisodeStream? {
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
@@ -71,7 +71,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         if !groups.isEmpty, settled || waitedEnough { break }
         try? await Task.sleep(for: .milliseconds(250))
     }
-    guard let best = StreamRanking.best(groups, continuity: continuity, binge: nil),
+    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge),
           let url = best.playableURL else { return nil }
     core.loadEnginePlayer(for: best)
     _ = prepareTorrentStream(best)   // fire-and-forget prime; self-terminating backoff
@@ -176,6 +176,9 @@ struct iOSDetailView: View {
         /// Quality signature + torrent flag of the launching stream, recorded into LastStreamStore on
         /// playback start (CW direct-resume + quality-continuity parity with tvOS).
         var qualityText: String? = nil
+        /// The launching stream's release group (behaviorHints.bingeGroup), recorded so a CW resume's
+        /// prev/next keeps the same release across episodes (binge continuity).
+        var bingeGroup: String? = nil
         var isTorrent: Bool = false
     }
 
@@ -273,7 +276,8 @@ struct iOSDetailView: View {
             case .player(let launch):
                 PlayerScreen(
                     url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
-                    recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
+                    recordMeta: launch.meta, recordQualityText: launch.qualityText,
+                    recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
                     // reportProgress feeds the engine Player (TimeChanged) so Continue Watching updates live and
                     // watched time is tracked; saveProgress keeps the signed-in remote/overlay sync. iOS was only
                     // doing the latter, so nothing reached the engine and CW never updated (tvOS does both).
@@ -714,7 +718,8 @@ struct iOSDetailView: View {
                               name: m.name, poster: m.poster, season: nil, episode: nil)
         presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent))
+                                            qualityText: StreamRanking.signature(stream),
+                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: stream.isTorrent))
     }
 
     /// Play an arbitrary chosen movie source (a tapped source-list row).
@@ -726,7 +731,8 @@ struct iOSDetailView: View {
                               name: m.name, poster: m.poster, season: nil, episode: nil)
         presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent))
+                                            qualityText: StreamRanking.signature(stream),
+                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: stream.isTorrent))
     }
 
     // MARK: Live — backdrop + LIVE badge + source list (no VOD chrome)
@@ -855,7 +861,8 @@ struct iOSDetailView: View {
                               name: m.name, poster: m.poster, season: nil, episode: nil)
         presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
                                             resume: 0, meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent))
+                                            qualityText: StreamRanking.signature(stream),
+                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: stream.isTorrent))
     }
 
     // MARK: Series — season selector + episode cards
