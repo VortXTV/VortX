@@ -100,6 +100,10 @@ struct PlayerScreen: View {
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var appliedAutoTracks = false
+    @State private var videoHeight = 0          // from mediaSummary, for the metadata line (#20)
+    @State private var audioCodec = ""
+    @State private var isHDR = false
+    @State private var metadataLine = ""        // "4K · HDR · EAC3"-style line shown under the title
     @State private var controlsVisible = true
     @State private var scrubbing = false
     #if os(macOS)
@@ -277,6 +281,8 @@ struct PlayerScreen: View {
         switch name {
         case MPVProperty.pausedForCache:
             if let b = data as? Bool { buffering = b }
+        case MPVProperty.videoParamsSigPeak:
+            if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
         case MPVProperty.timePos:
             if let d = data as? Double {
                 if d > 0, !hasStartedPlaying {      // playback actually began
@@ -332,6 +338,9 @@ struct PlayerScreen: View {
             if let b = data as? Bool { isPaused = b }
         case MPVProperty.trackList:
             refreshTracks()
+            let summary = coordinator.player?.mediaSummary()
+            videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
+            metadataLine = computeMetadataLine()
             if !appliedAutoTracks, !audioTracks.isEmpty || !subtitleTracks.isEmpty {
                 appliedAutoTracks = true
                 autoSelectTracks()
@@ -736,12 +745,49 @@ struct PlayerScreen: View {
         }
     }
 
+    /// "4K · HDR · EAC3"-style line from the current video height + HDR + audio codec (tvOS parity #20),
+    /// shown under the title so the user can tell what they actually got. Recomputed on track/HDR change.
+    private func computeMetadataLine() -> String {
+        var parts: [String] = []
+        switch videoHeight {
+        case 2000...:     parts.append("4K")
+        case 1300..<2000: parts.append("1440p")
+        case 900..<1300:  parts.append("1080p")
+        case 600..<900:   parts.append("720p")
+        case 1..<600:     parts.append("\(videoHeight)p")
+        default:          break
+        }
+        if isHDR { parts.append("HDR") }
+        if !audioCodec.isEmpty { parts.append(audioLabel(audioCodec)) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private func audioLabel(_ c: String) -> String {
+        switch c.lowercased() {
+        case "eac3":                 return "EAC3"
+        case "ac3":                  return "AC3"
+        case "truehd":               return "TrueHD"
+        case "dts", "dts-hd", "dca": return "DTS"
+        case "aac":                  return "AAC"
+        case "flac":                 return "FLAC"
+        case "opus":                 return "Opus"
+        case "mp3":                  return "MP3"
+        default:                     return c.uppercased()
+        }
+    }
+
     private var topBar: some View {
         HStack(spacing: 12) {
             iconButton("chevron.down") { leavePlayback() }
             if !title.isEmpty {
-                Text(title).font(.headline.weight(.semibold)).foregroundStyle(.white)
-                    .lineLimit(1).shadow(radius: 3)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.headline.weight(.semibold)).foregroundStyle(.white)
+                        .lineLimit(1).shadow(radius: 3)
+                    if !metadataLine.isEmpty {
+                        Text(metadataLine).font(.caption.weight(.medium))
+                            .foregroundStyle(.white.opacity(0.75)).lineLimit(1).shadow(radius: 2)
+                    }
+                }
             }
             Spacer()
             if hasNext {
