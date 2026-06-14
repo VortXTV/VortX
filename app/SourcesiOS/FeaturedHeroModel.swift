@@ -57,6 +57,10 @@ final class FeaturedHeroModel: ObservableObject {
     /// (Cinemeta first for `tt` ids, then every installed meta add-on for tmdb:/tvdb:/kitsu: ids).
     private static var metaSourceBases: [String] = []
 
+    /// Ids with an enrichment fetch in flight, so the eager pool pre-fetch and the per-show fetch don't
+    /// double-request the same title (apply-race / wasted round-trips). MainActor-isolated.
+    private var enriching: Set<String> = []
+
     /// Configure the meta-enrichment sources from the installed add-ons. Accepts raw transport URLs
     /// (".../manifest.json"); only add-ons that actually serve `meta` are kept.
     static func configureMetaSources(_ addons: [CoreDescriptor]) {
@@ -100,6 +104,12 @@ final class FeaturedHeroModel: ObservableObject {
         interactionHeld = false
         show(pool[rotationIndex], animated: false)
         startRotation()
+        // Eagerly enrich the WHOLE pool now, not just the visible item. Continue-Watching seeds carry
+        // only a name + poster, so a CW hero (e.g. Game of Thrones) showed bare — its enrichment used to
+        // start only when it rotated in and often lost the apply-race against the ~7s rotation. Pre-fetching
+        // every pool item means each is already cached (rating/year/genres/synopsis/logo) by the time it
+        // appears, so the meta row is there on first show. The cache + in-flight guards de-dup the work.
+        for item in pool { enrichIfNeeded(item) }
     }
 
     /// Kick off (or restart) the auto-advance loop. No-op when motion is disabled or the pool has a
@@ -182,9 +192,10 @@ final class FeaturedHeroModel: ObservableObject {
     /// (issue #54). Cached to the session cache; applied live only if the title is still the one on
     /// screen. Self-contained (no dependency on the tvOS `FocusedItemModel`), so tvOS is untouched.
     private func enrichIfNeeded(_ item: FeaturedHeroItem) {
-        guard Self.enrichmentCache[item.id] == nil else { return }
+        guard Self.enrichmentCache[item.id] == nil, !enriching.contains(item.id) else { return }
         let candidates = Self.metaURLs(for: item)
         guard !candidates.isEmpty else { return }
+        enriching.insert(item.id)
         Task { [weak self] in
             for url in candidates {
                 var request = URLRequest(url: url)
@@ -198,6 +209,7 @@ final class FeaturedHeroModel: ObservableObject {
                 let enriched = item.enriched(with: meta)
                 await MainActor.run {
                     Self.enrichmentCache[item.id] = enriched
+                    self?.enriching.remove(item.id)
                     guard let self, self.hero?.id == item.id else { return }
                     // No animation here: this is an in-place content upgrade of the SAME hero, not a
                     // swap, so cross-fading would flicker the already-visible backdrop.
@@ -205,6 +217,7 @@ final class FeaturedHeroModel: ObservableObject {
                 }
                 return
             }
+            await MainActor.run { self?.enriching.remove(item.id) }   // no candidate resolved → free the id to retry later
         }
     }
 

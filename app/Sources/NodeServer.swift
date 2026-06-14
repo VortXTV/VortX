@@ -208,7 +208,7 @@ enum NodeServer {
           if (!process.env.NEEDS_WEB_PROXY) return;   // web-host target only; native iOS/tvOS have no WKWebView
           try {
             var http = require('http'), https = require('https'), UP = 'web.stremio.com';
-            http.createServer(function (req, res) {
+            var proxySrv = http.createServer(function (req, res) {
               var opts = { host: UP, path: req.url, method: req.method,
                 headers: Object.assign({}, req.headers, { host: UP }) };
               var preq = https.request(opts, function (pres) {
@@ -221,7 +221,14 @@ enum NodeServer {
               });
               preq.on('error', function (e) { try { res.writeHead(502); res.end(String(e)); } catch (_) {} });
               req.pipe(preq);
-            }).listen(11471, '127.0.0.1', function () { w('[proxy]', ['stremio-web on 11471']); });
+            });
+            // CRITICAL: listen() reports EADDRINUSE (a previous instance still holds 11471 after a fast
+            // relaunch / force-quit) as an async 'error' EVENT, not a throw, so the try/catch below could
+            // never catch it. Without this handler it was an UNCAUGHT exception that crashed the whole node
+            // runtime and took the 11470 streaming server down with it: the "server dies within seconds on
+            // relaunch" crash (NOT a memory/jetsam issue). Swallow it; the instance already on the port serves.
+            proxySrv.on('error', function (e) { w('[proxy-err]', ['11471 listen: ' + (e && e.message || e)]); });
+            proxySrv.listen(11471, '127.0.0.1', function () { w('[proxy]', ['stremio-web on 11471']); });
           } catch (e) { w('[proxy-err]', [String(e)]); }
         })();
         """
