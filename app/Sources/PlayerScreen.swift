@@ -52,11 +52,12 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, info
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, info, playerSettings
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
+            case .playerSettings: 8
             }
         }
         var title: String {
@@ -64,7 +65,7 @@ struct PlayerScreen: View {
             case .speed: "Playback Speed"; case .subtitles: "Subtitles"
             case .subtitleSettings: "Subtitle Settings"; case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
-            case .sources: "Sources"; case .info: "Playback Info"
+            case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             }
         }
     }
@@ -815,7 +816,7 @@ struct PlayerScreen: View {
                     scheduleHide()
                 }
             }
-            iconButton("info.circle") { openPanel(.info) }
+            iconButton("gearshape") { openPanel(.playerSettings) }   // decoder toggle + playback info (tvOS parity #22)
             iconButton("arrow.up.forward.app") {       // hand off to Infuse / VLC / Share
                 hideTask?.cancel()
                 showExternalChooser = true
@@ -1131,6 +1132,18 @@ struct PlayerScreen: View {
             let stats = infoRows
             if stats.isEmpty { return [Row(label: "No info yet", isHeader: true)] }
             return stats.map { Row(label: $0.0, detail: $0.1) }
+        case .playerSettings:
+            let hw = coordinator.player?.hardwareDecoding ?? true
+            return [
+                Row(label: "Decoder", isHeader: true),
+                Row(label: "Hardware", detail: "recommended", selected: hw) {
+                    coordinator.player?.setHardwareDecoding(true)
+                },
+                Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
+                    coordinator.player?.setHardwareDecoding(false)
+                },
+                Row(label: "Playback Info", detail: "›") { openPanel(.info) },
+            ]
         }
     }
 
