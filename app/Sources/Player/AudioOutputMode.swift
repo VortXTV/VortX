@@ -18,6 +18,10 @@ enum AudioOutputMode: String, CaseIterable {
     case stereo
     /// Force multichannel even when the route reports stereo, for a receiver that under-reports.
     case surround
+    /// Bitstream Dolby / DTS untouched to an AV receiver that decodes them itself (lossless TrueHD /
+    /// DTS-HD MA), rather than decoding to PCM here. For a real AVR; if the route can't take the
+    /// bitstream, mpv falls back to decoding so it never goes silent.
+    case passthrough
 
     static let key = "stremiox.audioOutputMode"
 
@@ -25,11 +29,18 @@ enum AudioOutputMode: String, CaseIterable {
         AudioOutputMode(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .auto
     }
 
+    /// The mpv `audio-spdif` codec list when bitstreaming, else nil (decode to PCM). Only Passthrough
+    /// bitstreams; the decode modes leave this nil so DTS/Atmos are decoded to multichannel PCM.
+    var spdifCodecs: String? {
+        self == .passthrough ? "ac3,dts,eac3,truehd,dts-hd" : nil
+    }
+
     var label: String {
         switch self {
         case .auto: return "Auto"
         case .stereo: return "Stereo"
         case .surround: return "Surround"
+        case .passthrough: return "Passthrough"
         }
     }
 
@@ -37,7 +48,8 @@ enum AudioOutputMode: String, CaseIterable {
         switch self {
         case .auto: return "Matches your TV or receiver. Best for most setups."
         case .stereo: return "Forces a stereo downmix. Choose this if a soundbar or receiver plays no sound."
-        case .surround: return "Forces multichannel for a receiver that supports it but reports stereo."
+        case .surround: return "Decodes Dolby/DTS to multichannel PCM and forces it on. Pick this if a soundbar that doesn't support DTS drops to stereo."
+        case .passthrough: return "Sends Dolby/DTS untouched to an AV receiver that decodes them. Best on Mac or a real receiver; falls back to decoding if unsupported."
         }
     }
 }

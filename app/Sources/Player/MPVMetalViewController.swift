@@ -173,7 +173,7 @@ final class MPVMetalViewController: PlatformViewController {
     private var channelPolicy: String {
         switch AudioOutputMode.current {
         case .stereo: return "stereo"
-        case .surround: return "auto"
+        case .surround, .passthrough: return "auto"   // passthrough bitstreams the native layout untouched
         case .auto: return outputChannels > 2 ? "auto-safe" : "stereo"
         }
     }
@@ -336,6 +336,11 @@ final class MPVMetalViewController: PlatformViewController {
         // like desktop mpv, so we leave audio at mpv's defaults.
         #if canImport(UIKit)
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
+        // Passthrough mode bitstreams Dolby/DTS to a capable AV receiver instead of decoding to PCM;
+        // mpv degrades spdif -> PCM on a route that can't take it, so this never forces silence.
+        if let spdif = AudioOutputMode.current.spdifCodecs {
+            checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
+        }
         // Never let an AO-open failure fall through to the null AO: that is silent death with no
         // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
         // the next silent-audio report is actually diagnosable instead of a guess.
