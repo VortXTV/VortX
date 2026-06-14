@@ -242,17 +242,19 @@ struct iOSDetailView: View {
             if type == "series" {
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if core.metaDetails?.meta?.id != id { core.loadMeta(type: type, id: id) }
+            } else if core.metaDetails?.meta?.id == id {
+                loadMovieStreamsIfNeeded()        // meta already resident → dispatch streams now
             } else {
-                // A movie / live channel is a SINGLE video: request its streams explicitly (the stream id
-                // IS the title id), not the engine's guess_stream. RELOAD when the resident meta is THIS
-                // title's but carries no streams for it (e.g. the Home hero enrichment loaded meta only) —
-                // guarding on the meta id alone skipped the stream request and left movies with just the
-                // 2-3 fastest add-ons / "no sources". Mirrors the iOSEpisodeStreams hasThisEpisodeStreams guard.
-                let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == id } ?? false
-                if core.metaDetails?.meta?.id != id || !hasStreams {
-                    core.loadMeta(type: type, id: id, streamType: type, streamId: id)
-                }
+                core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
+        }
+        // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
+        // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
+        // (idPrefixes ["tt"]) are silently dropped from the plan for a non-imdb id (so only AIOStreams-style
+        // broad add-ons answer). The imdb id lives in the meta's behaviorHints.defaultVideoId, known only
+        // AFTER the meta loads — so dispatch the streams here, once the meta arrives. (movieStreamId).
+        .onChange(of: core.metaDetails?.meta?.id) { _ in
+            if type != "series" { loadMovieStreamsIfNeeded() }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -649,6 +651,27 @@ struct iOSDetailView: View {
             play: { stream, url in Task { await playStream(stream, url: url) } }
         )
         .padding(.horizontal, Theme.Space.md)
+    }
+
+    /// The id to dispatch a movie/live stream request with: the meta's imdb `defaultVideoId` (tt...) when
+    /// the catalog id is non-imdb (tmdb:/kitsu:), else the catalog id. Falls back to the catalog id before
+    /// the meta is loaded. This is what makes imdb-keyed stream add-ons match (the engine's own guess_stream
+    /// uses the same default_video_id; we lost it by moving movies to an explicit streamPath).
+    private var movieStreamId: String {
+        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
+        return id
+    }
+
+    /// Dispatch the movie/live stream request with the imdb-preferring stream id, unless those streams are
+    /// already resident. No-op for series and until this title's meta has loaded (so movieStreamId can read
+    /// the imdb defaultVideoId). The hasStreams guard keys on the EFFECTIVE id, so a re-dispatch loop can't
+    /// form once the imdb-keyed streams arrive.
+    private func loadMovieStreamsIfNeeded() {
+        guard type != "series", core.metaDetails?.meta?.id == id else { return }
+        let streamId = movieStreamId
+        let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
+        guard !hasStreams else { return }
+        core.loadMeta(type: type, id: id, streamType: type, streamId: streamId)
     }
 
     /// Apply the Direct-links-only filter (drop every torrent source) so a user with the setting on

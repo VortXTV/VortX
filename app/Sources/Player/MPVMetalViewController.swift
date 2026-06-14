@@ -308,11 +308,15 @@ final class MPVMetalViewController: PlatformViewController {
         // without on-device soak testing of the same DV remuxes.
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "300"))
+#if os(macOS)
         checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "64MiB"))
-#if os(tvOS)
-        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "512MiB"))
-#else
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "256MiB"))
+#else
+        // iOS/tvOS: the server is in-process and jetsam-bound and its RSS includes these mpv buffers, so
+        // keep the back-buffer (already-played, for seek-back) small. The per-file demuxer-max-bytes below
+        // overrides the forward cache; this init is just the pre-load default.
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "24MiB"))
+        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
         // HLS: pick the HIGHEST-bandwidth variant of an adaptive master playlist. mpv's documented
@@ -549,17 +553,18 @@ final class MPVMetalViewController: PlatformViewController {
         if live {
             readAhead = "64MiB"
         } else if PerformanceMode.reduced {
-            readAhead = isLocalStream ? "64MiB" : "256MiB"   // 2 GB Apple TV HD: keep buffers tight
+            readAhead = isLocalStream ? "64MiB" : "96MiB"   // 2 GB Apple TV HD: keep buffers tightest
         } else {
             #if os(macOS)
             readAhead = isLocalStream ? "128MiB" : "512MiB"
             #else
-            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound, so a remote (debrid /
-            // direct-CDN) file gets a 256 MiB read-ahead instead of 512 MiB — that buffer, stacked on the
-            // in-process server + mpv 4K decode, is what drove the debrid "server died" RSS to ~1.6 GB.
-            // 256 MiB is still ample for a fast debrid link; the Mac (out-of-process server + swap) keeps
-            // the larger buffer for slow-CDN resilience.
-            readAhead = isLocalStream ? "128MiB" : "256MiB"
+            // iOS/tvOS run the streaming server IN-PROCESS and are jetsam-bound. Crucially, on iOS the node
+            // server's reported RSS INCLUDES this mpv demuxer cache (same process), so a big read-ahead is
+            // counted twice toward the jetsam ceiling AND grows even on DEBRID (direct CDN) playback — which
+            // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
+            // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
+            // server + swap) keeps the larger buffer for slow-CDN resilience.
+            readAhead = isLocalStream ? "96MiB" : "128MiB"
             #endif
         }
         mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)

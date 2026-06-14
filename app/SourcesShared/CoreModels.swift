@@ -306,6 +306,11 @@ struct CoreMetaItem: Decodable {
 struct CoreMetaBehaviorHints: Decodable {
     let hasScheduledVideos: Bool?
     let featuredVideoId: String?
+    /// The canonical video id for a single-video title (a movie). For a title from a TMDB/Kitsu catalog
+    /// the meta `id` is tmdb:/kitsu: but `defaultVideoId` carries the imdb id (tt...). Official Stremio
+    /// uses this as the movie stream-path id, so imdb-keyed stream add-ons (idPrefixes ["tt"]) match;
+    /// passing the raw tmdb id instead silently drops every imdb add-on from the plan.
+    let defaultVideoId: String?
 }
 
 /// Pure, engine-free now/next selection over a live channel's scheduled `videos[]`. Mirrors the

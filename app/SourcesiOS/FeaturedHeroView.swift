@@ -21,14 +21,14 @@ struct FeaturedHeroView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
 
-    /// Hero band height. iOS uses the 0.3.0 height (320): the taller 420 immersive band that bled up under
-    /// the nav bar felt cramped on a phone, so the user reverted it. macOS keeps 460 and DOES bleed up under
-    /// the transparent titlebar (the wordmark lives in the unified titlebar), so its taller band reads well.
+    /// Hero band height. iOS is 380: a bit bigger than the 0.3.0 320 (the user wanted a larger billboard),
+    /// but NOT the 420 immersive band that bled under the nav bar and felt cramped. The content row is
+    /// bottom-anchored, so the extra height just shows more backdrop above it. macOS keeps 460.
     static var heroHeight: CGFloat {
         #if os(macOS)
         return 460
         #else
-        return 320
+        return 380
         #endif
     }
 

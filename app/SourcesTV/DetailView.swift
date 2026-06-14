@@ -40,18 +40,45 @@ struct DetailView: View {
         // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
         // the safe area itself), so only text and controls moved back inside the safe zone.
         .onAppear {
-            // Movies / live are a single video: request streams explicitly (the stream id IS the title
-            // id) instead of the engine's guess_stream, which under-queries add-ons for movies (only the
-            // 2-3 fastest responded). Series load streams per-episode (CoreEpisodeStreams), so a series
-            // detail loads meta only.
+            // Movies / live are a single video. Their stream request must carry the IMDB id, not the raw
+            // catalog id: a TMDB/Kitsu catalog gives a tmdb:/kitsu: meta id, and imdb-keyed add-ons
+            // (idPrefixes ["tt"]) are dropped from the plan for a non-imdb id (only AIOStreams-style broad
+            // add-ons answer). The imdb id is in the meta's behaviorHints.defaultVideoId, known only after
+            // the meta loads, so load meta FIRST then dispatch streams on meta-ready (loadMovieStreamsIfNeeded).
+            // Series load streams per-episode (CoreEpisodeStreams), so a series detail loads meta only.
             if type == "series" {
                 core.loadMeta(type: type, id: id)
+            } else if core.metaDetails?.meta?.id == id {
+                loadMovieStreamsIfNeeded()
             } else {
-                core.loadMeta(type: type, id: id, streamType: type, streamId: id)
+                core.loadMeta(type: type, id: id)
             }
             captureHero()
         }
-        .onChange(of: core.metaDetails?.meta?.id) { captureHero() }
+        .onChange(of: core.metaDetails?.meta?.id) {
+            captureHero()
+            if type != "series" { loadMovieStreamsIfNeeded() }
+        }
+    }
+
+    /// The id to dispatch a movie/live stream request with: the meta's imdb `defaultVideoId` (tt...) when
+    /// the catalog id is non-imdb (tmdb:/kitsu:), else the catalog id. Falls back to the catalog id before
+    /// the meta loads. Matches official Stremio (and the engine's guess_stream), which key movie streams on
+    /// default_video_id so imdb add-ons match.
+    private var movieStreamId: String {
+        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, !dv.isEmpty, dv != id { return dv }
+        return id
+    }
+
+    /// Dispatch the movie/live stream request with the imdb-preferring id, unless those streams are already
+    /// resident. No-op for series and until this title's meta loaded. The hasStreams guard keys on the
+    /// EFFECTIVE id so no re-dispatch loop forms once the imdb-keyed streams arrive.
+    private func loadMovieStreamsIfNeeded() {
+        guard type != "series", core.metaDetails?.meta?.id == id else { return }
+        let streamId = movieStreamId
+        let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
+        guard !hasStreams else { return }
+        core.loadMeta(type: type, id: id, streamType: type, streamId: streamId)
     }
 
     /// Feed the browse pages' hero cache with what this page knows. The engine resolved this meta

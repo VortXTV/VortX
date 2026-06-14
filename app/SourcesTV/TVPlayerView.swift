@@ -1503,6 +1503,11 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        // Re-arm the watched marker for the NEW episode. Without this, the first episode of a binge sets
+        // markedWatched=true at ~90% and every in-place auto-advanced episode after it is blocked by the
+        // `!markedWatched` guard, so only the session's first episode ever marks watched (the "watched
+        // episodes don't tick" regression; iOS PlayerScreen.goToEpisode already resets it).
+        markedWatched = false
         sourceHops = 0; exhaustedURLs = []   // fresh episode, fresh failover budget
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         let newMeta = PlaybackMeta(libraryId: m.libraryId, videoId: v.id, type: "series",
