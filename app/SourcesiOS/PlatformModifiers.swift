@@ -176,27 +176,4 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var savedToolbarVisible: Bool?
     }
 }
-
-/// Configures the macOS BROWSE window to draw content UNDER a transparent titlebar, so the hero backdrop
-/// bleeds full-bleed to the very top of the window (removing the black strip above it). Set ONCE when the
-/// window mounts and NEVER toggled off: reassigning `styleMask` on restore collapsed the window to its
-/// minimum size on-device (see MacPlayerChromeHider's note at the top of this file), and a set-once
-/// configurator sidesteps that hazard entirely. `.fullSizeContentView` keeps the standard traffic-light
-/// buttons; the wordmark lives in the toolbar's principal slot, so hiding the title text loses nothing.
-/// Attach via `.background(MacWindowFullBleedConfigurator())` inside a macOS-only block in the app root.
-struct MacWindowFullBleedConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        // The window isn't attached yet; defer one runloop turn to reach + configure it once.
-        DispatchQueue.main.async { [weak view] in
-            guard let window = view?.window else { return }
-            window.styleMask.insert(.fullSizeContentView)
-            window.titlebarAppearsTransparent = true
-            window.titleVisibility = .hidden
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}
 #endif

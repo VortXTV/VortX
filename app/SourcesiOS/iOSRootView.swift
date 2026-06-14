@@ -228,13 +228,6 @@ struct iOSHomeView: View {
                 }
                 .padding(.bottom, Theme.Space.md)
             }
-            #if os(macOS)
-            // macOS: the window is full-size-content under a transparent titlebar
-            // (MacWindowFullBleedConfigurator), so let the hero billboard bleed UP to the window top — the
-            // backdrop runs under the translucent bar instead of leaving a black strip above it. On iOS this
-            // top-bleed was reverted: the 0.3.0 layout (hero starting below the bar) reads less cramped on a phone.
-            .ignoresSafeArea(.container, edges: .top)
-            #endif
             // A scroll gesture quiets the ambient hero rotation (resumes after inactivity) — the
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
@@ -369,9 +362,6 @@ struct iOSLibraryView: View {
                         .frame(minHeight: 420)
                 }
             }
-            #if os(macOS)
-            .ignoresSafeArea(.container, edges: .top)   // macOS hero bleeds under the translucent titlebar (matches Home); reverted on iOS
-            #endif
             .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle("Library", isActive: isActive)
@@ -657,9 +647,6 @@ struct iOSDiscoverView: View {
                 // clipping report. Home has only self-bounding horizontal rails, so it never needed this.
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            #if os(macOS)
-            .ignoresSafeArea(.container, edges: .top)   // macOS hero bleeds under the translucent titlebar (matches Home); reverted on iOS
-            #endif
             .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle("Discover", isActive: isActive)
