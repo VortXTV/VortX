@@ -4,7 +4,7 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
-## 0.3.1 (prerelease) - 2026-06-14
+## 0.3.1 - 2026-06-14
 
 A bug-fix and polish pass on top of 0.3.0, driven by on-device testing. Cut as a prerelease to verify the streaming-server and movie fixes on real devices before promoting it to the latest release.
 

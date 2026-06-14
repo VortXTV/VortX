@@ -8,6 +8,28 @@ import AppKit
 
 class MetalLayer: CAMetalLayer {
 
+    // Tracks the last fully-presented drawable so captureFrameJPEGData can read its texture.
+    // MPV calls nextDrawable() to acquire a new render target; at that moment the previous target
+    // has been presented and is the frame the user sees. Written on MPV's render thread, read on
+    // the capture queue — protected by drawableLock.
+    private let drawableLock = NSLock()
+    private var _pendingDrawable: (any CAMetalDrawable)?
+    private var _displayedDrawable: (any CAMetalDrawable)?
+
+    var captureDrawable: (any CAMetalDrawable)? {
+        drawableLock.lock(); defer { drawableLock.unlock() }
+        return _displayedDrawable
+    }
+
+    override func nextDrawable() -> (any CAMetalDrawable)? {
+        let d = super.nextDrawable()
+        drawableLock.lock()
+        _displayedDrawable = _pendingDrawable
+        _pendingDrawable = d
+        drawableLock.unlock()
+        return d
+    }
+
     // workaround for a MoltenVK that sets the drawableSize to 1x1 to forcefully complete
     // the presentation, this causes flicker and the drawableSize possibly staying at 1x1
     // https://github.com/mpv-player/mpv/pull/13651

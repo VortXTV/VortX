@@ -117,6 +117,11 @@ struct PlayerScreen: View {
     ]
 
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
+    @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
+    @State private var hoverPreviewTime: Double?
+    @State private var hoverPreviewRatio: CGFloat?
+    @State private var lastLocalTrickplayCapture = -1000.0
+    @State private var localTrickplayCaptureInFlight = false
     @AppStorage("stremiox.videoSize") private var videoSize = "original"   // whole frame, correct aspect
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
@@ -291,6 +296,7 @@ struct PlayerScreen: View {
         .tint(Theme.Palette.accent)
         .onAppear {
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             scheduleHide(); startLoadTimeout()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
@@ -360,6 +366,7 @@ struct PlayerScreen: View {
                 if !scrubbing {
                     currentTime = d
                     updateCurrentSkip(at: d)
+                    maybeCaptureLocalTrickplay(at: d)
                     // Live streams must NOT write a resume offset: their "position" is just elapsed
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
                     // bogus offset (or drop a fake Continue-Watching entry).
@@ -445,6 +452,65 @@ struct PlayerScreen: View {
 
     /// Persist the exact link that just started playing into LastStreamStore, so Continue-Watching can
     /// one-tap resume this stream and reopening the title auto-picks the same quality — the iOS/Mac twin
+    // MARK: - Local trickplay capture
+
+    private var trickplayLocalCacheKey: String {
+        if let m = recordMeta { return "v:\(m.libraryId):\(m.videoId)" }
+        return "u:\((curURL ?? url).absoluteString)"
+    }
+
+    private func maybeCaptureLocalTrickplay(at time: Double) {
+        guard !scrubbing, !buffering, !isPaused else { return }
+        guard !localTrickplayCaptureInFlight else { return }
+        guard time - lastLocalTrickplayCapture >= 10 else { return }
+        lastLocalTrickplayCapture = time
+        localTrickplayCaptureInFlight = true
+        coordinator.player?.captureFrameJPEGData { data in
+            self.localTrickplayCaptureInFlight = false
+            guard let data else { return }
+            self.scrubThumbnails.recordCapturedFrameData(data, at: time)
+        }
+    }
+
+    @ViewBuilder
+    private func trickplayPopup(time: Double) -> some View {
+        VStack(spacing: 4) {
+            if let image = scrubThumbnails.image {
+                #if canImport(AppKit)
+                let img = Image(nsImage: image)
+                #else
+                let img = Image(uiImage: image)
+                #endif
+                img.resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 320, height: 180)
+                    .background(.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(.white.opacity(0.2), lineWidth: 1))
+            }
+            Text(timeString(time))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+    }
+
+    private func trickplayBubbleOffset(sliderWidth: CGFloat) -> CGFloat {
+        // When no thumbnail, the pill is narrow (~70 pt); use that for centering/clamping.
+        let popupWidth: CGFloat = scrubThumbnails.image != nil ? 320 : 70
+        guard sliderWidth > 0 else { return 0 }
+        let ratio: CGFloat
+        if let r = hoverPreviewRatio { ratio = r }
+        else if duration > 0 { ratio = CGFloat(scrubTarget / duration) }
+        else { return 0 }
+        return min(max(0, ratio * sliderWidth - popupWidth / 2), max(0, sliderWidth - popupWidth))
+    }
+
+    // MARK: - Continue Watching
+
     /// of TVPlayerView's record-on-start. Records the bare `curURL`/`curHeaders` the active source was
     /// launched with (a proxied loopback URL is rebuilt from these on resume), not the internal
     /// `initialPlayback` rewrite. No-op for ad-hoc plays with no `recordMeta` (e.g. paste-a-link).
@@ -981,21 +1047,59 @@ struct PlayerScreen: View {
             } else {
                 HStack(spacing: 12) {
                     Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white)
-                    // While dragging, the thumb follows a local scrubTarget so an incoming timePos tick
-                    // can't yank it back to the (pre-seek) playback position (#32). On release we commit
-                    // scrubTarget once. Outside a drag the thumb tracks live currentTime.
-                    Slider(value: Binding(get: { scrubbing ? scrubTarget : currentTime },
-                                          set: { scrubTarget = $0 }),
-                           in: 0...max(duration, 1)) { editing in
-                        scrubbing = editing
-                        if editing { scrubTarget = currentTime; hideTask?.cancel() }
-                        else {
-                            currentTime = scrubTarget
-                            coordinator.player?.seek(to: scrubTarget)
-                            if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
-                            scheduleHide()
+                    // Slider is wrapped in a GeometryReader so the trickplay bubble can be positioned
+                    // relative to the knob and macOS hover can compute the preview time from cursor x.
+                    GeometryReader { geo in
+                        // macOS Slider track is inset by ~half the thumb diameter on each side.
+                        let sliderInset: CGFloat = 10
+                        let trackWidth = max(1, geo.size.width - sliderInset * 2)
+                        // While dragging the thumb follows scrubTarget so an incoming timePos tick
+                        // can't yank it back to the pre-seek position (#32). On release we commit.
+                        Slider(value: Binding(get: { scrubbing ? scrubTarget : currentTime },
+                                              set: { scrubTarget = $0; scrubThumbnails.show(time: $0) }),
+                               in: 0...max(duration, 1)) { editing in
+                            scrubbing = editing
+                            if editing {
+                                scrubTarget = currentTime; hideTask?.cancel()
+                                hoverPreviewTime = nil; hoverPreviewRatio = nil
+                            } else {
+                                currentTime = scrubTarget
+                                coordinator.player?.seek(to: scrubTarget)
+                                if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
+                                scrubThumbnails.clear()
+                                scheduleHide()
+                            }
                         }
-                    }.tint(Theme.Palette.accent)
+                        .tint(Theme.Palette.accent)
+                        #if os(macOS)
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let loc):
+                                guard !scrubbing else { return }
+                                let ratio = min(max(0, (loc.x - sliderInset) / trackWidth), 1)
+                                hoverPreviewRatio = ratio
+                                hoverPreviewTime = ratio * max(duration, 0)
+                                scrubThumbnails.show(time: hoverPreviewTime!)
+                            case .ended:
+                                guard !scrubbing else { return }
+                                hoverPreviewTime = nil; hoverPreviewRatio = nil
+                                scrubThumbnails.clear()
+                            }
+                        }
+                        #endif
+                        // bottomLeading alignment: popup bottom anchors at slider bottom, grows upward.
+                        // y: -28 lifts it 4 pt above the slider top (slider is 24 pt tall).
+                        .overlay(alignment: .bottomLeading) {
+                            if scrubbing || hoverPreviewTime != nil {
+                                trickplayPopup(time: hoverPreviewTime ?? scrubTarget)
+                                    .fixedSize()
+                                    .offset(x: trickplayBubbleOffset(sliderWidth: geo.size.width), y: -28)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)))
+                            }
+                        }
+                    }
+                    .frame(height: 24)
+                    .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)
                     Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
                 }
             }
