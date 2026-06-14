@@ -82,9 +82,6 @@ struct StremioXiOSApp: App {
                 // iPadOS ignore this — their windows are managed by the system, not content size.)
                 #if os(macOS)
                 .frame(minWidth: 900, minHeight: 600)
-                // Draw content under a transparent titlebar so the hero backdrop bleeds full-bleed to the
-                // window top (no black strip above it). Set-once; see MacWindowFullBleedConfigurator.
-                .background(MacWindowFullBleedConfigurator())
                 #endif
         }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
