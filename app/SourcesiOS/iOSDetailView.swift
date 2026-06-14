@@ -141,7 +141,18 @@ struct iOSDetailView: View {
         .inlineNavigationTitle()
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
-        .onAppear { if core.metaDetails?.meta?.id != id { core.loadMeta(type: type, id: id) } }
+        .onAppear {
+            if core.metaDetails?.meta?.id != id {
+                // A movie / live channel is a SINGLE video: request its streams explicitly (the stream id
+                // IS the title id) instead of relying on the engine's guess_stream. A series loads streams
+                // per-episode from iOSEpisodeStreams, so a series detail loads meta only.
+                if type == "series" {
+                    core.loadMeta(type: type, id: id)
+                } else {
+                    core.loadMeta(type: type, id: id, streamType: type, streamId: id)
+                }
+            }
+        }
         .onDisappear { core.unloadMeta(); torrentPrime?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
@@ -917,7 +928,13 @@ struct iOSEpisodeStreams: View {
         // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {
-            if core.metaDetails?.meta?.id != meta.id {
+            // Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
+            // WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
+            // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
+            // Also (re)load whenever the loaded streams aren't this episode's; the engine de-dups an
+            // identical meta+stream load, so this is cheap when the right streams are already present.
+            let hasThisEpisodeStreams = core.metaDetails?.streams.contains { $0.request.path.id == video.id } ?? false
+            if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
                 core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
             }
         }
