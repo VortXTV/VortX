@@ -24,6 +24,10 @@ A bug-fix and polish pass on top of 0.3.0, driven by on-device testing. Cut as a
 - **Local scrub-preview thumbnails**, captured while you watch, so dragging the seek bar shows a frame preview even without a server storyboard. Contributed by OrigamiSpace.
 - **Scroll arrows on catalog rows** (Mac, and iPad with a pointer), so a long row is easy to page through without a trackpad swipe.
 - **A bigger iPhone hero billboard**, and a sticky release group across episodes. Both iPhone and Mac keep the 0.3.0 translucent top bar (the immersive bleed treatments tried on each were reverted).
+- **Binge continuity on Continue Watching**: resuming a series, and its in-player Next / Previous, now keep the same release group across episodes, not just the same resolution.
+
+### Also fixed
+- **The iPhone hero billboard rotates again** instead of occasionally freezing on one title after switching tabs.
 
 ### Notes
 - Still being verified on real devices: streaming-server memory under sustained playback, and movie add-on coverage. More player and competitor-parity features are landing next.
