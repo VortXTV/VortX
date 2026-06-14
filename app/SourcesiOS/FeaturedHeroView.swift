@@ -30,6 +30,12 @@ struct FeaturedHeroView: View {
         #endif
     }
 
+    /// macOS only: the hero tracks a fixed ~2:1 billboard ratio of the window WIDTH instead of a fixed
+    /// height, so a wide window doesn't squash a 16:9 still into a thin sliver (the over-zoom / heavy
+    /// side-letterbox reports). A 16:9 backdrop then nearly fills the band, with only a hair of blurred
+    /// ambient fill at the edges. iPhone / iPad keep the fixed band (portrait widths are already tall).
+    static let macHeroAspect: CGFloat = 2.0
+
     private var heroHeight: CGFloat { Self.heroHeight }
 
     var body: some View {
@@ -47,8 +53,16 @@ struct FeaturedHeroView: View {
                     .transition(reduceMotion ? .identity : .opacity)
             }
         }
+        #if os(macOS)
+        // Track a ~2:1 billboard ratio of the WINDOW WIDTH (not a fixed short height) so a wide window
+        // can't squash a 16:9 still into a sliver. The backdrop then fills the band edge-to-edge with only
+        // a gentle crop — the reference home-screen look — instead of letterbox bars or a heavy zoom.
+        .frame(maxWidth: .infinity)
+        .aspectRatio(Self.macHeroAspect, contentMode: .fit)
+        #else
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
+        #endif
         // The LazyVStack host has no horizontal padding (each rail insets itself), so the band is
         // already edge-to-edge — a fixed-height ambient scroll-header.
         // Animate the swap on the hero id — the model already wraps content changes in the matching
@@ -74,19 +88,7 @@ struct FeaturedHeroView: View {
                 posterFallback
                 AsyncImage(url: URL(string: model.hero?.backdrop ?? "")) { phase in
                     switch phase {
-                    case .success(let img):
-                        ZStack {
-                            // Ambient fill: a blurred, band-filling copy so the wide Mac hero has no empty
-                            // side gaps — WITHOUT cropping the real still.
-                            img.resizable().aspectRatio(contentMode: .fill)
-                                .frame(width: geo.size.width, height: geo.size.height)
-                                .clipped()
-                                .blur(radius: 40)
-                                .opacity(0.55)
-                            // The still shown WHOLE (fit) so the wide-short band can't zoom a 16:9 backdrop
-                            // down to a sliver (the "only the top of the throne" report). Fit, not fill.
-                            img.resizable().aspectRatio(contentMode: .fit)
-                        }
+                    case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
                     default: Color.clear   // transparent while loading / on failure so the poster shows through
                     }
                 }
@@ -94,8 +96,12 @@ struct FeaturedHeroView: View {
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
         }
+        #if os(macOS)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)   // fill the responsive billboard band set by body
+        #else
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
+        #endif
         // Cross-fade the artwork itself on id change so a new featured title dissolves in.
         .id(model.hero?.id)
         .transition(reduceMotion ? .identity : .opacity)
