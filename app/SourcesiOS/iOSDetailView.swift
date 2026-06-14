@@ -188,13 +188,17 @@ struct iOSDetailView: View {
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
         .onAppear {
-            if core.metaDetails?.meta?.id != id {
+            if type == "series" {
+                // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
+                if core.metaDetails?.meta?.id != id { core.loadMeta(type: type, id: id) }
+            } else {
                 // A movie / live channel is a SINGLE video: request its streams explicitly (the stream id
-                // IS the title id) instead of relying on the engine's guess_stream. A series loads streams
-                // per-episode from iOSEpisodeStreams, so a series detail loads meta only.
-                if type == "series" {
-                    core.loadMeta(type: type, id: id)
-                } else {
+                // IS the title id), not the engine's guess_stream. RELOAD when the resident meta is THIS
+                // title's but carries no streams for it (e.g. the Home hero enrichment loaded meta only) —
+                // guarding on the meta id alone skipped the stream request and left movies with just the
+                // 2-3 fastest add-ons / "no sources". Mirrors the iOSEpisodeStreams hasThisEpisodeStreams guard.
+                let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == id } ?? false
+                if core.metaDetails?.meta?.id != id || !hasStreams {
                     core.loadMeta(type: type, id: id, streamType: type, streamId: id)
                 }
             }

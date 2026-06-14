@@ -39,7 +39,18 @@ struct DetailView: View {
         // TV overscan, and pushing the whole page into them clipped the top of the detail page
         // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
         // the safe area itself), so only text and controls moved back inside the safe zone.
-        .onAppear { core.loadMeta(type: type, id: id); captureHero() }
+        .onAppear {
+            // Movies / live are a single video: request streams explicitly (the stream id IS the title
+            // id) instead of the engine's guess_stream, which under-queries add-ons for movies (only the
+            // 2-3 fastest responded). Series load streams per-episode (CoreEpisodeStreams), so a series
+            // detail loads meta only.
+            if type == "series" {
+                core.loadMeta(type: type, id: id)
+            } else {
+                core.loadMeta(type: type, id: id, streamType: type, streamId: id)
+            }
+            captureHero()
+        }
         .onChange(of: core.metaDetails?.meta?.id) { captureHero() }
     }
 
