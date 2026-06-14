@@ -4,6 +4,13 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 11 (prerelease) - 2026-06-14
+
+Priority fix for the Apple TV streaming-server death (issue #56).
+
+### Fixed
+- **The Apple TV streaming server no longer dies after one torrent.** On a 2 GB Apple TV HD, the in-process server ran the full configuration (including a second HTTPS server it never uses) and capped its torrent cache at 512 MB, so loading one torrent pushed the app past the device's memory budget and tvOS killed the server, with no in-process restart. The Apple TV now runs the same lean configuration as the iPhone build (no unused HTTPS/transcode subsystems), and the torrent cache is sized to the device (256 MB on 2 GB hardware, 512 MB on 3 GB+), keeping it under budget. This also relieves the memory pressure behind the playback stutter. *Please re-test on the Apple TV HD; if stutter remains, the player read-ahead is the next lever.*
+
 ## 0.3.0 beta 10 (prerelease) - 2026-06-14
 
 Working down the full audit, plus a dedicated macOS pass.

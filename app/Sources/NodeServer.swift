@@ -68,20 +68,17 @@ enum NodeServer {
         // all share the libuv threadpool (default 4). Many dead trackers resolving slowly
         // can saturate it and stall the engine. 16 threads relieves that contention. Cheap
         // and harmless; the heartbeat in the preload tells us if the loop still freezes.
-        setenv("UV_THREADPOOL_SIZE", "16", 1)
-        #if os(iOS)
-        // iPhone/iPad only: match the configuration the official Stremio iOS app ships. Drop the
-        // secondary :12470 HTTPS server + local.strem.io cert subsystem (NO_HTTPS_SERVER) and HLSv2.
-        // On a real iPhone the embedded node server shares ONE tight per-app memory budget with the
-        // Rust core + libmpv + SwiftUI, and these unused subsystems inflate the in-process footprint
-        // enough that iOS jetsam-killed the server ~5s after launch ("streaming server crashed", beta7).
-        // The simulator has no jetsam enforcement, so it only reproduced on device. Set as discrete
-        // flags rather than IOS_APP on purpose: IOS_APP would also try `_linkedBinding("apple_bridge")`,
-        // which isn't linked in this NodeMobile build and could throw. tvOS keeps the default config
-        // (larger budget, unaffected — same reason CASTING_DISABLED above is set directly, not via IOS_APP).
+        // ALL embedded-server platforms (iPhone, iPad, AND Apple TV): drop the secondary :12470 HTTPS
+        // server + local.strem.io cert subsystem (NO_HTTPS_SERVER) and HLSv2. The in-process node server
+        // shares ONE tight per-app memory budget with the Rust core + libmpv + SwiftUI, and these unused
+        // subsystems inflate the footprint. This was iOS-only on the wrong assumption that "tvOS has a
+        // larger budget" — but the Apple TV HD has just 2 GB (LESS than a modern iPhone), and its server
+        // was dying after one torrent allocated the cache (issue #56, beta5). The footprint cut + the
+        // device-aware cache cap (StremioServer.applyServerConfig) together keep it under budget.
+        // Discrete flags, NOT IOS_APP (which would try `_linkedBinding("apple_bridge")`, not linked here
+        // and could throw). The simulator has no jetsam, so this only reproduced on device.
         setenv("NO_HTTPS_SERVER", "1", 1)
         setenv("HLS_V2_DISABLED", "1", 1)
-        #endif
         // Memory: the server defaults its torrent cache to 2 GB, which is a lot for the
         // Apple TV's per-app memory budget. We do NOT disable caching (that thins the
         // torrent buffer); instead the app caps it to a TV-safe size via a /settings

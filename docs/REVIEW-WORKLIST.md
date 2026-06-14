@@ -346,6 +346,11 @@ Notes: items 80-82 (dead code, access-control, working-as-designed) fold into wh
 - [ ] **[low] mac-no-scroll-wheel-trackpad-player** — no scroll-to-seek / pinch-aspect / wheel-volume over the video.
 - [ ] **[low] mac-keychain-disk-read-on-main** — sharpens #15: `Keychain.string()` does a synchronous `Data(contentsOf:)` of credentials.plist on EVERY call on the main thread (no in-memory cache). Add a cache, not just an async variant.
 
+## User-reported (2026-06-14) — fold into the right phase
+- [ ] **[high] cw-hero-no-metadata** — the featured backdrop hero shows NO rating/year/genres/synopsis for CONTINUE WATCHING items (e.g. Game of Thrones, a `tt` id) — only title + Play. Catalog heroes (Disclosure Day/Obsession, from(meta:)) are rich; CW heroes (from(cw:)) carry only name+poster and rely on FeaturedHeroModel.enrichIfNeeded, which isn't landing (apply-race: hero rotates during the ~6s fetch, and/or configureMetaSources only runs at onAppear before addons load). Fix: reconfigure meta sources on `core.addons.count` change + de-dup in-flight enrich fetches + apply when the id still matches (mirror tvOS FocusedItemModel). NOT core.loadMeta (single shared slot the detail page owns). This is the recurring "#54" CW-backdrop-metadata bug.
+- [ ] **[high] ios-detail-view-scaling** (redditor, beta7) — "Home scales properly but the DETAIL view has the same [scaling] issue" on iPhone. The A-Z layout audit marked Detail "safe" — a real user disagrees, so RUNTIME-VERIFY the iPhone detail page (open a title) and find what scales/clips. May be type-scale or a fixed width in iOSDetailView not yet caught.
+- [x] **[critical] tvos-server-dies-after-one-torrent** (issue #56, Apple TV HD 2GB) — SHIPPED beta11: extended NO_HTTPS_SERVER+HLS_V2_DISABLED to tvOS + device-aware 256/512MB cache cap. Memory-jetsam after the cache allocates on the first torrent. Stutter likely the same memory pressure; re-verify on a real Apple TV HD; if it persists, tune mpv read-ahead next.
+
 ## Shipped
 - beta10 (build 93): S4 mark-watched/finished (CW clears), mac-window-close-quits, mac Return-to-submit (sign-in + server URL), cooler danger red, poster-card VoiceOver labels.
 - beta9 (build 92): S1 viewport clipping (all screens), S5b adaptive onAccent, #3/#4 crash guards, S10 isSignedIn guard.

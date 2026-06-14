@@ -143,7 +143,12 @@ enum StremioServer {
     /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
     static func applyServerConfig() async {
         guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return }
-        let cap = 512 * 1024 * 1024   // 512 MB, vs the 2 GB default
+        // Device-aware cap. A flat 512 MB was still too much for the 2 GB Apple TV HD: loading one
+        // torrent allocates the cache and jetsam kills the server after it succeeds once (issue #56).
+        // Halve the cap on low-memory devices (≤ ~2.5 GB: Apple TV HD, older iPhones) where the per-app
+        // budget is tightest; keep 512 MB on 3 GB+ devices for a fuller streaming buffer.
+        let lowMemory = ProcessInfo.processInfo.physicalMemory < 2_500_000_000
+        let cap = (lowMemory ? 256 : 512) * 1024 * 1024   // vs the 2 GB server default
         for _ in 0 ..< 12 {
             if await isOnline() {
                 var req = URLRequest(url: url)
