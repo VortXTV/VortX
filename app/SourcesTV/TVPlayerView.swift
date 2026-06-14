@@ -118,6 +118,9 @@ struct TVPlayerView: View {
     @State private var showStats = false                // live playback info overlay
     @State private var statsRows: [(String, String)] = []
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
+    @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
+    @State private var lastLocalTrickplayCapture = -1000.0
+    @State private var localTrickplayCaptureInFlight = false
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources, settings }
@@ -170,6 +173,7 @@ struct TVPlayerView: View {
                             }
                             currentTime = d
                             updateCurrentSkip(at: d)
+                            maybeCaptureLocalTrickplay(at: d)
                             // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
                             // to the engine — a live stream has no meaningful watch position.
                             if !isCurrentLiveStream, lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
@@ -243,6 +247,7 @@ struct TVPlayerView: View {
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
             }
+            scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
@@ -519,13 +524,7 @@ struct TVPlayerView: View {
                     // control row is unreachable for live (see vertical()), so this stays presentation-only.
                     liveIndicator
                 } else {
-                    HStack(spacing: Theme.Space.md) {
-                        Text(timeString(scrubbing ? scrubTarget : currentTime)).font(.callout.monospacedDigit())
-                            .foregroundStyle(scrubbing ? Theme.Palette.accent : Theme.Palette.textPrimary)
-                        scrubber
-                        Text(timeString(duration)).font(.callout.monospacedDigit())
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                    }
+                    trickplayControls
                 }
                 ZStack {
                     HStack(spacing: Theme.Space.md) {
@@ -882,6 +881,7 @@ struct TVPlayerView: View {
         curIsLive = isLiveMeta(curMeta) && !stream.isTorrent
         curBinge = stream.behaviorHints?.bingeGroup
         curHeaders = stream.requestHeaders
+        scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
@@ -1530,6 +1530,7 @@ struct TVPlayerView: View {
             if let oldHash = leavingHash, oldHash != pre.stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
             prepareTorrent(pre.stream)
             curURL = u
+            scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             // @MainActor: the synchronous CoreBridge calls below (loadMeta / streamGroups ->
             // addonNamesByBase, which lazily mutates addonNamesCache) are main-actor-only. A bare
             // Task runs its pre-await body on a background thread, racing the dictionary against
@@ -1580,6 +1581,7 @@ struct TVPlayerView: View {
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
                     curIsLive = isLiveMeta(newMeta) && !s.isTorrent
+                    scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
                     resumeSeconds = await account.resumeOffset(for: newMeta)
                     loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                     startLoadTimeout()
@@ -1784,6 +1786,7 @@ struct TVPlayerView: View {
         }
         lastScrubAt = now
         scrubTarget = min(duration, max(0, scrubTarget + Double(dir) * scrubStep))
+        scrubThumbnails.show(time: scrubTarget)
         flashControls()
         scheduleScrubCommit()
     }
@@ -1803,11 +1806,83 @@ struct TVPlayerView: View {
         scrubbing = false
         coordinator.player?.seek(to: scrubTarget)
         currentTime = scrubTarget; lastSaved = scrubTarget
+        scrubThumbnails.clear()
         flashControls()
     }
     private func commitScrubIfNeeded() { if scrubbing { commitScrub() } }
     /// Discard the in-progress scrub preview and keep playing where we are (Menu while scrubbing).
-    private func cancelScrub() { scrubCommit?.cancel(); scrubbing = false; flashControls() }
+    private func cancelScrub() { scrubCommit?.cancel(); scrubbing = false; scrubThumbnails.clear(); flashControls() }
+
+    // MARK: - Local trickplay
+
+    private var trickplayLocalCacheKey: String {
+        if let m = curMeta { return "v:\(m.libraryId):\(m.videoId)" }
+        return "u:\((curURL ?? url).absoluteString)"
+    }
+
+    private func maybeCaptureLocalTrickplay(at time: Double) {
+        guard !scrubbing, !buffering, !isPaused else { return }
+        guard !localTrickplayCaptureInFlight else { return }
+        guard time - lastLocalTrickplayCapture >= 10 else { return }
+        lastLocalTrickplayCapture = time
+        localTrickplayCaptureInFlight = true
+        coordinator.player?.captureFrameJPEGData { data in
+            self.localTrickplayCaptureInFlight = false
+            guard let data else { return }
+            self.scrubThumbnails.recordCapturedFrameData(data, at: time)
+        }
+    }
+
+    /// Scrubber row that expands upward to show a trickplay bubble when the user is scrubbing.
+    private var trickplayControls: some View {
+        let shown = scrubbing ? scrubTarget : currentTime
+        let frac = duration > 0 ? min(1, max(0, shown / duration)) : 0
+        let sideWidth: CGFloat = 130
+        let spacing = Theme.Space.md
+        let bubbleWidth: CGFloat = 480
+        let bubbleHeight: CGFloat = 270
+        return GeometryReader { geo in
+            let scrubWidth = max(1, geo.size.width - sideWidth * 2 - spacing * 2)
+            let knobX = sideWidth + spacing + scrubWidth * frac
+            ZStack(alignment: .bottomLeading) {
+                if scrubbing, let image = scrubThumbnails.image {
+                    trickplayBubble(image, time: shown)
+                        .offset(x: min(max(0, knobX - bubbleWidth / 2), max(0, geo.size.width - bubbleWidth)), y: -42)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)))
+                }
+                HStack(spacing: spacing) {
+                    Text(timeString(shown)).font(.callout.monospacedDigit())
+                        .foregroundStyle(scrubbing ? Theme.Palette.accent : Theme.Palette.textPrimary)
+                        .frame(width: sideWidth, alignment: .leading)
+                    scrubber
+                    Text(timeString(duration)).font(.callout.monospacedDigit())
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .frame(width: sideWidth, alignment: .trailing)
+                }
+                .frame(maxHeight: .infinity, alignment: .bottom)
+            }
+            .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)
+        }
+        .frame(height: scrubbing && scrubThumbnails.image != nil ? bubbleHeight + 26 : 28)
+    }
+
+    private func trickplayBubble(_ image: UIImage, time: Double) -> some View {
+        VStack(spacing: 6) {
+            Image(uiImage: image)
+                .resizable().aspectRatio(contentMode: .fit)
+                .frame(width: 480, height: 270)
+                .background(.black)
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            Text(timeString(time))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(Theme.Palette.textPrimary)
+        }
+        .padding(6)
+        .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .stroke(Theme.Palette.textPrimary.opacity(0.18), lineWidth: 1))
+        .shadow(color: .black.opacity(0.45), radius: 12, y: 6)
+    }
 
     /// Reveal the bar from a hidden state, selecting Play, and restart the auto-hide timer.
     private func showControls() {
