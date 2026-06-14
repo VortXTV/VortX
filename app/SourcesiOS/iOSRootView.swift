@@ -748,6 +748,10 @@ struct iOSPlayerLaunch: Identifiable {
     /// direct-resume; nil for paste-a-link (which has no `meta`, so nothing is recorded anyway).
     var qualityText: String? = nil
     var isTorrent: Bool = false
+    /// Series only: the season's ordered episodes + a resolver, so a Continue-Watching resume gets the
+    /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
+    var episodes: [PlayerEpisodeRef] = []
+    var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
 }
 
 extension View {
@@ -759,6 +763,7 @@ extension View {
             PlayerScreen(
                 url: item.url, title: item.title, headers: item.headers, resumeSeconds: item.resume,
                 recordMeta: item.meta, recordQualityText: item.qualityText, recordIsTorrent: item.isTorrent,
+                episodes: item.episodes, loadEpisode: item.loadEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
@@ -803,9 +808,38 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     } else {
         resume = await account.resumeOffset(for: meta)
     }
+    // For a series, give the player the season's episode list + a resolver so the CW resume has the same
+    // in-player Next / Prev / episode-list as the detail page. The CW item's videos may not be resident,
+    // so wait briefly (~1.5s) for the meta; if it doesn't arrive, the recorded stream still resumes,
+    // just without episode nav this session.
+    var episodes: [PlayerEpisodeRef] = []
+    var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
+    if entry.type == "series" {
+        if core.metaDetails?.meta?.id != item.id || (core.metaDetails?.meta?.videos?.isEmpty ?? true) {
+            core.loadMeta(type: "series", id: item.id)
+            for _ in 0 ..< 6 {
+                if core.metaDetails?.meta?.id == item.id, !(core.metaDetails?.meta?.videos?.isEmpty ?? true) { break }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+        let season = entry.season ?? 1
+        let seasonVideos = (core.metaDetails?.meta?.videos ?? [])
+            .filter { ($0.season ?? 1) == season }
+            .sorted { $0.episodeNumber < $1.episodeNumber }
+        if seasonVideos.count > 1 {
+            episodes = seasonVideos.map { PlayerEpisodeRef(id: $0.id, label: "E\($0.episodeNumber) · \($0.episodeTitle)") }
+            loadEpisode = { vid in
+                await iOSResolveEpisodeStream(videoId: vid, in: seasonVideos, seriesId: item.id,
+                                              seriesName: entry.name, defaultSeason: season,
+                                              fallbackPoster: entry.poster, continuity: entry.qualityText,
+                                              core: core, account: account)
+            }
+        }
+    }
     return iOSPlayerLaunch(url: url, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
-                           qualityText: entry.qualityText, isTorrent: entry.torrent ?? false)
+                           qualityText: entry.qualityText, isTorrent: entry.torrent ?? false,
+                           episodes: episodes, loadEpisode: loadEpisode)
 }
 
 /// Stremio's "paste a link" feature on touch / Mac (#16) — the twin of the tvOS `OpenLinkView`. Plays

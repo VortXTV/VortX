@@ -34,6 +34,48 @@ private func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     }
 }
 
+/// Direct-links-only filter (drop torrent sources) — the free twin of the per-view displayGroups,
+/// shared by the Continue-Watching resume so it ranks the same set the detail page would.
+func iOSDisplayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    guard PlaybackSettings.directLinksOnly else { return groups }
+    return groups.compactMap { group in
+        let streams = group.streams.filter { !$0.isTorrent }
+        guard !streams.isEmpty else { return nil }
+        return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
+    }
+}
+
+/// Resolve a series episode (by video id) to a ready-to-play stream: load its streams, filter
+/// direct-links, rank (quality continuity), prime the torrent, and compute the resume offset. The
+/// Continue-Watching resume hands this to PlayerScreen as its loadEpisode closure so a CW resume gets
+/// the same in-player Next / Prev / episode-list switching the detail page has. @MainActor: touches CoreBridge.
+@MainActor
+func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: String,
+                             seriesName: String, defaultSeason: Int, fallbackPoster: String?,
+                             continuity: String?, core: CoreBridge,
+                             account: StremioAccount) async -> PlayerEpisodeStream? {
+    guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
+    core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
+    var groups: [CoreStreamSourceGroup] = []
+    for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+        groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
+        if !groups.isEmpty { break }
+        try? await Task.sleep(for: .milliseconds(250))
+    }
+    guard let best = StreamRanking.best(groups, continuity: continuity, binge: nil),
+          let url = best.playableURL else { return nil }
+    core.loadEnginePlayer(for: best)
+    _ = prepareTorrentStream(best)   // fire-and-forget prime; self-terminating backoff
+    let pm = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
+                          name: seriesName, poster: v.thumbnail ?? fallbackPoster,
+                          season: v.season, episode: v.episode)
+    let title = "\(seriesName)  ·  S\(v.season ?? defaultSeason)E\(v.episodeNumber)"
+    let resume: Double
+    if let engine = core.engineResumeSeconds(for: pm) { resume = engine }
+    else { resume = await account.resumeOffset(for: pm) }
+    return PlayerEpisodeStream(stream: best, url: url, meta: pm, title: title, resume: resume)
+}
+
 /// A left-to-right layout that wraps onto a new line when a row runs out of width. The hero action rows
 /// use it so a chip that doesn't fit the (now hard-width-capped) hero moves to the next line, instead of
 /// being compressed into a vertical sliver ("Tr / ail / er"). Each child is measured and placed at its
