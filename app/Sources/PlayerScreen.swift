@@ -705,7 +705,7 @@ struct PlayerScreen: View {
     /// The best playable stream not yet tried for this title / episode, honouring the user's source
     /// ordering + continuity / binge hints. Returns nil when nothing untried remains.
     private func nextUntriedStream() -> CoreStream? {
-        let remaining = core.streamGroups().map { group in
+        let remaining = currentSourceGroups.map { group in
             CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
                 guard let u = s.playableURL else { return false }
                 return u != curURL && !exhaustedURLs.contains(u)
@@ -1368,9 +1368,21 @@ struct PlayerScreen: View {
 
     // MARK: - Source switching
 
+    /// Stream groups for the CURRENTLY playing episode / movie. Prefer the per-streamId set so a CW resume
+    /// or an episode switch shows THIS episode's sources (not a stale or empty resident set), falling back
+    /// to the bare resident groups for movies / before the per-id set has populated. This is what makes the
+    /// in-player Sources button reliably appear on a Continue-Watching resume.
+    private var currentSourceGroups: [CoreStreamSourceGroup] {
+        if let id = curMeta?.videoId {
+            let scoped = core.streamGroups(forStreamId: id)
+            if !scoped.isEmpty { return scoped }
+        }
+        return core.streamGroups()
+    }
+
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
-        core.streamGroups().reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
+        currentSourceGroups.reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
     }
 
     /// Up to a capped number of loaded sources, grouped by add-on in their existing priority order, so
@@ -1381,7 +1393,7 @@ struct PlayerScreen: View {
         let maxInPlayerSources = 60
         var rs: [Row] = []
         var count = 0
-        let groups = core.streamGroups()
+        let groups = currentSourceGroups
         if groups.isEmpty { return [Row(label: "Loading sources…", isHeader: true)] }
         for group in groups {
             let best = group.streams.filter { $0.playableURL != nil }

@@ -57,9 +57,18 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
+    var firstPlayableAt: Date? = nil
     for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-        if !groups.isEmpty { break }
+        if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
+        // Settle gate: rank only once every add-on has answered, OR ~4s after the first playable result —
+        // so the BEST stream (continuity-matching 4K) wins instead of whoever answered first (often a
+        // plain 1080p). Without it a CW resume / prev / next grabbed the first add-on's stream and missed
+        // the 4K a slower add-on returned a moment later. Mirrors tvOS play(episode:).
+        let progress = core.streamLoadProgress(forStreamId: v.id)
+        let settled = progress.total > 0 && progress.loaded >= progress.total
+        let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
+        if !groups.isEmpty, settled || waitedEnough { break }
         try? await Task.sleep(for: .milliseconds(250))
     }
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: nil),
@@ -1233,9 +1242,16 @@ struct iOSEpisodeStreams: View {
         guard let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
         var groups: [CoreStreamSourceGroup] = []
+        var firstPlayableAt: Date? = nil
         for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
             groups = displayGroups(core.streamGroups(forStreamId: v.id))
-            if !groups.isEmpty { break }
+            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
+            // Settle gate (see iOSResolveEpisodeStream): rank only once add-ons settle or ~4s past the
+            // first playable result, so the best continuity-matching stream wins, not whoever answered first.
+            let progress = core.streamLoadProgress(forStreamId: v.id)
+            let settled = progress.total > 0 && progress.loaded >= progress.total
+            let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
+            if !groups.isEmpty, settled || waitedEnough { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge),
