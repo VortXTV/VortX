@@ -322,22 +322,35 @@ struct iOSSettingsView: View {
                     } label: {
                         Label("Server log", systemImage: "doc.text.magnifyingglass")
                     }
-                    // The in-process Node server CANNOT re-init once it exits (a nodejs-mobile limit), so
-                    // if it has died (e.g. memory pressure while the app was backgrounded on lock) the only
-                    // way back is a fresh launch. Shown only once it has actually exited: a one-tap quit so
-                    // the user reopens to a clean server, instead of silent playback failures.
-                    if NodeServer.exitCode != nil {
-                        Button(role: .destructive) { exit(0) } label: {
-                            Label("Restart server (quits StremioX, then reopen it)", systemImage: "arrow.clockwise")
-                        }
+                    // The in-process Node server CANNOT re-init once it exits (a nodejs-mobile limit), so a
+                    // "restart" on iOS is necessarily a fresh app launch. Always offered now (the user asked
+                    // for a one-tap restart to reclaim memory before/after the server is killed under
+                    // pressure), not only once it has already exited. role:.destructive + the label make the
+                    // quit explicit, and the status line below says whether the server is currently running.
+                    Button(role: .destructive) { exit(0) } label: {
+                        Label("Restart server (quits StremioX, then reopen it)", systemImage: "arrow.clockwise")
                     }
                 }
                 #endif
 
                 #if os(macOS)
-                // macOS only: let this Mac act as a Stremio streaming server for the rest of the
-                // LAN (like the desktop app), so the Apple TV / phone can use it as their server.
-                if !StremioServer.isCustom { lanSharingControls }
+                if !StremioServer.isCustom {
+                    // macOS: the server is a CHILD process, so restart it IN PLACE without quitting the app
+                    // (unlike iOS' one-shot in-process nodejs-mobile). Reaps the child, frees its accumulated
+                    // memory, and rebinds 11470. Same restart() the LAN-sharing toggle already uses.
+                    Button {
+                        NodeServer.restart()
+                        Task {   // re-check status once the child has respawned
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            serverOnline = await StremioServer.isOnline()
+                        }
+                    } label: {
+                        Label("Restart streaming server", systemImage: "arrow.clockwise")
+                    }
+                    // macOS only: let this Mac act as a Stremio streaming server for the rest of the
+                    // LAN (like the desktop app), so the Apple TV / phone can use it as their server.
+                    lanSharingControls
+                }
                 #endif
             }
         } header: {
