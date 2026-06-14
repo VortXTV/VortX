@@ -1380,6 +1380,37 @@ struct iOSSourceList: View {
             .padding(.horizontal, Theme.Space.md)
     }
 
+    /// Add-ons whose stream request FAILED (fetch/timeout/TLS/ATS) — the actionable transport failures.
+    private var erroredAddons: [CoreBridge.StreamAddonState] { states.filter { $0.error != nil } }
+    /// Add-ons that answered with no streams (queried, genuinely empty) — distinct from "not queried".
+    private var emptyAddons: [CoreBridge.StreamAddonState] {
+        states.filter { $0.error == nil && !$0.loading && $0.ready == 0 }
+    }
+
+    /// Below a NON-empty source list, account for the add-ons that produced nothing, so a title that
+    /// shows only a couple of add-ons doesn't read as "StremioX didn't ask the rest". Errored add-ons
+    /// are named with their reason (the actionable case, e.g. an iOS-only stream-fetch failure); the
+    /// rest that came back empty are summarised. This is the on-device evidence for "movies only show
+    /// a few add-ons": errored → transport/dispatch issue, empty → the add-on genuinely had nothing.
+    @ViewBuilder private var unresolvedFooter: some View {
+        if !loading, !erroredAddons.isEmpty || !emptyAddons.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                if !erroredAddons.isEmpty {
+                    iOSEmptyRow(text: "\(erroredAddons.count) add-on\(erroredAddons.count == 1 ? "" : "s") couldn't be reached:")
+                    ForEach(erroredAddons) { addonReasonRow($0.name, $0.error ?? "couldn't be reached") }
+                }
+                if !emptyAddons.isEmpty {
+                    Text("\(emptyAddons.count) other add-on\(emptyAddons.count == 1 ? "" : "s") returned no sources for this title.")
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, Theme.Space.md)
+                }
+            }
+            .padding(.top, Theme.Space.xs)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             iOSRailHeader(eyebrow: eyebrow, title: "Sources")
@@ -1403,6 +1434,7 @@ struct iOSSourceList: View {
                 if showAllSources || !showsPrimaryControls {
                     if groups.count > 1 { filterBar }
                     groupedList
+                    unresolvedFooter
                 }
             }
         }
