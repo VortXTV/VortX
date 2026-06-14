@@ -145,9 +145,11 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 
 ## Installing
 
-The builds are attached to the [latest release](../../releases/latest). They are unsigned because this is a third-party client distributed outside the App Store, so you re-sign them yourself with one of the methods below. None require a jailbreak.
+The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the **Full** build `StremioX-tvOS-x.y.z.ipa` with torrents, and the smaller **Lite** build `StremioX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), and the **macOS app** as a `.dmg`. None of this requires a jailbreak.
 
-Grab the build you need from the latest release. For Apple TV, decide between the **Full** build (`StremioX-tvOS-x.y.z.ipa`, torrents included) and the smaller **Lite** build (`StremioX-tvOS-lite-x.y.z.ipa`, debrid and direct links only); see "Two builds" above. The iOS IPA covers iPhone and iPad. The Mac app is attached to the same release as a `.dmg`; because it is distributed outside the App Store, the release notes cover opening it the first time (right-click Open, or clearing the quarantine attribute).
+**Is it safe, and why the extra setup?** StremioX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
+
+**iPhone, iPad, and Apple TV** use one of Methods 1 to 4 below; the signing identity you pick sets how long each install lasts. **macOS** is simpler (no re-signing, no expiry) and has its own section at the end.
 
 ### The trade-off to understand first
 
@@ -186,6 +188,18 @@ Apple only runs apps signed by a valid identity, and what you sign with decides 
 1. On a Mac with Xcode, open Window, then Devices and Simulators. Connect iPhone or iPad over USB; pair the Apple TV over the network (it shows under Discovered and displays a pairing code).
 2. Drag the IPA onto the device, or re-sign with your personal team first using [ios-app-signer](https://dantheman827.github.io/ios-app-signer/) if Xcode refuses the unsigned IPA.
 3. Free Apple ID signs for 7 days, paid developer account for a year.
+
+### macOS (the .dmg): one-time setup, no re-signing
+
+The Mac app does not expire and needs no Apple ID or re-signing. You clear Apple's download quarantine once, because the app is signed ad-hoc rather than with a Developer ID (yet).
+
+1. Open the downloaded `.dmg` and drag **StremioX** into your **Applications** folder. (Run it from Applications, not from inside the mounted disk image.)
+2. The first time you open it, macOS says **"StremioX Not Opened, Apple could not verify it is free of malware."** That is expected for any app not signed with an Apple Developer ID; see the safety note above. Get past it one of two ways:
+   - **System Settings** (the only built-in way on macOS 15 Sequoia, where Apple removed the old right-click then Open shortcut): try to open StremioX once so the warning appears, then go to **System Settings, then Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the StremioX line. Confirm with Touch ID or your password, and it launches.
+   - **Terminal** (works on every version, and is the fastest): run `xattr -dr com.apple.quarantine /Applications/StremioX.app`, then open the app normally.
+3. After that first launch it opens like any other app, forever. To update, drag the new release's app over the old one in Applications and clear the quarantine again.
+
+Torrents work on the Mac too (it bundles the streaming server). If you only use debrid or direct links, turn on **Direct Links Only** in Settings.
 
 ### Updating
 
