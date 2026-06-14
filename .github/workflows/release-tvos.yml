@@ -1,10 +1,11 @@
-name: Release IPAs (tvOS + iOS)
+name: Release apps (iOS + tvOS + macOS)
 
-# Builds the tvOS IPA from source on GitHub's runners and attaches it to the
-# release, so anyone can verify the published binary really comes from this
-# code (issue #7). Everything it consumes is public: NodeMobile and the fonts
-# from this repo's vendor release, server.js from Stremio's CDN, and the
-# stremio-core engine built from the core/ crate in this repo.
+# Builds the iOS + tvOS IPAs and the native macOS app from source on GitHub's
+# runners and attaches them to the release, so anyone can verify the published
+# binaries really come from this code (issue #7). Everything it consumes is
+# public: NodeMobile and the fonts from this repo's vendor release, server.js
+# from Stremio's CDN, and the stremio-core engine built from the core/ crate.
+# The macOS app ships as a drag-to-install .dmg (ad-hoc signed, not notarized).
 
 on:
   # Release-tag caches are isolated per tag, so seed the same exact cache key on
@@ -18,6 +19,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Attach the built apps to this existing release tag (e.g. v0.3.0-beta13). Leave blank to upload as a run artifact only."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -110,15 +116,18 @@ jobs:
           (cd out/lite && zip -qry ../StremioX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../StremioX-iOS-ci.ipa Payload)
           # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
-          # (every nested binary gets a valid signature -> the kernel will run it), then zip the
-          # bundle as StremioXMac.app. Shipped as a zip so the documented run step (unzip ->
-          # xattr + codesign) works copy-paste. We can't notarize without an Apple Developer ID, so a
-          # downloaded build is still quarantined -- the release notes give the one-time fix.
+          # (every nested binary gets a valid signature, so the kernel will run it), then package it as
+          # a drag-to-install .dmg holding the app plus an /Applications symlink. We can't notarize
+          # without an Apple Developer ID, so a downloaded build is still quarantined; the release notes
+          # give the one-time right-click-Open / xattr fix.
           MAC_APP="app/build/ci-mac/Build/Products/Release/StremioXMac.app"
           codesign --force --deep --sign - "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
-          ditto -c -k --keepParent "$MAC_APP" out/StremioX-macOS-ci.zip
-          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa out/StremioX-macOS-ci.zip | tee out/SHA256SUMS-ci.txt
+          DMG_STAGE="$(mktemp -d)"
+          cp -R "$MAC_APP" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "StremioX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/StremioX-macOS-ci.dmg
+          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa out/StremioX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
@@ -129,24 +138,26 @@ jobs:
             out/StremioX-tvOS-ci.ipa
             out/StremioX-tvOS-lite-ci.ipa
             out/StremioX-iOS-ci.ipa
-            out/StremioX-macOS-ci.zip
+            out/StremioX-macOS-ci.dmg
             out/SHA256SUMS-ci.txt
 
       - name: Attach the CI builds to the release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           mv out/StremioX-tvOS-ci.ipa "out/StremioX-tvOS-$TAG-ci.ipa"
           mv out/StremioX-tvOS-lite-ci.ipa "out/StremioX-tvOS-lite-$TAG-ci.ipa"
           mv out/StremioX-iOS-ci.ipa "out/StremioX-iOS-$TAG-ci.ipa"
-          mv out/StremioX-macOS-ci.zip "out/StremioX-macOS-$TAG-ci.zip"
-          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" "out/StremioX-macOS-$TAG-ci.zip" > out/SHA256SUMS-ci.txt
+          mv out/StremioX-macOS-ci.dmg "out/StremioX-macOS-$TAG-ci.dmg"
+          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" "out/StremioX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
           gh release upload "$TAG" \
             "out/StremioX-tvOS-$TAG-ci.ipa" \
             "out/StremioX-tvOS-lite-$TAG-ci.ipa" \
             "out/StremioX-iOS-$TAG-ci.ipa" \
-            "out/StremioX-macOS-$TAG-ci.zip" \
+            "out/StremioX-macOS-$TAG-ci.dmg" \
             out/SHA256SUMS-ci.txt \
             --clobber
+          # Remove the older .zip mac asset if this tag had one from a previous run.
+          gh release delete-asset "$TAG" "StremioX-macOS-$TAG-ci.zip" -y 2>/dev/null || true
