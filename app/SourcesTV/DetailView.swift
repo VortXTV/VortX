@@ -903,9 +903,12 @@ struct CoreStreamList: View {
             Button { play(stream) } label: { streamLabel(addon, stream, enabled: true) }
                 .buttonStyle(RowFocusStyle())
         } else {
-            streamLabel(addon, stream, enabled: false)   // external/youtube, not playable in-app
-                .background(Theme.Palette.surface1.opacity(0.5),
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            // Non-playable (Ratings/RPDB, external/youtube): keep it FOCUSABLE via an inert Button so
+            // the tvOS focus engine can land here and keep scrolling DOWN past it. A bare non-focusable
+            // first row blocked the whole "All sources" list from scrolling (issue #77). The enabled:false
+            // label still dims and shows the lock icon, so it reads as non-playable.
+            Button {} label: { streamLabel(addon, stream, enabled: false) }
+                .buttonStyle(RowFocusStyle())
         }
     }
 
