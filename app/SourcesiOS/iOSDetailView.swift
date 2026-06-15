@@ -274,9 +274,9 @@ struct iOSDetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) { _ in
             if type != "series" { loadMovieStreamsIfNeeded() }
             else if let m = meta, let videos = m.videos {
-                // F5: opening a series schedules alerts for its upcoming episodes (no-op unless the user
-                // turned alerts on). Keyed by episode id, so revisiting refreshes rather than duplicates.
-                NewEpisodeNotifications.scheduleUpcoming(seriesName: m.name, videos: videos)
+                // F5: opening a series schedules its next-episode alert (asks permission in context the
+                // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
+                Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS

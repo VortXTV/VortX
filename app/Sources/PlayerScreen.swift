@@ -372,6 +372,7 @@ struct PlayerScreen: View {
             scheduleHide(); startLoadTimeout()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
+            if !isTrailer { PlayerOrientation.forceLandscape() }   // rotate to landscape as the stream opens, even under rotation lock
             #elseif os(macOS)
             // macOS has no idle-timer API; hold a display-sleep assertion so the Mac doesn't dim/sleep
             // mid-movie (the iOS/tvOS keep-awake parity that was missing on Mac).
@@ -386,6 +387,7 @@ struct PlayerScreen: View {
             NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
+            PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
             #endif

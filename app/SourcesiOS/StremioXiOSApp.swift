@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
 /// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors StremioTVApp's
@@ -26,6 +29,13 @@ struct StremioXiOSApp: App {
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     #endif
 
+    // iOS / iPadOS: an app delegate that reports the current allowed-orientation mask, so the player can
+    // force landscape (rotating even when the user has rotation lock on) and the rest of the app rotates
+    // freely again on exit. See OrientationAppDelegate / PlayerOrientation at the bottom of this file.
+    #if os(iOS)
+    @UIApplicationDelegateAdaptor(OrientationAppDelegate.self) private var orientationDelegate
+    #endif
+
     init() {
         #if !STREMIOX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
@@ -48,6 +58,18 @@ struct StremioXiOSApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }
+                    if core.library == nil { core.loadLibrary() }   // so the F5 sweep below has data to work with
+                }
+                .task(id: core.library?.catalog.count ?? 0) {
+                    // F5 library-wide sweep: once the library is loaded, schedule the next-episode alert for
+                    // EVERY series in it, not just the ones the user opens (alerts are on by default). Re-runs
+                    // when the library count changes; each series holds a single pending request, so the whole
+                    // sweep stays under iOS's 64 pending-notification cap.
+                    let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
+                    guard NewEpisodeNotifications.isEnabled, !series.isEmpty else { return }
+                    let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+                    let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+                    await NewEpisodeNotifications.sweepLibrary(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
                 }
                 // macOS: present the player full-window at the scene ROOT (above the dimmed app), not as a
                 // separate floating window. The overlay is applied HERE — INSIDE the environmentObjects
@@ -152,5 +174,48 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     /// still holding port 11470 and no way to get the window back — and applicationWillTerminate above
     /// never fired, so the server was only reaped on an explicit Quit.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+#endif
+
+#if os(iOS)
+/// Reports the app's currently-allowed interface orientations to UIKit. The player flips `lock` to
+/// landscape while it is open, so the video rotates to landscape even when the user has rotation lock on,
+/// then back to `.all` on exit so the rest of the app rotates per the user's preference again.
+final class OrientationAppDelegate: NSObject, UIApplicationDelegate {
+    static var lock: UIInterfaceOrientationMask = .allButUpsideDown
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        Self.lock
+    }
+}
+
+/// Force / release landscape for the player on iPhone and iPad. `requestGeometryUpdate` actually rotates
+/// the window and overrides the user's rotation lock for the orientations we report as supported, so a
+/// stream opens landscape even when the device is locked to portrait. No-op outside iOS.
+enum PlayerOrientation {
+    /// AppStorage flag (default on): users who prefer the player to follow rotation lock can turn it off.
+    static let autoLandscapeKey = "stremiox.autoLandscapeInPlayer"
+    static var autoLandscapeEnabled: Bool {
+        UserDefaults.standard.object(forKey: autoLandscapeKey) == nil ? true : UserDefaults.standard.bool(forKey: autoLandscapeKey)
+    }
+
+    @MainActor static func forceLandscape() {
+        guard autoLandscapeEnabled else { return }
+        OrientationAppDelegate.lock = .landscape
+        guard let scene = activeScene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight))
+        scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+
+    @MainActor static func release() {
+        OrientationAppDelegate.lock = .allButUpsideDown
+        activeScene?.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+    }
+
+    @MainActor private static var activeScene: UIWindowScene? {
+        UIApplication.shared.connectedScenes
+            .first { $0.activationState == .foregroundActive } as? UIWindowScene
+            ?? UIApplication.shared.connectedScenes.first as? UIWindowScene
+    }
 }
 #endif

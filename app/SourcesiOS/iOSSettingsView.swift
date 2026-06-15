@@ -44,7 +44,8 @@ struct iOSSettingsView: View {
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = 10   // skip-button step in seconds
-    @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = false
+    @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = true
+    @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
 
     var body: some View {
         NavigationStack {
@@ -214,6 +215,10 @@ struct iOSSettingsView: View {
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
+            #if os(iOS)
+            Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
+                .tint(Theme.Palette.accent)
+            #endif
             if !installedExternalPlayers.isEmpty {
                 Picker("Play in", selection: $defaultExternalPlayer) {
                     Text("Built-in player").tag("")
@@ -732,7 +737,12 @@ private struct ServerLogView: View {
 /// native take on Stremio's library-notification idea, built on Apple's local notification scheduling.
 enum NewEpisodeNotifications {
     static let enabledKey = "stremiox.notifyNewEpisodes"
-    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+
+    /// On by default: an unset key reads as enabled, so a followed show pings out of the box and the first
+    /// schedule asks for permission in context. Once the user flips the toggle, the stored value wins.
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: enabledKey) == nil ? true : UserDefaults.standard.bool(forKey: enabledKey)
+    }
 
     /// Turn alerts on or off. Enabling asks the system for permission; a denial flips the stored flag back
     /// off so the toggle reflects the real authorization. Disabling clears every pending alert. Returns the
@@ -750,24 +760,79 @@ enum NewEpisodeNotifications {
         return granted
     }
 
-    /// Schedule an alert at the air time of every not-yet-released episode of `series` within the next
-    /// 45 days. No-op when alerts are off. iOS keeps at most 64 pending requests, so the near horizon plus
-    /// the per-episode-id key (which de-dupes re-opens) keeps us comfortably under that ceiling.
-    static func scheduleUpcoming(seriesName: String, videos: [CoreVideo]) {
+    /// Ask for permission the first time there is something to schedule (alerts are on by default, so the
+    /// prompt lands in context). Returns whether we may post. A denial is respected, we schedule nothing.
+    @discardableResult
+    static func ensureAuthorized() async -> Bool {
+        guard isEnabled else { return false }
+        let center = UNUserNotificationCenter.current()
+        switch await center.notificationSettings().authorizationStatus {
+        case .authorized, .provisional, .ephemeral: return true
+        case .notDetermined: return (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+        default: return false
+        }
+    }
+
+    /// Schedule a single alert at the air time of the SOONEST not-yet-aired episode of a series within the
+    /// next 45 days. Keyed by series id, so each series holds exactly one pending request (re-scheduling
+    /// replaces it), which keeps even a large library sweep comfortably under iOS's 64 pending-request cap.
+    /// No-op when alerts are off, or when the series has nothing upcoming.
+    static func scheduleUpcoming(seriesId: String, seriesName: String, videos: [CoreVideo]) {
         guard isEnabled else { return }
         let now = Date()
         let horizon = now.addingTimeInterval(45 * 86_400)
         let center = UNUserNotificationCenter.current()
-        for v in videos {
-            guard let air = v.releasedDate, air > now, air < horizon else { continue }
-            let content = UNMutableNotificationContent()
-            content.title = seriesName
-            let epLabel = v.season.map { "S\($0)E\(v.episodeNumber)" } ?? "Episode \(v.episodeNumber)"
-            content.body = "New episode is out: \(epLabel)"
-            content.sound = .default
-            let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: air)
-            let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
-            center.add(UNNotificationRequest(identifier: "stremiox.ep.\(v.id)", content: content, trigger: trigger))
+        let identifier = "stremiox.nextep.\(seriesId)"
+        let next = videos
+            .compactMap { v -> (CoreVideo, Date)? in v.releasedDate.map { (v, $0) } }
+            .filter { $0.1 > now && $0.1 < horizon }
+            .min { $0.1 < $1.1 }
+        guard let (v, air) = next else {
+            center.removePendingNotificationRequests(withIdentifiers: [identifier])   // nothing upcoming -> clear any stale one
+            return
         }
+        let content = UNMutableNotificationContent()
+        content.title = seriesName
+        let epLabel = v.season.map { "S\($0)E\(v.episodeNumber)" } ?? "Episode \(v.episodeNumber)"
+        content.body = "New episode is out: \(epLabel)"
+        content.sound = .default
+        let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: air)
+        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+        center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: trigger))
+    }
+
+    /// Convenience for the open-series hook: ensure permission, then schedule that one series.
+    static func scheduleUpcomingAuthorized(seriesId: String, seriesName: String, videos: [CoreVideo]) async {
+        guard await ensureAuthorized() else { return }
+        scheduleUpcoming(seriesId: seriesId, seriesName: seriesName, videos: videos)
+    }
+
+    /// Library-wide sweep: schedule the next-episode alert for EVERY series in the library, not just the
+    /// ones the user opens. Each series' meta is fetched straight from the installed meta add-ons (never the
+    /// engine, so the open detail page's meta slot is untouched), capped and off the main thread, so a show
+    /// the user follows pings even if they never reopen its page.
+    static func sweepLibrary(seriesIDs: [String], seriesNames: [String: String], metaBases: [String]) async {
+        guard await ensureAuthorized(), !metaBases.isEmpty else { return }
+        for id in seriesIDs.prefix(60) {
+            guard let meta = await fetchSeriesMeta(id: id, bases: metaBases) else { continue }
+            scheduleUpcoming(seriesId: id, seriesName: meta.name.isEmpty ? (seriesNames[id] ?? meta.name) : meta.name,
+                             videos: meta.videos ?? [])
+        }
+    }
+
+    /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
+    /// answers. Never touches the engine. nil if none decode.
+    static func fetchSeriesMeta(id: String, bases: [String]) async -> CoreMetaItem? {
+        struct Wrap: Decodable { let meta: CoreMetaItem? }
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        for base in bases {
+            guard let url = URL(string: "\(base)/meta/series/\(escaped).json") else { continue }
+            var req = URLRequest(url: url); req.timeoutInterval = 12
+            if let (data, _) = try? await URLSession.shared.data(for: req),
+               let wrap = try? JSONDecoder().decode(Wrap.self, from: data), let meta = wrap.meta {
+                return meta
+            }
+        }
+        return nil
     }
 }
