@@ -41,6 +41,7 @@ struct iOSSettingsView: View {
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
+    @AppStorage("stremiox.seekStep") private var seekStep = 10   // skip-button step in seconds
 
     var body: some View {
         NavigationStack {
@@ -205,6 +206,9 @@ struct iOSSettingsView: View {
             }
             Picker("Audio output", selection: $audioOutput) {
                 ForEach(AudioOutputMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+            }
+            Picker("Skip step", selection: $seekStep) {
+                ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
             if !installedExternalPlayers.isEmpty {
                 Picker("Play in", selection: $defaultExternalPlayer) {

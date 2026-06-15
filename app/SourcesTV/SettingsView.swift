@@ -23,6 +23,7 @@ struct SettingsView: View {
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
+    @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {
@@ -167,6 +168,7 @@ struct SettingsView: View {
             choiceRow("Audio output", AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
         }
     }
 

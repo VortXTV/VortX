@@ -92,6 +92,8 @@ struct TVPlayerView: View {
     @State private var chapterFractions: [Double] = []    // chapter boundary positions (0...1) for scrubber ticks
     @State private var upNextSuppressed = false           // user chose Watch Credits: hide band + don't auto-advance this episode
     @State private var upNextWantsCredits = false         // which band button is focused (false = Play Now, true = Watch Credits)
+    @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds ("10"/"15"/"30"), shared with iOS
+    private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
     @State private var skipFetchTask: Task<Void, Never>?
@@ -368,8 +370,8 @@ struct TVPlayerView: View {
                 if let seg = currentSkip { skipTo(seg) } else { showControls() }   // pill up → skip, else reveal
             // Netflix-style seek-while-hidden: Left/Right nudge -/+10s directly, with a brief time pill,
             // WITHOUT revealing the whole control bar. Up/Down (and any other press) still reveal it.
-            case .leftArrow: hiddenSeek(-10)
-            case .rightArrow: hiddenSeek(10)
+            case .leftArrow: hiddenSeek(-seekStepSeconds)
+            case .rightArrow: hiddenSeek(seekStepSeconds)
             default: showControls()                       // up/down + any swipe reveals the bar
             }
             return
@@ -452,8 +454,8 @@ struct TVPlayerView: View {
         case .close:   saveProgress(at: currentTime); leavePlayback()
         case .scrub:   scrubbing ? commitScrub() : toggle()
         case .restart: restart()
-        case .back:    seek(-10)
-        case .fwd:     seek(10)
+        case .back:    seek(-seekStepSeconds)
+        case .fwd:     seek(seekStepSeconds)
         case .play:    toggle()
         case .prev:    playPrevious()
         case .next:    playNext()
@@ -576,11 +578,11 @@ struct TVPlayerView: View {
                 ZStack {
                     HStack(spacing: Theme.Space.md) {
                         ctrlButton(.restart, "arrow.counterclockwise")
-                        ctrlButton(.back, "gobackward.10")
+                        ctrlButton(.back, "gobackward.\(seekStep)")
                         if allEpisodes.count > 1 && hasPrevEpisode { ctrlButton(.prev, "backward.end.fill") }
                         ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true)
                         if allEpisodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") }
-                        ctrlButton(.fwd, "goforward.10")
+                        ctrlButton(.fwd, "goforward.\(seekStep)")
                     }
                     // The right side carries the per-panel buttons; the gear lives alone on the
                     // left so player-wide settings (handoff, decoder, info, QR) stay uncluttered.

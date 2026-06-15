@@ -130,6 +130,7 @@ struct PlayerScreen: View {
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
     @AppStorage("stremiox.videoSize") private var videoSize = "original"   // whole frame, correct aspect
+    @AppStorage("stremiox.seekStep") private var seekStep = "10"            // skip-button step in seconds ("10"/"15"/"30")
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
     @State private var markedWatched = false           // ~90%/EOF watched marker fires once per title (mirrors tvOS)
@@ -1098,9 +1099,9 @@ struct PlayerScreen: View {
 
     private var centerTransport: some View {
         HStack(spacing: 44) {
-            // Skip back 10s (hidden for live — no fixed timeline to seek within).
+            // Skip back by the user's seek step (hidden for live — no fixed timeline to seek within).
             if !isLive {
-                seekButton("gobackward.10", by: -10)
+                seekButton("gobackward.\(seekStep)", by: -seekStepSeconds)
             }
             Button { coordinator.player?.togglePause(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
@@ -1109,10 +1110,13 @@ struct PlayerScreen: View {
             }
             .accessibilityLabel(isPaused ? "Play" : "Pause")
             if !isLive {
-                seekButton("goforward.10", by: 10)
+                seekButton("goforward.\(seekStep)", by: seekStepSeconds)
             }
         }
     }
+
+    /// The seek-step setting as seconds, falling back to 10 if the stored value is somehow unparsable.
+    private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
 
     private func seekButton(_ icon: String, by delta: Double) -> some View {
         Button {
