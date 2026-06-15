@@ -22,5 +22,13 @@
 		<string>vlc-x-callback</string>
 		<string>vlc</string>
 	</array>
+	<!-- Keep audio playing (and, crucially, the in-process streaming server thread alive) when the
+	     screen locks or the app briefly backgrounds during playback. Without this, iOS suspends the
+	     whole process: the embedded node server freezes (event-loop lag of minutes in the logs) and
+	     the stream dies when you return. Pairs with the player's AVAudioSession(.playback) setup. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 </dict>
 </plist>
