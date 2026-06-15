@@ -128,6 +128,9 @@ struct PlayerScreen: View {
         var detail: String = ""
         var selected: Bool = false
         var isHeader: Bool = false
+        /// Render the detail on its own line below the label, wrapping in full instead of truncating to
+        /// one line. Used by the Info panel's filename row so a long release name stays fully readable.
+        var wraps: Bool = false
         var apply: () -> Void = {}
     }
 
@@ -1517,18 +1520,33 @@ struct PlayerScreen: View {
                     panelRows = rows(for: open)
                 }
             } label: {
-                HStack {
-                    Text(row.label).foregroundStyle(.white).lineLimit(1)
-                    Spacer()
-                    if row.selected {
-                        Image(systemName: "checkmark").foregroundStyle(Theme.Palette.accent)
-                    } else if !row.detail.isEmpty {
-                        Text(row.detail).font(.subheadline).foregroundStyle(.white.opacity(0.55)).lineLimit(1)
+                if row.wraps {
+                    // Label over a full-width, fully-wrapping detail (a long filename / release name).
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(row.label).foregroundStyle(.white)
+                        if !row.detail.isEmpty {
+                            Text(row.detail).font(.subheadline).foregroundStyle(.white.opacity(0.55))
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding(.horizontal).padding(.vertical, 13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                } else {
+                    HStack {
+                        Text(row.label).foregroundStyle(.white).lineLimit(1)
+                        Spacer()
+                        if row.selected {
+                            Image(systemName: "checkmark").foregroundStyle(Theme.Palette.accent)
+                        } else if !row.detail.isEmpty {
+                            Text(row.detail).font(.subheadline).foregroundStyle(.white.opacity(0.55)).lineLimit(1)
+                        }
+                    }
+                    .padding(.horizontal).padding(.vertical, 13)
+                    .background(row.selected ? Theme.Palette.accentSoft : Color.clear)
+                    .contentShape(Rectangle())
                 }
-                .padding(.horizontal).padding(.vertical, 13)
-                .background(row.selected ? Theme.Palette.accentSoft : Color.clear)
-                .contentShape(Rectangle())
             }
         }
     }
@@ -1665,22 +1683,27 @@ struct PlayerScreen: View {
             return sourceRows()
         case .info:
             var rows: [Row] = []
+            // Title block: what is playing, named at the top of the sheet (movie name, or show · SxE).
+            rows.append(Row(label: "Now Playing", isHeader: true))
+            rows.append(Row(label: curTitle, wraps: true))
             if let s = currentStream {
                 rows.append(Row(label: "Source", isHeader: true))
-                let release = String(sourceLabel(s).prefix(60))
-                if !release.isEmpty { rows.append(Row(label: "Release", detail: release)) }
+                let release = String(sourceLabel(s).prefix(80))
+                if !release.isEmpty { rows.append(Row(label: "Release", detail: release, wraps: true)) }
                 if let file = s.behaviorHints?.filename, !file.isEmpty {
-                    rows.append(Row(label: "File", detail: file))
+                    rows.append(Row(label: "File", detail: file, wraps: true))   // long filenames wrap, never truncate
                 }
                 if let size = StreamRanking.sizeText(s) { rows.append(Row(label: "Size", detail: size)) }
+                if let addon = currentSourceGroups.first(where: { $0.streams.contains { $0.playableURL == curURL } })?.addon {
+                    rows.append(Row(label: "Add-on", detail: addon))
+                }
             }
             let stats = infoRows
             if !stats.isEmpty {
                 rows.append(Row(label: "Playback", isHeader: true))
                 rows.append(contentsOf: stats.map { Row(label: $0.0, detail: $0.1) })
             }
-            if rows.isEmpty { return [Row(label: "No info yet", isHeader: true)] }
-            return rows
+            return rows   // the title block is always present, so the sheet is never empty
         case .chapters:
             let chs = coordinator.player?.chapters() ?? []
             if chs.isEmpty { return [Row(label: "No chapters", isHeader: true)] }
