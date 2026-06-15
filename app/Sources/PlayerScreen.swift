@@ -234,6 +234,24 @@ struct PlayerScreen: View {
     @State private var infoRows: [(String, String)] = []
 
     var body: some View {
+        #if os(iOS)
+        // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
+        // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
+        // server can transcode HLS); tvOS routes HLS in TVPlayerView.
+        if HLSPlayerView.handles(url) {
+            HLSPlayerView(url: url, headers: headers, resumeSeconds: resumeSeconds,
+                          onProgress: onProgress, onClose: onClose)
+                .ignoresSafeArea()
+                .statusBarHidden(true)
+        } else {
+            mpvBody
+        }
+        #else
+        mpvBody
+        #endif
+    }
+
+    private var mpvBody: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
