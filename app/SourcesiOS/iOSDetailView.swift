@@ -646,7 +646,9 @@ struct iOSDetailView: View {
                 Task { await playMovie() }
             } label: {
                 HStack(spacing: Theme.Space.sm) {
-                    if preparing { ProgressView().tint(Theme.Palette.onAccent) }
+                    // Spin while resolving (preparing) AND while still waiting on add-ons, so the gated
+                    // "Finding best… X/Y" state reads as busy, matching the source-list control bar.
+                    if preparing || movieLoadingSources { ProgressView().tint(Theme.Palette.onAccent) }
                     else { Image(systemName: "play.fill") }
                     Text(movieLabel)
                 }
@@ -756,12 +758,28 @@ struct iOSDetailView: View {
         StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality)
     }
 
-    private var movieReady: Bool { meta != nil && movieBest != nil }
+    /// Whether stream add-ons are still answering for this movie. Mirrors the tvOS Watch-Now gate:
+    /// total == 0 means no add-on has reported yet; loaded < total means some are still in flight. The
+    /// settle timeout opens the gate even if one add-on hangs.
+    private var movieLoadingSources: Bool {
+        guard !settleTimedOut else { return false }
+        let p = core.streamLoadProgress()
+        return p.total == 0 || p.loaded < p.total
+    }
+
+    /// Watch-Now arms only once EVERY stream add-on has answered (or the settle timeout fired), so one
+    /// press plays the best of ALL sources, not the best of whoever replied first — matching tvOS. The
+    /// Quality picker stays live throughout, so a user who wants a specific source can pick it immediately.
+    private var movieReady: Bool { meta != nil && movieBest != nil && !movieLoadingSources }
 
     private var movieLabel: String {
         if preparing { return "Finding the best source…" }
-        guard movieReady, let s = movieBest else { return settleTimedOut ? "No sources found" : "Loading sources…" }
-        return "Watch  ·  \(StreamRanking.qualityLabel(s))"
+        if movieReady, let s = movieBest { return "Watch  ·  \(StreamRanking.qualityLabel(s))" }
+        if movieLoadingSources {
+            let p = core.streamLoadProgress()
+            return p.total > 0 ? "Finding best…  \(p.loaded)/\(p.total)" : "Loading sources…"
+        }
+        return "No sources found"
     }
 
     private func playMovie() async {
@@ -1599,10 +1617,22 @@ struct iOSSourceList: View {
             // on the same quality it last played (same-release-group biased) — matching tvOS.
             if let best = StreamRanking.best(groups, continuity: continuity), let url = best.playableURL {
                 HStack(spacing: Theme.Space.sm) {
+                    // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
+                    // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
+                    // gate. The Quality picker stays live so a manual pick is always available immediately.
                     Button { play(best, url) } label: {
-                        Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
+                        if loading {
+                            HStack(spacing: Theme.Space.sm) {
+                                ProgressView().tint(Theme.Palette.onAccent)
+                                Text(progress.total > 0 ? "Finding best…  \(progress.loaded)/\(progress.total)" : "Finding best…")
+                            }
+                        } else {
+                            Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
+                        }
                     }
                     .buttonStyle(PrimaryActionStyle())
+                    .disabled(loading)
+                    .opacity(loading ? 0.55 : 1)
 
                     qualityMenu
                 }
