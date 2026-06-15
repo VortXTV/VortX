@@ -264,7 +264,7 @@ struct SettingsView: View {
                     Label("Restart App", systemImage: "arrow.clockwise.circle")
                 }
                 .buttonStyle(ChipButtonStyle())
-                .confirmationDialog("Restart StremioX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
+                .confirmationDialog("Restart VortX?", isPresented: $showRestartConfirm, titleVisibility: .visible) {
                     Button("Quit Now", role: .destructive) {
                         DiagnosticsLog.logSync("app", "user requested app restart from Settings")
                         exit(0)
@@ -475,7 +475,7 @@ struct SettingsView: View {
 
     private var backupSection: some View {
         section("Backup & Restore") {
-            Text("A backup saves your profiles, theme, and player preferences so they travel with you, for example when StremioX becomes VortX. On iPhone, iPad, and Mac you can save that to a file today.")
+            Text("A backup saves your profiles, theme, and player preferences so they travel with you and survive a future major update. On iPhone, iPad, and Mac you can save that to a file today.")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
             Text("On Apple TV a scan-with-your-phone backup is coming: Backup will show a QR code, you scan it with your phone, and your settings save to your VortX account. Restore shows another code to bring them right back. Until then, signing in restores your library, add-ons, and watch history here.")

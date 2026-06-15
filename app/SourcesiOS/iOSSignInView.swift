@@ -67,12 +67,8 @@ struct iOSSignInView: View {
     // MARK: Brand
 
     private var wordmark: some View {
-        HStack(spacing: 0) {
-            Text("Stremio").foregroundStyle(Theme.Palette.textPrimary)
-            Text("X").foregroundStyle(Theme.Palette.accent)
-        }
-        .font(Theme.Typography.wordmark)
-        .padding(.top, Theme.Space.sm)
+        VortXWordmark(fontSize: 40)
+            .padding(.top, Theme.Space.sm)
     }
 
     private var intro: some View {

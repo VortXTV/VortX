@@ -439,7 +439,7 @@ struct iOSSettingsView: View {
                     // pressure), not only once it has already exited. role:.destructive + the label make the
                     // quit explicit, and the status line below says whether the server is currently running.
                     Button(role: .destructive) { exit(0) } label: {
-                        Label("Restart server (quits StremioX, then reopen it)", systemImage: "arrow.clockwise")
+                        Label("Restart server (quits VortX, then reopen it)", systemImage: "arrow.clockwise")
                     }
                 }
                 #endif
@@ -708,7 +708,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Backup & Restore")
         } footer: {
-            Text("Save your profiles, theme, and playback preferences to a file you can keep. When StremioX becomes VortX, restore that file to bring everything across. Your library and watch history return when you sign in to your account.")
+            Text("Save your profiles, theme, and playback preferences to a file you can keep, so a future major update can never lose them. Your library and watch history return when you sign in to your account.")
         }
     }
 

@@ -1434,20 +1434,13 @@ extension View {
             .toolbar {
                 if isActive {
                     ToolbarItem(placement: .principal) {
-                        HStack(spacing: 0) {
-                            Text("Stremio").foregroundStyle(Theme.Palette.textPrimary)
-                            Text("X").foregroundStyle(Theme.Palette.accent)
-                        }
-                        .font(Theme.Typography.wordmark)
-                        // macOS hoists the principal item into the unified titlebar and wraps it in a
-                        // system capsule sized to the text's LAYOUT width — but a bold New York (serif)
-                        // wordmark's ink overshoots that box (S side-bearing + X/o terminals), so it
-                        // spilled past the pill. fixedSize stops the bar squeezing it; the horizontal
-                        // padding widens the measured bounds so the capsule clears the serif overhang.
-                        .fixedSize()
-                        .padding(.horizontal, Theme.Space.xs)
-                        .accessibilityAddTraits(.isHeader)
-                        .accessibilityLabel("StremioX")
+                        // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows
+                        // the theme accent). Sized down for the nav bar. VortXWordmark is already
+                        // fixedSize'd; the horizontal padding widens the measured bounds so macOS's
+                        // unified-titlebar capsule clears the lockup.
+                        VortXWordmark(fontSize: 26)
+                            .padding(.horizontal, Theme.Space.xs)
+                            .accessibilityAddTraits(.isHeader)
                     }
                 }
             }

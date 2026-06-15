@@ -18,7 +18,7 @@ struct ServerConfigView: View {
             Theme.Palette.canvas.ignoresSafeArea()
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("Streaming Server").screenTitleStyle()
-                Text("Use the server embedded on this device, or point StremioX at a remote / dedicated Stremio server (for example one you run at home).")
+                Text("Use the server embedded on this device, or point VortX at a remote / dedicated Stremio server (for example one you run at home).")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     .frame(maxWidth: 1100, alignment: .leading)
 

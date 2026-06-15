@@ -54,7 +54,8 @@ final class ThemeManager: ObservableObject {
     private static let textScaleKey = "stremiox.theme.textScale"
 
     private init() {
-        accentID = UserDefaults.standard.string(forKey: Self.accentKey) ?? "ember"
+        // New installs land on the VortX brand accent; anyone who already picked an accent keeps it.
+        accentID = UserDefaults.standard.string(forKey: Self.accentKey) ?? "vortx"
         oled = UserDefaults.standard.bool(forKey: Self.oledKey)
         let saved = UserDefaults.standard.object(forKey: Self.textScaleKey) as? Double
         textScale = saved.map { min(max($0, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound) } ?? 1.0
@@ -68,8 +69,10 @@ final class ThemeManager: ObservableObject {
         textScale = (next * 100).rounded() / 100
     }
 
-    /// Eight curated accents. Ember is the default and matches the original ember design.
+    /// Nine curated accents. VortX (the brand gold/obsidian) is the default; Ember matches the original
+    /// ember design and stays available for anyone who prefers the coral cast.
     static let accents: [AccentOption] = [
+        AccentOption(id: "vortx",   label: "VortX",   base: themeRGB(0.851, 0.467, 0.024), bright: themeRGB(0.961, 0.620, 0.043)),
         AccentOption(id: "ember",   label: "Ember",   base: themeRGB(0.949, 0.471, 0.294), bright: themeRGB(1.000, 0.569, 0.388)),
         AccentOption(id: "ocean",   label: "Ocean",   base: themeRGB(0.298, 0.565, 0.886), bright: themeRGB(0.435, 0.690, 0.984)),
         AccentOption(id: "forest",  label: "Forest",  base: themeRGB(0.376, 0.706, 0.443), bright: themeRGB(0.478, 0.831, 0.553)),
@@ -92,6 +95,7 @@ final class ThemeManager: ObservableObject {
     /// accent gets a neutral near-black on light/mid fills or near-white on dark fills (max contrast,
     /// no stale hue). Re-reads live when the accent changes, like `accent` itself.
     var onAccent: Color {
+        if accentID == "vortx" { return themeRGB(0.059, 0.051, 0.039) }   // brand obsidian ink on VortX gold
         if accentID == "ember" { return themeRGB(0.106, 0.067, 0.043) }   // signature warm ink on ember
         return accentLuminance > 0.5 ? themeRGB(0.10, 0.10, 0.11) : themeRGB(0.97, 0.97, 0.96)
     }

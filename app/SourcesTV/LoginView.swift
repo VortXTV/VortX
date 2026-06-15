@@ -22,11 +22,7 @@ struct LoginView: View {
         ZStack {
             Theme.Palette.canvas.ignoresSafeArea()
             VStack(spacing: Theme.Space.lg) {
-                HStack(spacing: 0) {
-                    Text("Stremio").foregroundStyle(Theme.Palette.textPrimary)
-                    Text("X").foregroundStyle(Theme.Palette.accent)
-                }
-                .font(Theme.Typography.hero)
+                VortXWordmark(fontSize: 54)
 
                 Text(mode == .link
                      ? "Scan the QR code or enter the code on another device to sign in."

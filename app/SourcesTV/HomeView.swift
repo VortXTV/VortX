@@ -75,14 +75,12 @@ struct HomeView: View {
         focusModel.warm(continueWatching.map(\.focusedHero))
     }
 
-    /// Serif wordmark, the editorial signature: warm-white "Stremio" with an ember "X".
+    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent).
     private var header: some View {
         HStack(spacing: 0) {
-            Text("Stremio").foregroundStyle(Theme.Palette.textPrimary)
-            Text("X").foregroundStyle(Theme.Palette.accent)
+            VortXWordmark(fontSize: 42)
             Spacer()
         }
-        .font(Theme.Typography.wordmark)
         .padding(.horizontal, Theme.Space.screenEdge)
     }
 }
