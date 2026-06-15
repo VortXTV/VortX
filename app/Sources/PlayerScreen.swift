@@ -363,6 +363,7 @@ struct PlayerScreen: View {
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
             refreshTask?.cancel(); sleepTask?.cancel()
+            NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
             #elseif os(macOS)
@@ -411,6 +412,12 @@ struct PlayerScreen: View {
                     reconnecting = false; loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
+                    // Lock Screen / Control Center transport. Relative mpv seek so the skip always works off
+                    // the LIVE position (a captured currentTime would be stale in these long-lived targets).
+                    NowPlayingCenter.wireCommands(
+                        togglePause: { coordinator.player?.togglePause() },
+                        seek: { delta in coordinator.player?.seek(by: delta) },
+                        stepSeconds: seekStepSeconds)
                     startStallWatchdog()            // arm mid-playback freeze detection
                     fetchSkipTimestamps()           // crowd intro/outro spans (disk-cached, non-blocking)
                     fetchAddonSubtitles()
@@ -418,6 +425,7 @@ struct PlayerScreen: View {
                 if !scrubbing {
                     currentTime = d
                     updateCurrentSkip(at: d)
+                    NowPlayingCenter.update(title: curTitle, elapsed: d, duration: duration, paused: isPaused)
                     maybeCaptureLocalTrickplay(at: d)
                     // Live streams must NOT write a resume offset: their "position" is just elapsed
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
@@ -455,7 +463,12 @@ struct PlayerScreen: View {
                 refreshSkipSegments()
             }
         case MPVProperty.pause:
-            if let b = data as? Bool { isPaused = b }
+            if let b = data as? Bool {
+                isPaused = b
+                // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
+                // paused, so without this the now-playing rate would stay stuck at "playing").
+                NowPlayingCenter.update(title: curTitle, elapsed: currentTime, duration: duration, paused: b)
+            }
         case MPVProperty.trackList:
             refreshTracks()
             let summary = coordinator.player?.mediaSummary()
