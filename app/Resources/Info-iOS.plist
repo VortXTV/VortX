@@ -8,6 +8,14 @@
 	     server at http://127.0.0.1:11470 (cleartext loopback), otherwise it shows "Error". -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
+		<!-- Allow plain-http connections. The user can point the app at their OWN streaming server (a
+		     dedicated box, a Tailscale host, a LAN machine) via Settings, and that URL is unknown at
+		     build time, so a per-domain ATS exception isn't possible. NSAllowsLocalNetworking only covers
+		     loopback + RFC1918 LAN, not Tailscale's 100.64.0.0/10 CGNAT range, so a custom server reached
+		     over Tailscale was blocked at the network layer (issue #58). The app only talks to add-on
+		     endpoints and the server URL the user themselves configured. -->
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 		<key>NSAllowsArbitraryLoadsInWebContent</key>
