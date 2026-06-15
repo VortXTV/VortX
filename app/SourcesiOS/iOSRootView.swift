@@ -1213,11 +1213,15 @@ private struct PosterCardiOS: View {
             ZStack(alignment: .bottom) {
                 AsyncImage(url: URL(string: poster ?? "")) { phase in
                     switch phase {
-                    case .success(let img): img.resizable().aspectRatio(2/3, contentMode: .fill)
+                    // scaledToFill (not a forced 2/3 aspectRatio): keeps the source proportions and CROPS to
+                    // the card, so add-on posters that aren't 2:3 (URL-image catalogs) fill the card cleanly
+                    // instead of being stretched into a squished shape.
+                    case .success(let img): img.resizable().scaledToFill()
                     default: Theme.Palette.surface1
                     }
                 }
                 .frame(width: 120, height: 180)
+                .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                 if progress > 0.01 {
                     GeometryReader { geo in
