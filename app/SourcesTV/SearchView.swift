@@ -84,8 +84,12 @@ struct SearchView: View {
                                    menu: .catalog)
                     }
                 }
-                .padding(.vertical, Theme.Space.sm)
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)
             }
+            // Cancel the parent VStack's screenEdge padding so the ScrollView reaches the screen
+            // edge and its clip region starts there rather than at the first card's left edge.
+            .padding(.horizontal, -Theme.Space.screenEdge)
         }
     }
 
@@ -119,25 +123,42 @@ struct SearchView: View {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         var seen = Set<String>()
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
 
-        let coreSuggestions = core.searchSuggestions.map(\.name)
-            .filter { title in
-                guard title.caseInsensitiveCompare(trimmed) != .orderedSame else { return false }
-                return seen.insert(title).inserted
-            }
-
-        let localTitles = core.searchResults.map(\.name)
-            + core.continueWatching.map(\.name)
-            + core.boardRows.flatMap { $0.items.map(\.name) }
-        let localMatches = localTitles.filter { title in
-            guard title.caseInsensitiveCompare(trimmed) != .orderedSame else { return false }
-            guard title.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive]) != nil else {
-                return false
-            }
-            return seen.insert(title).inserted
+        // Returns true (and records the title) only if it contains the query as a substring
+        // and hasn't been seen before. Exact matches are excluded (the user typed it already).
+        func keep(_ title: String) -> Bool {
+            title.caseInsensitiveCompare(trimmed) != .orderedSame
+                && title.range(of: trimmed, options: opts) != nil
+                && seen.insert(title).inserted
         }
 
-        return Array((coreSuggestions + localMatches).prefix(10))
+        // Continue watching first: small, personal, high signal.
+        let watching = core.continueWatching.map(\.name).filter { keep($0) }
+
+        // Engine suggestion catalog — interleaved by type when available. In practice this may
+        // be empty if the addon set doesn't provide a suggestion catalog, in which case
+        // searchResults below becomes the effective source.
+        func interleaved<T>(from items: [T], typeAt: KeyPath<T, String>, nameAt: KeyPath<T, String>) -> [String] {
+            let filtered = items.filter { keep($0[keyPath: nameAt]) }
+            let movies = filtered.filter { $0[keyPath: typeAt] == "movie" }
+            let series = filtered.filter { $0[keyPath: typeAt] == "series" }
+            let other  = filtered.filter { $0[keyPath: typeAt] != "movie" && $0[keyPath: typeAt] != "series" }
+            var mixed: [String] = []
+            for i in 0..<max(movies.count, series.count) {
+                if i < movies.count { mixed.append(movies[i][keyPath: nameAt]) }
+                if i < series.count { mixed.append(series[i][keyPath: nameAt]) }
+            }
+            return mixed + other.map { $0[keyPath: nameAt] }
+        }
+
+        let engineMixed = interleaved(from: core.searchSuggestions, typeAt: \.type, nameAt: \.name)
+        // searchResults carry full type info — apply the same interleaving so series from the
+        // current results aren't pushed behind all movies (the root cause of GoT appearing late).
+        let resultsMixed = interleaved(from: core.searchResults, typeAt: \.type, nameAt: \.name)
+        let board = core.boardRows.flatMap { $0.items }.filter { keep($0.name) }.map(\.name)
+
+        return Array((watching + engineMixed + resultsMixed + board).prefix(10))
     }
 
     private func scheduleSearch(_ value: String) {
