@@ -35,7 +35,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.5"
-        CURRENT_PROJECT_VERSION: "109"
+        CURRENT_PROJECT_VERSION: "110"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (StremioXiOSNative, StremioXTV) have no
@@ -95,7 +95,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
         MARKETING_VERSION: "0.3.5"
-        CURRENT_PROJECT_VERSION: "109"
+        CURRENT_PROJECT_VERSION: "110"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -150,14 +150,15 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
         MARKETING_VERSION: "0.3.5"
-        CURRENT_PROJECT_VERSION: "109"
+        CURRENT_PROJECT_VERSION: "110"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: VortX
-        # Name the product "StremioX" (not the target name "StremioXMac") so the .app, the executable, and
-        # the generated CFBundleName all read "StremioX" — the menu bar, Dock, and Finder then all show
-        # "StremioX". The bundle id (com.stremiox.mac) and the Xcode target/scheme name stay StremioXMac.
-        PRODUCT_NAME: StremioX
+        # Name the product "VortX" (not the target name "StremioXMac") so the .app, the executable, and
+        # the generated CFBundleName all read "VortX" — the menu bar, Dock, Finder, and the installed
+        # app all show "VortX". The bundle id (com.stremiox.mac) and the Xcode target/scheme name stay
+        # StremioXMac (internal; the deeper bundle-id/target rename is the 0.4 work).
+        PRODUCT_NAME: VortX
         CODE_SIGNING_ALLOWED: "NO"
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
@@ -200,7 +201,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
         MARKETING_VERSION: "0.3.5"
-        CURRENT_PROJECT_VERSION: "109"
+        CURRENT_PROJECT_VERSION: "110"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -242,7 +243,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.5"
-        CURRENT_PROJECT_VERSION: "109"
+        CURRENT_PROJECT_VERSION: "110"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist

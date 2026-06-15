@@ -33,9 +33,9 @@ One thing worth being straight about: I didn't hand-write the code. Claude (Anth
 
 The Apple TV release ships in two flavors. Pick one; they are the same app otherwise, and your account, profiles, and settings are identical between them.
 
-| | **StremioX (Full)** | **StremioX Lite** |
+| | **VortX (Full)** | **VortX Lite** |
 |---|---|---|
-| File | `StremioX-tvOS-x.y.z.ipa` (~48 MB) | `StremioX-tvOS-lite-x.y.z.ipa` (~31 MB) |
+| File | `VortX-tvOS-x.y.z.ipa` (~48 MB) | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB) |
 | Torrents and magnets | Yes, via the embedded streaming server | No, cannot play them at all |
 | Embedded streaming server | Bundled and running | Not bundled |
 | Direct and debrid links (Real-Debrid, TorBox, Premiumize, usenet resolved to http) | Yes | Yes |
@@ -157,7 +157,7 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 
 ## Installing
 
-The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the **Full** build `StremioX-tvOS-x.y.z.ipa` with torrents, and the smaller **Lite** build `StremioX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), and the **macOS app** as a `.dmg`. None of this requires a jailbreak.
+The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the **Full** build `VortX-tvOS-x.y.z.ipa` with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), and the **macOS app** as a `.dmg`. None of this requires a jailbreak.
 
 **Is it safe, and why the extra setup?** StremioX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
 
@@ -205,10 +205,10 @@ Apple only runs apps signed by a valid identity, and what you sign with decides 
 
 The Mac app does not expire and needs no Apple ID or re-signing. You clear Apple's download quarantine once, because the app is signed ad-hoc rather than with a Developer ID (yet).
 
-1. Open the downloaded `.dmg` and drag **StremioX** into your **Applications** folder. (Run it from Applications, not from inside the mounted disk image.)
-2. The first time you open it, macOS says **"StremioX Not Opened, Apple could not verify it is free of malware."** That is expected for any app not signed with an Apple Developer ID; see the safety note above. Get past it one of two ways:
-   - **System Settings** (the only built-in way on macOS 15 Sequoia, where Apple removed the old right-click then Open shortcut): try to open StremioX once so the warning appears, then go to **System Settings, then Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the StremioX line. Confirm with Touch ID or your password, and it launches.
-   - **Terminal** (works on every version, and is the fastest): run `xattr -dr com.apple.quarantine /Applications/StremioX.app`, then open the app normally.
+1. Open the downloaded `.dmg` and drag **VortX** into your **Applications** folder. (Run it from Applications, not from inside the mounted disk image.)
+2. The first time you open it, macOS says **"VortX Not Opened, Apple could not verify it is free of malware."** That is expected for any app not signed with an Apple Developer ID; see the safety note above. Get past it one of two ways:
+   - **System Settings** (the only built-in way on macOS 15 Sequoia, where Apple removed the old right-click then Open shortcut): try to open VortX once so the warning appears, then go to **System Settings, then Privacy & Security**, scroll to the bottom, and click **Open Anyway** next to the VortX line. Confirm with Touch ID or your password, and it launches.
+   - **Terminal** (works on every version, and is the fastest): run `xattr -dr com.apple.quarantine /Applications/VortX.app`, then open the app normally.
 3. After that first launch it opens like any other app, forever. To update, drag the new release's app over the old one in Applications and clear the quarantine again.
 
 Torrents work on the Mac too (it bundles the streaming server). If you only use debrid or direct links, turn on **Direct Links Only** in Settings.
@@ -276,7 +276,7 @@ Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github
 
 ## Known issues
 
-- **Profiles are per-device for now.** The roster and each profile's watch history live on the device. An early build (0.2.7 to 0.2.9 build 30) tried to sync them through the account's library storage; that could break library sync in official apps with a "Serialization error: state.watched" message. Current builds scrub those documents from the account automatically on launch, which fixes the official apps too. If you saw that error, open StremioX once on this version and give the official app a minute to resync.
+- **Profiles are per-device for now.** The roster and each profile's watch history live on the device. An early build (0.2.7 to 0.2.9 build 30) tried to sync them through the account's library storage; that could break library sync in official apps with a "Serialization error: state.watched" message. Current builds scrub those documents from the account automatically on launch, which fixes the official apps too. If you saw that error, open VortX once on this version and give the official app a minute to resync.
 - **Desktop and Android are still in development.** They run the shared engine but are not yet at the Apple apps' level of polish, and are not part of the released builds yet.
 - **Unsigned builds.** You re-sign the IPA yourself, and depending on the signing method, reinstalling can require signing in again.
 
@@ -290,7 +290,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 - [mpv](https://mpv.io/) and [MPVKit](https://github.com/mpvkit/MPVKit), for the player.
 - [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile), for the embedded server runtime.
 - Claude (Anthropic) wrote the code.
-- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the StremioX Lite build, the stream-ranking reports that drove the cached-first fixes, and the build-from-source report that made a fresh clone work for everyone.
+- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the VortX Lite build, the stream-ranking reports that drove the cached-first fixes, and the build-from-source report that made a fresh clone work for everyone.
 
 See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
 

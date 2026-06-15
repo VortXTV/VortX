@@ -112,33 +112,33 @@ jobs:
           cp -R app/build/ci/Build/Products/Release-appletvos/StremioXTV.app out/full/Payload/
           cp -R app/build/ci-lite/Build/Products/Release-appletvos/StremioXTVLite.app out/lite/Payload/
           cp -R app/build/ci-ios/Build/Products/Release-iphoneos/StremioXiOSNative.app out/ios/Payload/
-          (cd out/full && zip -qry ../StremioX-tvOS-ci.ipa Payload)
-          (cd out/lite && zip -qry ../StremioX-tvOS-lite-ci.ipa Payload)
-          (cd out/ios && zip -qry ../StremioX-iOS-ci.ipa Payload)
+          (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
+          (cd out/lite && zip -qry ../VortX-tvOS-lite-ci.ipa Payload)
+          (cd out/ios && zip -qry ../VortX-iOS-ci.ipa Payload)
           # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
           # (every nested binary gets a valid signature, so the kernel will run it), then package it as
           # a drag-to-install .dmg holding the app plus an /Applications symlink. We can't notarize
           # without an Apple Developer ID, so a downloaded build is still quarantined; the release notes
           # give the one-time right-click-Open / xattr fix.
-          MAC_APP="app/build/ci-mac/Build/Products/Release/StremioX.app"
+          MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
           codesign --force --deep --sign - "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
           DMG_STAGE="$(mktemp -d)"
           cp -R "$MAC_APP" "$DMG_STAGE/"
           ln -s /Applications "$DMG_STAGE/Applications"
-          hdiutil create -volname "StremioX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/StremioX-macOS-ci.dmg
-          shasum -a 256 out/StremioX-tvOS-ci.ipa out/StremioX-tvOS-lite-ci.ipa out/StremioX-iOS-ci.ipa out/StremioX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
+          hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
+          shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v7
         with:
-          name: StremioX-tvOS-ci
+          name: VortX-tvOS-ci
           path: |
-            out/StremioX-tvOS-ci.ipa
-            out/StremioX-tvOS-lite-ci.ipa
-            out/StremioX-iOS-ci.ipa
-            out/StremioX-macOS-ci.dmg
+            out/VortX-tvOS-ci.ipa
+            out/VortX-tvOS-lite-ci.ipa
+            out/VortX-iOS-ci.ipa
+            out/VortX-macOS-ci.dmg
             out/SHA256SUMS-ci.txt
 
       - name: Attach the CI builds to the release
@@ -147,17 +147,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
-          mv out/StremioX-tvOS-ci.ipa "out/StremioX-tvOS-$TAG-ci.ipa"
-          mv out/StremioX-tvOS-lite-ci.ipa "out/StremioX-tvOS-lite-$TAG-ci.ipa"
-          mv out/StremioX-iOS-ci.ipa "out/StremioX-iOS-$TAG-ci.ipa"
-          mv out/StremioX-macOS-ci.dmg "out/StremioX-macOS-$TAG-ci.dmg"
-          shasum -a 256 "out/StremioX-tvOS-$TAG-ci.ipa" "out/StremioX-tvOS-lite-$TAG-ci.ipa" "out/StremioX-iOS-$TAG-ci.ipa" "out/StremioX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
+          mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
+          mv out/VortX-tvOS-lite-ci.ipa "out/VortX-tvOS-lite-$TAG-ci.ipa"
+          mv out/VortX-iOS-ci.ipa "out/VortX-iOS-$TAG-ci.ipa"
+          mv out/VortX-macOS-ci.dmg "out/VortX-macOS-$TAG-ci.dmg"
+          shasum -a 256 "out/VortX-tvOS-$TAG-ci.ipa" "out/VortX-tvOS-lite-$TAG-ci.ipa" "out/VortX-iOS-$TAG-ci.ipa" "out/VortX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
           gh release upload "$TAG" \
-            "out/StremioX-tvOS-$TAG-ci.ipa" \
-            "out/StremioX-tvOS-lite-$TAG-ci.ipa" \
-            "out/StremioX-iOS-$TAG-ci.ipa" \
-            "out/StremioX-macOS-$TAG-ci.dmg" \
+            "out/VortX-tvOS-$TAG-ci.ipa" \
+            "out/VortX-tvOS-lite-$TAG-ci.ipa" \
+            "out/VortX-iOS-$TAG-ci.ipa" \
+            "out/VortX-macOS-$TAG-ci.dmg" \
             out/SHA256SUMS-ci.txt \
             --clobber
           # Remove the older .zip mac asset if this tag had one from a previous run.
-          gh release delete-asset "$TAG" "StremioX-macOS-$TAG-ci.zip" -y 2>/dev/null || true
+          gh release delete-asset "$TAG" "VortX-macOS-$TAG-ci.zip" -y 2>/dev/null || true
