@@ -2,12 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Base Info.plist (Xcode merges its generated keys on top). The ATS exception lets the
-	     native client's URLSession reach the embedded streaming server at http://127.0.0.1:11470
-	     (cleartext loopback) to create torrents. libmpv playback isn't ATS-governed. -->
+	<!-- Base Info.plist (Xcode merges its generated keys on top). Allow plain-http connections: the
+	     native client's URLSession reaches the embedded streaming server at http://127.0.0.1:11470
+	     (cleartext loopback) to create torrents, AND add-ons commonly serve POSTER images over plain
+	     http (or redirect to it), which a local-networking-only exception blocked, leaving those tiles
+	     blank on Apple TV. CRITICAL: NSAllowsArbitraryLoads must be the ONLY ATS key here, because on
+	     tvOS 10+ it is IGNORED when NSAllowsLocalNetworking / NSAllowsArbitraryLoadsInWebContent is also
+	     present; it is a superset that already covers loopback, LAN, and public cleartext. (Matches the
+	     iOS plist fix.) libmpv playback isn't ATS-governed. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsLocalNetworking</key>
+		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
 	<!-- Schemes the player's "Play in" handoff may probe with canOpenURL; keep in sync
