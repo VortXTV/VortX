@@ -223,6 +223,7 @@ struct PlayerScreen: View {
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
     @State private var chapterFractions: [Double] = []   // chapter boundary positions (0...1) for scrubber ticks
+    @State private var upNextSuppressed = false           // user tapped Watch Credits: hide the band + don't auto-advance this episode
     @State private var apiSkipCandidates: [SegmentCandidate] = []
     @State private var currentSkip: SkipSegment?
     @State private var skipFetchKey = ""
@@ -251,14 +252,17 @@ struct PlayerScreen: View {
 
             if (buffering || reconnecting) && !loadFailed { bufferingOverlay }
 
-            // Skip pill shows only while watching (controls hidden), mirroring tvOS.
-            if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed { skipPill(seg) }
+            // Skip pill shows only while watching (controls hidden); suppressed once the Up Next band is up
+            // so the two end-of-episode prompts never stack.
+            if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed, upNextRemaining == nil { skipPill(seg) }
 
             // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
             // still reach them when auto-hidden — otherwise a hidden bar drops out of the a11y tree (#31).
             if !loadFailed {
                 controls.opacity(controlsVisible ? 1 : 0).allowsHitTesting(controlsVisible)
             }
+
+            if upNextRemaining != nil, panel == nil, !loadFailed, hasStartedPlaying { upNextBand }
 
             if let panel { selectionSheet(panel) }
 
@@ -297,6 +301,7 @@ struct PlayerScreen: View {
                 .hidden()
             #endif
         }
+        .animation(.easeOut(duration: 0.3), value: upNextRemaining != nil)
         #if os(iOS)
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
@@ -441,6 +446,11 @@ struct PlayerScreen: View {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
+                onClose()
+            } else if upNextSuppressed {
+                // User chose "Watch Credits": play through to the end, then stop here instead of
+                // auto-advancing. The episode is already marked watched above, so Continue Watching
+                // rolls to the next episode on its own without yanking the viewer out of the credits.
                 onClose()
             } else if canNextEpisode, let i = episodeIndex {
                 goToEpisode(episodes[i + 1].id, autoAdvance: true)   // in-place advance to the next episode
@@ -847,6 +857,58 @@ struct PlayerScreen: View {
         return episodes.firstIndex { $0.id == id }
     }
     private var canNextEpisode: Bool { episodeIndex.map { $0 + 1 < episodes.count } ?? false }
+
+    /// Seconds left until auto-advance, when the Up Next band should be on screen: only with a next
+    /// episode queued, a real runtime, the play head in the final stretch, and the user hasn't chosen to
+    /// sit through the credits. nil hides the band. The EOF handler does the actual advance at 0.
+    private var upNextRemaining: Int? {
+        guard canNextEpisode, !upNextSuppressed, duration > 60, currentTime > 0 else { return nil }
+        let remaining = duration - currentTime
+        guard remaining > 0, remaining <= 20 else { return nil }
+        return Int(remaining.rounded(.up))
+    }
+    /// The label of the episode that plays next, for the Up Next band.
+    private var nextEpisodeLabel: String? {
+        guard let i = episodeIndex, i + 1 < episodes.count else { return nil }
+        return episodes[i + 1].label
+    }
+
+    /// The end-of-episode Up Next card: next-episode title, a countdown to auto-advance, and Play Now /
+    /// Watch Credits. Shown bottom-trailing in the final stretch; touch/click, so no focus wiring needed.
+    private var upNextBand: some View {
+        HStack(spacing: 14) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("UP NEXT").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.white.opacity(0.7))
+                if let label = nextEpisodeLabel {
+                    Text(label).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
+                }
+                if let r = upNextRemaining {
+                    Text("Playing in \(r)s").font(.caption).foregroundStyle(.white.opacity(0.7))
+                }
+            }
+            Spacer(minLength: 8)
+            Button { upNextSuppressed = true } label: {
+                Text("Watch Credits").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 9)
+                    .background(.white.opacity(0.18), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            Button { goToNextEpisode() } label: {
+                Label("Play Now", systemImage: "play.fill").font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.onAccent)
+                    .padding(.horizontal, 16).padding(.vertical, 9)
+                    .background(Theme.Palette.accent, in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(16)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(maxWidth: 480)
+        .padding(.horizontal, 24).padding(.bottom, 96)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .accessibilityElement(children: .contain)
+    }
     private var canPrevEpisode: Bool { (episodeIndex ?? -1) > 0 }
 
     private func goToNextEpisode() { if let i = episodeIndex, i + 1 < episodes.count { goToEpisode(episodes[i + 1].id) } }
@@ -874,6 +936,7 @@ struct PlayerScreen: View {
             curTitleState = es.title
             curBingeState = es.stream.behaviorHints?.bingeGroup   // keep recorded binge group on the live episode
             markedWatched = false
+            upNextSuppressed = false   // re-arm the Up Next band for the new episode
             appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
             lastReported = -1
             switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume)
