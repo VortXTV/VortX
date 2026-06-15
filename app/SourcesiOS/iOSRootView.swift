@@ -1,4 +1,9 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// Native iOS root: a CUSTOM bottom-tab shell over the shared engine. A native `TabView` collapses
 /// the 5th+ tabs into a system "More" tab on iPhone, burying Add-ons and Settings; instead we drive
@@ -1093,7 +1098,7 @@ private struct PosterGrid: View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button { onTap(item) } label: {
-                    PosterCardiOS(id: item.id, name: item.name, poster: item.poster,
+                    PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background,
                                   progress: item.progress, menu: menu)
                 }
                 .buttonStyle(.plain)
@@ -1138,7 +1143,7 @@ private struct PosterRail: View {
                     LazyHStack(spacing: Theme.Space.sm) {
                         ForEach(items) { item in
                             Button { onTap(item) } label: {
-                                PosterCardiOS(id: item.id, name: item.name, poster: item.poster,
+                                PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background,
                                               progress: item.progress, menu: menu,
                                               onDetails: onDetails.map { od in { od(item) } })
                             }
@@ -1194,10 +1199,77 @@ private struct PosterRail: View {
 // (FeaturedHeroView.swift) on all three browse screens; its 16:9-art helpers now live on
 // `FeaturedHeroItem`.
 
+#if canImport(UIKit)
+private typealias PlatformPosterImage = UIImage
+#elseif canImport(AppKit)
+private typealias PlatformPosterImage = NSImage
+#endif
+
+/// In-memory decoded-poster cache on top of the shared URLCache (disk). Keyed by URL, evicted under
+/// memory pressure, so a poster shown in several rails decodes once.
+private let posterMemoryCacheiOS: NSCache<NSURL, PlatformPosterImage> = {
+    let c = NSCache<NSURL, PlatformPosterImage>(); c.countLimit = 400; return c
+}()
+
+/// Cached, self-retrying poster image for the iPhone / iPad / Mac rails and grids. Raw `AsyncImage` keeps
+/// no cache and CANCELS its request when a Lazy cell recycles on scroll, without retrying, which is exactly
+/// the on-device "some posters load, others stay blank" report. This loads via `.task(id:)` (re-runs on
+/// every reappear, instant on a cache hit), treats a cancel as not-a-failure so the next appear retries,
+/// and shows a film placeholder only on a real failure. Mirrors the tvOS PosterArt loader; the caller keeps
+/// its own frame / crop / clip so the 120x180 fill-crop framing (F37) is unchanged.
+struct CachedPosterImage: View {
+    let url: String?
+    @State private var image: PlatformPosterImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                imageView(image).resizable().scaledToFill()
+            } else if failed {
+                Theme.Palette.surface1.overlay(
+                    Image(systemName: "film").font(.system(size: 28)).foregroundStyle(Theme.Palette.textTertiary))
+            } else {
+                Theme.Palette.surface1
+            }
+        }
+        .task(id: url) { await load() }
+    }
+
+    private func imageView(_ img: PlatformPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
+    }
+
+    private func load() async {
+        failed = false
+        guard let raw = url, !raw.isEmpty, let u = URL(string: raw) else { failed = true; return }
+        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { image = cached; return }
+        var req = URLRequest(url: u)
+        req.cachePolicy = .returnCacheDataElseLoad   // posters are immutable: prefer the shared disk cache
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            guard !Task.isCancelled else { return }
+            if let img = PlatformPosterImage(data: data) {
+                posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
+                image = img
+            } else { failed = true }
+        } catch {
+            if !Task.isCancelled { failed = true }   // a cancel (scrolled away) is not a failure; the next appear retries
+        }
+    }
+}
+
 private struct PosterCardiOS: View {
     let id: String
     let name: String
     let poster: String?
+    /// Backdrop to fall back to when an add-on item carries no `poster` (AIOMetadata sometimes omits it),
+    /// so the tile shows the title's art cropped to the card instead of a blank surface. Nil = no fallback.
+    var fallbackArt: String? = nil
     let progress: Double
     /// Which long-press menu to attach (#14). `.none` attaches none.
     var menu: iOSPosterMenu = .none
@@ -1211,18 +1283,14 @@ private struct PosterCardiOS: View {
     private var card: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottom) {
-                AsyncImage(url: URL(string: poster ?? "")) { phase in
-                    switch phase {
-                    // scaledToFill (not a forced 2/3 aspectRatio): keeps the source proportions and CROPS to
-                    // the card, so add-on posters that aren't 2:3 (URL-image catalogs) fill the card cleanly
-                    // instead of being stretched into a squished shape.
-                    case .success(let img): img.resizable().scaledToFill()
-                    default: Theme.Palette.surface1
-                    }
-                }
-                .frame(width: 120, height: 180)
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                // Cached, self-retrying loader (not raw AsyncImage, which cancels on cell recycle and never
+                // retries, the blank-poster cause). scaledToFill inside CachedPosterImage keeps the source
+                // proportions and CROPS to the card, so non-2:3 add-on posters fill cleanly (F37), and a
+                // missing poster falls back to the title's backdrop before a plain film placeholder.
+                CachedPosterImage(url: poster ?? fallbackArt)
+                    .frame(width: 120, height: 180)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                 if progress > 0.01 {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
