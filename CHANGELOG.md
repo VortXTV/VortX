@@ -4,6 +4,24 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.4 - 2026-06-15
+
+A focused fix pass on top of 0.3.3, across iPhone, iPad, Mac, and Apple TV, clearing the issues found in 0.3.3 testing.
+
+### Added
+- **The Quality picker is now in the Apple TV player too.** Swap resolution (4K to 1080p to 720p) at your current position, the same one-tap switch the iPhone, iPad, and Mac player already had.
+- **A default external-player picker on Mac and Apple TV.** Choose IINA or Infuse on Mac, or Infuse, VLC, and the others on Apple TV, and direct and debrid streams open straight there.
+
+### Fixed
+- **The Skip step setting now shows your choice and takes effect** on iPhone, iPad, and Mac. It was reading the saved value in the wrong format, so the control looked blank.
+- **Mac Settings shows the real audio and subtitle labels again,** instead of every row collapsing to "Size".
+- **A source with no readable resolution now reads "Other", not "Best",** so a small file is never dressed up as the top pick. A file far too small to be 4K is also no longer tagged 4K.
+- **The Apple TV player controls are rebalanced.** Aspect, speed, and source switching moved to the left next to the gear, so the right side is no longer crowded and the skip and audio buttons no longer overlap.
+- **The Apple TV "Ends at" clock no longer cuts off** after its first couple of digits.
+
+### Notes
+- Landing next: an A/B loop, a frame grab to Photos, sharing a title, copy-all-source-links, a What's New sheet, and haptics.
+
 ## 0.3.3 - 2026-06-15
 
 The big player and browse update on top of 0.3.1, across iPhone, iPad, Mac, and Apple TV. A new in-player quality picker, native adaptive-stream playback, a default external-player engine, new-episode alerts, smarter HDR, a full set of source filters, and a long list of on-device fixes (the subtitle freeze and blank posters among them).

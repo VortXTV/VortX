@@ -61,6 +61,18 @@ enum ExternalPlayers {
         return UIApplication.shared.canOpenURL(url)
     }
 
+    /// UserDefaults key for the user's chosen default player (stores `Player.id`, the name; "" or an
+    /// unknown id == the built-in libmpv player). Settings binds an @AppStorage Picker to this.
+    static let defaultKey = "stremiox.player.tvDefaultPlayer"
+
+    /// The user's chosen default player to auto-hand-off every eligible stream to, or nil for the
+    /// built-in player. Resolved from the full curated list (not `detected()`): tvOS canOpenURL is
+    /// unreliable, so a player the user deliberately picked is trusted even if detection misses it.
+    static func defaultPlayer() -> Player? {
+        guard let id = UserDefaults.standard.string(forKey: defaultKey), !id.isEmpty else { return nil }
+        return candidates.first { $0.id == id }
+    }
+
     /// Open `streamURL` in `player`. Returns false when the URL cannot be encoded.
     @discardableResult
     static func open(_ streamURL: URL, in player: Player) -> Bool {

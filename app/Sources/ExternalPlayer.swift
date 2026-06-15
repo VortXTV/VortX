@@ -32,8 +32,11 @@ enum ExternalPlayer {
         func deepLink(for stream: URL) -> URL? { make(stream) }
     }
 
-    /// Every supported target (installed or not). Order = chooser order.
-    static let all: [Target] = [
+    /// Every supported target (installed or not). Order = chooser order. Built per-platform: the
+    /// x-callback players below are iOS apps; macOS-native players are appended on Mac builds, where
+    /// those iOS-only schemes don't resolve and so filter themselves out of the installed list.
+    static let all: [Target] = {
+        var targets: [Target] = [
         Target(id: "infuse", name: "Infuse", icon: "play.rectangle.on.rectangle.fill",
                probe: URL(string: "infuse://")!,
                make: { stream in
@@ -64,7 +67,19 @@ enum ExternalPlayer {
                make: { stream in
                    encoded(stream).flatMap { URL(string: "mxplayer://\($0)") }
                }),
-    ]
+        ]
+        #if canImport(AppKit)
+        // macOS-native players. IINA is the popular mpv-based Mac player; Infuse (above) also ships a
+        // Mac app answering the same infuse:// x-callback scheme, so it appears here too when installed.
+        targets.append(
+            Target(id: "iina", name: "IINA", icon: "play.rectangle.on.rectangle.fill",
+                   probe: URL(string: "iina://")!,
+                   make: { stream in
+                       encoded(stream).flatMap { URL(string: "iina://weblink?url=\($0)") }
+                   }))
+        #endif
+        return targets
+    }()
 
     /// Only the targets actually installed on this device, what the chooser should offer.
     @MainActor static var installed: [Target] { all.filter(\.isInstalled) }

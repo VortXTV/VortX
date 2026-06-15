@@ -25,6 +25,7 @@ struct SettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
+    @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {
@@ -170,7 +171,15 @@ struct SettingsView: View {
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
+            choiceRow("Play in", externalPlayerChoices, selection: $defaultExternalPlayer)
+            Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
+    }
+
+    /// Built-in plus every curated external player; picking one auto-hands eligible streams to it.
+    private var externalPlayerChoices: [(String, String)] {
+        [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
     }
 
     private var effectiveDirectLinksOnly: Bool {

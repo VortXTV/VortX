@@ -43,7 +43,7 @@ struct iOSSettingsView: View {
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
-    @AppStorage("stremiox.seekStep") private var seekStep = 10   // skip-button step in seconds
+    @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
     @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = true
     @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
 
@@ -572,17 +572,17 @@ struct iOSSettingsView: View {
             Picker("Audio language", selection: $prefAudioLang) {
                 ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("audioLang-\(theme.accentID)")
             Picker("Subtitle language", selection: $prefSubLang) {
                 ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subLang-\(theme.accentID)")
             Picker("Subtitles", selection: $prefForced) {
                 ForEach(TrackPreferences.ForcedPolicy.allCases, id: \.rawValue) {
                     Text($0.label).tag($0.rawValue)
                 }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subForced-\(theme.accentID)")
         } header: {
             Text("Audio & Subtitles")
         } footer: {
@@ -610,11 +610,11 @@ struct iOSSettingsView: View {
             Picker("Font", selection: $subFont) {
                 ForEach(SubtitleStyle.fonts, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subFont-\(theme.accentID)")
             Picker("Size", selection: $subSize) {
                 ForEach(SubtitleStyle.sizes, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subSize-\(theme.accentID)")
             Stepper(value: subSizeScaleBinding,
                     in: SubtitleStyle.sizeScaleRange,
                     step: SubtitleStyle.sizeScaleStep) {
@@ -623,11 +623,11 @@ struct iOSSettingsView: View {
             Picker("Color", selection: $subColor) {
                 ForEach(SubtitleStyle.colors, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subColor-\(theme.accentID)")
             Picker("Background", selection: $subBackground) {
                 ForEach(SubtitleStyle.backgrounds, id: \.id) { Text($0.label).tag($0.id) }
             }
-            .tint(Theme.Palette.accent).id(theme.accentID)
+            .tint(Theme.Palette.accent).id("subBackground-\(theme.accentID)")
         } header: {
             Text("Subtitle Style")
         } footer: {

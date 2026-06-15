@@ -133,8 +133,8 @@ struct TVPlayerView: View {
     @State private var localTrickplayCaptureInFlight = false
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, settings }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, playerSettings }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -258,6 +258,7 @@ struct TVPlayerView: View {
             if curURL == nil {   // seed from initial request
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
+                maybeRouteToDefaultExternalPlayer()
             }
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             if curHint == nil { curHint = sourceHint }
@@ -395,16 +396,21 @@ struct TVPlayerView: View {
     /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
     /// bar) are separate rows above this one; up/down moves between the three.
     private var buttonRow: [Control] {
-        var c: [Control] = [.settings, .restart, .back]
+        // Remote left/right order mirrors the on-screen left→right layout (controlBar): the left
+        // settings cluster (gear, aspect, speed, sources, quality), then the centre transport, then
+        // the right track cluster (audio, subs, episodes, chapters). Keeping this in step with the
+        // visual order is what makes d-pad focus land where the eye expects.
+        var c: [Control] = [.settings, .aspect, .playback]
+        if hasAlternateSources { c.append(.sources) }
+        if hasQualityOptions { c.append(.quality) }
+        c.append(.restart)
+        c.append(.back)
         if allEpisodes.count > 1 && hasPrevEpisode { c.append(.prev) }
         c.append(.play)
         if allEpisodes.count > 1 && hasNextEpisode { c.append(.next) }
         c.append(.fwd)
         if !audioTracks.isEmpty { c.append(.audio) }
         c.append(.subs)
-        c.append(.aspect)
-        c.append(.playback)
-        if hasAlternateSources { c.append(.sources) }   // was drawn but missing here → unreachable by remote
         if allEpisodes.count > 1 { c.append(.episodes) }
         if hasChapters { c.append(.chapters) }
         return c
@@ -467,6 +473,7 @@ struct TVPlayerView: View {
         case .episodes: openPanel(.episodes)
         case .chapters: openPanel(.chapters)
         case .sources:  openPanel(.sources)
+        case .quality:  openPanel(.quality)
         case .settings: openPanel(.playerSettings)
         }
     }
@@ -585,18 +592,21 @@ struct TVPlayerView: View {
                         if allEpisodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") }
                         ctrlButton(.fwd, "goforward.\(seekStep)")
                     }
-                    // The right side carries the per-panel buttons; the gear lives alone on the
-                    // left so player-wide settings (handoff, decoder, info, QR) stay uncluttered.
+                    // Left cluster: the gear plus the "how it plays" controls (aspect, speed, source and
+                    // quality switching). Grouping them here unclutters the right side, which was
+                    // crowding the centre transport so the skip and audio buttons overlapped.
                     HStack(spacing: Theme.Space.md) {
                         ctrlButton(.settings, "gearshape.fill")
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    HStack(spacing: Theme.Space.md) {
-                        if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
-                        ctrlButton(.subs, "captions.bubble")
                         ctrlButton(.aspect, "aspectratio")
                         ctrlButton(.playback, "speedometer")
                         if hasAlternateSources { ctrlButton(.sources, "rectangle.2.swap") }
+                        if hasQualityOptions { ctrlButton(.quality, "4k.tv") }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    // Right cluster: the "what plays" controls — audio/subtitle tracks and navigation.
+                    HStack(spacing: Theme.Space.md) {
+                        if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
+                        ctrlButton(.subs, "captions.bubble")
                         if allEpisodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                         if hasChapters { ctrlButton(.chapters, "list.bullet.below.rectangle") }
                     }
@@ -799,6 +809,17 @@ struct TVPlayerView: View {
             }
         case .sources:
             return sourceRows()
+        case .quality:
+            // Best playable stream per distinct resolution (4K / 1080p / …), best-first, mirroring the
+            // iOS in-player quality picker. Picking one switches the stream in place at the same spot.
+            let opts = StreamRanking.resolutionOptions(core.streamGroups())
+            guard opts.count > 1 else { return [OptionRow(label: "Only one quality available", isHeader: true)] }
+            return opts.map { opt in
+                OptionRow(label: opt.label, detail: StreamRanking.sourceDetail(opt.stream).size ?? "",
+                          isSelected: opt.stream.playableURL == curURL) {
+                    switchStream(to: opt.stream)
+                }
+            }
         }
     }
 
@@ -833,6 +854,12 @@ struct TVPlayerView: View {
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
         core.streamGroups().reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
+    }
+
+    /// True when the loaded sources span more than one distinct resolution, so an in-player quality
+    /// picker (4K / 1080p / …) is worth showing. A single-resolution title hides the button.
+    private var hasQualityOptions: Bool {
+        StreamRanking.resolutionOptions(core.streamGroups()).count > 1
     }
 
     /// The file carries embedded chapter markers (beyond the implicit whole-file chapter), so the Chapters
@@ -924,6 +951,19 @@ struct TVPlayerView: View {
             })
         }
         return rows
+    }
+
+    /// When the user has chosen a default external player (Settings → Play in), hand the launch stream
+    /// straight to it instead of the built-in player, mirroring iOS. Only direct/debrid remote streams
+    /// are eligible: torrents and header-gated streams play through our embedded server, whose loopback
+    /// URL an external app can't replay. If the chosen app isn't actually installed the open() no-ops and
+    /// the built-in player just keeps playing, so a missing app never strands the user on a dead screen.
+    private func maybeRouteToDefaultExternalPlayer() {
+        guard let player = ExternalPlayers.defaultPlayer(),
+              !isTorrentPlayback, (curHeaders?.isEmpty ?? true),
+              let u = curURL, let host = u.host, host != "127.0.0.1", host != "localhost", host != "::1"
+        else { return }
+        ExternalPlayers.open(u, in: player)
     }
 
     /// A concise one-line label for a source: the first line of its name, else its description.
@@ -1060,6 +1100,7 @@ struct TVPlayerView: View {
         case .episodes:         return "Episodes"
         case .chapters:         return "Chapters"
         case .sources:          return "Sources"
+        case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
         }
     }
@@ -2043,7 +2084,9 @@ struct TVPlayerView: View {
     private var trickplayControls: some View {
         let shown = scrubbing ? scrubTarget : currentTime
         let frac = duration > 0 ? min(1, max(0, shown / duration)) : 0
-        let sideWidth: CGFloat = 130
+        // Wide enough for the longest side label, the "Ends 10:45 PM" wall-clock line, at tvOS caption
+        // size. The earlier 130 fit "1:23:45" but clipped the ends-at clock to its first digits (#71).
+        let sideWidth: CGFloat = 210
         let spacing = Theme.Space.md
         let bubbleWidth: CGFloat = 480
         let bubbleHeight: CGFloat = 270

@@ -668,12 +668,15 @@ enum StreamRanking {
         return nil
     }
 
-    /// A short resolution tag for the Watch-Now button ("4K" / "1080p" / …), or "Best" when unknown.
+    /// A short resolution tag for the Watch-Now button ("4K" / "1080p" / …), or "Other" when the
+    /// resolution can't be determined. ("Other", not "Best": an untagged source is unknown quality,
+    /// not the best one.) A bare "4k"/"uhd" tag is only trusted when the file size isn't implausibly
+    /// small for 4K, so a low-res file that merely carries a 4k tag isn't promoted to the 4K bucket.
     static func qualityLabel(_ s: CoreStream) -> String {
         let t = qualityText(s)
         if let r = explicitResolution(t) { return r >= 4000 ? "4K" : "\(r)p" }
-        if boundedMatch(t, "4k") || boundedMatch(t, "uhd") { return "4K" }
-        return "Best"
+        if (boundedMatch(t, "4k") || boundedMatch(t, "uhd")), !implausibleForResolution(t) { return "4K" }
+        return "Other"
     }
 
     /// Enriched label for the Watch-Now button, derived from the EXACT stream best() will
