@@ -6,13 +6,13 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.2 (prerelease) - 2026-06-15
 
-The player and competitor-parity feature wave. Cut as an iterating prerelease: features land build by build, then it promotes to the latest release.
+A small player update. The larger player and browse features are landing in 0.3.3.
 
 ### Added
 - **Seek-while-hidden on Apple TV.** With the controls hidden, Left/Right now seek backward/forward 10 seconds directly, with a brief time pill, instead of revealing the whole control bar. Up/Down still reveal the controls.
 
-### Landing next in 0.3.2
-A default external-player engine (Infuse/VLC), an Up Next autoplay band with a countdown, an in-player quality picker, tvOS glass buttons, Mac keyboard navigation, new-episode notifications, and more.
+### Landing next in 0.3.3
+An in-player quality picker, a default external-player engine (Infuse/VLC), an Up Next autoplay band with a countdown, new-episode notifications, Mac keyboard navigation, Dolby Vision DV7 colour fix, and more.
 
 ## 0.3.1 - 2026-06-15
 
@@ -40,7 +40,7 @@ A bug-fix and polish pass on top of 0.3.0, driven by on-device testing across iP
 - **The iPhone hero billboard rotates again** instead of occasionally freezing on one title after switching tabs.
 
 ### Notes
-- A wave of new player and competitor-parity features (seek-while-hidden, an Up Next autoplay band, a default external-player engine, an in-player quality picker, and more) is landing in 0.3.2.
+- A wave of new player and browse features (an in-player quality picker, a default external-player engine, an Up Next autoplay band, and more) is landing next.
 
 ## 0.3.0 - 2026-06-14
 
