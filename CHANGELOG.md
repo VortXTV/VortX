@@ -18,6 +18,7 @@ StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian
 - **Best stream is smarter: a true remux now beats a merely bigger file.** The picker ranks source type (remux over Blu-ray over web) and HDR/Dolby Vision and audio above raw file size, with size only breaking ties, so the highest-quality source wins instead of just the largest.
 - **The Apple TV "All sources" list scrolls all the way down again** even when the first entry is a non-playable one (like a Ratings add-on).
 - **The Apple TV top menu bar comes back reliably** after returning from the Home screen or switching profiles, instead of occasionally staying hidden.
+- **Apple TV search suggestions interleave movies and series** instead of listing every movie before the first series, so a show you are typing surfaces sooner. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
 
 ### Notes
 - Next up is VortX in full: the repository and docs move to the new name, with a website, a subreddit, and a Discord to follow.

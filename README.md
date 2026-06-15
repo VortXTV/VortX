@@ -290,7 +290,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 - [mpv](https://mpv.io/) and [MPVKit](https://github.com/mpvkit/MPVKit), for the player.
 - [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile), for the embedded server runtime.
 - Claude (Anthropic) wrote the code.
-- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the VortX Lite build, the stream-ranking reports that drove the cached-first fixes, and the build-from-source report that made a fresh clone work for everyone.
+- [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the VortX Lite build, the stream-ranking reports that drove the cached-first fixes, the build-from-source report that made a fresh clone work for everyone, and the Apple TV search-suggestion interleaving.
 
 See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
 
