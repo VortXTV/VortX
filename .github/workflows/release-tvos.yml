@@ -115,6 +115,13 @@ jobs:
           (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
           (cd out/lite && zip -qry ../VortX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../VortX-iOS-ci.ipa Payload)
+          # Reclaim disk before building the .dmg: the IPAs are zipped now, so the tvOS/iOS build
+          # trees and the unzipped payloads are dead weight, and the macos-latest runner disk is
+          # tight (four MPVKit-GPL builds + node). Without this, `hdiutil create` failed with
+          # "No space left on device" on the macOS leg (the empty-asset release for v0.3.6).
+          rm -rf out/full/Payload out/lite/Payload out/ios/Payload
+          rm -rf app/build/ci app/build/ci-lite app/build/ci-ios
+          df -h / | tail -1
           # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
           # (every nested binary gets a valid signature, so the kernel will run it), then package it as
           # a drag-to-install .dmg holding the app plus an /Applications symlink. We can't notarize
