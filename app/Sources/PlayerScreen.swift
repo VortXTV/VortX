@@ -42,6 +42,7 @@ struct PlayerScreen: View {
     var recordQualityText: String? = nil                    // StreamRanking.signature(stream) of the launching stream
     var recordBingeGroup: String? = nil                     // behaviorHints.bingeGroup of the launching stream (CW binge continuity)
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
+    var isTrailer: Bool = false                             // a trailer preview: always plays in-app, never auto-routes external
     /// The release group of the CURRENTLY playing stream, updated on an in-player episode switch so the
     /// recorded binge group tracks the live episode (not the stale launch value). nil = use recordBingeGroup.
     @State private var curBingeState: String? = nil
@@ -299,6 +300,15 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            #if os(iOS) || os(macOS)
+            // Auto-route to the user's chosen default external player (Infuse / VLC), when one is set, for a
+            // header-free direct/debrid stream. Torrents, header-gated streams (external apps can't apply our
+            // request headers), loopback URLs, and trailers (a direct trailer URL is structurally identical
+            // to a debrid movie URL, so it would otherwise be hijacked) stay in the built-in player.
+            if !isTrailer, (headers?.isEmpty ?? true), ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent) {
+                onClose(); return
+            }
+            #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             scheduleHide(); startLoadTimeout()

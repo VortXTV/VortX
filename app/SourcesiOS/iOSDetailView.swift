@@ -288,7 +288,7 @@ struct iOSDetailView: View {
                 .ignoresSafeArea()
             case .trailerPlayer(let url, let title):
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
-                             recordMeta: nil, onClose: { presentation = nil })
+                             recordMeta: nil, isTrailer: true, onClose: { presentation = nil })
                     .ignoresSafeArea()
             }
         }

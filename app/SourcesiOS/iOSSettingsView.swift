@@ -39,6 +39,8 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
+    // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
+    @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
 
     var body: some View {
         NavigationStack {
@@ -204,6 +206,12 @@ struct iOSSettingsView: View {
             Picker("Audio output", selection: $audioOutput) {
                 ForEach(AudioOutputMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            if !installedExternalPlayers.isEmpty {
+                Picker("Play in", selection: $defaultExternalPlayer) {
+                    Text("Built-in player").tag("")
+                    ForEach(installedExternalPlayers) { Label($0.name, systemImage: $0.icon).tag($0.id) }
+                }
+            }
         } header: {
             Text("Playback")
         } footer: {
@@ -212,9 +220,16 @@ struct iOSSettingsView: View {
                      ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
                      : "Hide torrent and magnet sources. Only direct and debrid links will play.")
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
+                if !installedExternalPlayers.isEmpty {
+                    Text("Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.")
+                }
             }
         }
     }
+
+    /// External players present on this device, the choices the "Play in" picker offers. Evaluated once
+    /// per view build; installing a new player after launch needs a Settings re-open to appear.
+    private var installedExternalPlayers: [ExternalPlayer.Target] { ExternalPlayer.installed }
 
     private var effectiveDirectLinksOnly: Bool { PlaybackSettings.directLinksOnly }
 

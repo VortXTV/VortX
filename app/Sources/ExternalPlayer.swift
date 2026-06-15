@@ -68,4 +68,42 @@ enum ExternalPlayer {
     private static func encoded(_ url: URL) -> String? {
         url.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
     }
+
+    // MARK: - Default player (auto-route on Play)
+
+    /// UserDefaults key for the chosen default player. Internal so Settings can bind a Picker to it
+    /// via `@AppStorage` (empty string in that store == built-in / no default).
+    static let defaultKey = "stremiox.player.defaultExternalID"
+
+    /// The user's chosen DEFAULT player: a Target.id to auto-open every eligible stream in, or nil/empty for
+    /// the built-in libmpv player (Settings' @AppStorage Picker writes "" for built-in; defaultTarget treats
+    /// any id that matches no installed Target as built-in too). Set from Settings. Persisted across launches.
+    static var defaultPlayerID: String? {
+        get { UserDefaults.standard.string(forKey: defaultKey) }
+        set {
+            if let newValue { UserDefaults.standard.set(newValue, forKey: defaultKey) }
+            else { UserDefaults.standard.removeObject(forKey: defaultKey) }
+        }
+    }
+
+    /// The installed default target, if the user picked one and it is still installed; else nil (built-in).
+    @MainActor static var defaultTarget: Target? {
+        guard let id = defaultPlayerID else { return nil }
+        return installed.first { $0.id == id }
+    }
+
+    /// Whether `stream` can be handed to an external app: external players need a DIRECT remote URL
+    /// (debrid / CDN), not the embedded server's loopback torrent/proxy URL (they can't apply our request
+    /// headers or reach an in-process torrent). So torrents and 127.0.0.1/localhost URLs stay built-in.
+    static func canRouteExternally(_ stream: URL, isTorrent: Bool) -> Bool {
+        guard !isTorrent, let host = stream.host else { return false }
+        return host != "127.0.0.1" && host != "localhost"
+    }
+
+    /// If a default external player is set and `stream` is eligible, open it there and return true; the
+    /// caller then dismisses the built-in player. Returns false to play in the built-in player as usual.
+    @MainActor static func routeToDefaultIfSet(_ stream: URL, isTorrent: Bool) -> Bool {
+        guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return false }
+        return open(target, stream: stream)
+    }
 }
