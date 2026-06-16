@@ -591,29 +591,7 @@ struct iOSSearchView: View {
         return [("Movies", movies), ("Series", series), ("Other", other)].filter { !$0.items.isEmpty }
     }
 
-    /// Autocomplete titles for `.searchSuggestions`, from the engine's LocalSearch index plus any
-    /// loaded result / Continue-Watching / board titles that substring-match — the tvOS approach.
-    private var suggestionTitles: [String] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var seen = Set<String>()
-
-        let coreSuggestions = core.searchSuggestions.map(\.name).filter { title in
-            guard title.caseInsensitiveCompare(trimmed) != .orderedSame else { return false }
-            return seen.insert(title).inserted
-        }
-        let localTitles = core.searchResults.map(\.name)
-            + core.continueWatching.map(\.name)
-            + core.boardRows.flatMap { $0.items.map(\.name) }
-        let localMatches = localTitles.filter { title in
-            guard title.caseInsensitiveCompare(trimmed) != .orderedSame else { return false }
-            guard title.range(of: trimmed, options: [.caseInsensitive, .diacriticInsensitive]) != nil else {
-                return false
-            }
-            return seen.insert(title).inserted
-        }
-        return Array((coreSuggestions + localMatches).prefix(10))
-    }
+    private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
 
     private var hasSearchQuery: Bool {
         query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
