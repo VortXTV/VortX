@@ -25,9 +25,9 @@ verify_sha256() { # <file> <expected-hash> <label>
 }
 
 # 1) NodeMobile.xcframework. The official nodejs-mobile v18.20.4 release is
-#    iOS-only; StremioX needs tvOS slices too (device + simulator), so a
+#    iOS-only; VortX needs tvOS slices too (device + simulator), so a
 #    tvOS-enabled build is hosted as a release asset on this repo.
-NODEMOBILE_URL="https://github.com/mamaclapper/StremioX/releases/download/vendor-1/NodeMobile-v18.20.4-ios-tvos.xcframework.zip"
+NODEMOBILE_URL="https://github.com/VortXTV/VortX/releases/download/vendor-1/NodeMobile-v18.20.4-ios-tvos.xcframework.zip"
 echo "Fetching NodeMobile.xcframework (iOS + tvOS)..."
 mkdir -p app/Vendor
 curl -sfL "$NODEMOBILE_URL" -o /tmp/nodemobile.zip
@@ -73,9 +73,9 @@ FONTS_DIR="app/Resources/fonts"
 if [ -z "$(ls "$FONTS_DIR"/*.ttf "$FONTS_DIR"/*.otf 2>/dev/null)" ]; then
     echo "Fetching subtitle fallback fonts..."
     mkdir -p "$FONTS_DIR"
-    curl -sfL "https://github.com/mamaclapper/StremioX/releases/download/vendor-1/StremioX-subtitle-fonts-v2.zip" -o /tmp/stremiox-fonts.zip
-    verify_sha256 /tmp/stremiox-fonts.zip "$FONTS_SHA256" "subtitle fonts"
-    unzip -qo /tmp/stremiox-fonts.zip -d "$FONTS_DIR"
+    curl -sfL "https://github.com/VortXTV/VortX/releases/download/vendor-1/StremioX-subtitle-fonts-v2.zip" -o /tmp/vortx-fonts.zip
+    verify_sha256 /tmp/vortx-fonts.zip "$FONTS_SHA256" "subtitle fonts"
+    unzip -qo /tmp/vortx-fonts.zip -d "$FONTS_DIR"
 else
     echo "Subtitle fonts already present."
 fi

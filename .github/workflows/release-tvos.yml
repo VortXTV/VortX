@@ -18,6 +18,13 @@ on:
       - "scripts/**"
   release:
     types: [published]
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-tvos.yml"
+      - "core/**"
+      - "scripts/**"
+      - "app/**"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -71,7 +78,7 @@ jobs:
         run: ./scripts/fetch-server-deps.sh
 
       - name: Fetch the macOS node runtime
-        # StremioXMac bundles node + server.js as its streaming server. The binary is gitignored, so
+        # VortXMac bundles node + server.js as its streaming server. The binary is gitignored, so
         # it must be fetched BEFORE xcodegen runs — xcodegen validates that the
         # Resources/node-darwin-arm64 source path exists, and fails project generation if it's absent.
         run: ./app/scripts/fetch-node-macos.sh
@@ -90,28 +97,36 @@ jobs:
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
 
-      - name: Build (unsigned Release, same as the published builds)
+      - name: Build tvOS (Full)
         run: |
-          cd app
-          xcodebuild -project StremioX.xcodeproj -scheme StremioXTV \
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
             -configuration Release -destination 'generic/platform=tvOS' \
-            -derivedDataPath build/ci CODE_SIGNING_ALLOWED=NO build
-          xcodebuild -project StremioX.xcodeproj -scheme StremioXTVLite \
+            -derivedDataPath app/build/ci CODE_SIGNING_ALLOWED=NO build
+
+      - name: Build tvOS (Lite)
+        run: |
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXTVLite \
             -configuration Release -destination 'generic/platform=tvOS' \
-            -derivedDataPath build/ci-lite CODE_SIGNING_ALLOWED=NO build
-          xcodebuild -project StremioX.xcodeproj -scheme StremioXiOSNative \
+            -derivedDataPath app/build/ci-lite CODE_SIGNING_ALLOWED=NO build
+
+      - name: Build iOS
+        run: |
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
             -configuration Release -destination 'generic/platform=iOS' \
-            -derivedDataPath build/ci-ios CODE_SIGNING_ALLOWED=NO build
-          xcodebuild -project StremioX.xcodeproj -scheme StremioXMac \
+            -derivedDataPath app/build/ci-ios CODE_SIGNING_ALLOWED=NO build
+
+      - name: Build macOS
+        run: |
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXMac \
             -configuration Release -destination 'platform=macOS,arch=arm64' \
-            -derivedDataPath build/ci-mac CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO build
 
       - name: Package the IPAs
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
-          cp -R app/build/ci/Build/Products/Release-appletvos/StremioXTV.app out/full/Payload/
-          cp -R app/build/ci-lite/Build/Products/Release-appletvos/StremioXTVLite.app out/lite/Payload/
-          cp -R app/build/ci-ios/Build/Products/Release-iphoneos/StremioXiOSNative.app out/ios/Payload/
+          mv app/build/ci/Build/Products/Release-appletvos/VortXTV.app out/full/Payload/
+          mv app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app out/lite/Payload/
+          mv app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app out/ios/Payload/
           (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
           (cd out/lite && zip -qry ../VortX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../VortX-iOS-ci.ipa Payload)
@@ -131,7 +146,7 @@ jobs:
           codesign --force --deep --sign - "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
           DMG_STAGE="$(mktemp -d)"
-          cp -R "$MAC_APP" "$DMG_STAGE/"
+          mv "$MAC_APP" "$DMG_STAGE/"
           ln -s /Applications "$DMG_STAGE/Applications"
           hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt

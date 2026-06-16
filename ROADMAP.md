@@ -6,7 +6,7 @@ VortX is the modern, native Stremio client for Apple devices, carrying the Apple
 
 ## Have an idea?
 
-Feature requests and bug reports are welcome, and they shape this list. Start a [GitHub Discussion](https://github.com/mamaclapper/VortX/discussions) to suggest a feature or think one through, or [open an issue](https://github.com/mamaclapper/VortX/issues) for a bug. Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
+Feature requests and bug reports are welcome, and they shape this list. Start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) to suggest a feature or think one through, or [open an issue](https://github.com/VortXTV/VortX/issues) for a bug. Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 ## The version path
 

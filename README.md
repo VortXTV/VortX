@@ -8,9 +8,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mamaclapper/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/mamaclapper/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
-  <a href="https://github.com/mamaclapper/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/mamaclapper/VortX/total?color=4c8dff" alt="Downloads"></a>
-  <a href="https://github.com/mamaclapper/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/mamaclapper/VortX?color=4c8dff" alt="License"></a>
+  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/vortxtv/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
+  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/vortxtv/VortX/total?color=4c8dff" alt="Downloads"></a>
+  <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/vortxtv/VortX?color=4c8dff" alt="License"></a>
   <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS-4c8dff" alt="Platforms">
 </p>
 
@@ -32,7 +32,7 @@ Three layers, so your setup always follows you:
 
 Stremio is a great engine and a great protocol, and VortX is built on it. But the Apple apps fell behind. Stremio's Apple TV, iPhone, and iPad builds stopped getting updates and went stale while the platform moved on, and the Apple TV option stayed feature limited. Apple users, and Apple TV users especially, were left on an old build.
 
-VortX picks that up and carries it forward. It is the modern, native, actively developed Stremio client for Apple devices, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best Stremio experience on Apple hardware, and the foundation for the best one anywhere. It builds *on* Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
+VortX picks that up and carries it forward. It is the modern, native, actively developed Stremio client for Apple devices, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best Stremio experience on Apple hardware, and the foundation for the best one anywhere. It builds _on_ Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
 
 One thing worth being straight about: I didn't hand-write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own devices, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was genuinely good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo. A small but growing group of community contributors has since pitched in too (see Credits).
 
@@ -40,13 +40,13 @@ One thing worth being straight about: I didn't hand-write the code. Claude (Anth
 
 The Apple TV release ships in two flavors. Pick one; they are the same app otherwise, and your account, profiles, and settings are identical between them.
 
-| | **VortX (Full)** | **VortX Lite** |
-|---|---|---|
-| File | `VortX-tvOS-x.y.z.ipa` (~48 MB) | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB) |
-| Torrents and magnets | Yes, via the embedded streaming server | No, cannot play them at all |
-| Embedded streaming server | Bundled and running | Not bundled |
-| Direct and debrid links (Real-Debrid, TorBox, Premiumize, usenet resolved to http) | Yes | Yes |
-| Best for | Everyone who wants torrent support | Debrid-only users who never want a peer connection without a VPN |
+|                                                                                    | **VortX (Full)**                       | **VortX Lite**                                                   |
+| ---------------------------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| File                                                                               | `VortX-tvOS-x.y.z.ipa` (~48 MB)        | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB)                             |
+| Torrents and magnets                                                               | Yes, via the embedded streaming server | No, cannot play them at all                                      |
+| Embedded streaming server                                                          | Bundled and running                    | Not bundled                                                      |
+| Direct and debrid links (Real-Debrid, TorBox, Premiumize, usenet resolved to http) | Yes                                    | Yes                                                              |
+| Best for                                                                           | Everyone who wants torrent support     | Debrid-only users who never want a peer connection without a VPN |
 
 **Why a Lite build exists.** When you play a torrent your device joins a peer-to-peer swarm, and your IP is visible to everyone in it. Debrid and direct links are ordinary HTTPS downloads with none of that exposure. If you only ever stream through a debrid service, the Lite build removes the torrent engine entirely, so there is no way to accidentally start a peer connection, and the app is smaller and starts faster.
 
@@ -152,7 +152,7 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 - Audio language, subtitle language, and subtitle style follow the profile: set once per viewer, applied on switch, synced across devices. Requested by [heinzgruber](https://github.com/heinzgruber).
 - A profile can share the main account or sign into its own; switching keeps every session valid.
 - Sign in by scanning a QR code with your phone instead of typing a password with the remote; password sign-in stays as a fallback. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
-- Profiles and their history are per-device for now; cross-device sync returns once StremioX has its own sync channel, planned on the roadmap.
+- Profiles and their history are per-device for now; cross-device sync returns once VortX has its own sync channel, planned on the roadmap.
 
 **The rest**
 
@@ -166,7 +166,7 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 
 The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the **Full** build `VortX-tvOS-x.y.z.ipa` with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), and the **macOS app** as a `.dmg`. None of this requires a jailbreak.
 
-**Is it safe, and why the extra setup?** StremioX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
+**Is it safe, and why the extra setup?** VortX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
 
 **iPhone, iPad, and Apple TV** use one of Methods 1 to 4 below; the signing identity you pick sets how long each install lasts. **macOS** is simpler (no re-signing, no expiry) and has its own section at the end.
 
@@ -182,7 +182,7 @@ Apple only runs apps signed by a valid identity, and what you sign with decides 
 
 1. Go to [signulous.com](https://www.signulous.com), buy a device registration, and follow their steps to register your iPhone, iPad, or Apple TV (for Apple TV they walk you through finding its UDID).
 2. Wait for the registration to be processed (usually under an hour, can take a few).
-3. Open their upload page, upload the StremioX IPA, and it appears in your personal library.
+3. Open their upload page, upload the VortX IPA, and it appears in your personal library.
 4. On the device, open the install link they give you and install. On Apple TV, installation happens over the browser flow they provide.
 5. Signed for a year. When a new version ships, upload the new IPA and install over the top; your sign-in and settings stay.
 
@@ -265,19 +265,19 @@ You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 # 3) Generate the project and build (unsigned, for sideloading)
 cd app && xcodegen generate
 # Full Apple TV build (with torrents):
-xcodebuild -scheme StremioXTV         -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme VortXTV         -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
 # Lite Apple TV build (no embedded server):
-xcodebuild -scheme StremioXTVLite     -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme VortXTVLite     -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
 # Native iPhone and iPad build:
-xcodebuild -scheme StremioXiOSNative  -sdk iphoneos  -destination 'generic/platform=iOS'  -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme VortXiOSNative  -sdk iphoneos  -destination 'generic/platform=iOS'  -configuration Release CODE_SIGNING_ALLOWED=NO build
 # Native Mac build:
-xcodebuild -scheme StremioXMac        -destination 'platform=macOS,arch=arm64'            -configuration Release CODE_SIGNING_ALLOWED=NO build
+xcodebuild -scheme VortXMac        -destination 'platform=macOS,arch=arm64'            -configuration Release CODE_SIGNING_ALLOWED=NO build
 
 # 4) Wrap a built .app into an .ipa (Apple TV / iOS)
-./scripts/repackage-ipa.sh <dir-with-Payload> build/StremioX.ipa
+./scripts/repackage-ipa.sh <dir-with-Payload> build/VortX.ipa
 ```
 
-(The legacy `StremioX` iOS web-host target and its `./scripts/build-web.sh` bundle step still build for now, but the native `StremioXiOSNative` app has replaced it.)
+(The legacy `VortX` iOS web-host target and its `./scripts/build-web.sh` bundle step still build for now, but the native `VortXiOSNative` app has replaced it.)
 
 `server.js` is not committed here because it is the streaming server's own proprietary file. The script prefers a copy from a local Stremio.app (set `STREMIO_APP` to point at one) and otherwise downloads the standard desktop build from the public CDN, so a fresh clone builds without any local install.
 
@@ -287,9 +287,9 @@ It started out talking to add-ons by hand, and that kept getting small things wr
 
 ## What's next
 
-With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and — on the path to 1.0 — StremioX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
+With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and — on the path to 1.0 — VortX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
-Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/mamaclapper/VortX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/mamaclapper/VortX/issues). Requests genuinely shape the roadmap.
+Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/VortXTV/VortX/issues). Requests genuinely shape the roadmap.
 
 ## Known issues
 
@@ -313,10 +313,9 @@ See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
 
 ## A note on the bundled streaming server
 
-The Full IPAs include `server.js`, the streaming server's own proprietary file, distributed for free inside the official apps. StremioX has not modified it and claims no rights to it; it is bundled only so the app works out of the box. The Lite build omits it entirely. Swapping it for an open-source streaming server is on the [roadmap](ROADMAP.md).
+The Full IPAs include `server.js`, the streaming server's own proprietary file, distributed for free inside the official apps. VortX has not modified it and claims no rights to it; it is bundled only so the app works out of the box. The Lite build omits it entirely. Swapping it for an open-source streaming server is on the [roadmap](ROADMAP.md).
 
 ## Star History
-
 
 <a href="https://www.star-history.com/?repos=vortxtv%2Fvortx&type=date&legend=top-left">
  <picture>
