@@ -7,6 +7,13 @@
   Video, Audio, Live TV. Native on every screen.
 </p>
 
+<p align="center">
+  <a href="https://github.com/mamaclapper/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/mamaclapper/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
+  <a href="https://github.com/mamaclapper/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/mamaclapper/VortX/total?color=4c8dff" alt="Downloads"></a>
+  <a href="https://github.com/mamaclapper/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/mamaclapper/VortX?color=4c8dff" alt="License"></a>
+  <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS-4c8dff" alt="Platforms">
+</p>
+
 # VortX
 
 The native streaming client for Apple devices, **formerly StremioX**. Fully native apps for Apple TV, iPhone, iPad, and Mac, built on stremio-core and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
@@ -310,11 +317,12 @@ The Full IPAs include `server.js`, the streaming server's own proprietary file, 
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=mamaclapper%2FStremioX&type=date&legend=top-left">
+
+<a href="https://www.star-history.com/?repos=vortxtv%2Fvortx&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&legend=top-left" />
  </picture>
 </a>
 
