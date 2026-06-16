@@ -8,9 +8,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/VortXTV/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
-  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/VortXTV/VortX/total?color=4c8dff" alt="Downloads"></a>
-  <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/VortXTV/VortX?color=4c8dff" alt="License"></a>
+  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/vortxtv/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
+  <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/vortxtv/VortX/total?color=4c8dff" alt="Downloads"></a>
+  <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/vortxtv/VortX?color=4c8dff" alt="License"></a>
   <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS-4c8dff" alt="Platforms">
 </p>
 
@@ -40,13 +40,13 @@ One thing worth being straight about: I didn't hand-write the code. Claude (Anth
 
 The Apple TV release ships in two flavors. Pick one; they are the same app otherwise, and your account, profiles, and settings are identical between them.
 
-| | **VortX (Full)** | **VortX Lite** |
-|---|---|---|
-| File | `VortX-tvOS-x.y.z.ipa` (~48 MB) | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB) |
-| Torrents and magnets | Yes, via the embedded streaming server | No, cannot play them at all |
-| Embedded streaming server | Bundled and running | Not bundled |
-| Direct and debrid links (Real-Debrid, TorBox, Premiumize, usenet resolved to http) | Yes | Yes |
-| Best for | Everyone who wants torrent support | Debrid-only users who never want a peer connection without a VPN |
+|                                                                                    | **VortX (Full)**                       | **VortX Lite**                                                   |
+| ---------------------------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------- |
+| File                                                                               | `VortX-tvOS-x.y.z.ipa` (~48 MB)        | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB)                             |
+| Torrents and magnets                                                               | Yes, via the embedded streaming server | No, cannot play them at all                                      |
+| Embedded streaming server                                                          | Bundled and running                    | Not bundled                                                      |
+| Direct and debrid links (Real-Debrid, TorBox, Premiumize, usenet resolved to http) | Yes                                    | Yes                                                              |
+| Best for                                                                           | Everyone who wants torrent support     | Debrid-only users who never want a peer connection without a VPN |
 
 **Why a Lite build exists.** When you play a torrent your device joins a peer-to-peer swarm, and your IP is visible to everyone in it. Debrid and direct links are ordinary HTTPS downloads with none of that exposure. If you only ever stream through a debrid service, the Lite build removes the torrent engine entirely, so there is no way to accidentally start a peer connection, and the app is smaller and starts faster.
 
