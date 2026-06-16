@@ -525,6 +525,11 @@ struct iOSSearchView: View {
                 searchDebouncePending = false
                 core.suggestSearch(query)
                 core.search(query)
+                // On macOS the search bar is visible in the toolbar on every tab (all tabs stay
+                // mounted). Switch to the Search tab so results are actually visible.
+                #if os(macOS)
+                if !isActive { MacCommands.go(.search) }
+                #endif
             }
             .onAppear { core.loadSearchSuggestions() }
             .onChange(of: query) { value in scheduleSearch(value) }   // iOS 16 single-param onChange
