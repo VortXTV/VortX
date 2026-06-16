@@ -9,9 +9,21 @@ struct OpenLinkView: View {
     @State private var input = ""
     @State private var working = false
     @State private var status: String?
+    @State private var fileChoices: [LinkOpener.TorrentFile]? = nil   // multi-file pack → show the picker
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
+        Group {
+            if let choices = fileChoices {
+                filePicker(choices)
+            } else {
+                inputForm
+            }
+        }
+        .padding(Theme.Space.xxl)
+    }
+
+    private var inputForm: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
             Text("Play a link")
                 .font(Theme.Typography.sectionTitle)
@@ -38,7 +50,6 @@ struct OpenLinkView: View {
             }
             Spacer()
         }
-        .padding(Theme.Space.xxl)
     }
 
     private func play() {
@@ -74,15 +85,57 @@ struct OpenLinkView: View {
         status = "Fetching torrent info… this can take up to a minute"
         Task { @MainActor in
             defer { working = false }
-            guard let pick = await LinkOpener.resolveMagnet(magnet) else {
+            guard let resolution = await LinkOpener.resolveMagnet(magnet) else {
                 status = "Could not fetch the torrent. No reachable peers, or a dead magnet."
                 return
             }
-            dismiss()
-            presenter.request = PlaybackRequest(
-                url: pick.url,
-                title: magnet.name ?? pick.fileName,
-                torrent: true)
+            switch resolution {
+            case .single(let url, let fileName):
+                dismiss()
+                presenter.request = PlaybackRequest(url: url, title: magnet.name ?? fileName, torrent: true)
+            case .choose(let files):
+                status = nil
+                fileChoices = files   // a multi-file pack: show the picker, the user clicks a file to play
+            }
+        }
+    }
+
+    /// The multi-file magnet picker: each video file in the pack as a focusable row (name + size).
+    @ViewBuilder private func filePicker(_ files: [LinkOpener.TorrentFile]) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.lg) {
+            Text("Pick a file")
+                .font(Theme.Typography.sectionTitle)
+                .foregroundStyle(Theme.Palette.textPrimary)
+            Text("This magnet has \(files.count) videos. Choose which one to play.")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            ScrollView {
+                VStack(spacing: Theme.Space.md) {
+                    ForEach(files) { file in
+                        Button {
+                            dismiss()
+                            presenter.request = PlaybackRequest(url: file.url, title: file.name, torrent: true)
+                        } label: {
+                            HStack(spacing: Theme.Space.md) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(file.name).lineLimit(2)
+                                    if file.sizeBytes > 0 {
+                                        Text(LinkOpener.sizeString(file.sizeBytes))
+                                            .font(Theme.Typography.label)
+                                            .foregroundStyle(Theme.Palette.textSecondary)
+                                    }
+                                }
+                                Spacer(minLength: Theme.Space.md)
+                                Image(systemName: "play.fill")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(RowFocusStyle())
+                    }
+                }
+            }
+            Button("Back") { fileChoices = nil }
+                .buttonStyle(ChipButtonStyle(selected: false))
         }
     }
 }
@@ -92,6 +145,17 @@ enum LinkOpener {
         let infoHash: String
         let name: String?
         let trackers: [String]
+    }
+
+    /// One selectable video file inside a multi-file magnet (a season pack / playlist). `id` is the
+    /// torrent file index used to build the `/{infoHash}/{idx}` play URL.
+    struct TorrentFile: Identifiable { let id: Int; let name: String; let sizeBytes: Double; let url: URL }
+
+    /// A resolved magnet: either one file to auto-play, or several videos for the user to choose from.
+    enum Resolution { case single(url: URL, fileName: String); case choose([TorrentFile]) }
+
+    static func sizeString(_ bytes: Double) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
     static func parseMagnet(_ text: String) -> Magnet? {
@@ -118,10 +182,11 @@ enum LinkOpener {
         return Magnet(infoHash: hash, name: name, trackers: trackers)
     }
 
-    /// Ask the embedded engine for the torrent. The create call returns once the
-    /// metadata is in (it needs at least one peer), with the file list; pick the
-    /// biggest video file.
-    static func resolveMagnet(_ magnet: Magnet) async -> (url: URL, fileName: String)? {
+    /// Ask the embedded engine for the torrent. The create call returns once the metadata is in (it
+    /// needs at least one peer), with the file list. A single-video torrent (a movie plus the usual
+    /// junk) auto-plays the one video as before; a multi-video torrent (a season pack / playlist)
+    /// returns the list so the user can pick which file to play instead of just getting the biggest (#81).
+    static func resolveMagnet(_ magnet: Magnet) async -> Resolution? {
         guard !PlaybackSettings.torrentsDisabled else { return nil }
         let sources = TorrentTrackers.sources(forHash: magnet.infoHash,
                                               streamSources: nil,
@@ -144,14 +209,28 @@ enum LinkOpener {
               let response = try? JSONDecoder().decode(CreateResponse.self, from: data),
               let files = response.files, !files.isEmpty else { return nil }
         let videoExtensions: Set<String> = ["mp4", "mkv", "avi", "mov", "m4v", "ts", "webm", "wmv", "mpg", "mpeg"]
+        func playURL(_ idx: Int) -> URL? { URL(string: "\(StremioServer.base)/\(magnet.infoHash)/\(idx)") }
         let indexed = Array(files.enumerated())
         let videos = indexed.filter { entry in
             let ext = (entry.element.name ?? "").split(separator: ".").last.map { String($0).lowercased() } ?? ""
             return videoExtensions.contains(ext)
         }
+        // Multiple videos = a pack/playlist: hand back the list in natural name order (so episodes read
+        // 1, 2, 3) for the user to choose from.
+        if videos.count > 1 {
+            let choices = videos
+                .sorted { ($0.element.name ?? "").localizedStandardCompare($1.element.name ?? "") == .orderedAscending }
+                .compactMap { entry -> TorrentFile? in
+                    guard let url = playURL(entry.offset) else { return nil }
+                    return TorrentFile(id: entry.offset, name: entry.element.name ?? "File \(entry.offset + 1)",
+                                       sizeBytes: entry.element.length ?? 0, url: url)
+                }
+            if choices.count > 1 { return .choose(choices) }
+        }
+        // One video (or none): play the biggest file, exactly as before.
         guard let best = (videos.isEmpty ? indexed : videos).max(by: { ($0.element.length ?? 0) < ($1.element.length ?? 0) }),
-              let url = URL(string: "\(StremioServer.base)/\(magnet.infoHash)/\(best.offset)") else { return nil }
-        return (url, best.element.name ?? "Torrent")
+              let url = playURL(best.offset) else { return nil }
+        return .single(url: url, fileName: best.element.name ?? "Torrent")
     }
 
     /// RFC 4648 base32 (the older magnet info-hash encoding) to lowercase hex.
