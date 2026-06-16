@@ -44,7 +44,7 @@ final class UpdateChecker: ObservableObject {
             guard let self else { return }
             // /releases/latest excludes drafts and prereleases (the vendor asset
             // release stays invisible here).
-            guard let url = URL(string: "https://api.github.com/repos/mamaclapper/StremioX/releases/latest"),
+            guard let url = URL(string: "https://api.github.com/repos/VortXTV/VortX/releases/latest"),
                   let (data, response) = try? await URLSession.shared.data(from: url),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let payload = try? JSONDecoder().decode(LatestRelease.self, from: data) else { return }

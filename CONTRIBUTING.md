@@ -1,4 +1,4 @@
-# Contributing to StremioX
+# Contributing to VortX
 
 Contributions are welcome, and the bar to clear is low: the project has merged community PRs within hours of them opening. Here is what makes that fast.
 
@@ -9,7 +9,7 @@ macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust ni
 ```bash
 ./scripts/fetch-server-deps.sh        # NodeMobile, server.js, subtitle fonts (all public downloads)
 ./scripts/build-core-xcframework.sh   # the stremio-core engine (Rust, needs nightly + rust-src)
-cd app && xcodegen generate           # then open StremioX.xcodeproj
+cd app && xcodegen generate           # then open VortX.xcodeproj
 ```
 
 The tvOS app runs fine in the Apple TV simulator. Code signing is allowed in the project so you can deploy to your own hardware from Xcode.

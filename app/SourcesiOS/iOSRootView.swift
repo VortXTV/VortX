@@ -156,7 +156,7 @@ struct iOSRootView: View {
     /// Open the GitHub releases page (where the signed IPA / dmg lives) in the browser. Cross-platform
     /// via SwiftUI's openURL, so no UIKit/AppKit import is needed here.
     private func openReleasesPage() {
-        guard let url = URL(string: "https://github.com/mamaclapper/StremioX/releases/latest") else { return }
+        guard let url = URL(string: "https://github.com/VortXTV/VortX/releases/latest") else { return }
         openURL(url)
     }
 

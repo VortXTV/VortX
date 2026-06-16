@@ -1,4 +1,4 @@
-name: StremioX
+name: VortX
 options:
   bundleIdPrefix: com.stremiox
   deploymentTarget:
@@ -9,7 +9,7 @@ packages:
     url: https://github.com/mpvkit/MPVKit
     exactVersion: "0.41.0"
 targets:
-  StremioX:
+  VortX:
     type: application
     platform: iOS
     sources:
@@ -38,7 +38,7 @@ targets:
         CURRENT_PROJECT_VERSION: "112"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
-        # load the UI from a loopback origin. The native targets (StremioXiOSNative, StremioXTV) have no
+        # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
         # webview, so this flag gates that proxy off there to shed footprint (issue #56, 2 GB Apple TV HD).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_WEB_HOST"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -53,26 +53,26 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
   # Native iPhone/iPad client on stremio-core + libmpv (0.3.0), the same engine + player as the
-  # Apple TV app, with a touch UI in SourcesiOS. Replaces the web-host StremioX target once it
+  # Apple TV app, with a touch UI in SourcesiOS. Replaces the web-host VortX target once it
   # reaches parity (see docs/REBASE-iOS.md). Built alongside it so the web host keeps working
   # until cutover. Mirrors the proven tvOS native target's settings.
-  StremioXiOSNative:
+  VortXiOSNative:
     type: application
     platform: iOS
     # Raise the per-app jetsam ceiling so the in-process node server + mpv 4K buffers don't trip the
     # memory limit (the device server-death). Applied when the IPA is (re)signed; sideload tools
     # (AltStore/Sideloadly) carry this entitlement for free Apple IDs, as emulators do.
     entitlements:
-      path: StremioXiOSNative.entitlements
+      path: VortXiOSNative.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
     sources:
-      - SourcesiOS                # touch UI
-      - SourcesShared             # shared engine bridge, models, account, ranking, profiles, themes
-      - Sources/Player            # libmpv player core (shared with tvOS)
-      - Sources/NodeServer.swift  # embedded streaming server
-      - Sources/PlayerScreen.swift   # full native touch player (controls, tracks, resume), reused by the native UI
-      - Sources/ShareSheet.swift     # share sheet used by the player handoff
+      - SourcesiOS # touch UI
+      - SourcesShared # shared engine bridge, models, account, ranking, profiles, themes
+      - Sources/Player # libmpv player core (shared with tvOS)
+      - Sources/NodeServer.swift # embedded streaming server
+      - Sources/PlayerScreen.swift # full native touch player (controls, tracks, resume), reused by the native UI
+      - Sources/ShareSheet.swift # share sheet used by the player handoff
       - Sources/ExternalPlayer.swift # external-player handoff used by the player
       - Resources/Assets.xcassets
       - path: Resources/server.js
@@ -93,7 +93,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.7"
         CURRENT_PROJECT_VERSION: "112"
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -113,21 +113,21 @@ targets:
   # and spawns server.js in a child process (SourcesShared/MacNodeServer.swift). This restores TORRENT
   # playback on the Mac — it is no longer Direct-Links-Only. MPVKit's macos-arm64 slices and the
   # stremio-core macOS slice are complete.
-  StremioXMac:
+  VortXMac:
     type: application
     platform: macOS
-    deploymentTarget: "14.0"   # MPVKit's macOS slices (Libuavs3d) require macOS 14
+    deploymentTarget: "14.0" # MPVKit's macOS slices (Libuavs3d) require macOS 14
     sources:
-      - SourcesiOS                   # the native SwiftUI UI also runs on macOS
-      - SourcesShared                # includes MacNodeServer.swift (the child-process node server)
+      - SourcesiOS # the native SwiftUI UI also runs on macOS
+      - SourcesShared # includes MacNodeServer.swift (the child-process node server)
       - Sources/Player
       - Sources/PlayerScreen.swift
       - Sources/ShareSheet.swift
       - Sources/ExternalPlayer.swift
       - Resources/Assets.xcassets
-      - path: Resources/server.js    # Stremio streaming server, run by the bundled node binary
+      - path: Resources/server.js # Stremio streaming server, run by the bundled node binary
         buildPhase: resources
-      - path: Resources/node-darwin-arm64   # standalone node executable (fetched pre-build)
+      - path: Resources/node-darwin-arm64 # standalone node executable (fetched pre-build)
         buildPhase: resources
       - path: Resources/fonts
         optional: true
@@ -135,20 +135,20 @@ targets:
         buildPhase: resources
     dependencies:
       - package: MPVKit
-        product: MPVKit-GPL          # macos-arm64_x86_64 slice
+        product: MPVKit-GPL # macos-arm64_x86_64 slice
       - framework: Vendor/StremioXCore.xcframework
-        embed: false                 # now carries an aarch64-apple-darwin slice
+        embed: false # now carries an aarch64-apple-darwin slice
     preBuildScripts:
       # Download the standalone node binary before the resource copy phase runs. Idempotent:
       # skips the ~95MB download when the right version is already present.
-      - script: "\"${SRCROOT}/scripts/fetch-node-macos.sh\""
+      - script: '"${SRCROOT}/scripts/fetch-node-macos.sh"'
         name: Fetch node binary (macOS streaming server)
         outputFiles:
           - "$(SRCROOT)/Resources/node-darwin-arm64"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.7"
         CURRENT_PROJECT_VERSION: "112"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -158,19 +158,19 @@ targets:
         # macOS the same way it does on iOS/tvOS. Mac was the only target shipping default ATS (issue #58).
         INFOPLIST_FILE: Resources/Info-macOS.plist
         INFOPLIST_KEY_CFBundleDisplayName: VortX
-        # Name the product "VortX" (not the target name "StremioXMac") so the .app, the executable, and
+        # Name the product "VortX" (not the target name "VortXMac") so the .app, the executable, and
         # the generated CFBundleName all read "VortX" — the menu bar, Dock, Finder, and the installed
         # app all show "VortX". The bundle id (com.stremiox.mac) and the Xcode target/scheme name stay
-        # StremioXMac (internal; the deeper bundle-id/target rename is the 0.4 work).
+        # VortXMac (internal; the deeper bundle-id/target rename is the 0.4 work).
         PRODUCT_NAME: VortX
         CODE_SIGNING_ALLOWED: "NO"
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
-  StremioXTV:
+  VortXTV:
     type: application
     platform: tvOS
     entitlements:
-      path: StremioXTV.entitlements
+      path: VortXTV.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
     sources:
@@ -203,7 +203,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.7"
         CURRENT_PROJECT_VERSION: "112"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
@@ -215,11 +215,11 @@ targets:
         CODE_SIGNING_REQUIRED: "NO"
   # Lite/debrid-only tvOS build. This omits NodeMobile and server.js entirely,
   # so the app cannot create or play torrents even if old preferences say otherwise.
-  StremioXTVLite:
+  VortXTVLite:
     type: application
     platform: tvOS
     entitlements:
-      path: StremioXTVLite.entitlements
+      path: VortXTVLite.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
     sources:
@@ -244,7 +244,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/StremioX-Bridging.h
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.7"
         CURRENT_PROJECT_VERSION: "112"
@@ -256,34 +256,34 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
 schemes:
-  StremioX:
+  VortX:
     build:
       targets:
-        StremioX: all
+        VortX: all
     run:
       config: Debug
     archive:
       config: Release
-  StremioXiOSNative:
+  VortXiOSNative:
     build:
       targets:
-        StremioXiOSNative: all
+        VortXiOSNative: all
     run:
       config: Debug
     archive:
       config: Release
-  StremioXTV:
+  VortXTV:
     build:
       targets:
-        StremioXTV: all
+        VortXTV: all
     run:
       config: Debug
     archive:
       config: Release
-  StremioXTVLite:
+  VortXTVLite:
     build:
       targets:
-        StremioXTVLite: all
+        VortXTVLite: all
     run:
       config: Debug
     archive:
