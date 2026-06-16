@@ -1041,6 +1041,54 @@ final class CoreBridge: ObservableObject {
     }
 }
 
+// MARK: - Search suggestions
+
+extension CoreBridge {
+    /// Autocomplete titles for `.searchSuggestions`, shared between tvOS and iOS/macOS search.
+    ///
+    /// Priority order:
+    /// 1. Continue-watching titles that substring-match (personal, small, high signal).
+    /// 2. Engine suggestion catalog, interleaved movie/series (may be empty depending on addons).
+    /// 3. Current search results, interleaved by type (primary source when engine catalog is empty).
+    /// 4. Home board rows as a last-resort fallback.
+    ///
+    /// All sources are filtered to titles that contain `query` as a case/diacritic-insensitive
+    /// substring. The engine's suggestion API does fuzzy/related matching and can return unrelated
+    /// titles; the substring guard drops them client-side. Results are capped at 10.
+    func searchSuggestionTitles(for query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var seen = Set<String>()
+        let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+
+        func keep(_ title: String) -> Bool {
+            title.caseInsensitiveCompare(trimmed) != .orderedSame
+                && title.range(of: trimmed, options: opts) != nil
+                && seen.insert(title).inserted
+        }
+
+        func interleaved<T>(from items: [T], typeAt: KeyPath<T, String>, nameAt: KeyPath<T, String>) -> [String] {
+            let filtered = items.filter { keep($0[keyPath: nameAt]) }
+            let movies = filtered.filter { $0[keyPath: typeAt] == "movie" }
+            let series = filtered.filter { $0[keyPath: typeAt] == "series" }
+            let other  = filtered.filter { $0[keyPath: typeAt] != "movie" && $0[keyPath: typeAt] != "series" }
+            var mixed: [String] = []
+            for i in 0..<max(movies.count, series.count) {
+                if i < movies.count { mixed.append(movies[i][keyPath: nameAt]) }
+                if i < series.count { mixed.append(series[i][keyPath: nameAt]) }
+            }
+            return mixed + other.map { $0[keyPath: nameAt] }
+        }
+
+        let watching     = continueWatching.map(\.name).filter { keep($0) }
+        let engineMixed  = interleaved(from: searchSuggestions, typeAt: \.type, nameAt: \.name)
+        let resultsMixed = interleaved(from: searchResults,     typeAt: \.type, nameAt: \.name)
+        let board        = boardRows.flatMap(\.items).filter { keep($0.name) }.map(\.name)
+
+        return Array((watching + engineMixed + resultsMixed + board).prefix(10))
+    }
+}
+
 /// Top-level C callback (no captures allowed). `ctx` is deliberately unused: resolving the
 /// process-lifetime singleton directly is always safe, while dereferencing an unretained
 /// pointer from a Rust worker thread would be a use-after-free if the bridge were ever
