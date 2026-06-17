@@ -110,7 +110,7 @@ struct SyncSettingsView: View {
             Text(code)
                 .font(.system(size: 20, weight: .semibold, design: .monospaced))
                 .foregroundStyle(Theme.Palette.accent)
-                .textSelection(.enabled)
+                .selectableText()
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.Palette.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
@@ -191,4 +191,15 @@ enum UITextContentTypeShim {
         switch self { case .none: return nil; case .emailAddress: return .emailAddress; case .oneTimeCode: return .oneTimeCode }
     }
     #endif
+}
+
+private extension View {
+    /// Text selection is iOS/macOS only; a no-op on tvOS so the recovery-code field still compiles.
+    @ViewBuilder func selectableText() -> some View {
+        #if os(tvOS)
+        self
+        #else
+        self.textSelection(.enabled)
+        #endif
+    }
 }
