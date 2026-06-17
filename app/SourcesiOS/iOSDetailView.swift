@@ -1137,7 +1137,14 @@ struct iOSDetailView: View {
         guard !LiveTypes.contains(type), !meta.genres.isEmpty else { return }
         Task {
             let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
-            await MainActor.run { similarItems = items }
+            var merged = items
+            // When a TMDB key is set, prepend TMDB recommendations (deduped) for richer "more like this".
+            if ApiKeys.tmdbKey() != nil, id.hasPrefix("tt") {
+                let existing = Set(items.map(\.id))
+                let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id && !existing.contains($0.id) }
+                merged = recs + items
+            }
+            await MainActor.run { similarItems = merged }
         }
     }
 

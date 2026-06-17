@@ -168,6 +168,25 @@ struct AddonClient {
         }
     }
 
+    /// TMDB-recommended titles as previews, key-gated and fail-soft. Resolves each recommended IMDb id
+    /// to a Cinemeta meta so the results play through the engine. Returns [] when no TMDB key is set.
+    static func tmdbSimilar(type: String, imdbID: String) async -> [MetaPreview] {
+        let ids = await TMDBClient.recommendations(imdbID: imdbID, type: type)
+        guard !ids.isEmpty else { return [] }
+        let client = AddonClient()
+        return await withTaskGroup(of: MetaPreview?.self) { group in
+            for recId in ids {
+                group.addTask {
+                    guard let m = try? await client.meta(type: type, id: recId) else { return nil }
+                    return MetaPreview(id: m.id, type: m.type, name: m.name, poster: m.poster, posterShape: nil, popularity: nil)
+                }
+            }
+            var out: [MetaPreview] = []
+            for await preview in group { if let preview { out.append(preview) } }
+            return out
+        }
+    }
+
     /// Extracts a series keyword from a title when the title signals it belongs to a series:
     /// anything before a colon (e.g. "Title: Subtitle" → "Title"), or the base name with a
     /// trailing Arabic number stripped (e.g. "Title 3" → "Title"). Returns nil for standalone
