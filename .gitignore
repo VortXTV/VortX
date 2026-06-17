@@ -33,6 +33,7 @@ app/Resources/node-darwin-arm64
 
 # agent / editor config
 .claude/
+CLAUDE.md
 app/Resources/fonts/
 graphify-out/
 

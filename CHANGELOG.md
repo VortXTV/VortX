@@ -4,6 +4,56 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.8 - Unreleased (pre-release in progress)
+
+A point release in progress. The big additions, a free end-to-end-encrypted VortX account that syncs your profiles, settings, library, and history across devices, plus TMDB and MDBList support and an add-on manager, are landing alongside the items below. Confirmed so far:
+
+### Added
+
+- **More like this.** Detail pages now suggest related titles, blending shared genres with same-franchise matches. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#89)
+- **Recent searches on Apple TV.** Your last searches appear when you open Search, per profile. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#90)
+- **A max file-size limit**, in Settings under Streams, alongside the max-quality cap. Ask for "1080p but not a 20 GB file." Sources that do not advertise a size are kept, so nothing useful is hidden.
+- **Save magnets and pasted links for later**, per profile. A saved multi-file torrent reopens its file picker, so a playlist comes right back. (#81)
+
+### Fixed
+
+- **The Apple TV top menu bar returns reliably** after you scroll a series and press Back. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#75, #91)
+
+## 0.3.7 - 2026-06-16
+
+A small release: a multi-file magnet picker, a macOS search fix, and the move to the VortXTV GitHub organization.
+
+### Added
+
+- **Pick which file to play from a multi-file magnet.** Paste a season pack or playlist and choose a video from the list (name and size), on iPhone, iPad, Mac, and Apple TV. A single-video torrent still auto-plays the best file. (#81)
+
+### Fixed
+
+- **Searching from the home header on Mac now opens the Search tab.** Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#80, #82)
+- **Apple TV's smart search suggestions now also apply on iPhone, iPad, and Mac**, so a show you are typing surfaces sooner.
+
+### Notes
+
+- The project moved to the **VortXTV** GitHub organization. Old links redirect; stars, forks, issues, and releases carried over.
+
+## 0.3.6 - 2026-06-15
+
+The curvy vortex X everywhere, the VortX gold theme by default, and a macOS custom-server fix.
+
+### Added
+
+- **The curvy vortex X** (two swirling ribbons and a cream center) is now the app icon, the launch screen, and the in-app wordmark on every platform.
+- **VortX gold is the default accent** for new installs. If you already picked a theme, it stays.
+
+### Fixed
+
+- **Plain-HTTP custom streaming servers now connect on macOS** (for example a server reached over Tailscale). The Mac build was missing the transport-security exception the iPhone and Apple TV builds already had. (#58)
+- **Mac, iPhone, and iPad wait for all sources** before auto-playing the best one, matching Apple TV, so the genuinely best release wins instead of the first to arrive.
+
+### Notes
+
+- Remaining "StremioX" labels in Settings are now "VortX".
+
 ## 0.3.5 - 2026-06-15
 
 StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. A handful of player and Apple TV fixes ride along too, including a smarter best-stream picker.
