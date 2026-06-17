@@ -79,6 +79,13 @@ final class VortXSyncManager: ObservableObject {
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
         persist()
+        // On sign-in, pull the account's profiles + settings; if the account has none yet (a fresh
+        // account), seed it from this device. Last-writer-wins, good enough for v1 cross-device sync.
+        Task { [weak self] in
+            guard let self else { return }
+            let restored = await self.syncDown()
+            if !restored { await self.syncUp() }
+        }
     }
 
     enum AuthResult: Equatable { case ok, totpRequired, failed(String) }
@@ -176,5 +183,22 @@ final class VortXSyncManager: ObservableObject {
         let version = Int(Date().timeIntervalSince1970 * 1000)
         let (code, _) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
         return code == 200
+    }
+
+    // MARK: - Profiles + settings sync (reuses the SettingsBackup serialization as the doc payload)
+
+    /// Push this device's profiles + settings to the account.
+    @discardableResult
+    func syncUp() async -> Bool {
+        guard isSignedIn, let data = try? SettingsBackup.makeBackup() else { return false }
+        return await pushSyncDoc(["settings": data.base64EncodedString(), "format": 1])
+    }
+
+    /// Pull the account's profiles + settings and apply them locally. True if something was restored.
+    @discardableResult
+    func syncDown() async -> Bool {
+        guard isSignedIn, let doc = await pullSyncDoc(),
+              let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) else { return false }
+        return ((try? SettingsBackup.restore(from: data)) ?? 0) > 0
     }
 }

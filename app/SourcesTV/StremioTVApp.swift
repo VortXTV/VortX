@@ -55,6 +55,7 @@ struct StremioTVApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { TabBarHealer.heal("foreground") }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { TabBarHealer.heal("foreground+1.5s") }
                 }
+                if phase == .background { Task { await VortXSyncManager.shared.syncUp() } }   // push profiles + settings
             }
             .onAppear {
                 // Profile housekeeping (the library repair scan + sync probe) is background work;
