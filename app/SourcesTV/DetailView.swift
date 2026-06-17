@@ -55,6 +55,12 @@ struct DetailView: View {
             }
             captureHero()
         }
+        .onDisappear {
+            // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
+            // user presses Back the NavigationStack pops but the bar can stay hidden at its scroll-
+            // suppressed position. Heal it the same way the player-close path does.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { TabBarHealer.heal("detail-popped") }
+        }
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
