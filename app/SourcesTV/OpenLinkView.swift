@@ -10,6 +10,7 @@ struct OpenLinkView: View {
     @State private var working = false
     @State private var status: String?
     @State private var fileChoices: [LinkOpener.TorrentFile]? = nil   // multi-file pack → show the picker
+    @State private var saved: [SavedLinksStore.Entry] = []           // saved magnets/links for this profile (#81)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -21,6 +22,7 @@ struct OpenLinkView: View {
             }
         }
         .padding(Theme.Space.xxl)
+        .onAppear { saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID) }
     }
 
     private var inputForm: some View {
@@ -40,6 +42,9 @@ struct OpenLinkView: View {
                 Button(working ? "Working…" : "Play") { play() }
                     .buttonStyle(PrimaryActionStyle())
                     .disabled(working || input.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Save") { saveCurrent() }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .disabled(working || input.trimmingCharacters(in: .whitespaces).isEmpty)
                 Button("Cancel") { dismiss() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             }
@@ -48,7 +53,38 @@ struct OpenLinkView: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(working ? Theme.Palette.textSecondary : Theme.Palette.danger)
             }
+            if !saved.isEmpty { savedSection }
             Spacer()
+        }
+    }
+
+    /// Saved magnets and links (#81): tap one to play it again; a pack reopens its file picker.
+    private var savedSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Saved")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            ScrollView {
+                VStack(spacing: Theme.Space.sm) {
+                    ForEach(saved) { entry in
+                        HStack(spacing: Theme.Space.md) {
+                            Button { playSaved(entry) } label: {
+                                HStack(spacing: Theme.Space.md) {
+                                    Image(systemName: entry.isMagnet ? "bolt.horizontal.circle" : "link")
+                                    Text(entry.name).lineLimit(1)
+                                    Spacer(minLength: Theme.Space.md)
+                                    Image(systemName: "play.fill")
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(RowFocusStyle())
+                            Button { removeSaved(entry) } label: { Image(systemName: "trash") }
+                                .buttonStyle(ChipButtonStyle(selected: false))
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 360)
         }
     }
 
@@ -98,6 +134,30 @@ struct OpenLinkView: View {
                 fileChoices = files   // a multi-file pack: show the picker, the user clicks a file to play
             }
         }
+    }
+
+    // MARK: - Saved links (#81)
+
+    private func saveCurrent() {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let isMagnet = text.lowercased().hasPrefix("magnet:")
+        let last = URL(string: text)?.lastPathComponent ?? ""
+        let name = isMagnet ? (LinkOpener.parseMagnet(text)?.name ?? "Magnet link") : (last.isEmpty ? text : last)
+        SavedLinksStore.save(.init(id: text, link: text, name: name, poster: nil, isMagnet: isMagnet, savedAt: Date()),
+                             profileID: ProfileStore.shared.activeID)
+        saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID)
+        status = "Saved."
+    }
+
+    private func playSaved(_ entry: SavedLinksStore.Entry) {
+        input = entry.link
+        play()
+    }
+
+    private func removeSaved(_ entry: SavedLinksStore.Entry) {
+        SavedLinksStore.remove(entry.id, profileID: ProfileStore.shared.activeID)
+        saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID)
     }
 
     /// The multi-file magnet picker: each video file in the pack as a focusable row (name + size).

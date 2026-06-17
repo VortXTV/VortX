@@ -476,6 +476,10 @@ enum StreamRanking {
         if prefs.hdrOnly, !(text.contains("hdr") || text.contains("dolby vision")
             || text.contains("dolbyvision") || text.contains("dovi")) { return false }
         if prefs.maxResolution > 0, resolution(text) > prefs.maxResolution { return false }  // cap known resolutions
+        if prefs.maxFileSizeGB > 0 {                                                          // cap advertised file size
+            let gb = sizeGB(text) > 0 ? sizeGB(text) : sizeMB(text) / 1024
+            if gb > 0, gb > prefs.maxFileSizeGB { return false }                              // unknown-size sources pass
+        }
         return true
     }
 

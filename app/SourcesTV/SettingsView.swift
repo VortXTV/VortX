@@ -391,6 +391,12 @@ struct SettingsView: View {
                 Text("Require words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
                 TextField("none", text: $sourcePrefs.includeKeywords)
             }
+            choiceRow("Max file size",
+                      [(0.0, "Off"), (2.0, "2 GB"), (5.0, "5 GB"), (10.0, "10 GB"),
+                       (15.0, "15 GB"), (20.0, "20 GB"), (30.0, "30 GB"), (50.0, "50 GB")],
+                      selection: $sourcePrefs.maxFileSizeGB)
+            Text("Hides sources larger than the cap (e.g. 1080p but not a 20 GB file). Sources with no stated size are kept.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
@@ -438,6 +444,23 @@ struct SettingsView: View {
         }
         // Each row is its own focus section so Down moves between stacked rows (e.g. Size ->
         // Color -> Background) without first leveling onto the chip beneath the focused one.
+        .focusSection()
+    }
+
+    /// Numeric variant of `choiceRow` for a `Double`-backed setting (e.g. the max file-size cap).
+    private func choiceRow(_ label: String, _ options: [(id: Double, label: String)],
+                           selection: Binding<Double>) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text(label).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.Space.sm) {
+                    ForEach(options, id: \.id) { opt in
+                        Button { selection.wrappedValue = opt.id } label: { Text(opt.label) }
+                            .buttonStyle(ChipButtonStyle(selected: selection.wrappedValue == opt.id))
+                    }
+                }
+            }
+        }
         .focusSection()
     }
 

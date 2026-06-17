@@ -40,6 +40,7 @@ struct iOSSettingsView: View {
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
+    @AppStorage(PlaybackSettings.Key.keepPlayingInBackground) private var keepPlayingInBackground = true
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
@@ -255,6 +256,10 @@ struct iOSSettingsView: View {
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
                 .tint(Theme.Palette.accent)
+            if !PlaybackSettings.directLinksOnlyForced {
+                Toggle("Keep playing in background", isOn: $keepPlayingInBackground)
+                    .tint(Theme.Palette.accent)
+            }
             #endif
             if !installedExternalPlayers.isEmpty {
                 Picker("Play in", selection: $defaultExternalPlayer) {
@@ -383,6 +388,16 @@ struct iOSSettingsView: View {
                 Text("4K").tag(4000)
                 Text("1080p").tag(1080)
                 Text("720p").tag(720)
+            }
+            Picker("Max file size", selection: $sourcePrefs.maxFileSizeGB) {
+                Text("Unlimited").tag(0.0)
+                Text("2 GB").tag(2.0)
+                Text("5 GB").tag(5.0)
+                Text("10 GB").tag(10.0)
+                Text("15 GB").tag(15.0)
+                Text("20 GB").tag(20.0)
+                Text("30 GB").tag(30.0)
+                Text("50 GB").tag(50.0)
             }
         } header: {
             Text("Streams")

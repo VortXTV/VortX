@@ -98,6 +98,42 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "UninstallAddon", "args": raw])
     }
 
+    /// Install an add-on from its manifest URL. Stremio add-on URLs ARE the manifest.json URL; we fetch
+    /// it, build the full Descriptor the engine's InstallAddon action expects (mirroring UninstallAddon's
+    /// contract), and dispatch it. The engine's ctx event then refreshes `addons`. Returns a user-facing
+    /// error string on failure, nil on success.
+    @MainActor
+    func installAddon(urlString: String) async -> String? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            return "Enter a valid add-on URL (https://…/manifest.json)."
+        }
+        if !url.absoluteString.lowercased().hasSuffix("manifest.json") {
+            url = url.appendingPathComponent("manifest.json")
+        }
+        if addons.contains(where: { $0.transportUrl == url.absoluteString }) {
+            return "That add-on is already installed."
+        }
+        do {
+            let (data, resp) = try await URLSession.shared.data(from: url)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  manifest["id"] != nil, manifest["name"] != nil else {
+                return "That URL did not return a valid add-on manifest."
+            }
+            let descriptor: [String: Any] = [
+                "transportUrl": url.absoluteString,
+                "manifest": manifest,
+                "flags": ["official": false, "protected": false],
+            ]
+            dispatchCtx(["action": "InstallAddon", "args": descriptor])
+            return nil
+        } catch {
+            return "Could not reach that add-on. Check the URL and your connection."
+        }
+    }
+
     /// stremio-core's storage schema version, a smoke check that the FFI is wired end-to-end.
     var schemaVersion: UInt32 { stremiox_core_schema_version() }
 
@@ -983,10 +1019,47 @@ final class CoreBridge: ObservableObject {
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
             guard !items.isEmpty else { continue }
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
+            if CatalogPrefsStore.isHidden(key) { continue }   // user hid this catalog row (catalog manager)
             rows.append(CoreBoardRow(id: key, title: titles[key] ?? request.path.id,
                                      type: request.path.type, items: items))
         }
-        return rows
+        // Apply the user's catalog order; unlisted catalogs keep the engine's relative order after the listed ones.
+        return rows.enumerated().sorted { a, b in
+            let ra = CatalogPrefsStore.rank(a.element.id), rb = CatalogPrefsStore.rank(b.element.id)
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map(\.element)
+    }
+
+    /// One catalog an installed add-on provides, for the catalog manager editor.
+    struct CatalogInfo: Identifiable {
+        let key: String
+        let title: String
+        let addonName: String
+        let type: String
+        var id: String { key }
+    }
+
+    /// Every catalog the installed add-ons provide (deduped by key), titled the same way the board is.
+    var allCatalogs: [CatalogInfo] {
+        guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
+        var out: [CatalogInfo] = []
+        var seen = Set<String>()
+        for addon in ctx.profile.addons {
+            for catalog in addon.manifest.catalogs {
+                let key = Self.catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)
+                guard seen.insert(key).inserted else { continue }
+                out.append(CatalogInfo(key: key,
+                                       title: Self.displayCatalogTitle(name: catalog.name ?? catalog.id, type: catalog.type),
+                                       addonName: addon.manifest.name, type: catalog.type))
+            }
+        }
+        return out
+    }
+
+    /// Rebuild the board (e.g. after a catalog-preference change) and republish on the main queue.
+    func rebuildBoardRows() {
+        let rows = buildBoardRows()
+        DispatchQueue.main.async { [weak self] in self?.boardRows = rows }
     }
 
     /// The Home board rows whose content type is Live TV (tv / channel / events), for the Live

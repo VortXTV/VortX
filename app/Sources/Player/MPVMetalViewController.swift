@@ -406,8 +406,16 @@ final class MPVMetalViewController: PlatformViewController {
 
     #if canImport(UIKit)
     @objc public func enterBackground() {
-        // fix black screen issue when app enter foreground again
+        // Always drop video decode (fixes the black screen on return and saves GPU). On iOS, whether
+        // AUDIO keeps going is the keep-alive choice (#74): continuing audio holds the AVAudioSession
+        // active so iOS won't suspend the app and freeze the embedded streaming server mid-stream; opting
+        // out pauses so the app can suspend and save battery/data. On tvOS, leaving the app should always
+        // stop playback (there is no screen-lock-keep-listening case).
+        #if os(iOS)
+        if !PlaybackSettings.keepPlayingInBackground { pause() }
+        #else
         pause()
+        #endif
         checkError(mpv_set_option_string(mpv, "vid", "no"))
     }
 

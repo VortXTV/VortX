@@ -3,6 +3,15 @@ import Foundation
 enum PlaybackSettings {
     enum Key {
         static let directLinksOnly = "stremiox.directLinksOnly"
+        static let keepPlayingInBackground = "stremiox.keepPlayingInBackground"
+    }
+
+    /// Keep audio playing (and the in-process streaming server thread alive) when the app backgrounds
+    /// or the screen locks, so a stream survives a lock instead of iOS suspending the process and
+    /// freezing the embedded node server (#74). Defaults to ON; turn it off to let playback pause and
+    /// the app suspend, saving battery and data.
+    static var keepPlayingInBackground: Bool {
+        UserDefaults.standard.object(forKey: Key.keepPlayingInBackground) as? Bool ?? true
     }
 
     static var directLinksOnlyForced: Bool {

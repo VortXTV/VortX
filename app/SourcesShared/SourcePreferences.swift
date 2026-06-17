@@ -39,6 +39,7 @@ final class SourcePreferences: ObservableObject {
     static let hideDeadKey           = "stremiox.streaming.hideDeadTorrents"
     static let instantOnlyKey        = "stremiox.streaming.instantOnly"
     static let maxResolutionKey      = "stremiox.streaming.maxResolution"
+    static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
     static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
     static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
@@ -90,6 +91,12 @@ final class SourcePreferences: ObservableObject {
     @Published var maxResolution: Int {
         didSet { UserDefaults.standard.set(maxResolution, forKey: Self.maxResolutionKey) }
     }
+    /// Cap the file size of shown sources in GB (0 = unlimited). Only drops a source whose ADVERTISED
+    /// size exceeds the cap, so sources with no stated size (many cached / debrid links) are kept.
+    /// Off (0) by default. Pairs with `maxResolution` for "1080p but not a 20 GB file".
+    @Published var maxFileSizeGB: Double {
+        didSet { UserDefaults.standard.set(maxFileSizeGB, forKey: Self.maxFileSizeKey) }
+    }
     /// Show only HDR / Dolby Vision sources. Off by default (aggressive, hides most SDR releases).
     @Published var hdrOnly: Bool {
         didSet { UserDefaults.standard.set(hdrOnly, forKey: Self.hdrOnlyKey) }
@@ -108,6 +115,7 @@ final class SourcePreferences: ObservableObject {
     var noFiltersActive: Bool {
         excludeTerms.isEmpty && includeTerms.isEmpty && safetyMode == "off"
             && !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0
+            && maxFileSizeGB == 0
     }
 
     /// Parsed, lowercased, non-empty exclude / include terms.
@@ -126,6 +134,7 @@ final class SourcePreferences: ObservableObject {
         hideDeadTorrents = UserDefaults.standard.bool(forKey: Self.hideDeadKey)
         instantOnly     = UserDefaults.standard.bool(forKey: Self.instantOnlyKey)
         maxResolution   = UserDefaults.standard.integer(forKey: Self.maxResolutionKey)
+        maxFileSizeGB   = UserDefaults.standard.double(forKey: Self.maxFileSizeKey)
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
         defaultSourceSort = UserDefaults.standard.string(forKey: Self.defaultSortKey) ?? "best"

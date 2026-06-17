@@ -1,11 +1,15 @@
 import SwiftUI
 
-/// Add-ons installed on your account, read live from the engine. You can remove a non-default addon
-/// here; install new ones from the Stremio web or mobile app (they sync down on next launch).
+/// Add-ons installed on your account, read live from the engine. Install one by its manifest URL,
+/// or remove a non-default add-on here. Changes sync to your account and to the official apps.
 struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @State private var newAddonURL = ""
+    @State private var installing = false
+    @State private var installMessage: String?
+    @State private var installFailed = false
 
     var body: some View {
         NavigationStack {
@@ -13,11 +17,27 @@ struct AddonsView: View {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Text("Add-ons").screenTitleStyle()
                     if !account.isSignedIn {
-                        hint("Sign in to manage your add-ons. They sync from the Stremio web or mobile app.")
-                    } else if core.addons.isEmpty {
-                        hint("No add-ons found on your account yet. Install them from the Stremio web or mobile app and they will sync down on next launch.")
+                        hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
                     } else {
-                        ForEach(core.addons) { addon in addonRow(addon) }
+                        installSection
+                        if core.addons.isEmpty {
+                            hint("No add-ons yet. Paste an add-on's manifest URL above to install one.")
+                        } else {
+                            NavigationLink { CatalogManagerView() } label: {
+                                HStack(spacing: Theme.Space.md) {
+                                    Label("Customize catalogs", systemImage: "slider.horizontal.3")
+                                        .font(Theme.Typography.cardTitle)
+                                        .foregroundStyle(Theme.Palette.textPrimary)
+                                    Spacer()
+                                    Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+                                }
+                                .padding(Theme.Space.md)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            ForEach(core.addons) { addon in addonRow(addon) }
+                        }
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenInset)
@@ -25,6 +45,48 @@ struct AddonsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+        }
+    }
+
+    private var installSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Add an add-on")
+                .font(Theme.Typography.cardTitle)
+                .foregroundStyle(Theme.Palette.textPrimary)
+            HStack(spacing: Theme.Space.md) {
+                TextField("https://…/manifest.json", text: $newAddonURL)
+                    .font(.system(size: 16, design: .monospaced))
+                    .disableAutocorrection(true)
+                    .frame(maxWidth: 560)
+                Button(installing ? "Installing…" : "Install") { install() }
+                    .buttonStyle(PrimaryActionStyle())
+                    .disabled(installing || newAddonURL.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            if let installMessage {
+                Text(installMessage)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(installFailed ? Theme.Palette.danger : Theme.Palette.textSecondary)
+            }
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+
+    private func install() {
+        installing = true
+        installMessage = nil
+        let url = newAddonURL
+        Task { @MainActor in
+            let error = await core.installAddon(urlString: url)
+            installing = false
+            installFailed = error != nil
+            if let error {
+                installMessage = error
+            } else {
+                installMessage = "Installed."
+                newAddonURL = ""
+            }
         }
     }
 

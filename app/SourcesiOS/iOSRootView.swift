@@ -909,6 +909,7 @@ private struct iOSOpenLinkView: View {
     @State private var status: String?
     @State private var resolveTask: Task<Void, Never>?   // in-flight magnet resolution; cancelled if the sheet closes
     @State private var fileChoices: [OpenLinkMagnet.TorrentFile]? = nil   // multi-file pack → show the picker
+    @State private var saved: [SavedLinksStore.Entry] = []               // saved magnets/links for this profile (#81)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -922,6 +923,7 @@ private struct iOSOpenLinkView: View {
         .padding(Theme.Space.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .onAppear { saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID) }
         // Closing the sheet mid-resolve must stop the magnet fetch, otherwise it would fire onPlay and
         // present the player after the user already backed out.
         .onDisappear { resolveTask?.cancel() }
@@ -945,6 +947,9 @@ private struct iOSOpenLinkView: View {
                 Button(working ? "Working…" : "Play") { play() }
                     .buttonStyle(PrimaryActionStyle())
                     .disabled(working || input.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button("Save") { saveCurrent() }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .disabled(working || input.trimmingCharacters(in: .whitespaces).isEmpty)
                 Button("Cancel") { resolveTask?.cancel(); dismiss() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             }
@@ -953,8 +958,63 @@ private struct iOSOpenLinkView: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(working ? Theme.Palette.textSecondary : Theme.Palette.danger)
             }
+            if !saved.isEmpty { savedSection }
             Spacer()
         }
+    }
+
+    /// Saved magnets and links (#81): tap one to play it again; a pack reopens its file picker.
+    private var savedSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Saved")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+            ScrollView {
+                VStack(spacing: Theme.Space.sm) {
+                    ForEach(saved) { entry in
+                        HStack(spacing: Theme.Space.md) {
+                            Button { playSaved(entry) } label: {
+                                HStack(spacing: Theme.Space.md) {
+                                    Image(systemName: entry.isMagnet ? "bolt.horizontal.circle" : "link")
+                                    Text(entry.name).lineLimit(1)
+                                    Spacer(minLength: Theme.Space.md)
+                                    Image(systemName: "play.fill")
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            Button { removeSaved(entry) } label: { Image(systemName: "trash") }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                    }
+                }
+            }
+            .frame(maxHeight: 280)
+        }
+    }
+
+    private func saveCurrent() {
+        let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let isMagnet = text.lowercased().hasPrefix("magnet:")
+        let last = URL(string: text)?.lastPathComponent ?? ""
+        let name = isMagnet ? (OpenLinkMagnet.parse(text)?.name ?? "Magnet link") : (last.isEmpty ? text : last)
+        SavedLinksStore.save(.init(id: text, link: text, name: name, poster: nil, isMagnet: isMagnet, savedAt: Date()),
+                             profileID: ProfileStore.shared.activeID)
+        saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID)
+        status = "Saved."
+    }
+
+    private func playSaved(_ entry: SavedLinksStore.Entry) {
+        input = entry.link
+        play()
+    }
+
+    private func removeSaved(_ entry: SavedLinksStore.Entry) {
+        SavedLinksStore.remove(entry.id, profileID: ProfileStore.shared.activeID)
+        saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID)
     }
 
     private func play() {
@@ -1405,6 +1465,13 @@ private struct PosterCardiOS: View {
                 .foregroundStyle(Theme.Palette.textSecondary)
                 .lineLimit(1).frame(width: 120, alignment: .leading)
         }
+        // One contiguous tap + long-press target over the whole card (poster, the 6pt gap, and title).
+        // Without it the .buttonStyle(.plain) label hit-tests as the UNION of its subview shapes, so the
+        // inter-child gap and rounded-corner regions are dead zones that fall through to the adjacent
+        // grid cell — the reported "tap a card in row 1, the row-2 item opens". Rectangle (not the
+        // poster's RoundedRectangle) so the title and gap are inside the target and corners aren't dead.
+        .frame(width: 120, alignment: .leading)
+        .contentShape(Rectangle())
     }
 }
 
