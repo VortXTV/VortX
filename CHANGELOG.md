@@ -4,20 +4,25 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.8 - Unreleased (pre-release in progress)
+## 0.3.8 - 2026-06-17 (pre-release)
 
-A point release in progress. The big additions, a free end-to-end-encrypted VortX account that syncs your profiles, settings, library, and history across devices, plus TMDB and MDBList support and an add-on manager, are landing alongside the items below. Confirmed so far:
+The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your profiles and settings follow you between devices, the server only ever holds ciphertext. Plus in-app add-on management, a catalog manager, optional TMDB-powered recommendations, and a handful of fixes. This is a pre-release for testing; QR sign-in on Apple TV and one-tap Stremio sign-in are coming in 0.3.9.
 
 ### Added
 
-- **More like this.** Detail pages now suggest related titles, blending shared genres with same-franchise matches. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#89)
-- **Recent searches on Apple TV.** Your last searches appear when you open Search, per profile. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#90)
-- **A max file-size limit**, in Settings under Streams, alongside the max-quality cap. Ask for "1080p but not a 20 GB file." Sources that do not advertise a size are kept, so nothing useful is hidden.
-- **Save magnets and pasted links for later**, per profile. A saved multi-file torrent reopens its file picker, so a playlist comes right back. (#81)
+- **VortX account (optional, end-to-end encrypted).** Create an account, sign in, or recover it from Settings; your password derives the encryption key on-device, so the server can never read your data. Your **profiles and settings sync** across devices on sign-in. Manage it (backup/restore, two-factor, change password, connect Stremio) at [vortx.tv/dashboard](https://vortx.tv/dashboard).
+- **Install add-ons in the app.** Paste an add-on's manifest URL in Add-ons to install it, no more leaving for the Stremio app.
+- **Catalog manager.** Show, hide, and reorder the catalog rows on Home, per profile (Add-ons, Customize catalogs).
+- **Smarter "More like this".** With your own TMDB key (Settings, Metadata), detail-page recommendations blend in TMDB's; without a key it uses the built-in genre and franchise matching. Builds on the new section contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#89)
+- **Save magnets and pasted links for later**, per profile. A saved multi-file torrent reopens its file picker. (#81)
+- **A max file-size limit** in Settings under Streams, alongside the max-quality cap. Ask for "1080p but not a 20 GB file."
+- **Recent searches on Apple TV.** Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#90)
 
 ### Fixed
 
+- **Playback no longer dies when you lock the screen or leave the app on iPhone/iPad.** Keeping it playing also keeps the streaming server alive, so a torrent survives. Toggle in Settings, Playback. (#74)
 - **The Apple TV top menu bar returns reliably** after you scroll a series and press Back. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#75, #91)
+- **A macOS crash during trickplay in the background is fixed.** Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#93)
 
 ## 0.3.7 - 2026-06-16
 
