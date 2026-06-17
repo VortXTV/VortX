@@ -228,6 +228,7 @@ struct iOSSettingsView: View {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
             NavigationLink("VortX account & sync") { SyncSettingsView() }
+            NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
         }
     }
 

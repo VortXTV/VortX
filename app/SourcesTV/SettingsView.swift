@@ -155,6 +155,10 @@ struct SettingsView: View {
                 Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
+            NavigationLink { MetadataKeysView() } label: {
+                Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
         }
     }
 
