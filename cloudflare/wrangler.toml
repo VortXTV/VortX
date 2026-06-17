@@ -1,0 +1,33 @@
+# VortX sync service. A blind relay: it stores only the end-to-end-encrypted backup blob keyed by
+# an opaque account id, plus short-lived pairing records that hand an account from one device to
+# another. It can never read user data (the AES key never leaves the user's devices).
+#
+# Deploy:
+#   1. npx wrangler d1 create vortx-sync           # then paste database_id below
+#   2. npx wrangler d1 execute vortx-sync --remote --file=./schema.sql
+#   3. npx wrangler deploy
+#   4. Map api.vortx.tv to this Worker (dashboard > Workers > Triggers > Custom Domains),
+#      then set VortXSyncClient.baseURL = https://api.vortx.tv in the app.
+
+name = "vortx-sync"
+main = "src/index.ts"
+compatibility_date = "2026-06-01"
+
+# api.vortx.tv (vortx.tv is on this same Cloudflare account, so wrangler provisions DNS + cert).
+routes = [{ pattern = "api.vortx.tv", custom_domain = true }]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vortx-sync"
+database_id = "120e186c-2b07-4bfd-9030-e4f17daa9252"
+
+[observability]
+enabled = true
+
+# Per-IP throttle on credential + account endpoints (brute-force / abuse control). Keyed by
+# "<path>:<ip>" in code, so each sensitive endpoint gets its own bucket. period must be 10 or 60.
+[[unsafe.bindings]]
+name = "RL"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 30, period = 60 }

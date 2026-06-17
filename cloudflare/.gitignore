@@ -1,0 +1,11 @@
+# Cloudflare Workers / wrangler
+.wrangler/
+node_modules/
+dist/
+# local secrets (real secrets are set with `wrangler secret put`, never committed)
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+# agent/editor config
+.claude/
