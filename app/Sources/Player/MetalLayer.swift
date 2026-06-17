@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import QuartzCore
 #if canImport(UIKit)
 import UIKit
@@ -8,25 +9,75 @@ import AppKit
 
 class MetalLayer: CAMetalLayer {
 
-    // Tracks the last fully-presented drawable so captureFrameJPEGData can read its texture.
-    // MPV calls nextDrawable() to acquire a new render target; at that moment the previous target
-    // has been presented and is the frame the user sees. Written on MPV's render thread, read on
-    // the capture queue — protected by drawableLock.
-    private let drawableLock = NSLock()
-    private var _pendingDrawable: (any CAMetalDrawable)?
-    private var _displayedDrawable: (any CAMetalDrawable)?
+    // Trickplay capture: when a capture is requested, the next nextDrawable() call blits the
+    // newly acquired drawable's texture into captureTexture before returning the drawable to mpv.
+    // The newly acquired drawable holds the frame from 2+ renders ago — valid and not in transition,
+    // unlike the previous drawable which MoltenVK may recycle inside super.nextDrawable().
+    // All fields protected by captureLock (VO thread vs main thread).
+    private let captureLock = NSLock()
+    private var captureCommandQueue: MTLCommandQueue?
+    private var captureTexture: MTLTexture?
+    // Handler receives the texture on success, or nil if the blit could not be submitted
+    // (pipeline not ready, size mismatch). Caller MUST handle nil to unblock its in-flight guard.
+    private var _captureHandler: ((MTLTexture?) -> Void)?
 
-    var captureDrawable: (any CAMetalDrawable)? {
-        drawableLock.lock(); defer { drawableLock.unlock() }
-        return _displayedDrawable
+    func setupCaptureQueue(_ queue: MTLCommandQueue) {
+        captureLock.lock()
+        captureCommandQueue = queue
+        captureLock.unlock()
+    }
+
+    func updateCaptureTexture(_ texture: MTLTexture?) {
+        captureLock.lock()
+        captureTexture = texture
+        captureLock.unlock()
+    }
+
+    /// Schedule a single frame capture. handler(texture) fires on a Metal completion thread when
+    /// the GPU blit finishes, or handler(nil) fires immediately if the blit cannot be submitted.
+    /// Replaces any pending unserviced handler (best-effort, no backlog).
+    func requestCapture(handler: @escaping (MTLTexture?) -> Void) {
+        captureLock.lock()
+        _captureHandler = handler
+        captureLock.unlock()
     }
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
         let d = super.nextDrawable()
-        drawableLock.lock()
-        _displayedDrawable = _pendingDrawable
-        _pendingDrawable = d
-        drawableLock.unlock()
+        guard let d else { return nil }
+
+        captureLock.lock()
+        let handler = _captureHandler
+        _captureHandler = nil
+        let queue = captureCommandQueue
+        let dst = captureTexture
+        captureLock.unlock()
+
+        if let handler {
+            var committed = false
+            if let queue, let dst,
+               let cmd = queue.makeCommandBuffer(),
+               let blit = cmd.makeBlitCommandEncoder() {
+                let src = d.texture
+                if src.width == dst.width, src.height == dst.height,
+                   src.pixelFormat == dst.pixelFormat {
+                    blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
+                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                              sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
+                              to: dst, destinationSlice: 0, destinationLevel: 0,
+                              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                    blit.endEncoding()
+                    cmd.addCompletedHandler { _ in handler(dst) }
+                    cmd.commit()
+                    committed = true
+                } else {
+                    blit.endEncoding()
+                }
+            }
+            // Always unblock the caller so its in-flight guard never gets stuck.
+            if !committed { handler(nil) }
+        }
+
         return d
     }
 
@@ -41,7 +92,7 @@ class MetalLayer: CAMetalLayer {
             }
         }
     }
-    
+
     // EDR layer control exists on iOS 16+/macOS only; CAMetalLayer has no
     // wantsExtendedDynamicRangeContent on tvOS at all. tvOS HDR is driven by
     // HDRDisplayMode (an AVDisplayManager HDMI display-mode switch) plus the
