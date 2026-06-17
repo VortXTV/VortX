@@ -1,14 +1,40 @@
 import SwiftUI
 
+private enum SearchHistoryStore {
+    private static let limit = 5
+
+    private static func key(_ profileID: UUID?) -> String {
+        "stremiox.searchHistory.\(profileID?.uuidString ?? "default")"
+    }
+
+    static func load(profileID: UUID?) -> [String] {
+        UserDefaults.standard.stringArray(forKey: key(profileID)) ?? []
+    }
+
+    static func add(_ query: String, profileID: UUID?) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var history = load(profileID: profileID).filter { $0.lowercased() != trimmed.lowercased() }
+        history.insert(trimmed, at: 0)
+        UserDefaults.standard.set(Array(history.prefix(limit)), forKey: key(profileID))
+    }
+
+    static func clear(profileID: UUID?) {
+        UserDefaults.standard.removeObject(forKey: key(profileID))
+    }
+}
+
 /// Search across every installed addon, on the engine (CatalogsWithExtra with a search extra).
 struct SearchView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var profiles: ProfileStore
     @State private var showOpenLink = false
     @State private var query = ""
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
+    @State private var history: [String] = []
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -21,11 +47,16 @@ struct SearchView: View {
     private var results: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                Button { showOpenLink = true } label: {
-                    Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
+                if !history.isEmpty && !isTyping {
+                    historySection
                 }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .sheet(isPresented: $showOpenLink) { OpenLinkView() }
+                if !isTyping {
+                    Button { showOpenLink = true } label: {
+                        Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .sheet(isPresented: $showOpenLink) { OpenLinkView() }
+                }
                 resultGrid
             }
             .padding(.horizontal, Theme.Space.screenEdge)
@@ -43,9 +74,43 @@ struct SearchView: View {
             core.suggestSearch(query)
             searchNow(query)
         }
-        .onAppear { core.loadSearchSuggestions() }
+        .onAppear {
+            core.loadSearchSuggestions()
+            history = SearchHistoryStore.load(profileID: profiles.activeID)
+        }
         .onChange(of: query) { _, value in scheduleSearch(value) }
+        .onChange(of: profiles.activeID) { _, id in
+            history = SearchHistoryStore.load(profileID: id)
+        }
         .onDisappear { searchTask?.cancel() }
+    }
+
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            Text("Recent Searches").sectionTitleStyle()
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.Space.sm) {
+                    ForEach(history, id: \.self) { term in
+                        Button {
+                            query = term
+                        } label: {
+                            Label(term, systemImage: "clock")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                    }
+                    Button {
+                        SearchHistoryStore.clear(profileID: profiles.activeID)
+                        history = []
+                    } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.sm)
+            }
+            .padding(.horizontal, -Theme.Space.screenEdge)
+        }
     }
 
     @ViewBuilder private var resultGrid: some View {
@@ -82,6 +147,7 @@ struct SearchView: View {
                     ForEach(items) { item in
                         PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
                                    menu: .catalog)
+                            .simultaneousGesture(TapGesture().onEnded { _ in saveToHistory(query) })
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -111,6 +177,10 @@ struct SearchView: View {
             : "No matches for \"\(query)\"."
     }
 
+    private var isTyping: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private var isWaitingForCurrentQuery: Bool {
         hasSearchQuery && (searchDebouncePending || core.searchIsLoading)
     }
@@ -135,5 +205,12 @@ struct SearchView: View {
 
     private func searchNow(_ value: String) {
         core.search(value)
+    }
+
+    private func saveToHistory(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        SearchHistoryStore.add(trimmed, profileID: profiles.activeID)
+        history = SearchHistoryStore.load(profileID: profiles.activeID)
     }
 }
