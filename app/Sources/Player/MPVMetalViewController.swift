@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import ImageIO
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -38,9 +39,13 @@ final class MPVMetalViewController: PlatformViewController {
     var playDelegate: MPVPlayerDelegate?
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
-    // Initialized on first capture using the same MTLDevice MPV renders into. Always accessed from
+    // Initialized on first capture using the same MTLDevice mpv renders into. Always accessed from
     // captureQueue (serial), so no lock is needed.
     private var ciContext: CIContext?
+    // Tracks the last drawable size and format for which captureTexture was created, so that
+    // updateCapturePipeline() is a no-op when called from captureFrameJPEGData every 10 s.
+    private var capturePipelineSize: CGSize = .zero
+    private var capturePipelineFormat: MTLPixelFormat = .invalid
     var playUrl: URL?
     var playHeaders: [String: String]?
     var playUrlLive = false
@@ -62,7 +67,7 @@ final class MPVMetalViewController: PlatformViewController {
         super.viewDidLoad()
         
         metalLayer.frame = view.bounds
-        metalLayer.framebufferOnly = false  // must be false for CIImage(mtlTexture:) readback in captureFrameJPEGData
+        metalLayer.framebufferOnly = false  // must be false for MoltenVK internal blits (e.g. format resolve)
         // Insurance against render-thread/main-thread deadlocks: the drawable present must never wait
         // on the main run loop's CATransaction commit (presentsWithTransaction = false, the default —
         // made explicit), and nextDrawable() must be able to time out instead of blocking the vo thread
@@ -613,11 +618,26 @@ final class MPVMetalViewController: PlatformViewController {
         getFlag(MPVProperty.pause) ? play() : pause()
     }
 
-    /// Match the output chain to the playing file's dynamic range: mpv encodes
-    /// PQ or HLG instead of tone-mapping to SDR, the Metal layer gets the matching
-    /// colorspace tag, and on tvOS the TV is asked to switch into HDR mode (which
-    /// is what lights the TV's HDR badge). Runs on the main thread from the
-    /// sig-peak observer, once per video reconfigure.
+    private func updateCapturePipeline() {
+        guard let device = metalLayer.device else { return }
+        let size = metalLayer.drawableSize
+        let fmt = metalLayer.pixelFormat
+        guard size.width > 1, size.height > 1 else { return }
+        guard size != capturePipelineSize || fmt != capturePipelineFormat else { return }
+
+        guard let queue = device.makeCommandQueue() else { return }
+        metalLayer.setupCaptureQueue(queue)
+
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: fmt, width: Int(size.width), height: Int(size.height), mipmapped: false)
+        desc.usage = .shaderRead
+        desc.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: desc) else { return }
+        metalLayer.updateCaptureTexture(tex)
+        capturePipelineSize = size
+        capturePipelineFormat = fmt
+    }
+
     /// Re-derive the dynamic range from the CURRENTLY decoded video params and apply it. Used by the
     /// gamma observer and MPV_EVENT_VIDEO_RECONFIG, neither of which carries a sig-peak value, so it
     /// reads sig-peak fresh. Unlike the sig-peak property-change observer this does NOT depend on a value
@@ -960,33 +980,37 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func captureFrameJPEGData(completion: @escaping (Data?) -> Void) {
-        guard let drawable = metalLayer.captureDrawable else { completion(nil); return }
-        captureQueue.async { [self] in
-            let texture = drawable.texture
-            guard texture.width > 0, texture.height > 0 else { completion(nil); return }
-            // CIImage(mtlTexture:) handles any MTLPixelFormat natively; framebufferOnly=false
-            // (set in viewDidLoad) is required for the texture to be readable here.
-            guard let raw = CIImage(mtlTexture: texture,
-                                    options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]) else {
-                NSLog("[trickplay] capture failed: CIImage(mtlTexture:) rejected fmt=%d", texture.pixelFormat.rawValue)
-                completion(nil)
-                return
+        guard mpv != nil else { completion(nil); return }
+        // Build or rebuild the pipeline lazily — at VIDEO_RECONFIG time the device/drawableSize may
+        // not be set yet (especially on tvOS); calling here retries until everything is ready.
+        // updateCapturePipeline is a no-op once the pipeline matches the current resolution/format.
+        updateCapturePipeline()
+        // requestCapture schedules a blit for the next nextDrawable() call on mpv's VO thread.
+        // handler(nil) is called immediately by MetalLayer if the blit cannot be submitted, so
+        // the caller's in-flight guard is always released even when the pipeline isn't ready yet.
+        metalLayer.requestCapture { [weak self] texture in
+            guard let self, let texture else { completion(nil); return }
+            self.captureQueue.async {
+                // CIImage(mtlTexture:) wraps the texture lazily. Metal textures have (0,0) at
+                // top-left; CIImage has (0,0) at bottom-left — flip y while scaling to 480px wide.
+                guard let raw = CIImage(mtlTexture: texture,
+                                        options: [.colorSpace: CGColorSpaceCreateDeviceRGB()]) else {
+                    completion(nil); return
+                }
+                let tw = CGFloat(texture.width), th = CGFloat(texture.height)
+                let s = 480.0 / tw
+                let image = raw.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s))
+                if self.ciContext == nil { self.ciContext = CIContext(mtlDevice: texture.device) }
+                guard let ctx = self.ciContext,
+                      let sRGB = CGColorSpace(name: CGColorSpace.sRGB),
+                      let jpeg = ctx.jpegRepresentation(
+                          of: image, colorSpace: sRGB,
+                          options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7]
+                      ) else {
+                    completion(nil); return
+                }
+                completion(jpeg)
             }
-            // Metal (0,0) = top-left; CIImage (0,0) = bottom-left — combined flip+downscale
-            // transform: (x,y) → (x·s, (h−y)·s) where s = 480/textureWidth.
-            let s = 480 / CGFloat(texture.width)
-            let h = raw.extent.height
-            let image = raw.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: h * s))
-            // CIContext holds GPU resources — create once, reuse across captures.
-            if ciContext == nil { ciContext = CIContext(mtlDevice: texture.device) }
-            guard let ctx = ciContext, let sRGB = CGColorSpace(name: CGColorSpace.sRGB),
-                  let jpeg = ctx.jpegRepresentation(of: image, colorSpace: sRGB,
-                                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.7]) else {
-                NSLog("[trickplay] capture failed: JPEG encoding error")
-                completion(nil)
-                return
-            }
-            completion(jpeg)
         }
     }
 
@@ -1099,6 +1123,7 @@ final class MPVMetalViewController: PlatformViewController {
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.mpv != nil else { return }
                         self.reapplyDynamicRange()
+                        self.updateCapturePipeline()
                     }
                 case MPV_EVENT_END_FILE:
                     // A file finished, if it ENDED IN ERROR (couldn't open: dead/uncached link,
