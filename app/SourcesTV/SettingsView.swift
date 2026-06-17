@@ -151,6 +151,10 @@ struct SettingsView: View {
                 }
                 .buttonStyle(PrimaryActionStyle())
             }
+            NavigationLink { SyncSettingsView() } label: {
+                Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
         }
     }
 

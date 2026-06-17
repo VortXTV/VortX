@@ -40,6 +40,7 @@ struct StremioTVApp: App {
             .environmentObject(presenter)
             .environmentObject(ThemeManager.shared)
             .environmentObject(ProfileStore.shared)
+            .environmentObject(VortXSyncManager.shared)
             .preferredColorScheme(.dark)
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)

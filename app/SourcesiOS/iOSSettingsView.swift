@@ -227,6 +227,7 @@ struct iOSSettingsView: View {
             } else {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
+            NavigationLink("VortX account & sync") { SyncSettingsView() }
         }
     }
 

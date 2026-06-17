@@ -95,6 +95,7 @@ struct StremioXiOSApp: App {
                 .environmentObject(core)
                 .environmentObject(ThemeManager.shared)
                 .environmentObject(ProfileStore.shared)
+                .environmentObject(VortXSyncManager.shared)
                 .preferredColorScheme(.dark)
                 // Tint the whole scene so system chrome inside separately-presented sheets (SignIn /
                 // OpenLink) and the ProfileEditor cover renders the app accent, not system blue.
