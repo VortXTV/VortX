@@ -12,6 +12,8 @@ struct DetailView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
 
+    @State private var similarItems: [MetaPreview] = []
+
     var body: some View {
         Group {
             if let meta = core.metaDetails?.meta {
@@ -54,6 +56,7 @@ struct DetailView: View {
                 core.loadMeta(type: type, id: id)
             }
             captureHero()
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
         }
         .onDisappear {
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
@@ -64,6 +67,7 @@ struct DetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
         }
     }
 
@@ -85,6 +89,32 @@ struct DetailView: View {
         let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
         core.loadMeta(type: type, id: id, streamType: type, streamId: streamId)
+    }
+
+    @ViewBuilder private var moreLikeThisSection: some View {
+        if !similarItems.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                RailHeader(title: "More Like This")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                        ForEach(similarItems.prefix(20)) { item in
+                            PosterCard(title: item.name, poster: item.poster,
+                                       type: item.type, id: item.id)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.lg)
+                }
+            }
+        }
+    }
+
+    private func loadSimilar(_ meta: CoreMetaItem) {
+        guard !LiveTypes.contains(type), !meta.genres.isEmpty else { return }
+        Task {
+            let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
+            await MainActor.run { similarItems = items }
+        }
     }
 
     /// Feed the browse pages' hero cache with what this page knows. The engine resolved this meta
@@ -114,6 +144,7 @@ struct DetailView: View {
                                          watched: watched,
                                          initialSeason: primary?.video.season)
                         .id("detailContent")
+                    moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)
             }
@@ -128,30 +159,33 @@ struct DetailView: View {
             FullBleedBackdrop(url: m.background ?? m.poster)
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Spacer().frame(height: 380)
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text(m.name)
-                            .font(Theme.Typography.hero).tracking(-1.5)
-                            .foregroundStyle(Theme.Palette.textPrimary)
-                            .lineLimit(2).minimumScaleFactor(0.6)
-                            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
-                        metaRow(m)
-                        if let d = m.description, !d.isEmpty {
-                            Text(d)
-                                .font(Theme.Typography.body)
-                                .foregroundStyle(Theme.Palette.textSecondary)
-                                .lineLimit(4).lineSpacing(2)
-                                .frame(maxWidth: 1000, alignment: .leading)
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Spacer().frame(height: 380)
+                        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                            Text(m.name)
+                                .font(Theme.Typography.hero).tracking(-1.5)
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                                .lineLimit(2).minimumScaleFactor(0.6)
+                                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                            metaRow(m)
+                            if let d = m.description, !d.isEmpty {
+                                Text(d)
+                                    .font(Theme.Typography.body)
+                                    .foregroundStyle(Theme.Palette.textSecondary)
+                                    .lineLimit(4).lineSpacing(2)
+                                    .frame(maxWidth: 1000, alignment: .leading)
+                            }
+                            HStack(spacing: Theme.Space.sm) { trailerChip(m) }
+                                .padding(.top, Theme.Space.xs)
                         }
-                        HStack(spacing: Theme.Space.sm) { trailerChip(m) }
-                            .padding(.top, Theme.Space.xs)
+                        CoreStreamList(title: m.name,
+                                       meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
+                                                          name: m.name, poster: m.poster,
+                                                          season: nil, episode: nil))
                     }
-                    CoreStreamList(title: m.name,
-                                   meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
-                                                      name: m.name, poster: m.poster,
-                                                      season: nil, episode: nil))
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    moreLikeThisSection
                 }
-                .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
             }
         }

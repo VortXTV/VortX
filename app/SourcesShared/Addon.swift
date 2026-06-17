@@ -9,6 +9,7 @@ struct MetaPreview: Identifiable, Decodable, Hashable {
     let name: String
     let poster: String?
     let posterShape: String?
+    let popularity: Double?
 }
 
 /// Full meta (detail page). `videos` is present for series (episodes).
@@ -119,6 +120,68 @@ struct AddonClient {
     func catalog(base: String, type: String, id: String, genre: String) async throws -> [MetaPreview] {
         let g = genre.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? genre
         return try await Self.get("\(base)/catalog/\(type)/\(id)/genre=\(g).json", as: MetasResponse.self).metas
+    }
+
+    /// Fetches items similar to a given title. Runs genre-filtered top catalogs (up to 3 genres)
+    /// and, when the title looks like a series member (subtitle after a colon, or trailing number),
+    /// a keyword search for the series name — all in parallel. Results are merged, deduplicated,
+    /// and sorted by an effective popularity that gives franchise keyword matches a 3× boost so
+    /// related entries in the same series surface above equally-popular genre-only results.
+    /// In the future, if we add a TMDB API key or similar, we could use the Recommendations API.
+    static func similar(type: String, excludingId: String, genres: [String], title: String) async -> [MetaPreview] {
+        let genresToQuery = Array(genres.prefix(3))
+        guard !genresToQuery.isEmpty else { return [] }
+        let keyword = franchiseKeyword(from: title)
+        return await withTaskGroup(of: (isKeyword: Bool, items: [MetaPreview]).self) { group in
+            for genre in genresToQuery {
+                group.addTask {
+                    let g = genre.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? genre
+                    let items = (try? await get("\(cinemeta)/catalog/\(type)/top/genre=\(g).json",
+                                               as: MetasResponse.self))?.metas ?? []
+                    return (false, items)
+                }
+            }
+            if let kw = keyword {
+                group.addTask {
+                    let q = kw.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? kw
+                    let items = (try? await get("\(cinemeta)/catalog/\(type)/top/search=\(q).json",
+                                               as: MetasResponse.self))?.metas ?? []
+                    return (true, items)
+                }
+            }
+            var byId: [String: MetaPreview] = [:]
+            var keywordIds = Set<String>()
+            for await (isKeyword, items) in group {
+                for item in items where item.id != excludingId {
+                    byId[item.id] = item
+                    if isKeyword { keywordIds.insert(item.id) }
+                }
+            }
+            // Keyword (series) matches get a 3× popularity boost so they rank above genre-only
+            // results of similar raw popularity. Items with no popularity fall back to 0.
+            let results = byId.values.sorted {
+                let aScore = ($0.popularity ?? 0) * (keywordIds.contains($0.id) ? 3 : 1)
+                let bScore = ($1.popularity ?? 0) * (keywordIds.contains($1.id) ? 3 : 1)
+                return aScore > bScore
+            }
+            return results
+        }
+    }
+
+    /// Extracts a series keyword from a title when the title signals it belongs to a series:
+    /// anything before a colon (e.g. "Title: Subtitle" → "Title"), or the base name with a
+    /// trailing Arabic number stripped (e.g. "Title 3" → "Title"). Returns nil for standalone
+    /// titles where a keyword search would just return the same item.
+    private static func franchiseKeyword(from title: String) -> String? {
+        if let colonRange = title.range(of: ":") {
+            let before = title[..<colonRange.lowerBound].trimmingCharacters(in: .whitespaces)
+            if !before.isEmpty { return before }
+        }
+        let words = title.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        if let last = words.last, Int(last) != nil, words.count > 1 {
+            return words.dropLast().joined(separator: " ")
+        }
+        return nil
     }
 
     func search(type: String, query: String) async throws -> [MetaPreview] {

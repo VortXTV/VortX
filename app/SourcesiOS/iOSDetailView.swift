@@ -164,6 +164,7 @@ struct iOSDetailView: View {
     @State private var season = 1
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
+    @State private var similarItems: [MetaPreview] = []
 
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
@@ -244,6 +245,7 @@ struct iOSDetailView: View {
                             }
                             .frame(maxWidth: geo.size.width > 700 ? 900 : .infinity)
                             .frame(maxWidth: .infinity)
+                            moreLikeThisSection
                         }
                     }
                     .padding(.bottom, Theme.Space.xl)
@@ -265,6 +267,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -278,6 +281,7 @@ struct iOSDetailView: View {
                 // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
+            if let m = meta { loadSimilar(m) }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -1089,6 +1093,53 @@ struct iOSDetailView: View {
     }
 
     private func seasonLabel(_ s: Int) -> String { s == 0 ? "Specials" : "Season \(s)" }
+
+    // MARK: More Like This
+
+    @ViewBuilder private var moreLikeThisSection: some View {
+        if !similarItems.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                iOSRailHeader(eyebrow: type == "series" ? "Similar Series" : "Similar Movies",
+                              title: "More Like This")
+                    .padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.sm) {
+                        ForEach(similarItems.prefix(20)) { item in
+                            NavigationLink {
+                                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                            } label: {
+                                moreLikeThisCard(item)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                }
+            }
+        }
+    }
+
+    private func moreLikeThisCard(_ item: MetaPreview) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            CachedPosterImage(url: item.poster)
+                .frame(width: 100, height: 150)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            Text(item.name)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .frame(width: 100, alignment: .leading)
+        }
+    }
+
+    private func loadSimilar(_ meta: CoreMetaItem) {
+        guard !LiveTypes.contains(type), !meta.genres.isEmpty else { return }
+        Task {
+            let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
+            await MainActor.run { similarItems = items }
+        }
+    }
 
     // MARK: Shared
 
