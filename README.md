@@ -13,6 +13,9 @@
   <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/vortxtv/VortX?color=4c8dff" alt="License"></a>
   <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS-4c8dff" alt="Platforms">
 </p>
+<p align="center">
+  <a href="https://www.reddit.com/r/Vortx"><img src="https://github.com/user-attachments/assets/05eced3b-efeb-4238-83af-d3a105d3a8f1" width="26" height="26" alt="reddit"></a>
+
 
 # VortX
 
