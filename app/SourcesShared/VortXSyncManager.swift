@@ -187,18 +187,35 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - Profiles + settings sync (reuses the SettingsBackup serialization as the doc payload)
 
-    /// Push this device's profiles + settings to the account.
+    /// Push this device's profiles + settings to the account. MERGES into the existing doc (preserving
+    /// keys other surfaces wrote, e.g. the website's Stremio import) instead of replacing it, and carries
+    /// the metadata keys explicitly because they live in the Keychain (SettingsBackup excludes them).
     @discardableResult
     func syncUp() async -> Bool {
         guard isSignedIn, let data = try? SettingsBackup.makeBackup() else { return false }
-        return await pushSyncDoc(["settings": data.base64EncodedString(), "format": 1])
+        var doc = await pullSyncDoc() ?? [:]
+        doc["settings"] = data.base64EncodedString()
+        doc["format"] = 1
+        var keys: [String: String] = [:]
+        if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
+        if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
+        if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
+        return await pushSyncDoc(doc)
     }
 
-    /// Pull the account's profiles + settings and apply them locally. True if something was restored.
+    /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
+    /// was restored.
     @discardableResult
     func syncDown() async -> Bool {
-        guard isSignedIn, let doc = await pullSyncDoc(),
-              let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) else { return false }
-        return ((try? SettingsBackup.restore(from: data)) ?? 0) > 0
+        guard isSignedIn, let doc = await pullSyncDoc() else { return false }
+        var restored = false
+        if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64),
+           ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 { restored = true }
+        if let keys = doc["apiKeys"] as? [String: String] {
+            if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
+            if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
+            restored = true
+        }
+        return restored
     }
 }
