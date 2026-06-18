@@ -31,3 +31,8 @@ name = "RL"
 type = "ratelimit"
 namespace_id = "1001"
 simple = { limit = 30, period = 60 }
+
+# Transactional email (Cloudflare Email Sending). vortx.tv is onboarded as a sending domain, so the
+# Worker can send from welcome@vortx.tv. Used for welcome + security-notice emails on account events.
+[[send_email]]
+name = "EMAIL"

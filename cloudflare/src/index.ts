@@ -20,10 +20,18 @@
  * not reveal even the verifiers.
  */
 
+interface EmailMessage {
+  to: string;
+  from: { email: string; name?: string };
+  subject: string;
+  html: string;
+  text: string;
+}
 export interface Env {
   DB: D1Database;
   SESSION_SECRET: string;
   RL: { limit(opts: { key: string }): Promise<{ success: boolean }> };
+  EMAIL?: { send(msg: EmailMessage): Promise<unknown> }; // Cloudflare Email Sending binding (optional so dry-runs/tests work)
 }
 
 const PAIR_TTL_MS = 10 * 60 * 1000;
@@ -144,6 +152,34 @@ function pub(row: { id: string; email: string; username_display: string; usernam
   return { id: row.id, email: row.email, username: row.username_display, usernameChangedAt: row.username_changed_at ?? 0 };
 }
 
+// --- Transactional email (Cloudflare Email Sending). Best-effort: a send failure is logged and
+// swallowed so it can never break an auth flow. All interpolated values are server-controlled or
+// validated (usernames are [a-zA-Z0-9_]), so the templates are safe. ---
+const MAIL_FROM = { email: "welcome@vortx.tv", name: "VortX" };
+function emailHtml(heading: string, lines: string[], note?: string): string {
+  const body = lines.map((l) => `<p style="margin:0 0 14px;color:#cbb38c;font-size:15px;line-height:1.6">${l}</p>`).join("");
+  const noteHtml = note
+    ? `<p style="margin:20px 0 0;padding:12px 14px;background:#0f0d0a;border:1px solid rgba(253,246,227,.1);border-radius:10px;color:#998163;font-size:13px;line-height:1.55">${note}</p>`
+    : "";
+  return `<!doctype html><html><body style="margin:0;background:#0b0907;padding:30px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">`
+    + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">`
+    + `<table role="presentation" width="100%" style="max-width:480px" cellpadding="0" cellspacing="0">`
+    + `<tr><td style="padding:0 4px 20px"><span style="font-weight:800;font-size:22px;letter-spacing:-.5px;color:#f59e0b">VortX</span></td></tr>`
+    + `<tr><td style="background:linear-gradient(180deg,#18140d,#13100a);border:1px solid rgba(253,246,227,.08);border-radius:18px;padding:30px 28px">`
+    + `<h1 style="margin:0 0 16px;font-weight:800;font-size:21px;letter-spacing:-.4px;color:#fdf6e3">${heading}</h1>${body}${noteHtml}</td></tr>`
+    + `<tr><td style="padding:18px 4px 0;color:#6b5d47;font-size:12px;line-height:1.5">VortX is end to end encrypted, so we can never read your data. You received this because of activity on your VortX account.</td></tr>`
+    + `</table></td></tr></table></body></html>`;
+}
+function emailText(heading: string, lines: string[], note?: string): string {
+  return `VortX\n\n${heading}\n\n${lines.join("\n\n")}${note ? "\n\n" + note : ""}\n\nVortX is end to end encrypted, so we can never read your data.`;
+}
+async function sendMail(env: Env, to: string, subject: string, heading: string, lines: string[], note?: string): Promise<void> {
+  if (!env.EMAIL) return;
+  try {
+    await env.EMAIL.send({ to, from: MAIL_FROM, subject, html: emailHtml(heading, lines, note), text: emailText(heading, lines, note) });
+  } catch (e) { console.error("email send failed:", e); }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const res = await route(request, env);
@@ -240,6 +276,11 @@ async function register(req: Request, env: Env): Promise<Response> {
     recVerifier ? await pbkdf2(recVerifier, recSalt, SERVER_ITERS) : null, recVerifier ? b64(recSalt) : null,
     wrappedKeyPw, wrappedKeyRec || null, Date.now(),
   ).run();
+
+  await sendMail(env, email, "Welcome to VortX", `Welcome, @${username}.`, [
+    "Your VortX account is ready. Your profiles, library, add-ons, and settings can now sync across every device, end to end encrypted.",
+    "Your password is the key that unlocks your data on each device, so keep it somewhere safe.",
+  ], "Save your recovery code somewhere safe and offline. If you forget your password and have no device signed in, it is the only way back, and we cannot reset it for you.");
 
   return json({ token: await makeSession(id, env), account: { id, email, username } });
 }
@@ -341,6 +382,11 @@ async function recoverComplete(req: Request, env: Env): Promise<Response> {
   // and bumps session_version, invalidating any token an attacker may hold (H-1).
   await env.DB.prepare("UPDATE accounts SET auth_salt = ?, auth_hash = ?, wrapped_key_pw = ?, totp_secret = NULL, totp_pending = NULL, session_version = session_version + 1 WHERE id = ?")
     .bind(b64(authSalt), await pbkdf2(newAuthVerifier, authSalt, SERVER_ITERS), newWrappedKeyPw, row.id).run();
+  await sendMail(env, row.email, "Your VortX password was reset", "Your password was reset with your recovery code", [
+    "Your VortX password was just reset using your recovery code, and you were signed out everywhere else.",
+    "Two-factor authentication was turned off as part of recovery. If you use it, re-enable it from your dashboard.",
+    "If this was not you, reset your password again immediately.",
+  ]);
   return json({ token: await makeSession(row.id, env, await accountSessionVersion(row.id, env)), account: pub(row) });
 }
 
@@ -354,13 +400,17 @@ async function changePassword(req: Request, env: Env): Promise<Response> {
   const newWrappedKeyPw = isStr(b?.newWrappedKeyPassword) ? (b!.newWrappedKeyPassword as string) : "";
   // kdf_salt is kept (it also derives the recovery key); the new master key is derived from the SAME salt (M-4).
   if (!oldAuthVerifier || b64Len(newAuthVerifier) !== 32 || !newWrappedKeyPw) return json({ error: "bad_request" }, 400);
-  const row = await env.DB.prepare("SELECT auth_salt, auth_hash FROM accounts WHERE id = ?").bind(id).first<any>();
+  const row = await env.DB.prepare("SELECT email, auth_salt, auth_hash FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row) return json({ error: "unauthorized" }, 401);
   if (!ctEqual(await pbkdf2(oldAuthVerifier, unb64(row.auth_salt), SERVER_ITERS), row.auth_hash)) return json({ error: "invalid_credentials" }, 401);
   const authSalt = crypto.getRandomValues(new Uint8Array(16));
   // Bump session_version to revoke other sessions (H-1), then hand back a fresh token for THIS device.
   await env.DB.prepare("UPDATE accounts SET auth_salt = ?, auth_hash = ?, wrapped_key_pw = ?, session_version = session_version + 1 WHERE id = ?")
     .bind(b64(authSalt), await pbkdf2(newAuthVerifier, authSalt, SERVER_ITERS), newWrappedKeyPw, id).run();
+  await sendMail(env, row.email, "Your VortX password was changed", "Your password was changed", [
+    "The password on your VortX account was just changed, and other signed-in sessions were signed out.",
+    "If this was you, no action is needed. If it was not you, recover your account now with your recovery code and set a new password.",
+  ]);
   return json({ token: await makeSession(id, env, await accountSessionVersion(id, env)) });
 }
 
@@ -413,10 +463,14 @@ async function twofaActivate(req: Request, env: Env): Promise<Response> {
   if (!id) return json({ error: "unauthorized" }, 401);
   const b = await readJSON(req);
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
-  const row = await env.DB.prepare("SELECT totp_pending FROM accounts WHERE id = ?").bind(id).first<any>();
+  const row = await env.DB.prepare("SELECT email, totp_pending FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_pending) return json({ error: "no_pending" }, 400);
   if (!(await verifyTotp(row.totp_pending, code))) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = totp_pending, totp_pending = NULL WHERE id = ?").bind(id).run();
+  await sendMail(env, row.email, "Two-factor is on for your VortX account", "Two-factor authentication enabled", [
+    "An authenticator app was just added to your VortX account. You will need a code from it the next time you sign in.",
+    "If this was not you, disable it and change your password right away.",
+  ]);
   return json({ ok: true });
 }
 async function twofaDisable(req: Request, env: Env): Promise<Response> {
@@ -424,10 +478,14 @@ async function twofaDisable(req: Request, env: Env): Promise<Response> {
   if (!id) return json({ error: "unauthorized" }, 401);
   const b = await readJSON(req);
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
-  const row = await env.DB.prepare("SELECT totp_secret FROM accounts WHERE id = ?").bind(id).first<any>();
+  const row = await env.DB.prepare("SELECT email, totp_secret FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_secret) return json({ error: "not_enabled" }, 400);
   if (!(await verifyTotp(row.totp_secret, code))) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = NULL, totp_pending = NULL WHERE id = ?").bind(id).run();
+  await sendMail(env, row.email, "Two-factor is off for your VortX account", "Two-factor authentication disabled", [
+    "Two-factor authentication was just turned off for your VortX account.",
+    "If this was not you, turn it back on and change your password right away.",
+  ]);
   return json({ ok: true });
 }
 
