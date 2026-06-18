@@ -32,6 +32,7 @@ export interface Env {
   SESSION_SECRET: string;
   RL: { limit(opts: { key: string }): Promise<{ success: boolean }> };
   EMAIL?: { send(msg: EmailMessage): Promise<unknown> }; // Cloudflare Email Sending binding (optional so dry-runs/tests work)
+  ADMIN_TOKEN?: string; // gates /v1/admin/stats (set via `wrangler secret put ADMIN_TOKEN`)
 }
 
 const PAIR_TTL_MS = 10 * 60 * 1000;
@@ -193,9 +194,12 @@ function emailText(heading: string, lines: string[], opts: MailOpts = {}): strin
 }
 async function sendMail(env: Env, to: string, subject: string, heading: string, lines: string[], opts: MailOpts = {}): Promise<void> {
   if (!env.EMAIL) return;
+  let ok = 1;
   try {
     await env.EMAIL.send({ to, from: MAIL_FROM, subject, html: emailHtml(heading, lines, opts), text: emailText(heading, lines, opts) });
-  } catch (e) { console.error("email send failed:", e); }
+  } catch (e) { ok = 0; console.error("email send failed:", e); }
+  // Log the attempt for the admin dashboard (no recipient/body stored). Best-effort.
+  try { await env.DB.prepare("INSERT INTO email_sends (ts, kind, ok) VALUES (?,?,?)").bind(Date.now(), subject.slice(0, 40), ok).run(); } catch {}
 }
 
 export default {
@@ -238,6 +242,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/qr/status" && m === "GET") return qrStatus(url, env);
       if (p === "/v1/backup" && m === "PUT") return backupPut(request, env);
       if (p === "/v1/backup" && m === "GET") return backupGet(request, env);
+      if (p === "/v1/admin/stats" && m === "GET") return adminStats(request, env);
       return noContent(404);
     } catch (err) {
       console.error("unhandled", err);
@@ -669,4 +674,36 @@ async function backupGet(req: Request, env: Env): Promise<Response> {
     .bind(id).first<{ document: string; version: number }>();
   if (!row) return noContent(404);
   return json({ document: row.document, version: row.version });
+}
+
+// --- Admin stats (gated by ADMIN_TOKEN). Aggregate counts only; no user content is readable
+// anyway (E2E), and we never return emails or ciphertext. ---
+async function adminStats(req: Request, env: Env): Promise<Response> {
+  const tok = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!env.ADMIN_TOKEN || tok.length !== env.ADMIN_TOKEN.length || !ctEqual(tok, env.ADMIN_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const now = Date.now(), DAY = 86_400_000;
+  const a = await env.DB.prepare(
+    `SELECT COUNT(*) AS total, SUM(totp_secret IS NOT NULL) AS twofa, SUM(wrapped_key_rec IS NOT NULL) AS recovery,
+       SUM(created_at >= ?1) AS d1, SUM(created_at >= ?2) AS d7, SUM(created_at >= ?3) AS d30,
+       MIN(created_at) AS firstAt, MAX(created_at) AS lastAt FROM accounts`,
+  ).bind(now - DAY, now - 7 * DAY, now - 30 * DAY).first<any>();
+  const b = await env.DB.prepare("SELECT COUNT(*) AS docs, COALESCE(SUM(LENGTH(document)),0) AS bytes, MAX(updated_at) AS lastAt FROM backups").first<any>();
+  const pr = await env.DB.prepare("SELECT COUNT(*) AS total, SUM(expires_at > ?1) AS active FROM pairings").bind(now).first<any>();
+  const em = await env.DB.prepare("SELECT COUNT(*) AS total, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0) AS failed, SUM(ts >= ?1) AS d7 FROM email_sends").bind(now - 7 * DAY).first<any>();
+  const daily = await env.DB.prepare("SELECT strftime('%Y-%m-%d', created_at/1000, 'unixepoch') AS day, COUNT(*) AS n FROM accounts WHERE created_at >= ?1 GROUP BY day ORDER BY day").bind(now - 14 * DAY).all<any>();
+  const kinds = await env.DB.prepare("SELECT kind, COUNT(*) AS n, COALESCE(SUM(ok),0) AS ok FROM email_sends GROUP BY kind ORDER BY n DESC LIMIT 12").all<any>();
+  return json({
+    generatedAt: now,
+    accounts: {
+      total: a?.total ?? 0,
+      signups: { day: a?.d1 ?? 0, week: a?.d7 ?? 0, month: a?.d30 ?? 0 },
+      twoFactor: a?.twofa ?? 0, withRecovery: a?.recovery ?? 0,
+      firstAt: a?.firstAt ?? null, lastAt: a?.lastAt ?? null,
+    },
+    sync: { documents: b?.docs ?? 0, bytes: b?.bytes ?? 0, lastUpdatedAt: b?.lastAt ?? null },
+    pairings: { total: pr?.total ?? 0, active: pr?.active ?? 0 },
+    emails: { total: em?.total ?? 0, ok: em?.ok ?? 0, failed: em?.failed ?? 0, week: em?.d7 ?? 0, byKind: kinds.results ?? [] },
+    dailySignups: daily.results ?? [],
+    nodes: { total: 0, note: "Federation nodes will appear here when self-hosting ships." },
+  });
 }

@@ -53,3 +53,13 @@ CREATE TABLE IF NOT EXISTS pairings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pairings_code ON pairings (code);
+
+-- Email send log (for the admin dashboard): one row per transactional send attempt. No PII beyond
+-- the kind; never logs the recipient address or body.
+CREATE TABLE IF NOT EXISTS email_sends (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts   INTEGER NOT NULL,   -- epoch ms
+  kind TEXT    NOT NULL,   -- short label (the email subject)
+  ok   INTEGER NOT NULL    -- 1 = accepted by Cloudflare, 0 = send threw
+);
+CREATE INDEX IF NOT EXISTS idx_email_sends_ts ON email_sends (ts);
