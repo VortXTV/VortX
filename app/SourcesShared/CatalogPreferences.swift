@@ -52,9 +52,16 @@ struct CatalogManagerView: View {
     @ObservedObject private var prefs = CatalogPreferences.shared
 
     private var ordered: [CoreBridge.CatalogInfo] {
-        core.allCatalogs.sorted { a, b in
+        // Fall back to the LIVE Home order (boardRows) when the user hasn't set an explicit order, so the
+        // editor reflects how catalogs currently appear instead of an arbitrary alphabetical list (Bug 10).
+        var boardIndex: [String: Int] = [:]
+        for (i, row) in core.boardRows.enumerated() where boardIndex[row.id] == nil { boardIndex[row.id] = i }
+        return core.allCatalogs.sorted { a, b in
             let ra = CatalogPrefsStore.rank(a.key), rb = CatalogPrefsStore.rank(b.key)
-            return ra != rb ? ra < rb : a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+            if ra != rb { return ra < rb }
+            let ba = boardIndex[a.key] ?? Int.max, bb = boardIndex[b.key] ?? Int.max
+            if ba != bb { return ba < bb }
+            return a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
         }
     }
 

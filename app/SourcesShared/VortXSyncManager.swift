@@ -244,6 +244,18 @@ final class VortXSyncManager: ObservableObject {
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
 
+    /// Refresh account fields from /me (e.g. two-factor was toggled on the website), so the app's view
+    /// of the account is not stuck at whatever sign-in returned (Bug 1).
+    func refreshAccount() async {
+        guard isSignedIn, var a = account else { return }
+        let (code, json) = await request("GET", "/v1/auth/me", auth: true)
+        guard code == 200, let acct = json?["account"] as? [String: Any] else { return }
+        a.username = acct["username"] as? String ?? a.username
+        a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
+        account = a
+        persist()
+    }
+
     /// Auto-sync: a debounced push, called whenever a setting / profile / key changes. Coalesces a burst
     /// of edits into one push a couple of seconds later, so every change propagates without spamming.
     private var pendingSync: Task<Void, Never>?
