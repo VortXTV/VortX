@@ -38,9 +38,20 @@ const te = new TextEncoder();
 const td = new TextDecoder();
 const enc = (s: string) => te.encode(s);
 
+// CORS is locked to the production site plus this project's own preview/dev origins. The API is
+// Bearer-authenticated and a foreign origin starts with no token, so reflecting an allowed origin
+// here cannot leak data; it just lets preview deploys and local dev be tested. Anything else gets
+// the production origin back, which the browser rejects for a mismatched caller.
+function allowedOrigin(origin: string | null): string {
+  if (!origin) return "https://vortx.tv";
+  if (origin === "https://vortx.tv") return origin;
+  if (/^https:\/\/[a-z0-9-]+\.(vortx-site|vortx)\.pages\.dev$/.test(origin)) return origin;
+  if (/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) return origin;
+  return "https://vortx.tv";
+}
 function cors(): Record<string, string> {
   return {
-    "access-control-allow-origin": "https://vortx.tv",
+    "access-control-allow-origin": "https://vortx.tv", // overridden per-request in fetch() via allowedOrigin
     "access-control-allow-methods": "GET,PUT,POST,OPTIONS",
     "access-control-allow-headers": "content-type,authorization",
     "access-control-max-age": "86400",
@@ -124,7 +135,7 @@ const RL_PATHS = new Set([
   "/v1/auth/login", "/v1/auth/register", "/v1/auth/prelogin",
   "/v1/auth/recover-start", "/v1/auth/recover-complete", "/v1/auth/change-password",
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
-  "/v1/qr/authorize", "/v1/connect/stremio",
+  "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
 ]);
 async function readJSON(req: Request): Promise<Record<string, unknown> | null> {
   try { const b = await req.json(); return b && typeof b === "object" ? (b as Record<string, unknown>) : null; } catch { return null; }
@@ -135,6 +146,15 @@ function pub(row: { id: string; email: string; username_display: string; usernam
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const res = await route(request, env);
+    const out = new Response(res.body, res);
+    out.headers.set("access-control-allow-origin", allowedOrigin(request.headers.get("Origin")));
+    out.headers.append("vary", "Origin");
+    return out;
+  },
+};
+
+async function route(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") return noContent(204);
     const url = new URL(request.url);
     const p = url.pathname, m = request.method;
@@ -158,6 +178,7 @@ export default {
       if (p === "/v1/auth/2fa/activate" && m === "POST") return twofaActivate(request, env);
       if (p === "/v1/auth/2fa/disable" && m === "POST") return twofaDisable(request, env);
       if (p === "/v1/connect/stremio" && m === "POST") return connectStremio(request, env);
+      if (p === "/v1/addon/manifest" && m === "POST") return addonManifest(request, env);
       if (p === "/v1/qr/start" && m === "POST") return qrStart(request, env);
       if (p === "/v1/qr/authorize" && m === "POST") return qrAuthorize(request, env);
       if (p === "/v1/qr/status" && m === "GET") return qrStatus(url, env);
@@ -168,8 +189,7 @@ export default {
       console.error("unhandled", err);
       return json({ error: "internal" }, 500);
     }
-  },
-};
+}
 
 // Non-revealing salt for unknown logins, so prelogin can't enumerate accounts.
 async function decoySalt(login: string, env: Env): Promise<string> {
@@ -449,6 +469,55 @@ async function connectStremio(req: Request, env: Env): Promise<Response> {
     }));
   // authKey is intentionally NOT returned or stored; this is a one-time import.
   return json({ ok: true, email, addons, library });
+}
+
+// --- Add-on manifest proxy: the dashboard's add-on manager pastes a manifest URL; the browser
+// cannot fetch it directly (the site CSP locks connect-src to api.vortx.tv, and add-on hosts vary
+// on CORS). The Worker fetches and validates it. Requires a VortX session, is rate-limited, and
+// refuses private / loopback hosts (basic SSRF guard) since it makes an outbound request on the
+// caller's behalf. It returns only parsed manifest fields, never the raw response. ---
+const PRIVATE_HOST_RE = /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|.*\.local|.*\.internal)$/i;
+function normalizeManifestUrl(raw: string): string | null {
+  let u = raw.trim();
+  if (!u) return null;
+  u = u.replace(/^stremio:\/\//i, "https://");
+  if (!/^https?:\/\//i.test(u)) u = "https://" + u;
+  let url: URL;
+  try { url = new URL(u); } catch { return null; }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  if (PRIVATE_HOST_RE.test(url.hostname)) return null;
+  if (!/\/manifest\.json$/i.test(url.pathname)) url.pathname = url.pathname.replace(/\/+$/, "") + "/manifest.json";
+  url.hash = "";
+  return url.toString();
+}
+async function addonManifest(req: Request, env: Env): Promise<Response> {
+  const accountId = await requireAuth(req, env);
+  if (!accountId) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const transportUrl = normalizeManifestUrl(isStr(b?.url, 2048) ? (b!.url as string) : "");
+  if (!transportUrl) return json({ error: "invalid_url" }, 400);
+
+  let res: Response;
+  try {
+    res = await fetch(transportUrl, { headers: { accept: "application/json" }, redirect: "follow", signal: AbortSignal.timeout(8000) });
+  } catch { return json({ error: "unreachable" }, 502); }
+  if (!res.ok) return json({ error: "not_a_manifest", status: res.status }, 502);
+  let mf: any;
+  try { mf = await res.json(); } catch { return json({ error: "not_a_manifest" }, 502); }
+  if (!mf || typeof mf !== "object" || !mf.id || (!mf.name && !Array.isArray(mf.types))) return json({ error: "not_a_manifest" }, 502);
+
+  const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : undefined);
+  return json({
+    addon: {
+      transportUrl,
+      name: str(mf.name, 120) ?? transportUrl,
+      types: Array.isArray(mf.types) ? mf.types.slice(0, 12).map((t: unknown) => String(t)) : [],
+      version: str(mf.version, 24),
+      description: str(mf.description, 300),
+      logo: typeof mf.logo === "string" && /^https:\/\//i.test(mf.logo) ? mf.logo : undefined,
+      configurable: !!(mf.behaviorHints && (mf.behaviorHints.configurable || mf.behaviorHints.configurationRequired)),
+    },
+  });
 }
 
 // --- QR login (data key handed to the joining device, wrapped to its ephemeral X25519 key) ---
