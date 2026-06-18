@@ -443,7 +443,10 @@ async function connectStremio(req: Request, env: Env): Promise<Response> {
     .filter((a: any) => a.transportUrl);
   const library = (Array.isArray(libJson?.result) ? libJson.result : [])
     .filter((it: any) => it && !it.removed && it._id)
-    .map((it: any) => ({ id: it._id, name: it.name, type: it.type, poster: it.poster }));
+    .map((it: any) => ({
+      id: it._id, name: it.name, type: it.type, poster: it.poster,
+      t: it.state?.timeOffset ?? 0, d: it.state?.duration ?? 0, // for Continue Watching on the dashboard
+    }));
   // authKey is intentionally NOT returned or stored; this is a one-time import.
   return json({ ok: true, email, addons, library });
 }
