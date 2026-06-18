@@ -156,27 +156,45 @@ function pub(row: { id: string; email: string; username_display: string; usernam
 // swallowed so it can never break an auth flow. All interpolated values are server-controlled or
 // validated (usernames are [a-zA-Z0-9_]), so the templates are safe. ---
 const MAIL_FROM = { email: "welcome@vortx.tv", name: "VortX" };
-function emailHtml(heading: string, lines: string[], note?: string): string {
-  const body = lines.map((l) => `<p style="margin:0 0 14px;color:#cbb38c;font-size:15px;line-height:1.6">${l}</p>`).join("");
-  const noteHtml = note
-    ? `<p style="margin:20px 0 0;padding:12px 14px;background:#0f0d0a;border:1px solid rgba(253,246,227,.1);border-radius:10px;color:#998163;font-size:13px;line-height:1.55">${note}</p>`
+const MAIL_LOGO = "https://vortx.tv/vortx-mark.png"; // the real VortX mark (rasterized); hosted, not inlined
+interface MailOpts { note?: string; recoveryCode?: string }
+// Light theme on purpose: dark-themed emails get mangled by mail-client dark-mode inversion, so a
+// light card with dark ink stays readable everywhere. color-scheme=light pins it.
+function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): string {
+  const body = lines.map((l) => `<p style="margin:0 0 16px;color:#4a3f2c;font-size:15px;line-height:1.62">${l}</p>`).join("");
+  const code = opts.recoveryCode
+    ? `<div style="margin:22px 0 8px;padding:16px 18px;background:#fbf3e2;border:1px solid #e7c986;border-radius:12px">`
+      + `<div style="color:#7a5a1e;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Your recovery code</div>`
+      + `<div style="font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:18px;font-weight:700;letter-spacing:.03em;color:#1a1206;word-break:break-all">${opts.recoveryCode}</div></div>`
+      + `<p style="margin:8px 0 0;color:#9a6a1e;font-size:12.5px;line-height:1.5">Anyone with this code and your email could recover your account, so save it offline and delete this email afterward. We cannot resend it or reset it for you.</p>`
     : "";
-  return `<!doctype html><html><body style="margin:0;background:#0b0907;padding:30px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">`
-    + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">`
-    + `<table role="presentation" width="100%" style="max-width:480px" cellpadding="0" cellspacing="0">`
-    + `<tr><td style="padding:0 4px 20px"><span style="font-weight:800;font-size:22px;letter-spacing:-.5px;color:#f59e0b">VortX</span></td></tr>`
-    + `<tr><td style="background:linear-gradient(180deg,#18140d,#13100a);border:1px solid rgba(253,246,227,.08);border-radius:18px;padding:30px 28px">`
-    + `<h1 style="margin:0 0 16px;font-weight:800;font-size:21px;letter-spacing:-.4px;color:#fdf6e3">${heading}</h1>${body}${noteHtml}</td></tr>`
-    + `<tr><td style="padding:18px 4px 0;color:#6b5d47;font-size:12px;line-height:1.5">VortX is end to end encrypted, so we can never read your data. You received this because of activity on your VortX account.</td></tr>`
+  const note = opts.note
+    ? `<p style="margin:20px 0 0;padding:13px 15px;background:#f3ecdd;border-radius:10px;color:#6a5a3c;font-size:13px;line-height:1.55">${opts.note}</p>`
+    : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">`
+    + `<meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">`
+    + `<meta name="viewport" content="width=device-width,initial-scale=1"></head>`
+    + `<body style="margin:0;background:#efe7d6;padding:30px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">`
+    + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#efe7d6"><tr><td align="center">`
+    + `<table role="presentation" width="100%" style="max-width:484px" cellpadding="0" cellspacing="0">`
+    + `<tr><td align="center" style="padding:4px 0 22px">`
+    + `<img src="${MAIL_LOGO}" width="36" height="36" alt="" style="vertical-align:middle;display:inline-block;border:0">`
+    + `<span style="vertical-align:middle;display:inline-block;margin-left:9px;font-size:23px;font-weight:800;letter-spacing:-.5px;color:#b45309">VortX</span></td></tr>`
+    + `<tr><td style="background:#ffffff;border:1px solid #e7ddc7;border-radius:18px;padding:30px 28px">`
+    + `<h1 style="margin:0 0 16px;font-size:21px;font-weight:800;letter-spacing:-.4px;color:#1a1206">${heading}</h1>${body}${code}${note}</td></tr>`
+    + `<tr><td style="padding:18px 8px 0;color:#9b8a6c;font-size:12px;line-height:1.5">VortX is end to end encrypted, so we can never read your data. You received this because of activity on your VortX account.</td></tr>`
     + `</table></td></tr></table></body></html>`;
 }
-function emailText(heading: string, lines: string[], note?: string): string {
-  return `VortX\n\n${heading}\n\n${lines.join("\n\n")}${note ? "\n\n" + note : ""}\n\nVortX is end to end encrypted, so we can never read your data.`;
+function emailText(heading: string, lines: string[], opts: MailOpts = {}): string {
+  let t = `VortX\n\n${heading}\n\n${lines.join("\n\n")}`;
+  if (opts.recoveryCode) t += `\n\nYour recovery code: ${opts.recoveryCode}\n(Save it offline and delete this email. Anyone with this code and your email could recover your account. We cannot resend or reset it.)`;
+  if (opts.note) t += `\n\n${opts.note}`;
+  return t + `\n\nVortX is end to end encrypted, so we can never read your data.`;
 }
-async function sendMail(env: Env, to: string, subject: string, heading: string, lines: string[], note?: string): Promise<void> {
+async function sendMail(env: Env, to: string, subject: string, heading: string, lines: string[], opts: MailOpts = {}): Promise<void> {
   if (!env.EMAIL) return;
   try {
-    await env.EMAIL.send({ to, from: MAIL_FROM, subject, html: emailHtml(heading, lines, note), text: emailText(heading, lines, note) });
+    await env.EMAIL.send({ to, from: MAIL_FROM, subject, html: emailHtml(heading, lines, opts), text: emailText(heading, lines, opts) });
   } catch (e) { console.error("email send failed:", e); }
 }
 
@@ -253,6 +271,9 @@ async function register(req: Request, env: Env): Promise<Response> {
   const wrappedKeyPw = isStr(b?.wrappedKeyPassword) ? (b!.wrappedKeyPassword as string) : "";
   const wrappedKeyRec = isStr(b?.wrappedKeyRecovery) ? (b!.wrappedKeyRecovery as string) : "";
   const recVerifier = isStr(b?.recVerifier) ? (b!.recVerifier as string) : "";
+  // Plaintext recovery code: used ONLY to include in the welcome email, NEVER written to the DB
+  // (the account stays zero-knowledge at rest). Validated to a sane shape before it touches a template.
+  const recoveryCode = isStr(b?.recoveryCode, 64) && /^VX-[0-9A-Za-z-]+$/.test(b!.recoveryCode as string) ? (b!.recoveryCode as string) : "";
   if (!EMAIL_RE.test(email)) return json({ error: "invalid_email" }, 400);
   if (!USERNAME_RE.test(username)) return json({ error: "invalid_username" }, 400);
   // Validate the crypto fields decode to the expected sizes, so a buggy client can't weaken the account (L-5).
@@ -280,7 +301,9 @@ async function register(req: Request, env: Env): Promise<Response> {
   await sendMail(env, email, "Welcome to VortX", `Welcome, @${username}.`, [
     "Your VortX account is ready. Your profiles, library, add-ons, and settings can now sync across every device, end to end encrypted.",
     "Your password is the key that unlocks your data on each device, so keep it somewhere safe.",
-  ], "Save your recovery code somewhere safe and offline. If you forget your password and have no device signed in, it is the only way back, and we cannot reset it for you.");
+  ], recoveryCode
+    ? { recoveryCode }
+    : { note: "Save your recovery code somewhere safe and offline. If you forget your password and have no device signed in, it is the only way back, and we cannot reset it for you." });
 
   return json({ token: await makeSession(id, env), account: { id, email, username } });
 }
