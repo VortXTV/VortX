@@ -25,7 +25,14 @@ final class VortXSyncManager: ObservableObject {
     private var token: String?
     private var dataKey: Data?
 
-    private init() { restore() }
+    private init() {
+        restore()
+        // Auto-sync: profiles and settings persist to UserDefaults, so one observer catches every change
+        // and schedules a debounced push (no-op when signed out). Metadata keys (Keychain) push via ApiKeys.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.requestSyncSoon() }
+        }
+    }
 
     // MARK: - Keychain persistence
 
@@ -79,13 +86,8 @@ final class VortXSyncManager: ObservableObject {
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
         persist()
-        // On sign-in, pull the account's profiles + settings; if the account has none yet (a fresh
-        // account), seed it from this device. Last-writer-wins, good enough for v1 cross-device sync.
-        Task { [weak self] in
-            guard let self else { return }
-            let restored = await self.syncDown()
-            if !restored { await self.syncUp() }
-        }
+        // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
+        // blindly overwrites either side. A new account just gets seeded.
     }
 
     enum AuthResult: Equatable { case ok, totpRequired, failed(String) }
@@ -217,5 +219,41 @@ final class VortXSyncManager: ObservableObject {
             restored = true
         }
         return restored
+    }
+
+    // MARK: - Reconciliation (no blind last-writer-wins)
+
+    enum SignInReconcile: Equatable { case seededFromDevice, hasAccountData }
+
+    /// True when the account already holds synced data (so a sign-in is a merge/conflict, not a seed).
+    func accountHasSyncData() async -> Bool {
+        guard let doc = await pullSyncDoc() else { return false }
+        return doc["settings"] != nil || doc["apiKeys"] != nil
+    }
+
+    /// Call right after a successful sign-in. A fresh (empty) account is seeded from this device; if the
+    /// account already has data, the UI must ASK the user which side to keep (useAccountData vs pushThisDevice).
+    func reconcileAfterSignIn() async -> SignInReconcile {
+        if await accountHasSyncData() { return .hasAccountData }
+        await syncUp()
+        return .seededFromDevice
+    }
+
+    /// Conflict resolution: replace this device's profiles + settings with the account's.
+    func useAccountData() async { await syncDown() }
+    /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
+    @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
+
+    /// Auto-sync: a debounced push, called whenever a setting / profile / key changes. Coalesces a burst
+    /// of edits into one push a couple of seconds later, so every change propagates without spamming.
+    private var pendingSync: Task<Void, Never>?
+    func requestSyncSoon() {
+        guard isSignedIn else { return }
+        pendingSync?.cancel()
+        pendingSync = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if Task.isCancelled { return }
+            await self?.syncUp()
+        }
     }
 }

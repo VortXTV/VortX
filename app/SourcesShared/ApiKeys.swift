@@ -10,8 +10,8 @@ final class ApiKeys: ObservableObject {
     private let tmdbAccount = "vortx.apikey.tmdb"
     private let mdblistAccount = "vortx.apikey.mdblist"
 
-    @Published var tmdb: String { didSet { Keychain.set(tmdb.isEmpty ? nil : tmdb, for: tmdbAccount) } }
-    @Published var mdblist: String { didSet { Keychain.set(mdblist.isEmpty ? nil : mdblist, for: mdblistAccount) } }
+    @Published var tmdb: String { didSet { Keychain.set(tmdb.isEmpty ? nil : tmdb, for: tmdbAccount); VortXSyncManager.shared.requestSyncSoon() } }
+    @Published var mdblist: String { didSet { Keychain.set(mdblist.isEmpty ? nil : mdblist, for: mdblistAccount); VortXSyncManager.shared.requestSyncSoon() } }
 
     private init() {
         tmdb = Keychain.string(tmdbAccount) ?? ""

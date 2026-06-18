@@ -18,6 +18,8 @@ struct SyncSettingsView: View {
     @State private var message: String?
     @State private var failed = false
     @State private var newRecoveryCode: String?   // shown once, right after creating an account
+    @State private var showConflict = false       // account already has data: ask which side to keep
+    @State private var syncing = false
 
     var body: some View {
         ScrollView {
@@ -34,6 +36,12 @@ struct SyncSettingsView: View {
             .frame(maxWidth: 720, alignment: .leading)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .alert("Sync conflict", isPresented: $showConflict) {
+            Button("Use account's data") { Task { syncing = true; await sync.useAccountData(); syncing = false } }
+            Button("Keep this device") { Task { syncing = true; await sync.pushThisDevice(); syncing = false } }
+        } message: {
+            Text("This account already has saved profiles and settings. Keep this device's data and push it up, or replace this device with the account's data?")
+        }
     }
 
     // MARK: Signed in
@@ -49,11 +57,16 @@ struct SyncSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
 
-        Text("Your profiles, settings, library, and history sync to this account, end-to-end encrypted.")
+        Text("Your profiles, settings, and metadata keys sync to this account, end-to-end encrypted. They also sync automatically a moment after any change.")
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
 
-        Button("Sign out") { sync.signOut(); reset() }
-            .buttonStyle(ChipButtonStyle(selected: false))
+        HStack(spacing: Theme.Space.md) {
+            Button(syncing ? "Syncing…" : "Sync now") { Task { syncing = true; await sync.pushThisDevice(); syncing = false } }
+                .buttonStyle(PrimaryActionStyle())
+                .disabled(syncing)
+            Button("Sign out") { sync.signOut(); reset() }
+                .buttonStyle(ChipButtonStyle(selected: false))
+        }
     }
 
     // MARK: Signed out
@@ -148,6 +161,8 @@ struct SyncSettingsView: View {
         switch result {
         case .ok:
             password = ""; totp = ""; needsTotp = false
+            // Decide pull vs seed vs ask: a fresh account is seeded; one with data prompts which to keep.
+            Task { if await sync.reconcileAfterSignIn() == .hasAccountData { showConflict = true } }
         case .totpRequired:
             needsTotp = true; message = "Enter your authenticator code."; failed = false
         case .failed(let msg):
