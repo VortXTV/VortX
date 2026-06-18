@@ -9,7 +9,7 @@ struct MetadataKeysView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("Metadata services").screenTitleStyle()
-                Text("Optional. Add your own TMDB and MDBList keys to enrich recommendations and ratings. Nothing here is required and your keys stay on this device.")
+                Text("Optional. Add your own TMDB and MDBList keys to enrich recommendations and ratings. Nothing here is required and your keys stay on this device (and sync, encrypted, to your VortX account).")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 keyField("TMDB", text: $keys.tmdb, hint: "Free at themoviedb.org, Settings then API.")
@@ -31,10 +31,11 @@ struct MetadataKeysView: View {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.Palette.accent)
                 }
             }
-            TextField("Paste your key", text: text)
+            // Masked like a password (Bug 3): keys are credentials.
+            SecureField("Paste your key", text: text)
                 .font(.system(size: 15, design: .monospaced))
-                .disableAutocorrection(true)
                 #if os(iOS)
+                .textContentType(.password)
                 .textInputAutocapitalization(.never)
                 #endif
             Text(hint).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)

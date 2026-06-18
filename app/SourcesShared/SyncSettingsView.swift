@@ -42,6 +42,7 @@ struct SyncSettingsView: View {
         } message: {
             Text("This account already has saved profiles and settings. Keep this device's data and push it up, or replace this device with the account's data?")
         }
+        .task { await sync.refreshAccount() }
     }
 
     // MARK: Signed in
@@ -86,7 +87,7 @@ struct SyncSettingsView: View {
             }
 
             VStack(spacing: Theme.Space.md) {
-                field("Email", text: $email, content: .emailAddress)
+                field(mode == .signIn ? "Email or username" : "Email", text: $email, content: .emailAddress)
                 if mode == .create { field("Username", text: $username) }
                 if mode == .recover { field("Recovery code (VX-…)", text: $recoveryCodeInput) }
                 secureField(mode == .recover ? "New password" : "Password", text: $password)
