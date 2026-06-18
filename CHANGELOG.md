@@ -4,13 +4,13 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.8 - 2026-06-17 (pre-release)
+## 0.3.8 - 2026-06-18 (pre-release)
 
-The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your profiles and settings follow you between devices, the server only ever holds ciphertext. Plus in-app add-on management, a catalog manager, optional TMDB-powered recommendations, and a handful of fixes. This is a pre-release for testing; QR sign-in on Apple TV and one-tap Stremio sign-in are coming in 0.3.9.
+The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your profiles and settings follow you between devices, the server only ever holds ciphertext. This build fixes the headline problem from the first beta: your devices now actually sync to each other. Plus in-app add-on management, a catalog manager, optional TMDB-powered recommendations, and a batch of fixes. This is a pre-release for testing; QR sign-in on Apple TV and one-tap Stremio sign-in are coming in 0.3.9.
 
 ### Added
 
-- **VortX account (optional, end-to-end encrypted).** Create an account, sign in, or recover it from Settings; your password derives the encryption key on-device, so the server can never read your data. Your **profiles and settings sync** across devices on sign-in. Manage it (backup/restore, two-factor, change password, connect Stremio) at [vortx.tv/dashboard](https://vortx.tv/dashboard).
+- **VortX account (optional, end-to-end encrypted).** Create an account, sign in, or recover it from Settings; your password derives the encryption key on-device, so the server can never read your data. Your **profiles and settings sync** across devices, pulled automatically each time you open the app. Manage it (backup/restore, two-factor, change password, connect Stremio, library and add-ons) at [vortx.tv/dashboard](https://vortx.tv/dashboard).
 - **Install add-ons in the app.** Paste an add-on's manifest URL in Add-ons to install it, no more leaving for the Stremio app.
 - **Catalog manager.** Show, hide, and reorder the catalog rows on Home, per profile (Add-ons, Customize catalogs).
 - **Smarter "More like this".** With your own TMDB key (Settings, Metadata), detail-page recommendations blend in TMDB's; without a key it uses the built-in genre and franchise matching. Builds on the new section contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#89)
@@ -20,6 +20,12 @@ The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your pr
 
 ### Fixed
 
+- **Profiles and settings now sync between your devices automatically,** by pulling the latest from your account each time you open the app, not only on sign-in. Before, a device only pushed its own changes and never picked up another device's, so Apple TV profiles never reached iPhone or Mac.
+- **Two-factor no longer shows as off in the app** after you enable it; it refreshes its status from the server.
+- **The sign-in field reads "Email or username,"** since either one works.
+- **Your TMDB and MDBList keys are masked** in Settings instead of shown in plain text.
+- **The catalog manager lists your catalogs in their current Home order,** not alphabetically.
+- **A macOS crash tied to the window toolbar is fixed** (a conditional toolbar item that could crash during a view update).
 - **Playback no longer dies when you lock the screen or leave the app on iPhone/iPad.** Keeping it playing also keeps the streaming server alive, so a torrent survives. Toggle in Settings, Playback. (#74)
 - **The Apple TV top menu bar returns reliably** after you scroll a series and press Back. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#75, #91)
 - **A macOS crash during trickplay in the background is fixed.** Contributed by [OrigamiSpace](https://github.com/OrigamiSpace). (#93)
