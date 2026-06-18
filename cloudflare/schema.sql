@@ -6,11 +6,13 @@
 -- or the data key, so it can never read user data. All key derivation, wrapping, and the sync-doc
 -- encryption happen on the client (website + app), with matching parameters.
 
-DROP TABLE IF EXISTS backups;
-DROP TABLE IF EXISTS pairings;
-DROP TABLE IF EXISTS accounts;
+-- SAFETY (do not remove). This file is IDEMPOTENT and NON-DESTRUCTIVE: it is safe to run against the
+-- live database at any time and it NEVER drops a table. There are REAL accounts in production. A DROP
+-- here is permanent, unrecoverable data loss, because the data is end to end encrypted and there is no
+-- server-side reset. To add a column, append an additive `ALTER TABLE ... ADD COLUMN` (see
+-- cloudflare/migrations/). NEVER put DROP TABLE / DELETE / TRUNCATE in any file run against remote D1.
 
-CREATE TABLE accounts (
+CREATE TABLE IF NOT EXISTS accounts (
   id                 TEXT PRIMARY KEY,        -- uuid
   email              TEXT NOT NULL UNIQUE,    -- lowercased
   username           TEXT NOT NULL UNIQUE,    -- lowercased, case-insensitive uniqueness
@@ -31,7 +33,7 @@ CREATE TABLE accounts (
 );
 
 -- The synced state: one ciphertext document per account (the server cannot read it). LWW by version.
-CREATE TABLE backups (
+CREATE TABLE IF NOT EXISTS backups (
   account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   document   TEXT    NOT NULL,   -- AES-GCM ciphertext under the account data key
   version    INTEGER NOT NULL,
@@ -39,7 +41,7 @@ CREATE TABLE backups (
 );
 
 -- QR login: a device shows a code; the logged-in app authorizes it; the device polls for a session.
-CREATE TABLE pairings (
+CREATE TABLE IF NOT EXISTS pairings (
   pairing_id    TEXT PRIMARY KEY,
   code          TEXT    NOT NULL,
   device_pubkey TEXT    NOT NULL,             -- joining device's ephemeral X25519 public key (for the data-key handoff)
@@ -50,4 +52,4 @@ CREATE TABLE pairings (
   created_at    INTEGER NOT NULL
 );
 
-CREATE INDEX idx_pairings_code ON pairings (code);
+CREATE INDEX IF NOT EXISTS idx_pairings_code ON pairings (code);
