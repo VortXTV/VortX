@@ -158,7 +158,7 @@ function pub(row: { id: string; email: string; username_display: string; usernam
 // validated (usernames are [a-zA-Z0-9_]), so the templates are safe. ---
 const MAIL_FROM = { email: "welcome@vortx.tv", name: "VortX" };
 const MAIL_LOGO = "https://vortx.tv/vortx-mark.png"; // the real VortX mark (rasterized); hosted, not inlined
-interface MailOpts { note?: string; recoveryCode?: string }
+interface MailOpts { note?: string; recoveryCode?: string; code?: string }
 // Light theme on purpose: dark-themed emails get mangled by mail-client dark-mode inversion, so a
 // light card with dark ink stays readable everywhere. color-scheme=light pins it.
 function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): string {
@@ -243,6 +243,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/backup" && m === "PUT") return backupPut(request, env);
       if (p === "/v1/backup" && m === "GET") return backupGet(request, env);
       if (p === "/v1/admin/stats" && m === "GET") return adminStats(request, env);
+      if (p === "/v1/admin/announce" && m === "POST") return adminAnnounce(request, env);
       return noContent(404);
     } catch (err) {
       console.error("unhandled", err);
@@ -706,4 +707,22 @@ async function adminStats(req: Request, env: Env): Promise<Response> {
     dailySignups: daily.results ?? [],
     nodes: { total: 0, note: "Federation nodes will appear here when self-hosting ships." },
   });
+}
+
+// --- Admin announcement: send one transactional email to every account (gated by ADMIN_TOKEN). The
+// body carries the content so nothing is hardcoded. Reuses the branded sendMail (so it is logged in
+// email_sends and rendered in the light template). Returns how many were sent. ---
+async function adminAnnounce(req: Request, env: Env): Promise<Response> {
+  const tok = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!env.ADMIN_TOKEN || tok.length !== env.ADMIN_TOKEN.length || !ctEqual(tok, env.ADMIN_TOKEN)) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const subject = isStr(b?.subject, 200) ? (b!.subject as string) : "";
+  const heading = isStr(b?.heading, 200) ? (b!.heading as string) : "";
+  const lines = Array.isArray(b?.lines) ? (b!.lines as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 20) : [];
+  if (!subject || !heading || !lines.length) return json({ error: "bad_request" }, 400);
+  const rows = await env.DB.prepare("SELECT email FROM accounts").all<{ email: string }>();
+  const emails = (rows.results ?? []).map((r) => r.email);
+  let sent = 0;
+  for (const email of emails) { await sendMail(env, email, subject, heading, lines); sent++; }
+  return json({ ok: true, sent, total: emails.length });
 }
