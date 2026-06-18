@@ -1565,8 +1565,11 @@ extension View {
         navigationTitle(pageTitle)
             .navigationBarTitleDisplayModeInlineCompat()
             .toolbar {
-                if isActive {
-                    ToolbarItem(placement: .principal) {
+                // Keep the toolbar item identity STABLE and toggle its CONTENT, rather than adding/removing
+                // the item when isActive flips. On macOS, inserting/removing a `.principal` item mid-update
+                // crashes NSToolbar (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, Bug 12).
+                ToolbarItem(placement: .principal) {
+                    if isActive {
                         // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows
                         // the theme accent). Sized down for the nav bar. VortXWordmark is already
                         // fixedSize'd; the horizontal padding widens the measured bounds so macOS's
