@@ -48,6 +48,7 @@ struct StremioTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
+                    Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
                     // The top tab bar can desync (park offscreen) across a background/foreground cycle,
                     // the same "vanishing tab bar" the player-close heal fixes. Re-assert it on return so
                     // the menu never stays gone after the Home button (issue #75). Two shots: the desync

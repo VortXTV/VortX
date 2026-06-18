@@ -24,6 +24,8 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
+    private var lastSyncedVersion = 0   // newest doc version this device has pushed or applied
+    private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
 
     private init() {
         restore()
@@ -178,13 +180,37 @@ final class VortXSyncManager: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
     }
 
+    /// Pull the doc plus its server version, so the foreground pull can apply only changes that are
+    /// newer than what this device already has (and not re-apply its own last push).
+    private func pullDocVersioned() async -> (doc: [String: Any], version: Int)? {
+        guard let dataKey else { return nil }
+        let (code, json) = await request("GET", "/v1/backup", auth: true)
+        guard code == 200, let docStr = json?["document"] as? String,
+              let version = json?["version"] as? Int,
+              let pt = VortXSyncCrypto.open(key: dataKey, docStr),
+              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return nil }
+        return (obj, version)
+    }
+
     @discardableResult
     func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
               let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return false }
         let version = Int(Date().timeIntervalSince1970 * 1000)
         let (code, _) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        if code == 200 { lastSyncedVersion = max(lastSyncedVersion, version) }
         return code == 200
+    }
+
+    /// A small JSON view of local state the website dashboard can read (the binary-plist `settings`
+    /// blob is opaque to a browser). Profiles let the dashboard show the family roster + the real count.
+    private func vortxSummary() -> [String: Any] {
+        let profiles: [[String: Any]] = ProfileStore.shared.profiles.map { p in
+            ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner]
+        }
+        var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
+        if let active = ProfileStore.shared.activeID { v["activeProfile"] = active.uuidString }
+        return v
     }
 
     // MARK: - Profiles + settings sync (reuses the SettingsBackup serialization as the doc payload)
@@ -198,6 +224,7 @@ final class VortXSyncManager: ObservableObject {
         var doc = await pullSyncDoc() ?? [:]
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
+        doc["vortx"] = vortxSummary()   // JSON the dashboard can read (profiles, active selection)
         var keys: [String: String] = [:]
         if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
         if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
@@ -207,9 +234,17 @@ final class VortXSyncManager: ObservableObject {
 
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
     /// was restored.
+    /// Pull the account's profiles + settings and apply them locally. Version-aware so it only applies
+    /// changes NEWER than what this device already has (and skips while a local push is queued, so it
+    /// never clobbers a fresh local edit). `force` ignores both guards (used by the manual "Sync now"
+    /// and by sign-in reconciliation). True if anything was restored.
     @discardableResult
-    func syncDown() async -> Bool {
-        guard isSignedIn, let doc = await pullSyncDoc() else { return false }
+    func syncDown(force: Bool = false) async -> Bool {
+        guard isSignedIn else { return false }
+        if !force, hasPendingPush { return false }
+        guard let pulled = await pullDocVersioned() else { return false }
+        if !force, pulled.version <= lastSyncedVersion { return false }
+        let doc = pulled.doc
         var restored = false
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64),
            ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 { restored = true }
@@ -218,6 +253,7 @@ final class VortXSyncManager: ObservableObject {
             if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
             restored = true
         }
+        lastSyncedVersion = max(lastSyncedVersion, pulled.version)
         return restored
     }
 
@@ -239,8 +275,8 @@ final class VortXSyncManager: ObservableObject {
         return .seededFromDevice
     }
 
-    /// Conflict resolution: replace this device's profiles + settings with the account's.
-    func useAccountData() async { await syncDown() }
+    /// Conflict resolution: replace this device's profiles + settings with the account's (forced).
+    func useAccountData() async { await syncDown(force: true) }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
 
@@ -261,11 +297,13 @@ final class VortXSyncManager: ObservableObject {
     private var pendingSync: Task<Void, Never>?
     func requestSyncSoon() {
         guard isSignedIn else { return }
+        hasPendingPush = true
         pendingSync?.cancel()
         pendingSync = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             if Task.isCancelled { return }
             await self?.syncUp()
+            self?.hasPendingPush = false
         }
     }
 }

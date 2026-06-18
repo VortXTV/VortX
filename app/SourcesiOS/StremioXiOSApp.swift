@@ -52,7 +52,10 @@ struct StremioXiOSApp: App {
         WindowGroup {
             iOSRootView()
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
-                    if phase == .active { UpdateChecker.shared.checkIfStale() }
+                    if phase == .active {
+                        UpdateChecker.shared.checkIfStale()
+                        Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
+                    }
                     if phase == .background { Task { await VortXSyncManager.shared.syncUp() } }   // push profiles + settings
                 }
                 .onAppear {
