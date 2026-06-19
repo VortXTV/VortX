@@ -165,8 +165,10 @@ struct OpenLinkView: View {
             }
             switch resolution {
             case .single(let url, let fileName):
+                let savedName = magnet.name ?? fileName
                 dismiss()
-                presenter.request = PlaybackRequest(url: url, title: magnet.name ?? fileName, torrent: true)
+                presenter.request = PlaybackRequest(url: url, title: savedName, torrent: true)
+                Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: savedName) }   // #81
             case .choose(let files):
                 status = nil
                 fileChoices = files   // a multi-file pack: show the picker, the user clicks a file to play
@@ -213,6 +215,7 @@ struct OpenLinkView: View {
                         Button {
                             dismiss()
                             presenter.request = PlaybackRequest(url: file.url, title: file.name, torrent: true)
+                            Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: file.name) }   // #81
                         } label: {
                             HStack(spacing: Theme.Space.md) {
                                 VStack(alignment: .leading, spacing: 4) {
