@@ -800,6 +800,7 @@ async function metaSearch(req: Request, env: Env): Promise<Response> {
     type: mm.type === "series" ? "series" : "movie",
     name: str(mm.name, 200),
     poster: typeof mm.poster === "string" && /^https:\/\//i.test(mm.poster) ? mm.poster : undefined,
+    year: str(mm.releaseInfo, 12),   // for disambiguation in the dashboard search results
   })).filter((r: any) => r.id && r.name);
   return json({ results });
 }
