@@ -264,6 +264,17 @@ final class ProfileStore: ObservableObject {
         if let adds = edits["libraryAdds"] as? [String: Any] {
             for (idStr, raw) in adds {
                 guard let uuid = UUID(uuidString: idStr), let items = raw as? [[String: Any]] else { continue }
+                if let target = profiles.first(where: { $0.id == uuid }), target.usesEngineHistory {
+                    // Owner / own-account profile: its library IS the account (engine) library, not an
+                    // overlay. Add each resolved Cinemeta title to the engine (real catalog id, safe for
+                    // account sync). applyRemoteOverlay would skip it (it refuses engine-backed profiles).
+                    for it in items {
+                        guard let metaId = it["id"] as? String, !metaId.isEmpty else { continue }
+                        let type = (it["type"] as? String) ?? "movie"
+                        Task { await CoreBridge.shared.addCatalogItemToAccount(id: metaId, type: type) }
+                    }
+                    continue
+                }
                 var entries: [String: WatchEntry] = [:]
                 for it in items {
                     guard let metaId = it["id"] as? String, !metaId.isEmpty else { continue }
