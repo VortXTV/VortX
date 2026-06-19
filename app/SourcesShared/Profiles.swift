@@ -635,6 +635,18 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
+    /// Save a title to the overlay profile's Library without marking it watched (the "Add to
+    /// Library" button). Writes a zero-offset, zero-watched entry so libraryItems shows it while
+    /// cwItems correctly skips it (no progress, no watched episodes) until it is actually played.
+    /// A no-op when the title is already tracked, so an add never clobbers existing progress.
+    func addLibraryEntry(metaId: String, name: String, type: String, poster: String?) {
+        guard watch[metaId] == nil else { return }
+        watch[metaId] = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0,
+                                   lastWatched: Self.isoNow(), name: name, type: type, poster: poster)
+        saveWatchCache()
+        schedulePushWatch()
+    }
+
     /// A title finished (movie, or a series' last episode): zero the offset so it leaves the rail.
     func finishedWatching(metaId: String) {
         guard var entry = watch[metaId] else { return }

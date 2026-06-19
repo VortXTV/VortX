@@ -707,6 +707,12 @@ final class CoreBridge: ObservableObject {
     /// Whether the open detail page's title is saved to the library proper (present,
     /// not removed, not a temporary watched-marker entry). Drives the Library button.
     var detailInLibrary: Bool {
+        // Overlay (non-owner) profile: the engine's libraryItem belongs to the account, so the
+        // chip must reflect the profile's own overlay, kept symmetric with the guarded add/remove.
+        if !ProfileStore.shared.activeUsesEngineHistory {
+            guard let id = metaDetails?.meta?.id else { return false }
+            return ProfileStore.shared.watch[id] != nil
+        }
         guard let item = metaDetails?.libraryItem else { return false }
         return item.removed != true && item.temp != true
     }
@@ -716,6 +722,14 @@ final class CoreBridge: ObservableObject {
     /// Library tab or Continue Watching is in no catalog, so this hands the engine
     /// its own full meta JSON instead (a superset of the preview it expects).
     func addDetailToLibrary() {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: save to the profile's private overlay, never the account library.
+            if let meta = metaDetails?.meta {
+                ProfileStore.shared.addLibraryEntry(metaId: meta.id, name: meta.name,
+                                                    type: meta.type, poster: meta.poster)
+            }
+            return
+        }
         guard let data = stateData("meta_details"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let metaItems = object["metaItems"] as? [[String: Any]] else { return }
@@ -737,6 +751,14 @@ final class CoreBridge: ObservableObject {
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id
     /// in whichever catalog field holds it) so the shape is exactly what the engine expects back.
     func addToLibrary(metaId: String) {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: save to the profile's private overlay, never the account library.
+            if let info = overlayDisplayInfo(forId: metaId) {
+                ProfileStore.shared.addLibraryEntry(metaId: metaId, name: info.name,
+                                                    type: info.type, poster: info.poster)
+            }
+            return
+        }
         guard let raw = rawMetaPreview(forId: metaId) else { return }
         dispatchCtx(["action": "AddToLibrary", "args": raw])
     }
