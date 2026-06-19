@@ -230,8 +230,10 @@ final class VortXSyncManager: ObservableObject {
     private func vortxSummary() -> [String: Any] {
         let store = ProfileStore.shared
         let profiles: [[String: Any]] = store.profiles.map { p in
+            // pinHash is the salted SHA-256 (salt = the profile id, already here), never the raw PIN,
+            // so the dashboard can verify a PIN entry by re-hashing without ever seeing the digits.
             ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,
-             "familyEdit": p.familyEdit]
+             "familyEdit": p.familyEdit, "pinHash": p.pin ?? ""]
         }
         // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
         // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account
