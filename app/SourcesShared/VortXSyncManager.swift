@@ -25,6 +25,7 @@ final class VortXSyncManager: ObservableObject {
     private var token: String?
     private var dataKey: Data?
     private var lastSyncedVersion = 0   // newest doc version this device has pushed or applied
+    private var lastAppliedProfileEditsAt: Double = 0  // LWW stamp of the last web profileEdits applied (in-memory; re-apply is idempotent)
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
 
     // MARK: - Real-time sync state (WebSocket + while-active poll)
@@ -229,7 +230,8 @@ final class VortXSyncManager: ObservableObject {
     private func vortxSummary() -> [String: Any] {
         let store = ProfileStore.shared
         let profiles: [[String: Any]] = store.profiles.map { p in
-            ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner]
+            ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,
+             "familyEdit": p.familyEdit]
         }
         // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
         // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account
@@ -372,6 +374,17 @@ final class VortXSyncManager: ObservableObject {
                 ProfileStore.shared.applyRemoteOverlay(profileID: uuid, entries: entries)
             }
             restored = true
+        }
+        // Web-authored profile edits (vortx.tv dashboard writes doc.profileEdits, a SIBLING key the app
+        // preserves via syncUp's read-merge-write, unlike doc.vortx which the app overwrites). Apply
+        // name/familyEdit/pin + per-profile library adds, LWW by editedAt, once per stamp.
+        if let edits = doc["profileEdits"] as? [String: Any] {
+            let editedAt = (edits["editedAt"] as? Double) ?? Double((edits["editedAt"] as? Int) ?? 0)
+            if editedAt > lastAppliedProfileEditsAt {
+                ProfileStore.shared.applyProfileEdits(edits)
+                lastAppliedProfileEditsAt = editedAt
+                restored = true
+            }
         }
         lastSyncedVersion = max(lastSyncedVersion, pulled.version)
         return restored

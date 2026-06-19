@@ -19,6 +19,10 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// The account's main profile (the one created by migration). It uses the account's own watch
     /// history, exactly like before profiles existed. Every other shared profile keeps its own.
     var isOwner: Bool = false
+    /// Family head (the account owner) may edit this profile from the vortx.tv dashboard WITHOUT its
+    /// PIN. Per-secondary, set from the dashboard. Default false. Governs WEB edit permission only,
+    /// not the on-device profile-switch PIN gate (see vortx-dashboard-profile-mgmt-design).
+    var familyEdit: Bool = false
     /// Per-profile playback preferences (audio/subtitle language plus subtitle style), mirrored
     /// into the flat UserDefaults keys the player reads when this profile becomes active.
     /// nil = never customized (pre-feature roster); seeded from the flat values on first load.
@@ -81,15 +85,16 @@ struct UserProfile: Codable, Identifiable, Equatable {
         usesOwnAccount = try c.decodeIfPresent(Bool.self, forKey: .usesOwnAccount) ?? false
         email = try c.decodeIfPresent(String.self, forKey: .email)
         isOwner = try c.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
+        familyEdit = try c.decodeIfPresent(Bool.self, forKey: .familyEdit) ?? false
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
-         email: String? = nil, isOwner: Bool = false, playback: PlaybackPrefs? = nil) {
+         email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
-        self.email = email; self.isOwner = isOwner; self.playback = playback
+        self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
     }
 }
 
@@ -217,6 +222,44 @@ final class ProfileStore: ObservableObject {
         persist()
         if activeID == profile.id, let first = profiles.first { return select(first) }
         return nil
+    }
+
+    /// Apply web-authored profile edits (the vortx.tv dashboard writes doc.profileEdits; the app reads
+    /// it on sync-down). Non-destructive in this revision: updates name / familyEdit / pin on EXISTING
+    /// profiles by id, and feeds per-profile library adds into the overlay via applyRemoteOverlay.
+    /// Create and delete are intentionally NOT handled here yet (a later, hard-gated step). Union-safe:
+    /// a profile absent from the edits is left untouched. See [[vortx-dashboard-profile-mgmt-design]].
+    func applyProfileEdits(_ edits: [String: Any]) {
+        if let roster = edits["roster"] as? [[String: Any]] {
+            for e in roster {
+                guard let idStr = e["id"] as? String, let uuid = UUID(uuidString: idStr),
+                      var p = profiles.first(where: { $0.id == uuid }) else { continue }
+                if e["deleted"] as? Bool == true { continue }   // delete is a later, hard-gated step
+                var changed = false
+                if let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !name.isEmpty, name != p.name { p.name = name; changed = true }
+                if let fe = e["familyEdit"] as? Bool, fe != p.familyEdit { p.familyEdit = fe; changed = true }
+                if e.keys.contains("pin") {
+                    let newPin = (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    if newPin != p.pin { p.pin = newPin; changed = true }
+                }
+                if changed { update(p) }
+            }
+        }
+        if let adds = edits["libraryAdds"] as? [String: Any] {
+            for (idStr, raw) in adds {
+                guard let uuid = UUID(uuidString: idStr), let items = raw as? [[String: Any]] else { continue }
+                var entries: [String: WatchEntry] = [:]
+                for it in items {
+                    guard let metaId = it["id"] as? String, !metaId.isEmpty else { continue }
+                    entries[metaId] = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0,
+                        lastWatched: Self.isoNow(), name: it["name"] as? String ?? "",
+                        type: it["type"] as? String ?? "movie",
+                        poster: (it["poster"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                }
+                applyRemoteOverlay(profileID: uuid, entries: entries)
+            }
+        }
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
