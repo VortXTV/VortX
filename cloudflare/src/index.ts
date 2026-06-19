@@ -33,6 +33,7 @@ export interface Env {
   RL: { limit(opts: { key: string }): Promise<{ success: boolean }> };
   EMAIL?: { send(msg: EmailMessage): Promise<unknown> }; // Cloudflare Email Sending binding (optional so dry-runs/tests work)
   ADMIN_TOKEN?: string; // gates /v1/admin/stats (set via `wrangler secret put ADMIN_TOKEN`)
+  ALLOW_TEST_RESET_CODE?: string; // LOCAL-ONLY test seam: when "1", reset/start echoes the code (see resetStart). Never set in prod.
 }
 
 const PAIR_TTL_MS = 10 * 60 * 1000;
@@ -457,6 +458,7 @@ async function resetStart(req: Request, env: Env): Promise<Response> {
   if (!login) return json({ error: "bad_request" }, 400);
   const row = await env.DB.prepare("SELECT id, email FROM accounts WHERE email = ? OR username = ?")
     .bind(login, login).first<{ id: string; email: string }>();
+  let issuedCode = ""; // captured only for the env-gated local test seam below
   if (row) {
     // Re-issue cooldown: while a fresh code is still pending (< 60s old), do not mint another. Without this,
     // repeated reset/start calls hand out new 5-guess windows on the 6-digit space (per-IP rate-limiting
@@ -466,6 +468,7 @@ async function resetStart(req: Request, env: Env): Promise<Response> {
     const issuedAt = existing ? existing.expires_at - RESET_TTL_MS : 0;
     if (!existing || Date.now() - issuedAt >= RESET_REISSUE_COOLDOWN_MS) {
       const code = gen6();
+      issuedCode = code;
       await env.DB.prepare(
         `INSERT INTO password_resets (account_id, code_hash, expires_at, attempts) VALUES (?,?,?,0)
          ON CONFLICT(account_id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0`,
@@ -476,6 +479,11 @@ async function resetStart(req: Request, env: Env): Promise<Response> {
       ], { code });
     }
   }
+  // LOCAL-ONLY test seam: the reset code lives in email only, so an automated e2e against a local wrangler
+  // dev has no way to read it. When ALLOW_TEST_RESET_CODE === "1" (set by the dev harness, NEVER in prod),
+  // echo the freshly minted code so the test can complete the flow. The prod env does not set this var, so
+  // the response is the unchanged { ok: true } there. Guarded twice (env flag AND a code was actually minted).
+  if (env.ALLOW_TEST_RESET_CODE === "1" && issuedCode) return json({ ok: true, _code: issuedCode });
   return json({ ok: true }); // always ok, so a reset request cannot enumerate accounts
 }
 
