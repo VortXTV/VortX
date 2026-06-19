@@ -27,6 +27,19 @@ final class VortXSyncManager: ObservableObject {
     private var lastSyncedVersion = 0   // newest doc version this device has pushed or applied
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
 
+    // MARK: - Real-time sync state (WebSocket + while-active poll)
+    /// The live SyncRoom socket; nil whenever disconnected. Receives {"type":"updated","version":N}
+    /// pushes from other devices and triggers a pull within ~1s.
+    private var ws: URLSessionWebSocketTask?
+    private var wsBackoff: TimeInterval = 1          // reconnect delay, doubled per failure (capped)
+    private var wsReconnect: Task<Void, Never>?      // pending reconnect attempt
+    private var wsKeepAlive: Task<Void, Never>?      // periodic "ping" so the room never idles us out
+    private var pollTask: Task<Void, Never>?         // while-active fallback poll
+    private var realtimeActive = false               // true between startRealtime() and stopRealtime()
+    private let wsMaxBackoff: TimeInterval = 30
+    private let pollIntervalNanos: UInt64 = 10_000_000_000   // 10s fallback poll while active
+    private let keepAliveNanos: UInt64 = 30_000_000_000      // 30s ping to hold the room open
+
     private init() {
         restore()
         // Auto-sync: profiles and settings persist to UserDefaults, so one observer catches every change
@@ -55,6 +68,7 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signOut() {
+        stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         Keychain.set(nil, for: kcAccount)
     }
@@ -88,6 +102,10 @@ final class VortXSyncManager: ObservableObject {
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
         persist()
+        // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
+        // is active it would also be opened by scenePhase, but adopting here covers the in-place sign-in
+        // flow where the scene never re-activates). Idempotent: startRealtime() no-ops if already live.
+        startRealtime()
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
     }
@@ -393,6 +411,127 @@ final class VortXSyncManager: ObservableObject {
             if Task.isCancelled { return }
             await self?.syncUp()
             self?.hasPendingPush = false
+        }
+    }
+
+    // MARK: - Real-time pull (WebSocket SyncRoom) + while-active poll fallback
+
+    /// Open the real-time channel: connect to the worker SyncRoom and start the while-active poll.
+    /// Called on scene .active and on sign-in. Fail-soft and idempotent: no-op when signed out or
+    /// already running, and a missing/failed WebSocket never breaks the existing foreground pull.
+    func startRealtime() {
+        guard isSignedIn, !realtimeActive else { return }
+        realtimeActive = true
+        wsBackoff = 1
+        connectWebSocket()
+        startPoll()
+        // Catch up immediately on the way in (matches the scenePhase foreground pull), so a change made
+        // while this device was backgrounded applies right away rather than waiting for the next push.
+        Task { await syncDown() }
+    }
+
+    /// Close the real-time channel: tear down the socket, reconnect, keep-alive, and the poll. Called on
+    /// scene .background and on sign-out. Safe to call repeatedly.
+    func stopRealtime() {
+        realtimeActive = false
+        wsReconnect?.cancel(); wsReconnect = nil
+        wsKeepAlive?.cancel(); wsKeepAlive = nil
+        pollTask?.cancel(); pollTask = nil
+        ws?.cancel(with: .goingAway, reason: nil)
+        ws = nil
+    }
+
+    private func connectWebSocket() {
+        guard realtimeActive, isSignedIn, let token,
+              // https -> wss for the SyncRoom upgrade endpoint.
+              let url = URL(string: base.replacingOccurrences(of: "https://", with: "wss://") + "/v1/sync/connect")
+        else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer " + token, forHTTPHeaderField: "authorization")
+        let task = URLSession.shared.webSocketTask(with: req)
+        ws = task
+        task.resume()
+        startKeepAlive()
+        receiveNext()
+    }
+
+    /// One receive at a time, re-armed after each message. A failure means the socket dropped: schedule a
+    /// backoff reconnect (the while-active poll keeps changes flowing in the meantime).
+    private func receiveNext() {
+        guard let task = ws else { return }
+        task.receive { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.ws === task else { return }   // ignore a stale socket's late callback
+                switch result {
+                case .success(let message):
+                    self.handle(message)
+                    self.wsBackoff = 1   // a clean message means the link is healthy; reset backoff
+                    self.receiveNext()
+                case .failure:
+                    self.scheduleReconnect()
+                }
+            }
+        }
+    }
+
+    private func handle(_ message: URLSessionWebSocketTask.Message) {
+        let text: String?
+        switch message {
+        case .string(let s): text = s
+        case .data(let d): text = String(data: d, encoding: .utf8)
+        @unknown default: text = nil
+        }
+        guard let text, let data = text.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              (obj["type"] as? String) == "updated" else { return }
+        // Only pull when the broadcast version is genuinely newer than what we hold. This is the same
+        // version guard syncDown() enforces, checked up front so our own push echo (and the keep-alive
+        // pong) never triggers a redundant pull or a feedback loop with requestSyncSoon.
+        let version = (obj["version"] as? Int) ?? Int(obj["version"] as? Double ?? 0)
+        guard version > lastSyncedVersion else { return }
+        Task { await syncDown() }   // syncDown re-checks the guard, so this stays idempotent
+    }
+
+    private func scheduleReconnect() {
+        ws?.cancel(with: .abnormalClosure, reason: nil)
+        ws = nil
+        wsKeepAlive?.cancel(); wsKeepAlive = nil
+        guard realtimeActive, isSignedIn else { return }
+        let delay = wsBackoff
+        wsBackoff = min(wsBackoff * 2, wsMaxBackoff)
+        wsReconnect?.cancel()
+        wsReconnect = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            if Task.isCancelled { return }
+            await MainActor.run { self?.connectWebSocket() }
+        }
+    }
+
+    /// Periodic "ping" so an idle room (Hibernation API) keeps our socket; the worker replies "pong".
+    private func startKeepAlive() {
+        wsKeepAlive?.cancel()
+        wsKeepAlive = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: self?.keepAliveNanos ?? 30_000_000_000)
+                if Task.isCancelled { return }
+                guard let self, let task = self.ws else { return }
+                task.send(.string("ping")) { [weak self] error in
+                    if error != nil { Task { @MainActor in self?.scheduleReconnect() } }
+                }
+            }
+        }
+    }
+
+    /// Lightweight fallback: while active, pull every ~10s so changes propagate near-real-time even if the
+    /// WebSocket is unavailable. Cheap (the version guard skips no-op pulls) and cancelled on background.
+    private func startPoll() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: self?.pollIntervalNanos ?? 10_000_000_000)
+                if Task.isCancelled { return }
+                await self?.syncDown()   // guarded: applies only versions newer than ours, skips while a push is queued
+            }
         }
     }
 }

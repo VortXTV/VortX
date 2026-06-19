@@ -55,8 +55,12 @@ struct StremioXiOSApp: App {
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
                         Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
+                        VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     }
-                    if phase == .background { Task { await VortXSyncManager.shared.syncUp() } }   // push profiles + settings
+                    if phase == .background {
+                        VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
+                        Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                    }
                 }
                 .onAppear {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
