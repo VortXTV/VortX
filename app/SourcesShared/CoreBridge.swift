@@ -655,6 +655,11 @@ final class CoreBridge: ObservableObject {
     /// value) deliberately suppresses the account fallback. Do not "simplify" this to nil, or the
     /// caller would then resume the account's offset and play the wrong episode position.
     func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
+        // Overlay (non-owner) profile: the engine library item belongs to the owner account, so its saved
+        // resume position is not this profile's. Decline here so the caller falls back to account.resumeOffset,
+        // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
+        // throughout this file (markPlaybackWatched, removeFromLibrary, setLibraryItemWatched, finishedWatching).
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
         guard let item = metaDetails?.libraryItem else { return nil }
         if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId { return 0 }
         return max(0, item.state.timeOffset / 1000.0)
