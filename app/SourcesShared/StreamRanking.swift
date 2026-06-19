@@ -450,15 +450,13 @@ enum StreamRanking {
         return .unknown
     }
 
-    /// Small intra-tier provider preference. Real-Debrid sinks slightly (cache purges plus
-    /// throttling make it the least reliable of the majors), so at EQUAL quality any other
-    /// provider wins, while a better-quality RD stream still beats a worse one elsewhere.
-    /// When per-provider ranking becomes user-configurable this table becomes the default.
+    /// Intra-tier provider preference. NEUTRAL: no service is favoured or penalised, so debrid providers
+    /// rank purely by the user's source-type order + quality. The old Real-Debrid -150 penalty was removed
+    /// (do not single out any one service). Kept as the hook for a future user-configurable per-provider
+    /// order, which will populate this table.
     static func providerOffset(for provider: ServiceProvider) -> Int {
-        switch provider {
-        case .realDebrid: return -150
-        default:          return 0
-        }
+        _ = provider
+        return 0
     }
 
     /// File size in GB parsed from the add-on's stream text (name / description / filename),
