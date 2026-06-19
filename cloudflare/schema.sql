@@ -63,3 +63,13 @@ CREATE TABLE IF NOT EXISTS email_sends (
   ok   INTEGER NOT NULL    -- 1 = accepted by Cloudflare, 0 = send threw
 );
 CREATE INDEX IF NOT EXISTS idx_email_sends_ts ON email_sends (ts);
+
+-- Email-based password reset (forgot password AND lost recovery code). A short-lived 6-digit code,
+-- HMAC-hashed, with an attempt counter. Verifying it lets the client re-key the account into a FRESH
+-- vault (the old data can't be decrypted without the old password/recovery code, so it is cleared).
+CREATE TABLE IF NOT EXISTS password_resets (
+  account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  code_hash  TEXT    NOT NULL,
+  expires_at INTEGER NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0
+);
