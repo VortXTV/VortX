@@ -723,6 +723,34 @@ final class ProfileStore: ObservableObject {
         return cache
     }
 
+    /// Hydrate an OVERLAY profile's local watch overlay from a synced byProfile payload (cloud -> device,
+    /// the missing sync-down leg, so a secondary profile's library + CW show in the app on every device,
+    /// not just the dashboard). Merges per item last-writer-wins by lastWatched and UNIONs watchedVideoIds
+    /// so neither side's progress or watched-episodes are lost. Only ever writes overlay caches; an
+    /// engine-backed (owner) profile is skipped so the account library is never touched (the invariant).
+    func applyRemoteOverlay(profileID: UUID, entries: [String: WatchEntry]) {
+        guard !entries.isEmpty else { return }
+        if let p = profiles.first(where: { $0.id == profileID }), p.usesEngineHistory { return }
+        var current = watchEntries(for: profileID)
+        var changed = false
+        for (metaId, incoming) in entries {
+            guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
+            let union = Array(Set(existing.watchedVideoIds).union(incoming.watchedVideoIds))
+            if incoming.lastWatched > existing.lastWatched {
+                var merged = incoming; merged.watchedVideoIds = union
+                current[metaId] = merged; changed = true
+            } else if union.count != existing.watchedVideoIds.count {
+                existing.watchedVideoIds = union
+                current[metaId] = existing; changed = true
+            }
+        }
+        guard changed else { return }
+        if let data = try? JSONEncoder().encode(current) {
+            UserDefaults.standard.set(data, forKey: Self.watchCacheKey(profileID))
+        }
+        if active?.id == profileID { watch = current }   // refresh the live overlay if this is the active profile
+    }
+
     private static func isoNow() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

@@ -239,8 +239,11 @@ final class VortXSyncManager: ObservableObject {
             let cache = store.watchEntries(for: p.id)
             guard !cache.isEmpty else { continue }
             let library: [[String: Any]] = cache.map { (metaId, e) in
+                // t/d in seconds for the dashboard; v (resume episode/movie id) + w (watched episode ids)
+                // so syncDown can rebuild the FULL overlay on another device, not just library membership.
                 ["id": metaId, "name": e.name, "type": e.type, "poster": e.poster ?? "",
-                 "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched]
+                 "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched,
+                 "v": e.videoId ?? "", "w": e.watchedVideoIds]
             }
             byProfile[p.id.uuidString] = ["library": library]
         }
@@ -339,6 +342,34 @@ final class VortXSyncManager: ObservableObject {
                 let profileID = key == "default" ? nil : UUID(uuidString: key)
                 if key != "default", profileID == nil { continue }
                 SearchHistoryStore.merge(terms, for: profileID)
+            }
+            restored = true
+        }
+        // Per-profile library / Continue Watching for OVERLAY profiles (the missing leg): syncUp wrote each
+        // profile's overlay into doc.vortx.byProfile (what the dashboard reads); this pulls it BACK into the
+        // local overlay so a secondary profile's library + CW actually appear in the app on every device, not
+        // just the dashboard. ProfileStore.applyRemoteOverlay merges last-writer-wins per item and only ever
+        // touches overlay caches, never the owner/engine (account) library.
+        if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
+            for (idStr, raw) in byProfile {
+                guard let uuid = UUID(uuidString: idStr),
+                      let bucket = raw as? [String: Any],
+                      let lib = bucket["library"] as? [[String: Any]] else { continue }
+                var entries: [String: WatchEntry] = [:]
+                for item in lib {
+                    guard let metaId = item["id"] as? String, !metaId.isEmpty else { continue }
+                    let tSec = (item["t"] as? Int) ?? Int((item["t"] as? Double) ?? 0)
+                    let dSec = (item["d"] as? Int) ?? Int((item["d"] as? Double) ?? 0)
+                    let videoId = (item["v"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    var e = WatchEntry(videoId: videoId, timeOffsetMs: tSec * 1000, durationMs: dSec * 1000,
+                                       lastWatched: item["lastWatched"] as? String ?? "",
+                                       name: item["name"] as? String ?? "",
+                                       type: item["type"] as? String ?? "movie",
+                                       poster: (item["poster"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                    e.watchedVideoIds = item["w"] as? [String] ?? []
+                    entries[metaId] = e
+                }
+                ProfileStore.shared.applyRemoteOverlay(profileID: uuid, entries: entries)
             }
             restored = true
         }
