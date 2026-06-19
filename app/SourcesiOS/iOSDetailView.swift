@@ -165,6 +165,7 @@ struct iOSDetailView: View {
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
+    @State private var mdbRatings: MDBListRatings?
 
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
@@ -267,7 +268,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -281,7 +282,7 @@ struct iOSDetailView: View {
                 // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
-            if let m = meta { loadSimilar(m) }
+            if let m = meta { loadSimilar(m); loadRatings() }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -367,6 +368,7 @@ struct iOSDetailView: View {
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     titleOrLogo
                     metaRow
+                    ratingsRow
                 }
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
@@ -738,6 +740,53 @@ struct iOSDetailView: View {
         guard !hasStreams else { return }
         core.loadMeta(type: type, id: id, streamType: type, streamId: streamId)
     }
+
+    /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
+    /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
+    private var ratingsImdbID: String? {
+        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft: leaves the row
+    /// hidden on any miss. Skipped for live channels, which carry no ratings.
+    private func loadRatings() {
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
+        Task {
+            let r = await MDBListClient.ratings(imdbID: imdb, type: type)
+            await MainActor.run { mdbRatings = r }
+        }
+    }
+
+    /// Compact MDBList ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), shown only when the user has set
+    /// an MDBList key AND ratings came back. Renders nothing otherwise (no error UI). Same typography as
+    /// metaRow so it reads as a second fact line under the title.
+    @ViewBuilder private var ratingsRow: some View {
+        if let text = mdbRatings.flatMap(Self.mdbRatingsText), !text.isEmpty {
+            Text(text)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(1).truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Build the joined ratings string from the decoded model, or nil when nothing is present.
+    private static func mdbRatingsText(_ r: MDBListRatings) -> String? {
+        var parts: [String] = []
+        if let v = r.imdb { parts.append("IMDb \(mdbImdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
+        if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
+        if let v = r.tmdb { parts.append("TMDB \(v)%") }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
+    }
+
+    /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
+    private static let mdbImdbFmt: NumberFormatter = {
+        let f = NumberFormatter()
+        f.minimumFractionDigits = 1
+        f.maximumFractionDigits = 1
+        return f
+    }()
 
     /// Apply the Direct-links-only filter (drop every torrent source) so a user with the setting on
     /// never sees or auto-plays a torrent — the exact `displayGroups` the tvOS `CoreStreamList` uses.

@@ -13,6 +13,7 @@ struct DetailView: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
 
     @State private var similarItems: [MetaPreview] = []
+    @State private var mdbRatings: MDBListRatings?
 
     var body: some View {
         Group {
@@ -56,7 +57,7 @@ struct DetailView: View {
                 core.loadMeta(type: type, id: id)
             }
             captureHero()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
         }
         .onDisappear {
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
@@ -67,7 +68,24 @@ struct DetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
+        }
+    }
+
+    /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
+    /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
+    private var ratingsImdbID: String? {
+        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft: leaves the row
+    /// hidden on any miss. Skipped for live channels, which carry no ratings.
+    private func loadRatings() {
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
+        Task {
+            let r = await MDBListClient.ratings(imdbID: imdb, type: type)
+            await MainActor.run { mdbRatings = r }
         }
     }
 
@@ -175,6 +193,7 @@ struct DetailView: View {
                                 .lineLimit(2).minimumScaleFactor(0.6)
                                 .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                             metaRow(m)
+                            ratingsRow()
                             if let d = m.description, !d.isEmpty {
                                 Text(d)
                                     .font(Theme.Typography.body)
@@ -330,6 +349,7 @@ struct DetailView: View {
                     .lineLimit(2).minimumScaleFactor(0.6)
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                 metaRow(m)
+                ratingsRow()
                 if let d = m.description, !d.isEmpty {
                     Text(d)
                         .font(Theme.Typography.body)
@@ -415,6 +435,34 @@ struct DetailView: View {
         .font(Theme.Typography.label)
         .foregroundStyle(Theme.Palette.textSecondary)
     }
+
+    /// Compact MDBList ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), shown only when the user has set
+    /// an MDBList key AND ratings came back. Renders nothing otherwise (no error UI). Same typography as
+    /// metaRow so it reads as a second fact line under the title.
+    @ViewBuilder private func ratingsRow() -> some View {
+        if let text = mdbRatings.flatMap(Self.ratingsText), !text.isEmpty {
+            Text(text)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
+    /// Build the joined ratings string from the decoded model, or nil when nothing is present.
+    private static func ratingsText(_ r: MDBListRatings) -> String? {
+        var parts: [String] = []
+        if let v = r.imdb { parts.append("IMDb \(imdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
+        if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
+        if let v = r.tmdb { parts.append("TMDB \(v)%") }
+        return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
+    }
+
+    /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
+    private static let imdbFmt: NumberFormatter = {
+        let f = NumberFormatter()
+        f.minimumFractionDigits = 1
+        f.maximumFractionDigits = 1
+        return f
+    }()
 
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
