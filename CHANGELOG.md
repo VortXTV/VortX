@@ -4,7 +4,7 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.8 - 2026-06-18 (pre-release)
+## 0.3.8 - 2026-06-19 (pre-release)
 
 The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your profiles and settings follow you between devices, the server only ever holds ciphertext. This build fixes the headline problem from the first beta: your devices now actually sync to each other. Plus in-app add-on management, a catalog manager, optional TMDB-powered recommendations, and a batch of fixes. This is a pre-release for testing; QR sign-in on Apple TV and one-tap Stremio sign-in are coming in 0.3.9.
 
@@ -20,7 +20,7 @@ The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your pr
 
 ### Fixed
 
-- **Profiles and settings now sync between your devices automatically,** by pulling the latest from your account each time you open the app, not only on sign-in. Before, a device only pushed its own changes and never picked up another device's, so Apple TV profiles never reached iPhone or Mac.
+- **Profiles and settings now sync between your devices live, without a relaunch.** Open the app and it pulls and applies the latest from your account, so a profile or setting you change on one device shows up on the others. An earlier beta pulled the data but did not apply it to the running app, so profiles could appear to flip back; that is fixed.
 - **Two-factor no longer shows as off in the app** after you enable it; it refreshes its status from the server.
 - **The sign-in field reads "Email or username,"** since either one works.
 - **Your TMDB and MDBList keys are masked** in Settings instead of shown in plain text.
