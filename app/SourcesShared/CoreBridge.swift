@@ -779,6 +779,21 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "AddToLibrary", "args": meta])
     }
 
+    /// Add a real Cinemeta catalog title to the ACCOUNT (engine) library, used when a dashboard
+    /// add-to-library targets the OWNER profile (whose library is the account itself, not a per-profile
+    /// overlay), regardless of which profile is active locally. Resolves the full meta (the engine wants
+    /// the full object, like addDetailToLibrary) and dispatches it. The id must be a real catalog id.
+    @MainActor
+    func addCatalogItemToAccount(id: String, type: String) async {
+        let safeType = (type == "series") ? "series" : "movie"
+        let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
+              let (data, _) = try? await URLSession.shared.data(from: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return }
+        dispatchCtx(["action": "AddToLibrary", "args": meta])
+    }
+
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
     func setCatalogWatched(metaId: String, _ isWatched: Bool) {
