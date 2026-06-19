@@ -8,10 +8,13 @@ import SwiftUI
 /// This hero is an AMBIENT BILLBOARD, decoupled from the catalog grid: the model rotates it through a
 /// random pool of top items as a still backdrop, and rotation quiets while the user interacts. It does
 /// NOT auto-select / focus / ring any poster, and tapping a poster opens that title via normal
-/// navigation rather than "featuring" it here (issue #53). The hero never plays a trailer inline — the
-/// dead in-hero YouTube autoplay layer (issue #46/#1/#3, "Error 153" widget that occluded the art) was
-/// removed; the Play button opens the title's detail and the Trailer chip plays in a full-screen cover.
-/// The cross-fade and rotation honour `accessibilityReduceMotion` (the view swaps instantly when set).
+/// navigation rather than "featuring" it here (issue #53). When the featured item has a trailer id and
+/// motion is allowed, a muted, looping YouTube clip plays as the hero backdrop (#44) via the keyless
+/// IFrame embed (`YouTubeEmbedView`); the still backdrop underneath is the permanent fallback, so a
+/// missing / slow / blocked clip never occludes the art (this is the correct fix for the old "Error 153"
+/// autoplay layer that was removed in issue #46/#1/#3). The Play button opens the title's detail and the
+/// Trailer chip plays the trailer in-app in a full-screen cover. The cross-fade, rotation, and the hero
+/// clip honour `accessibilityReduceMotion` (the view swaps instantly and the clip is skipped when set).
 struct FeaturedHeroView: View {
     @ObservedObject var model: FeaturedHeroModel
     /// Open the featured title's detail page (hero Play button).
@@ -19,6 +22,9 @@ struct FeaturedHeroView: View {
 
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// The yt id presented full-screen by the Trailer chip (Bug A in the hero). Drives a cover.
+    @State private var trailerEmbedID: String?
 
 
     /// Hero band height. iOS is 380: a bit bigger than the 0.3.0 320 (the user wanted a larger billboard),
@@ -36,9 +42,12 @@ struct FeaturedHeroView: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            // The still backdrop image — the only art layer. No trailer webview is ever mounted over
-            // it, so nothing can occlude the artwork (issue #46/#1/#3).
+            // The still backdrop image is the base art layer and the permanent fallback: the muted clip
+            // (#44) only paints OVER it when a trailer id resolves, so a missing / slow / blocked embed
+            // never leaves the band black — the artwork always shows through. Reduce-motion skips the
+            // clip entirely.
             backdrop
+            heroClip
             if let hero = model.hero {
                 content(hero)
                     .padding(.horizontal, Theme.Space.md)
@@ -57,6 +66,52 @@ struct FeaturedHeroView: View {
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
+        // Bug A in the hero: the Trailer chip presents the in-app YouTube embed full-screen (a media
+        // cover, so it fills the window on macOS too).
+        .platformFullScreenPlayerCover(item: trailerEmbedCoverItem) { item in
+            TrailerEmbedCover(youTubeID: item.id, title: model.hero?.name ?? "Trailer",
+                              onClose: { trailerEmbedID = nil })
+        }
+    }
+
+    /// The muted, looping, chromeless in-hero clip (#44). Mounted over the backdrop ONLY when motion is
+    /// allowed and the featured item has a resolved trailer id. Keyed on the hero id so it reloads per
+    /// item; the still backdrop underneath is the fallback when no clip plays. Decorative — the title /
+    /// meta read first for VoiceOver.
+    @ViewBuilder private var heroClip: some View {
+        if !reduceMotion, let hero = model.hero, let yt = hero.trailerYouTubeID, !yt.isEmpty {
+            YouTubeEmbedView(youTubeID: yt, mode: .background)
+                .frame(height: heroHeight)
+                .frame(maxWidth: .infinity)
+                .clipped()
+                .allowsHitTesting(false)       // the clip is ambient; taps fall through to the chrome
+                .id("hero-clip-\(hero.id)")    // reload the embed for each new featured item
+                .transition(reduceMotion ? .identity : .opacity)
+                .overlay(
+                    // Reuse the same dual scrim the backdrop uses so the title/meta stay legible over
+                    // video, and the band still dissolves into the page below.
+                    LinearGradient(stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.5),
+                        .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.82),
+                        .init(color: Theme.Palette.canvas, location: 1.0),
+                    ], startPoint: .top, endPoint: .bottom)
+                )
+                .overlay(
+                    LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
+                                   startPoint: .leading, endPoint: .center)
+                )
+                .accessibilityHidden(true)
+        }
+    }
+
+    /// Binding of the Identifiable yt-id box that drives the cover. Maps the `String?` state into the
+    /// `Binding<TrailerEmbedID?>` the cover modifier expects; clearing it dismisses.
+    private var trailerEmbedCoverItem: Binding<TrailerEmbedID?> {
+        Binding(
+            get: { trailerEmbedID.map(TrailerEmbedID.init) },
+            set: { trailerEmbedID = $0?.id }
+        )
     }
 
     // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)
@@ -220,11 +275,11 @@ struct FeaturedHeroView: View {
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
     /// Tapping it opens an explicit full-screen player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
-        if let yt = hero.trailerYouTubeID, let watch = URL(string: "https://www.youtube.com/watch?v=\(yt)") {
+        if let yt = hero.trailerYouTubeID, !yt.isEmpty {
             Button {
-                // Open the trailer in the YouTube app / browser. The in-app `/yt` resolver (ytdl-core)
-                // currently 403s, so external open is the reliable path (no WKWebView "Error 153").
-                TrailerOpener.open(watch)
+                // Play the trailer in-app via the keyless YouTube IFrame embed (Bug A) — same as the
+                // detail page. No external hand-off, no Error 153.
+                trailerEmbedID = yt
             } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }
@@ -232,3 +287,6 @@ struct FeaturedHeroView: View {
         }
     }
 }
+
+/// Identifiable yt-id box for `platformFullScreenCover(item:)` (the hero Trailer chip, Bug A).
+private struct TrailerEmbedID: Identifiable { let id: String }

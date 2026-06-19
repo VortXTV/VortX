@@ -170,14 +170,18 @@ struct iOSDetailView: View {
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
         case player(PlayerLaunch)
-        /// A trailer plays in the SAME native mpv player as a stream (resolved via the embedded
-        /// server's `/yt` route), not a WKWebView IFrame — so no YouTube Error 153. recordMeta is
-        /// nil for these so a trailer never lands in Continue Watching.
+        /// A non-YouTube (direct) trailer stream plays in the SAME native mpv player as a stream.
+        /// recordMeta is nil for these so a trailer never lands in Continue Watching.
         case trailerPlayer(url: URL, title: String)
+        /// A YouTube trailer (Bug A): plays via the keyless YouTube IFrame embed in a WKWebView
+        /// (`YouTubeEmbedView`, interactive mode). This takes ONLY the yt id, so it can never fall
+        /// through to the feature movie stream the way a stream-pipeline trailer could.
+        case trailerEmbed(youTubeID: String, title: String)
         var id: String {
             switch self {
             case .player(let l): "player-\(l.id)"
             case .trailerPlayer(_, let t): "trailer-\(t)"
+            case .trailerEmbed(let yt, _): "trailer-embed-\(yt)"
             }
         }
     }
@@ -315,24 +319,28 @@ struct iOSDetailView: View {
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
                              recordMeta: nil, isTrailer: true, onClose: { presentation = nil })
                     .ignoresSafeArea()
+            case .trailerEmbed(let youTubeID, let title):
+                TrailerEmbedCover(youTubeID: youTubeID, title: title, onClose: { presentation = nil })
             }
         }
     }
 
-    /// Open the meta's trailer in the native mpv player via the embedded server's `/yt` route — the
-    /// same path tvOS uses, so it plays a real video stream instead of a WKWebView IFrame (which
-    /// YouTube rejected with Error 153). Falls back to the public YouTube link externally if no
-    /// playable URL resolves (e.g. server still cold-starting, or a no-server build).
+    /// Bug A: present the meta's trailer. A non-YouTube (direct) trailer stream plays natively in mpv;
+    /// a YouTube trailer plays IN-APP via the keyless YouTube IFrame embed (`YouTubeEmbedView`), the
+    /// same mechanism the official Stremio client uses. The embed takes only the yt id, so it can never
+    /// fall through to the feature movie stream — which is exactly the failure Bug A described. The old
+    /// path (external-open / `/yt` ytdl-core resolver, which 403s) is only the last-resort fallback when
+    /// a YouTube-only trailer somehow has no usable id.
     private func playTrailer() {
         guard let m = meta, let req = TrailerRequest.from(meta: m) else { return }
         if let direct = req.directURL {
             // A real (non-YouTube) trailer stream plays natively in mpv.
             presentation = .trailerPlayer(url: direct, title: "\(m.name) — Trailer")
+        } else if let yt = req.youTubeID, !yt.isEmpty {
+            // YouTube trailer → in-app IFrame embed. No key, no extraction, no Error 153.
+            presentation = .trailerEmbed(youTubeID: yt, title: "\(m.name) — Trailer")
         } else if let watch = req.watchURL {
-            // YouTube trailers open in the YouTube app / browser. The in-app `/yt` resolver (ytdl-core)
-            // currently 403s — YouTube changed its player and broke extraction — so external open is the
-            // reliable path; it never hits the old WKWebView "Error 153". In-app YouTube playback is
-            // tracked for a follow-up (server-side resolver update).
+            // Defensive fallback only: open externally if no embeddable id resolved.
             TrailerOpener.open(watch)
         }
     }
