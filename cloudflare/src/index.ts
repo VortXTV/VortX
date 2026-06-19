@@ -143,6 +143,7 @@ const b64Len = (s: string): number => { try { return unb64(s).length; } catch { 
 const RL_PATHS = new Set([
   "/v1/auth/login", "/v1/auth/register", "/v1/auth/prelogin",
   "/v1/auth/recover-start", "/v1/auth/recover-complete", "/v1/auth/change-password", "/v1/auth/recovery/regenerate",
+  "/v1/auth/reset/start", "/v1/auth/reset/complete",
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
 ]);
@@ -169,6 +170,12 @@ function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): strin
       + `<div style="font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:18px;font-weight:700;letter-spacing:.03em;color:#1a1206;word-break:break-all">${opts.recoveryCode}</div></div>`
       + `<p style="margin:8px 0 0;color:#9a6a1e;font-size:12.5px;line-height:1.5">Anyone with this code and your email could recover your account, so save it offline and delete this email afterward. We cannot resend it or reset it for you.</p>`
     : "";
+  const code6 = opts.code
+    ? `<div style="margin:22px 0 8px;padding:16px 18px;background:#fbf3e2;border:1px solid #e7c986;border-radius:12px">`
+      + `<div style="color:#7a5a1e;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Your reset code</div>`
+      + `<div style="font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:27px;font-weight:700;letter-spacing:.2em;color:#1a1206">${opts.code}</div></div>`
+      + `<p style="margin:8px 0 0;color:#9a6a1e;font-size:12.5px;line-height:1.5">This code expires in 15 minutes. Completing a reset starts a fresh, empty vault, your old synced data cannot be recovered without your old password or recovery code.</p>`
+    : "";
   const note = opts.note
     ? `<p style="margin:20px 0 0;padding:13px 15px;background:#f3ecdd;border-radius:10px;color:#6a5a3c;font-size:13px;line-height:1.55">${opts.note}</p>`
     : "";
@@ -182,13 +189,14 @@ function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): strin
     + `<img src="${MAIL_LOGO}" width="36" height="36" alt="" style="vertical-align:middle;display:inline-block;border:0">`
     + `<span style="vertical-align:middle;display:inline-block;margin-left:9px;font-size:23px;font-weight:800;letter-spacing:-.5px;color:#b45309">VortX</span></td></tr>`
     + `<tr><td style="background:#ffffff;border:1px solid #e7ddc7;border-radius:18px;padding:30px 28px">`
-    + `<h1 style="margin:0 0 16px;font-size:21px;font-weight:800;letter-spacing:-.4px;color:#1a1206">${heading}</h1>${body}${code}${note}</td></tr>`
+    + `<h1 style="margin:0 0 16px;font-size:21px;font-weight:800;letter-spacing:-.4px;color:#1a1206">${heading}</h1>${body}${code}${code6}${note}</td></tr>`
     + `<tr><td style="padding:18px 8px 0;color:#9b8a6c;font-size:12px;line-height:1.5">VortX is end to end encrypted, so we can never read your data. You received this because of activity on your VortX account.</td></tr>`
     + `</table></td></tr></table></body></html>`;
 }
 function emailText(heading: string, lines: string[], opts: MailOpts = {}): string {
   let t = `VortX\n\n${heading}\n\n${lines.join("\n\n")}`;
   if (opts.recoveryCode) t += `\n\nYour recovery code: ${opts.recoveryCode}\n(Save it offline and delete this email. Anyone with this code and your email could recover your account. We cannot resend or reset it.)`;
+  if (opts.code) t += `\n\nYour reset code: ${opts.code}\n(Expires in 15 minutes. Completing a reset starts a fresh, empty vault; old synced data cannot be recovered without your old password or recovery code.)`;
   if (opts.note) t += `\n\n${opts.note}`;
   return t + `\n\nVortX is end to end encrypted, so we can never read your data.`;
 }
@@ -232,6 +240,8 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/auth/recover-start" && m === "POST") return recoverStart(request, env);
       if (p === "/v1/auth/recover-complete" && m === "POST") return recoverComplete(request, env);
       if (p === "/v1/auth/recovery/regenerate" && m === "POST") return recoveryRegenerate(request, env);
+      if (p === "/v1/auth/reset/start" && m === "POST") return resetStart(request, env);
+      if (p === "/v1/auth/reset/complete" && m === "POST") return resetComplete(request, env);
       if (p === "/v1/auth/change-password" && m === "POST") return changePassword(request, env);
       if (p === "/v1/auth/2fa/enroll" && m === "POST") return twofaEnroll(request, env);
       if (p === "/v1/auth/2fa/activate" && m === "POST") return twofaActivate(request, env);
@@ -423,6 +433,99 @@ async function recoverComplete(req: Request, env: Env): Promise<Response> {
 // --- Regenerate the recovery code (logged in, data-preserving): the client re-wraps the SAME data key
 // under a brand-new recovery code and sends the new wrapped key + verifier. The old code stops working.
 // We email the new code (the client passes it; never stored). This is the "refresh my recovery code" flow. ---
+const RESET_TTL_MS = 15 * 60 * 1000, RESET_MAX_ATTEMPTS = 5, RESET_REISSUE_COOLDOWN_MS = 60 * 1000;
+
+// 6-digit reset code, rejection-sampled so the modulo does not bias the distribution (2^32 is not a
+// multiple of 1e6). 4_294_000_000 = floor(2^32 / 1e6) * 1e6.
+function gen6(): string {
+  let n = crypto.getRandomValues(new Uint32Array(1))[0];
+  while (n >= 4_294_000_000) n = crypto.getRandomValues(new Uint32Array(1))[0];
+  return (n % 1_000_000).toString().padStart(6, "0");
+}
+async function hmacCode(secret: string, code: string): Promise<string> {
+  return b64(new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey(secret), enc("reset:" + code))));
+}
+
+// Email-code password reset, for a user who lost BOTH their password AND their recovery code. It can only
+// restore ACCESS, never the encrypted data (the old data key is unrecoverable without the old password or
+// recovery code), so completing it mints a FRESH, empty vault and deletes the old backup. The 6-digit code
+// is HMAC'd with SESSION_SECRET and only ever lives in the email, never in the DB (same zero-knowledge
+// discipline as the welcome-email recovery code).
+async function resetStart(req: Request, env: Env): Promise<Response> {
+  const b = await readJSON(req);
+  const login = isStr(b?.login, 254) ? (b!.login as string).trim().toLowerCase() : "";
+  if (!login) return json({ error: "bad_request" }, 400);
+  const row = await env.DB.prepare("SELECT id, email FROM accounts WHERE email = ? OR username = ?")
+    .bind(login, login).first<{ id: string; email: string }>();
+  if (row) {
+    // Re-issue cooldown: while a fresh code is still pending (< 60s old), do not mint another. Without this,
+    // repeated reset/start calls hand out new 5-guess windows on the 6-digit space (per-IP rate-limiting
+    // alone is defeated by IP rotation).
+    const existing = await env.DB.prepare("SELECT expires_at FROM password_resets WHERE account_id = ?")
+      .bind(row.id).first<{ expires_at: number }>();
+    const issuedAt = existing ? existing.expires_at - RESET_TTL_MS : 0;
+    if (!existing || Date.now() - issuedAt >= RESET_REISSUE_COOLDOWN_MS) {
+      const code = gen6();
+      await env.DB.prepare(
+        `INSERT INTO password_resets (account_id, code_hash, expires_at, attempts) VALUES (?,?,?,0)
+         ON CONFLICT(account_id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, attempts = 0`,
+      ).bind(row.id, await hmacCode(env.SESSION_SECRET, code), Date.now() + RESET_TTL_MS).run();
+      await sendMail(env, row.email, "Your VortX password reset code", "Reset your password", [
+        "Enter this code in VortX to reset your password. It expires in 15 minutes.",
+        "Resetting starts a fresh, empty vault: your synced library, add-ons, and settings cannot be recovered without your old password or recovery code. If you remember either, cancel this and sign in instead.",
+      ], { code });
+    }
+  }
+  return json({ ok: true }); // always ok, so a reset request cannot enumerate accounts
+}
+
+async function resetComplete(req: Request, env: Env): Promise<Response> {
+  const b = await readJSON(req);
+  const login = isStr(b?.login, 254) ? (b!.login as string).trim().toLowerCase() : "";
+  const code = isStr(b?.code, 6) ? (b!.code as string).trim() : "";
+  const authVerifier = isStr(b?.authVerifier) ? (b!.authVerifier as string) : "";
+  const wrappedKeyPw = isStr(b?.wrappedKeyPassword) ? (b!.wrappedKeyPassword as string) : "";
+  const wrappedKeyRec = isStr(b?.wrappedKeyRecovery) ? (b!.wrappedKeyRecovery as string) : "";
+  const recVerifier = isStr(b?.recVerifier) ? (b!.recVerifier as string) : "";
+  if (!login || !/^\d{6}$/.test(code) || b64Len(authVerifier) !== 32 || !wrappedKeyPw) {
+    return json({ error: "bad_request" }, 400);
+  }
+  const row = await env.DB.prepare("SELECT id, email, username_display FROM accounts WHERE email = ? OR username = ?")
+    .bind(login, login).first<any>();
+  if (!row) return json({ error: "invalid_code" }, 401);
+  const pr = await env.DB.prepare("SELECT code_hash, expires_at, attempts FROM password_resets WHERE account_id = ?")
+    .bind(row.id).first<{ code_hash: string; expires_at: number; attempts: number }>();
+  if (!pr || pr.expires_at < Date.now() || pr.attempts >= RESET_MAX_ATTEMPTS) return json({ error: "invalid_code" }, 401);
+  if (!ctEqual(await hmacCode(env.SESSION_SECRET, code), pr.code_hash)) {
+    await env.DB.prepare("UPDATE password_resets SET attempts = attempts + 1 WHERE account_id = ?").bind(row.id).run();
+    return json({ error: "invalid_code" }, 401);
+  }
+  // Verified. The user has neither the old password nor the old recovery code, so they cannot unwrap the old
+  // data key: the client minted a FRESH data key + a fresh recovery code. Re-key like register, but NEVER
+  // rotate kdf_salt (M-4: it also derives the recovery key). Clear 2FA + bump session_version (H-1).
+  const authSalt = crypto.getRandomValues(new Uint8Array(16));
+  const recSalt = crypto.getRandomValues(new Uint8Array(16));
+  await env.DB.prepare(
+    `UPDATE accounts SET auth_salt = ?, auth_hash = ?, wrapped_key_pw = ?, wrapped_key_rec = ?,
+       rec_verifier_hash = ?, rec_verifier_salt = ?, totp_secret = NULL, totp_pending = NULL,
+       session_version = session_version + 1 WHERE id = ?`,
+  ).bind(
+    b64(authSalt), await pbkdf2(authVerifier, authSalt, SERVER_ITERS), wrappedKeyPw, wrappedKeyRec || null,
+    recVerifier ? await pbkdf2(recVerifier, recSalt, SERVER_ITERS) : null, recVerifier ? b64(recSalt) : null, row.id,
+  ).run();
+  // The old backup is ciphertext under the OLD data key, undecryptable by the fresh key, so delete it. It is
+  // deliberately NOT emailed: the blob can be large, the EMAIL binding has no attachment, and a best-effort
+  // send could silently fail, leaving the user thinking they kept a copy of data they cannot actually decrypt.
+  await env.DB.prepare("DELETE FROM backups WHERE account_id = ?").bind(row.id).run();
+  await env.DB.prepare("DELETE FROM password_resets WHERE account_id = ?").bind(row.id).run();
+  await sendMail(env, row.email, "Your VortX password was reset", "Your password was reset with an email code", [
+    "Your VortX password was reset using an email code, you were signed out everywhere, and two-factor was turned off.",
+    "Because the reset could not carry over your old encrypted data, you are starting with a fresh, empty vault.",
+    "If this was not you, reset again immediately and secure your email.",
+  ]);
+  return json({ token: await makeSession(row.id, env, await accountSessionVersion(row.id, env)), account: pub(row) });
+}
+
 async function recoveryRegenerate(req: Request, env: Env): Promise<Response> {
   const id = await requireAuth(req, env);
   if (!id) return json({ error: "unauthorized" }, 401);
