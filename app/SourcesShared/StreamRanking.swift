@@ -518,7 +518,29 @@ enum StreamRanking {
     }
 
     /// Drop streams that fail the user filters, and any group left empty. No-op when nothing is set.
+    /// Aggregator "reasons / statistics" pseudo-streams (AIOStreams Stream-Expression output, SeaDex/SEL
+    /// setups, etc.) are a filter EXPLANATION, not playable video. They inherit the resolution-group tag
+    /// they describe (often "4K"), which wrongly made them the top "Watch in 4K" pick and inflated the 4K
+    /// bucket while every real stream was 1080p. Detect by the diagnostic headings these add-ons emit and
+    /// drop them from EVERY path (ranking, the quality buckets, the Watch-in label, the dropdown).
+    static func isNonVideo(_ s: CoreStream) -> Bool {
+        let t = qualityText(s)
+        let markers = ["included reasons", "removal reasons", "excluded resolution", "stream expression",
+                       "year matching", "no streams found", "no results found", "stream statistics"]
+        return markers.contains { t.contains($0) }
+    }
+
+    /// Strip the non-video diagnostic pseudo-streams unconditionally (BEFORE the user-filter early-out),
+    /// so they are gone even when the user has no quality filters active.
+    private static func stripNonVideo(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        groups.compactMap { group in
+            let kept = group.streams.filter { !isNonVideo($0) }
+            return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)
+        }
+    }
+
     static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
         let prefs = SourcePreferences.shared
         guard !prefs.noFiltersActive else { return groups }
         return groups.compactMap { group in
