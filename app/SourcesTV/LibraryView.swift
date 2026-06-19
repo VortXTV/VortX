@@ -6,6 +6,7 @@ struct LibraryView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @StateObject private var focusModel = FocusedItemModel()
     private let columns = Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
 
@@ -18,18 +19,30 @@ struct LibraryView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
-                        if let library = core.library {
-                            filters(library.selectable)
-                            if library.catalog.isEmpty {
-                                hint("Your library is empty. Add titles to your library in Stremio and they will show up here.")
+                        if profiles.activeUsesEngineHistory {
+                            // Owner profile: the account library (engine), with its type/sort filters.
+                            if let library = core.library {
+                                filters(library.selectable)
+                                if library.catalog.isEmpty {
+                                    hint("Your library is empty. Add titles to your library in Stremio and they will show up here.")
+                                } else {
+                                    grid(library.catalog)
+                                }
+                            } else if account.isSignedIn {
+                                BigSpinner()
+                                    .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                             } else {
-                                grid(library.catalog)
+                                CoreEmptyState.signedOut
                             }
-                        } else if account.isSignedIn {
-                            BigSpinner()
-                                .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                         } else {
-                            CoreEmptyState.signedOut
+                            // Overlay profile: its own private watch overlay (never the account). No
+                            // engine `selectable`, so the filter chips are omitted.
+                            let items = profiles.libraryItems
+                            if items.isEmpty {
+                                hint("This profile's library is empty. Titles it watches show up here.")
+                            } else {
+                                grid(items)
+                            }
                         }
                     }
                     .padding(.top, Theme.Space.sm)
@@ -43,10 +56,12 @@ struct LibraryView: View {
         // first load can land before ctx.library is populated. Revisiting the tab refills it.
         .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
         .onChange(of: core.library?.catalog.first?.id) { seed() }
+        .onChange(of: profiles.activeID) { seed() }
     }
 
     private func seed() {
-        focusModel.seedIfEmpty(core.library?.catalog.first?.focusedHero)
+        let first = profiles.activeUsesEngineHistory ? core.library?.catalog.first : profiles.libraryItems.first
+        focusModel.seedIfEmpty(first?.focusedHero)
     }
 
     private func filters(_ selectable: CoreLibrarySelectable) -> some View {

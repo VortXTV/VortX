@@ -493,6 +493,21 @@ final class ProfileStore: ObservableObject {
         return dated.sorted { $0.lastWatched > $1.lastWatched }.prefix(30).map(\.item)
     }
 
+    /// The active overlay profile's full Library: EVERY title it has watched, newest first. Unlike
+    /// cwItems it keeps finished movies and titles with no progress yet, so it reads as a "saved
+    /// titles" library rather than a Continue Watching rail. Built exactly like cwItems otherwise.
+    var libraryItems: [CoreCWItem] {
+        var dated: [(lastWatched: String, item: CoreCWItem)] = []
+        for (metaId, entry) in watch {
+            let item = CoreCWItem(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
+                                  state: CoreLibState(timeOffset: Double(entry.timeOffsetMs),
+                                                      duration: Double(entry.durationMs),
+                                                      videoId: entry.videoId))
+            dated.append((entry.lastWatched, item))
+        }
+        return dated.sorted { $0.lastWatched > $1.lastWatched }.map(\.item)
+    }
+
     /// Player progress for an overlay profile (the StremioAccount/CoreBridge layers route here
     /// when the active profile keeps its own history).
     func recordProgress(meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double) {

@@ -204,6 +204,7 @@ struct iOSHomeView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
@@ -214,9 +215,11 @@ struct iOSHomeView: View {
     /// All Home rail items in display order (Continue Watching first, then catalog rows), as
     /// `RailItem`s carrying the catalog preview fields so the hero seeds richly. CW entries also
     /// carry their in-progress `video_id` so a direct resume can confirm the remembered link
-    /// still matches the episode the engine is parked on.
+    /// still matches the episode the engine is parked on. The owner profile rides the account's
+    /// engine history; an overlay profile rides its own private synced overlay (never the account).
     private var continueWatchingItems: [RailItem] {
-        core.continueWatching.map {
+        let source = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        return source.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
                      cwVideoId: $0.state.videoId)
         }
@@ -233,7 +236,9 @@ struct iOSHomeView: View {
         // no network round-trip. Falls back to the bare CW seed + enrichment for titles not in a catalog.
         let metaByID = Dictionary(core.boardRows.flatMap { $0.items }.map { ($0.id, $0) },
                                   uniquingKeysWith: { first, _ in first })
-        var items: [FeaturedHeroItem] = core.continueWatching.prefix(3).map { cw in
+        // Overlay profiles seed from their own watch overlay, never the account's CW.
+        let cwSource = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        var items: [FeaturedHeroItem] = cwSource.prefix(3).map { cw in
             if let meta = metaByID[cw.id] { return FeaturedHeroItem.from(meta: meta) }
             return FeaturedHeroItem.from(cw: cw)
         }
@@ -281,7 +286,9 @@ struct iOSHomeView: View {
                                 }
                         }
                     }
-                    if core.boardRows.isEmpty && core.continueWatching.isEmpty {
+                    // Use the profile-aware CW source so an overlay profile WITH history never reads as
+                    // empty, and one with none still shows the empty state honestly.
+                    if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
                         emptyState
                     }
                 }
@@ -375,12 +382,16 @@ struct iOSLibraryView: View {
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @State private var path: [FeaturedHeroItem] = []
 
+    /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
+    /// own private watch overlay (every watched title), never the account.
     private var libraryItems: [RailItem] {
-        (core.library?.catalog ?? []).map {
+        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        return source.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
         }
     }
@@ -388,13 +399,18 @@ struct iOSLibraryView: View {
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
     /// tvOS) the hero derives 16:9 art from metahub for IMDB ids and enriches the rest in the background.
     private var heroCandidates: [FeaturedHeroItem] {
-        (core.library?.catalog ?? []).prefix(5).map(FeaturedHeroItem.from(cw:))
+        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        return source.prefix(5).map(FeaturedHeroItem.from(cw:))
     }
 
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
-                if let lib = core.library, !lib.catalog.isEmpty {
+                // The owner profile's Library is the account library (engine), with its type/sort filter
+                // chips; an overlay profile's Library is its own private watch overlay, with no engine
+                // `selectable` so the filter chips are omitted. Both gate on the profile-aware
+                // `libraryItems`, so an overlay profile WITH history shows its grid (not "empty").
+                if !libraryItems.isEmpty {
                     // Hero is an ambient billboard scroll-header above the grid (shown only when there
                     // are saved titles), so its Play / Trailer buttons stay tappable. Type + sort
                     // filter chip rows (#15) sit between the hero and the grid, mirroring the Discover
@@ -407,7 +423,9 @@ struct iOSLibraryView: View {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                            filterChips(lib.selectable)
+                            if profiles.activeUsesEngineHistory, let lib = core.library {
+                                filterChips(lib.selectable)
+                            }
                             PosterGrid(items: libraryItems, onTap: handleTap, menu: .library)
                         }
                     }
