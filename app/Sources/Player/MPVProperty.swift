@@ -13,6 +13,10 @@ struct MPVProperty {
     static let pausedForCache = "paused-for-cache"
     static let timePos = "time-pos"
     static let duration = "duration"
+    /// Whether the current stream can be seeked within. A VOD becomes seekable once playback starts;
+    /// a true live feed stays non-seekable. PlayerScreen uses this for runtime live-detection so a live
+    /// stream whose meta type isn't in `LiveTypes` still gets live treatment (no resume/progress/mark-watched).
+    static let seekable = "seekable"
     static let trackList = "track-list"
     static let aid = "aid"
     static let sid = "sid"
