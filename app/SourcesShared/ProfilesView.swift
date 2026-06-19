@@ -278,12 +278,16 @@ struct ProfileEditorView: View {
     let original: UserProfile
     @EnvironmentObject private var store: ProfileStore
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var account: StremioAccount   // for the locked-panel "Switch profile" reload
+    @EnvironmentObject private var core: CoreBridge          // (mirrors ProfilePickerView's switch path)
     @Environment(\.dismiss) private var dismiss
 
     @State private var draft: UserProfile
     @State private var pinText: String
     @State private var customAvatar = ""
     @State private var confirmDelete = false
+    @State private var switchPinPrompt = false   // PIN gate when switching INTO a locked profile
+    @State private var signInNeeded = false      // an own-account profile with no stored token
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
 
@@ -427,10 +431,19 @@ struct ProfileEditorView: View {
                 dismiss()
             }
         }
+        .profileCover(isPresented: $signInNeeded) {
+            // An own-account profile with no stored token: sign in here rather than dismissing into a
+            // signed-out profile. LoginView is the tvOS panel; the touch UI ships iOSSignInView.
+            #if os(tvOS)
+            LoginView(account: account)
+            #else
+            iOSSignInView()
+            #endif
+        }
     }
 
-    /// Shown instead of the form for a non-active profile: editing is only allowed from within
-    /// that profile, so the door is closed here with no bypass.
+    /// Shown instead of the form for a non-active profile: editing is only allowed from within that
+    /// profile. The door to editing stays closed (no PIN bypass), but the user can SWITCH to it here.
     private var lockedPanel: some View {
         ZStack {
             Color.black.opacity(0.72).ignoresSafeArea()
@@ -440,14 +453,47 @@ struct ProfileEditorView: View {
                 Text("\(original.name) can only be edited from that profile")
                     .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
                     .multilineTextAlignment(.center)
-                Text("Switch to \(original.name) first (Settings, Profiles, Switch Profile), then edit its settings.")
+                Text("Switch to \(original.name) to use it and edit its settings.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 640)
-                Button("OK") { dismiss() }.buttonStyle(PrimaryActionStyle())
+                HStack(spacing: Theme.Space.md) {
+                    Button("Switch to \(original.name)") {
+                        if original.hasPin { switchPinPrompt = true } else { commitSwitch() }
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+                    Button("Cancel") { dismiss() }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                }
             }
             .padding(Theme.Space.xxl)
             .background(Theme.Palette.surface1,
                         in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            // Unfocusable while the PIN gate is up, so the remote lands in the gate (tvOS).
+            .disabled(switchPinPrompt)
+
+            if switchPinPrompt {
+                PinGateOverlay(profile: original,
+                               onUnlock: { switchPinPrompt = false; commitSwitch() },
+                               onCancel: { switchPinPrompt = false })
+            }
+        }
+    }
+
+    /// Switch the active profile to this (locked) one, mirroring ProfilePickerView.commit: select it,
+    /// then reload the account/engine for the new profile, and dismiss. A PIN-protected profile prompts
+    /// for its PIN first (switchPinPrompt). On .needsSignIn the editor presents sign-in (Option B)
+    /// instead of dismissing into a signed-out profile.
+    private func commitSwitch() {
+        switch store.select(original) {
+        case .sameAccount:
+            dismiss()
+        case .switchAccount(let token):
+            account.reloadForActiveProfile()
+            core.switchAccount(token: token)
+            dismiss()
+        case .needsSignIn:
+            account.reloadForActiveProfile()
+            signInNeeded = true
         }
     }
 
