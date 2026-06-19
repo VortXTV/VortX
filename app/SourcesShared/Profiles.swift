@@ -249,6 +249,18 @@ final class ProfileStore: ObservableObject {
                         let newPin = (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                         if newPin != p.pin { p.pin = newPin; changed = true }
                     }
+                    // Per-profile app settings managed from the dashboard (appearance + playback). update()
+                    // re-applies theme + playback to the live app when this is the active profile.
+                    if let st = e["settings"] as? [String: Any] {
+                        if let a = st["avatar"] as? String, !a.isEmpty, a != p.avatar { p.avatar = a; changed = true }
+                        if let ac = st["accent"] as? String, !ac.isEmpty, ac != p.accentID { p.accentID = ac; changed = true }
+                        if let o = st["oled"] as? Bool, o != p.oled { p.oled = o; changed = true }
+                        if let ts = st["textScale"] as? Double, ts != p.textScale { p.textScale = ts; changed = true }
+                        if let pbDict = st["playback"] as? [String: Any] {
+                            let next = Self.playbackPrefs(from: pbDict, base: p.playback)
+                            if next != p.playback { p.playback = next; changed = true }
+                        }
+                    }
                     if changed { update(p) }
                 } else {
                     // CREATE: a new secondary the dashboard added (never an owner). Defaults match a
@@ -286,6 +298,22 @@ final class ProfileStore: ObservableObject {
                 applyRemoteOverlay(profileID: uuid, entries: entries)
             }
         }
+    }
+
+    /// Build a PlaybackPrefs from a dashboard `settings.playback` dict, falling back to the profile's
+    /// current prefs (then sane empties) for any field the dashboard did not send.
+    private static func playbackPrefs(from d: [String: Any], base: UserProfile.PlaybackPrefs?) -> UserProfile.PlaybackPrefs {
+        UserProfile.PlaybackPrefs(
+            audioLang: d["audioLang"] as? String ?? base?.audioLang ?? "",
+            subtitleLang: d["subtitleLang"] as? String ?? base?.subtitleLang ?? "",
+            forcedPolicy: d["forced"] as? String ?? base?.forcedPolicy ?? "",
+            subFont: d["subFont"] as? String ?? base?.subFont ?? "",
+            subSize: d["subSize"] as? String ?? base?.subSize ?? "",
+            subColor: d["subColor"] as? String ?? base?.subColor ?? "",
+            subBackground: d["subBackground"] as? String ?? base?.subBackground ?? "",
+            subSizeScale: d["subSizeScale"] as? Double ?? base?.subSizeScale,
+            sourceTypeOrder: d["sourceTypeOrder"] as? [String] ?? base?.sourceTypeOrder,
+            useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
