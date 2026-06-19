@@ -205,11 +205,26 @@ final class VortXSyncManager: ObservableObject {
     /// A small JSON view of local state the website dashboard can read (the binary-plist `settings`
     /// blob is opaque to a browser). Profiles let the dashboard show the family roster + the real count.
     private func vortxSummary() -> [String: Any] {
-        let profiles: [[String: Any]] = ProfileStore.shared.profiles.map { p in
+        let store = ProfileStore.shared
+        let profiles: [[String: Any]] = store.profiles.map { p in
             ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner]
         }
+        // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
+        // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account
+        // library, not a watch overlay). The dashboard derives CW from each item's t/d progress.
+        var byProfile: [String: Any] = [:]
+        for p in store.profiles where !p.isOwner {
+            let cache = store.watchEntries(for: p.id)
+            guard !cache.isEmpty else { continue }
+            let library: [[String: Any]] = cache.map { (metaId, e) in
+                ["id": metaId, "name": e.name, "type": e.type, "poster": e.poster ?? "",
+                 "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched]
+            }
+            byProfile[p.id.uuidString] = ["library": library]
+        }
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
-        if let active = ProfileStore.shared.activeID { v["activeProfile"] = active.uuidString }
+        if !byProfile.isEmpty { v["byProfile"] = byProfile }
+        if let active = store.activeID { v["activeProfile"] = active.uuidString }
         return v
     }
 
