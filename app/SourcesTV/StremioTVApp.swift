@@ -49,6 +49,7 @@ struct StremioTVApp: App {
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
                     Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
+                    VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     // The top tab bar can desync (park offscreen) across a background/foreground cycle,
                     // the same "vanishing tab bar" the player-close heal fixes. Re-assert it on return so
                     // the menu never stays gone after the Home button (issue #75). Two shots: the desync
@@ -56,7 +57,10 @@ struct StremioTVApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { TabBarHealer.heal("foreground") }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { TabBarHealer.heal("foreground+1.5s") }
                 }
-                if phase == .background { Task { await VortXSyncManager.shared.syncUp() } }   // push profiles + settings
+                if phase == .background {
+                    VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
+                    Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                }
             }
             .onAppear {
                 // Profile housekeeping (the library repair scan + sync probe) is background work;
