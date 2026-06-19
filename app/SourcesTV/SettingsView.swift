@@ -130,35 +130,44 @@ struct SettingsView: View {
 
     @ViewBuilder private var accountSection: some View {
         section("Account") {
-            if account.isSignedIn {
-                HStack(spacing: Theme.Space.md) {
-                    Image(systemName: "person.crop.circle.fill")
-                        .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(account.email ?? "Signed in").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                        Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
-                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // The whole account block is one focus section so Down keeps stepping DOWN through
+            // its stacked rows instead of leaving after the first hit. "Log Out" sits far right
+            // (after a Spacer) while the rows below it are left-aligned; without this grouping
+            // the downward beam from Log Out misses the left-aligned links and the engine exits
+            // the section, skipping "VortX account & sync" and the metadata-keys row.
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                if account.isSignedIn {
+                    HStack(spacing: Theme.Space.md) {
+                        Image(systemName: "person.crop.circle.fill")
+                            .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(account.email ?? "Signed in").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                            Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
+                                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                        Spacer()
+                        Button { account.signOut(); core.logOut() } label: {
+                            Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
                     }
-                    Spacer()
-                    Button { account.signOut(); core.logOut() } label: {
-                        Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                } else {
+                    NavigationLink { LoginView(account: account) } label: {
+                        Label("Sign in to your Stremio account", systemImage: "person.crop.circle")
                     }
-                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                    .buttonStyle(PrimaryActionStyle())
                 }
-            } else {
-                NavigationLink { LoginView(account: account) } label: {
-                    Label("Sign in to your Stremio account", systemImage: "person.crop.circle")
+                NavigationLink { SyncSettingsView() } label: {
+                    Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
                 }
-                .buttonStyle(PrimaryActionStyle())
+                .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { MetadataKeysView() } label: {
+                    Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
             }
-            NavigationLink { SyncSettingsView() } label: {
-                Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
-            }
-            .buttonStyle(ChipButtonStyle(selected: false))
-            NavigationLink { MetadataKeysView() } label: {
-                Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
-            }
-            .buttonStyle(ChipButtonStyle(selected: false))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
         }
     }
 
