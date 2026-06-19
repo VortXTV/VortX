@@ -11,6 +11,7 @@ struct OpenLinkView: View {
     @State private var status: String?
     @State private var fileChoices: [LinkOpener.TorrentFile]? = nil   // multi-file pack → show the picker
     @State private var saved: [SavedLinksStore.Entry] = []           // saved magnets/links for this profile (#81)
+    @State private var resolveTask: Task<Void, Never>? = nil          // in-flight Twitch resolve, cancelled on dismiss
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -23,6 +24,7 @@ struct OpenLinkView: View {
         }
         .padding(Theme.Space.xxl)
         .onAppear { saved = SavedLinksStore.all(profileID: ProfileStore.shared.activeID) }
+        .onDisappear { resolveTask?.cancel() }
     }
 
     private var inputForm: some View {
@@ -31,8 +33,8 @@ struct OpenLinkView: View {
                 .font(Theme.Typography.sectionTitle)
                 .foregroundStyle(Theme.Palette.textPrimary)
             Text(directLinksOnly
-                 ? "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s)."
-                 : "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), or a magnet link.")
+                 ? "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), or a live Twitch channel link."
+                 : "A direct video URL (mp4, mkv, m3u8 and friends), a debrid or usenet link your service resolved to http(s), a live Twitch channel link, or a magnet link.")
                 .font(Theme.Typography.body)
                 .foregroundStyle(Theme.Palette.textSecondary)
             TextField(directLinksOnly ? "https://..." : "https://...  or  magnet:?xt=...", text: $input)
@@ -102,6 +104,22 @@ struct OpenLinkView: View {
             playMagnet(magnet)
             return
         }
+        // Recognise a streaming-service link (0.3.9 Phase 1: Twitch resolves in-app to HLS; YouTube is
+        // detected but not yet resolved). Everything else falls through to the existing direct-link path.
+        switch LinkResolver.detect(text) {
+        case .twitch(let channel):
+            playTwitch(channel: channel)
+            return
+        case .youtube:
+            status = "YouTube links are coming soon. Twitch and direct video links work today."
+            return
+        case .unsupported(let note):
+            if let note { status = note; return }
+            // Fall through: an unsupported classification just means "not a service link"; try it as a
+            // plain http(s) / bare-host link below so existing direct-link behaviour is unchanged.
+        case .direct:
+            break
+        }
         // A bare host or path with no scheme is almost always meant as https.
         if !text.contains("://"), text.contains(".") { text = "https://" + text }
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased(),
@@ -114,6 +132,26 @@ struct OpenLinkView: View {
         let title = url.lastPathComponent.isEmpty ? (url.host ?? "Stream") : url.lastPathComponent
         dismiss()
         presenter.request = PlaybackRequest(url: url, title: title)
+    }
+
+    /// Resolve a live Twitch channel to its HLS master playlist (best-effort, off-main) and present the
+    /// existing player. A Twitch channel is LIVE, so the resolved `.m3u8` rides the same adaptive-HLS path
+    /// as any live stream: the player's runtime non-seekable detection treats it as live, and the launch
+    /// carries no `meta`, so no Continue Watching entry or progress is ever written.
+    private func playTwitch(channel: String) {
+        working = true
+        status = "Resolving Twitch channel…"
+        resolveTask = Task { @MainActor in
+            defer { working = false }
+            let resolved = await LinkResolver.resolveTwitch(channel: channel)
+            guard !Task.isCancelled else { return }   // sheet closed mid-resolve → don't present the player
+            guard let url = resolved else {
+                status = "Couldn't open that Twitch channel. It may be offline, or Twitch changed its API."
+                return
+            }
+            dismiss()
+            presenter.request = PlaybackRequest(url: url, title: "Twitch: \(channel)")
+        }
     }
 
     private func playMagnet(_ magnet: LinkOpener.Magnet) {
