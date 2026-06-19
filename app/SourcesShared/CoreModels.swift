@@ -204,8 +204,15 @@ struct CoreBoardRow: Identifiable {
 /// path): broadcast TV, individual channels, and live events. Shared so the Live surface, the live
 /// detail branch, and the player all agree on what "live" means.
 enum LiveTypes {
-    static let all: Set<String> = ["tv", "channel", "events", "sport"]
-    static func contains(_ type: String) -> Bool { all.contains(type) }
+    /// Add-ons label live content inconsistently, so match CASE-INSENSITIVELY across the common variants
+    /// instead of one exact set, which is why a "sport" / "Sports" / "live" / "linear" feed used to be
+    /// misread as VOD (the player must open in live mode or an HLS feed plays a few seconds and quits).
+    /// Builds on #94, which added "sport". Exact tokens only, never substrings, so "tv" can't swallow "tvshow".
+    static let all: Set<String> = [
+        "tv", "channel", "channels", "events", "event",
+        "sport", "sports", "live", "linear", "iptv",
+    ]
+    static func contains(_ type: String) -> Bool { all.contains(type.lowercased()) }
 }
 
 // MARK: meta_details
