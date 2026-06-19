@@ -232,8 +232,20 @@ final class VortXSyncManager: ObservableObject {
         let profiles: [[String: Any]] = store.profiles.map { p in
             // pinHash is the salted SHA-256 (salt = the profile id, already here), never the raw PIN,
             // so the dashboard can verify a PIN entry by re-hashing without ever seeing the digits.
-            ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,
-             "familyEdit": p.familyEdit, "pinHash": p.pin ?? ""]
+            // `settings` mirrors the per-profile app settings so the dashboard can show + manage them
+            // (it writes them back via doc.profileEdits[].settings, applied by ProfileStore.applyProfileEdits).
+            var settings: [String: Any] = ["avatar": p.avatar, "accent": p.accentID, "oled": p.oled, "textScale": p.textScale]
+            if let pb = p.playback {
+                var playback: [String: Any] = ["audioLang": pb.audioLang, "subtitleLang": pb.subtitleLang,
+                    "forced": pb.forcedPolicy, "subFont": pb.subFont, "subSize": pb.subSize,
+                    "subColor": pb.subColor, "subBackground": pb.subBackground]
+                if let s = pb.subSizeScale { playback["subSizeScale"] = s }
+                if let o = pb.sourceTypeOrder { playback["sourceTypeOrder"] = o }
+                if let u = pb.useAddonOrder { playback["useAddonOrder"] = u }
+                settings["playback"] = playback
+            }
+            return ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,
+                    "familyEdit": p.familyEdit, "pinHash": p.pin ?? "", "settings": settings]
         }
         // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
         // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account
