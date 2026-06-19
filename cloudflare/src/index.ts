@@ -151,6 +151,7 @@ const RL_PATHS = new Set([
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
   "/v1/qr/start", "/v1/auth/check-username",   // pairing-row spam + username enumeration
+  "/v1/meta/search",                           // Cinemeta proxy for the dashboard's add-to-library
 ]);
 // Cap the body before parsing so an oversized request cannot tie up the parser (DoS guard). 2 MB sits
 // safely above MAX_DOC (1 MB) so a real backup PUT is never rejected, but blocks pathological bodies.
@@ -260,6 +261,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/auth/2fa/disable" && m === "POST") return twofaDisable(request, env);
       if (p === "/v1/connect/stremio" && m === "POST") return connectStremio(request, env);
       if (p === "/v1/addon/manifest" && m === "POST") return addonManifest(request, env);
+      if (p === "/v1/meta/search" && m === "POST") return metaSearch(request, env);
       if (p === "/v1/qr/start" && m === "POST") return qrStart(request, env);
       if (p === "/v1/qr/authorize" && m === "POST") return qrAuthorize(request, env);
       if (p === "/v1/qr/status" && m === "GET") return qrStatus(url, env);
@@ -768,6 +770,38 @@ async function addonManifest(req: Request, env: Env): Promise<Response> {
       configurable: !!(mf.behaviorHints && (mf.behaviorHints.configurable || mf.behaviorHints.configurationRequired)),
     },
   });
+}
+
+// --- Meta search (Cinemeta proxy): the dashboard's add-to-library needs to find a real catalog title
+// to add. The upstream host is FIXED (Cinemeta), so there is no SSRF surface: the caller supplies only a
+// query string (path-encoded) and a validated type. Requires a session, rate-limited, returns trimmed
+// preview fields only. ---
+const CINEMETA = "https://v3-cinemeta.strem.io";
+async function metaSearch(req: Request, env: Env): Promise<Response> {
+  const accountId = await requireAuth(req, env);
+  if (!accountId) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const q = isStr(b?.q, 200) ? (b!.q as string).trim() : "";
+  const type = b?.type === "series" ? "series" : "movie";
+  if (q.length < 2) return json({ results: [] });
+  let data: any;
+  try {
+    const res = await fetch(`${CINEMETA}/catalog/${type}/top/search=${encodeURIComponent(q)}.json`,
+                            { headers: { accept: "application/json" }, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return json({ results: [] });
+    const text = await res.text();
+    if (text.length > 1024 * 1024) return json({ results: [] });
+    data = JSON.parse(text);
+  } catch { return json({ error: "unreachable" }, 502); }
+  const metas = Array.isArray(data?.metas) ? data.metas : [];
+  const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : undefined);
+  const results = metas.slice(0, 24).map((mm: any) => ({
+    id: str(mm.id, 64),
+    type: mm.type === "series" ? "series" : "movie",
+    name: str(mm.name, 200),
+    poster: typeof mm.poster === "string" && /^https:\/\//i.test(mm.poster) ? mm.poster : undefined,
+  })).filter((r: any) => r.id && r.name);
+  return json({ results });
 }
 
 // --- QR login (data key handed to the joining device, wrapped to its ephemeral X25519 key) ---
