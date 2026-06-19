@@ -37,10 +37,14 @@ struct SyncSettingsView: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .alert("Sync conflict", isPresented: $showConflict) {
+            // "Merge both" is the recommended/default: it unions the rosters so NO profile is lost.
+            // The other two force one side, but even "Use account's data" still keeps local-only
+            // profiles (syncDown unions them back), so neither choice can silently delete a profile.
+            Button("Merge both (keep all profiles)") { Task { syncing = true; await sync.mergeBoth(); syncing = false } }
             Button("Use account's data") { Task { syncing = true; await sync.useAccountData(); syncing = false } }
             Button("Keep this device") { Task { syncing = true; await sync.pushThisDevice(); syncing = false } }
         } message: {
-            Text("This account already has saved profiles and settings. Keep this device's data and push it up, or replace this device with the account's data?")
+            Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.")
         }
         .task { await sync.refreshAccount() }
     }
@@ -62,7 +66,7 @@ struct SyncSettingsView: View {
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
 
         HStack(spacing: Theme.Space.md) {
-            Button(syncing ? "Syncing…" : "Sync now") { Task { syncing = true; await sync.pushThisDevice(); syncing = false } }
+            Button(syncing ? "Syncing…" : "Sync now") { syncNow() }
                 .buttonStyle(PrimaryActionStyle())
                 .disabled(syncing)
             Button("Sign out") { sync.signOut(); reset() }
@@ -137,6 +141,23 @@ struct SyncSettingsView: View {
     }
 
     // MARK: Actions
+
+    /// Explicit "Sync now": if the account's roster differs from this device, ASK which to keep
+    /// (Merge both / Use account / Keep this device) instead of blind-pushing, so a deliberate push
+    /// never silently drops the other side's profiles. When the rosters match there is nothing to ask,
+    /// so it just pushes as before.
+    private func syncNow() {
+        Task { @MainActor in
+            syncing = true
+            if await sync.rosterConflictWithAccount() {
+                syncing = false
+                showConflict = true
+            } else {
+                await sync.pushThisDevice()
+                syncing = false
+            }
+        }
+    }
 
     private func submit() {
         working = true; message = nil; failed = false

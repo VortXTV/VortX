@@ -232,6 +232,18 @@ final class VortXSyncManager: ObservableObject {
         return v
     }
 
+    /// Decode just the profile roster out of a doc's `settings` blob (the base64 SettingsBackup
+    /// envelope, whose payload is a binary-plist of the UserDefaults domain). Returns nil when the
+    /// blob is absent or carries no roster key, so callers can skip the union when there is nothing
+    /// to merge. Reads the same `stremiox.profiles` JSON the ProfileStore persists.
+    static func decodeRoster(fromSettingsBlob blob: Any?) -> [UserProfile]? {
+        guard let b64 = blob as? String, let data = Data(base64Encoded: b64),
+              let domain = try? SettingsBackup.decodeDomain(from: data),
+              let rosterData = domain["stremiox.profiles"] as? Data,
+              let roster = try? JSONDecoder().decode([UserProfile].self, from: rosterData) else { return nil }
+        return roster
+    }
+
     // MARK: - Profiles + settings sync (reuses the SettingsBackup serialization as the doc payload)
 
     /// Push this device's profiles + settings to the account. MERGES into the existing doc (preserving
@@ -239,8 +251,16 @@ final class VortXSyncManager: ObservableObject {
     /// the metadata keys explicitly because they live in the Keychain (SettingsBackup excludes them).
     @discardableResult
     func syncUp() async -> Bool {
-        guard isSignedIn, let data = try? SettingsBackup.makeBackup() else { return false }
+        guard isSignedIn else { return false }
         var doc = await pullSyncDoc() ?? [:]
+        // UNION the cloud's roster into the local one BEFORE makeBackup(), so a device with FEWER
+        // profiles never shrinks the cloud's profile set: the pushed blob already contains both sides.
+        // Any cloud-only profile that gets merged back keeps its own watch overlay (mergeInRoster does
+        // not clear watchCacheKey), so its Continue Watching is not lost when it returns to this device.
+        if let cloudRoster = Self.decodeRoster(fromSettingsBlob: doc["settings"]) {
+            ProfileStore.shared.mergeInRoster(cloudRoster)
+        }
+        guard let data = try? SettingsBackup.makeBackup() else { return false }
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
         doc["vortx"] = vortxSummary()   // JSON the dashboard can read (profiles, active selection)
@@ -276,11 +296,18 @@ final class VortXSyncManager: ObservableObject {
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
-        if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64),
-           ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
-            restored = true
-            ProfileStore.shared.reloadFromDefaults()   // apply the restored roster to the LIVE store, no relaunch
-            LastStreamStore.invalidateCache()          // the restore wrote new lastStream behind the cache; re-read it
+        if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) {
+            // Capture the LIVE roster BEFORE restore: SettingsBackup.restore overwrites the roster key
+            // with the cloud blob wholesale, and a cloud blob with FEWER profiles would otherwise delete
+            // a richer local profile (the data-loss bug). Restore, re-read the cloud roster, then UNION
+            // the captured local roster back in so no local-only profile is ever dropped by this pull.
+            let localRosterBefore = ProfileStore.shared.profiles
+            if ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
+                restored = true
+                ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
+                ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
+                LastStreamStore.invalidateCache()                    // the restore wrote new lastStream behind the cache; re-read it
+            }
         }
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
@@ -320,9 +347,27 @@ final class VortXSyncManager: ObservableObject {
     }
 
     /// Conflict resolution: replace this device's profiles + settings with the account's (forced).
+    /// Even this "use account" path still UNIONs profiles (syncDown merges the local roster back in),
+    /// so it can never delete a local-only profile; it only adopts the account's settings + fields.
     func useAccountData() async { await syncDown(force: true) }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
+
+    /// Conflict resolution (the RECOMMENDED choice on an explicit "Sync now" when the rosters differ):
+    /// union both ways so EVERY profile from both sides survives, then push. syncDown unions the cloud
+    /// roster into this device, and syncUp re-unions and pushes, so afterwards both the device and the
+    /// account hold the full set of profiles.
+    @discardableResult func mergeBoth() async -> Bool {
+        await syncDown(force: true)
+        return await syncUp()
+    }
+
+    /// Whether this device's live roster differs (by the set of profile ids) from the account's, so the
+    /// explicit "Sync now" button can decide between a silent push and the three-way conflict prompt.
+    func rosterConflictWithAccount() async -> Bool {
+        guard let cloudRoster = Self.decodeRoster(fromSettingsBlob: (await pullSyncDoc())?["settings"]) else { return false }
+        return ProfileStore.shared.rosterDiffers(from: cloudRoster)
+    }
 
     /// Refresh account fields from /me (e.g. two-factor was toggled on the website), so the app's view
     /// of the account is not stuck at whatever sign-in returned (Bug 1).

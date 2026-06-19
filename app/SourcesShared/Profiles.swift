@@ -462,6 +462,72 @@ final class ProfileStore: ObservableObject {
         }
     }
 
+    // MARK: Roster merge (UNION by id, so cross-device sync never silently drops a profile)
+
+    /// The roster-level modification time this device last recorded (a `persist(touch:true)` stamp).
+    /// Used as the tiebreaker when the SAME profile id exists on both sides of a merge.
+    var rosterModified: Date {
+        Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: Self.modifiedKey))
+    }
+
+    /// Whether `incoming` is a genuinely different roster from the live one, compared by the SET of
+    /// profile ids (the symmetric difference). Drives the explicit "Sync now" conflict prompt: if the
+    /// id sets match, there is nothing to ask about and the sync can proceed silently.
+    func rosterDiffers(from incoming: [UserProfile]) -> Bool {
+        Set(profiles.map(\.id)) != Set(incoming.map(\.id))
+    }
+
+    /// UNION the live roster with `incoming` by profile `id`. The core safety guarantee for
+    /// cross-device sync: a profile present on only ONE side is ALWAYS kept, so a cloud blob carrying
+    /// fewer profiles can never delete a richer local roster (the data-loss bug), and a fewer-profile
+    /// local roster can never shrink the cloud (see VortXSyncManager.syncUp).
+    ///
+    /// For an id present on BOTH sides we keep one deterministically: prefer the side whose roster
+    /// `modifiedKey` is newer (`incomingModified` vs this device's `rosterModified`); when that cannot
+    /// decide (older rosters carry no stamp, so both read 0), prefer the LOCAL copy. Either way the id
+    /// is retained; only its fields are chosen.
+    ///
+    /// Per-profile watch overlays are NOT touched here: a unioned-back profile keeps its own
+    /// `watchCacheKey(id)` cache (SettingsBackup.restore only ever SETS keys, it never deletes one),
+    /// so re-adding a profile preserves its Continue Watching / library overlay.
+    ///
+    /// NOTE: explicit cross-device DELETE propagation (tombstones) is deferred. Until it exists,
+    /// union-merge means a profile that was deliberately deleted on one device may reappear from
+    /// another device that still has it. That is the intended, safe tradeoff: a profile coming BACK
+    /// is recoverable; a profile silently DELETED with its history is not.
+    func mergeInRoster(_ incoming: [UserProfile], incomingModified: Date? = nil) {
+        guard !incoming.isEmpty else { return }
+        let preferIncoming = (incomingModified ?? .distantPast) > rosterModified
+        let incomingByID = Dictionary(incoming.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let localByID = Dictionary(profiles.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+
+        // Start from the live order, then append any ids that exist only in the incoming roster, so
+        // the union keeps every profile from both sides and preserves a stable, local-first ordering.
+        var merged: [UserProfile] = profiles.map { local in
+            guard let remote = incomingByID[local.id] else { return local }
+            return preferIncoming ? remote : local
+        }
+        for remote in incoming where localByID[remote.id] == nil {
+            merged.append(remote)
+        }
+
+        // No change once the ids and chosen fields already match: skip the write so this never loops
+        // (reloadFromDefaults / syncDown call into here on the foreground/auto path).
+        guard merged != profiles else { return }
+        profiles = merged
+        normalizeOwner()
+        if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
+            activeID = profiles.first?.id
+        }
+        if let active {
+            applyTheme(active)
+            applyPlayback(active)
+            SourcePreferences.shared.reload()
+        }
+        persist(touch: false)   // a merge is not a local edit; never schedule a push from here
+        loadWatchCache()
+    }
+
     private func schedulePushRoster() {
         pushRosterTask?.cancel()
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
