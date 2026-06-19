@@ -69,4 +69,24 @@ enum LastStreamStore {
     /// so without this a synced Continue-Watching link stays invisible until relaunch and the resume falls
     /// back to re-resolving (and could grab the wrong source). Called from VortXSyncManager.syncDown.
     static func invalidateCache() { cache.removeAll() }
+
+    private static var loggedResume: Set<String> = []
+    /// Trace one Continue-Watching direct-resume decision per (title, outcome) per launch into the
+    /// on-device diagnostics file. CW falling back to the slow re-resolve path (the user-visible
+    /// "source failed, retry" sequence) is any non-"hit" outcome here; the line names which link in the
+    /// record -> persist -> relaunch -> read chain broke. A "noEntry" miss also dumps the store
+    /// inventory (count + first keys) so an item.id / profileID key mismatch is visible at a glance.
+    /// Deduped because tvOS computes directResume in the card render path (per card, per render),
+    /// which would otherwise flood the 512KB log and rotate the useful lines away.
+    static func logResume(_ outcome: String, libraryId: String, profileID: UUID?) {
+        guard loggedResume.insert("\(outcome):\(libraryId)").inserted else { return }
+        var detail = ""
+        if outcome == "noEntry", let profileID {
+            let dict = load(profileID)
+            let keys = dict.keys.sorted().prefix(8).joined(separator: ",")
+            detail = " count=\(dict.count) keys=[\(keys)]"
+        }
+        let pid = profileID.map { String($0.uuidString.prefix(8)) } ?? "nil"
+        DiagnosticsLog.log("cw-resume", "\(outcome) id=\(libraryId) profile=\(pid)\(detail)")
+    }
 }

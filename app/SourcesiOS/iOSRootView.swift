@@ -884,10 +884,20 @@ extension View {
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                              account: StremioAccount) async -> iOSPlayerLaunch? {
-    guard let entry = LastStreamStore.entry(for: item.id, profileID: ProfileStore.shared.activeID),
-          let url = URL(string: entry.url) else { return nil }
-    if PlaybackSettings.torrentsDisabled && entry.torrent == true { return nil }
-    if item.type == "series", let cwVideo = item.cwVideoId, cwVideo != entry.videoId { return nil }
+    let pid = ProfileStore.shared.activeID
+    guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
+        LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
+    }
+    guard let url = URL(string: entry.url) else {
+        LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
+    }
+    if PlaybackSettings.torrentsDisabled && entry.torrent == true {
+        LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
+    }
+    if item.type == "series", let cwVideo = item.cwVideoId, cwVideo != entry.videoId {
+        LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
+    }
+    LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)

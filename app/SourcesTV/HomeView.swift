@@ -142,10 +142,20 @@ struct CoreContinueWatchingRow: View {
     /// sources. Falls back to the detail page when no remembered link fits: never
     /// played here, or the engine moved the series on to a different episode.
     private func directResume(_ item: CoreCWItem) -> (() -> Void)? {
-        guard let entry = LastStreamStore.entry(for: item.id, profileID: profiles.activeID),
-              let url = URL(string: entry.url) else { return nil }
-        if PlaybackSettings.torrentsDisabled && entry.torrent == true { return nil }
-        if item.type == "series", let cwVideo = item.state.videoId, cwVideo != entry.videoId { return nil }
+        let pid = profiles.activeID
+        guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
+            LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
+        }
+        guard let url = URL(string: entry.url) else {
+            LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
+        }
+        if PlaybackSettings.torrentsDisabled && entry.torrent == true {
+            LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
+        }
+        if item.type == "series", let cwVideo = item.state.videoId, cwVideo != entry.videoId {
+            LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
+        }
+        LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
             presenter.request = PlaybackRequest(
                 url: url, title: entry.title,
