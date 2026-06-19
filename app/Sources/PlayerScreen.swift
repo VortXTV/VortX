@@ -173,6 +173,8 @@ struct PlayerScreen: View {
     /// Display-sleep assertion held while the player is open (macOS parity with the iOS idle-timer
     /// disable): keeps the Mac from dimming / sleeping mid-movie. Ended on disappear.
     @State private var macSleepActivity: NSObjectProtocol?
+    /// macOS player keyDown monitor for Space/Left/Right; see installMacKeyMonitor.
+    @State private var macKeyMonitor: Any?
     #endif
     @State private var panel: Panel?
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
@@ -339,17 +341,9 @@ struct PlayerScreen: View {
             Button { leavePlayback() } label: { EmptyView() }
                 .keyboardShortcut(.cancelAction)
                 .hidden()
-            // Standard player keys on macOS: Space toggles play/pause, Left/Right seek by the skip step.
-            // Hidden buttons (same approach as the Esc handler) so they work without managing view focus.
-            Button { coordinator.player?.togglePause(); scheduleHide() } label: { EmptyView() }
-                .keyboardShortcut(.space, modifiers: [])
-                .hidden()
-            Button { seekBy(-seekStepSeconds) } label: { EmptyView() }
-                .keyboardShortcut(.leftArrow, modifiers: [])
-                .hidden()
-            Button { seekBy(seekStepSeconds) } label: { EmptyView() }
-                .keyboardShortcut(.rightArrow, modifiers: [])
-                .hidden()
+            // Space/Left/Right are handled by an NSEvent keyDown monitor (installMacKeyMonitor), not
+            // SwiftUI .keyboardShortcut: AppKit gives unmodified arrows+Space to the Metal NSView's
+            // keyDown:, so hidden-button shortcuts never fired. The Esc/.cancelAction handler above stays.
             #endif
         }
         .animation(.easeOut(duration: 0.3), value: upNextRemaining != nil)
@@ -379,6 +373,7 @@ struct PlayerScreen: View {
             // mid-movie (the iOS/tvOS keep-awake parity that was missing on Mac).
             macSleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled,
                                                                      reason: "StremioX video playback")
+            installMacKeyMonitor()
             #endif
         }
         .onDisappear {
@@ -391,6 +386,7 @@ struct PlayerScreen: View {
             PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
+            removeMacKeyMonitor()
             #endif
         }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -1912,6 +1908,40 @@ struct PlayerScreen: View {
         if !isLive, duration > 0 { onProgress(currentTime, duration) }
         onClose()
     }
+
+    #if os(macOS)
+    private static let kVK_Space = 49
+    private static let kVK_LeftArrow = 123
+    private static let kVK_RightArrow = 124
+
+    /// App-level keyDown monitor for the transport keys. SwiftUI .keyboardShortcut does not see
+    /// unmodified Space/arrows on macOS (AppKit routes them to the Metal NSView's keyDown:), so we
+    /// intercept here before responder dispatch. nil consumes the event (no beep); the event passes through.
+    private func installMacKeyMonitor() {
+        guard macKeyMonitor == nil else { return }
+        macKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard panel == nil, !showExternalChooser, !showShare,
+                  !externalLinkDead, !subtitleLoadFailed else { return event }
+            let mods: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
+            if !event.modifierFlags.intersection(mods).isEmpty { return event }
+            if event.window?.firstResponder is NSText { return event }
+            switch Int(event.keyCode) {
+            case Self.kVK_Space:
+                coordinator.player?.togglePause(); scheduleHide(); return nil
+            case Self.kVK_LeftArrow:
+                seekBy(-seekStepSeconds); return nil
+            case Self.kVK_RightArrow:
+                seekBy(seekStepSeconds); return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeMacKeyMonitor() {
+        if let m = macKeyMonitor { NSEvent.removeMonitor(m); macKeyMonitor = nil }
+    }
+    #endif
 
     private func refreshTracks() {
         audioTracks = coordinator.player?.tracks(ofType: "audio") ?? []
