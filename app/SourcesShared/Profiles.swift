@@ -621,6 +621,15 @@ final class ProfileStore: ObservableObject {
         }
     }
 
+    /// The stored watch overlay for ANY profile, read straight from its cache, so the VortX sync can
+    /// emit each profile's Continue Watching / library to the dashboard. The engine-backed owner
+    /// profile returns empty here (its history lives in the account library, not an overlay cache).
+    func watchEntries(for profileID: UUID) -> [String: WatchEntry] {
+        guard let data = UserDefaults.standard.data(forKey: Self.watchCacheKey(profileID)),
+              let cache = try? JSONDecoder().decode([String: WatchEntry].self, from: data) else { return [:] }
+        return cache
+    }
+
     private static func isoNow() -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
