@@ -182,6 +182,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// 2.0 downmix every endpoint can play; Surround forces the full layout for an under-reporting
     /// receiver; Auto downmixes a stereo route but keeps native multichannel for a real receiver.
     private var channelPolicy: String {
+        #if canImport(UIKit)
+        // A route that can only render stereo (TV built-in speakers, AirPlay) silently fails to open
+        // a decoded multichannel layout: force a 2.0 downmix regardless of the chosen mode so the AO
+        // always has something it can play (#78). The viewer can still pick a different route's mode
+        // when a real receiver is attached; this only overrides the stereo-only endpoints.
+        if routeIsStereoOnly { return "stereo" }
+        #endif
         switch AudioOutputMode.current {
         case .stereo: return "stereo"
         case .surround, .passthrough: return "auto"   // passthrough bitstreams the native layout untouched
@@ -192,6 +199,28 @@ final class MPVMetalViewController: PlatformViewController {
     /// The active route's hardware output sample rate (e.g. 48000 over HDMI-ARC), read after the
     /// session is active. 0 = unknown, do not force a rate.
     private var outputSampleRate: Double = 0
+
+    #if canImport(UIKit)
+    /// The active output route's first port type (e.g. `.HDMI`, `.builtInSpeaker`, `.airPlay`),
+    /// read after the session is active. Used to keep the hard-won soundbar/eARC path on real
+    /// external audio (`.HDMI` / `.usbAudio` / `.lineOut`) while giving routes that cannot drive a
+    /// decoded multichannel / Atmos / passthrough config (TV built-in speakers, AirPlay) a plain,
+    /// route-openable stereo config so the audiounit AO opens instead of producing silence (#78).
+    private var outputPortType: AVAudioSession.Port?
+
+    /// True when the active route can only render plain stereo PCM and must NOT be handed a native
+    /// multichannel / spdif / inflated-rate config. tvOS reports the TV's own speakers as built-in
+    /// when the system audio format is set to Atmos / Best-Available, and the audiounit AO then
+    /// silently fails to open the negotiated multichannel layout (#78: "no sound on built-in TV
+    /// speakers under Atmos/Best-Available; Passthrough freezes"). A real AVR / soundbar reaches the
+    /// Apple TV over `.HDMI` (ARC/eARC), so it stays on the existing path and the 0.2.43 fix holds.
+    private var routeIsStereoOnly: Bool {
+        switch outputPortType {
+        case .some(.builtInSpeaker), .some(.airPlay): return true
+        default: return false
+        }
+    }
+    #endif
 
     private func configureAudioSession() {
         // AVAudioSession is iOS/tvOS only; on macOS mpv's coreaudio AO owns audio routing, so this
@@ -209,6 +238,7 @@ final class MPVMetalViewController: PlatformViewController {
             try session.setActive(true)
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
+            outputPortType = session.currentRoute.outputs.first?.portType
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }
@@ -223,7 +253,14 @@ final class MPVMetalViewController: PlatformViewController {
     /// hand-off fixes it. Gated to stereo routes (<=2ch) so a true multichannel receiver keeps its
     /// native-rate PCM path untouched.
     private var sampleRatePolicy: Int? {
-        guard outputChannels <= 2, outputSampleRate >= 8000 else { return nil }
+        guard outputSampleRate >= 8000 else { return nil }
+        #if canImport(UIKit)
+        // Force the route's own rate on a stereo-only endpoint too: under Atmos / Best-Available the
+        // TV's built-in speakers can advertise >2 channels yet still need mpv to resample to the
+        // route, or the AO opens onto a layout/rate it can't drive and goes silent (#78).
+        if routeIsStereoOnly { return Int(outputSampleRate.rounded()) }
+        #endif
+        guard outputChannels <= 2 else { return nil }
         return Int(outputSampleRate.rounded())
     }
 
@@ -353,13 +390,18 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
         // Passthrough mode bitstreams Dolby/DTS to a capable AV receiver instead of decoding to PCM;
         // mpv degrades spdif -> PCM on a route that can't take it, so this never forces silence.
-        if let spdif = AudioOutputMode.current.spdifCodecs {
+        // EXCEPT a stereo-only route (TV built-in speakers / AirPlay): there, passthrough does not
+        // degrade cleanly and instead WEDGES the AO open (#78 "Passthrough freezes"), so never arm
+        // spdif on those routes regardless of the chosen mode.
+        if !routeIsStereoOnly, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
         }
-        // Never let an AO-open failure fall through to the null AO: that is silent death with no
-        // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
-        // the next silent-audio report is actually diagnosable instead of a guess.
-        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
+        // AO-open failure handling, route-aware. On a real external route (HDMI/ARC/eARC, USB, line
+        // out) keep `no` so a soundbar mis-negotiation surfaces as a log instead of silent death and
+        // stays diagnosable. On a stereo-only route (TV built-in / AirPlay) the failure mode is the
+        // user being stranded silent or the file freezing, so allow the null AO: playback keeps
+        // running (video continues) instead of wedging, the graceful fallback for #78.
+        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", routeIsStereoOnly ? "yes" : "no"))
         // THE soundbar fix: resample to the route's actual rate so a rate mismatch over a fixed-rate
         // HDMI-ARC link can't drop to silence (mpv's audiounit AO does not resample to the route).
         if let rate = sampleRatePolicy {
@@ -468,6 +510,7 @@ final class MPVMetalViewController: PlatformViewController {
         let session = AVAudioSession.sharedInstance()
         outputChannels = max(session.maximumOutputNumberOfChannels, 2)
         outputSampleRate = session.sampleRate
+        outputPortType = session.currentRoute.outputs.first?.portType
         let next = (channelPolicy, sampleRatePolicy ?? 0)
         if let applied = appliedAudioPolicy, applied == next { return }   // no real change: don't churn the AO
         appliedAudioPolicy = next
@@ -939,7 +982,15 @@ final class MPVMetalViewController: PlatformViewController {
     func setAudioOutputMode(_ mode: AudioOutputMode) {
         UserDefaults.standard.set(mode.rawValue, forKey: AudioOutputMode.key)
         setString("audio-channels", channelPolicy)
-        setString("audio-spdif", mode.spdifCodecs ?? "")
+        // Never arm spdif on a stereo-only route (TV built-in / AirPlay): passthrough there freezes
+        // the AO (#78). channelPolicy already forces a stereo downmix for those routes; keep spdif off
+        // so a runtime switch to Passthrough on the built-in speakers degrades to decoded stereo PCM.
+        #if canImport(UIKit)
+        let spdif = routeIsStereoOnly ? nil : mode.spdifCodecs
+        #else
+        let spdif = mode.spdifCodecs
+        #endif
+        setString("audio-spdif", spdif ?? "")
     }
 
     /// Live numbers for the player's "Playback info" overlay.
