@@ -248,6 +248,17 @@ final class VortXSyncManager: ObservableObject {
         if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
         if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
+        // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
+        // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
+        // "default" bucket for searches made with no profile selected. Best-effort: skip empty lists.
+        var searches: [String: [String]] = [:]
+        for p in ProfileStore.shared.profiles {
+            let terms = SearchHistoryStore.allTerms(for: p.id)
+            if !terms.isEmpty { searches[p.id.uuidString] = terms }
+        }
+        let defaultTerms = SearchHistoryStore.allTerms(for: nil)
+        if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
+        if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
         return await pushSyncDoc(doc)
     }
 
@@ -274,6 +285,16 @@ final class VortXSyncManager: ObservableObject {
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
             if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
+            restored = true
+        }
+        if let searches = doc["searches"] as? [String: [String]] {
+            for (key, terms) in searches {
+                // "default" is the no-profile bucket (nil); everything else is a profile UUID. Merge keeps
+                // each profile's own list separate, so one profile's searches never leak to another.
+                let profileID = key == "default" ? nil : UUID(uuidString: key)
+                if key != "default", profileID == nil { continue }
+                SearchHistoryStore.merge(terms, for: profileID)
+            }
             restored = true
         }
         lastSyncedVersion = max(lastSyncedVersion, pulled.version)
