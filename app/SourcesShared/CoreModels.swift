@@ -204,7 +204,7 @@ struct CoreBoardRow: Identifiable {
 /// path): broadcast TV, individual channels, and live events. Shared so the Live surface, the live
 /// detail branch, and the player all agree on what "live" means.
 enum LiveTypes {
-    static let all: Set<String> = ["tv", "channel", "events"]
+    static let all: Set<String> = ["tv", "channel", "events", "sport"]
     static func contains(_ type: String) -> Bool { all.contains(type) }
 }
 
