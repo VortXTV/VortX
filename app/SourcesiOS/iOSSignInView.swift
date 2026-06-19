@@ -86,7 +86,7 @@ struct iOSSignInView: View {
     private var passwordCard: some View {
         VStack(spacing: Theme.Space.md) {
             field {
-                TextField("Email", text: $email)
+                TextField("Email or username", text: $email)
                     .textContentType(.username)
                     .emailFieldStyle()
                     .autocorrectionDisabled()

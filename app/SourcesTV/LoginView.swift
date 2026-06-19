@@ -54,7 +54,7 @@ struct LoginView: View {
 
     private var passwordLogin: some View {
         VStack(spacing: Theme.Space.md) {
-            field { TextField("Email", text: $email)
+            field { TextField("Email or username", text: $email)
                 .textContentType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled() }
             field { SecureField("Password", text: $password).textContentType(.password) }
 
