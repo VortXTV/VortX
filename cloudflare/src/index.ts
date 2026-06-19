@@ -354,7 +354,14 @@ async function login(req: Request, env: Env): Promise<Response> {
   if (row.totp_secret) {
     const totp = isStr(b?.totp, 8) ? (b!.totp as string).trim() : "";
     if (!totp) return json({ error: "totp_required" }, 401);
-    if (!(await verifyTotp(row.totp_secret, totp))) return json({ error: "invalid_totp" }, 401);
+    const step = await verifyTotp(row.totp_secret, totp);
+    if (step < 0) return json({ error: "invalid_totp" }, 401);
+    // Anti-replay (F7): record the matched step only if it is newer than the last used one. The
+    // conditional UPDATE is atomic; 0 rows changed means this step was already used (a replay) -> reject.
+    const used = await env.DB.prepare(
+      "UPDATE accounts SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)",
+    ).bind(step, row.id, step).run();
+    if ((used.meta?.changes ?? 0) === 0) return json({ error: "invalid_totp" }, 401);
   }
   return json({
     token: await makeSession(row.id, env, row.session_version ?? 0),
@@ -618,11 +625,13 @@ async function hotp(secretB32: string, counter: number): Promise<string> {
   const bin = ((mac[off] & 0x7f) << 24) | (mac[off + 1] << 16) | (mac[off + 2] << 8) | mac[off + 3];
   return (bin % 1_000_000).toString().padStart(6, "0");
 }
-async function verifyTotp(secretB32: string, code: string): Promise<boolean> {
-  if (!/^\d{6}$/.test(code)) return false;
+/// Returns the matched time-step (for anti-replay tracking, F7) or -1 if the code is invalid. Accepts
+/// the previous / current / next 30s window for clock drift.
+async function verifyTotp(secretB32: string, code: string): Promise<number> {
+  if (!/^\d{6}$/.test(code)) return -1;
   const step = Math.floor(Date.now() / 30000);
-  for (const w of [-1, 0, 1]) if (ctEqual(await hotp(secretB32, step + w), code)) return true;
-  return false;
+  for (const w of [-1, 0, 1]) if (ctEqual(await hotp(secretB32, step + w), code)) return step + w;
+  return -1;
 }
 
 async function twofaEnroll(req: Request, env: Env): Promise<Response> {
@@ -643,7 +652,7 @@ async function twofaActivate(req: Request, env: Env): Promise<Response> {
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
   const row = await env.DB.prepare("SELECT email, totp_pending FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_pending) return json({ error: "no_pending" }, 400);
-  if (!(await verifyTotp(row.totp_pending, code))) return json({ error: "invalid_code" }, 401);
+  if ((await verifyTotp(row.totp_pending, code)) < 0) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = totp_pending, totp_pending = NULL WHERE id = ?").bind(id).run();
   await sendMail(env, row.email, "Two-factor is on for your VortX account", "Two-factor authentication enabled", [
     "An authenticator app was just added to your VortX account. You will need a code from it the next time you sign in.",
@@ -658,7 +667,7 @@ async function twofaDisable(req: Request, env: Env): Promise<Response> {
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
   const row = await env.DB.prepare("SELECT email, totp_secret FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_secret) return json({ error: "not_enabled" }, 400);
-  if (!(await verifyTotp(row.totp_secret, code))) return json({ error: "invalid_code" }, 401);
+  if ((await verifyTotp(row.totp_secret, code)) < 0) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = NULL, totp_pending = NULL WHERE id = ?").bind(id).run();
   await sendMail(env, row.email, "Two-factor is off for your VortX account", "Two-factor authentication disabled", [
     "Two-factor authentication was just turned off for your VortX account.",

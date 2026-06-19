@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   wrapped_key_rec    TEXT,                    -- data key, AES-GCM-wrapped under the recovery key (client)
   totp_secret        TEXT,                    -- base32 TOTP secret once 2FA is ACTIVE (null = off)
   totp_pending       TEXT,                    -- base32 secret mid-enrollment, before a code confirms it
+  totp_last_step     INTEGER,                 -- highest TOTP time-step accepted at login, so a code can't be replayed (F7)
   session_version    INTEGER NOT NULL DEFAULT 0, -- bumped on password change/recovery to revoke old tokens (H-1)
   created_at         INTEGER NOT NULL
 );
