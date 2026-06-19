@@ -483,6 +483,7 @@ struct iOSSearchView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount   // passed to the lifted paste-a-link player
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @EnvironmentObject private var profiles: ProfileStore   // per-profile recent searches (#90, ported from tvOS)
     @State private var query = ""
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
@@ -490,6 +491,7 @@ struct iOSSearchView: View {
     @State private var showOpenLink = false
     @State private var pastedPlayer: iOSPlayerLaunch?   // paste-a-link player, presented from here (not the sheet)
     @State private var pendingLaunch: iOSPlayerLaunch?  // staged while the link sheet dismisses, presented in onDismiss
+    @State private var history: [String] = []           // recent searches for the active profile (#90)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -504,6 +506,8 @@ struct iOSSearchView: View {
                     }
                     .buttonStyle(ChipButtonStyle(selected: false))
                     .padding(.horizontal, Theme.Space.md)
+
+                    if !history.isEmpty && !isTyping { historySection }
 
                     results
                 }
@@ -531,8 +535,14 @@ struct iOSSearchView: View {
                 if !isActive { MacCommands.go(.search) }
                 #endif
             }
-            .onAppear { core.loadSearchSuggestions() }
+            .onAppear {
+                core.loadSearchSuggestions()
+                history = SearchHistoryStore.load(profileID: profiles.activeID)
+            }
             .onChange(of: query) { value in scheduleSearch(value) }   // iOS 16 single-param onChange
+            .onChange(of: profiles.activeID) { _ in
+                history = SearchHistoryStore.load(profileID: profiles.activeID)
+            }
             .onDisappear { searchTask?.cancel() }
             .sheet(isPresented: $showOpenLink, onDismiss: {
                 // Present the player only AFTER the link sheet has fully dismissed. On macOS a still-open
@@ -576,7 +586,7 @@ struct iOSSearchView: View {
                                items: section.items.map {
                                    RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
                                },
-                               onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
+                               onTap: { saveToHistory(query); path.append(FeaturedHeroItem.from(rail: $0)) },
                                menu: .catalog)
                 }
             }
@@ -592,6 +602,44 @@ struct iOSSearchView: View {
     }
 
     private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
+
+    /// Recent searches (per profile, sync-backed) shown when the field is empty — the touch/Mac twin of
+    /// the tvOS SearchView history row (#90). Tap a chip to re-run it; Clear wipes the list.
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text("Recent Searches")
+                .font(Theme.Typography.sectionTitle)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .padding(.horizontal, Theme.Space.md)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: Theme.Space.sm) {
+                    ForEach(history, id: \.self) { term in
+                        Button { query = term } label: { Label(term, systemImage: "clock") }
+                            .buttonStyle(ChipButtonStyle(selected: false))
+                    }
+                    Button {
+                        SearchHistoryStore.clear(profileID: profiles.activeID)
+                        history = []
+                    } label: { Label("Clear", systemImage: "trash") }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                }
+                .padding(.horizontal, Theme.Space.md)
+            }
+        }
+    }
+
+    /// True while the user is typing a query, so the recent-searches row hides during an active search.
+    private var isTyping: Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Record a query the user actually engaged with (opened a result for), mirroring tvOS.
+    private func saveToHistory(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return }
+        SearchHistoryStore.add(trimmed, profileID: profiles.activeID)
+        history = SearchHistoryStore.load(profileID: profiles.activeID)
+    }
 
     private var hasSearchQuery: Bool {
         query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
