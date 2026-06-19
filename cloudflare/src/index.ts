@@ -142,7 +142,7 @@ const b64Len = (s: string): number => { try { return unb64(s).length; } catch { 
 // Endpoints worth throttling per-IP: credential checks, account creation, and the Stremio proxy (C-1, H-2, H-3).
 const RL_PATHS = new Set([
   "/v1/auth/login", "/v1/auth/register", "/v1/auth/prelogin",
-  "/v1/auth/recover-start", "/v1/auth/recover-complete", "/v1/auth/change-password",
+  "/v1/auth/recover-start", "/v1/auth/recover-complete", "/v1/auth/change-password", "/v1/auth/recovery/regenerate",
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
 ]);
@@ -231,6 +231,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/auth/check-username" && m === "POST") return checkUsername(request, env);
       if (p === "/v1/auth/recover-start" && m === "POST") return recoverStart(request, env);
       if (p === "/v1/auth/recover-complete" && m === "POST") return recoverComplete(request, env);
+      if (p === "/v1/auth/recovery/regenerate" && m === "POST") return recoveryRegenerate(request, env);
       if (p === "/v1/auth/change-password" && m === "POST") return changePassword(request, env);
       if (p === "/v1/auth/2fa/enroll" && m === "POST") return twofaEnroll(request, env);
       if (p === "/v1/auth/2fa/activate" && m === "POST") return twofaActivate(request, env);
@@ -417,6 +418,29 @@ async function recoverComplete(req: Request, env: Env): Promise<Response> {
     "If this was not you, reset your password again immediately.",
   ]);
   return json({ token: await makeSession(row.id, env, await accountSessionVersion(row.id, env)), account: pub(row) });
+}
+
+// --- Regenerate the recovery code (logged in, data-preserving): the client re-wraps the SAME data key
+// under a brand-new recovery code and sends the new wrapped key + verifier. The old code stops working.
+// We email the new code (the client passes it; never stored). This is the "refresh my recovery code" flow. ---
+async function recoveryRegenerate(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const wrappedKeyRec = isStr(b?.wrappedKeyRecovery) ? (b!.wrappedKeyRecovery as string) : "";
+  const recVerifier = isStr(b?.recVerifier) ? (b!.recVerifier as string) : "";
+  const recoveryCode = isStr(b?.recoveryCode, 64) && /^VX-[0-9A-Za-z-]+$/.test(b!.recoveryCode as string) ? (b!.recoveryCode as string) : "";
+  if (!wrappedKeyRec || b64Len(recVerifier) !== 32) return json({ error: "bad_request" }, 400);
+  const recSalt = crypto.getRandomValues(new Uint8Array(16));
+  const row = await env.DB.prepare("SELECT email FROM accounts WHERE id = ?").bind(id).first<{ email: string }>();
+  await env.DB.prepare("UPDATE accounts SET wrapped_key_rec = ?, rec_verifier_hash = ?, rec_verifier_salt = ? WHERE id = ?")
+    .bind(wrappedKeyRec, await pbkdf2(recVerifier, recSalt, SERVER_ITERS), b64(recSalt), id).run();
+  if (row?.email) {
+    await sendMail(env, row.email, "Your new VortX recovery code", "Your new recovery code", [
+      "You generated a new recovery code for your VortX account. Your previous code no longer works.",
+    ], recoveryCode ? { recoveryCode } : { note: "Save it somewhere safe and offline." });
+  }
+  return json({ ok: true });
 }
 
 // --- Change password (logged in): client re-derives the key from the new password and re-wraps the data key ---
