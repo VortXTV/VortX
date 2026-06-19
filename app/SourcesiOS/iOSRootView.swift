@@ -93,7 +93,7 @@ struct iOSRootView: View {
         .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
-        .animation(.easeOut(duration: 0.25), value: updates.available?.version)
+        .animation(.easeOut(duration: 0.25), value: updates.available?.build)
         .animation(.easeOut(duration: 0.25), value: dismissedUpdateVersion)
         #if os(macOS)
         // macOS menu-bar commands (the "Go" menu + ⌘-shortcuts) post here, since they live at the
@@ -135,7 +135,7 @@ struct iOSRootView: View {
     /// Prominent accent bar shown across every tab when a newer release is available and not yet
     /// dismissed for that version. Tapping opens the downloads page; the × remembers this version.
     @ViewBuilder private var updateBanner: some View {
-        if let u = updates.available, u.version != dismissedUpdateVersion {
+        if let u = updates.available, u.key != dismissedUpdateVersion {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.down.circle.fill").font(.system(size: 18, weight: .semibold))
                 VStack(alignment: .leading, spacing: 1) {
@@ -144,7 +144,7 @@ struct iOSRootView: View {
                         .font(.system(size: 12)).foregroundStyle(Theme.Palette.onAccent.opacity(0.85)).lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                Button { dismissedUpdateVersion = u.version } label: {
+                Button { dismissedUpdateVersion = u.key } label: {
                     Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
                         .padding(8).contentShape(Rectangle())
                 }
