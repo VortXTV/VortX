@@ -101,6 +101,34 @@ enum StreamRanking {
         }
     }
 
+    /// Whether a streams-loading wait should stop now and hand the result to `best(continuity:)`.
+    ///
+    /// For a RESUME (`rememberedQuality` set), it holds out until a stream MATCHING that quality has
+    /// loaded, and (unless the user ranks torrents on top, or uses add-on order) a NON-TORRENT one:
+    /// torrents answer in ~4s while the user's debrid/direct stream of that quality usually lands
+    /// ~10-12s later, so a flat short cutoff auto-picked the fast torrent and a Continue-Watching
+    /// resume "tried a torrent first" before reaching the user's stream. A generous ceiling stops a
+    /// quality that never returns from hanging the resume. With no remembered quality (a fresh play),
+    /// it keeps the original short window so picking stays snappy. `best()` still ranks the final
+    /// choice, so a torrent-first user's order is honored once their stream is in hand.
+    static func resolveSettled(_ groups: [CoreStreamSourceGroup], loaded: Int, total: Int,
+                               secondsSinceFirstPlayable seconds: TimeInterval,
+                               rememberedQuality: String?) -> Bool {
+        guard !groups.isEmpty else { return false }
+        if total > 0, loaded >= total { return true }                  // every add-on has answered
+        guard let hint = rememberedQuality, !hint.isEmpty else {
+            return seconds > 4                                         // fresh play: original snappy window
+        }
+        let prefs = SourcePreferences.shared
+        let torrentOK = prefs.useAddonOrder || prefs.typeOrder.first == .torrent
+        let qualityReady = groups.contains { group in
+            group.streams.contains { s in
+                s.playableURL != nil && continuityBonus(s, hint: hint) > 0 && (torrentOK || !s.isTorrent)
+            }
+        }
+        return qualityReady || seconds > 16                            // ceiling so a vanished quality cannot hang it
+    }
+
     static func score(_ s: CoreStream) -> Int {
         let key = streamKey(s)
         cacheLock.lock()

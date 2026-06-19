@@ -76,14 +76,14 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
         if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-        // Settle gate: rank only once every add-on has answered, OR ~4s after the first playable result —
-        // so the BEST stream (continuity-matching 4K) wins instead of whoever answered first (often a
-        // plain 1080p). Without it a CW resume / prev / next grabbed the first add-on's stream and missed
-        // the 4K a slower add-on returned a moment later. Mirrors tvOS play(episode:).
+        // Settle gate (see StreamRanking.resolveSettled): for a resume, hold out until the SAME quality the
+        // user last played has loaded (and, unless they rank torrents on top, a non-torrent one), because
+        // torrents answer in ~4s while the user's debrid of that quality lands ~10-12s later — a flat 4s
+        // cutoff auto-picked the fast torrent, so the CW resume "tried a torrent first".
         let progress = core.streamLoadProgress(forStreamId: v.id)
-        let settled = progress.total > 0 && progress.loaded >= progress.total
-        let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
-        if !groups.isEmpty, settled || waitedEnough { break }
+        let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+        if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+                                        secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
         try? await Task.sleep(for: .milliseconds(250))
     }
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge),
@@ -1408,12 +1408,12 @@ struct iOSEpisodeStreams: View {
         for _ in 0 ..< 80 {                                // ~20s ceiling, matching the page's settle timeout
             groups = displayGroups(core.streamGroups(forStreamId: v.id))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
-            // Settle gate (see iOSResolveEpisodeStream): rank only once add-ons settle or ~4s past the
-            // first playable result, so the best continuity-matching stream wins, not whoever answered first.
+            // Settle gate (see StreamRanking.resolveSettled): hold out for the remembered quality (non-torrent
+            // unless the user ranks torrents first) so a resume lands on the user's stream, not the first torrent.
             let progress = core.streamLoadProgress(forStreamId: v.id)
-            let settled = progress.total > 0 && progress.loaded >= progress.total
-            let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
-            if !groups.isEmpty, settled || waitedEnough { break }
+            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge),

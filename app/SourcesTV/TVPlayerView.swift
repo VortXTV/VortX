@@ -1815,14 +1815,17 @@ struct TVPlayerView: View {
             // add-ons: either every add-on has answered, or the first playable landed a few seconds
             // ago and we stop waiting for stragglers.
             var firstPlayableAt: Date?
-            for _ in 0..<100 {                                          // ~10s
+            for _ in 0..<200 {                                          // ~20s (the wanted-quality debrid can land ~10-12s in)
                 let groups = core.streamGroups(forStreamId: v.id)
                 let progress = core.streamLoadProgress(forStreamId: v.id)
                 let hasPlayable = groups.contains { $0.streams.contains { $0.playableURL != nil } }
                 if hasPlayable, firstPlayableAt == nil { firstPlayableAt = Date() }
-                let settled = progress.total > 0 && progress.loaded == progress.total
-                let waitedEnough = firstPlayableAt.map { Date().timeIntervalSince($0) > 4 } ?? false
-                if settled || waitedEnough,
+                // Settle gate (see StreamRanking.resolveSettled): wait for the SAME quality the last episode
+                // played (non-torrent unless the user ranks torrents first) so auto-next stays on the user's
+                // source instead of grabbing the first torrent that answers.
+                let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+                if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+                                                secondsSinceFirstPlayable: elapsed, rememberedQuality: curHint),
                    let s = StreamRanking.best(groups, continuity: curHint, binge: curBinge), let u = s.playableURL {
                     DiagnosticsLog.log("binge", "auto-next FALLBACK: wanted binge=\(curBinge ?? "nil") got=\(s.behaviorHints?.bingeGroup ?? "nil") name=\(s.name?.prefix(60) ?? "")")
                     curBinge = s.behaviorHints?.bingeGroup
