@@ -150,8 +150,13 @@ const RL_PATHS = new Set([
   "/v1/auth/reset/start", "/v1/auth/reset/complete",
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
+  "/v1/qr/start", "/v1/auth/check-username",   // pairing-row spam + username enumeration
 ]);
-async function readJSON(req: Request): Promise<Record<string, unknown> | null> {
+// Cap the body before parsing so an oversized request cannot tie up the parser (DoS guard). 2 MB sits
+// safely above MAX_DOC (1 MB) so a real backup PUT is never rejected, but blocks pathological bodies.
+async function readJSON(req: Request, maxBytes = 2 * 1024 * 1024): Promise<Record<string, unknown> | null> {
+  const cl = req.headers.get("content-length");
+  if (cl && Number(cl) > maxBytes) return null;
   try { const b = await req.json(); return b && typeof b === "object" ? (b as Record<string, unknown>) : null; } catch { return null; }
 }
 function pub(row: { id: string; email: string; username_display: string; username_changed_at?: number }) {
@@ -166,8 +171,11 @@ const MAIL_LOGO = "https://vortx.tv/vortx-mark.png"; // the real VortX mark (ras
 interface MailOpts { note?: string; recoveryCode?: string; code?: string }
 // Light theme on purpose: dark-themed emails get mangled by mail-client dark-mode inversion, so a
 // light card with dark ink stays readable everywhere. color-scheme=light pins it.
+// Escape interpolations in the HTML email so admin-supplied announce content (heading / lines) can
+// never inject markup into a recipient's mail client.
+const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): string {
-  const body = lines.map((l) => `<p style="margin:0 0 16px;color:#4a3f2c;font-size:15px;line-height:1.62">${l}</p>`).join("");
+  const body = lines.map((l) => `<p style="margin:0 0 16px;color:#4a3f2c;font-size:15px;line-height:1.62">${escHtml(l)}</p>`).join("");
   const code = opts.recoveryCode
     ? `<div style="margin:22px 0 8px;padding:16px 18px;background:#fbf3e2;border:1px solid #e7c986;border-radius:12px">`
       + `<div style="color:#7a5a1e;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Your recovery code</div>`
@@ -193,7 +201,7 @@ function emailHtml(heading: string, lines: string[], opts: MailOpts = {}): strin
     + `<img src="${MAIL_LOGO}" width="36" height="36" alt="" style="vertical-align:middle;display:inline-block;border:0">`
     + `<span style="vertical-align:middle;display:inline-block;margin-left:9px;font-size:23px;font-weight:800;letter-spacing:-.5px;color:#b45309">VortX</span></td></tr>`
     + `<tr><td style="background:#ffffff;border:1px solid #e7ddc7;border-radius:18px;padding:30px 28px">`
-    + `<h1 style="margin:0 0 16px;font-size:21px;font-weight:800;letter-spacing:-.4px;color:#1a1206">${heading}</h1>${body}${code}${code6}${note}</td></tr>`
+    + `<h1 style="margin:0 0 16px;font-size:21px;font-weight:800;letter-spacing:-.4px;color:#1a1206">${escHtml(heading)}</h1>${body}${code}${code6}${note}</td></tr>`
     + `<tr><td style="padding:18px 8px 0;color:#9b8a6c;font-size:12px;line-height:1.5">VortX is end to end encrypted, so we can never read your data. You received this because of activity on your VortX account.</td></tr>`
     + `</table></td></tr></table></body></html>`;
 }
@@ -702,7 +710,12 @@ async function connectStremio(req: Request, env: Env): Promise<Response> {
 // on CORS). The Worker fetches and validates it. Requires a VortX session, is rate-limited, and
 // refuses private / loopback hosts (basic SSRF guard) since it makes an outbound request on the
 // caller's behalf. It returns only parsed manifest fields, never the raw response. ---
-const PRIVATE_HOST_RE = /^(localhost|0\.0\.0\.0|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?|.*\.local|.*\.internal)$/i;
+// Private / loopback / link-local / ULA / CGNAT hosts the manifest proxy must refuse (SSRF guard).
+// NOTE: prefix branches (127., 10., ...) are anchored only at the START, not with a trailing $, or a
+// real address like 127.0.0.1 would never match (the earlier ^(...|127\.|...)$ form did exactly that
+// and silently passed every private IPv4 through). Adds 100.64/10 (CGNAT / Tailscale), IPv4-mapped and
+// bracketed IPv6, fe80 link-local, and fc/fd ULA. Validated against a block/allow matrix.
+const PRIVATE_HOST_RE = /^(localhost$|0\.0\.0\.0$|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|\[?::1\]?$|\[?::ffff:|\[?fe80:|\[?fc[0-9a-f]{2}:|\[?fd[0-9a-f]{2}:|.+\.local$|.+\.internal$)/i;
 function normalizeManifestUrl(raw: string): string | null {
   let u = raw.trim();
   if (!u) return null;
@@ -727,9 +740,20 @@ async function addonManifest(req: Request, env: Env): Promise<Response> {
   try {
     res = await fetch(transportUrl, { headers: { accept: "application/json" }, redirect: "follow", signal: AbortSignal.timeout(8000) });
   } catch { return json({ error: "unreachable" }, 502); }
+  // SSRF: the host check above only saw the FIRST url; fetch follows redirects, so a public host can 30x
+  // to a private one. Re-check the FINAL url's host before trusting the response.
+  try { if (PRIVATE_HOST_RE.test(new URL(res.url).hostname)) return json({ error: "invalid_url" }, 400); }
+  catch { return json({ error: "invalid_url" }, 400); }
   if (!res.ok) return json({ error: "not_a_manifest", status: res.status }, 502);
+  // Cap the body so a hostile host can't stream megabytes into the parser (a manifest is a few KB).
+  const clen = res.headers.get("content-length");
+  if (clen && Number(clen) > 512 * 1024) return json({ error: "not_a_manifest" }, 502);
   let mf: any;
-  try { mf = await res.json(); } catch { return json({ error: "not_a_manifest" }, 502); }
+  try {
+    const text = await res.text();
+    if (text.length > 512 * 1024) return json({ error: "not_a_manifest" }, 502);
+    mf = JSON.parse(text);
+  } catch { return json({ error: "not_a_manifest" }, 502); }
   if (!mf || typeof mf !== "object" || !mf.id || (!mf.name && !Array.isArray(mf.types))) return json({ error: "not_a_manifest" }, 502);
 
   const str = (v: unknown, max: number) => (typeof v === "string" ? v.slice(0, max) : undefined);
