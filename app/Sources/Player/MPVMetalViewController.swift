@@ -369,8 +369,23 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
         #endif
 
+        // Power-user custom mpv options. Applied LAST, after every VortX baseline option above, so an
+        // advanced viewer can override the defaults (the "mpv conf" setting). Each option is set with
+        // its own fail-safe: a bad key/value logs and is skipped, it must never abort the baseline
+        // config or crash playback. Set here (before mpv_initialize) so options that are pre-init-only
+        // also take effect; properties that only apply at runtime would need the property API instead,
+        // a known limitation documented in the setting hint.
+        for (key, value) in PlaybackSettings.parsedCustomMpvOptions {
+            let err = mpv_set_option_string(mpv, key, value)
+            if err < 0 {
+                mpvLog.error("custom mpv option rejected: \(key, privacy: .public)=\(value, privacy: .public) (\(String(cString: mpv_error_string(err)), privacy: .public))")
+            } else {
+                mpvLog.log("custom mpv option applied: \(key, privacy: .public)=\(value, privacy: .public)")
+            }
+        }
+
         checkError(mpv_initialize(mpv))
-        
+
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsSigPeak, MPV_FORMAT_DOUBLE)
         // Also observe the transfer characteristic (gamma): HLG content can sit at sig-peak ~1.0, so the
         // sig-peak observer alone never flips it to HDR. A late gamma settle (pq/hlg arriving after the

@@ -4,6 +4,32 @@ enum PlaybackSettings {
     enum Key {
         static let directLinksOnly = "stremiox.directLinksOnly"
         static let keepPlayingInBackground = "stremiox.keepPlayingInBackground"
+        static let customMpvOptions = "stremiox.customMpvOptions"
+    }
+
+    /// Power-user libmpv options, supplied as a free-form "key=value per line" snippet (an mpv.conf
+    /// fragment, e.g. "profile=gpu-hq", "scale=ewa_lanczossharp", "video-sync=display-resample").
+    /// Applied verbatim during player setup after VortX's own baseline options, so an advanced viewer
+    /// can override the defaults. Default empty (no options). A malformed line is logged and skipped;
+    /// it never blocks the baseline config or crashes playback.
+    static var customMpvOptions: String {
+        get { UserDefaults.standard.string(forKey: Key.customMpvOptions) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: Key.customMpvOptions) }
+    }
+
+    /// Parsed `customMpvOptions`: one (key, value) pair per non-blank, non-comment line, split on the
+    /// FIRST '=' (values may themselves contain '='), with both sides trimmed. Lines without an '=' or
+    /// with an empty key are dropped.
+    static var parsedCustomMpvOptions: [(key: String, value: String)] {
+        customMpvOptions.split(separator: "\n", omittingEmptySubsequences: false).compactMap { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { return nil }
+            guard let eq = line.firstIndex(of: "=") else { return nil }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            let value = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty else { return nil }
+            return (key, value)
+        }
     }
 
     /// Keep audio playing (and the in-process streaming server thread alive) when the app backgrounds

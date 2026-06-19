@@ -41,6 +41,7 @@ struct iOSSettingsView: View {
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.keepPlayingInBackground) private var keepPlayingInBackground = true
+    @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
@@ -72,6 +73,7 @@ struct iOSSettingsView: View {
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
                 subtitleSection.listRowBackground(Theme.Palette.surface1)
+                advancedSection.listRowBackground(Theme.Palette.surface1)
                 backupSection.listRowBackground(Theme.Palette.surface1)
                 aboutSection.listRowBackground(Theme.Palette.surface1)
                 engineSection.listRowBackground(Theme.Palette.surface1)
@@ -283,6 +285,22 @@ struct iOSSettingsView: View {
                     Text("Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.")
                 }
             }
+        }
+    }
+
+    @ViewBuilder private var advancedSection: some View {
+        Section {
+            TextField("profile=gpu-hq\nscale=ewa_lanczossharp", text: $customMpvOptions, axis: .vertical)
+                .lineLimit(3...10)
+                .font(.system(.callout, design: .monospaced))
+                .autocorrectionDisabled(true)
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+        } header: {
+            Text("Advanced (mpv options)")
+        } footer: {
+            Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
     }
 

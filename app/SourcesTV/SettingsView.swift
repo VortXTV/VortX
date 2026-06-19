@@ -22,6 +22,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
+    @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
@@ -41,6 +42,7 @@ struct SettingsView: View {
                     appearanceSection
                     audioSubtitleSection
                     subtitleSection
+                    advancedSection
                     backupSection
                     aboutSection
                 }
@@ -444,6 +446,19 @@ struct SettingsView: View {
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)
             Text("Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
+    // MARK: Advanced (mpv options)
+
+    private var advancedSection: some View {
+        section("Advanced (mpv options)") {
+            Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            TextField("profile=gpu-hq", text: $customMpvOptions, axis: .vertical)
+                .lineLimit(3...10)
+                .autocorrectionDisabled(true)
+                .focusSection()
         }
     }
 
