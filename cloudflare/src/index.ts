@@ -20,6 +20,8 @@
  * not reveal even the verifiers.
  */
 
+import { DurableObject } from "cloudflare:workers";
+
 interface EmailMessage {
   to: string;
   from: { email: string; name?: string };
@@ -34,6 +36,7 @@ export interface Env {
   EMAIL?: { send(msg: EmailMessage): Promise<unknown> }; // Cloudflare Email Sending binding (optional so dry-runs/tests work)
   ADMIN_TOKEN?: string; // gates /v1/admin/stats (set via `wrangler secret put ADMIN_TOKEN`)
   ALLOW_TEST_RESET_CODE?: string; // LOCAL-ONLY test seam: when "1", reset/start echoes the code (see resetStart). Never set in prod.
+  SYNC_ROOM: DurableObjectNamespace<SyncRoom>; // one room per account; pushes "updated" to a device's siblings on backup change
 }
 
 const PAIR_TTL_MS = 10 * 60 * 1000;
@@ -254,6 +257,7 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/qr/status" && m === "GET") return qrStatus(url, env);
       if (p === "/v1/backup" && m === "PUT") return backupPut(request, env);
       if (p === "/v1/backup" && m === "GET") return backupGet(request, env);
+      if (p === "/v1/sync/connect" && m === "GET") return syncConnect(request, env);
       if (p === "/v1/admin/stats" && m === "GET") return adminStats(request, env);
       if (p === "/v1/admin/announce" && m === "POST") return adminAnnounce(request, env);
       return noContent(404);
@@ -801,7 +805,18 @@ async function backupPut(req: Request, env: Env): Promise<Response> {
      WHERE excluded.version > backups.version`,
   ).bind(id, document, Math.trunc(version), Date.now()).run();
   // accepted=false means a newer version already won (last-writer-wins); the client should re-fetch and merge (M-5).
-  return json({ ok: true, accepted: (res.meta?.changes ?? 1) > 0 });
+  const accepted = (res.meta?.changes ?? 1) > 0;
+  // Real-time fan-out: when this push actually stored a newer version, tell every OTHER connected device
+  // for this account to pull. Fire-and-forget (never block or fail the PUT on the notify), and only on a
+  // real version bump so a rejected stale write does not wake siblings. The pushing device sees its own
+  // version, so a self-notification is harmless (the client guards on version).
+  if (accepted) {
+    try {
+      const room = env.SYNC_ROOM.get(env.SYNC_ROOM.idFromName(id));
+      await room.broadcast(Math.trunc(version));
+    } catch (e) { console.error("sync broadcast failed:", e); }
+  }
+  return json({ ok: true, accepted });
 }
 async function backupGet(req: Request, env: Env): Promise<Response> {
   const id = await requireAuth(req, env);
@@ -810,6 +825,79 @@ async function backupGet(req: Request, env: Env): Promise<Response> {
     .bind(id).first<{ document: string; version: number }>();
   if (!row) return noContent(404);
   return json({ document: row.document, version: row.version });
+}
+
+// --- Real-time sync (WebSocket). A device opens a long-lived socket to its account's SyncRoom DO and
+// waits for a {"type":"updated","version":N} push, which it gets whenever ANOTHER device stores a newer
+// backup (see backupPut). On that push the device just calls GET /v1/backup and merges; the socket
+// carries no user data, only the version number, so it stays zero-knowledge.
+//
+// Auth is the SAME account session as every other authed route. A WebSocket handshake is a GET that the
+// browser cannot decorate with an Authorization header, so the token may arrive either way:
+//   - Authorization: Bearer <token>   (native app / Tauri / any non-browser client; preferred)
+//   - ?token=<token>                   (browser fallback; the dashboard uses this)
+// Either path runs through verifySession, exactly like requireAuth. Unauthenticated or non-upgrade
+// requests are rejected before the socket is created, so a room only ever holds the account's own
+// devices. The DO is addressed by idFromName(accountId), so each account gets its own isolated room. ---
+async function syncConnect(request: Request, env: Env): Promise<Response> {
+  if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+    return json({ error: "expected_websocket" }, 426);
+  }
+  const h = request.headers.get("authorization");
+  const headerTok = h && h.startsWith("Bearer ") ? h.slice(7) : null;
+  const queryTok = new URL(request.url).searchParams.get("token");
+  const accountId = await verifySession(headerTok || queryTok, env);
+  if (!accountId) return json({ error: "unauthorized" }, 401);
+  // Hand the upgrade to this account's room. The DO completes the 101 and keeps the socket.
+  const room = env.SYNC_ROOM.get(env.SYNC_ROOM.idFromName(accountId));
+  return room.fetch(request);
+}
+
+// --- SyncRoom Durable Object: one instance per account (addressed by idFromName(accountId)). It holds the
+// account's open device sockets and, on broadcast(version), tells every one of them to pull. Uses the
+// WebSocket Hibernation API (ctx.acceptWebSocket), so an idle room with sleeping sockets uses no compute
+// and costs nothing until a message or a broadcast wakes it. Cost note: Durable Objects + hibernatable
+// WebSockets bill on active wall-clock and request count only (idle hibernated sockets are free), so for
+// a few devices per account this stays comfortably within the included Workers allowance. ---
+export class SyncRoom extends DurableObject<Env> {
+  // The Worker has already authenticated the session for THIS account before forwarding the upgrade, so the
+  // room only ever sees its own account's devices. We just complete the handshake and retain the socket.
+  override async fetch(request: Request): Promise<Response> {
+    if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+      return new Response("expected websocket", { status: 426 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server); // hibernation: the runtime parks the socket until a message/broadcast
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Fire-and-forget notification from backupPut: push {"type":"updated","version":N} to every live socket.
+  // getWebSockets() returns the account's hibernated + active sockets; a dropped socket is skipped/cleaned.
+  broadcast(version: number): void {
+    const msg = JSON.stringify({ type: "updated", version });
+    for (const ws of this.ctx.getWebSockets()) {
+      try { ws.send(msg); } catch { try { ws.close(1011, "send failed"); } catch {} }
+    }
+  }
+
+  // A client should not need to send anything (the protocol is server-push only), but reply to a "ping"
+  // text frame with "pong" so a client can keep-alive / confirm liveness without a separate channel.
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message === "string" && message === "ping") {
+      try { ws.send("pong"); } catch {}
+    }
+  }
+
+  // Drop the socket on close/error. With web_socket_auto_reply_to_close (compat date >= 2026-04-07) the
+  // runtime already finishes the close handshake; calling close() here is safe and harmless on this compat
+  // date (2026-06-01). getWebSockets() stops returning a closed socket, so the set self-cleans.
+  override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    try { ws.close(code, reason); } catch {}
+  }
+  override async webSocketError(ws: WebSocket): Promise<void> {
+    try { ws.close(1011, "error"); } catch {}
+  }
 }
 
 // --- Admin stats (gated by ADMIN_TOKEN). Aggregate counts only; no user content is readable

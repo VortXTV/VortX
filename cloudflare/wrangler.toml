@@ -36,3 +36,19 @@ simple = { limit = 30, period = 60 }
 # Worker can send from welcome@vortx.tv. Used for welcome + security-notice emails on account events.
 [[send_email]]
 name = "EMAIL"
+
+# Real-time cross-device sync. One SyncRoom Durable Object per account (addressed by idFromName(accountId))
+# holds that account's open device WebSockets. On a backup change the Worker calls room.broadcast(version)
+# and every other connected device gets {"type":"updated","version":N} and pulls. Sockets use the WebSocket
+# Hibernation API, so idle rooms park with zero compute. Cost: DOs + hibernatable WebSockets bill only on
+# active wall-clock + request count (idle hibernated connections are free), so a handful of devices per
+# account stays within the included Workers paid-plan allowance; there is no separate always-on charge.
+[[durable_objects.bindings]]
+name = "SYNC_ROOM"
+class_name = "SyncRoom"
+
+# SyncRoom keeps no SQL/KV storage (it only holds live sockets), but DO classes must still be registered in
+# a migration. new_sqlite_classes is the current default storage backend for new DO classes.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SyncRoom"]
