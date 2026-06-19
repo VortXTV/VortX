@@ -25,4 +25,29 @@ enum SearchHistoryStore {
     static func clear(profileID: UUID?) {
         UserDefaults.standard.removeObject(forKey: storageKey(profileID))
     }
+
+    /// All recent terms for a given profile (mirrors `load`, used by VortX-account sync to read every
+    /// profile's list when building the sync doc).
+    static func allTerms(for profileID: UUID?) -> [String] {
+        load(profileID: profileID)
+    }
+
+    /// Apply pulled terms from another device into a profile's list, newest-wins and de-duplicated
+    /// (case-insensitive), keeping the same cap. The pulled list leads, then this device's local terms
+    /// fill in behind it, so nothing already here is lost. No-op on an empty pull.
+    static func merge(_ terms: [String], for profileID: UUID?) {
+        let incoming = terms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !incoming.isEmpty else { return }
+        var seen = Set<String>()
+        var merged: [String] = []
+        for term in incoming + load(profileID: profileID) {
+            let key = term.lowercased()
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            merged.append(term)
+        }
+        UserDefaults.standard.set(Array(merged.prefix(limit)), forKey: storageKey(profileID))
+    }
 }
