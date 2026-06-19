@@ -56,6 +56,11 @@ struct iOSRootView: View {
     }
 
     @State private var tab: Tab = .home
+    #if os(macOS)
+    /// macOS keyboard browse: the focused bottom tab-strip item (its own focus space, traversed with
+    /// Left/Right and Tab; Enter switches to it). nil = no tab in the strip is focused. Keyed by raw value.
+    @FocusState private var tabFocus: MacBrowseFocus?
+    #endif
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
@@ -108,6 +113,11 @@ struct iOSRootView: View {
                 tabButton(item)
             }
         }
+        #if os(macOS)
+        // Group the tab items so native directional focus walks Left/Right across the strip; Tab / Full
+        // Keyboard Access reaches it via the standard key-view loop. Enter on a focused tab switches to it.
+        .focusSection()
+        #endif
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
         .padding(.top, Theme.Space.xs)
@@ -162,7 +172,7 @@ struct iOSRootView: View {
 
     private func tabButton(_ item: Tab) -> some View {
         let selected = tab == item
-        return Button {
+        let base = Button {
             tab = item
         } label: {
             VStack(spacing: 3) {
@@ -192,6 +202,18 @@ struct iOSRootView: View {
         .accessibilityLabel(item.title)
         .accessibilityHint("Switches to \(item.title) tab")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+
+        #if os(macOS)
+        // macOS keyboard browse: each tab item is focusable so arrows/Tab walk the strip and the focus
+        // ring shows where you are; Enter fires the Button (switches tab). Additive + gated, so iOS is
+        // unchanged. The ring uses the control radius (the pill is capsule-ish at this small size).
+        return base
+            .focusable()
+            .focused($tabFocus, equals: .tab(item.rawValue))
+            .macFocusRing(tabFocus == .tab(item.rawValue), cornerRadius: Theme.Radius.control)
+        #else
+        return base
+        #endif
     }
 }
 
@@ -212,6 +234,11 @@ struct iOSHomeView: View {
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
+    #if os(macOS)
+    /// macOS keyboard browse: which Home poster card is focused. Passed to each rail so its cards become
+    /// `.focusable()` and join native arrow traversal; nil on iOS (this whole member is macOS-only).
+    @FocusState private var macFocus: MacBrowseFocus?
+    #endif
 
     /// All Home rail items in display order (Continue Watching first, then catalog rows), as
     /// `RailItem`s carrying the catalog preview fields so the hero seeds richly. CW entries also
@@ -263,31 +290,31 @@ struct iOSHomeView: View {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
                         // offers the engine's "Remove from Continue Watching" (#14).
-                        PosterRail(title: "Continue Watching", items: continueWatchingItems,
-                                   onTap: handleContinueWatchingTap, menu: .continueWatching,
-                                   onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                        homeRail(PosterRail(title: "Continue Watching", items: continueWatchingItems,
+                                            onTap: handleContinueWatchingTap, menu: .continueWatching,
+                                            onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
                     }
                     // Local recommendations seeded from this profile's recent watch history (#0.3.9).
                     // Hidden when there's no TMDB key, no history to seed from, or no results.
                     if !topPicks.items.isEmpty {
-                        PosterRail(title: "Top Picks for you",
-                                   items: topPicks.items.map {
-                                       RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                poster: $0.poster, progress: 0)
-                                   },
-                                   onTap: handleTap)
+                        homeRail(PosterRail(title: "Top Picks for you",
+                                            items: topPicks.items.map {
+                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                         poster: $0.poster, progress: 0)
+                                            },
+                                            onTap: handleTap))
                     }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
-                            PosterRail(title: row.title,
-                                       items: row.items.map {
-                                           RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                    poster: $0.poster, progress: 0,
-                                                    background: $0.background, description: $0.description,
-                                                    releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
-                                                    genres: $0.genres)
-                                       },
-                                       onTap: handleTap)
+                            homeRail(PosterRail(title: row.title,
+                                                items: row.items.map {
+                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                             poster: $0.poster, progress: 0,
+                                                             background: $0.background, description: $0.description,
+                                                             releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
+                                                             genres: $0.genres)
+                                                },
+                                                onTap: handleTap))
                                 // Vertical infinite scroll: reaching the last populated catalog row loads the
                                 // next page of Home catalogs (no-op past the end / while one is in flight).
                                 .onAppear {
@@ -308,6 +335,11 @@ struct iOSHomeView: View {
             // A scroll gesture quiets the ambient hero rotation (resumes after inactivity) — the
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
+            #if os(macOS)
+            // Escape steps focus up a level: drop the focused card so the keyboard browse returns to a
+            // neutral state (the bottom tab strip is its own focus space, reachable via Tab / arrows).
+            .onExitCommand { macFocus = nil }
+            #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle("Home", isActive: isActive)
             .toolbar {
@@ -343,6 +375,20 @@ struct iOSHomeView: View {
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); hero.seed(heroCandidates, reduceMotion: reduceMotion) }
         .onDisappear { hero.stop() }
+    }
+
+    /// Inject the macOS keyboard-focus binding into a Home rail so its cards become arrow-navigable
+    /// (`.focusable()` + native traversal). On iOS this is a transparent pass-through, so iPhone / iPad
+    /// rails are byte-for-byte unchanged. Returns the (possibly reconfigured) `PosterRail` directly so
+    /// the `@ViewBuilder` parents see a plain View, not a `()` from a mutating statement.
+    private func homeRail(_ rail: PosterRail) -> PosterRail {
+        #if os(macOS)
+        var configured = rail
+        configured.macFocus = $macFocus
+        return configured
+        #else
+        return rail
+        #endif
     }
 
     /// Tapping a poster opens that title's detail through normal navigation — it does NOT "feature" it
@@ -1401,6 +1447,13 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
+    #if os(macOS)
+    /// macOS keyboard browse: when Home passes its `@FocusState` binding, the rail's cards become
+    /// `.focusable()` and join the native focus traversal (arrows move within / between rails, Enter
+    /// fires the card's tap). Other callers (Search) and all of iOS leave this nil, so their cards are
+    /// byte-for-byte unchanged (no `.focusable`, no ring). The rail is keyed by its `title`.
+    var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
+    #endif
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     /// Pointer hovering the rail (#3). Never fires on pure-touch iPhone, so the
     /// scroll arrows reveal only on Mac / iPad-with-trackpad, where swiping a long
@@ -1418,17 +1471,7 @@ private struct PosterRail: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: Theme.Space.sm) {
                         ForEach(items) { item in
-                            Button { onTap(item) } label: {
-                                PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
-                                              progress: item.progress, menu: menu,
-                                              onDetails: onDetails.map { od in { od(item) } })
-                            }
-                            .buttonStyle(.plain)
-                            .id(item.id)
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel(item.name)
-                            .accessibilityHint("Opens details")
-                            .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
+                            railCard(item, proxy: proxy)
                         }
                     }
                     .padding(.horizontal, Theme.Space.md)
@@ -1440,8 +1483,49 @@ private struct PosterRail: View {
                     if showArrows && pageIndex < items.count - 1 { railArrow(forward: true) { page(by: 1, proxy) } }
                 }
             }
+            #if os(macOS)
+            // Group the rail's cards so native directional focus resolves Left/Right WITHIN the row and
+            // Up/Down BETWEEN rows geometrically, only when this rail opts into keyboard focus (Home).
+            .modifier(MacRailFocusSection(enabled: macFocus != nil))
+            #endif
         }
         .onHover { hovering = $0 }
+    }
+
+    /// One rail card. The touch/iOS body is identical across platforms; on macOS, when the rail opts in,
+    /// the card additionally becomes `.focusable()` + shows the accent ring while focused and auto-scrolls
+    /// into view, all additive modifiers so touch / VoiceOver / the existing tap + long-press are unchanged.
+    @ViewBuilder private func railCard(_ item: RailItem, proxy: ScrollViewProxy) -> some View {
+        let base = Button { onTap(item) } label: {
+            PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
+                          progress: item.progress, menu: menu,
+                          onDetails: onDetails.map { od in { od(item) } })
+        }
+        .buttonStyle(.plain)
+        .id(item.id)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(item.name)
+        .accessibilityHint("Opens details")
+        .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
+
+        #if os(macOS)
+        if let macFocus {
+            let target = MacBrowseFocus.card(rail: title, item: item.id)
+            base
+                .focusable()
+                .focused(macFocus, equals: target)
+                .macFocusRing(macFocus.wrappedValue == target)
+                // Keep the keyboard-focused card on screen as focus walks the row (the same scrollTo the
+                // hover arrows use). Driven off focus change so it tracks both arrow moves and Tab landings.
+                .onChange(of: macFocus.wrappedValue) { newValue in
+                    if newValue == target { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
+                }
+        } else {
+            base
+        }
+        #else
+        base
+        #endif
     }
 
     /// Arrows matter only when a pointer is present and the row actually overflows a page.
