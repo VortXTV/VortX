@@ -399,6 +399,14 @@ enum StreamRanking {
         // Usenet first: a debrid service's usenet results carry the same service code.
         if text.contains("usenet") || text.contains("nzb") || text.contains("easynews")
             || text.contains("📰") { return .usenet }
+        // Resolved torrent = debrid/cached, detected STRUCTURALLY (add-on-agnostic). A RAW torrent has an
+        // infoHash and NO url; once a debrid/cached service resolves it, the stream gains a direct `url`
+        // while keeping the original infoHash. So url + infoHash together means "a torrent a service already
+        // resolved to an instant link" -> debrid tier, no matter how the add-on formats its service tag.
+        // This is the fix for a debrid stream sinking to .direct (tier 0, BELOW raw torrents) when its tag
+        // text is not in the grammar below: every add-on / user config writes those tags differently, so the
+        // structural signal is the reliable one. Raw torrents (url == nil) still fall to .torrent below.
+        if s.url != nil, s.infoHash != nil { return .debrid }
         // Bracketed service tag with any cache suffix: [RD+], [AD⚡], [TB⏳], [PM download],
         // [RD⬇], [RD C]/[RD U] (kodi forms), [RD🔄].
         if matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)([+⚡⏳⬇🔄]|\s+download|\s+[cu])?\]"#) {
