@@ -332,7 +332,7 @@ async function login(req: Request, env: Env): Promise<Response> {
   }
   return json({
     token: await makeSession(row.id, env, row.session_version ?? 0),
-    account: pub(row),
+    account: { ...pub(row), twoFactorEnabled: !!row.totp_secret }, // so the app shows 2FA on from sign-in (Bug 1)
     wrappedKeyPassword: row.wrapped_key_pw,
     kdfSalt: row.kdf_salt,
     kdfIters: row.kdf_iters,
