@@ -224,26 +224,41 @@ final class ProfileStore: ObservableObject {
         return nil
     }
 
-    /// Apply web-authored profile edits (the vortx.tv dashboard writes doc.profileEdits; the app reads
-    /// it on sync-down). Non-destructive in this revision: updates name / familyEdit / pin on EXISTING
-    /// profiles by id, and feeds per-profile library adds into the overlay via applyRemoteOverlay.
-    /// Create and delete are intentionally NOT handled here yet (a later, hard-gated step). Union-safe:
-    /// a profile absent from the edits is left untouched. See [[vortx-dashboard-profile-mgmt-design]].
+    /// Apply web-authored profile edits (the vortx.tv dashboard writes doc.profileEdits; the app reads it
+    /// on sync-down): update name / familyEdit / pin on existing profiles, CREATE a web-authored new
+    /// profile (an id not seen locally), DELETE a tombstoned one (HARD-GATED: never the owner, and
+    /// remove() itself refuses the last profile), and feed per-profile library adds into the overlay.
+    /// Union-safe: a profile absent from the edits is left untouched. See [[vortx-dashboard-profile-mgmt-design]].
     func applyProfileEdits(_ edits: [String: Any]) {
         if let roster = edits["roster"] as? [[String: Any]] {
             for e in roster {
-                guard let idStr = e["id"] as? String, let uuid = UUID(uuidString: idStr),
-                      var p = profiles.first(where: { $0.id == uuid }) else { continue }
-                if e["deleted"] as? Bool == true { continue }   // delete is a later, hard-gated step
-                var changed = false
-                if let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !name.isEmpty, name != p.name { p.name = name; changed = true }
-                if let fe = e["familyEdit"] as? Bool, fe != p.familyEdit { p.familyEdit = fe; changed = true }
-                if e.keys.contains("pin") {
-                    let newPin = (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                    if newPin != p.pin { p.pin = newPin; changed = true }
+                guard let idStr = e["id"] as? String, let uuid = UUID(uuidString: idStr) else { continue }
+                let existing = profiles.first(where: { $0.id == uuid })
+                if e["deleted"] as? Bool == true {
+                    // DELETE, hard-gated: only a non-owner profile; remove() refuses the last one and
+                    // clears that profile's watch cache + per-profile keychain slot.
+                    if let target = existing, !target.isOwner { remove(target) }
+                    continue
                 }
-                if changed { update(p) }
+                if var p = existing {
+                    var changed = false
+                    if let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !name.isEmpty, name != p.name { p.name = name; changed = true }
+                    if let fe = e["familyEdit"] as? Bool, fe != p.familyEdit { p.familyEdit = fe; changed = true }
+                    if e.keys.contains("pin") {
+                        let newPin = (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                        if newPin != p.pin { p.pin = newPin; changed = true }
+                    }
+                    if changed { update(p) }
+                } else {
+                    // CREATE: a new secondary the dashboard added (never an owner). Defaults match a
+                    // normal new profile; playback is seeded on the next load like any pre-feature roster.
+                    guard let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !name.isEmpty else { continue }
+                    add(UserProfile(id: uuid, name: name, avatar: "🍿",
+                                    pin: (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                                    isOwner: false, familyEdit: (e["familyEdit"] as? Bool) ?? false))
+                }
             }
         }
         if let adds = edits["libraryAdds"] as? [String: Any] {
