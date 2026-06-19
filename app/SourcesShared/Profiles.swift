@@ -428,6 +428,32 @@ final class ProfileStore: ObservableObject {
         loadWatchCache()
     }
 
+    /// Apply a roster that a VortX account sync just restored into UserDefaults (SettingsBackup.restore)
+    /// to the LIVE store, so another device's profile changes appear WITHOUT a relaunch. This is the fix
+    /// for "use account data did nothing" and the cross-device ping-pong: previously the synced defaults
+    /// were written but the in-memory roster never re-read, so the device kept (and re-pushed) its own.
+    /// Mirrors adoptRemoteRoster, but reads the restored defaults and KEEPS this device's active selection
+    /// (selection is per-device, not synced). Never schedules a push (touch: false), so it cannot loop.
+    func reloadFromDefaults() {
+        guard let data = UserDefaults.standard.data(forKey: Self.listKey),
+              let list = try? JSONDecoder().decode([UserProfile].self, from: data) else { return }
+        let keepActive = activeID
+        profiles = list
+        normalizeOwner()
+        if let keepActive, profiles.contains(where: { $0.id == keepActive }) {
+            activeID = keepActive
+        } else if !profiles.contains(where: { $0.id == activeID }) {
+            activeID = profiles.first?.id
+        }
+        if let active {
+            applyTheme(active)
+            applyPlayback(active)
+            SourcePreferences.shared.reload()
+        }
+        persist(touch: false)
+        loadWatchCache()
+    }
+
     /// The owner profile can never be an own-account profile; scrub the flag wherever a roster
     /// comes from (old build, remote sync) so no device ends up reading an empty token slot.
     private func normalizeOwner() {
