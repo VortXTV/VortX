@@ -136,13 +136,18 @@ struct SettingsView: View {
             // the downward beam from Log Out misses the left-aligned links and the engine exits
             // the section, skipping "VortX account & sync" and the metadata-keys row.
             VStack(alignment: .leading, spacing: Theme.Space.md) {
+                // Lead with the VortX account (the app's own E2E account + sync); the Stremio account sits beneath.
+                NavigationLink { SyncSettingsView() } label: {
+                    Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
                 if account.isSignedIn {
                     HStack(spacing: Theme.Space.md) {
                         Image(systemName: "person.crop.circle.fill")
                             .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
                         VStack(alignment: .leading, spacing: 6) {
                             Text(account.email ?? "Signed in").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                            Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
+                            Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                         }
                         Spacer()
@@ -157,10 +162,6 @@ struct SettingsView: View {
                     }
                     .buttonStyle(PrimaryActionStyle())
                 }
-                NavigationLink { SyncSettingsView() } label: {
-                    Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { MetadataKeysView() } label: {
                     Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
                 }

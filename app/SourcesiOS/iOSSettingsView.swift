@@ -213,10 +213,13 @@ struct iOSSettingsView: View {
 
     @ViewBuilder private var accountSection: some View {
         Section("Account") {
+            // Lead with the VortX account (the app's own end-to-end-encrypted account + sync); the Stremio
+            // account is shown beneath it as a connected source.
+            NavigationLink("VortX account & sync") { SyncSettingsView() }
             if account.isSignedIn {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(account.email ?? "Signed in")
-                    Text("\(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
+                    Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -227,7 +230,6 @@ struct iOSSettingsView: View {
             } else {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
-            NavigationLink("VortX account & sync") { SyncSettingsView() }
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
         }
     }
