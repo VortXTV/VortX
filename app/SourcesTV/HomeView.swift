@@ -8,11 +8,17 @@ struct HomeView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var profiles: ProfileStore
     @StateObject private var focusModel = FocusedItemModel()
+    @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
     private var continueWatching: [CoreCWItem] {
         profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+    }
+
+    /// The profile-aware library, used (with Continue Watching) to seed + exclude in Top Picks.
+    private var libraryItems: [CoreCWItem] {
+        profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
     var body: some View {
@@ -34,6 +40,11 @@ struct HomeView: View {
                             // history inside CoreBridge.removeFromLibrary.
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
                         }
+                        // Local recommendations seeded from this profile's recent watch history (#0.3.9).
+                        // Hidden when there's no TMDB key, no history to seed from, or no results.
+                        if !topPicks.items.isEmpty {
+                            TopPicksRow(items: topPicks.items, focusModel: focusModel)
+                        }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
                         }
@@ -54,11 +65,17 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed() }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks() }
         .onChange(of: core.boardRows.first?.id) { seed() }
-        .onChange(of: core.continueWatching.first?.id) { seed() }
-        .onChange(of: profiles.activeID) { seed() }
+        .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
+        .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources() }
+    }
+
+    /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
+    /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
+    private func refreshTopPicks() {
+        topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
@@ -192,6 +209,43 @@ struct CoreCatalogRowView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// "Top Picks for you": local recommendations seeded from the active profile's recent watch history
+/// (see `TopPicksModel`). Mirrors `CoreCatalogRowView`, but its items are `MetaPreview`s from the
+/// recommender, so it builds a lightweight `FocusedHero` (metahub backdrop) for the living backdrop.
+struct TopPicksRow: View {
+    let items: [MetaPreview]
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: "Based on what you watch", title: "Top Picks for you")
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   menu: .catalog,
+                                   onFocus: focusModel.map { model in
+                                       { model.focus(hero(for: item)) }
+                                   })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A bare hero for the backdrop; the FocusedItemModel enriches it (rating/synopsis/real backdrop)
+    /// from the session cache or Cinemeta a beat after focus, exactly like a library card.
+    private func hero(for item: MetaPreview) -> FocusedHero {
+        FocusedHero(id: item.id, type: item.type, title: item.name,
+                    backdrop: item.poster, metaLine: item.type.capitalized,
+                    overview: nil, genreLine: nil)
     }
 }
 

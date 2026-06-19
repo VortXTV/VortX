@@ -208,6 +208,7 @@ struct iOSHomeView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
+    @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -266,6 +267,16 @@ struct iOSHomeView: View {
                                    onTap: handleContinueWatchingTap, menu: .continueWatching,
                                    onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
                     }
+                    // Local recommendations seeded from this profile's recent watch history (#0.3.9).
+                    // Hidden when there's no TMDB key, no history to seed from, or no results.
+                    if !topPicks.items.isEmpty {
+                        PosterRail(title: "Top Picks for you",
+                                   items: topPicks.items.map {
+                                       RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                poster: $0.poster, progress: 0)
+                                   },
+                                   onTap: handleTap)
+                    }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
                             PosterRail(title: row.title,
@@ -322,8 +333,10 @@ struct iOSHomeView: View {
             if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            refreshTopPicks()
         }
-        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
+        .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -338,6 +351,14 @@ struct iOSHomeView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
+    /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
+    private func refreshTopPicks() {
+        let cw = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        let library = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
     }
 
     /// Continue-Watching one-tap direct resume (#11): play the exact last-played stream straight away
