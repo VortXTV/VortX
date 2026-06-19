@@ -63,4 +63,10 @@ enum LastStreamStore {
             UserDefaults.standard.set(data, forKey: key(profileID))
         }
     }
+
+    /// Drop the in-memory cache so the next `entry()`/`load()` re-reads UserDefaults. A VortX-account
+    /// sync writes the restored streams straight into UserDefaults behind this cache (SettingsBackup.restore),
+    /// so without this a synced Continue-Watching link stays invisible until relaunch and the resume falls
+    /// back to re-resolving (and could grab the wrong source). Called from VortXSyncManager.syncDown.
+    static func invalidateCache() { cache.removeAll() }
 }

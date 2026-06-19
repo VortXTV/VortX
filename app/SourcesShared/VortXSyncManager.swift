@@ -265,6 +265,7 @@ final class VortXSyncManager: ObservableObject {
            ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
             restored = true
             ProfileStore.shared.reloadFromDefaults()   // apply the restored roster to the LIVE store, no relaunch
+            LastStreamStore.invalidateCache()          // the restore wrote new lastStream behind the cache; re-read it
         }
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
