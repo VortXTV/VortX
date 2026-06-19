@@ -86,6 +86,18 @@ struct PlayerScreen: View {
         guard let type = recordMeta?.type, LiveTypes.contains(type) else { return false }
         return !recordIsTorrent
     }
+    /// Runtime live-detection (follow-up to OrigamiSpace #94): a stream is treated as live when its meta
+    /// type says so (`isLive`) OR mpv reports it as non-seekable after playback has actually begun. A VOD
+    /// becomes seekable once playback starts; a true live feed stays non-seekable, so a live stream typed
+    /// as VOD still gets the live treatment (no resume / progress / mark-watched / warm-next / end-of-file
+    /// auto-advance). The `hasStartedPlaying` guard is CRITICAL: a still-buffering VOD also reports
+    /// non-seekable, so gating on it avoids mis-flagging every movie as live (which would disable resume
+    /// and progress on all VOD). Only the runtime VOD-only guards use this; the load-time mpv mode keeps
+    /// the type-based `isLive`.
+    private var effectivelyLive: Bool {
+        if isLive { return true }
+        return hasStartedPlaying && !isSeekable
+    }
 
     // MARK: Panels
 
@@ -216,6 +228,9 @@ struct PlayerScreen: View {
     @State private var loadFailed = false            // playback couldn't start (dead/uncached link)
     @State private var loadErrorMsg = ""
     @State private var hasStartedPlaying = false
+    /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
+    /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
+    @State private var isSeekable = true
     @State private var loadTimeout: Task<Void, Never>?
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
@@ -474,7 +489,7 @@ struct PlayerScreen: View {
                     // Live streams must NOT write a resume offset: their "position" is just elapsed
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
                     // bogus offset (or drop a fake Continue-Watching entry).
-                    if !isLive, duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
+                    if !effectivelyLive, duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
                         lastReported = d
                         onProgress(d, duration)
                     }
@@ -483,10 +498,10 @@ struct PlayerScreen: View {
                     // file) so auto-advance isn't a cold start. Purely additive: the actual advance
                     // still resolves through loadEpisode, so progress reporting and engine binding are
                     // unchanged — this only pre-heats the slow I/O the next open would otherwise pay for.
-                    if !isLive, duration > 60, d / duration >= 0.5 { warmNextIfNeeded() }
+                    if !effectivelyLive, duration > 60, d / duration >= 0.5 { warmNextIfNeeded() }
                     // ~90% in → flip the engine's watched marker live, so the title leaves Continue
                     // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if !markedWatched, !isLive, duration > 0, d / duration >= 0.9, let m = curMeta {
+                    if !markedWatched, !effectivelyLive, duration > 0, d / duration >= 0.9, let m = curMeta {
                         markedWatched = true
                         core.markPlaybackWatched(m)
                     }
@@ -512,6 +527,11 @@ struct PlayerScreen: View {
                 }
                 refreshSkipSegments()
             }
+        case MPVProperty.seekable:
+            // Runtime live-detection: a VOD turns seekable once playback starts, a live feed stays
+            // non-seekable. `effectivelyLive` reads this only after `hasStartedPlaying`, so a transient
+            // false during initial buffering can't mis-flag a movie as live.
+            if let s = data as? Bool { isSeekable = s }
         case MPVProperty.pause:
             if let b = data as? Bool {
                 isPaused = b
@@ -534,7 +554,7 @@ struct PlayerScreen: View {
             }
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
-            if !markedWatched, !isLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            if !markedWatched, !effectivelyLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
@@ -635,7 +655,7 @@ struct PlayerScreen: View {
     /// launched with (a proxied loopback URL is rebuilt from these on resume), not the internal
     /// `initialPlayback` rewrite. No-op for ad-hoc plays with no `recordMeta` (e.g. paste-a-link).
     private func recordLastStream() {
-        guard !isLive else { return }   // live has no resumable position → don't seed CW direct-resume
+        guard !effectivelyLive else { return }   // live has no resumable position → don't seed CW direct-resume
         guard let m = curMeta else { return }
         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
             videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
@@ -723,7 +743,7 @@ struct PlayerScreen: View {
         }
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
-        buffering = true; hasStartedPlaying = false; appliedSize = false; loadErrorMsg = ""
+        buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive)
         startLoadTimeout()
     }
@@ -866,7 +886,7 @@ struct PlayerScreen: View {
         withAnimation { reconnecting = true }
         // Resume where it froze: reload in place, the seek lands once duration is known again.
         let resume = currentTime
-        appliedSize = false; hasStartedPlaying = false; buffering = true
+        appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive)
         if resume > 5 { nudgeResume(to: resume) }   // jump back to where it froze once mpv is ready
     }
@@ -934,7 +954,7 @@ struct PlayerScreen: View {
         }
         if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock
         appliedSize = false; appliedAutoTracks = false
-        hasStartedPlaying = false; buffering = true; loadErrorMsg = ""
+        hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
         reconnectMsg = "Switching source…"
@@ -1905,7 +1925,7 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-        if !isLive, duration > 0 { onProgress(currentTime, duration) }
+        if !effectivelyLive, duration > 0 { onProgress(currentTime, duration) }
         onClose()
     }
 

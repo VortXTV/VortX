@@ -379,6 +379,7 @@ final class MPVMetalViewController: PlatformViewController {
         mpv_observe_property(mpv, 0, MPVProperty.pausedForCache, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.timePos, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.duration, MPV_FORMAT_DOUBLE)
+        mpv_observe_property(mpv, 0, MPVProperty.seekable, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.pause, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.trackList, MPV_FORMAT_NONE)
         // mpv gets a retained relay holding a WEAK controller reference, never the controller
@@ -1092,6 +1093,9 @@ final class MPVMetalViewController: PlatformViewController {
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 self.emit(propertyName, value)
                             }
+                        case MPVProperty.seekable:
+                            let seekable = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
+                            self.emit(propertyName, seekable)
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
