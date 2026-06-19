@@ -443,6 +443,11 @@ struct PosterCard: View {
                     .frame(width: width, alignment: .leading)
             }
             .background { if let onFocus { FocusReporter(onFocus: onFocus) } }
+            // Pin the focus/long-press interaction region to the card's RESTING rect. Without this,
+            // tvOS builds the context-menu preview from the focused card's scaled-up, shadow-offset
+            // frame (see CardFocusStyle), which bleeds into the next rail and makes a long-press snap
+            // focus to the row below instead of holding the card in place.
+            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
     }
 
