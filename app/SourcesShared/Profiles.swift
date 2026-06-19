@@ -686,6 +686,11 @@ final class ProfileStore: ObservableObject {
 
     private func schedulePushWatch() {
         pushWatchTask?.cancel()
+        // An overlay profile's library/CW just changed: nudge the VortX E2E sync so doc.vortx.byProfile
+        // refreshes and the SyncRoom broadcast fires, so sibling devices pull within ~5s and
+        // applyRemoteOverlay shows it (real-time per-profile sync). Runs regardless of the legacy
+        // ProfileSync key below; requestSyncSoon no-ops when not signed into a VortX account.
+        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
         guard let profile = active, !profile.usesEngineHistory,
               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
         let snapshot = watch
