@@ -277,7 +277,7 @@ struct PlayerScreen: View {
         // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
         // server can transcode HLS); tvOS routes HLS in TVPlayerView.
         if HLSPlayerView.handles(url) {
-            HLSPlayerView(url: url, headers: headers, resumeSeconds: resumeSeconds,
+            HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
                           onProgress: onProgress, onClose: onClose)
                 .ignoresSafeArea()
                 .statusBarHidden(true)

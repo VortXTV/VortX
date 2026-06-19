@@ -51,7 +51,7 @@ private struct TVHLSPlayer: View {
             Color.black.ignoresSafeArea()
             if ready {
                 HLSPlayerView(
-                    url: request.url, headers: request.headers, resumeSeconds: resumeSeconds,
+                    url: request.url, title: request.title, headers: request.headers, resumeSeconds: resumeSeconds,
                     onProgress: { pos, dur in
                         guard let m = request.meta else { return }
                         core.reportProgress(timeSeconds: pos, durationSeconds: dur)
