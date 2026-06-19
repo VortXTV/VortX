@@ -247,7 +247,10 @@ final class VortXSyncManager: ObservableObject {
         let doc = pulled.doc
         var restored = false
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64),
-           ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 { restored = true }
+           ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
+            restored = true
+            ProfileStore.shared.reloadFromDefaults()   // apply the restored roster to the LIVE store, no relaunch
+        }
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
             if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
