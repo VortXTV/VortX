@@ -1236,7 +1236,9 @@ private struct iOSOpenLinkView: View {
             guard !Task.isCancelled else { return }   // sheet closed mid-resolve → don't present the player
             switch resolution {
             case .single(let url, let fileName):
-                onPlay(iOSPlayerLaunch(url: url, title: magnet.name ?? fileName))
+                let savedName = magnet.name ?? fileName
+                onPlay(iOSPlayerLaunch(url: url, title: savedName))
+                Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: savedName) }   // #81
             case .choose(let files):
                 status = nil
                 fileChoices = files   // a multi-file pack: show the picker, the user taps a file to play
@@ -1256,7 +1258,10 @@ private struct iOSOpenLinkView: View {
             ScrollView {
                 VStack(spacing: Theme.Space.sm) {
                     ForEach(files) { file in
-                        Button { onPlay(iOSPlayerLaunch(url: file.url, title: file.name)) } label: {
+                        Button {
+                            onPlay(iOSPlayerLaunch(url: file.url, title: file.name))
+                            Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: file.name) }   // #81
+                        } label: {
                             HStack(spacing: Theme.Space.md) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(file.name)

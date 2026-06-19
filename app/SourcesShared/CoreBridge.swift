@@ -763,6 +763,22 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "AddToLibrary", "args": raw])
     }
 
+    /// Add a fully-formed meta object (e.g. a Cinemeta title resolved from a played magnet/link, #81) to
+    /// the library, honouring the per-profile invariant. The dict must be a real catalog meta (a `tt…` /
+    /// `tmdb…` id), never a synthetic magnet item, or it poisons official-client account sync.
+    func addRawMetaToLibrary(_ meta: [String: Any]) {
+        guard let id = meta["id"] as? String, !id.isEmpty else { return }
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: save to the profile's private overlay, never the account library.
+            ProfileStore.shared.addLibraryEntry(metaId: id,
+                                                name: meta["name"] as? String ?? id,
+                                                type: meta["type"] as? String ?? "movie",
+                                                poster: meta["poster"] as? String)
+            return
+        }
+        dispatchCtx(["action": "AddToLibrary", "args": meta])
+    }
+
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
     func setCatalogWatched(metaId: String, _ isWatched: Bool) {
