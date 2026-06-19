@@ -113,6 +113,10 @@ final class VortXSyncManager: ObservableObject {
             "authVerifier": VortXSyncCrypto.authVerifier(masterKey: masterKey, password: password),
             "wrappedKeyPassword": wrappedPw, "wrappedKeyRecovery": wrappedRec,
             "recVerifier": VortXSyncCrypto.recVerifier(recoveryKey: recoveryKey, recoveryCode: recoveryCode),
+            // Sent ONLY so the worker can put it in the welcome email; it is never stored server-side
+            // (index.ts marks it "NEVER written to the DB"), and the website register sends it the same way.
+            // Without this the welcome email falls back to a generic "save your code" note (the regression).
+            "recoveryCode": recoveryCode,
         ]
         let (code, json) = await request("POST", "/v1/auth/register", body: body)
         if code == 200, let token = json?["token"] as? String, let acct = json?["account"] as? [String: Any] {
