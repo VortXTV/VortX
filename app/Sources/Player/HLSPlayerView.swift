@@ -101,6 +101,20 @@ struct HLSPlayerView: View {
                 readyObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
                     guard let self, item.status == .readyToPlay, !self.didResume else { return }
                     self.didResume = true
+                    // Activate .playback before play() so PiP and locked-screen/background audio work for
+                    // this AVPlayer (PiP refuses to start without an active .playback session). The libmpv
+                    // path sets the same category in configureAudioSession, so a HLS->torrent hand-off
+                    // doesn't change it; only one player is active at a time, so this is idempotent. tvOS
+                    // omits this: it uses no PiP overlay button and AVKit owns its own session there.
+                    #if os(iOS)
+                    do {
+                        let session = AVAudioSession.sharedInstance()
+                        try session.setCategory(.playback, mode: .moviePlayback, options: [])
+                        try session.setActive(true)
+                    } catch {
+                        // Fail-soft: playback still works inline, only PiP/background audio degrade.
+                    }
+                    #endif
                     if self.resumeSeconds > 1 {
                         player.seek(to: CMTime(seconds: self.resumeSeconds, preferredTimescale: 600))
                     }
