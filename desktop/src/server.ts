@@ -3,11 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Stream } from "./engine";
 
 // Client for the embedded streaming server (Stremio's server.js on http://127.0.0.1:11470, spawned +
-// monitored by the Rust backend — see src-tauri/src/server.rs). Direct/debrid streams play straight
+// monitored by the Rust backend, see src-tauri/src/server.rs). Direct/debrid streams play straight
 // from their `url`; TORRENT streams (infoHash, no url) are CREATED on the local server, which fetches
 // pieces and exposes the selected file over HTTP for the player. This is the desktop port of the
 // Apple app's StremioServer + TorrentTrackers + prepareTorrent (StremioServer.swift,
-// TorrentTrackers.swift, iOSDetailView.prepareTorrentStream) — same /create body, same trackers, same
+// TorrentTrackers.swift, iOSDetailView.prepareTorrentStream), same /create body, same trackers, same
 // /<hash>/<fileIdx> file endpoint, fronted by the Rust commands instead of a native NodeServer.
 
 // The Rust backend's server-state command shape (matches server::ServerState's serde tagging).
@@ -41,7 +41,7 @@ export async function isListening(): Promise<boolean> {
 
 /**
  * Whether torrent playback is available right now: the backend reports the server running AND it is
- * actually listening. Cached after the first `true` so the hot path (stream filtering) stays sync —
+ * actually listening. Cached after the first `true` so the hot path (stream filtering) stays sync,
  * `primeAvailability()` warms it on startup and a few times after, mirroring the Apple app treating
  * the embedded server as present once it has booted.
  */
@@ -81,14 +81,14 @@ const DEFAULT_TRACKERS: string[] = [
 
 /**
  * The full peerSearch source list for a `/create`: the stream's own sources, DHT, the HTTP twin of
- * every udp tracker present, and the TCP/TLS defaults — de-duped, order preserved. Mirrors
+ * every udp tracker present, and the TCP/TLS defaults, de-duped, order preserved. Mirrors
  * TorrentTrackers.sources(forHash:streamSources:).
  */
 function trackerSources(hash: string, streamSources: string[] | undefined): string[] {
   const sources: string[] = [...(streamSources ?? [])];
   sources.push(`dht:${hash}`);
   // The HTTP twin of every udp tracker: the major trackers answer the same announce over HTTP on the
-  // same host:port — a UDP-free path to peers.
+  // same host:port, a UDP-free path to peers.
   const twins = (streamSources ?? [])
     .filter((entry) => entry.startsWith("tracker:udp://"))
     .map((entry) => {
@@ -109,7 +109,7 @@ export function isTorrent(stream: Stream): boolean {
 }
 
 /**
- * The playable URL for a stream: its direct/debrid `url`, or — for a torrent — the embedded server's
+ * The playable URL for a stream: its direct/debrid `url`, or, for a torrent, the embedded server's
  * `/<infohash>/<fileIdx>` file endpoint. Returns null when a torrent is requested but the server is
  * unavailable. Mirrors StremioServer.resolveURL(for:).
  */
@@ -124,7 +124,7 @@ export async function resolveUrl(stream: Stream): Promise<string | null> {
 /**
  * For a torrent, tell the server to create the torrent (start fetching peers) before playback, with
  * the TCP/TLS trackers injected so a swarm can form. No-op for direct/debrid streams. Fire-and-forget
- * (the file endpoint blocks until ready), best-effort — a failed prime just means slower start.
+ * (the file endpoint blocks until ready), best-effort, a failed prime just means slower start.
  * Direct port of iOSDetailView.prepareTorrentStream / StremioServer.prepare.
  */
 export async function prepareTorrent(stream: Stream): Promise<void> {

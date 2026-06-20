@@ -96,7 +96,7 @@ export async function openDetail(type: string, id: string): Promise<void> {
 }
 
 /**
- * Dispatch the engine's MetaDetails Load — the one transport the movie page already uses. `streamPath`
+ * Dispatch the engine's MetaDetails Load, the one transport the movie page already uses. `streamPath`
  * scopes which streams the engine fetches: null guesses from the meta (movie / the show's own id),
  * an episode's `{ resource:"stream", type, id }` fetches THAT episode's sources (same as tvOS
  * CoreBridge.loadMeta with streamType/streamId).
@@ -223,7 +223,7 @@ function youTubeID(value: string): string | undefined {
       return last || undefined;
     }
   } catch {
-    // not a URL — fall through to the bare-id check
+    // not a URL, fall through to the bare-id check
   }
   return /^[A-Za-z0-9_-]{11}$/.test(trimmed) ? trimmed : undefined;
 }
@@ -270,8 +270,8 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
 }
 
 /**
- * Series page: hero + meta, then either the season selector + episode list, or — once an episode is
- * opened — that episode's own ranked source list (the same UI the movie page shows). Mirrors
+ * Series page: hero + meta, then either the season selector + episode list, or, once an episode is
+ * opened, that episode's own ranked source list (the same UI the movie page shows). Mirrors
  * DetailView.swift's seriesPage / CoreSeasonedEpisodes / CoreEpisodeStreams.
  */
 function renderSeries(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | null, ctx: Ctx | null): void {
@@ -421,7 +421,7 @@ function streamSection(
   const loading = progress.total === 0 || progress.loaded < progress.total;
   const top = best(groups);
 
-  // Done, nothing playable: a greyed button + an explanation. The wording depends on WHY — if the
+  // Done, nothing playable: a greyed button + an explanation. The wording depends on WHY, if the
   // embedded streaming server failed to start, torrents were filtered out and that's the likely
   // cause; otherwise the add-ons simply returned nothing usable.
   if (!top && !loading) {
@@ -516,7 +516,7 @@ function sourceList(groups: StreamSourceGroup[], total: number): string {
 
   const visible = groups.filter((g) => state!.sourceFilter === null || g.base === state!.sourceFilter);
   // Each row carries its add-on base + the stream's index within that group, so the click handler
-  // can look the exact Stream back up (it may be a torrent with no url — resolved on click). This is
+  // can look the exact Stream back up (it may be a torrent with no url, resolved on click). This is
   // the same "re-read state, find by key" pattern the quality-variant rows use.
   const rows = visible
     .map((group) => group.streams.map((s, i) => streamRow(group, s, i)).join(""))
