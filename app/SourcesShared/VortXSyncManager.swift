@@ -345,6 +345,13 @@ final class VortXSyncManager: ObservableObject {
         var keys: [String: String] = [:]
         if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
         if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
+        // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
+        // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
+        let debrid = DebridKeys.shared
+        if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
+        if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
+        if debrid.isConfigured(.premiumize) { keys["premiumize"] = debrid.key(for: .premiumize) }
+        if debrid.isConfigured(.torBox)     { keys["torBox"]     = debrid.key(for: .torBox) }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
         // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
         // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
@@ -390,6 +397,12 @@ final class VortXSyncManager: ObservableObject {
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
             if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
+            // Debrid keys: apply only when present so a doc without them never clears a locally-entered key.
+            let debrid = DebridKeys.shared
+            if let v = keys["realDebrid"], v != debrid.key(for: .realDebrid) { debrid.setKey(v, for: .realDebrid) }
+            if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
+            if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
+            if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
