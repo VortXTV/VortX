@@ -1,0 +1,72 @@
+{
+  "name": "VortX",
+  "identifier": "tv.vortx.altstore",
+  "subtitle": "Native Apple Stremio client on stremio-core + libmpv.",
+  "iconURL": "https://raw.githubusercontent.com/VortXTV/VortX/main/docs/logo.png",
+  "website": "https://vortx.tv",
+  "tintColor": "C8A24B",
+  "apps": [
+    {
+      "name": "VortX",
+      "bundleIdentifier": "com.stremiox.app.native",
+      "developerName": "Mamaclapper",
+      "subtitle": "Stream movies and shows on iPhone, iPad, Apple TV, and Mac.",
+      "localizedDescription": "VortX is a native, open-source Stremio client for Apple devices, built on the official stremio-core engine and the libmpv player. Multi-profile (free), HDR/Dolby Vision tone-mapping, skip intro/outro, stream ranking, in-app add-ons, in-app debrid keys, and more. Sideload-friendly: this source delivers one-tap updates so you never re-download an IPA by hand.",
+      "iconURL": "https://raw.githubusercontent.com/VortXTV/VortX/main/docs/logo.png",
+      "tintColor": "C8A24B",
+      "category": "entertainment",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "0.3.8",
+          "date": "2026-06-18",
+          "localizedDescription": "# VortX (0.3.8) Beta 4\n\nBeta 4 is the reliability-and-control release. The big one: **cross-device sync can no longer lose a profile or its watch history** (Beta 3 had a path where a device with fewer profiles could overwrite the others). On top of that, **a secondary profile's library and Continue Watching now actually show in the app and sync to every device within seconds**, you can **manage everything from the web dashboard, including every per-profile setting**, played **magnets and torrents save to your library**, the app **tells you when a new build is out**, and the source picker **no\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.8/VortX-iOS-v0.3.8-ci.ipa",
+          "size": 44857879,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.7",
+          "date": "2026-06-16",
+          "localizedDescription": "# VortX (0.3.7)\n\nA small follow-up to 0.3.6: search fixes from OrigamiSpace, plus you can now choose which file to play from a multi-file magnet. In-place update; nothing resets.\n\n## Fixed\n- **Search from the header works on Mac again.** Searching from the home header now opens the Search tab and shows results, instead of doing nothing. This was a long standing macOS bug. Fix contributed by [OrigamiSpace](https://github.com/OrigamiSpace) (#80).\n\n## Added\n- **Pick a file from a multi-file magnet.** Paste a magnet that holds a whole pack (a season, or a folder of videos) and VortX now shows a \"P\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.7/VortX-iOS-v0.3.7-ci.ipa",
+          "size": 44434321,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.6",
+          "date": "2026-06-15",
+          "localizedDescription": "# VortX (0.3.6)\n\nA focused follow-up to the rebrand. The headline: plain-http custom streaming servers now connect on Mac, so a server you reach over Tailscale works the same way it already does on iPhone, iPad, and Apple TV. The vortex \"X\" is now the real curved mark everywhere, there is a VortX gold theme set as the new default, and Mac and iPhone now wait for every source before auto-playing the best one, the way Apple TV already does. In-place update: your library, add-ons, history, and settings stay exactly as they are.\n\n## Fixed\n- **Custom streaming servers over plain http now connect on\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.6/VortX-iOS-v0.3.6-ci.ipa",
+          "size": 44407441,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.5",
+          "date": "2026-06-15",
+          "localizedDescription": "# VortX (0.3.5)\n\nStremioX is now VortX. This release puts on the new name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. A handful of player and Apple TV fixes ride along too, including a smarter best-stream picker.\n\n## Added\n- **The app is now VortX.** A new name, a new gold-on-obsidian app icon, and an animated VortX launch screen on iPhone, iPad, Mac, and Apple TV. Same app and same account underneath, so nothing rese\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.5/VortX-iOS-v0.3.5-ci.ipa",
+          "size": 44423703,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.4",
+          "date": "2026-06-15",
+          "localizedDescription": "A focused fix pass on top of 0.3.3, across iPhone, iPad, Mac, and Apple TV, clearing the issues found in 0.3.3 testing.\r\n\r\n## Added\r\n- **The Quality picker is now in the Apple TV player too.** Swap resolution (4K to 1080p to 720p) at your current position, the same one-tap switch the iPhone, iPad, and Mac player already had.\r\n- **A default external-player picker on Mac and Apple TV.** Choose IINA or Infuse on Mac, or Infuse, VLC, and the others on Apple TV, and direct and debrid streams open straight there.\r\n\r\n## Fixed\r\n- **The Skip step setting now shows your choice and takes effect** on iPho\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.4/StremioX-iOS-v0.3.4-ci.ipa",
+          "size": 43227315,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.3",
+          "date": "2026-06-15",
+          "localizedDescription": "## 0.3.3 - 2026-06-15\r\n\r\nThe big player and browse update on top of 0.3.1, across iPhone, iPad, Mac, and Apple TV. A new in-player quality picker, native adaptive-stream playback, a default external-player engine, new-episode alerts, smarter HDR, a full set of source filters, and a long list of on-device fixes (the subtitle freeze and blank posters among them).\r\n\r\n### Added\r\n- **An in-player Quality picker.** One tap swaps the resolution (4K to 1080p to 720p and back) at your current position, without reopening the source list.\r\n- **Adaptive streams now play in AVPlayer on iPhone, iPad, and Ap\u2026",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.3/StremioX-iOS-v0.3.3-ci.ipa",
+          "size": 43228049,
+          "minOSVersion": "16.0"
+        }
+      ]
+    }
+  ],
+  "news": []
+}
