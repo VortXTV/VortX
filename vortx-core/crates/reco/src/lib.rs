@@ -26,12 +26,16 @@
 //! not guaranteed byte-identical across platforms.
 
 mod catalog;
+mod collab;
 mod feature;
 mod homefeed;
 mod recommend;
 mod taste;
 
 pub use catalog::{catalog_ratings, visible_catalog};
+pub use collab::{
+    affinity_from_strengths, collab_bonus, rerank_with_collab, CollabModel, CollabPrefs,
+};
 pub use feature::{cosine, feature_vector, FeatureKey, FeatureVector, MetaFeatures, RuntimeBucket};
 pub use homefeed::{
     build_home_feed, AllEligible, AllOf, AvailabilitySet, EligibilityFilter, HomeFeed,
