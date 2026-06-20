@@ -41,6 +41,49 @@ enum TMDBClient {
         }
     }
 
+    /// A streaming/rent/buy provider a title is available on, for the "Where to watch" row.
+    struct WatchProvider: Identifiable, Hashable {
+        let name: String
+        let logoURL: String?
+        var id: String { name }
+    }
+
+    /// Legal streaming availability for a title in the viewer's region, from TMDB's watch/providers
+    /// (JustWatch data). `link` is the JustWatch page for the title. Nil when there's no TMDB key, the
+    /// id is not an IMDb id, or nothing is listed for the region. Streaming (flatrate) is listed first.
+    struct WatchAvailability {
+        let link: String?
+        let providers: [WatchProvider]
+    }
+
+    static var deviceRegion: String { Locale.current.region?.identifier ?? "US" }
+
+    static func watchProviders(imdbID: String, type: String, region: String = TMDBClient.deviceRegion) async -> WatchAvailability? {
+        guard let key = ApiKeys.tmdbKey(), imdbID.hasPrefix("tt") else { return nil }
+        let media = (type == "series") ? "tv" : "movie"
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int,
+              let prov = await get("/\(media)/\(tmdbID)/watch/providers?api_key=\(key)"),
+              let results = prov["results"] as? [String: Any],
+              let here = results[region] as? [String: Any] else { return nil }
+        let link = here["link"] as? String
+        func read(_ bucket: String) -> [WatchProvider] {
+            ((here[bucket] as? [[String: Any]]) ?? [])
+                .sorted { ($0["display_priority"] as? Int ?? 99) < ($1["display_priority"] as? Int ?? 99) }
+                .compactMap { p in
+                    guard let name = p["provider_name"] as? String else { return nil }
+                    let logo = (p["logo_path"] as? String).map { "https://image.tmdb.org/t/p/w92\($0)" }
+                    return WatchProvider(name: name, logoURL: logo)
+                }
+        }
+        // Streaming first, then rent, then buy; dedupe by provider name.
+        var seen = Set<String>()
+        let merged = (read("flatrate") + read("rent") + read("buy")).filter { seen.insert($0.name).inserted }
+        guard !merged.isEmpty else { return nil }
+        return WatchAvailability(link: link, providers: merged)
+    }
+
     private static func get(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: host + path) else { return nil }
         do {

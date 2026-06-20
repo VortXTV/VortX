@@ -14,6 +14,7 @@ struct DetailView: View {
 
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
+    @State private var watchAvail: TMDBClient.WatchAvailability?
 
     var body: some View {
         Group {
@@ -57,7 +58,7 @@ struct DetailView: View {
                 core.loadMeta(type: type, id: id)
             }
             captureHero()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
         }
         .onDisappear {
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
@@ -68,7 +69,7 @@ struct DetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
         }
     }
 
@@ -142,6 +143,45 @@ struct DetailView: View {
         }
     }
 
+    @ViewBuilder private var whereToWatchSection: some View {
+        if let avail = watchAvail, !avail.providers.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                RailHeader(title: "Where to Watch")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.md) {
+                        ForEach(avail.providers) { provider in
+                            VStack(spacing: 6) {
+                                AsyncImage(url: URL(string: provider.logoURL ?? "")) { img in
+                                    img.resizable().scaledToFit()
+                                } placeholder: {
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Theme.Palette.surface1)
+                                }
+                                .frame(width: 56, height: 56)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                Text(provider.name)
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(Theme.Palette.textTertiary)
+                                    .lineLimit(1).frame(width: 80)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.sm)
+                }
+            }
+        }
+    }
+
+    /// Legal streaming availability for the title in the viewer's region (TMDB watch/providers). Only
+    /// runs with a TMDB key + an IMDb id; a nil result simply hides the section.
+    private func loadWatchProviders() {
+        guard !LiveTypes.contains(type), id.hasPrefix("tt") else { return }
+        Task {
+            let avail = await TMDBClient.watchProviders(imdbID: id, type: type)
+            await MainActor.run { watchAvail = avail }
+        }
+    }
+
     /// Feed the browse pages' hero cache with what this page knows. The engine resolved this meta
     /// through the add-on system, so it works for every id scheme (tt, tmdb:, tvdb:, anything).
     private func captureHero() {
@@ -169,6 +209,7 @@ struct DetailView: View {
                                          watched: watched,
                                          initialSeason: primary?.video.season)
                         .id("detailContent")
+                    whereToWatchSection
                     moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)
@@ -210,6 +251,7 @@ struct DetailView: View {
                                                           season: nil, episode: nil))
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
+                    whereToWatchSection
                     moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)

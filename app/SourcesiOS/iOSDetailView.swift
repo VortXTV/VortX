@@ -175,6 +175,7 @@ struct iOSDetailView: View {
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
+    @State private var watchAvail: TMDBClient.WatchAvailability?
 
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
@@ -259,6 +260,7 @@ struct iOSDetailView: View {
                             }
                             .frame(maxWidth: geo.size.width > 700 ? 900 : .infinity)
                             .frame(maxWidth: .infinity)
+                            whereToWatchSection
                             moreLikeThisSection
                         }
                     }
@@ -281,7 +283,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -295,7 +297,7 @@ struct iOSDetailView: View {
                 // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
-            if let m = meta { loadSimilar(m); loadRatings() }
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders() }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -1260,6 +1262,47 @@ struct iOSDetailView: View {
                 merged = recs + items
             }
             await MainActor.run { similarItems = merged }
+        }
+    }
+
+    @ViewBuilder private var whereToWatchSection: some View {
+        if let avail = watchAvail, !avail.providers.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Text("Where to Watch")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.md) {
+                        ForEach(avail.providers) { provider in
+                            VStack(spacing: 6) {
+                                AsyncImage(url: URL(string: provider.logoURL ?? "")) { img in
+                                    img.resizable().scaledToFit()
+                                } placeholder: {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.Palette.surface1)
+                                }
+                                .frame(width: 48, height: 48)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                Text(provider.name)
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(Theme.Palette.textTertiary)
+                                    .lineLimit(1).frame(width: 64)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                }
+            }
+        }
+    }
+
+    /// Legal streaming availability for the title in the viewer's region (TMDB watch/providers). Only
+    /// runs with a TMDB key + an IMDb id; a nil result simply hides the section.
+    private func loadWatchProviders() {
+        guard !LiveTypes.contains(type), id.hasPrefix("tt") else { return }
+        Task {
+            let avail = await TMDBClient.watchProviders(imdbID: id, type: type)
+            await MainActor.run { watchAvail = avail }
         }
     }
 
