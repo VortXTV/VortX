@@ -18,7 +18,7 @@ import { defaultSeason, episodesForSeason, isSeries, seasonsOf } from "../lib/se
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { play } from "../lib/player";
-import { cwPosition, cwProgress, inLibrary, toggleLibrary } from "../lib/store";
+import { cwPosition, cwProgress, cwResumeId, inLibrary, toggleLibrary } from "../lib/store";
 import { getSettings } from "../lib/settings";
 import { fetchRatings, ratingsText, type Ratings } from "../lib/mdblist";
 
@@ -275,7 +275,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     bg,
     "",
     `${titleBlock(meta, logo)}
-     <div class="hero-actions">${extra}</div>
+     <div class="hero-actions">${seriesPrimaryButton(videos)}${extra}</div>
      ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
      ${creditsRow(meta)}
      ${seasonSelector(seasons)}
@@ -501,6 +501,31 @@ function seasonSelector(seasons: number[]): string {
     )
     .join("");
   return `<div class="season-selector">${chips}</div>`;
+}
+
+/** The series hero primary action: Resume the last-watched episode, else Play the first. Reuses the
+ *  open-episode handler (the episode view then plays). Empty when the title has no episodes. */
+function seriesPrimaryButton(videos: Video[]): string {
+  const pick = seriesPrimaryEpisode(videos);
+  if (!pick) return "";
+  return `<button class="btn-primary" data-action="open-episode" data-video-id="${escapeHtml(pick.video.id)}">${icon("play")}<span>${escapeHtml(pick.label)}</span></button>`;
+}
+
+/** Pick the episode the hero action should target: the series' in-progress episode (Resume), else the
+ *  first episode (Play). */
+function seriesPrimaryEpisode(videos: Video[]): { video: Video; label: string } | null {
+  const eps = videos.filter((v) => v.episode !== undefined || v.season !== undefined);
+  if (!eps.length) return null;
+  const rid = state?.meta ? cwResumeId(state.meta.id) : null;
+  if (rid) {
+    const v = eps.find((e) => e.id === rid);
+    if (v) return { video: v, label: `Resume S${v.season ?? 0}E${v.episode ?? 0}` };
+  }
+  // First episode of the DEFAULT season (skips season-0 specials, matching the episode list), not the
+  // globally-first video - otherwise a Special would be labelled S0E1.
+  const first = episodesForSeason(eps, defaultSeason(seasonsOf(eps)))[0];
+  if (!first) return null;
+  return { video: first, label: `Play S${first.season ?? 0}E${first.episode ?? 0}` };
 }
 
 function episodeList(videos: Video[], season: number): string {

@@ -219,6 +219,12 @@ export function cwProgress(resumeId: string): number {
   return e && e.duration > 0 ? Math.min(1, e.position / e.duration) : 0;
 }
 
+/** The PLAYED id to resume for a title (e.g. the last-watched episode id of a series), or null if the
+ *  title has no in-progress entry. Drives the series "Resume S#E#" hero action. */
+export function cwResumeId(titleId: string): string | null {
+  return continueWatching().find((e) => e.id === titleId)?.resumeId ?? null;
+}
+
 /** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
  *  drops that played id once past 95% (finished). */
 export function recordProgress(
