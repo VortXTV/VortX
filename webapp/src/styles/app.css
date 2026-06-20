@@ -18,8 +18,8 @@
   --accent-soft: rgba(245, 158, 11, 0.18);
   --on-accent: #0f0d0a;
   --text: #f6f1e9;
-  --muted: #bcb1a1;
-  --muted-2: #8c8273;
+  --muted: #d4cfc1; /* lifted to clear WCAG AA (4.5:1) on the dark surfaces; was #bcb1a1 (~4.3) */
+  --muted-2: #a89f94; /* lifted to clear AA for secondary text; was #8c8273 (~2.8, failed) */
   --danger: #e0533d;
 
   /* UI = SF Pro on Apple platforms; editorial serif = New York for the wordmark + hero. */
@@ -1725,7 +1725,7 @@ input:focus-visible {
 }
 .field:focus {
   outline: 2px solid var(--accent-bright);
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 .auth-hint {
   font-size: 0.8rem;
@@ -1991,4 +1991,66 @@ video::cue {
   background: var(--accent-soft);
   color: var(--accent-bright);
   outline: none;
+}
+
+/* ===== Quality sweep polish (a11y + responsive) ============================================== */
+
+/* Keyboard focus on the color swatches + segmented controls (they had no focus indicator). */
+.swatch:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 3px;
+}
+.seg:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 2px;
+}
+
+/* Hide-rail (x) + remove (x) controls are hover-revealed; on touch there is no hover, so keep them
+   visible enough to use. */
+@media (hover: none) {
+  .rail-hide {
+    opacity: 0.6;
+    pointer-events: auto;
+  }
+}
+
+/* Settings rows: stack label over control on phones so long labels never push the control off-screen. */
+@media (max-width: 640px) {
+  .settings-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-sm);
+  }
+  .settings-row-control {
+    align-self: stretch;
+  }
+}
+
+/* Lighter immersive hero on small phones: the clamp(300px..) padding ate most of a short screen. */
+@media (max-width: 480px) {
+  .detail-body {
+    padding-top: clamp(120px, 40vh, 220px);
+  }
+  .detail-bg,
+  .detail-scrim {
+    height: min(60vh, 460px);
+  }
+}
+
+/* Reclaim tab-bar touch-target height + label width on the smallest phones (was ~41px at 320px). */
+@media (max-width: 375px) {
+  .tabbar {
+    padding: 0.4rem 2px calc(0.4rem + env(safe-area-inset-bottom, 0px));
+  }
+  .tab {
+    font-size: 0.55rem;
+  }
+}
+
+/* Guarantee a 44px tap target on the primary nav (WCAG / Apple HIG minimum) on all touch widths. */
+@media (max-width: 760px) {
+  .tab {
+    min-height: 44px;
+    justify-content: center;
+  }
 }

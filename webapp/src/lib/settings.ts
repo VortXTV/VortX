@@ -204,8 +204,13 @@ export function applySettings(s: Settings = getSettings()): void {
   else root.style.setProperty("--text-scale", String(s.textScale));
 
   // Performance: 'reduced' trims animations app-wide (the app's Performance row; also an a11y win). CSS
-  // keys off [data-perf="reduced"] to near-zero all transition/animation durations.
-  root.dataset.perf = s.performance === "reduced" ? "reduced" : "full";
+  // keys off [data-perf="reduced"] to near-zero all transition/animation durations. On the default
+  // 'auto', also honor the OS prefers-reduced-motion setting so users who set it system-wide get it
+  // without opening Settings.
+  const osReduce =
+    typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const reduceMotion = s.performance === "reduced" || (s.performance === "auto" && osReduce);
+  root.dataset.perf = reduceMotion ? "reduced" : "full";
 
   // Subtitle style: the player's native <track> cues read these via `video::cue` (see app.css).
   root.style.setProperty("--sub-scale", String(s.subtitleScale));
