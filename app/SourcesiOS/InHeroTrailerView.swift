@@ -67,7 +67,9 @@ struct InHeroTrailerView: View {
     /// meta stay legible over video and the band still dissolves into the page below), an "Unmute" speaker
     /// affordance, and a full-surface tap target that opens the trailer with sound.
     private var clip: some View {
-        YouTubeEmbedView(youTubeID: youTubeID, mode: .background)
+        // A short ~6-second muted window (started a few seconds in to skip studio/title cards) rather than
+        // the full trailer: a quick, ambient "clip" of the title that loops behind the hero art.
+        YouTubeEmbedView(youTubeID: youTubeID, mode: .clip(startSeconds: 8, windowSeconds: 6))
             .frame(height: height)
             .frame(maxWidth: .infinity)
             .clipped()

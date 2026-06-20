@@ -30,6 +30,11 @@ struct YouTubeEmbedView: View {
         case interactive
         /// Muted, looping, controls-less background clip for the hero.
         case background
+        /// Muted, chromeless SHORT clip: plays a `windowSeconds` window starting `startSeconds` in and
+        /// loops just that window, so the hero shows a brief representative clip rather than a full
+        /// trailer. Uses the IFrame Player API so it can seek-loop a sub-window (URL loop only loops
+        /// the whole video).
+        case clip(startSeconds: Int, windowSeconds: Int)
     }
 
     var body: some View {
@@ -120,6 +125,9 @@ private enum YouTubeEmbedHTML {
         case .background:
             // Muted autoplay + loop (loop needs `playlist=<id>`), chromeless.
             params = "autoplay=1&mute=1&controls=0&loop=1&playlist=\(id)&playsinline=1&rel=0&modestbranding=1&enablejsapi=1&fs=0&origin=\(origin)"
+        case .clip(let start, let seconds):
+            // A short looped window needs the JS API (URL `loop` only loops the whole video).
+            return clipPage(id: id, origin: origin, start: start, seconds: seconds)
         }
         return """
         <!DOCTYPE html>
@@ -139,6 +147,62 @@ private enum YouTubeEmbedHTML {
                   allow="autoplay; encrypted-media; picture-in-picture"
                   allowfullscreen>
           </iframe>
+        </body>
+        </html>
+        """
+    }
+
+    /// IFrame Player API page for a short, muted, looping clip WINDOW (the hero "5-6 second clip"): plays
+    /// a `seconds`-long window starting `start` seconds in and seeks back to keep looping only that window.
+    /// Starting a few seconds in skips studio/title cards so the window lands on real footage; when the
+    /// fixed start would overrun a short video it falls back to 25% in. Muted + chromeless + playsinline,
+    /// the only reliably-allowed inline autoplay on iOS/WKWebView.
+    static func clipPage(id: String, origin: String, start: Int, seconds: Int) -> String {
+        """
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+          <style>
+            * { margin: 0; padding: 0; }
+            html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+            #player { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+          </style>
+        </head>
+        <body>
+          <div id="player"></div>
+          <script src="https://www.youtube.com/iframe_api"></script>
+          <script>
+            var START = \(start), WIN = \(seconds), loop;
+            function onYouTubeIframeAPIReady() {
+              new YT.Player('player', {
+                videoId: '\(id)',
+                playerVars: { autoplay: 1, mute: 1, controls: 0, playsinline: 1, rel: 0,
+                              modestbranding: 1, fs: 0, disablekb: 1, enablejsapi: 1, origin: '\(origin)' },
+                events: {
+                  onReady: function (e) {
+                    var d = e.target.getDuration();
+                    if (d && START > d - WIN) { START = Math.max(0, Math.floor(d * 0.25)); }
+                    e.target.mute();
+                    e.target.seekTo(START, true);
+                    e.target.playVideo();
+                  },
+                  onStateChange: function (e) {
+                    if (e.data === YT.PlayerState.PLAYING) {
+                      clearInterval(loop);
+                      loop = setInterval(function () {
+                        var t = e.target.getCurrentTime();
+                        if (t < START - 0.5 || t > START + WIN) { e.target.seekTo(START, true); }
+                      }, 400);
+                    } else if (e.data === YT.PlayerState.ENDED) {
+                      e.target.seekTo(START, true);
+                      e.target.playVideo();
+                    }
+                  }
+                }
+              });
+            }
+          </script>
         </body>
         </html>
         """
