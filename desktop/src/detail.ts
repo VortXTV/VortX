@@ -12,7 +12,7 @@ import {
 import {
   best,
   rankedGroups,
-  sourceTags,
+  sourceTagList,
   streamGroups,
   tiers,
   variantOptions,
@@ -517,10 +517,21 @@ function sourceList(groups: StreamSourceGroup[], total: number): string {
   return `${filterBar}<div class="streams">${rows}</div>`;
 }
 
+/** Classify a quality tag for chip coloring (resolution / source / HDR / audio / cached). */
+function qtagKind(tag: string): string {
+  if (tag === "Cached") return "cached";
+  if (tag === "DV" || tag === "HDR") return "hdr";
+  if (tag === "Remux" || tag === "BluRay" || tag === "WEB") return "src";
+  if (tag === "Atmos" || tag === "DTS-HD" || tag === "DTS") return "audio";
+  return "res";
+}
+
 function streamRow(group: StreamSourceGroup, stream: Stream, index: number): string {
   const badges = `<span class="badge">${escapeHtml(group.addon.toUpperCase())}</span>`;
   const torrentBadge = isTorrent(stream) ? `<span class="badge badge-torrent">TORRENT</span>` : "";
-  const tags = `<span class="stream-tags">${escapeHtml(sourceTags(stream))}</span>`;
+  const tags = sourceTagList(stream)
+    .map((tag) => `<span class="qtag qtag-${qtagKind(tag)}">${escapeHtml(tag)}</span>`)
+    .join("");
   const name = stream.name ? `<div class="stream-name">${escapeHtml(stream.name)}</div>` : "";
   const desc = stream.description ? `<div class="stream-desc">${escapeHtml(stream.description)}</div>` : "";
   return `
