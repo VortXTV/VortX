@@ -276,7 +276,7 @@ struct PlayerScreen: View {
         // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
         // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
         // server can transcode HLS); tvOS routes HLS in TVPlayerView.
-        if HLSPlayerView.handles(url) {
+        if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url) {
             HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
                           onProgress: onProgress, onClose: onClose)
                 .ignoresSafeArea()
@@ -289,15 +289,49 @@ struct PlayerScreen: View {
         #endif
     }
 
-    private var mpvBody: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+    #if os(iOS)
+    /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto` the HLS case is
+    /// already handled in `body` (the minimal HLSPlayerView), so here in auto this is false for everything that
+    /// reaches it, and today's behavior is unchanged. It only goes true when the player-engine override forces
+    /// AVPlayer (the on-device test path for the full-chrome AVPlayer engine). `isDolbyVision` is not yet
+    /// threaded from the stream picker, so DV auto-routing arrives with that wiring.
+    private var useAVPlayerEngine: Bool {
+        let loopback = url.host == "127.0.0.1" || url.host == "localhost"
+        return PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: false) == .avfoundation
+    }
+    #endif
 
-            MPVMetalPlayerView(coordinator: coordinator)
+    /// The video surface: the AVFoundation engine when routed there, otherwise libmpv. Both bind to the same
+    /// Coordinator and feed the same `handleProperty`, so the surrounding overlay drives either unchanged.
+    @ViewBuilder private var playerSurface: some View {
+        #if os(iOS)
+        if useAVPlayerEngine {
+            AVPlayerEngineView(coordinator: coordinator)
                 .play(initialPlayback.url, headers: initialPlayback.headers)
                 .live(initialIsLive)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
                 .ignoresSafeArea()
+        } else {
+            mpvSurface
+        }
+        #else
+        mpvSurface
+        #endif
+    }
+
+    @ViewBuilder private var mpvSurface: some View {
+        MPVMetalPlayerView(coordinator: coordinator)
+            .play(initialPlayback.url, headers: initialPlayback.headers)
+            .live(initialIsLive)
+            .onPropertyChange { _, name, data in handleProperty(name, data) }
+            .ignoresSafeArea()
+    }
+
+    private var mpvBody: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            playerSurface
 
             // Reliable tap-to-toggle: a transparent hit-test layer over the video. The UIKit
             // recognizer on the Metal view frequently missed taps (you had to tap many times);

@@ -45,6 +45,9 @@ struct iOSSettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
+    #if os(iOS)
+    @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
+    #endif
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
@@ -260,6 +263,11 @@ struct iOSSettingsView: View {
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            #if os(iOS)
+            Picker("Player engine", selection: $playerEngine) {
+                ForEach(PlayerEngineRouter.Override.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+            }
+            #endif
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
