@@ -420,7 +420,9 @@ struct SettingsView: View {
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             choiceRow("Safety filter", [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
-            Text("Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
+            Text(sourcePrefs.keywordsAreRegex
+                 ? "Hides CAM and fake-quality sources. Hide / Require words are case-insensitive regex patterns (an invalid pattern is ignored)."
+                 : "Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             HStack(spacing: Theme.Space.md) {
                 Text("Hide words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
@@ -430,6 +432,12 @@ struct SettingsView: View {
                 Text("Require words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
                 TextField("none", text: $sourcePrefs.includeKeywords)
             }
+            Toggle(isOn: $sourcePrefs.keywordsAreRegex) {
+                Text("Match words as regex")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.Palette.accent)
             choiceRow("Max file size",
                       [(0.0, "Off"), (2.0, "2 GB"), (5.0, "5 GB"), (10.0, "10 GB"),
                        (15.0, "15 GB"), (20.0, "20 GB"), (30.0, "30 GB"), (50.0, "50 GB")],

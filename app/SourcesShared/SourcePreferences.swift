@@ -43,6 +43,7 @@ final class SourcePreferences: ObservableObject {
     static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
     static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
+    static let regexKey              = "stremiox.streaming.keywordsAreRegex"
 
     // Max possible quality score is ~13,800 (4K + cached + remux + HDR + atmos + file-size cap).
     // A 15,000-point tier gap means the preferred type ALWAYS beats a lower type regardless of quality.
@@ -65,12 +66,25 @@ final class SourcePreferences: ObservableObject {
     /// Comma-separated words to hide from the stream list (matched in the lowercased name+description+
     /// filename). Empty = no filtering. e.g. "cam, ts, hindi".
     @Published var excludeKeywords: String {
-        didSet { UserDefaults.standard.set(excludeKeywords, forKey: Self.excludeKey) }
+        didSet { UserDefaults.standard.set(excludeKeywords, forKey: Self.excludeKey); rebuildKeywordRegexes() }
     }
     /// Comma-separated words a stream MUST contain to be shown. Empty = no allow-list. e.g. "remux, atmos".
     @Published var includeKeywords: String {
-        didSet { UserDefaults.standard.set(includeKeywords, forKey: Self.includeKey) }
+        didSet { UserDefaults.standard.set(includeKeywords, forKey: Self.includeKey); rebuildKeywordRegexes() }
     }
+    /// Treat Hide / Require words as full case-insensitive REGEX patterns instead of comma-separated
+    /// substrings, for power users (e.g. require `2160p.*(remux|bluray)`, hide `\b(cam|ts|hdts)\b`). Off by
+    /// default. An invalid pattern compiles to nil and simply applies no keyword filter (fail-open), so a
+    /// typo can never hide every source. The two fields keep their own meaning: Hide = drop on match,
+    /// Require = drop on no-match.
+    @Published var keywordsAreRegex: Bool {
+        didSet { UserDefaults.standard.set(keywordsAreRegex, forKey: Self.regexKey); rebuildKeywordRegexes() }
+    }
+    /// Compiled forms of the keyword fields when `keywordsAreRegex` is on; nil when off, empty, or the
+    /// pattern is invalid. Rebuilt whenever a field or the toggle changes, so the per-stream filter never
+    /// recompiles in its hot loop.
+    private(set) var excludeRegex: NSRegularExpression?
+    private(set) var includeRegex: NSRegularExpression?
     /// "off" (default), "balanced" (drop CAM/TS/SCR junk), or "strict" (also drop implausible-for-resolution
     /// fakes). Reuses the existing junk classifiers.
     @Published var safetyMode: String {
@@ -113,16 +127,40 @@ final class SourcePreferences: ObservableObject {
 
     /// True when none of the opt-in filters are engaged, so the ranking can take its no-op fast path.
     var noFiltersActive: Bool {
-        excludeTerms.isEmpty && includeTerms.isEmpty && safetyMode == "off"
+        !keywordFilterActive && safetyMode == "off"
             && !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0
             && maxFileSizeGB == 0
     }
 
-    /// Parsed, lowercased, non-empty exclude / include terms.
+    /// Whether the Hide / Require fields impose any filter, accounting for regex vs substring mode.
+    var keywordFilterActive: Bool {
+        keywordsAreRegex ? (excludeRegex != nil || includeRegex != nil)
+                         : (!excludeTerms.isEmpty || !includeTerms.isEmpty)
+    }
+
+    /// Parsed, lowercased, non-empty exclude / include terms (substring mode).
     var excludeTerms: [String] { Self.terms(excludeKeywords) }
     var includeTerms: [String] { Self.terms(includeKeywords) }
     private static func terms(_ csv: String) -> [String] {
         csv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+    }
+
+    /// True if `text` matches `regex` anywhere. Used by the stream filter when regex mode is on.
+    func matches(_ regex: NSRegularExpression, _ text: String) -> Bool {
+        regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    private func rebuildKeywordRegexes() {
+        excludeRegex = Self.compilePattern(excludeKeywords, enabled: keywordsAreRegex)
+        includeRegex = Self.compilePattern(includeKeywords, enabled: keywordsAreRegex)
+    }
+
+    /// Compile a user pattern case-insensitively, or nil when regex mode is off, the field is blank, or the
+    /// pattern is invalid (fail-open: a bad regex applies no filter rather than hiding everything).
+    private static func compilePattern(_ pattern: String, enabled: Bool) -> NSRegularExpression? {
+        let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard enabled, !trimmed.isEmpty else { return nil }
+        return try? NSRegularExpression(pattern: trimmed, options: [.caseInsensitive])
     }
 
     private init() {
@@ -138,6 +176,8 @@ final class SourcePreferences: ObservableObject {
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
         defaultSourceSort = UserDefaults.standard.string(forKey: Self.defaultSortKey) ?? "best"
+        keywordsAreRegex = UserDefaults.standard.bool(forKey: Self.regexKey)
+        rebuildKeywordRegexes()   // didSet does not fire for initial assignment, so seed the compiled forms
     }
 
     private static func readOrder() -> [SourceType] {

@@ -495,9 +495,16 @@ enum StreamRanking {
         let prefs = SourcePreferences.shared
         if prefs.noFiltersActive { return true }   // fast path: nothing opted in
         let text = qualityText(s)
-        let exclude = prefs.excludeTerms, include = prefs.includeTerms
-        if exclude.contains(where: { text.contains($0) }) { return false }
-        if !include.isEmpty, !include.contains(where: { text.contains($0) }) { return false }
+        if prefs.keywordsAreRegex {
+            // Power-user regex mode: Hide = drop on match, Require = drop on no-match. An invalid pattern
+            // compiled to nil, so it imposes no constraint (fail-open).
+            if let rx = prefs.excludeRegex, prefs.matches(rx, text) { return false }
+            if let rx = prefs.includeRegex, !prefs.matches(rx, text) { return false }
+        } else {
+            let exclude = prefs.excludeTerms, include = prefs.includeTerms
+            if exclude.contains(where: { text.contains($0) }) { return false }
+            if !include.isEmpty, !include.contains(where: { text.contains($0) }) { return false }
+        }
         switch prefs.safetyMode {
         case "balanced": if junkClass(text) != nil { return false }
         case "strict":   if junkClass(text) != nil || implausibleForResolution(text) { return false }

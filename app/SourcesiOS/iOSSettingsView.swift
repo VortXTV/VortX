@@ -462,6 +462,11 @@ struct iOSSettingsView: View {
                 #if os(iOS)
                 .textInputAutocapitalization(.never)
                 #endif
+            Toggle("Match words as regex", isOn: $sourcePrefs.keywordsAreRegex).tint(Theme.Palette.accent)
+            Text(sourcePrefs.keywordsAreRegex
+                 ? "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored."
+                 : "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns.")
+                .font(.footnote).foregroundStyle(.secondary)
             Toggle("Instant sources only", isOn: $sourcePrefs.instantOnly).tint(Theme.Palette.accent)
             Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
             Toggle("HDR sources only", isOn: $sourcePrefs.hdrOnly).tint(Theme.Palette.accent)
