@@ -116,14 +116,17 @@ input:focus-visible {
 /* ---- Top bar / nav ---- */
 
 .topbar {
-  display: flex;
+  /* Wordmark hard-left, nav centered (the app's top-nav lockup): 1fr | auto | 1fr keeps the pill group
+     optically centered regardless of wordmark width. */
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  gap: 1.5rem;
-  padding: 1rem var(--space-page) 0.85rem;
+  gap: 1rem;
+  padding: 0.85rem var(--space-page);
   position: sticky;
   top: 0;
   z-index: 5;
-  background: linear-gradient(var(--bg) 60%, transparent);
+  background: linear-gradient(var(--bg) 55%, transparent);
 }
 .wordmark {
   display: inline-flex;
@@ -146,16 +149,24 @@ input:focus-visible {
 }
 .topnav {
   display: flex;
-  gap: 0.4rem;
-  margin-left: auto;
+  gap: 0.35rem;
+  justify-content: center;
   flex-wrap: wrap;
 }
 .topnav-link {
-  padding: 0.4rem 0.85rem;
-  border-radius: var(--radius-chip);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-pill);
   color: var(--muted);
-  font-size: 0.92rem;
-  transition: color var(--duration-fast) var(--ease), background var(--duration-fast) var(--ease);
+  font-size: 1rem;
+  font-weight: 600;
+  transition: color var(--dur-state) var(--ease), background var(--dur-state) var(--ease);
+}
+.topnav-link .ico {
+  width: 1.15em;
+  height: 1.15em;
 }
 .topnav-link:hover {
   color: var(--text);
@@ -164,6 +175,23 @@ input:focus-visible {
 .topnav-link.active {
   color: var(--on-accent);
   background: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+/* Compact nav on phones: wordmark + icon-only pills pinned right. */
+@media (max-width: 680px) {
+  .topbar {
+    grid-template-columns: auto 1fr;
+    gap: 0.5rem;
+  }
+  .topnav {
+    justify-content: flex-end;
+  }
+  .topnav-link span {
+    display: none;
+  }
+  .topnav-link {
+    padding: 0.5rem 0.6rem;
+  }
 }
 
 /* ---- Content shell ---- */
@@ -1164,4 +1192,117 @@ input:focus-visible {
   border-radius: var(--radius-card);
   box-shadow: var(--elev-rest);
   transition: transform var(--dur-state) var(--ease-spring), box-shadow var(--dur-state) var(--ease);
+}
+
+/* Inline icon base: 1em, currentColor, never shrinks. The SF-Symbol-style set (lib/icons.ts). */
+.ico {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  display: inline-block;
+  vertical-align: -0.125em;
+}
+
+/* ---- Featured hero (Home billboard; mirrors the app FeaturedHeroView) ----
+   A full-bleed backdrop with the app's dual scrim and a bottom-left content block: logo-or-serif-title,
+   ★rating · year · runtime · genres, a Play CTA, and a 3-line synopsis (max-width 760). Edge-to-edge:
+   it breaks out of the .content horizontal padding and sits flush under the sticky nav. */
+.featured {
+  position: relative;
+  margin: -0.75rem calc(-1 * var(--space-page)) var(--space-lg);
+  height: clamp(380px, 52vh, 460px);
+  overflow: hidden;
+  isolation: isolate;
+}
+.featured[hidden] {
+  display: none;
+}
+.featured-bg {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center 18%;
+  transition: opacity var(--dur-state) var(--ease);
+}
+.featured-scrim {
+  position: absolute;
+  inset: 0;
+  /* Same two scrims as the app hero: a vertical fade to canvas so the lower text reads, and a leading
+     fade for the title column. canvas = #15120e = rgb(21,18,14). */
+  background:
+    linear-gradient(to bottom, transparent 0%, rgba(21, 18, 14, 0.35) 50%, rgba(21, 18, 14, 0.85) 82%, var(--bg) 100%),
+    linear-gradient(to right, rgba(21, 18, 14, 0.6), transparent 50%);
+}
+.featured-content {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  max-width: min(760px, 92%);
+  padding: 0 var(--space-edge) var(--space-lg);
+  transition: opacity var(--dur-state) var(--ease);
+}
+.featured.is-swapping .featured-bg,
+.featured.is-swapping .featured-content {
+  opacity: 0;
+}
+.featured-logo {
+  max-width: 320px;
+  max-height: 110px;
+  object-fit: contain;
+  object-position: left bottom;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
+}
+.featured-title {
+  margin: 0;
+  color: var(--text);
+  text-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.featured-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem 1.1rem;
+  color: var(--muted);
+  font-size: 1.1rem;
+  font-weight: 500;
+}
+.featured-rating {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text);
+}
+.featured-rating .ico {
+  color: var(--accent-bright);
+}
+.featured-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  margin-top: var(--space-xs);
+}
+.featured-synopsis {
+  margin: 0;
+  max-width: 760px;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  .featured-bg,
+  .featured-content {
+    transition: none;
+  }
 }

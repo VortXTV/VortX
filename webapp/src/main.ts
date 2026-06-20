@@ -6,7 +6,8 @@ import { actionOf, el } from "./lib/dom";
 import { clearProgress, removeFromLibrary } from "./lib/store";
 import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
-import { loadBoard, renderBoardShell } from "./views/board";
+import { icon } from "./lib/icons";
+import { disposeFeatured, loadBoard, renderBoardShell } from "./views/board";
 import { discoverTypes, loadDiscover, loadMoreDiscover, renderDiscoverShell } from "./views/discover";
 import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
@@ -26,11 +27,11 @@ const APP_SHELL = `
   <header class="topbar">
     <a class="wordmark" href="#/" aria-label="VortX home">Vort<svg class="vortex-mark" viewBox="-8 -8 116 116" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="hdr-b" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.5" stop-color="#f59e0b"/><stop offset="1" stop-color="#d97706"/></linearGradient><linearGradient id="hdr-d" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#b45309"/><stop offset="1" stop-color="#7c2d12"/></linearGradient></defs><path d="M9.2,4 C43.3,29.2 56.7,70.8 90.8,96" stroke="url(#hdr-d)" stroke-width="18" stroke-linecap="round" fill="none"/><path d="M90.8,4 C56.7,29.2 43.3,70.8 9.2,96" stroke="url(#hdr-b)" stroke-width="18" stroke-linecap="round" fill="none"/><circle cx="50" cy="50" r="7.2" fill="#fdf6e3"/></svg></a>
     <nav class="topnav" aria-label="Primary">
-      <a class="topnav-link" data-nav="home" href="#/">Home</a>
-      <a class="topnav-link" data-nav="discover" href="#/discover/movie">Discover</a>
-      <a class="topnav-link" data-nav="search" href="#/search/">Search</a>
-      <a class="topnav-link" data-nav="library" href="#/library">Library</a>
-      <a class="topnav-link" data-nav="addons" href="#/addons">Add-ons</a>
+      <a class="topnav-link" data-nav="home" href="#/">${icon("home")}<span>Home</span></a>
+      <a class="topnav-link" data-nav="discover" href="#/discover/movie">${icon("discover")}<span>Discover</span></a>
+      <a class="topnav-link" data-nav="library" href="#/library">${icon("library")}<span>Library</span></a>
+      <a class="topnav-link" data-nav="search" href="#/search/">${icon("search")}<span>Search</span></a>
+      <a class="topnav-link" data-nav="addons" href="#/addons">${icon("addons")}<span>Add-ons</span></a>
     </nav>
   </header>
   <main class="content" id="main"></main>
@@ -101,6 +102,10 @@ async function renderRoute(route: Route): Promise<void> {
 
   // Leaving Detail for any non-detail route tears the overlay down.
   if (route.name !== "detail") setDetailVisible(false);
+
+  // Stop the Home featured-hero rotation before painting any route; the Home case re-arms it. Without
+  // this the rotation interval keeps firing against a detached DOM after the user navigates away.
+  disposeFeatured();
 
   switch (route.name) {
     case "home": {
