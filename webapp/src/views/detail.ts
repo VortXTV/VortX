@@ -190,7 +190,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
         ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
         ${creditsRow(meta)}
         ${streamSection(groups)}
-        ${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}
+        <div class="action-row">${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}</div>
       </div>
     </div>`;
 }
@@ -211,7 +211,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     ? episodeStreamView(open, meta)
     : `${heroHead(meta, logo)}${metaRow(meta)}${
         meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
+      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}<div class="action-row">${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}</div>`;
 
   host.innerHTML = `
     <div class="detail">

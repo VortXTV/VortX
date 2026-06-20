@@ -24,7 +24,7 @@ let addons: Addon[] = [];
 const APP_SHELL = `
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="topbar">
-    <a class="wordmark" href="#/" aria-label="VortX home">Vort<span class="accent">X</span></a>
+    <a class="wordmark" href="#/" aria-label="VortX home">Vort<svg class="vortex-mark" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M22.8 11.4 C88.6 60 114.2 140 180 188.6" fill="none" stroke="currentColor" stroke-width="42.8" stroke-linecap="round" opacity="0.85"/><path d="M180 11.4 C114.2 60 88.6 140 22.8 188.6" fill="none" stroke="currentColor" stroke-width="42.8" stroke-linecap="round"/><circle cx="100" cy="100" r="16" style="fill:var(--text)"/></svg></a>
     <nav class="topnav" aria-label="Primary">
       <a class="topnav-link" data-nav="home" href="#/">Home</a>
       <a class="topnav-link" data-nav="discover" href="#/discover/movie">Discover</a>
@@ -215,9 +215,31 @@ function wireGlobalClicks(): void {
   });
 }
 
+/** Dismiss the branded splash (in index.html so it paints before any JS). Shows once per session: the
+ *  full ~2.8s animation on first load, a short hold under reduced motion, and skipped on later loads
+ *  within the session. The board loads behind it concurrently. */
+function dismissSplash(): void {
+  const splash = document.getElementById("splash");
+  if (!splash) return;
+  if (sessionStorage.getItem("vortx.splashShown")) {
+    splash.remove();
+    return;
+  }
+  sessionStorage.setItem("vortx.splashShown", "1");
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.setTimeout(
+    () => {
+      splash.classList.add("fade-out");
+      window.setTimeout(() => splash.remove(), 400);
+    },
+    reduced ? 1200 : 2800,
+  );
+}
+
 async function start(): Promise<void> {
   const app = el("app");
   if (!app) return;
+  dismissSplash();
   app.innerHTML = APP_SHELL;
   wireGlobalClicks();
 

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
-    <meta name="theme-color" content="#161310" />
+    <meta name="theme-color" content="#15120e" />
     <meta
       name="description"
       content="VortX web: watch your Stremio catalogs in the browser. Direct, debrid, and HLS-first streaming."
@@ -31,6 +31,26 @@
     <title>VortX</title>
   </head>
   <body>
+    <!-- Branded splash: painted before any JS so the first frame is the VortX mark, not a blank canvas.
+         Fixed gold-on-obsidian (the brand moment, not the live accent); dismissed by main.ts once per session. -->
+    <div id="splash" class="splash" aria-hidden="true">
+      <div class="splash-stage">
+        <svg class="splash-vortex" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <defs>
+            <radialGradient id="splashGlow" cx="50%" cy="50%" r="75%">
+              <stop offset="0%" stop-color="#c2440f" stop-opacity="0.55" />
+              <stop offset="100%" stop-color="#c2440f" stop-opacity="0" />
+            </radialGradient>
+          </defs>
+          <circle class="splash-glow" cx="100" cy="100" r="150" fill="url(#splashGlow)" />
+          <circle class="splash-ring" cx="100" cy="100" r="75" fill="none" stroke="#f59e0b" stroke-width="3" opacity="0.7" />
+          <path class="splash-rib splash-rib-1" d="M22.8 11.4 C88.6 60 114.2 140 180 188.6" fill="none" stroke="#f59e0b" stroke-width="42.8" stroke-linecap="round" />
+          <path class="splash-rib splash-rib-2" d="M180 11.4 C114.2 60 88.6 140 22.8 188.6" fill="none" stroke="#d97706" stroke-width="42.8" stroke-linecap="round" opacity="0.85" />
+          <circle class="splash-dot" cx="100" cy="100" r="16" fill="#fdf6e3" />
+        </svg>
+        <p class="splash-tagline"><span>Everything. </span><span class="g">VortX</span><span>ed.</span></p>
+      </div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
