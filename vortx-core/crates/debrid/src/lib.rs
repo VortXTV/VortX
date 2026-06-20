@@ -11,10 +11,12 @@
 //! the playable link is always re-minted locally with the user's OWN credential.
 
 mod credential;
+mod flywheel;
 mod resolve;
 mod store;
 
 pub use credential::parse_credential;
+pub use flywheel::{should_probe, writeback_fact, ProbeResult, RateBudget, RateMeter};
 pub use resolve::{
     CacheView, ResolveMethod, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
     VaultCacheView,
