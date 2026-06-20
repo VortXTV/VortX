@@ -56,6 +56,7 @@ interface RefPage {
   ref: CatalogRef;
   skip: number;
   done: boolean;
+  lastFirstId?: string; // first item id of this catalog's previous page, to detect a skip-ignoring add-on
 }
 interface DiscoverPaging {
   token: number;
@@ -73,10 +74,16 @@ async function fetchPage(p: DiscoverPaging): Promise<MetaItem[]> {
   if (p !== paging || p.token !== discoverReqToken) return []; // superseded by a newer type load
   const fresh: MetaItem[] = [];
   for (const { r, metas } of results) {
-    if (!metas.length) {
-      r.done = true; // an empty page means this catalog is exhausted
+    const firstId = metas[0]?.id;
+    // A catalog is exhausted when it returns an empty page, OR returns the same first item as its
+    // previous page - an add-on that ignores `skip` would otherwise loop forever behind a Load more
+    // that adds nothing. Comparing this catalog's OWN previous page (not the global seen set) avoids
+    // prematurely stopping a catalog whose page merely overlaps another catalog's items.
+    if (!metas.length || (firstId !== undefined && firstId === r.lastFirstId)) {
+      r.done = true;
       continue;
     }
+    r.lastFirstId = firstId;
     r.skip += metas.length;
     for (const m of metas) {
       if (p.seen.has(m.id)) continue;
