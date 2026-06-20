@@ -1677,7 +1677,7 @@ private struct PosterCardiOS: View {
                 // retries, the blank-poster cause). scaledToFill inside CachedPosterImage keeps the source
                 // proportions and CROPS to the card, so non-2:3 add-on posters fill cleanly (F37), and a
                 // missing poster falls back to the title's backdrop before a plain film placeholder.
-                CachedPosterImage(url: poster ?? fallbackArt)
+                CachedPosterImage(url: XRDB.imageURL(id: id, fallback: poster ?? fallbackArt))
                     .frame(width: 120, height: 180)
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))

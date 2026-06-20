@@ -1236,7 +1236,7 @@ struct iOSDetailView: View {
 
     private func moreLikeThisCard(_ item: MetaPreview) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            CachedPosterImage(url: item.poster)
+            CachedPosterImage(url: XRDB.imageURL(id: item.id, fallback: item.poster))
                 .frame(width: 100, height: 150)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))

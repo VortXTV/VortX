@@ -174,6 +174,10 @@ struct SettingsView: View {
                     Label("Debrid services", systemImage: "bolt.horizontal.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { XRDBSettingsView() } label: {
+                    Label("Ratings on posters (XRDB)", systemImage: "star.circle")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()

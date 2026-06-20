@@ -429,7 +429,7 @@ struct PosterCard: View {
     private var legacyCardLabel: some View {
         Group {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                PosterArt(poster, width: width)
+                PosterArt(XRDB.imageURL(id: id, fallback: poster), width: width)
                     .overlay(alignment: .bottom) {
                         if let progress, progress > 0.01 {
                             ProgressStripe(value: progress).padding(Theme.Space.xs)

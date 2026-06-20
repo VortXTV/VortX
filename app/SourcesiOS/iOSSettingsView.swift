@@ -240,6 +240,7 @@ struct iOSSettingsView: View {
             }
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
+            NavigationLink("Ratings on posters (XRDB)") { XRDBSettingsView() }
         }
     }
 
