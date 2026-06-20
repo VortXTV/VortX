@@ -203,6 +203,21 @@ final class VortXSyncManager: ObservableObject {
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
     }
 
+    /// Tri-state pull used by `syncUp`'s data-loss guard: distinguishes "the account has no backup yet"
+    /// (safe to start from an empty doc) from "the pull failed" (must NOT push, or it clobbers the
+    /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
+    private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
+    private func pullSyncDocResult() async -> SyncDocPull {
+        guard let dataKey else { return .failed }
+        let (code, json) = await request("GET", "/v1/backup", auth: true)
+        if code == 404 { return .empty }                 // no backup yet
+        guard code == 200 else { return .failed }        // network/server error: do not clobber
+        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
+        guard let pt = VortXSyncCrypto.open(key: dataKey, docStr),
+              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable: do not clobber
+        return .doc(obj)
+    }
+
     /// Pull the doc plus its server version, so the foreground pull can apply only changes that are
     /// newer than what this device already has (and not re-apply its own last push).
     private func pullDocVersioned() async -> (doc: [String: Any], version: Int)? {
@@ -307,7 +322,15 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncUp() async -> Bool {
         guard isSignedIn else { return false }
-        var doc = await pullSyncDoc() ?? [:]
+        // Data-loss guard: a FAILED pull (network error or undecryptable doc) must NEVER overwrite the
+        // account's existing document, or it wipes keys other surfaces wrote (the website's Stremio-imported
+        // library + add-ons). Only start from an empty doc when the account POSITIVELY has no backup yet.
+        var doc: [String: Any]
+        switch await pullSyncDocResult() {
+        case .failed: return false
+        case .empty: doc = [:]
+        case .doc(let existing): doc = existing
+        }
         // UNION the cloud's roster into the local one BEFORE makeBackup(), so a device with FEWER
         // profiles never shrinks the cloud's profile set: the pushed blob already contains both sides.
         // Any cloud-only profile that gets merged back keeps its own watch overlay (mergeInRoster does
