@@ -8,6 +8,9 @@
 //! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
 
 use serde::{Deserialize, Serialize};
+use vortx_debrid::{
+    DebridService, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
+};
 use vortx_protocol::{MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, RankedStream, RankingPrefs};
 use vortx_reco::visible_catalog;
@@ -15,6 +18,14 @@ use vortx_state::maturity_allows_raw;
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
 use crate::engine::Engine;
+
+/// A `(infohash, service)` pair the host already knows is cached (read from its hive vault), supplied so
+/// the engine can plan a debrid resolve without doing any I/O of its own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CachedEntry {
+    pub infohash: String,
+    pub service: DebridService,
+}
 
 /// A resolution request from the host. Tagged by `kind` (snake_case). More resources (catalog / meta /
 /// subtitles) join here as their pure pipelines are wired; streams is the player-critical first path.
@@ -44,6 +55,18 @@ pub enum ResolveRequest {
     /// Gate a single meta detail (e.g. a deep link) through the active profile's parental controls.
     /// Boxed: `MetaDetail` is large, so this keeps the request enum small.
     Meta { meta: Box<MetaDetail> },
+    /// Plan how to resolve a set of sources (direct / magnet) into a playable order: instant debrid-cached
+    /// first, then an uncached debrid add, then P2P torrent. The host supplies the known-cached pairs and
+    /// the user's services; the engine does no network.
+    Debrid {
+        sources: Vec<ResolveSource>,
+        #[serde(default, rename = "userServices")]
+        user_services: Vec<DebridService>,
+        #[serde(default)]
+        cached: Vec<CachedEntry>,
+        #[serde(default)]
+        now: u64,
+    },
 }
 
 /// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
@@ -58,6 +81,8 @@ pub enum ResolveResponse {
     Catalog { metas: Vec<MetaPreview> },
     /// The meta detail, or `null` when the active profile's parental controls block it.
     Meta { meta: Option<Box<MetaDetail>> },
+    /// The ordered resolve plan (rank 0 = try first).
+    Debrid { plan: Vec<ResolveStep> },
     Error { error: String },
 }
 
@@ -108,6 +133,18 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             ResolveResponse::Meta {
                 meta: allowed.then_some(meta),
             }
+        }
+        ResolveRequest::Debrid {
+            sources,
+            user_services,
+            cached,
+            now,
+        } => {
+            let view = StaticCacheView::new(
+                cached.into_iter().map(|c| (c.infohash, c.service)).collect(),
+            );
+            let plan = ResolvePlanner::new(user_services).plan(&sources, &view, now);
+            ResolveResponse::Debrid { plan }
         }
     }
 }
