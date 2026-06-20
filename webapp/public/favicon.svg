@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VortX">
+  <rect width="64" height="64" rx="14" fill="#161310" />
+  <defs>
+    <linearGradient id="ember" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff9163" />
+      <stop offset="1" stop-color="#f27849" />
+    </linearGradient>
+  </defs>
+  <!-- The curvy vortex X: two skewed strokes that swirl rather than cross flat. -->
+  <g transform="skewX(-8)" transform-origin="32 32">
+    <path d="M20 16 C30 30 34 34 44 48" stroke="url(#ember)" stroke-width="7"
+          stroke-linecap="round" fill="none" />
+    <path d="M44 16 C34 30 30 34 20 48" stroke="url(#ember)" stroke-width="7"
+          stroke-linecap="round" fill="none" opacity="0.92" />
+  </g>
+</svg>

@@ -1,0 +1,4 @@
+# Cloudflare Pages SPA fallback: serve the built index.html for any path so deep links and refreshes
+# resolve to the app (the app itself is hash-routed, so this only matters for non-root entry URLs).
+# 200 = rewrite (not a 301/302 redirect), which keeps the URL intact for the client router.
+/*    /index.html   200

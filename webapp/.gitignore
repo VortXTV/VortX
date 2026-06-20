@@ -1,0 +1,8 @@
+node_modules
+dist
+*.local
+.DS_Store
+
+# Cloudflare Wrangler / Pages local state
+.wrangler
+.dev.vars

@@ -1,0 +1,15 @@
+# Cloudflare Pages response headers. A production CSP plus the standard hardening headers. The web
+# client fetches add-on data and plays media from arbitrary user-installed add-on hosts, so connect /
+# media / img must allow https: broadly; scripts and styles stay locked to self (Vite emits hashed
+# assets, no inline script). frame-src allows the YouTube no-cookie trailer embed only.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data: blob:; media-src 'self' https: blob:; connect-src 'self' https:; font-src 'self'; worker-src 'self' blob:; frame-src https://www.youtube-nocookie.com; object-src 'none'; base-uri 'self'; form-action 'self'
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+
+# Hashed Vite assets are immutable: cache them hard.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable

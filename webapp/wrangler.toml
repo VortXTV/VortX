@@ -1,0 +1,15 @@
+# Cloudflare Pages project config for web.vortx.tv.
+#
+# Deploy from the built output with:   npm run deploy
+# (which runs `npm run build` then `wrangler pages deploy dist --project-name=vortx-web`).
+#
+# In the Cloudflare dashboard, the Pages project "vortx-web" should have the custom domain
+# web.vortx.tv attached, and (for git-connected deploys) these build settings:
+#   Build command:        npm run build
+#   Build output dir:     dist
+#   Root directory:       web
+#
+# wrangler reads pages_build_output_dir for `wrangler pages deploy` and the Pages CI.
+name = "vortx-web"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-06-01"
