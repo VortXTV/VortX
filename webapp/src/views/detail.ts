@@ -4,6 +4,7 @@ import {
   best,
   hasOnlyUnplayable,
   isTorrent,
+  pickPreferred,
   rankedGroups,
   sourceTagList,
   tiers,
@@ -677,7 +678,8 @@ async function playStream(stream: Stream): Promise<void> {
 
 async function playBest(): Promise<boolean> {
   if (!state) return true;
-  const top = best(rankedGroups(state.groups));
+  // Honor the user's preferred-quality cap (Settings): the best stream at or under it, else the absolute best.
+  const top = pickPreferred(rankedGroups(state.groups), getSettings().preferredQuality);
   if (top) await playStream(top);
   return true;
 }

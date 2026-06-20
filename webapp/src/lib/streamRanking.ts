@@ -168,6 +168,29 @@ export function best(groups: RankedGroup[]): Stream | undefined {
   return all.reduce((b, s) => (score(s) > score(b) ? s : b));
 }
 
+/** A stream's resolution as a number (2160 / 1080 / ...), or null when the source doesn't declare one. */
+export function resolutionOf(s: Stream): number | null {
+  const label = qualityLabel(s);
+  if (label === "4K") return 2160;
+  const m = label.match(/^(\d+)p$/);
+  return m ? Number(m[1]) : null;
+}
+
+/** Auto-pick honoring a preferred max resolution: the highest-SCORED playable stream at or under `maxRes`
+ *  (sources with no declared resolution are allowed through). maxRes = 0 means "Auto" -> the absolute best.
+ *  Falls back to the absolute best when nothing meets the cap, so the user is never left with no source. */
+export function pickPreferred(groups: RankedGroup[], maxRes: number): Stream | undefined {
+  if (!maxRes) return best(groups);
+  const all = groups.flatMap((g) => g.streams).filter(isPlayable);
+  if (!all.length) return undefined;
+  const eligible = all.filter((s) => {
+    const r = resolutionOf(s);
+    return r === null || r <= maxRes;
+  });
+  const pool = eligible.length ? eligible : all;
+  return pool.reduce((b, s) => (score(s) > score(b) ? s : b));
+}
+
 /** Enriched label for the Watch button, from the EXACT stream best() plays ("4K - HDR - Remux"). */
 export function watchLabel(s: Stream): string {
   const t = qualityText(s);

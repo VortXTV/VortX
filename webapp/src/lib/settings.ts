@@ -19,6 +19,7 @@ export interface Settings {
   mdblistKey: string; // optional MDBList API key for IMDb/RT/TMDB ratings on the detail page
   subtitleScale: number; // 0.7 - 1.8, scales the player's subtitle text (video::cue)
   subtitleBackground: boolean; // a translucent backing behind subtitle text (vs text-only)
+  preferredQuality: number; // auto-pick resolution cap in p (2160/1080/720/480); 0 = Auto (absolute best)
 }
 
 /** The accent palette, ported 1:1 from ThemeManager.accents (the app's source of truth). base/bright are
@@ -63,6 +64,7 @@ const DEFAULTS: Settings = {
   mdblistKey: "",
   subtitleScale: 1,
   subtitleBackground: true,
+  preferredQuality: 0,
 };
 
 export const SUB_MIN = 0.7;

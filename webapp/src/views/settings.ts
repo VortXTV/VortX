@@ -45,7 +45,7 @@ export function renderSettings(target: HTMLElement): void {
       <h1 class="t-screen settings-title">Settings</h1>
       ${accountSection()}
       ${appearanceSection(s.accentID, s.background, s.textScale)}
-      ${playbackSection(s.audioLang, s.subtitleLang, s.subtitlesMode, s.autoplayTrailers)}
+      ${playbackSection(s.audioLang, s.subtitleLang, s.subtitlesMode, s.autoplayTrailers, s.preferredQuality)}
       ${subtitleStyleSection(s.subtitleScale, s.subtitleBackground)}
       ${ratingsSection(s.mdblistKey)}
       ${backupSection()}
@@ -113,9 +113,26 @@ function appearanceSection(accentID: string, background: string, textScale: numb
   return group("Appearance", body, "Accent, background, and text size apply across the whole app instantly.");
 }
 
-function playbackSection(audioLang: string, subtitleLang: string, mode: SubtitlesMode, autoplay: boolean): string {
+function playbackSection(
+  audioLang: string,
+  subtitleLang: string,
+  mode: SubtitlesMode,
+  autoplay: boolean,
+  preferredQuality: number,
+): string {
   const audio = langSelect("audio-lang", audioLang, "Original");
   const subs = langSelect("subtitle-lang", subtitleLang, "None");
+  const quality = segmented(
+    [
+      { value: "0", label: "Auto", on: preferredQuality === 0 },
+      { value: "2160", label: "4K", on: preferredQuality === 2160 },
+      { value: "1080", label: "1080p", on: preferredQuality === 1080 },
+      { value: "720", label: "720p", on: preferredQuality === 720 },
+      { value: "480", label: "480p", on: preferredQuality === 480 },
+    ],
+    "set-quality",
+    "q",
+  );
   const subMode = segmented([
     { value: "off", label: "Off", on: mode === "off" },
     { value: "on", label: "On", on: mode === "on" },
@@ -123,6 +140,7 @@ function playbackSection(audioLang: string, subtitleLang: string, mode: Subtitle
   ], "subtitles-mode", "mode");
   const trailers = toggle("toggle-autoplay", autoplay);
   const body =
+    row("Preferred quality", quality, "Auto-play the best source at or under this resolution.") +
     row("Audio language", audio) +
     row("Subtitle language", subs) +
     row("Subtitles", subMode) +
@@ -222,6 +240,10 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
     }
     case "subtitles-mode":
       updateSettings({ subtitlesMode: (hit.node.dataset.mode as SubtitlesMode) ?? "on" });
+      rerender();
+      return true;
+    case "set-quality":
+      updateSettings({ preferredQuality: Number(hit.node.dataset.q) || 0 });
       rerender();
       return true;
     case "toggle-autoplay":
