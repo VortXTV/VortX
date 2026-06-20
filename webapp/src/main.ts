@@ -91,6 +91,11 @@ function pageTitle(route: Route): string {
 
 /** Render a route. Async surfaces paint a shell synchronously, then stream content in. */
 async function renderRoute(route: Route): Promise<void> {
+  // A route change (e.g. browser back/forward) while the player overlay is open means the user navigated
+  // away from playback, so tear the player down: otherwise it stays on top of the new route, the video
+  // keeps playing audio, and its global key handler keeps capturing keystrokes.
+  if (isPlayerOpen()) closePlayer();
+
   markActiveNav(route);
   document.title = pageTitle(route);
 
