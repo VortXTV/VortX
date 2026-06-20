@@ -57,8 +57,10 @@ const enc = (s: string) => te.encode(s);
 // the production origin back, which the browser rejects for a mismatched caller.
 function allowedOrigin(origin: string | null): string {
   if (!origin) return "https://vortx.tv";
-  if (origin === "https://vortx.tv") return origin;
-  if (/^https:\/\/[a-z0-9-]+\.(vortx-site|vortx)\.pages\.dev$/.test(origin)) return origin;
+  // Production origins: the landing site (vortx.tv) and the web app (web.vortx.tv).
+  if (origin === "https://vortx.tv" || origin === "https://web.vortx.tv") return origin;
+  // Project preview/prod *.pages.dev deploys (landing = vortx/vortx-site, web app = vortx-web).
+  if (/^https:\/\/([a-z0-9-]+\.)?(vortx-site|vortx-web|vortx)\.pages\.dev$/.test(origin)) return origin;
   if (/^http:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)) return origin;
   return "https://vortx.tv";
 }
