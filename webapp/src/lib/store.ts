@@ -157,3 +157,31 @@ function persistCW(entries: CWEntry[]): void {
     /* storage disabled or full: best-effort */
   }
 }
+
+// --- Recent searches ----------------------------------------------------------------------------
+// The last few search queries, newest first, so the Search page can offer one-tap repeats. Local only.
+const RECENT_KEY = "vortx.web.recent.v1";
+const RECENT_MAX = 8;
+
+/** Recent search queries, newest first. */
+export function recentSearches(): string[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? (parsed as string[]).filter((s) => typeof s === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Record a search query (trimmed, de-duped case-insensitively, capped). */
+export function addRecentSearch(query: string): void {
+  const q = query.trim();
+  if (!q) return;
+  const next = [q, ...recentSearches().filter((s) => s.toLowerCase() !== q.toLowerCase())].slice(0, RECENT_MAX);
+  try {
+    localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+  } catch {
+    /* storage disabled or full: best-effort */
+  }
+}

@@ -3,6 +3,7 @@ import { search } from "../lib/addon";
 import { discoverTypes } from "./discover";
 import { escapeHtml } from "../lib/dom";
 import { posterCard } from "./board";
+import { addRecentSearch, recentSearches } from "../lib/store";
 
 // Search: query the searchable catalogs across installed add-ons and show a merged poster grid. The
 // query lives in the URL (#/search/<q>) so a search is shareable and survives a refresh.
@@ -19,7 +20,7 @@ export function renderSearchShell(host: HTMLElement, query: string): void {
                placeholder="Search movies and series" value="${escapeHtml(query)}" aria-label="Search" />
         <button class="chip" type="submit">Search</button>
       </form>
-      <div class="grid" id="search-grid" role="list">${query ? "" : prompt()}</div>
+      <div class="grid" id="search-grid" role="list">${query ? "" : recentChips()}</div>
     </div>`;
 }
 
@@ -27,6 +28,7 @@ export function renderSearchShell(host: HTMLElement, query: string): void {
 export async function loadSearch(addons: Addon[], query: string): Promise<void> {
   const grid = document.getElementById("search-grid");
   if (!grid || !query) return;
+  addRecentSearch(query);
   grid.innerHTML = `<p class="muted">Searching for “${escapeHtml(query)}”…</p>`;
   const types = discoverTypes(addons);
   const results = await search(addons, query, types.length ? types : ["movie", "series"]);
@@ -37,4 +39,14 @@ export async function loadSearch(addons: Addon[], query: string): Promise<void> 
 
 function prompt(): string {
   return `<p class="muted">Type a title to search across your installed catalog add-ons.</p>`;
+}
+
+/** Recent-search chips (one-tap repeat), or the prompt when there is no history. */
+function recentChips(): string {
+  const recents = recentSearches();
+  if (!recents.length) return prompt();
+  const chips = recents
+    .map((q) => `<a class="chip recent-chip" href="#/search/${encodeURIComponent(q)}">${escapeHtml(q)}</a>`)
+    .join("");
+  return `<div class="recent-searches"><span class="muted">Recent</span>${chips}</div>`;
 }
