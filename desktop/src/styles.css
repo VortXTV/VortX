@@ -735,3 +735,70 @@ body {
 .featured-actions {
   margin-top: 0.3rem;
 }
+
+/* ---- Bottom tab bar: floating glass pill with a filled accent active tab (matches the webapp) ---- */
+.tabbar {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 15; /* over the detail overlay (10); under the player (20) */
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px;
+  border-radius: var(--radius-pill);
+  background: rgba(33, 28, 22, 0.72);
+  backdrop-filter: blur(22px) saturate(1.3);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.95rem;
+  border-radius: var(--radius-pill);
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 600;
+  white-space: nowrap;
+  text-decoration: none;
+  transition: color var(--dur-state) var(--ease), background var(--dur-state) var(--ease);
+}
+.tab .ico {
+  width: 1.2em;
+  height: 1.2em;
+}
+.tab:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+.tab.active {
+  color: var(--on-accent);
+  background: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+/* Keep the player above the nav; let content + detail clear the floating bar. */
+.player-overlay {
+  z-index: 20;
+}
+.content {
+  padding-bottom: 6rem;
+}
+.detail-body {
+  padding-bottom: 6rem;
+}
+/* Placeholder for a screen not yet ported to the desktop. */
+.screen-msg {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 6rem 2rem;
+  text-align: center;
+  color: var(--muted);
+}
+.screen-msg h2 {
+  font-family: var(--serif);
+  font-size: 2rem;
+  color: var(--text);
+  margin-bottom: 0.5rem;
+}

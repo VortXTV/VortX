@@ -12,7 +12,7 @@ import {
 } from "./detail";
 import { primeAvailability } from "./server";
 import { close as closePlayer, play as openPlayer } from "./player";
-import { icon } from "./icons";
+import { icon, type IconName } from "./icons";
 
 // VortX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
 // (backdrop, hero, meta, per-add-on streams + quality selector, trailer) -> click a stream / Watch ->
@@ -106,6 +106,64 @@ function featuredHeroHtml(item: MetaItem): string {
     </section>`;
 }
 
+// ---- Bottom tab nav + router ---------------------------------------------
+// A floating pill bottom bar (matching the webapp) + a hash router. Home renders the engine board;
+// the other tabs are screens (filled in over subsequent ticks; placeholders for now). The core-event
+// listener only repaints the board while Home is the active route.
+
+interface NavTab {
+  id: string;
+  label: string;
+  icon: IconName;
+  hash: string;
+}
+const NAV: NavTab[] = [
+  { id: "home", label: "Home", icon: "home", hash: "#/" },
+  { id: "discover", label: "Discover", icon: "discover", hash: "#/discover" },
+  { id: "live", label: "Live", icon: "live", hash: "#/live" },
+  { id: "library", label: "Library", icon: "library", hash: "#/library" },
+  { id: "search", label: "Search", icon: "search", hash: "#/search" },
+  { id: "addons", label: "Add-ons", icon: "addons", hash: "#/addons" },
+  { id: "settings", label: "Settings", icon: "settings", hash: "#/settings" },
+];
+
+let currentRoute = "home";
+
+function renderNav(active: string): void {
+  const bar = el("tabbar");
+  if (!bar) return;
+  bar.innerHTML = NAV.map(
+    (t) =>
+      `<a class="tab${t.id === active ? " active" : ""}" data-nav="${t.id}" href="${t.hash}">${icon(t.icon)}<span>${t.label}</span></a>`,
+  ).join("");
+}
+
+function routeFromHash(): string {
+  const seg = location.hash.replace(/^#\/?/, "").split("/")[0];
+  return NAV.some((t) => t.id === seg) ? seg : "home";
+}
+
+function renderRoute(): void {
+  // A nav change while the detail overlay is open means leaving detail.
+  if (isDetailOpen()) closeDetail();
+  currentRoute = routeFromHash();
+  renderNav(currentRoute);
+  if (currentRoute === "home") {
+    void getState<Board>("board").then(renderBoard);
+  } else {
+    renderScreenPlaceholder(currentRoute);
+  }
+}
+
+/** Honest placeholder for a screen not yet ported to the desktop (the web app has them today). */
+function renderScreenPlaceholder(route: string): void {
+  const content = el("content");
+  if (!content) return;
+  const label = NAV.find((t) => t.id === route)?.label ?? route;
+  content.innerHTML = `<div class="screen-msg"><h2>${escapeHtml(label)}</h2><p>This screen is coming to the desktop app.</p></div>`;
+  setStatus("");
+}
+
 // ---- Player --------------------------------------------------------------
 // The player sink lives in player.ts (mpv via the Rust mpv_play command, webview <video> fallback).
 // openPlayer / closePlayer are imported from there; this file only routes clicks to them.
@@ -159,12 +217,18 @@ async function start(): Promise<void> {
     void openPlayer(url);
   });
 
+  // Paint the nav + route up front, BEFORE any engine call, so the UI never depends on the engine
+  // booting (and a screen route renders even while the board is still loading).
+  window.addEventListener("hashchange", renderRoute);
+  renderRoute();
+
   void awaitServer();
 
-  // Re-render the visible surface whenever the engine reports new state.
+  // Re-render the board whenever the engine reports new state, but only while Home is active (otherwise
+  // an engine event would clobber whatever screen the router painted).
   await listen("core-event", () => {
     if (isDetailOpen()) void refreshDetail();
-    else void getState<Board>("board").then(renderBoard);
+    else if (currentRoute === "home") void getState<Board>("board").then(renderBoard);
   });
 
   await dispatch("board", { action: "Load", args: { model: "CatalogsWithExtra", args: { type: null, extra: [] } } });
@@ -175,7 +239,7 @@ async function start(): Promise<void> {
 
   for (let i = 0; i < 8; i++) {
     setTimeout(() => {
-      if (!isDetailOpen()) void getState<Board>("board").then(renderBoard);
+      if (!isDetailOpen() && currentRoute === "home") void getState<Board>("board").then(renderBoard);
     }, i * 700);
   }
 }
