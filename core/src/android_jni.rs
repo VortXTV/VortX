@@ -35,18 +35,20 @@ use crate::EventSink;
 /// never started) can attach themselves before calling the Kotlin listener back.
 static JAVA_VM: Lazy<RwLock<Option<JavaVM>>> = Lazy::new(Default::default);
 
-/// A global ref to the Kotlin `EventListener` plus the cached `onEvent([B)V` method id. Held for the
-/// process lifetime (the event loop never stops), mirroring the Apple "callback valid forever"
-/// contract. `jmethodID` is `Send`/`Sync`-safe to cache; we wrap it so the whole struct can live in a
-/// static.
+/// A global ref to the Kotlin `EventListener`, held for the process lifetime (the event loop never
+/// stops), mirroring the Apple "callback valid forever" contract. `deliver_event` resolves `onEvent`
+/// by name + signature on each callback via `JNIEnv::call_method` (the simplest-correct path). Caching
+/// the `jmethodID` here (it is `Send`/`Sync`-safe) is a possible future optimization if the per-call
+/// lookup ever shows up in profiling; the event rate (model changes, not per-frame) does not warrant
+/// the extra complexity today.
 struct Listener {
     object: GlobalRef,
 }
 
 static LISTENER: Lazy<RwLock<Option<Listener>>> = Lazy::new(Default::default);
 
-/// Cached so we never relookup the class/method on the hot event path. The method is
-/// `EventListener.onEvent(json: ByteArray): Unit`.
+/// The Kotlin method `EventListener.onEvent(json: ByteArray): Unit` and its JNI signature, used by
+/// `deliver_event` to resolve and invoke the callback on each `RuntimeEvent`.
 const LISTENER_ON_EVENT: &str = "onEvent";
 const LISTENER_ON_EVENT_SIG: &str = "([B)V";
 
