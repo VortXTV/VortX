@@ -61,6 +61,11 @@ struct iOSSettingsView: View {
     @State private var showBackupImporter = false
     @State private var backupDocument: BackupDocument?
     @State private var backupAlert: BackupAlert?
+    // Library import/export: carry a profile's saved titles + watch progress to another device or
+    // profile, account-free (see LibraryPortability + ProfileStore.export/importLibraryItems).
+    @State private var showLibraryExporter = false
+    @State private var showLibraryImporter = false
+    @State private var libraryDocument: BackupDocument?
 
     var body: some View {
         NavigationStack {
@@ -121,6 +126,40 @@ struct iOSSettingsView: View {
                     }
                 case .failure(let error):
                     backupAlert = BackupAlert(title: "Restore Failed", message: error.localizedDescription)
+                }
+            }
+            .fileExporter(isPresented: $showLibraryExporter, document: libraryDocument,
+                          contentType: .json,
+                          defaultFilename: LibraryPortability.defaultFilename(profile: profiles.active?.name ?? "Library")) { result in
+                switch result {
+                case .success:
+                    backupAlert = BackupAlert(title: "Library Exported",
+                        message: "Saved this profile's titles and watch history. Import it on another device or into another profile.")
+                case .failure(let error):
+                    backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
+                }
+            }
+            .fileImporter(isPresented: $showLibraryImporter, allowedContentTypes: [.json]) { result in
+                switch result {
+                case .success(let url):
+                    do {
+                        let scoped = url.startAccessingSecurityScopedResource()
+                        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                        let items = try LibraryPortability.decode(from: try Data(contentsOf: url))
+                        let target = profiles.active?.name ?? "this profile"
+                        Task {
+                            let result = await profiles.importLibraryItems(items)
+                            var message = "\(result.applied) \(result.applied == 1 ? "title" : "titles") added to \(target)."
+                            if result.skipped > 0 {
+                                message += " \(result.skipped) \(result.skipped == 1 ? "title was" : "titles were") skipped: only standard catalog titles can be added to the main profile's account library."
+                            }
+                            backupAlert = BackupAlert(title: "Library Imported", message: message)
+                        }
+                    } catch {
+                        backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
+                    }
+                case .failure(let error):
+                    backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
                 }
             }
             .alert(item: $backupAlert) { info in
@@ -764,10 +803,39 @@ struct iOSSettingsView: View {
             } label: {
                 Label("Restore from Backup", systemImage: "arrow.down.doc")
             }
+            Button {
+                exportActiveLibrary()
+            } label: {
+                Label("Export Library", systemImage: "square.and.arrow.up.on.square")
+            }
+            Button {
+                showLibraryImporter = true
+            } label: {
+                Label("Import Library", systemImage: "square.and.arrow.down.on.square")
+            }
         } header: {
             Text("Backup & Restore")
         } footer: {
-            Text("Save your profiles, theme, and playback preferences to a file you can keep, so a future major update can never lose them. Your library and watch history return when you sign in to your account.")
+            Text("Save your profiles, theme, and playback preferences to a file you can keep, so a future major update can never lose them. Export Library carries the active profile's saved titles and watch progress to another device or profile, no account needed.")
+        }
+    }
+
+    /// Serialize the active profile's library + watch history and present the file exporter. Reads the
+    /// right source per the per-profile invariant (engine library for the owner, the private overlay
+    /// otherwise); an empty library is surfaced instead of writing a useless empty file.
+    private func exportActiveLibrary() {
+        let items = profiles.exportActiveLibraryItems()
+        guard !items.isEmpty else {
+            backupAlert = BackupAlert(title: "Nothing to Export",
+                message: "This profile has no saved titles or watch history yet.")
+            return
+        }
+        do {
+            let data = try LibraryPortability.encode(items: items, profile: profiles.active?.name ?? "Profile")
+            libraryDocument = BackupDocument(data: data)
+            showLibraryExporter = true
+        } catch {
+            backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
         }
     }
 
