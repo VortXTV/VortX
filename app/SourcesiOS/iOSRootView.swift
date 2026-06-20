@@ -231,6 +231,7 @@ struct iOSHomeView: View {
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -324,6 +325,18 @@ struct iOSHomeView: View {
                                 }
                         }
                     }
+                    // Editorial collections (B3, Nuvio-style): hand-curated rails backed by public
+                    // Cinemeta catalogs, rendered BELOW the add-on catalog rows. They give Home an
+                    // opinionated shape even with no extra catalog add-ons installed, and each fails soft
+                    // (an empty collection is dropped; an empty section renders nothing, no error state).
+                    ForEach(curated.collections) { collection in
+                        homeRail(PosterRail(title: collection.title,
+                                            items: collection.items.map {
+                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                         poster: $0.poster, progress: 0)
+                                            },
+                                            onTap: handleTap))
+                    }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
                     if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
@@ -366,6 +379,9 @@ struct iOSHomeView: View {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
+            // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
+            // already loaded or in flight, and retries on the next appearance if the first fetch failed.
+            curated.load()
         }
         .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
