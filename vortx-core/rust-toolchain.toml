@@ -1,0 +1,4 @@
+# Match the app's core toolchain (nightly + rust-src for the FFI/xcframework build).
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]

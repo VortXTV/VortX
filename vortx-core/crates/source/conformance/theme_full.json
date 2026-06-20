@@ -1,0 +1,32 @@
+{
+  "schema": "vortx-source/1",
+  "id": "tv.vortx.theme.midnight",
+  "version": "1.0.0",
+  "name": "Midnight",
+  "kind": "native_vortx",
+  "capabilities": ["theme"],
+  "transport": { "kind": "federated", "endpoint": "vortx://local" },
+  "customization": {
+    "providesThemes": true,
+    "scope": "per-profile",
+    "themes": [
+      {
+        "id": "midnight",
+        "label": "Midnight",
+        "accent": {
+          "base": { "space": "oklch", "l": 550, "c": 150, "h": 2640, "a": 255 },
+          "bright": { "space": "oklch", "l": 700, "c": 160, "h": 2640, "a": 255 }
+        },
+        "oled": true,
+        "palette": {
+          "textPrimary": { "space": "srgb", "r": 246, "g": 241, "b": 233, "a": 255 },
+          "danger": { "space": "srgb", "r": 222, "g": 72, "b": 86, "a": 255 }
+        },
+        "radius": { "card": 16, "chip": 10, "control": 12 },
+        "motion": { "focusResponse": 350, "focusDamping": 800, "state": 200 }
+      }
+    ]
+  },
+  "permissions": ["customize"],
+  "signature": { "alg": "ed25519", "keyId": "k_3f9a1c", "sig": "ZmFrZXNpZ25hdHVyZQ" }
+}

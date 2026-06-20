@@ -1,0 +1,35 @@
+{
+  "description": "Cross-language conformance for trickplay seek-to-tile math. Every implementation (Rust, TS, Swift) must map a seek millisecond to the SAME thumbnail crop. Pure integer arithmetic, so this is exactly reproducible everywhere; pinned as a frozen interop anchor.",
+  "cases": [
+    {
+      "name": "first_sheet_middle_of_row_zero",
+      "sprite": { "interval_ms": 5000, "tile_w": 320, "tile_h": 180, "cols": 10, "rows": 10 },
+      "seek_ms": 37000,
+      "expect": { "global_index": 7, "sheet": 0, "local_index": 7, "row": 0, "col": 7, "crop_x": 2240, "crop_y": 0, "crop_w": 320, "crop_h": 180 }
+    },
+    {
+      "name": "crosses_to_second_sheet",
+      "sprite": { "interval_ms": 5000, "tile_w": 320, "tile_h": 180, "cols": 10, "rows": 10 },
+      "seek_ms": 520000,
+      "expect": { "global_index": 104, "sheet": 1, "local_index": 4, "row": 0, "col": 4, "crop_x": 1280, "crop_y": 0, "crop_w": 320, "crop_h": 180 }
+    },
+    {
+      "name": "second_row_of_first_sheet",
+      "sprite": { "interval_ms": 5000, "tile_w": 320, "tile_h": 180, "cols": 10, "rows": 10 },
+      "seek_ms": 75000,
+      "expect": { "global_index": 15, "sheet": 0, "local_index": 15, "row": 1, "col": 5, "crop_x": 1600, "crop_y": 180, "crop_w": 320, "crop_h": 180 }
+    },
+    {
+      "name": "ten_second_interval_smaller_grid",
+      "sprite": { "interval_ms": 10000, "tile_w": 160, "tile_h": 90, "cols": 5, "rows": 5 },
+      "seek_ms": 260000,
+      "expect": { "global_index": 26, "sheet": 1, "local_index": 1, "row": 0, "col": 1, "crop_x": 160, "crop_y": 0, "crop_w": 160, "crop_h": 90 }
+    },
+    {
+      "name": "zero_seek_is_first_tile",
+      "sprite": { "interval_ms": 5000, "tile_w": 320, "tile_h": 180, "cols": 10, "rows": 10 },
+      "seek_ms": 0,
+      "expect": { "global_index": 0, "sheet": 0, "local_index": 0, "row": 0, "col": 0, "crop_x": 0, "crop_y": 0, "crop_w": 320, "crop_h": 180 }
+    }
+  ]
+}

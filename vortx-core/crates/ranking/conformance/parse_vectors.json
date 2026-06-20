@@ -1,0 +1,49 @@
+[
+  {
+    "description": "2160p bluray remux, Dolby Vision, Atmos",
+    "label": "The Movie 2024 2160p BluRay REMUX Dolby Vision TrueHD Atmos 7.1 x265",
+    "resolution": "2160p",
+    "source_class": "remux",
+    "hdr": "dolby_vision",
+    "audio": "atmos",
+    "junk": false
+  },
+  {
+    "description": "series web-dl with season/episode and DD+",
+    "label": "Show S03E09 1080p WEB-DL DDP5.1 H.264",
+    "resolution": "1080p",
+    "source_class": "web_dl",
+    "hdr": "none",
+    "audio": "dd_plus",
+    "season": 3,
+    "episode": 9,
+    "junk": false
+  },
+  {
+    "description": "hdcam is junk",
+    "label": "Movie 720p HDCAM",
+    "resolution": "720p",
+    "source_class": "cam",
+    "hdr": "none",
+    "audio": "none",
+    "junk": true
+  },
+  {
+    "description": "webrip with HDR10+",
+    "label": "Movie 2160p HDR10+ WEBRip",
+    "resolution": "2160p",
+    "source_class": "web",
+    "hdr": "hdr10_plus",
+    "audio": "none",
+    "junk": false
+  },
+  {
+    "description": "no recognizable tokens",
+    "label": "Just A Title",
+    "resolution": "unknown",
+    "source_class": "unknown",
+    "hdr": "none",
+    "audio": "none",
+    "junk": false
+  }
+]
