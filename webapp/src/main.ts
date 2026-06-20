@@ -72,9 +72,27 @@ function setDetailVisible(visible: boolean): void {
   }
 }
 
+/** The browser tab / history / shared-link title for a route. Detail sets its own (the title name) once
+ *  the meta loads, so it falls through to the bare brand here. */
+function pageTitle(route: Route): string {
+  switch (route.name) {
+    case "discover":
+      return "Discover · VortX";
+    case "search":
+      return route.query ? `${route.query} · Search · VortX` : "Search · VortX";
+    case "library":
+      return "Library · VortX";
+    case "addons":
+      return "Add-ons · VortX";
+    default:
+      return "VortX";
+  }
+}
+
 /** Render a route. Async surfaces paint a shell synchronously, then stream content in. */
 async function renderRoute(route: Route): Promise<void> {
   markActiveNav(route);
+  document.title = pageTitle(route);
 
   // Leaving Detail for any non-detail route tears the overlay down.
   if (route.name !== "detail") setDetailVisible(false);

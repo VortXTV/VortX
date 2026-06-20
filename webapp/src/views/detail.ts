@@ -157,6 +157,7 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
 
 function render(): void {
   if (!hostEl || !state?.meta) return;
+  document.title = `${state.meta.name} · VortX`;
   if (isSeries(state.type, state.meta)) {
     renderSeries(hostEl, state.meta);
     return;
