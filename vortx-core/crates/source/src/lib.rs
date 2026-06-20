@@ -19,6 +19,7 @@ mod customization;
 mod fanout;
 mod identity;
 mod manifest;
+mod pagination;
 mod registry;
 mod request;
 mod source;
@@ -40,6 +41,7 @@ pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
 };
+pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
 pub use request::{ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
