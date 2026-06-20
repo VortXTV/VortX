@@ -20,8 +20,8 @@ pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
 };
 pub use resource::{
-    CatalogResponse, MetaDetail, MetaPreview, MetaResponse, Stream, StreamBehaviorHints,
-    StreamResponse, StreamSource, Subtitle, SubtitlesResponse, Video,
+    AddonCatalogResponse, AddonDescriptor, CatalogResponse, MetaDetail, MetaPreview, MetaResponse,
+    Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle, SubtitlesResponse, Video,
 };
 pub use transport::{base_url, ResourcePath};
 
@@ -83,6 +83,14 @@ pub fn parse_subtitles(body: &str) -> Result<SubtitlesResponse, ProtocolError> {
     })
 }
 
+/// Decode an `addon_catalog` response body (an add-on that lists other add-ons).
+pub fn parse_addon_catalog(body: &str) -> Result<AddonCatalogResponse, ProtocolError> {
+    serde_json::from_str(body).map_err(|source| ProtocolError::Response {
+        resource: resources::ADDON_CATALOG,
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,7 +124,10 @@ mod tests {
         assert_eq!(m.types, vec!["movie", "series"]);
         assert_eq!(m.catalogs.len(), 2);
         assert_eq!(m.catalogs[0].extra.len(), 2);
-        assert_eq!(m.id_prefixes.as_deref(), Some(["tt".to_string()].as_slice()));
+        assert_eq!(
+            m.id_prefixes.as_deref(),
+            Some(["tt".to_string()].as_slice())
+        );
         // Short and Full resource forms both parse.
         assert_eq!(m.resources[0].name(), "catalog");
         assert_eq!(m.resources[1].name(), "meta");
@@ -173,7 +184,10 @@ mod tests {
     #[test]
     fn base_url_strips_manifest_suffix() {
         assert_eq!(base_url("https://x.io/manifest.json"), "https://x.io");
-        assert_eq!(base_url("https://x.io/cfg/manifest.json"), "https://x.io/cfg");
+        assert_eq!(
+            base_url("https://x.io/cfg/manifest.json"),
+            "https://x.io/cfg"
+        );
         // Already a base URL -> trailing slash trimmed, used as-is.
         assert_eq!(base_url("https://x.io/cfg/"), "https://x.io/cfg");
     }
@@ -194,7 +208,10 @@ mod tests {
         assert_eq!(parsed.streams.len(), 5);
         assert_eq!(
             parsed.streams[0].source(),
-            StreamSource::Torrent { info_hash: "a1b2".into(), file_idx: Some(0) }
+            StreamSource::Torrent {
+                info_hash: "a1b2".into(),
+                file_idx: Some(0)
+            }
         );
         assert_eq!(
             parsed.streams[1].source(),
@@ -230,7 +247,10 @@ mod tests {
         assert_eq!(parsed.meta.name, "Game of Thrones");
         assert_eq!(parsed.meta.videos.len(), 2);
         assert_eq!(parsed.meta.videos[0].season, Some(1));
-        assert_eq!(parsed.meta.videos[0].title.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(
+            parsed.meta.videos[0].title.as_deref(),
+            Some("Winter Is Coming")
+        );
     }
 
     #[test]
@@ -247,9 +267,31 @@ mod tests {
 
     #[test]
     fn decodes_subtitles() {
-        let body = r#"{ "subtitles": [ { "id": "1", "url": "https://s/en.srt", "lang": "eng" } ] }"#;
+        let body =
+            r#"{ "subtitles": [ { "id": "1", "url": "https://s/en.srt", "lang": "eng" } ] }"#;
         let parsed = parse_subtitles(body).unwrap();
         assert_eq!(parsed.subtitles.len(), 1);
         assert_eq!(parsed.subtitles[0].lang, "eng");
+    }
+
+    #[test]
+    fn decodes_addon_catalog_into_descriptors() {
+        let body = r#"{ "addons": [
+            { "transportUrl": "https://v3-cinemeta.strem.io/manifest.json",
+              "transportName": "Cinemeta",
+              "manifest": { "id": "com.linvo.cinemeta", "version": "3.0.13", "name": "Cinemeta",
+                            "resources": ["catalog", "meta"], "types": ["movie", "series"] } },
+            { "transportUrl": "https://torrentio.strem.fun/manifest.json",
+              "manifest": { "id": "com.stremio.torrentio", "version": "1.0.0", "name": "Torrentio",
+                            "resources": ["stream"], "types": ["movie", "series"],
+                            "idPrefixes": ["tt"] } }
+        ] }"#;
+        let parsed = parse_addon_catalog(body).expect("addon_catalog parses");
+        assert_eq!(parsed.addons.len(), 2);
+        assert_eq!(parsed.addons[0].transport_name.as_deref(), Some("Cinemeta"));
+        assert_eq!(parsed.addons[0].manifest.id, "com.linvo.cinemeta");
+        // transportName is optional and absent on the second entry.
+        assert!(parsed.addons[1].transport_name.is_none());
+        assert_eq!(parsed.addons[1].manifest.name, "Torrentio");
     }
 }

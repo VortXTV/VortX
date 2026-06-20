@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::manifest::Manifest;
+
 /// `GET .../catalog/...` -> `{ "metas": [ ... ] }`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatalogResponse {
@@ -34,6 +36,31 @@ pub struct SubtitlesResponse {
     pub subtitles: Vec<Subtitle>,
 }
 
+/// `GET .../addon_catalog/...` -> `{ "addons": [ { transportUrl, transportName, manifest } ] }`
+///
+/// An add-on that lists OTHER add-ons: community add-on collections, and (the payoff) the VortX
+/// "Singularity" source hub, which is served as a standard `addon_catalog` so it routes through the
+/// same engine path as any other add-on instead of being a bespoke integration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AddonCatalogResponse {
+    #[serde(default)]
+    pub addons: Vec<AddonDescriptor>,
+}
+
+/// One discoverable add-on inside an `addon_catalog`: its transport URL plus full manifest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddonDescriptor {
+    #[serde(rename = "transportUrl")]
+    pub transport_url: String,
+    #[serde(
+        default,
+        rename = "transportName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transport_name: Option<String>,
+    pub manifest: Manifest,
+}
+
 /// The lightweight item shown in catalog rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaPreview {
@@ -43,7 +70,11 @@ pub struct MetaPreview {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poster: Option<String>,
-    #[serde(default, rename = "posterShape", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "posterShape",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub poster_shape: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
@@ -51,9 +82,17 @@ pub struct MetaPreview {
     pub logo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, rename = "releaseInfo", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "releaseInfo",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub release_info: Option<String>,
-    #[serde(default, rename = "imdbRating", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "imdbRating",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub imdb_rating: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genres: Option<Vec<String>>,
@@ -68,7 +107,11 @@ pub struct MetaDetail {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poster: Option<String>,
-    #[serde(default, rename = "posterShape", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "posterShape",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub poster_shape: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
@@ -76,9 +119,17 @@ pub struct MetaDetail {
     pub logo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, rename = "releaseInfo", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "releaseInfo",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub release_info: Option<String>,
-    #[serde(default, rename = "imdbRating", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "imdbRating",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub imdb_rating: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -93,7 +144,11 @@ pub struct MetaDetail {
     /// Episodes for a series (and chapters/streams for channels).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub videos: Vec<Video>,
-    #[serde(default, rename = "behaviorHints", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "behaviorHints",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub behavior_hints: Option<Value>,
 }
 
@@ -133,7 +188,11 @@ pub struct Stream {
     pub info_hash: Option<String>,
     #[serde(default, rename = "fileIdx", skip_serializing_if = "Option::is_none")]
     pub file_idx: Option<u32>,
-    #[serde(default, rename = "externalUrl", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "externalUrl",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub external_url: Option<String>,
 
     /// Short label (resolution / source). Newer field; older add-ons use `title`.
@@ -145,7 +204,11 @@ pub struct Stream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
-    #[serde(default, rename = "behaviorHints", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "behaviorHints",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub behavior_hints: Option<StreamBehaviorHints>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtitles: Vec<Subtitle>,
@@ -159,7 +222,10 @@ pub enum StreamSource {
     /// A YouTube video id.
     YouTube(String),
     /// A torrent, by info-hash, optionally selecting a file index.
-    Torrent { info_hash: String, file_idx: Option<u32> },
+    Torrent {
+        info_hash: String,
+        file_idx: Option<u32>,
+    },
     /// A link to open in another app/browser.
     External(String),
     /// No recognised source (malformed / placeholder stream).
@@ -189,14 +255,30 @@ impl Stream {
 /// `behaviorHints` on a stream: binge grouping, web-readiness, proxy headers, geo-gating.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamBehaviorHints {
-    #[serde(default, rename = "bingeGroup", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "bingeGroup",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub binge_group: Option<String>,
-    #[serde(default, rename = "notWebReady", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "notWebReady",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub not_web_ready: Option<bool>,
     /// Headers the player must inject when fetching the stream (debrid/private trackers).
-    #[serde(default, rename = "proxyHeaders", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "proxyHeaders",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub proxy_headers: Option<Value>,
-    #[serde(default, rename = "countryWhitelist", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "countryWhitelist",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub country_whitelist: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,

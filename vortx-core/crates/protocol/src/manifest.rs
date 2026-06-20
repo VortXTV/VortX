@@ -29,21 +29,37 @@ pub struct Manifest {
     #[serde(default)]
     pub catalogs: Vec<ManifestCatalog>,
     /// Add-on-catalog resource (an add-on that lists OTHER add-ons), rarely used.
-    #[serde(default, rename = "addonCatalogs", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        rename = "addonCatalogs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub addon_catalogs: Vec<ManifestCatalog>,
 
     /// ID prefixes the add-on can answer for (e.g. `["tt"]` for IMDb ids). Empty = any.
-    #[serde(default, rename = "idPrefixes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "idPrefixes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id_prefixes: Option<Vec<String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logo: Option<String>,
-    #[serde(default, rename = "contactEmail", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "contactEmail",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub contact_email: Option<String>,
 
-    #[serde(default, rename = "behaviorHints", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "behaviorHints",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub behavior_hints: Option<ManifestBehaviorHints>,
 }
 
@@ -84,10 +100,18 @@ pub struct ManifestCatalog {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra: Vec<ManifestExtra>,
     /// Short-form supported extra prop names (older manifests).
-    #[serde(default, rename = "extraSupported", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "extraSupported",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub extra_supported: Option<Vec<String>>,
     /// Short-form required extra prop names (older manifests).
-    #[serde(default, rename = "extraRequired", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "extraRequired",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub extra_required: Option<Vec<String>>,
 }
 
@@ -99,7 +123,11 @@ pub struct ManifestExtra {
     pub is_required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
-    #[serde(default, rename = "optionsLimit", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "optionsLimit",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub options_limit: Option<u32>,
 }
 
