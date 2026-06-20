@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/addons",
+    "crates/hive",
 ]
 
 [workspace.package]
