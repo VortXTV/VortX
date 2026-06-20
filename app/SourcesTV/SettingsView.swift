@@ -170,6 +170,10 @@ struct SettingsView: View {
                     Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { DebridKeysView() } label: {
+                    Label("Debrid services", systemImage: "bolt.horizontal.circle")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()
