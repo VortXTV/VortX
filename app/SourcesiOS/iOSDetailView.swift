@@ -161,6 +161,7 @@ struct iOSDetailView: View {
     // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
     // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
     // `platformFullScreenPlayerCover(item:)` calls become a `.sheet(item:)`, and two sheets attached to
@@ -455,7 +456,7 @@ struct iOSDetailView: View {
     /// missing / slow / blocked embed never blanks the band. Tapping it (or its speaker control) escalates
     /// to the existing in-app interactive trailer with sound via `playTrailer()`.
     @ViewBuilder private var heroTrailerClip: some View {
-        if !reduceMotion, !LiveTypes.contains(type),
+        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
            let yt = meta?.trailerYouTubeID, !yt.isEmpty {
             InHeroTrailerView(youTubeID: yt, height: backdropHeight, onRequestSound: playTrailer)
         }

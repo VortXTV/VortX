@@ -49,6 +49,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
@@ -273,6 +274,8 @@ struct iOSSettingsView: View {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
             Toggle("Auto-skip intro & credits", isOn: $autoSkip)
+                .tint(Theme.Palette.accent)
+            Toggle("Autoplay trailers", isOn: $autoplayTrailers)
                 .tint(Theme.Palette.accent)
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
