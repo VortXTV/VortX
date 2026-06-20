@@ -69,6 +69,12 @@ extension PlayerEngine {
     func addExternalSubtitle(url: String, title: String, lang: String) {
         addExternalSubtitle(url: url, title: title, lang: lang, timeout: 20, completion: nil)
     }
+
+    /// The form the chrome actually uses: 3 named args plus a trailing `completion` closure (timeout
+    /// defaulted). A trailing-closure call binds to this overload, not the no-completion one above.
+    func addExternalSubtitle(url: String, title: String, lang: String, completion: ((Bool) -> Void)?) {
+        addExternalSubtitle(url: url, title: title, lang: lang, timeout: 20, completion: completion)
+    }
 }
 
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance

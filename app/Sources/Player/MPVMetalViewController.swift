@@ -1155,8 +1155,8 @@ final class MPVMetalViewController: PlatformViewController {
     /// traps, the crash on close.
     private func emit(_ name: String, _ data: Any?) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, let mpv = self.mpv else { return }
-            self.playDelegate?.propertyChange(mpv: mpv, propertyName: name, data: data)
+            guard let self, self.mpv != nil else { return }
+            self.playDelegate?.propertyChange(propertyName: name, data: data)
         }
     }
 
@@ -1190,7 +1190,7 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.videoParamsSigPeak:
                             if let sigPeak = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 DispatchQueue.main.async { [weak self] in
-                                    guard let self, let mpv = self.mpv else { return }   // dropped if torn down
+                                    guard let self, self.mpv != nil else { return }   // dropped if torn down
                                     #if canImport(UIKit)
                                     let maxEDRRange = self.view.window?.screen.potentialEDRHeadroom ?? 1.0
                                     #elseif canImport(AppKit)
@@ -1199,7 +1199,7 @@ final class MPVMetalViewController: PlatformViewController {
                                     // display screen support HDR and current playing HDR video
                                     self.hdrAvailable = maxEDRRange > 1.0 && sigPeak > 1.0
                                     self.syncDisplayDynamicRange(sigPeak: sigPeak)
-                                    self.playDelegate?.propertyChange(mpv: mpv, propertyName: propertyName, data: sigPeak)
+                                    self.playDelegate?.propertyChange(propertyName: propertyName, data: sigPeak)
                                 }
                             }
                         case MPVProperty.videoParamsGamma:

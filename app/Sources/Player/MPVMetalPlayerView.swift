@@ -59,7 +59,7 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         return self
     }
 
-    func onPropertyChange(_ handler: @escaping (MPVMetalViewController, String, Any?) -> Void) -> Self {
+    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
         coordinator.onPropertyChange = handler
         return self
     }
@@ -71,19 +71,21 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
 
     @MainActor
     public final class Coordinator: MPVPlayerDelegate, ObservableObject {
-        weak var player: MPVMetalViewController?
+        // `any PlayerEngine` so the same Coordinator + chrome can be driven by either the libmpv
+        // controller or an AVFoundation engine; whichever is assigned here is what the chrome talks to.
+        weak var player: (any PlayerEngine)?
 
         var playUrl : URL?
         var playHeaders: [String: String]?
         var playLive = false
-        var onPropertyChange: ((MPVMetalViewController, String, Any?) -> Void)?
+        var onPropertyChange: ((any PlayerEngine, String, Any?) -> Void)?
         var onTap: (() -> Void)?
 
         func play(_ url: URL) {
             player?.loadFile(url, headers: playHeaders, live: playLive)
         }
 
-        func propertyChange(mpv: OpaquePointer, propertyName: String, data: Any?) {
+        func propertyChange(propertyName: String, data: Any?) {
             guard let player else { return }
 
             self.onPropertyChange?(player, propertyName, data)
