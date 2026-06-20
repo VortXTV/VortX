@@ -18,6 +18,7 @@ import {
 import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
+import { loadLive, renderLive } from "./views/live";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
 import { handleSettingsClick, renderSettings } from "./views/settings";
 import { handleLoginClick, renderLogin } from "./views/login";
@@ -153,11 +154,10 @@ async function renderRoute(route: Route): Promise<void> {
       return;
     }
     case "live": {
-      // Live = the Discover grid scoped to live catalogs (tv / channel). Empty state if no live add-on.
-      const types = discoverTypes(addons);
-      const liveType = types.find((t) => t === "tv" || t === "channel") ?? "tv";
-      renderDiscoverShell(mainHost(), addons, liveType);
-      await loadDiscover(addons, liveType);
+      // Live TV: its own page (channels grid, or a clean empty state when no live add-on is installed).
+      const host = mainHost();
+      renderLive(host, addons);
+      await loadLive(addons);
       return;
     }
     case "settings": {
