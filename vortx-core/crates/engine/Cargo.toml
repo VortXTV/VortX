@@ -16,6 +16,7 @@ vortx-state = { path = "../state" }
 vortx-protocol = { path = "../protocol" }
 vortx-ranking = { path = "../ranking" }
 vortx-subtitles = { path = "../subtitles" }
+vortx-reco = { path = "../reco" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -57,6 +57,26 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
                 Err(e) => DispatchResult::err(e.to_string()),
             }
         }
+        Action::SetParental {
+            id,
+            kids,
+            maturity_ceiling,
+        } => {
+            let pid = ProfileId::new(id.clone());
+            match engine.store.roster.get(&pid) {
+                Some(p) => {
+                    let mut updated = p.clone();
+                    updated.parental.kids = kids;
+                    updated.parental.maturity_ceiling = maturity_ceiling;
+                    // Bump the LWW clock so this edit wins on a multi-device merge.
+                    updated.rev = updated.rev.saturating_add(1);
+                    updated.updated_at = env.now();
+                    engine.store.roster.upsert(updated);
+                    DispatchResult::ok(vec![EngineEvent::ParentalSet { id }])
+                }
+                None => DispatchResult::err("profile not found"),
+            }
+        }
         Action::GetState => DispatchResult::ok(vec![]),
     }
 }

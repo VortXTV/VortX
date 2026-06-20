@@ -14,6 +14,15 @@ pub enum Action {
     AddProfile { id: String, name: String },
     /// Tombstone-delete a profile (never the owner or the last live profile).
     DeleteProfile { id: String },
+    /// Set a profile's parental controls: the kids flag and an optional maturity ceiling (age). Bumps the
+    /// profile's LWW edit clock so the change wins on multi-device merge.
+    SetParental {
+        id: String,
+        #[serde(default)]
+        kids: bool,
+        #[serde(default, rename = "maturityCeiling", skip_serializing_if = "Option::is_none")]
+        maturity_ceiling: Option<u8>,
+    },
     /// No state change; a way for the host to request a fresh state snapshot.
     GetState,
 }
@@ -25,6 +34,7 @@ pub enum EngineEvent {
     ProfileSwitched { id: String },
     ProfileAdded { id: String },
     ProfileDeleted { id: String },
+    ParentalSet { id: String },
 }
 
 /// The result of a dispatch: success/failure, an optional error message, and the events produced.
