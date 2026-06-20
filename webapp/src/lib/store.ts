@@ -46,9 +46,8 @@ export async function loadInstalledAddons(): Promise<Addon[]> {
 /** Add a stream/catalog add-on by transport URL. Validates the manifest before persisting; returns
  *  the resolved Addon so the caller can refresh the UI. Throws if the URL is not a valid add-on. */
 export async function addAddon(transportUrl: string): Promise<Addon> {
-  const normalized = transportUrl.trim();
-  const addon = await loadAddon(normalized);
-  persist([...installedUrls(), normalized]);
+  const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
+  persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
   return addon;
 }
 
@@ -280,7 +279,10 @@ const BACKUP_KEYS = [
   "vortx.web.recent.v1",
 ];
 
-/** Serialize the local data (settings, add-ons, library, continue-watching, recent) to a JSON string. */
+/** Serialize the local data (settings, add-ons, library, continue-watching, recent) to a JSON string.
+ *  Metadata API keys (MDBList/TMDB) are REDACTED so the plaintext file is safe to store/share - they are
+ *  re-enterable after restore. Add-on transport URLs can also embed debrid keys, so the file is flagged
+ *  credential-bearing for the export UI to warn on. */
 export function exportBackup(): string {
   const data: Record<string, unknown> = {};
   for (const key of BACKUP_KEYS) {
@@ -292,15 +294,58 @@ export function exportBackup(): string {
       // skip a corrupt key rather than fail the whole export
     }
   }
-  return JSON.stringify({ app: "vortx-web", version: 1, data }, null, 2);
+  let redactedKeys = false;
+  const settings = data["vortx.web.settings.v1"];
+  if (settings && typeof settings === "object" && !Array.isArray(settings)) {
+    for (const k of ["mdblistKey", "tmdbKey"] as const) {
+      if ((settings as Record<string, unknown>)[k]) {
+        (settings as Record<string, unknown>)[k] = "";
+        redactedKeys = true;
+      }
+    }
+  }
+  return JSON.stringify(
+    {
+      app: "vortx-web",
+      version: 1,
+      redactedKeys,
+      note: "Keep this file private: add-on URLs can contain your debrid keys. Metadata API keys are redacted; re-add them after restoring.",
+      data,
+    },
+    null,
+    2,
+  );
 }
 
-/** Restore from an exportBackup() string. Returns true on success (caller should reload). */
+/** Type-check one backup value before it is written to localStorage (defends against a malformed or
+ *  hostile import injecting unexpected shapes). */
+function validBackupValue(key: string, val: unknown): boolean {
+  switch (key) {
+    case "vortx.web.settings.v1":
+      return !!val && typeof val === "object" && !Array.isArray(val);
+    case "vortx.web.addons.v1":
+      return Array.isArray(val) && val.every((u) => typeof u === "string");
+    case "vortx.web.recent.v1":
+      return Array.isArray(val) && val.every((s) => typeof s === "string");
+    case "vortx.web.library.v1":
+    case "vortx.web.cw.v1":
+      return Array.isArray(val) && val.every((e) => !!e && typeof e === "object" && !Array.isArray(e));
+    default:
+      return false;
+  }
+}
+
+/** Restore from an exportBackup() string. Validates the envelope + every present key's shape BEFORE
+ *  writing anything (all-or-nothing, so a bad file never half-applies). Returns true on success. */
 export function importBackup(json: string): boolean {
   try {
+    if (json.length > 5_000_000) return false; // 5 MB sanity cap
     const parsed = JSON.parse(json) as { data?: Record<string, unknown> };
     const data = parsed?.data;
-    if (!data || typeof data !== "object") return false;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    for (const key of BACKUP_KEYS) {
+      if (key in data && !validBackupValue(key, data[key])) return false; // reject the whole import
+    }
     for (const key of BACKUP_KEYS) {
       if (key in data) localStorage.setItem(key, JSON.stringify(data[key]));
     }
