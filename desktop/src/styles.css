@@ -144,6 +144,19 @@ body {
   align-items: center;
   justify-content: center;
 }
+/* Inline message shown over the player when the webview-fallback source fails to play. */
+.player-error {
+  position: fixed;
+  left: 50%;
+  bottom: 12%;
+  transform: translateX(-50%);
+  max-width: 32rem;
+  padding: 0.75rem 1.1rem;
+  border-radius: 0.6rem;
+  text-align: center;
+  color: var(--text);
+  background: rgba(34, 29, 24, 0.92);
+}
 
 .back {
   position: fixed;

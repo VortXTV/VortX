@@ -71,6 +71,18 @@ function playInWebview(host: HTMLElement, url: string): void {
   host.innerHTML = `
     <button class="back" data-action="close-player">‹ Back</button>
     <video class="video" controls autoplay src="${escapeHtml(url)}"></video>`;
+  // Show a message instead of a black screen if the fallback element can't load/decode the source (dead
+  // link, unsupported codec). Teardown clears the host via innerHTML, which detaches the element without
+  // firing "error", so this does not misfire on close. Parity with the web player's error feedback.
+  host.querySelector("video")?.addEventListener("error", () => {
+    let note = host.querySelector<HTMLElement>(".player-error");
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "player-error";
+      host.appendChild(note);
+    }
+    note.textContent = "This source could not be played. It may be offline or an unsupported format.";
+  });
 }
 
 /** Tear down playback: stop mpv (if it was used) or pause the fallback `<video>`, then hide chrome. */
