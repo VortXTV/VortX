@@ -16,7 +16,9 @@
 mod parse;
 mod prefs;
 mod rank;
+mod release;
 
 pub use parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
 pub use prefs::RankingPrefs;
 pub use rank::{rank, RankedStream, Tier};
+pub use release::{parse_release, ReleaseMeta};
