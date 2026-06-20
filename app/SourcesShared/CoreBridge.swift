@@ -409,8 +409,10 @@ final class CoreBridge: ObservableObject {
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
+        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         var groups: [CoreStreamSourceGroup] = []
         for group in details.streams {
+            guard !disabledAddons.contains(group.request.base) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             groups.append(CoreStreamSourceGroup(id: group.request.base,
                                                 addon: names[group.request.base] ?? "Add-on",
@@ -442,8 +444,10 @@ final class CoreBridge: ObservableObject {
     func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
+        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         var groups: [CoreStreamSourceGroup] = []
         for group in details.streams where group.request.path.id == streamId {
+            guard !disabledAddons.contains(group.request.base) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             groups.append(CoreStreamSourceGroup(id: group.request.base,
                                                 addon: names[group.request.base] ?? "Add-on",
@@ -1071,9 +1075,11 @@ final class CoreBridge: ObservableObject {
     private func buildBoardRows() -> [CoreBoardRow] {
         guard let board = decode(CoreBoardState.self, field: "board") else { return [] }
         let titles = catalogTitleMap()
+        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         var rows: [CoreBoardRow] = []
         for catalog in board.catalogs {
             guard let request = catalog.first?.request else { continue }
+            guard !disabledAddons.contains(request.base) else { continue }
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
             guard !items.isEmpty else { continue }
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
@@ -1102,7 +1108,9 @@ final class CoreBridge: ObservableObject {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
         var out: [CatalogInfo] = []
         var seen = Set<String>()
+        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         for addon in ctx.profile.addons {
+            guard !disabledAddons.contains(addon.transportUrl) else { continue }
             for catalog in addon.manifest.catalogs {
                 let key = Self.catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)
                 guard seen.insert(key).inserted else { continue }

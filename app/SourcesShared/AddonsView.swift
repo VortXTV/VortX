@@ -6,6 +6,7 @@ struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var profiles: ProfileStore
     @State private var newAddonURL = ""
     @State private var installing = false
     @State private var installMessage: String?
@@ -36,6 +37,7 @@ struct AddonsView: View {
                                 .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                             }
                             .buttonStyle(.plain)
+                            hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
                             ForEach(core.addons) { addon in addonRow(addon) }
                         }
                     }
@@ -91,19 +93,29 @@ struct AddonsView: View {
     }
 
     private func addonRow(_ addon: CoreDescriptor) -> some View {
-        HStack(alignment: .top, spacing: Theme.Space.md) {
+        let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
+        return HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill")
                 .font(.system(size: 36))
-                .foregroundStyle(addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
+                .foregroundStyle(isOff ? Theme.Palette.textTertiary
+                                       : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary))
                 .frame(width: 56)
             VStack(alignment: .leading, spacing: 8) {
-                Text(addon.manifest.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                Text(addon.capabilities).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                Text(addon.manifest.name).font(Theme.Typography.cardTitle)
+                    .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                Text(isOff ? "Off for this profile" : addon.capabilities)
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 Text(addon.host).font(.system(size: 16, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
                     .lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: Theme.Space.sm)
             if !addon.isProtected {
+                // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
+                Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
+                    Image(systemName: isOff ? "eye.slash" : "eye")
+                }
+                .buttonStyle(ChipButtonStyle(selected: !isOff))
+                .fixedSize()
                 Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
                     .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
                     .fixedSize()   // keep the Remove chip at its intrinsic width so a narrow phone row can't squeeze the label to one glyph per line

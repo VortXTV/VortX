@@ -28,6 +28,13 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// nil = never customized (pre-feature roster); seeded from the flat values on first load.
     var playback: PlaybackPrefs? = nil
 
+    /// Add-on transport URLs this profile has turned OFF. A per-profile, local overlay: the add-on
+    /// stays installed on the account, it is just hidden from THIS profile's Home rows, Discover,
+    /// and stream sources. nil/empty = every installed add-on is on, so older rosters and freshly
+    /// installed add-ons default to visible. A Kids profile can drop the adult/torrent add-ons
+    /// without touching anyone else. Follows the profile across devices like the rest of the roster.
+    var disabledAddons: [String]? = nil
+
     /// What follows a viewer between profiles: track languages and the subtitle look. Synced
     /// with the roster, so a profile keeps its preferences across devices. Raw-string fields
     /// mirror the UserDefaults representations one-to-one.
@@ -87,14 +94,17 @@ struct UserProfile: Codable, Identifiable, Equatable {
         isOwner = try c.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
         familyEdit = try c.decodeIfPresent(Bool.self, forKey: .familyEdit) ?? false
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
+        disabledAddons = try c.decodeIfPresent([String].self, forKey: .disabledAddons)
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
-         email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil) {
+         email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil,
+         disabledAddons: [String]? = nil) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
+        self.disabledAddons = disabledAddons
     }
 }
 
@@ -122,6 +132,18 @@ final class ProfileStore: ObservableObject {
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
 
+    /// Flat mirror of the ACTIVE profile's disabled add-on set, rewritten on every profile apply so
+    /// the off-main board build (`buildBoardRows`) and the main-actor `streamGroups` can both read it
+    /// cheaply without decoding the whole roster. Same pattern as `applyPlayback` flattening playback
+    /// prefs and `CatalogPrefsStore` exposing static UserDefaults reads.
+    static let activeDisabledAddonsKey = "stremiox.profile.disabledAddons"
+    /// Add-on transport URLs hidden for the active profile (thread-safe, off-main read). Callers hoist
+    /// this once per pass and test `.contains` inside their loop, cheaper than a per-item lookup that
+    /// would re-read UserDefaults and rebuild the set on the off-main board path.
+    static func activeDisabledAddons() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: activeDisabledAddonsKey) ?? [])
+    }
+
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
 
@@ -139,8 +161,13 @@ final class ProfileStore: ObservableObject {
         if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
             activeID = profiles.first?.id
         }
-        // The active profile owns the theme; resync in case the stored values drifted.
-        if let active { applyTheme(active) }
+        // The active profile owns the theme; resync in case the stored values drifted. Seed the
+        // add-on-visibility flat key too, so the first board build at launch honors the active
+        // profile's set (no CoreBridge call here: the board is built later from the engine event).
+        if let active {
+            applyTheme(active)
+            UserDefaults.standard.set(active.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
+        }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
         // copying it into every profile preserves today's behavior exactly; from then on each
         // profile diverges as its viewer customizes.
@@ -209,6 +236,23 @@ final class ProfileStore: ObservableObject {
             applyTheme(profile)
             applyPlayback(profile)
         }
+    }
+
+    /// Flip an add-on on/off for the ACTIVE profile. A local per-profile overlay, NOT an account
+    /// change: the add-on stays installed and stays on for every other profile. update() persists the
+    /// roster, schedules the cross-device push, and re-applies prefs, where applyPlayback flattens the
+    /// new set into the read key and rebuilds Home so the change shows at once.
+    func toggleAddon(base: String) {
+        guard var profile = active else { return }
+        var set = Set(profile.disabledAddons ?? [])
+        if set.contains(base) { set.remove(base) } else { set.insert(base) }
+        profile.disabledAddons = set.isEmpty ? nil : set.sorted()
+        update(profile)
+    }
+
+    /// Whether an add-on (by transport URL) is currently turned off for the active profile.
+    func isAddonDisabledForActive(base: String) -> Bool {
+        Set(active?.disabledAddons ?? []).contains(base)
     }
 
     /// Remove a profile (never the last one). Its private session key is deleted with it. Returns
@@ -363,6 +407,10 @@ final class ProfileStore: ObservableObject {
     /// Settings need no changes: the flat keys simply always reflect the active profile.
     private func applyPlayback(_ profile: UserProfile) {
         let d = UserDefaults.standard
+        // Per-profile add-on visibility: flatten this profile's disabled set into the key the off-main
+        // board build and streamGroups read, so Home, Discover, and stream sources all honor it the
+        // moment this profile becomes active. (Empty array = nothing hidden, the default.)
+        d.set(profile.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
         if let p = profile.playback {
             d.set(p.audioLang, forKey: TrackPreferences.Key.audio)
             d.set(p.subtitleLang, forKey: TrackPreferences.Key.subtitle)
@@ -395,6 +443,10 @@ final class ProfileStore: ObservableObject {
         // source of truth; reloading there would re-fire its @Published didSet and the
         // SettingsView .onChange(typeOrder) observer, echoing back into capturePlayback.
         StreamRanking.invalidateCaches()
+        // Home is per-profile now (it hides this profile's disabled add-ons), so drop the memoized
+        // board on every apply. Cheap: rebuildBoardRows recomputes the same rows and re-publishes,
+        // so an unchanged set diffs to a no-op in SwiftUI.
+        CoreBridge.shared.rebuildBoardRows()
     }
 
     /// Mirror of captureTheme for playback preferences: Settings and the in-player options write
