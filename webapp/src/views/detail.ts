@@ -1,5 +1,6 @@
 import type { Addon, MetaItem, Stream, Video } from "../lib/types";
-import { fetchMeta, fetchStreams, fetchSubtitles, type StreamGroup } from "../lib/addon";
+import { fetchMeta, fetchSimilar, fetchStreams, fetchSubtitles, type StreamGroup } from "../lib/addon";
+import { posterCard } from "./board";
 import {
   applyStreamFilters,
   best,
@@ -43,6 +44,7 @@ interface DetailState {
   selectedSeason: number | null;
   openEpisode: Video | null;
   ratings: Ratings | null; // MDBList IMDb/RT/TMDB, fetched async when an MDBList key is set
+  similar: MetaItem[]; // "More Like This" - keyless Cinemeta genre catalog, fetched async
 }
 
 let state: DetailState | null = null;
@@ -71,6 +73,7 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
     selectedSeason: null,
     openEpisode: null,
     ratings: null,
+    similar: [],
   };
   host.innerHTML = `<div class="detail"><div class="detail-loading">Loading…</div></div>`;
 
@@ -87,6 +90,17 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
     void loadStreams(type, id);
   }
   void loadRatings(meta); // IMDb/RT/TMDB, only when an MDBList key is set; repaints when it lands
+  void loadSimilar(meta); // "More Like This" rail; keyless, repaints when it lands
+  render();
+}
+
+/** Fetch keyless "More Like This" titles (Cinemeta genre catalog). Fail-soft; repaints on arrival. */
+async function loadSimilar(meta: MetaItem): Promise<void> {
+  const token = streamReqToken; // tie to the current title; a new openDetail bumps this
+  const similar = await fetchSimilar(meta);
+  if (!state || state.meta?.id !== meta.id || token !== streamReqToken) return; // navigated away
+  if (!similar.length) return;
+  state.similar = similar;
   render();
 }
 
@@ -224,7 +238,8 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
      ${streamStatusNote(groups)}
      ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
      ${streamPanel(groups)}
-     ${creditsRow(meta)}`,
+     ${creditsRow(meta)}
+     ${moreLikeThis()}`,
   );
 }
 
@@ -264,8 +279,20 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
      ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
      ${creditsRow(meta)}
      ${seasonSelector(seasons)}
-     ${episodeList(videos, state.selectedSeason)}`,
+     ${episodeList(videos, state.selectedSeason)}
+     ${moreLikeThis()}`,
   );
+}
+
+/** The "More Like This" rail: keyless genre-similar posters, reusing the board's poster card + rail. */
+function moreLikeThis(): string {
+  if (!state || !state.similar.length) return "";
+  const cards = state.similar.map((m) => posterCard(m)).join("");
+  return `
+    <section class="rail-section detail-rail" aria-labelledby="rail-more">
+      <div class="rail-head"><h2 class="rail-title" id="rail-more">More Like This</h2></div>
+      <div class="rail" role="list">${cards}</div>
+    </section>`;
 }
 
 /** The immersive detail shell: a tall full-bleed backdrop + dual scrim filling the first screen, with

@@ -156,6 +156,24 @@ export async function fetchCatalog(ref: CatalogRef, skip = 0): Promise<MetaItem[
   }
 }
 
+/** "More Like This": Cinemeta's public `top` catalog filtered by the title's first genre. Keyless and
+ *  account-free (works for everyone), so it is a reliable similar-titles source for the detail page.
+ *  Returns [] for unsupported types or on any error (fail-soft, like ratings). */
+export async function fetchSimilar(meta: MetaItem): Promise<MetaItem[]> {
+  const genre = meta.genres?.[0];
+  if (!genre || (meta.type !== "movie" && meta.type !== "series")) return [];
+  const base = CINEMETA_URL.replace(/\/manifest\.json$/, "");
+  const url = `${base}/catalog/${meta.type}/top/genre=${encodeURIComponent(genre)}.json`;
+  try {
+    const data = await fetchJson<CatalogResponse>(url);
+    return validMetas(data.metas)
+      .filter((m) => m.id !== meta.id)
+      .slice(0, 18);
+  } catch {
+    return [];
+  }
+}
+
 // ---- Search ------------------------------------------------------------------------------------
 
 /** The first add-on catalog that declares it supports the `search` extra prop for `type` (if any). */
