@@ -15,6 +15,7 @@
 
 mod antifraud;
 mod dedup;
+mod episode;
 mod parse;
 mod prefs;
 mod rank;
@@ -22,6 +23,9 @@ mod release;
 
 pub use antifraud::{validate as validate_stream, AntiFraudInput, DropReason, Verdict};
 pub use dedup::{dedup, DedupStream, MergedStream};
+pub use episode::{
+    absolute_from_seasonal, map_episode, EpisodeRequest, FileMatch, MatchKind, PackFile,
+};
 pub use parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
 pub use prefs::RankingPrefs;
 pub use rank::{rank, RankedStream, Tier};
