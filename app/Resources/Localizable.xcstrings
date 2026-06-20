@@ -1,0 +1,1470 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "@%@": {},
+    "%@": {},
+    "%@ · tap to get it": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · tocca per ottenerlo"
+          }
+        }
+      }
+    },
+    "%@ (%@)": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "%1$@ (%2$@)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
+        }
+      }
+    },
+    "%@ can only be edited from that profile": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ può essere modificato solo da quel profilo"
+          }
+        }
+      }
+    },
+    "%@ other add-on%@ returned no sources for this title.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "%1$@ other add-on%2$@ returned no sources for this title."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ altro componente aggiuntivo%@ non ha restituito sorgenti per questo titolo."
+          }
+        }
+      }
+    },
+    "%@: %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "%1$@: %2$@"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        }
+      }
+    },
+    "%@. %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "%1$@. %2$@"
+          }
+        }
+      }
+    },
+    "%@%%": {},
+    "%@s": {},
+    "2 GB": {},
+    "4K": {},
+    "5 GB": {},
+    "10 GB": {},
+    "15 GB": {},
+    "20 GB": {},
+    "30 GB": {},
+    "50 GB": {},
+    "720p": {},
+    "1080p": {},
+    "A backup saves your profiles, theme, and player preferences so they travel with you and survive a future major update. On iPhone, iPad, and Mac you can save that to a file today.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Un backup salva i tuoi profili, il tema e le preferenze del lettore, così ti seguono ovunque e sopravvivono a un futuro aggiornamento importante. Su iPhone, iPad e Mac puoi salvarlo in un file già da oggi."
+          }
+        }
+      }
+    },
+    "A one-tap starting point; fine-tune the controls below. Your source-type order saves per profile.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Un punto di partenza con un solo tocco; perfeziona i controlli qui sotto. L'ordine dei tipi di sorgente viene salvato per profilo."
+          }
+        }
+      }
+    },
+    "Accent": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Accento"
+          }
+        }
+      }
+    },
+    "Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "L'accento ricolora il focus, la selezione e l'avanzamento in tutta l'app. OLED Black usa il nero puro, ideale sui pannelli AMOLED."
+          }
+        }
+      }
+    },
+    "Accent recolors selection and progress across the app. OLED Black uses true black, best on AMOLED panels.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "L'accento ricolora la selezione e l'avanzamento in tutta l'app. OLED Black usa il nero puro, ideale sui pannelli AMOLED."
+          }
+        }
+      }
+    },
+    "Add an add-on": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aggiungi un componente aggiuntivo"
+          }
+        }
+      }
+    },
+    "Add Profile": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aggiungi profilo"
+          }
+        }
+      }
+    },
+    "Add several add-ons at once": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aggiungi più componenti aggiuntivi in una volta"
+          }
+        }
+      }
+    },
+    "Add your debrid API key once and VortX uses it everywhere, with no separate configuration site. Cached torrents resolve to instant direct links. Your keys stay on this device and sync, encrypted, to your VortX account.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aggiungi la tua chiave API debrid una volta e VortX la usa ovunque, senza un sito di configurazione separato. I torrent in cache si risolvono in link diretti istantanei. Le tue chiavi restano su questo dispositivo e si sincronizzano, cifrate, con il tuo account VortX."
+          }
+        }
+      }
+    },
+    "Add-ons": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Componenti aggiuntivi"
+          }
+        }
+      }
+    },
+    "Advanced (mpv options)": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avanzate (opzioni mpv)"
+          }
+        }
+      }
+    },
+    "All (%@)": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tutti (%@)"
+          }
+        }
+      }
+    },
+    "Already use Stremio?": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usi già Stremio?"
+          }
+        }
+      }
+    },
+    "Always HDR": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sempre HDR"
+          }
+        }
+      }
+    },
+    "App text size  ·  %@%%": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dimensione testo app  ·  %@%%"
+          }
+        }
+      }
+    },
+    "Appearance": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aspetto"
+          }
+        }
+      }
+    },
+    "Audio & Subtitles": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Audio e sottotitoli"
+          }
+        }
+      }
+    },
+    "Auto": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto"
+          }
+        }
+      }
+    },
+    "Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto mantiene l'esperienza completa sulle Apple TV più potenti e passa a una più leggera sui modelli più vecchi come Apple TV HD. Ridotta riduce le animazioni e i buffer di riproduzione così il telecomando resta reattivo su hardware debole. Riavvia l'app dopo aver cambiato questa impostazione."
+          }
+        }
+      }
+    },
+    "Auto tone-maps HDR and Dolby Vision to SDR only on a screen that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple; Always HDR to force pass-through.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto converte (tone-map) HDR e Dolby Vision in SDR solo su uno schermo che non può mostrare l'HDR. Scegli Converti in SDR se i remux 4K Dolby Vision appaiono slavati, verdi o viola; Sempre HDR per forzare il pass-through."
+          }
+        }
+      }
+    },
+    "Auto tone-maps HDR and Dolby Vision to SDR only on a TV that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple on your TV; Always HDR forces pass-through.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto converte (tone-map) HDR e Dolby Vision in SDR solo su un TV che non può mostrare l'HDR. Scegli Converti in SDR se i remux 4K Dolby Vision appaiono slavati, verdi o viola sul tuo TV; Sempre HDR forza il pass-through."
+          }
+        }
+      }
+    },
+    "Background": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sfondo"
+          }
+        }
+      }
+    },
+    "Backup & Restore": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup e ripristino"
+          }
+        }
+      }
+    },
+    "Balanced": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bilanciata"
+          }
+        }
+      }
+    },
+    "Built-in player": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lettore integrato"
+          }
+        }
+      }
+    },
+    "Check Add-ons for one that lists \"Streams\" (not just Catalogs or Metadata). If you recently force-quit the app, reopen it so your add-ons reload, or re-add a stream add-on.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Controlla nei Componenti aggiuntivi se ce n'è uno che elenca «Streams» (non solo Cataloghi o Metadati). Se hai chiuso forzatamente l'app di recente, riaprila così i componenti aggiuntivi si ricaricano, oppure aggiungi di nuovo un componente per le sorgenti."
+          }
+        }
+      }
+    },
+    "Choose which rows appear on Home and the order they show in.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scegli quali righe appaiono nella Home e in quale ordine."
+          }
+        }
+      }
+    },
+    "Could not build a code for this link.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Impossibile generare un codice per questo link."
+          }
+        }
+      }
+    },
+    "Currently using: %@%@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Currently using: %1$@%2$@"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In uso: %@%@"
+          }
+        }
+      }
+    },
+    "Customize catalogs": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Personalizza i cataloghi"
+          }
+        }
+      }
+    },
+    "Debrid services": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servizi debrid"
+          }
+        }
+      }
+    },
+    "Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le sorgenti dirette e debrid si aprono automaticamente nel lettore scelto. Torrent e lettore integrato non sono interessati."
+          }
+        }
+      }
+    },
+    "Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le sorgenti dirette e debrid si aprono direttamente nel lettore scelto, che poi gestisce riproduzione e ripresa. Torrent, sorgenti protette da header e trailer usano sempre il lettore integrato."
+          }
+        }
+      }
+    },
+    "Direct Links Only": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Solo link diretti"
+          }
+        }
+      }
+    },
+    "Discover": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esplora"
+          }
+        }
+      }
+    },
+    "Enter PIN for %@": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Inserisci il PIN per %@"
+          }
+        }
+      }
+    },
+    "Export Library, which saves a profile's titles and watch progress to a file, lives on iPhone, iPad, and Mac (Apple TV has no file picker). On Apple TV your library and history follow you through your VortX account.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esporta libreria, che salva i titoli e l'avanzamento di un profilo in un file, è disponibile su iPhone, iPad e Mac (Apple TV non ha un selettore file). Su Apple TV la tua libreria e la cronologia ti seguono tramite il tuo account VortX."
+          }
+        }
+      }
+    },
+    "Finding best…  %@/%@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Finding best…  %1$@/%2$@"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ricerca della migliore…  %@/%@"
+          }
+        }
+      }
+    },
+    "Fine size  ·  %@%%": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dimensione precisa  ·  %@%%"
+          }
+        }
+      }
+    },
+    "For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Per utenti esperti; una opzione=valore per riga. Applicata sopra le impostazioni predefinite di VortX al successivo avvio di un video."
+          }
+        }
+      }
+    },
+    "Full": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Completa"
+          }
+        }
+      }
+    },
+    "Get a notification when a new episode of a series you open is about to air. Scheduled on-device for upcoming episodes, so no background tracking is needed.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ricevi una notifica quando sta per uscire un nuovo episodio di una serie che apri. Programmata sul dispositivo per gli episodi in arrivo, quindi non serve alcun tracciamento in background."
+          }
+        }
+      }
+    },
+    "Go to link.stremio.com and enter this code": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vai su link.stremio.com e inserisci questo codice"
+          }
+        }
+      }
+    },
+    "Got it": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ho capito"
+          }
+        }
+      }
+    },
+    "Hide words": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Parole da nascondere"
+          }
+        }
+      }
+    },
+    "Hides adult and CAM/fake sources from this profile. For a full lock, set a PIN on your own profile so it can't be opened from here, and hide adult add-ons under Add-ons.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nasconde le sorgenti per adulti e CAM/false da questo profilo. Per un blocco completo, imposta un PIN sul tuo profilo così non può essere aperto da qui, e nascondi i componenti aggiuntivi per adulti in Componenti aggiuntivi."
+          }
+        }
+      }
+    },
+    "Hides sources larger than the cap (e.g. 1080p but not a 20 GB file). Sources with no stated size are kept.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nasconde le sorgenti più grandi del limite (es. 1080p ma non un file da 20 GB). Le sorgenti senza dimensione indicata vengono mantenute."
+          }
+        }
+      }
+    },
+    "If this title should have sources, the add-on may be offline or its config expired. Try another stream add-on.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se questo titolo dovrebbe avere sorgenti, il componente aggiuntivo potrebbe essere offline o la sua configurazione scaduta. Prova un altro componente per le sorgenti."
+          }
+        }
+      }
+    },
+    "Import from Stremio": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Importa da Stremio"
+          }
+        }
+      }
+    },
+    "Install the new build from the GitHub releases page; your sign-in and settings carry over.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Installa la nuova versione dalla pagina delle release di GitHub; il tuo accesso e le impostazioni vengono mantenuti."
+          }
+        }
+      }
+    },
+    "Keeps its own watch history, synced through your Stremio account to your other devices.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mantiene la propria cronologia di visione, sincronizzata tramite il tuo account Stremio sugli altri dispositivi."
+          }
+        }
+      }
+    },
+    "Library": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Libreria"
+          }
+        }
+      }
+    },
+    "LIVE": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LIVE"
+          }
+        }
+      }
+    },
+    "Live TV": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "TV in diretta"
+          }
+        }
+      }
+    },
+    "Makes every screen's text larger or smaller. Changes apply instantly.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rende il testo di ogni schermata più grande o più piccolo. Le modifiche si applicano subito."
+          }
+        }
+      }
+    },
+    "Match words as regex": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Confronta le parole come regex"
+          }
+        }
+      }
+    },
+    "Metadata services": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servizi di metadati"
+          }
+        }
+      }
+    },
+    "No catalogs yet. Install an add-on that provides catalogs first.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ancora nessun catalogo. Installa prima un componente aggiuntivo che fornisce cataloghi."
+          }
+        }
+      }
+    },
+    "No log yet. If the server stopped, play a torrent title to start it, then return here.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ancora nessun log. Se il server si è fermato, riproduci un titolo torrent per avviarlo, poi torna qui."
+          }
+        }
+      }
+    },
+    "None of your %@ add-on%@ returned a playable source for this title.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "None of your %1$@ add-on%2$@ returned a playable source for this title."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nessuno dei tuoi %@ componente aggiuntivo%@ ha restituito una sorgente riproducibile per questo titolo."
+          }
+        }
+      }
+    },
+    "Notifications": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notifiche"
+          }
+        }
+      }
+    },
+    "Off": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Off"
+          }
+        }
+      }
+    },
+    "OK": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        }
+      }
+    },
+    "OLED Black": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED Black"
+          }
+        }
+      }
+    },
+    "On Apple TV a scan-with-your-phone backup is coming: Backup will show a QR code, you scan it with your phone, and your settings save to your VortX account. Restore shows another code to bring them right back. Until then, signing in restores your library, add-ons, and watch history here.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Su Apple TV sta arrivando un backup da scansionare col telefono: Backup mostrerà un codice QR, lo scansioni col telefono e le tue impostazioni vengono salvate nel tuo account VortX. Ripristina mostra un altro codice per riportarle indietro. Fino ad allora, accedendo ripristini qui la tua libreria, i componenti aggiuntivi e la cronologia di visione."
+          }
+        }
+      }
+    },
+    "Open Account & sync and sign in with your Stremio account. VortX runs on the same engine, so your add-ons, library, and Continue Watching come across automatically, and stay in sync across your devices. Nothing to export or copy by hand.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apri Account e sincronizzazione e accedi con il tuo account Stremio. VortX usa lo stesso motore, quindi i tuoi componenti aggiuntivi, la libreria e Continua a guardare arrivano automaticamente e restano sincronizzati su tutti i tuoi dispositivi. Niente da esportare o copiare a mano."
+          }
+        }
+      }
+    },
+    "Optional. A free, end-to-end-encrypted account keeps your profiles, settings, and library safe across devices.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Facoltativo. Un account gratuito e cifrato end-to-end protegge i tuoi profili, le impostazioni e la libreria su tutti i dispositivi."
+          }
+        }
+      }
+    },
+    "Optional. Add your own TMDB and MDBList keys to enrich recommendations and ratings. Nothing here is required and your keys stay on this device (and sync, encrypted, to your VortX account).": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Facoltativo. Aggiungi le tue chiavi TMDB e MDBList per arricchire consigli e valutazioni. Nulla qui è obbligatorio e le tue chiavi restano su questo dispositivo (e si sincronizzano, cifrate, con il tuo account VortX)."
+          }
+        }
+      }
+    },
+    "Paste add-on manifest URLs, one per line, then install them all in one step.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Incolla gli URL dei manifest dei componenti aggiuntivi, uno per riga, poi installali tutti in un solo passaggio."
+          }
+        }
+      }
+    },
+    "Performance Auto keeps the full experience on capable devices and switches to a lighter one on weaker hardware. Reduced trims animations and shrinks playback buffers. Restart the app after changing this.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prestazioni Auto mantiene l'esperienza completa sui dispositivi più potenti e passa a una più leggera su hardware più debole. Ridotta riduce le animazioni e i buffer di riproduzione. Riavvia l'app dopo aver cambiato questa impostazione."
+          }
+        }
+      }
+    },
+    "Pick a file": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scegli un file"
+          }
+        }
+      }
+    },
+    "Pick how the scrubber looks during playback. The preview shows each design.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scegli l'aspetto della barra di avanzamento durante la riproduzione. L'anteprima mostra ogni stile."
+          }
+        }
+      }
+    },
+    "Play a link": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Riproduci un link"
+          }
+        }
+      }
+    },
+    "Playback": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Riproduzione"
+          }
+        }
+      }
+    },
+    "Playing in %@s": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Riproduzione tra %@s"
+          }
+        }
+      }
+    },
+    "Profiles": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Profili"
+          }
+        }
+      }
+    },
+    "Quality preset": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preset di qualità"
+          }
+        }
+      }
+    },
+    "Ratings on posters": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Valutazioni sui poster"
+          }
+        }
+      }
+    },
+    "Recent Searches": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ricerche recenti"
+          }
+        }
+      }
+    },
+    "Reduced": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ridotta"
+          }
+        }
+      }
+    },
+    "Require words": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Parole obbligatorie"
+          }
+        }
+      }
+    },
+    "S%@ · E%@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "S%1$@ · E%2$@"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "S%@ · E%@"
+          }
+        }
+      }
+    },
+    "Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Il filtro di sicurezza nasconde le sorgenti CAM e di falsa qualità. Le parole da nascondere / obbligatorie filtrano l'elenco delle sorgenti per nome, separate da virgola (es. nascondi «cam, ts», richiedi «remux»)."
+          }
+        }
+      }
+    },
+    "Save & Use": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salva e usa"
+          }
+        }
+      }
+    },
+    "Save your profiles, theme, and playback preferences to a file you can keep, so a future major update can never lose them. Export Library carries the active profile's saved titles and watch progress to another device or profile, no account needed.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salva i tuoi profili, il tema e le preferenze di riproduzione in un file da conservare, così un futuro aggiornamento importante non potrà mai perderli. Esporta libreria porta i titoli salvati e l'avanzamento del profilo attivo su un altro dispositivo o profilo, senza bisogno di un account."
+          }
+        }
+      }
+    },
+    "Save your recovery code": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salva il tuo codice di recupero"
+          }
+        }
+      }
+    },
+    "Saved": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salvato"
+          }
+        }
+      }
+    },
+    "Scan with your phone to open this stream there  ·  Press Back to dismiss": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scansiona col telefono per aprire questa sorgente lì  ·  Premi Indietro per chiudere"
+          }
+        }
+      }
+    },
+    "Seek bar style": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stile barra di avanzamento"
+          }
+        }
+      }
+    },
+    "Select = choose another source    ·    Play/Pause = retry    ·    Menu = back": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select = scegli un'altra sorgente    ·    Play/Pausa = riprova    ·    Menu = indietro"
+          }
+        }
+      }
+    },
+    "Select a profile to edit it. Each profile keeps its own look, languages, PIN, and optionally its own Stremio account. A profile with a PIN asks for it before it can be edited.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seleziona un profilo per modificarlo. Ogni profilo mantiene il proprio aspetto, le lingue, il PIN e, facoltativamente, il proprio account Stremio. Un profilo con PIN lo richiede prima di poter essere modificato."
+          }
+        }
+      }
+    },
+    "Settings": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Impostazioni"
+          }
+        }
+      }
+    },
+    "Sideload the new IPA from the GitHub releases page, your sign-in and settings carry over.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Installa tramite sideload il nuovo IPA dalla pagina delle release di GitHub; il tuo accesso e le impostazioni vengono mantenuti."
+          }
+        }
+      }
+    },
+    "Signing in pulls your add-ons and library into the app. Your account stays on this device.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Accedendo, i tuoi componenti aggiuntivi e la libreria vengono caricati nell'app. Il tuo account resta su questo dispositivo."
+          }
+        }
+      }
+    },
+    "Sort": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordina"
+          }
+        }
+      }
+    },
+    "Source failed, trying another…  (%@/%@)": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Source failed, trying another…  (%1$@/%2$@)"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sorgente non riuscita, ne provo un'altra…  (%@/%@)"
+          }
+        }
+      }
+    },
+    "Source type priority": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Priorità tipo di sorgente"
+          }
+        }
+      }
+    },
+    "Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le sorgenti del tipo in cima vengono classificate per prime in ogni fascia di qualità. Debrid e Usenet sono sempre istantanei; le sorgenti Torrent richiedono la disponibilità di peer."
+          }
+        }
+      }
+    },
+    "Still finding more · %@/%@ add-ons": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Still finding more · %1$@/%2$@ add-ons"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ricerca ancora in corso · %@/%@ componenti aggiuntivi"
+          }
+        }
+      }
+    },
+    "Streaming Server": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Server di streaming"
+          }
+        }
+      }
+    },
+    "Streams": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams"
+          }
+        }
+      }
+    },
+    "Stremio · %@ add-ons · %@ stream sources": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Stremio · %1$@ add-ons · %2$@ stream sources"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ componenti aggiuntivi · %@ sorgenti di streaming"
+          }
+        }
+      }
+    },
+    "Strict": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Rigoroso"
+          }
+        }
+      }
+    },
+    "Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Definisce lo stile dei sottotitoli del lettore integrato. Scegli quale traccia di sottotitoli mostrare dal lettore durante la visione."
+          }
+        }
+      }
+    },
+    "Subtitle Style": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stile sottotitoli"
+          }
+        }
+      }
+    },
+    "Switch to %@ to use it and edit its settings.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Passa a %@ per usarlo e modificarne le impostazioni."
+          }
+        }
+      }
+    },
+    "That link is not responding right now. Try a different source.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Questo link non risponde al momento. Prova una sorgente diversa."
+          }
+        }
+      }
+    },
+    "That subtitle source did not respond in time. Try another one.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Questa sorgente di sottotitoli non ha risposto in tempo. Provane un'altra."
+          }
+        }
+      }
+    },
+    "The app quits immediately. Open it again from the Home Screen; the streaming server restarts with it.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "L'app si chiude immediatamente. Riaprila dalla schermata Home; il server di streaming si riavvia con essa."
+          }
+        }
+      }
+    },
+    "The main profile. It uses your Stremio account's own watch history, like before profiles existed.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Il profilo principale. Usa la cronologia di visione del tuo account Stremio, come prima che esistessero i profili."
+          }
+        }
+      }
+    },
+    "The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Il lettore li seleziona automaticamente all'avvio di un titolo. Forzati mostra solo i sottotitoli dei dialoghi in lingua straniera; Sempre mostra i sottotitoli completi nella tua lingua. I titoli in lingua straniera ricevono sempre i sottotitoli completi così puoi seguirli."
+          }
+        }
+      }
+    },
+    "This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I profili di questo account differiscono da quelli di questo dispositivo. Unisci entrambi per mantenere ogni profilo (consigliato), oppure forza un lato."
+          }
+        }
+      }
+    },
+    "This is shown only once. It is the only way back in if you forget your password and lose your devices. Store it somewhere safe.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Viene mostrato una sola volta. È l'unico modo per rientrare se dimentichi la password e perdi i tuoi dispositivi. Conservalo in un luogo sicuro."
+          }
+        }
+      }
+    },
+    "This magnet has %@ videos. Choose which one to play.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Questo magnet contiene %@ video. Scegli quale riprodurre."
+          }
+        }
+      }
+    },
+    "Tone-map to SDR": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Converti in SDR"
+          }
+        }
+      }
+    },
+    "Unlimited": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Illimitato"
+          }
+        }
+      }
+    },
+    "UP NEXT": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PROSSIMO"
+          }
+        }
+      }
+    },
+    "Update available": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aggiornamento disponibile"
+          }
+        }
+      }
+    },
+    "Use add-on ranking order": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usa l'ordine di classificazione dei componenti aggiuntivi"
+          }
+        }
+      }
+    },
+    "Use Embedded": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usa integrato"
+          }
+        }
+      }
+    },
+    "Use the server embedded on this device, or point VortX at a remote / dedicated Stremio server (for example one you run at home).": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usa il server integrato in questo dispositivo, oppure punta VortX a un server Stremio remoto / dedicato (ad esempio uno che gestisci a casa)."
+          }
+        }
+      }
+    },
+    "Vort": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        }
+      }
+    },
+    "VortX %@": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        }
+      }
+    },
+    "VortX account": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Account VortX"
+          }
+        }
+      }
+    },
+    "Warm": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Caldo"
+          }
+        }
+      }
+    },
+    "Watch Credits": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda i titoli di coda"
+          }
+        }
+      }
+    },
+    "What's new": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Novità"
+          }
+        }
+      }
+    },
+    "When on, streams appear in the order your add-ons return them. Useful if you use a ranking add-on like AIOStreams. When off, the app's own ranking applies.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quando è attivo, le sorgenti appaiono nell'ordine in cui i tuoi componenti aggiuntivi le restituiscono. Utile se usi un componente di classificazione come AIOStreams. Quando è disattivo, si applica la classificazione dell'app."
+          }
+        }
+      }
+    },
+    "Where to Watch": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dove guardare"
+          }
+        }
+      }
+    },
+    "Who's watching?": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chi sta guardando?"
+          }
+        }
+      }
+    },
+    "Wrong PIN": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN errato"
+          }
+        }
+      }
+    },
+    "XRDB (extendedratings.com) bakes ratings from up to 12 sources, quality badges, and streaming-provider logos onto your posters and backdrops. Run your own XRDB instance or use a hosted one, set its address and your profile alias, and VortX loads its artwork everywhere. Optional, and unrelated to debrid.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB (extendedratings.com) integra valutazioni da un massimo di 12 fonti, badge di qualità e loghi dei provider di streaming sui tuoi poster e sfondi. Usa una tua istanza XRDB o una ospitata, imposta il suo indirizzo e il tuo alias profilo, e VortX carica le sue immagini ovunque. Facoltativo e non collegato al debrid."
+          }
+        }
+      }
+    },
+    "Your profiles, settings, and metadata keys sync to this account, end-to-end encrypted. They also sync automatically a moment after any change.": {
+      "localizations": {
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I tuoi profili, le impostazioni e le chiavi dei metadati si sincronizzano con questo account, cifrati end-to-end. Si sincronizzano anche automaticamente subito dopo ogni modifica."
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}
