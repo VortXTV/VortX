@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+import { icon } from "./icons";
+
 // The desktop player sink. The detail page resolves a playable URL through the UNCHANGED
 // prepareTorrent -> resolveUrl pipeline (detail.ts + server.ts + engine.ts) and hands it here; only
 // this (url) => play step changed from the original webview `<video>` injection.
@@ -55,7 +57,7 @@ export async function play(url: string): Promise<void> {
     await invoke("mpv_play", { url });
     usingFallback = false;
     // mpv owns the video surface; the overlay just carries the Back control over/beside it.
-    host.innerHTML = `<button class="back" data-action="close-player">‹ Back</button>`;
+    host.innerHTML = `<button class="back" data-action="close-player">${icon("back")}<span>Back</span></button>`;
     return;
   } catch (err) {
     // mpv unavailable or failed to start: fall back to the webview player for baseline codecs.
@@ -69,7 +71,7 @@ export async function play(url: string): Promise<void> {
 function playInWebview(host: HTMLElement, url: string): void {
   usingFallback = true;
   host.innerHTML = `
-    <button class="back" data-action="close-player">‹ Back</button>
+    <button class="back" data-action="close-player">${icon("back")}<span>Back</span></button>
     <video class="video" controls autoplay src="${escapeHtml(url)}"></video>`;
   // Show a message instead of a black screen if the fallback element can't load/decode the source (dead
   // link, unsupported codec). Teardown clears the host via innerHTML, which detaches the element without

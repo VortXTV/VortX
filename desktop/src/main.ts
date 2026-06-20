@@ -12,6 +12,7 @@ import {
 } from "./detail";
 import { primeAvailability } from "./server";
 import { close as closePlayer, play as openPlayer } from "./player";
+import { icon } from "./icons";
 
 // VortX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
 // (backdrop, hero, meta, per-add-on streams + quality selector, trailer) -> click a stream / Watch ->
@@ -99,7 +100,7 @@ function featuredHeroHtml(item: MetaItem): string {
       <div class="featured-content">
         ${title}
         ${meta}
-        <div class="featured-actions"><button class="watch" data-action="board-play"><span class="play-icon">▶</span> Play</button></div>
+        <div class="featured-actions"><button class="watch" data-action="board-play">${icon("play")}<span>Play</span></button></div>
         ${desc}
       </div>
     </section>`;

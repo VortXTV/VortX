@@ -20,6 +20,7 @@ import {
   type StreamSourceGroup,
 } from "./streamRanking";
 import { isTorrent, prepareTorrent, resolveUrl, status as serverStatus, torrentsAvailable } from "./server";
+import { icon } from "./icons";
 
 // The detail overlay: a full-bleed backdrop with a gradient scrim, a logo/title hero, a meta row
 // (rating · year · runtime · genres), a primary Watch button that plays the best ranked source, a
@@ -254,7 +255,7 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
   overlay.innerHTML = `
     <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
     <div class="detail-scrim"></div>
-    <button class="back" data-action="close-detail">‹ Back</button>
+    <button class="back" data-action="close-detail">${icon("back")}<span>Back</span></button>
     <div class="detail-body">
       ${heroHead(meta, logo)}
       ${metaRow(meta)}
@@ -296,7 +297,7 @@ function renderSeries(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nu
   overlay.innerHTML = `
     <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
     <div class="detail-scrim"></div>
-    <button class="back" data-action="close-detail">‹ Back</button>
+    <button class="back" data-action="close-detail">${icon("back")}<span>Back</span></button>
     <div class="detail-body">${body}</div>`;
 }
 
@@ -342,7 +343,7 @@ function episodeRow(v: Video): string {
   const thumb = httpUrl(v.thumbnail);
   const art = thumb
     ? `<img class="episode-thumb" loading="lazy" src="${escapeHtml(thumb)}" alt="${escapeHtml(title)}" />`
-    : `<div class="episode-thumb episode-thumb-empty">▷</div>`;
+    : `<div class="episode-thumb episode-thumb-empty">${icon("play")}</div>`;
   const date = v.released && v.released.length >= 10 ? v.released.slice(0, 10) : "";
   const meta = [code, date].filter(Boolean).join(" · ");
   const overview = v.overview ? `<div class="episode-overview">${escapeHtml(v.overview)}</div>` : "";
@@ -381,7 +382,7 @@ function episodeStreamView(
   if (rating) metaParts.unshift(`★ ${rating}`);
 
   return `
-    <button class="chip episode-back" data-action="close-episode">‹ Episodes</button>
+    <button class="chip episode-back" data-action="close-episode">${icon("back")}<span>Episodes</span></button>
     <span class="episode-eyebrow">${escapeHtml(meta.name)}</span>
     <h1 class="episode-screen-title">${escapeHtml(title)}</h1>
     <div class="meta-row">${metaParts.map((p) => `<span>${escapeHtml(p)}</span>`).join("")}</div>
@@ -430,9 +431,7 @@ function streamSection(
          service) and try again.`;
     return `
       <div class="stream-section">
-        <button class="watch disabled" disabled>
-          <span class="play-icon">▷</span> No playable sources
-        </button>
+        <button class="watch disabled" disabled>${icon("play")}<span>No playable sources</span></button>
         <p class="muted">${explain}</p>
       </div>`;
   }
@@ -450,13 +449,11 @@ function streamSection(
   // beside it. The full ranked list stays tucked behind "All sources".
   const controls = `
     <div class="stream-controls">
-      <button class="watch" data-action="play-best">
-        <span class="play-icon">▷</span> Watch in ${escapeHtml(watchLabel(top))}
-      </button>
-      <button class="chip" data-action="toggle-picker">Quality ⌄</button>
-      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">
-        ${state.showAllSources ? "Hide sources" : `All sources · ${streamCount}`}
-      </button>
+      <button class="watch" data-action="play-best">${icon("play")}<span>Watch in ${escapeHtml(watchLabel(top))}</span></button>
+      <button class="chip" data-action="toggle-picker">${icon("quality")}<span>Quality</span></button>
+      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${icon("sources")}<span>${
+        state.showAllSources ? "Hide sources" : `All sources · ${streamCount}`
+      }</span></button>
     </div>`;
 
   const stillLoading =
@@ -476,7 +473,7 @@ function qualityPicker(groups: StreamSourceGroup[]): string {
   if (!state?.pickerOpen) return "";
   if (state.pickerTier) {
     const variants = variantOptions(groups, state.pickerTier);
-    const back = `<button class="chip" data-action="picker-back">‹ ${escapeHtml(state.pickerTier)}</button>`;
+    const back = `<button class="chip" data-action="picker-back">${icon("back")}<span>${escapeHtml(state.pickerTier)}</span></button>`;
     const opts = variants
       .map(
         (v, i) =>
@@ -528,7 +525,7 @@ function streamRow(group: StreamSourceGroup, stream: Stream, index: number): str
   const desc = stream.description ? `<div class="stream-desc">${escapeHtml(stream.description)}</div>` : "";
   return `
     <button class="stream" data-action="play-stream" data-base="${escapeHtml(group.base)}" data-index="${index}">
-      <span class="stream-icon">▷</span>
+      <span class="stream-icon">${icon("play")}</span>
       <span class="stream-text">
         <span class="stream-meta">${badges}${torrentBadge}${tags}</span>
         ${name}${desc}
@@ -537,7 +534,7 @@ function streamRow(group: StreamSourceGroup, stream: Stream, index: number): str
 }
 
 function trailerButton(): string {
-  return `<button class="chip trailer-chip" data-action="play-trailer">▶ Trailer</button>`;
+  return `<button class="chip trailer-chip" data-action="play-trailer">${icon("trailer")}<span>Trailer</span></button>`;
 }
 
 // ---- Trailer (YouTube embed in the webview) ----------------------------------------------------
@@ -553,7 +550,7 @@ function openTrailer(youtubeId: string): void {
   }
   const src = `${TRAILER_HOST}/embed/${encodeURIComponent(youtubeId)}?autoplay=1&rel=0`;
   frame.innerHTML = `
-    <button class="back trailer-close" data-action="close-trailer">‹ Close</button>
+    <button class="back trailer-close" data-action="close-trailer">${icon("back")}<span>Close</span></button>
     <iframe class="trailer-frame" src="${src}" allow="autoplay; encrypted-media; fullscreen"
             allowfullscreen referrerpolicy="strict-origin"></iframe>`;
 }

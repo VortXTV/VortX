@@ -195,6 +195,9 @@ body {
   top: 1rem;
   left: 1rem;
   z-index: 12;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
   border: none;
   border-radius: 999px;
   padding: 0.5rem 1rem;
@@ -457,6 +460,9 @@ body {
 
 /* Chips: surface pills that brighten on hover, ember-tinted when selected (mirrors ChipButtonStyle). */
 .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
   border: none;
   border-radius: var(--radius-chip);
   padding: 0.7rem 1.15rem;
@@ -466,6 +472,14 @@ body {
   background: var(--surface-2);
   cursor: pointer;
   transition: background 150ms var(--ease), color 150ms var(--ease), transform 150ms var(--ease);
+}
+/* Inline icon base (SF-Symbol-style set, src/icons.ts): 1em, currentColor. */
+.ico {
+  width: 1em;
+  height: 1em;
+  flex: none;
+  display: inline-block;
+  vertical-align: -0.125em;
 }
 .chip:hover {
   background: var(--surface-3);
