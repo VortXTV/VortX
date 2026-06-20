@@ -176,6 +176,11 @@ struct iOSDetailView: View {
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
+    /// #37: a trailer id fetched from Cinemeta when the engine's detail meta carries none. Some catalog
+    /// add-ons (e.g. a TMDB catalog) return a meta WITHOUT trailerStreams, so the in-hero trailer never
+    /// mounted on the detail page even though the Home hero (which enriches via Cinemeta) had one. This
+    /// is the detail page's own fallback, used only when `meta.trailerYouTubeID` is nil.
+    @State private var resolvedTrailerID: String?
 
     /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
     private enum Presentation: Identifiable {
@@ -283,7 +288,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -297,7 +302,8 @@ struct iOSDetailView: View {
                 // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
-            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders() }
+            resolvedTrailerID = nil   // new title: drop the previous fallback before re-resolving
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -459,8 +465,27 @@ struct iOSDetailView: View {
     /// to the existing in-app interactive trailer with sound via `playTrailer()`.
     @ViewBuilder private var heroTrailerClip: some View {
         if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
-           let yt = meta?.trailerYouTubeID, !yt.isEmpty {
+           let yt = (meta?.trailerYouTubeID ?? resolvedTrailerID), !yt.isEmpty {
             InHeroTrailerView(youTubeID: yt, height: backdropHeight, onRequestSound: playTrailer)
+        }
+    }
+
+    /// #37 fallback: when the engine's detail meta has no trailer (`trailerYouTubeID == nil`), fetch the
+    /// title's meta from Cinemeta and pull the first trailer's YouTube id, so the in-hero trailer mounts
+    /// on the detail page just like the Home hero does. IMDB ids only (Cinemeta is keyed by `tt`); a
+    /// non-`tt` catalog id simply gets no fallback. Applied only if the title is still on screen.
+    private func resolveTrailerIfNeeded(_ m: CoreMetaItem) {
+        guard m.trailerYouTubeID == nil, resolvedTrailerID == nil, m.id.hasPrefix("tt"),
+              let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(m.type)/\(m.id).json") else { return }
+        Task {
+            var req = URLRequest(url: url); req.timeoutInterval = 6; req.cachePolicy = .returnCacheDataElseLoad
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
+                  let yt = decoded.meta?.trailerYouTubeID, !yt.isEmpty else { return }
+            await MainActor.run {
+                if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt }
+            }
         }
     }
 
@@ -586,7 +611,7 @@ struct iOSDetailView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.xs) {
                         NavigationLink {
                             iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
-                                  seasonEpisodes: episodesInSeason(primary.video.season ?? 1))
+                                  seasonEpisodes: sortedEpisodes(m.videos ?? []))
                         } label: {
                             Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume),
                                   systemImage: "play.fill")
@@ -1125,7 +1150,7 @@ struct iOSDetailView: View {
         if let m = meta {
             NavigationLink {
                 iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season,
-                                  seasonEpisodes: episodesInSeason(v.season ?? season))
+                                  seasonEpisodes: sortedEpisodes(m.videos ?? []))
             } label: {
                 episodeRowLabel(v, isWatched: isWatched, progress: progress)
             }
@@ -1346,7 +1371,7 @@ struct iOSEpisodeStreams: View {
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
-    let seasonEpisodes: [CoreVideo]   // ordered episodes of this season, for in-player Next/Prev/list + auto-advance
+    let seasonEpisodes: [CoreVideo]   // ALL episodes across seasons, ordered (season, episode), for in-player Next/Prev/list + auto-advance ACROSS the season boundary (so the last episode of a season rolls into the next season's first)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
@@ -1414,7 +1439,7 @@ struct iOSEpisodeStreams: View {
             PlayerScreen(
                 url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
                 recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
-                episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "E\($0.episodeNumber) · \($0.episodeTitle)") },
+                episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
                 loadEpisode: { await loadEpisodeStream($0) },
                 warmNextEpisode: { await warmEpisodeStream($0) },
                 onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },

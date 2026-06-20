@@ -289,6 +289,11 @@ struct CoreMetaItem: Decodable {
         return trailerLink.flatMap { Self.youTubeID(from: $0.name) }
     }
 
+    /// All episodes ordered (season, then episode, then id) across EVERY season — the list handed to the
+    /// player so in-player Next / auto-advance rolls past the season boundary into the next season's first
+    /// episode (was per-season, so it dead-ended at the last episode of a season).
+    var orderedEpisodes: [CoreVideo] { (videos ?? []).orderedBySeasonEpisode }
+
     /// Extract a YouTube video id from a watch / share / embed URL (or a bare 11-char id).
     static func youTubeID(from string: String) -> String? {
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -377,6 +382,21 @@ struct CoreVideo: Decodable, Identifiable {
         guard let released else { return nil }
         return ISO8601DateFormatter.epg.date(from: released)
             ?? ISO8601DateFormatter.epgFractional.date(from: released)
+    }
+}
+
+extension Array where Element == CoreVideo {
+    /// Episodes ordered by (season, episode, id) across all seasons. The cross-season player list, so
+    /// auto-advance rolls from a season's last episode into the next season's first (shared by the iOS/Mac
+    /// and tvOS detail screens). Specials (season 0) sort first and don't interrupt end-of-season advance.
+    var orderedBySeasonEpisode: [CoreVideo] {
+        sorted {
+            let ls = $0.season ?? 0, rs = $1.season ?? 0
+            if ls != rs { return ls < rs }
+            let le = $0.episode ?? 0, re = $1.episode ?? 0
+            if le != re { return le < re }
+            return $0.id < $1.id
+        }
     }
 }
 

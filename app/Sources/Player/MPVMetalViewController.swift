@@ -250,16 +250,21 @@ final class MPVMetalViewController: PlatformViewController {
             let mode: AVAudioSession.Mode = AudioOutputMode.current == .stereo ? .default : .moviePlayback
             try session.setCategory(.playback, mode: mode, options: [])
             try session.setActive(true)
-            // #88: let the system apply AirPods head-tracked Spatial Audio to multichannel content. Set
-            // BEFORE reading the channel count so the route can report its spatial multichannel capability.
-            // Benign on non-AirPods routes (HDMI/ARC/built-in speakers): it is a capability hint, not a
-            // re-route, so the eARC/soundbar PCM path is untouched.
+            // Read the route FIRST: the multichannel decision below depends on it.
+            outputPortType = session.currentRoute.outputs.first?.portType
+            // #88 / #78: advertise multichannel content ONLY on routes that can actually OPEN a multichannel
+            // layout — AirPods (system head-tracked Spatial Audio) and real receivers over HDMI/eARC. On the
+            // TV's built-in speakers / AirPlay with the system audio format set to Atmos / Best-Available,
+            // advertising multichannel makes the session present a spatial format that mpv's audiounit AO
+            // CANNOT open, so it falls back to the null AO and the movie is SILENT — even when the viewer
+            // picks Stereo, because the AO never opens before the channel choice matters (#78 reporter,
+            // Beta 5 still silent). Keeping those routes on a plain stereo session lets the AO open and play.
+            // Set before reading the channel count so `maximumOutputNumberOfChannels` reflects the decision.
             if #available(iOS 15.0, tvOS 15.0, *) {
-                try? session.setSupportsMultichannelContent(true)
+                try? session.setSupportsMultichannelContent(!routeIsStereoOnly)
             }
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
-            outputPortType = session.currentRoute.outputs.first?.portType
         } catch {
             mpvLog.error("AVAudioSession .playback setup failed: \(error.localizedDescription, privacy: .public)")
         }

@@ -408,7 +408,7 @@ struct DetailView: View {
                                 NavigationLink {
                                     CoreEpisodeStreams(meta: m, video: primaryEpisode,
                                                        season: primaryEpisode.season ?? 0,
-                                                       episodes: seasonEpisodes(videos: m.videos ?? [], season: primaryEpisode.season ?? 0))
+                                                       episodes: sortedEpisodes(m.videos ?? []))   // ALL seasons ordered → auto-advance crosses the season boundary
                                 } label: {
                                     Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume),
                                           systemImage: "play.fill")
@@ -669,7 +669,7 @@ struct CoreSeasonedEpisodes: View {
         let isWatched = watched.contains(v.id)
         let progress = episodeProgress(v)
         return NavigationLink {
-            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: episodes)
+            CoreEpisodeStreams(meta: meta, video: v, season: v.season ?? season, episodes: meta.orderedEpisodes)   // ALL seasons → cross-season auto-advance
         } label: {
             HStack(alignment: .top, spacing: Theme.Space.md) {
                 thumbnail(v, isWatched: isWatched, progress: progress)

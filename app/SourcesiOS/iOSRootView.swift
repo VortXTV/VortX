@@ -276,6 +276,22 @@ struct iOSHomeView: View {
         }
     }
 
+    #if os(macOS)
+    /// Every Home rail item flattened, for the keyboard-browse hero coupling: a focused card id resolves
+    /// to its `RailItem` so the hero can feature it. Mirrors the same sources the rails render from.
+    private var allRailItems: [RailItem] {
+        var out = continueWatchingItems
+        out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        out += core.boardRows.flatMap { $0.items }.map {
+            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                     background: $0.background, description: $0.description, releaseInfo: $0.releaseInfo,
+                     imdbRating: $0.imdbRating, genres: $0.genres)
+        }
+        out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        return out
+    }
+    #endif
+
     /// The hero's rotation pool: the first ~2-3 of Continue Watching, then the first items of the top
     /// catalog row, capped by the model. These are the titles a Home visitor sees first.
     private var heroCandidates: [FeaturedHeroItem] {
@@ -374,6 +390,15 @@ struct iOSHomeView: View {
             // Escape steps focus up a level: drop the focused card so the keyboard browse returns to a
             // neutral state (the bottom tab strip is its own focus space, reachable via Tab / arrows).
             .onExitCommand { macFocus = nil }
+            // Keyboard browse drives the hero: the focused poster features in the billboard (the tvOS
+            // focused-card-hero behaviour, adapted for the Mac). Focus leaving the cards lets it resume.
+            .onChange(of: macFocus) { newValue in
+                if case let .card(_, itemID) = newValue, let item = allRailItems.first(where: { $0.id == itemID }) {
+                    hero.feature(FeaturedHeroItem.from(rail: item))
+                } else {
+                    hero.noteInteraction()
+                }
+            }
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle("Home", isActive: isActive)
