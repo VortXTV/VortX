@@ -40,12 +40,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var pipController: AVPictureInPictureController?
     private weak var playerLayer: AVPlayerLayer?
     private(set) var videoSizeMode = UserDefaults.standard.string(forKey: "stremiox.videoSize") ?? "original"
+    // Cached AVMediaSelection groups + their MPVTrack views (loaded async once the item is ready). The
+    // MPVTrack.id is the option's index in the group; mpv's -1 = off (deselect the group).
+    private var audioGroup: AVMediaSelectionGroup?
+    private var subGroup: AVMediaSelectionGroup?
+    private var audioTracks: [MPVTrack] = []
+    private var subTracks: [MPVTrack] = []
 
     // MARK: Loading + transport
 
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool) {
         teardownObservers()
         isReady = false; didStart = false; pendingSeek = nil
+        audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
         // Claim .playback before play so PiP and locked-screen audio work; idempotent with the libmpv path
         // since only one engine is live at a time.
         do {
@@ -105,11 +112,27 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
-    // MARK: Tracks / subtitles (STUBBED this step; AVMediaSelection mapping lands at wiring time)
+    // MARK: Tracks / subtitles (embedded tracks via AVMediaSelection; external subs are a later step)
 
-    func tracks(ofType type: String) -> [MPVTrack] { [] }
-    func setAudioTrack(_ id: Int) {}
-    func setSubtitleTrack(_ id: Int) {}
+    func tracks(ofType type: String) -> [MPVTrack] {
+        switch type {
+        case "audio": return audioTracks
+        case "sub":   return subTracks
+        default:      return []
+        }
+    }
+    func setAudioTrack(_ id: Int) { select(id, in: audioGroup) }
+    func setSubtitleTrack(_ id: Int) { select(id, in: subGroup) }
+
+    /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
+    private func select(_ id: Int, in group: AVMediaSelectionGroup?) {
+        guard let group, let item = player.currentItem else { return }
+        if id < 0 { item.select(nil, in: group) }
+        else if id < group.options.count { item.select(group.options[id], in: group) }
+    }
+
+    /// External add-on subtitles need an AVAssetResourceLoaderDelegate to splice a remote WebVTT into the
+    /// asset; not built yet (a later step), so report failure rather than silently doing nothing.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) { completion?(false) }
     func setSubDelay(_ seconds: Double) {}
@@ -188,6 +211,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             if seekable { emit(MPVProperty.duration, dur) }
             emit(MPVProperty.seekable, seekable)
             emit(MPVProperty.trackList, nil)   // chrome re-pulls via tracks()
+            loadSelectionGroups()              // async; re-emits track-list once the groups resolve
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
                 player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
@@ -208,6 +232,31 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     private func emit(_ name: String, _ data: Any?) {
         playDelegate?.propertyChange(propertyName: name, data: data)
+    }
+
+    /// Load the audio + subtitle selection groups off the asset (async, non-deprecated), cache them as
+    /// [MPVTrack] (option index = id; mpv's -1 = off), then re-emit track-list so the chrome re-pulls.
+    private func loadSelectionGroups() {
+        guard let item = player.currentItem else { return }
+        let asset = item.asset
+        Task { @MainActor in
+            let ag = try? await asset.loadMediaSelectionGroup(for: .audible)
+            let sg = try? await asset.loadMediaSelectionGroup(for: .legible)
+            guard player.currentItem === item else { return }   // a newer file loaded meanwhile
+            audioGroup = ag
+            subGroup = sg
+            audioTracks = ag.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
+            subTracks = sg.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
+            emit(MPVProperty.trackList, nil)
+        }
+    }
+
+    private static func mpvTracks(from group: AVMediaSelectionGroup, type: String, item: AVPlayerItem) -> [MPVTrack] {
+        let selected = item.currentMediaSelection.selectedMediaOption(in: group)
+        return group.options.enumerated().map { idx, opt in
+            MPVTrack(id: idx, type: type, title: opt.displayName,
+                     lang: opt.extendedLanguageTag ?? "", selected: opt == selected)
+        }
     }
 
     private func teardownObservers() {
