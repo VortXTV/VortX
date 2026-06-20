@@ -25,6 +25,13 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -81,6 +88,13 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -130,6 +144,13 @@ targets:
       - path: Resources/node-darwin-arm64 # standalone node executable (fetched pre-build)
         buildPhase: resources
       - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
         optional: true
         type: folder
         buildPhase: resources
@@ -185,6 +206,13 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
+        optional: true
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -231,6 +259,13 @@ targets:
       # CoreText fallback does NOT cover CJK in this build (the original tofu bug), and the
       # trimmed face costs ~6.5 MB compressed, cheap enough to keep subtitles correct.
       - path: Resources/fonts
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Bundled Anime4K glsl shaders (MIT), loaded by the libmpv player's Anime4K upscaling preset.
+      # Folder reference so the .glsl files land under a `shaders/` subdir, resolved at runtime from
+      # Bundle.main (see MPVMetalViewController.anime4kShaderPaths).
+      - path: Resources/shaders
         optional: true
         type: folder
         buildPhase: resources

@@ -411,14 +411,26 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
         #endif
 
-        // Video upscaling / quality preset (Performance / Standard / High Quality). Applied as a baseline
-        // BEFORE the power-user customMpvOptions below, so a custom snippet still wins. Standard is a no-op
-        // (keeps libplacebo's sharp defaults). Takes effect on the next played file, like customMpvOptions.
+        // Video upscaling / quality preset (Performance / Standard / High Quality / Anime4K). Applied as a
+        // baseline BEFORE the power-user customMpvOptions below, so a custom snippet still wins. Standard is
+        // a no-op (keeps libplacebo's sharp defaults). Takes effect on the next played file, like customMpvOptions.
         let upscaling = PlaybackSettings.videoUpscaling
         for (key, value) in upscaling.mpvOptions {
             let err = mpv_set_option_string(mpv, key, value)
             if err < 0 {
                 mpvLog.error("upscaling option rejected: \(key, privacy: .public)=\(value, privacy: .public) (\(String(cString: mpv_error_string(err)), privacy: .public))")
+            }
+        }
+        // Anime4K preset: the scaler prerequisites above came from mpvOptions; the glsl-shaders chain
+        // itself is a list of bundle paths only knowable at runtime, so set it here. Resolved + joined
+        // by anime4kShaderPaths; an empty result (preset not anime4k, or a missing/incomplete bundle)
+        // leaves glsl-shaders untouched so the player still runs with the baseline scalers.
+        if let shaderList = anime4kShaderPaths(for: upscaling) {
+            let err = mpv_set_option_string(mpv, "glsl-shaders", shaderList)
+            if err < 0 {
+                mpvLog.error("glsl-shaders rejected: \(String(cString: mpv_error_string(err)), privacy: .public)")
+            } else {
+                mpvLog.log("glsl-shaders set for Anime4K preset")
             }
         }
         mpvLog.log("video upscaling preset = \(upscaling.rawValue, privacy: .public)")
@@ -463,7 +475,40 @@ final class MPVMetalViewController: PlatformViewController {
 
         setupNotification()
     }
-    
+
+    /// The mpv `glsl-shaders` value for an Anime4K preset: the bundled shader chain resolved to absolute
+    /// bundle paths, in the order Anime4K's Mode A requires, joined with mpv's list separator (`:`).
+    /// Returns nil for any non-Anime4K preset (so the caller leaves glsl-shaders alone), and also nil if
+    /// NONE of the shaders resolve from the bundle, so a build that somehow shipped without the resource
+    /// folder degrades to the baseline scalers instead of half-applying a broken chain. Any individual
+    /// shader that can't be found is logged and skipped; a partial chain still upscales.
+    private func anime4kShaderPaths(for preset: VideoUpscaling) -> String? {
+        let names = preset.glslShaderFileNames
+        guard !names.isEmpty else { return nil }
+        let paths: [String] = names.compactMap { name in
+            // The folder reference lands the files under a `shaders/` subdirectory of the bundle; fall
+            // back to the bundle root in case a future build lays them out flat (mirrors the fonts dir
+            // handling above).
+            let stem = (name as NSString).deletingPathExtension
+            let ext = (name as NSString).pathExtension
+            if let url = Bundle.main.url(forResource: stem, withExtension: ext, subdirectory: "shaders") {
+                return url.path
+            }
+            if let url = Bundle.main.url(forResource: stem, withExtension: ext) {
+                return url.path
+            }
+            mpvLog.error("Anime4K shader missing from bundle: \(name, privacy: .public)")
+            return nil
+        }
+        guard !paths.isEmpty else { return nil }
+        // mpv parses glsl-shaders as a `:`-separated list and treats `\` as the escape char, so a bundle
+        // path containing either (e.g. an app folder with a literal ':' is rare but legal) must be escaped
+        // or mpv would split the path. Escape '\' first, then ':'.
+        let escaped = paths.map { $0.replacingOccurrences(of: "\\", with: "\\\\")
+                                     .replacingOccurrences(of: ":", with: "\\:") }
+        return escaped.joined(separator: ":")
+    }
+
     public func setupNotification() {
         // App-lifecycle + audio-route observers are iOS/tvOS only (UIApplication notifications and
         // AVAudioSession both exist there). On macOS mpv's coreaudio AO handles routing and the app

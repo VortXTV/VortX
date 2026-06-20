@@ -16,7 +16,14 @@ enum PlaybackSettings {
     static var videoUpscaling: VideoUpscaling {
         get {
             if let raw = UserDefaults.standard.string(forKey: Key.videoUpscaling),
-               let mode = VideoUpscaling(rawValue: raw) { return mode }
+               let mode = VideoUpscaling(rawValue: raw) {
+                // Anime4K's CNN chain is far too heavy for the memory/GPU-constrained Apple TV HD (A8):
+                // it would stutter badly even if the user (or a synced profile from a Mac) had selected
+                // it. Fall back to the safe per-device default there, so the constrained device never
+                // actually runs Anime4K regardless of what is stored.
+                if mode == .anime4k && PerformanceMode.isConstrainedDevice { return .performance }
+                return mode
+            }
             return PerformanceMode.isConstrainedDevice ? .performance : .standard
         }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: Key.videoUpscaling) }
@@ -82,12 +89,14 @@ enum VideoUpscaling: String, CaseIterable {
     case performance   // weak GPU / battery: cheap bilinear scalers, debanding + dither off
     case standard      // VortX default: libplacebo's sharp lanczos + debanding (current behavior)
     case highQuality   // capable GPU (M-series Mac): ewa_lanczossharp scalers + stronger debanding
+    case anime4k       // anime-tuned CNN upscale via bundled Anime4K glsl shaders (GPU-heavy)
 
     var label: String {
         switch self {
         case .performance: return "Performance"
         case .standard:    return "Standard"
         case .highQuality: return "High Quality"
+        case .anime4k:     return "Anime4K"
         }
     }
 
@@ -96,11 +105,15 @@ enum VideoUpscaling: String, CaseIterable {
         case .performance: return "Fastest. Best for Apple TV HD or to save battery."
         case .standard:    return "Sharp default with debanding. Recommended for most devices."
         case .highQuality: return "Sharper upscaling for capable GPUs (Mac). Heavier; not for weak hardware."
+        case .anime4k:     return "Anime-tuned neural upscaling. Very GPU-heavy; best on Mac or a newer Apple TV. Use on animation only."
         }
     }
 
     /// mpv option (key, value) pairs for this preset, applied during `setupMpv`. `.standard` returns an
-    /// empty list so VortX's existing baseline is left untouched.
+    /// empty list so VortX's existing baseline is left untouched. `.anime4k` returns ONLY the scaler
+    /// prerequisites the Anime4K chain needs; the `glsl-shaders` paths themselves are resolved at runtime
+    /// from `Bundle.main` (see MPVMetalViewController.anime4kShaderPaths), since a bundle path is not
+    /// knowable at compile time.
     var mpvOptions: [(key: String, value: String)] {
         switch self {
         case .standard:
@@ -126,6 +139,40 @@ enum VideoUpscaling: String, CaseIterable {
                 ("deband-iterations", "2"),
                 ("dither-depth", "auto"),
             ]
+        case .anime4k:
+            // The Anime4K CNN shaders do the upscaling themselves, so mpv's own scalers must be cheap
+            // bilinear to avoid double-scaling and wasting GPU; debanding off too, the restore pass
+            // handles ringing. The shader chain is added separately via glsl-shaders at runtime.
+            return [
+                ("scale", "bilinear"),
+                ("cscale", "bilinear"),
+                ("dscale", "bilinear"),
+                ("deband", "no"),
+            ]
+        }
+    }
+
+    /// Ordered file names of the bundled Anime4K shader chain (Mode A: restore + upscale, Medium CNN
+    /// variants), resolved from the app bundle's `shaders/` folder at runtime. Order is significant and
+    /// must match Anime4K's published Mode A preset. Empty for every other preset. See
+    /// `app/Resources/shaders/LICENSE.md` for provenance.
+    var glslShaderFileNames: [String] {
+        switch self {
+        case .anime4k:
+            // This is Anime4K's canonical "Mode A (Fast)" chain from the official low-end Mac/Linux
+            // template (the Medium-variant CNN path tuned for modest GPUs), in the exact order mpv
+            // requires: highlight clamp, restore, 2x upscale, the two auto-downscale guards, then a
+            // final small 2x upscale to reach the target size.
+            return [
+                "Anime4K_Clamp_Highlights.glsl",
+                "Anime4K_Restore_CNN_M.glsl",
+                "Anime4K_Upscale_CNN_x2_M.glsl",
+                "Anime4K_AutoDownscalePre_x2.glsl",
+                "Anime4K_AutoDownscalePre_x4.glsl",
+                "Anime4K_Upscale_CNN_x2_S.glsl",
+            ]
+        default:
+            return []
         }
     }
 }
