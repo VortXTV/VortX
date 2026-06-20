@@ -18,6 +18,7 @@ members = [
     "crates/debrid",
     "crates/adapters",
     "crates/source",
+    "crates/reco",
 ]
 
 [workspace.package]
