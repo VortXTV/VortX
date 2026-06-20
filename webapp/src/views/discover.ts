@@ -42,10 +42,17 @@ export function renderDiscoverShell(host: HTMLElement, addons: Addon[], type: st
     </div>`;
 }
 
+// Monotonic guard: switching Discover type fires a new loadDiscover while the previous one may still be
+// in flight. Both write the fixed `#discover-grid`, so without this a slower earlier type's fetch could
+// resolve last and paint the wrong type's posters. Latest request wins.
+let discoverReqToken = 0;
+
 /** Merge every catalog of `type` into one de-duped grid. */
 export async function loadDiscover(addons: Addon[], type: string): Promise<void> {
+  const token = ++discoverReqToken;
   const refs = catalogRefs(addons).filter((r) => r.def.type === type);
   const pages = await Promise.all(refs.map((ref) => fetchCatalog(ref)));
+  if (token !== discoverReqToken) return; // a newer type switch superseded this load
   const seen = new Set<string>();
   const metas: MetaItem[] = [];
   for (const meta of pages.flat()) {
