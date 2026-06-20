@@ -10,14 +10,14 @@ import { isTorrent, torrentsAvailable } from "./server";
 // audio, and whether the source is cached/instant.
 
 export interface StreamSourceGroup {
-  base: string; // addon transport URL — the grouping key + stable id
+  base: string; // addon transport URL, the grouping key + stable id
   addon: string; // display name, resolved from ctx manifests
   streams: Stream[];
 }
 
 /**
  * A stream the desktop can play: any direct/debrid HTTP(S) `url`, plus TORRENT (`infoHash`) streams
- * once the embedded server is running — it turns the infoHash into a playable file endpoint. With the
+ * once the embedded server is running, it turns the infoHash into a playable file endpoint. With the
  * server down, torrents are filtered out (the detail page then explains the empty state).
  */
 export function isPlayable(stream: Stream): boolean {

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 // Thin wrapper over the Tauri commands wired in src-tauri/lib.rs. The frontend drives the embedded
 // stremio-core engine by dispatching `{ field, action }` envelopes and reading model fields back as
-// JSON — the same transport the iOS/Apple TV apps use, minus the C ABI. Re-renders are triggered by
+// JSON, the same transport the iOS/Apple TV apps use, minus the C ABI. Re-renders are triggered by
 // the `core-event` event (listened to in main.ts), so this module stays render-agnostic.
 
 // ---- Engine-shaped types (subset of the stremio-core-web JSON the model serializes) ------------
@@ -13,7 +13,7 @@ export interface Loadable<T> {
 }
 
 export interface ResourceRequest {
-  base?: string; // addon transport URL — the per-addon grouping key
+  base?: string; // addon transport URL, the per-addon grouping key
   path?: { resource?: string; type?: string; id?: string };
 }
 
@@ -73,7 +73,7 @@ export interface MetaDetails {
   streams?: StreamGroupResponse[];
 }
 
-// ctx — we only need the addon manifests so a stream group's `request.base` can resolve to the
+// ctx, we only need the addon manifests so a stream group's `request.base` can resolve to the
 // add-on's display name (the same map CoreBridge.addonNamesByBase builds on Apple).
 export interface Ctx {
   profile?: { addons?: { transportUrl?: string; manifest?: { name?: string } }[] };
