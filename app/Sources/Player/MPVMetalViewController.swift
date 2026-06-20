@@ -411,6 +411,18 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
         #endif
 
+        // Video upscaling / quality preset (Performance / Standard / High Quality). Applied as a baseline
+        // BEFORE the power-user customMpvOptions below, so a custom snippet still wins. Standard is a no-op
+        // (keeps libplacebo's sharp defaults). Takes effect on the next played file, like customMpvOptions.
+        let upscaling = PlaybackSettings.videoUpscaling
+        for (key, value) in upscaling.mpvOptions {
+            let err = mpv_set_option_string(mpv, key, value)
+            if err < 0 {
+                mpvLog.error("upscaling option rejected: \(key, privacy: .public)=\(value, privacy: .public) (\(String(cString: mpv_error_string(err)), privacy: .public))")
+            }
+        }
+        mpvLog.log("video upscaling preset = \(upscaling.rawValue, privacy: .public)")
+
         // Power-user custom mpv options. Applied LAST, after every VortX baseline option above, so an
         // advanced viewer can override the defaults (the "mpv conf" setting). Each option is set with
         // its own fail-safe: a bad key/value logs and is skipped, it must never abort the baseline

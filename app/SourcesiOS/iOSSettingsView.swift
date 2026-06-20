@@ -44,6 +44,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
+    @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
@@ -256,6 +257,9 @@ struct iOSSettingsView: View {
             Picker("Audio output", selection: $audioOutput) {
                 ForEach(AudioOutputMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            Picker("Video upscaling", selection: $videoUpscaling) {
+                ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+            }
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
@@ -281,6 +285,7 @@ struct iOSSettingsView: View {
                      ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
                      : "Hide torrent and magnet sources. Only direct and debrid links will play.")
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
+                Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 if !installedExternalPlayers.isEmpty {
                     Text("Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.")
                 }

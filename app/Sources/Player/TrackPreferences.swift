@@ -5,6 +5,21 @@ enum PlaybackSettings {
         static let directLinksOnly = "stremiox.directLinksOnly"
         static let keepPlayingInBackground = "stremiox.keepPlayingInBackground"
         static let customMpvOptions = "stremiox.customMpvOptions"
+        static let videoUpscaling = "stremiox.videoUpscaling"
+    }
+
+    /// Video upscaling / quality preset. Picks the libmpv (gpu-next / libplacebo) scaler and debanding
+    /// baseline applied during player setup. Default is hardware-aware: the memory-constrained Apple TV HD
+    /// (A8) gets `.performance` so a 4K stream doesn't stutter, every other device gets `.standard` (today's
+    /// sharp libplacebo default). A change takes effect on the next played file — the player is recreated
+    /// per session, the same lifetime as `customMpvOptions`.
+    static var videoUpscaling: VideoUpscaling {
+        get {
+            if let raw = UserDefaults.standard.string(forKey: Key.videoUpscaling),
+               let mode = VideoUpscaling(rawValue: raw) { return mode }
+            return PerformanceMode.isConstrainedDevice ? .performance : .standard
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: Key.videoUpscaling) }
     }
 
     /// Power-user libmpv options, supplied as a free-form "key=value per line" snippet (an mpv.conf
@@ -57,6 +72,62 @@ enum PlaybackSettings {
     }
 
     static var torrentsDisabled: Bool { directLinksOnly }
+}
+
+/// Video upscaling / quality preset, mapped to libmpv (gpu-next / libplacebo) scaler + debanding options.
+/// Applied as a BASELINE during player setup, before the power-user `customMpvOptions` (so a custom snippet
+/// still wins). `.standard` is intentionally a no-op: it keeps VortX's existing default, which is already
+/// libplacebo's sharp lanczos + debanding (the app deliberately avoids mpv's `profile=fast` for that reason).
+enum VideoUpscaling: String, CaseIterable {
+    case performance   // weak GPU / battery: cheap bilinear scalers, debanding + dither off
+    case standard      // VortX default: libplacebo's sharp lanczos + debanding (current behavior)
+    case highQuality   // capable GPU (M-series Mac): ewa_lanczossharp scalers + stronger debanding
+
+    var label: String {
+        switch self {
+        case .performance: return "Performance"
+        case .standard:    return "Standard"
+        case .highQuality: return "High Quality"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .performance: return "Fastest. Best for Apple TV HD or to save battery."
+        case .standard:    return "Sharp default with debanding. Recommended for most devices."
+        case .highQuality: return "Sharper upscaling for capable GPUs (Mac). Heavier; not for weak hardware."
+        }
+    }
+
+    /// mpv option (key, value) pairs for this preset, applied during `setupMpv`. `.standard` returns an
+    /// empty list so VortX's existing baseline is left untouched.
+    var mpvOptions: [(key: String, value: String)] {
+        switch self {
+        case .standard:
+            return []
+        case .performance:
+            // The cheap-scaler knobs mpv's `fast` profile sets, applied explicitly so they layer onto
+            // gpu-next without dragging in the rest of the legacy profile. Stops 4K stutter on the A8.
+            return [
+                ("scale", "bilinear"),
+                ("cscale", "bilinear"),
+                ("dscale", "bilinear"),
+                ("deband", "no"),
+                ("dither-depth", "no"),
+            ]
+        case .highQuality:
+            // libplacebo high-quality scalers. ewa_lanczossharp is the sharp anti-ringing upscaler;
+            // mitchell downscales cleanly. Heavier than the default, so it is opt-in only.
+            return [
+                ("scale", "ewa_lanczossharp"),
+                ("cscale", "ewa_lanczossharp"),
+                ("dscale", "mitchell"),
+                ("deband", "yes"),
+                ("deband-iterations", "2"),
+                ("dither-depth", "auto"),
+            ]
+        }
+    }
 }
 
 /// What audio and subtitle track the player should pick automatically. Persisted in UserDefaults and

@@ -25,6 +25,7 @@ struct SettingsView: View {
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
+    @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
@@ -190,6 +191,9 @@ struct SettingsView: View {
             }
             choiceRow("Audio output", AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow("Video upscaling", VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
+            Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow("Play in", externalPlayerChoices, selection: $defaultExternalPlayer)
