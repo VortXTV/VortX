@@ -975,6 +975,60 @@ input:focus-visible {
 }
 .addon-name {
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm, 0.5rem);
+  flex-wrap: wrap;
+}
+/* Add-on health badge: status pill next to the name. */
+.addon-health {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.addon-health::before {
+  content: "";
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  margin-right: 0.4em;
+  vertical-align: 0.05em;
+  background: currentColor;
+}
+.addon-health.checking {
+  color: var(--muted-2);
+  animation: addon-health-pulse 1.1s ease-in-out infinite;
+}
+.addon-health.online {
+  color: #7ad48d;
+  border-color: color-mix(in oklab, #7ad48d 40%, transparent);
+}
+.addon-health.slow {
+  color: #f5d061;
+  border-color: color-mix(in oklab, #f5d061 40%, transparent);
+}
+.addon-health.unreachable {
+  color: #fb6b76;
+  border-color: color-mix(in oklab, #fb6b76 40%, transparent);
+}
+@keyframes addon-health-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+/* Add-ons header row: title + Re-check action. */
+.addons-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md, 1rem);
+  flex-wrap: wrap;
 }
 .addon-desc {
   font-size: 0.85rem;
