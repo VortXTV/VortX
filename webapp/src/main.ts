@@ -7,6 +7,7 @@ import { clearProgress, removeFromLibrary } from "./lib/store";
 import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { icon } from "./lib/icons";
+import { initCardMenu } from "./lib/cardmenu";
 import { disposeFeatured, loadBoard, renderBoardShell } from "./views/board";
 import {
   discoverTypes,
@@ -290,6 +291,7 @@ async function start(): Promise<void> {
   dismissSplash();
   app.innerHTML = APP_SHELL;
   wireGlobalClicks();
+  initCardMenu(); // right-click / long-press context menu on poster cards
 
   void ensureValidSession(); // clear a revoked token in the background; never blocks first paint
   addons = await loadInstalledAddons();
