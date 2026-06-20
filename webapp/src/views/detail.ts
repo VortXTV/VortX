@@ -179,18 +179,14 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
   const trailer = trailerYouTubeID(meta);
+  const actions = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
   host.innerHTML = `
     <div class="detail">
-      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
-      <div class="detail-scrim"></div>
-      <a class="back" href="#/" data-action="nav-home">‹ Home</a>
-      <div class="detail-body">
-        ${heroHead(meta, logo)}
-        ${metaRow(meta)}
-        ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
+      ${detailHero(meta, logo, bg)}
+      <div class="detail-content">
+        ${streamSection(groups, actions)}
+        ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
         ${creditsRow(meta)}
-        ${streamSection(groups)}
-        <div class="action-row">${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}</div>
       </div>
     </div>`;
 }
@@ -203,65 +199,105 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     state.selectedSeason = defaultSeason(seasons);
   }
   const open = state.openEpisode;
-  const bg = (open ? httpUrl(open.thumbnail) : "") || httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
   const trailer = trailerYouTubeID(meta);
 
-  const body = open
-    ? episodeStreamView(open, meta)
-    : `${heroHead(meta, logo)}${metaRow(meta)}${
-        meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}<div class="action-row">${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}</div>`;
-
+  if (open) {
+    const bg = httpUrl(open.thumbnail) || httpUrl(meta.background) || httpUrl(meta.poster);
+    host.innerHTML = `
+      <div class="detail">
+        ${detailHero(meta, logo, bg, open)}
+        <div class="detail-content">${episodeStreamView(open)}</div>
+      </div>`;
+    return;
+  }
+  const bg = httpUrl(meta.background) || httpUrl(meta.poster);
+  const actions = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
   host.innerHTML = `
     <div class="detail">
-      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
-      <div class="detail-scrim"></div>
-      <a class="back" href="#/" data-action="nav-home">‹ Home</a>
-      <div class="detail-body">${body}</div>
+      ${detailHero(meta, logo, bg)}
+      <div class="detail-content">
+        <div class="hero-actions">${actions}</div>
+        ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
+        ${creditsRow(meta)}
+        ${seasonSelector(seasons)}
+        ${episodeList(videos, state.selectedSeason)}
+      </div>
     </div>`;
 }
 
-function heroHead(meta: MetaItem, logo: string): string {
-  if (logo) return `<img class="detail-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(meta.name)}" />`;
-  return `<h1 class="detail-title">${escapeHtml(meta.name)}</h1>`;
+/** The fixed hero banner: full-bleed backdrop + dual scrim + a bottom-left title block (logo or serif
+ *  title + a single-line meta row), with a contextual Back. Content flows BELOW it, mirroring
+ *  iOSDetailView (the backdrop is a banner, not a full-page wash). */
+function detailHero(meta: MetaItem, logo: string, bg: string, episode?: Video): string {
+  const back = episode
+    ? `<button class="back" data-action="close-episode">‹ Episodes</button>`
+    : `<a class="back" href="#/" data-action="nav-home">‹ Home</a>`;
+  const epTitle = episode ? episode.title || episode.name || `Episode ${episode.episode ?? 0}` : "";
+  const titleHtml = episode
+    ? `<span class="detail-eyebrow t-eyebrow">${escapeHtml(meta.name)}</span><h1 class="detail-title t-hero">${escapeHtml(epTitle)}</h1>`
+    : logo
+      ? `<img class="detail-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(meta.name)}" />`
+      : `<h1 class="detail-title t-hero">${escapeHtml(meta.name)}</h1>`;
+  return `
+    <div class="detail-hero">
+      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
+      <div class="detail-scrim"></div>
+      ${back}
+      <div class="detail-titleblock">${titleHtml}${episode ? episodeMetaRow(episode, meta) : metaRow(meta)}</div>
+    </div>`;
 }
 
+/** Single-line meta row (rating star + year/runtime/genres joined), so it never forces the hero wider. */
 function metaRow(meta: MetaItem): string {
-  const parts: string[] = [];
-  const imdb = imdbRating(meta);
-  if (imdb) parts.push(`<span class="rating">★ ${escapeHtml(imdb)}</span>`);
-  if (meta.releaseInfo) parts.push(`<span>${escapeHtml(meta.releaseInfo)}</span>`);
-  if (meta.runtime) parts.push(`<span>${escapeHtml(meta.runtime)}</span>`);
+  const facts: string[] = [];
+  if (meta.releaseInfo) facts.push(meta.releaseInfo);
+  if (meta.runtime) facts.push(meta.runtime);
   const g = genres(meta).slice(0, 3);
-  if (g.length) parts.push(`<span>${escapeHtml(g.join(" · "))}</span>`);
-  if (!parts.length) return "";
-  return `<div class="meta-row">${parts.join("")}</div>`;
+  if (g.length) facts.push(g.join(" · "));
+  const imdb = imdbRating(meta);
+  const star = imdb ? `<span class="rating">★ ${escapeHtml(imdb)}</span>` : "";
+  const line = facts.length ? `<span class="meta-facts">${escapeHtml(facts.join("  ·  "))}</span>` : "";
+  if (!star && !line) return "";
+  return `<div class="meta-row t-label">${star}${line}</div>`;
+}
+
+function episodeMetaRow(episode: Video, meta: MetaItem): string {
+  const facts: string[] = [`S${episode.season ?? 0} · E${episode.episode ?? 0}`];
+  const date = episode.released && episode.released.length >= 10 ? episode.released.slice(0, 10) : "";
+  if (date) facts.push(date);
+  if (meta.runtime) facts.push(meta.runtime);
+  const imdb = imdbRating(meta);
+  const star = imdb ? `<span class="rating">★ ${escapeHtml(imdb)}</span>` : "";
+  return `<div class="meta-row t-label">${star}<span class="meta-facts">${escapeHtml(facts.join("  ·  "))}</span></div>`;
 }
 
 // ---- Stream section (movie + episode share this) -----------------------------------------------
 
-function streamSection(groups: RankedGroup[]): string {
+function streamSection(groups: RankedGroup[], extraActions: string): string {
   if (!state) return "";
   const streamCount = groups.reduce((n, g) => n + g.streams.length, 0);
   const top = best(groups);
 
-  // Done loading, nothing playable.
+  // Done loading, nothing playable: a disabled primary + the rest of the cluster, then an explainer card.
   if (!top && !state.streamsLoading) {
     const onlyTorrents = hasOnlyUnplayable(state.groups);
     const explain = onlyTorrents
-      ? `The only sources found for this title are torrents, which the web app cannot play (it has no
-         streaming server). Use a debrid service (RealDebrid, AllDebrid, Premiumize) with a stream
-         add-on for direct links, or open this title in the VortX app.`
+      ? `The only sources found are torrents, which the web app can't play on its own (no streaming
+         server). Use a debrid service (RealDebrid, AllDebrid, Premiumize, TorBox) with a stream add-on
+         for instant direct links, or open this title in the VortX app.`
       : `None of your add-ons returned a playable source. Add a stream add-on that serves direct or
-         debrid links. The web app plays HTTP(S) and HLS sources only.`;
+         debrid links. The web app plays HTTP(S) and HLS sources.`;
     return `
       <div class="stream-section">
-        <button class="watch disabled" disabled>
-          <span class="play-icon" aria-hidden="true">▷</span> No playable sources
-        </button>
-        <p class="muted">${explain}</p>
-        <a class="chip" href="#/addons" data-action="nav-addons">Manage add-ons</a>
+        <div class="hero-actions">
+          <button class="btn-primary is-disabled" disabled><span class="play-icon" aria-hidden="true">▷</span> No playable sources</button>
+          ${extraActions}
+        </div>
+        <div class="surface-card stream-empty">
+          <p class="t-body muted">${explain}</p>
+          <a class="chip" href="#/addons" data-action="nav-addons">Manage add-ons</a>
+        </div>
       </div>`;
   }
 
@@ -269,36 +305,39 @@ function streamSection(groups: RankedGroup[]): string {
   if (!top) {
     return `
       <div class="stream-section">
-        <button class="watch loading" disabled><span class="spinner" aria-hidden="true"></span>Finding sources…</button>
+        <div class="hero-actions">
+          <button class="btn-primary is-disabled" disabled><span class="spinner" aria-hidden="true"></span> Finding the best source…</button>
+          ${extraActions}
+        </div>
       </div>`;
   }
 
-  // If this title/episode has a saved resume position, label the button "Resume … · 12:34" (playback
-  // already seeks to it; this just makes the affordance visible). resumeId is the played id.
+  // Saved resume position -> the primary reads "Resume · 12:34" (playback already seeks to it).
   const resumeId = state.openEpisode?.id ?? state.meta?.id;
   const resumePos = resumeId ? cwPosition(resumeId) : 0;
-  const watchInner =
-    resumePos > 0
-      ? `<span class="play-icon" aria-hidden="true">▷</span> Resume ${escapeHtml(watchLabel(top))} · ${formatTime(resumePos)}`
-      : `<span class="play-icon" aria-hidden="true">▷</span> Watch in ${escapeHtml(watchLabel(top))}`;
+  const watchText =
+    resumePos > 0 ? `Resume · ${formatTime(resumePos)}` : `Watch · ${escapeHtml(watchLabel(top))}`;
   const controls = `
-    <div class="stream-controls">
-      <button class="watch" data-action="play-best">
-        ${watchInner}
-      </button>
+    <div class="hero-actions">
+      <button class="btn-primary" data-action="play-best"><span class="play-icon" aria-hidden="true">▷</span> ${watchText}</button>
       <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">Quality ⌄</button>
-      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">
-        ${state.showAllSources ? "Hide sources" : `All sources · ${streamCount}`}
-      </button>
+      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${
+        state.showAllSources ? "Hide sources" : `Sources · ${streamCount}`
+      }</button>
+      ${extraActions}
     </div>`;
 
-  const stillLoading = state.streamsLoading
-    ? `<p class="muted small">Still finding more sources…</p>`
-    : "";
+  const stillLoading = state.streamsLoading ? `<p class="muted small">Still finding more sources…</p>` : "";
+  // The quality picker + the all-sources list live in one elevated panel below the cluster, only when
+  // a control is toggled open, so the default detail view stays focused on the primary CTA.
+  const panel =
+    state.pickerOpen || state.showAllSources
+      ? `<div class="surface-card stream-panel">${qualityPicker(groups)}${
+          state.showAllSources ? sourceList(groups, streamCount) : ""
+        }</div>`
+      : "";
 
-  return `<div class="stream-section">${controls}${stillLoading}${qualityPicker(groups)}${
-    state.showAllSources ? sourceList(groups, streamCount) : ""
-  }</div>`;
+  return `<div class="stream-section">${controls}${stillLoading}${panel}</div>`;
 }
 
 function qualityPicker(groups: RankedGroup[]): string {
@@ -422,28 +461,15 @@ function episodeRow(v: Video): string {
     </button>`;
 }
 
-function episodeStreamView(episode: Video, meta: MetaItem): string {
+/** The open-episode body. The episode title / meta / Back now live in the hero (detailHero with the
+ *  episode), so this is just the play cluster + the episode synopsis. */
+function episodeStreamView(episode: Video): string {
   if (!state) return "";
   const groups = rankedGroups(state.groups);
-  const epNum = episode.episode ?? 0;
-  const season = episode.season ?? 0;
-  const title = episode.title || episode.name || `Episode ${epNum}`;
-  const date = episode.released && episode.released.length >= 10 ? episode.released.slice(0, 10) : "";
-
-  const metaParts: string[] = [`S${season} · E${epNum}`];
-  if (date) metaParts.push(date);
-  if (meta.runtime) metaParts.push(meta.runtime);
-  const rating = imdbRating(meta);
-  if (rating) metaParts.unshift(`★ ${rating}`);
   const overview = episode.overview || episode.description;
-
-  return `
-    <button class="chip episode-back" data-action="close-episode">‹ Episodes</button>
-    <span class="episode-eyebrow">${escapeHtml(meta.name)}</span>
-    <h1 class="episode-screen-title">${escapeHtml(title)}</h1>
-    <div class="meta-row">${metaParts.map((p) => `<span>${escapeHtml(p)}</span>`).join("")}</div>
-    ${overview ? `<p class="desc">${escapeHtml(overview)}</p>` : ""}
-    ${streamSection(groups)}`;
+  return `${streamSection(groups, "")}${
+    overview ? `<p class="desc t-body">${escapeHtml(overview)}</p>` : ""
+  }`;
 }
 
 // ---- Links / rating / trailer helpers ----------------------------------------------------------

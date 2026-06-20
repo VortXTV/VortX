@@ -29,10 +29,16 @@
   --radius-card: 16px;
   --radius-chip: 12px;
   --radius-control: 14px;
+  --radius-pill: 999px;
   --shadow-card: 0 10px 30px -12px rgba(0, 0, 0, 0.7);
+  /* Elevation model (no borders for elevation; --hairline 1px for true dividers only). */
+  --elev-rest: 0 7px 12px rgba(0, 0, 0, 0.32);
+  --elev-focus: 0 10px 16px rgba(0, 0, 0, 0.45);
+  --glow-accent: 0 0 18px rgba(217, 119, 6, 0.6);
 
   /* 8pt spacing scale (DESIGN.md): section gaps step on this grid, not ad-hoc values. */
-  --space-page: clamp(1rem, 0.5rem + 2vw, 2.5rem);
+  --space-page: clamp(20px, 5vw, 60px);
+  --space-edge: clamp(20px, 5vw, 60px);
   --space-xs: 8px;
   --space-sm: 12px;
   --space-md: 20px;
@@ -43,6 +49,8 @@
   --duration-fast: 150ms;
   --duration-normal: 300ms;
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-state: 180ms;
 }
 
 * {
@@ -374,6 +382,12 @@ input:focus-visible {
   min-height: 60vh;
   color: var(--muted);
 }
+/* Fixed hero banner: the backdrop is a banner at the top (not a full-page wash); content flows below. */
+.detail-hero {
+  position: relative;
+  height: clamp(320px, 42vh, 560px);
+  overflow: hidden;
+}
 .detail-bg {
   position: absolute;
   inset: 0;
@@ -385,71 +399,92 @@ input:focus-visible {
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(180deg, rgba(22, 19, 16, 0.35) 0%, rgba(22, 19, 16, 0.85) 55%, var(--bg) 100%),
-    linear-gradient(90deg, rgba(22, 19, 16, 0.7) 0%, transparent 70%);
+    linear-gradient(180deg, transparent 0%, rgba(21, 18, 14, 0.55) 55%, rgba(21, 18, 14, 0.92) 82%, var(--bg) 100%),
+    linear-gradient(90deg, rgba(21, 18, 14, 0.65) 0%, transparent 55%);
 }
 .back {
-  position: sticky;
-  top: 1rem;
-  margin: 1rem 0 0 1rem;
+  position: absolute;
+  top: var(--space-md);
+  left: var(--space-edge);
   z-index: 3;
   display: inline-flex;
+  align-items: center;
   padding: 0.5rem 0.9rem;
-  border-radius: var(--radius-chip);
-  background: rgba(0, 0, 0, 0.5);
+  border-radius: var(--radius-pill);
+  background: rgba(0, 0, 0, 0.45);
   color: var(--text);
+  font-size: 0.95rem;
   backdrop-filter: blur(8px);
+  transition: background var(--dur-state) var(--ease);
 }
-.detail-body {
-  position: relative;
-  z-index: 2;
-  max-width: 900px;
-  padding: clamp(3rem, 12vh, 9rem) var(--space-page) 4rem;
+.back:hover {
+  background: rgba(0, 0, 0, 0.65);
+}
+/* Title block anchored bottom-left inside the hero (logo or serif title + a single-line meta row). */
+.detail-titleblock {
+  position: absolute;
+  left: var(--space-edge);
+  right: var(--space-edge);
+  bottom: var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.detail-eyebrow {
+  color: var(--accent-bright);
 }
 .detail-logo {
-  max-width: min(420px, 70%);
-  max-height: 180px;
+  max-width: min(340px, 72%);
+  max-height: 108px;
   object-fit: contain;
-  margin-bottom: 1rem;
+  object-position: left bottom;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
 }
 .detail-title {
-  font-family: var(--serif);
-  font-size: clamp(2rem, 1.2rem + 4vw, 4rem);
-  font-weight: 700;
-  line-height: 1.02;
-  letter-spacing: -0.02em;
-  margin-bottom: 0.75rem;
+  max-width: 20ch;
+  color: var(--text);
+  text-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
 }
 .meta-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
+  align-items: center;
+  gap: 0.6rem;
   color: var(--muted);
-  font-size: 0.95rem;
-  margin-bottom: 1rem;
 }
 .meta-row .rating {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
   color: var(--accent-bright);
-  font-weight: 600;
+  font-weight: 700;
+}
+/* Readable content column below the hero, blocks separated on the --space-lg rhythm. */
+.detail-content {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: var(--space-lg) var(--space-edge) var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
 }
 .desc {
-  max-width: 60ch;
+  max-width: 68ch;
   color: var(--text);
-  line-height: 1.55;
-  margin-bottom: 1.5rem;
+  margin: 0;
 }
-/* Cast / Director / Writer lines under the synopsis (web parity with the Apple detail page). */
+/* Cast / Director / Writer lines (web parity with the Apple detail page). */
 .credits {
   display: flex;
   flex-direction: column;
   gap: 0.3rem;
-  margin-bottom: 1.5rem;
-  max-width: 60ch;
-  font-size: 0.9rem;
+  margin: 0;
+  max-width: 68ch;
+  font-size: 0.92rem;
 }
 .credit-role {
   display: inline-block;
-  min-width: 5rem;
+  min-width: 4.5rem;
   color: var(--muted-2);
 }
 .credit-names {
@@ -459,39 +494,35 @@ input:focus-visible {
 /* ---- Stream section ---- */
 
 .stream-section {
-  margin-top: var(--space-md);
-  margin-bottom: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
 }
-.stream-controls {
+/* The hero action cluster: one big primary CTA (.btn-primary) + the secondary chips, all on one
+   wrapping row, so the page has a single clear primary action and no orphaned buttons. */
+.hero-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.75rem;
   align-items: center;
+  gap: var(--space-sm);
 }
-.watch {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.8rem 1.4rem;
-  border-radius: var(--radius-chip);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-size: 1rem;
-  font-weight: 600;
-  transition: transform var(--duration-fast) var(--ease), background var(--duration-fast) var(--ease);
+/* The play CTA dominates its row. */
+.hero-actions .btn-primary {
+  font-size: 1.1rem;
 }
-.watch:hover {
-  background: var(--accent-bright);
-  transform: translateY(-1px);
+/* The elevated panel that holds the quality picker + the all-sources list (only when toggled open). */
+.stream-panel {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
 }
-.watch.disabled,
-.watch.loading {
-  background: var(--surface-2);
-  color: var(--muted);
-  cursor: default;
-}
-.watch.loading {
-  transform: none;
+.stream-empty {
+  padding: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-sm);
 }
 .play-icon {
   font-size: 0.9em;
@@ -510,11 +541,11 @@ input:focus-visible {
   }
 }
 
+/* Layout-only now (it sits inside the elevated .stream-panel surface-card; no nested card). */
 .quality-panel {
-  margin-top: 0.9rem;
-  padding: 0.9rem;
-  background: var(--surface);
-  border-radius: var(--radius-card);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
 }
 .quality-eyebrow {
   display: block;
@@ -1070,4 +1101,67 @@ input:focus-visible {
 .addon-intro strong {
   color: var(--text);
   font-weight: 600;
+}
+
+/* ==============================================================================================
+   DESIGN SYSTEM (matches app/SourcesShared/Theme.swift + iOSDetailView). Screens use these classes
+   instead of ad-hoc font-size / button / card styling, so every surface reads as one product:
+   the Apple type scale, the PrimaryActionStyle CTA, ChipButtonStyle, the card + state model.
+   ============================================================================================== */
+
+/* Type scale: serif hero/wordmark, SF Pro elsewhere; web-scaled bodies (a touch smaller than the
+   10-foot tvOS sizes so it is not huge on a monitor). */
+.t-hero { font-family: var(--serif); font-weight: 800; font-size: clamp(40px, 4vw + 1rem, 64px); letter-spacing: -1.5px; line-height: 1.02; }
+.t-screen { font-family: var(--serif); font-weight: 700; font-size: clamp(30px, 3vw + 1rem, 48px); letter-spacing: -1px; }
+.t-section { font-weight: 600; font-size: clamp(20px, 1.4vw + 1rem, 28px); letter-spacing: -0.3px; }
+.t-card { font-weight: 600; font-size: 1.2rem; }
+.t-body { font-weight: 400; font-size: clamp(16px, 0.4vw + 1rem, 18px); line-height: 1.5; }
+.t-label { font-weight: 500; font-size: 0.95rem; }
+.t-eyebrow { font-weight: 700; font-size: 0.74rem; letter-spacing: 1.5px; text-transform: uppercase; color: var(--accent); }
+
+/* Primary CTA: the single large gold button (detail Watch, home Featured "Details"). The ONLY
+   accent-filled control; everything else is a chip. */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  padding: 15px var(--space-lg);
+  border-radius: var(--radius-control);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 700;
+  font-size: 1.05rem;
+  box-shadow: var(--elev-rest);
+  transition: transform var(--dur-state) var(--ease-spring), background var(--dur-state) var(--ease),
+    box-shadow var(--dur-state) var(--ease);
+}
+.btn-primary:hover { background: var(--accent-bright); transform: translateY(-1px); box-shadow: var(--elev-focus), var(--glow-accent); }
+.btn-primary:active { transform: scale(0.97); }
+.btn-primary.is-disabled, .btn-primary:disabled { background: var(--surface-2); color: var(--muted); box-shadow: none; cursor: default; transform: none; }
+
+/* Chip: every secondary control (Quality, Sources, Trailer, Save, Share, season, filters, type-switch). */
+.btn-chip, .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.62rem 1rem;
+  border-radius: var(--radius-chip);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 500;
+  transition: transform var(--dur-state) var(--ease-spring), background var(--dur-state) var(--ease),
+    color var(--dur-state) var(--ease);
+}
+.btn-chip:hover, .chip:hover { background: var(--surface-3); }
+.btn-chip:active, .chip:active { transform: scale(0.97); }
+.btn-chip.selected, .chip.selected { background: var(--accent-soft); color: var(--accent-bright); box-shadow: inset 0 0 0 1px var(--accent); }
+
+/* Surface card: rows + panels that float on the canvas via elevation, never borders. */
+.surface-card {
+  background: var(--surface);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-rest);
+  transition: transform var(--dur-state) var(--ease-spring), box-shadow var(--dur-state) var(--ease);
 }
