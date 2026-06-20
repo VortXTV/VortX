@@ -231,9 +231,11 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
  *  title + a single-line meta row), with a contextual Back. Content flows BELOW it, mirroring
  *  iOSDetailView (the backdrop is a banner, not a full-page wash). */
 function detailHero(meta: MetaItem, logo: string, bg: string, episode?: Video): string {
+  // The top nav stays visible on detail now, so the root page needs no extra Back chip (use the nav);
+  // only the open-episode view gets a contextual "Episodes" back.
   const back = episode
     ? `<button class="back" data-action="close-episode">${icon("back")}<span>Episodes</span></button>`
-    : `<a class="back" href="#/" data-action="nav-home">${icon("back")}<span>Home</span></a>`;
+    : "";
   const epTitle = episode ? episode.title || episode.name || `Episode ${episode.episode ?? 0}` : "";
   const titleHtml = episode
     ? `<span class="detail-eyebrow t-eyebrow">${escapeHtml(meta.name)}</span><h1 class="detail-title t-hero">${escapeHtml(epTitle)}</h1>`
@@ -295,10 +297,7 @@ function streamSection(groups: RankedGroup[], extraActions: string): string {
           <button class="btn-primary is-disabled" disabled>${icon("play")}<span>No playable sources</span></button>
           ${extraActions}
         </div>
-        <div class="surface-card stream-empty">
-          <p class="t-body muted">${explain}</p>
-          <a class="chip" href="#/addons" data-action="nav-addons">Manage add-ons</a>
-        </div>
+        <p class="stream-note">${explain} <a class="inline-link" href="#/addons" data-action="nav-addons">Manage add-ons</a></p>
       </div>`;
   }
 

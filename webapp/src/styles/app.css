@@ -125,7 +125,7 @@ input:focus-visible {
   padding: 0.85rem var(--space-page);
   position: sticky;
   top: 0;
-  z-index: 5;
+  z-index: 15;
   background: linear-gradient(var(--bg) 55%, transparent);
 }
 .wordmark {
@@ -393,6 +393,9 @@ input:focus-visible {
   display: none;
   background: var(--bg);
   overflow-y: auto;
+  /* Below the sticky topbar (z-index 15) so the nav stays visible on the detail page like the native
+     apps; the player overlay (z-index 20) still covers everything. */
+  z-index: 10;
 }
 .detail-overlay.active {
   display: block;
@@ -433,7 +436,8 @@ input:focus-visible {
 }
 .back {
   position: absolute;
-  top: var(--space-md);
+  /* Sits below the (now-visible) sticky top nav so the two never collide. */
+  top: calc(var(--space-md) + 52px);
   left: var(--space-edge);
   z-index: 3;
   display: inline-flex;
@@ -489,15 +493,14 @@ input:focus-visible {
   color: var(--accent-bright);
   font-weight: 700;
 }
-/* Readable content column below the hero (iOSDetailView caps the source-heavy column at 900 on wide
-   windows), blocks separated on the --space-lg rhythm. */
+/* Content below the hero, LEFT-ALIGNED under the title block (the apps align actions/synopsis to the
+   leading edge, they do NOT center them in a narrow column). Each block self-caps for readability. */
 .detail-content {
-  max-width: 900px;
-  margin: 0 auto;
-  padding: var(--space-lg) var(--space-edge) var(--space-xl);
+  padding: var(--space-md) var(--space-edge) var(--space-xl);
   display: flex;
   flex-direction: column;
-  gap: var(--space-lg);
+  align-items: flex-start;
+  gap: var(--space-md);
 }
 .desc {
   max-width: 760px;
@@ -525,9 +528,24 @@ input:focus-visible {
 /* ---- Stream section ---- */
 
 .stream-section {
+  width: 100%;
+  max-width: 860px;
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
+}
+/* Compact "no playable web source" note (the serverless tvOS-Lite state) - a slim line, not a big card. */
+.stream-note {
+  margin: 0;
+  max-width: 640px;
+  font-size: 0.95rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.inline-link {
+  color: var(--accent-bright);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 /* The hero action cluster: one big primary CTA (.btn-primary) + the secondary chips, all on one
    wrapping row, so the page has a single clear primary action and no orphaned buttons. */
