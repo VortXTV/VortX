@@ -35,7 +35,16 @@ function continueWatchingRail(): string {
   return `
     <section class="rail-section" aria-labelledby="rail-cw">
       <h2 class="rail-title" id="rail-cw">Continue Watching</h2>
-      <div class="rail" role="list">${cw.map((item) => removableCard(item, "cw", "Remove from Continue Watching")).join("")}</div>
+      <div class="rail" role="list">${cw
+        .map((item) =>
+          removableCard(
+            item,
+            "cw",
+            "Remove from Continue Watching",
+            item.duration > 0 ? item.position / item.duration : undefined,
+          ),
+        )
+        .join("")}</div>
     </section>`;
 }
 
@@ -58,25 +67,31 @@ export async function loadBoard(addons: Addon[]): Promise<void> {
   );
 }
 
-/** A single poster card linking to the detail route (an anchor, so it is keyboard-focusable). */
-export function posterCard(item: MetaItem): string {
+/** A single poster card linking to the detail route (an anchor, so it is keyboard-focusable). When a
+ *  `progress` fraction (0..1) is given, a thin watched-progress track is drawn under the art (used by
+ *  the Continue Watching rail); omitted everywhere else, so other grids are unchanged. */
+export function posterCard(item: MetaItem, progress?: number): string {
   const name = escapeHtml(item.name ?? "");
   const art = httpUrl(item.poster);
   const href = hashFor({ name: "detail", type: item.type, id: item.id });
   const inner = art
     ? `<img class="poster-art" loading="lazy" src="${escapeHtml(art)}" alt="${name}" />`
     : `<div class="poster-art poster-art-empty" aria-hidden="true">${name.slice(0, 1)}</div>`;
+  const bar =
+    progress !== undefined && progress > 0
+      ? `<span class="cw-progress" aria-hidden="true"><span style="width:${Math.min(100, Math.round(progress * 100))}%"></span></span>`
+      : "";
   return `
     <a class="poster" role="listitem" href="${escapeHtml(href)}" title="${name}">
-      ${inner}
+      ${inner}${bar}
       <span class="poster-name">${name}</span>
     </a>`;
 }
 
 /** A poster card wrapped with a remove (×) control, for the Continue Watching + Library rails. The button
  *  is a SIBLING of the card anchor (not nested) so clicking it removes rather than navigating. */
-export function removableCard(item: MetaItem, kind: "cw" | "lib", label: string): string {
-  return `<div class="card-wrap">${posterCard(item)}<button class="card-remove" type="button" data-action="remove-saved" data-id="${escapeHtml(item.id)}" data-kind="${kind}" aria-label="${escapeHtml(label)}">×</button></div>`;
+export function removableCard(item: MetaItem, kind: "cw" | "lib", label: string, progress?: number): string {
+  return `<div class="card-wrap">${posterCard(item, progress)}<button class="card-remove" type="button" data-action="remove-saved" data-id="${escapeHtml(item.id)}" data-kind="${kind}" aria-label="${escapeHtml(label)}">×</button></div>`;
 }
 
 function railTitle(ref: CatalogRef): string {

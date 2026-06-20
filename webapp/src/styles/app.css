@@ -228,6 +228,22 @@ input:focus-visible {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Watched-progress track under a Continue Watching poster (posterCard renders it only when a progress
+   fraction is passed). The inner span's inline width is the watched fraction. */
+.cw-progress {
+  display: block;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.cw-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+}
 .poster-skeleton .poster-art {
   animation: pulse 1.4s var(--ease) infinite;
 }
