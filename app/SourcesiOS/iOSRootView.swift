@@ -67,6 +67,8 @@ struct iOSRootView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
     @Environment(\.openURL) private var openURL
+    /// Post-update highlights, shown once when the build increases (never on a fresh install). See WhatsNew.
+    @State private var showWhatsNew = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -95,6 +97,11 @@ struct iOSRootView: View {
         .tint(Theme.Palette.accent)
         .animation(.easeOut(duration: 0.25), value: updates.available?.build)
         .animation(.easeOut(duration: 0.25), value: dismissedUpdateVersion)
+        .sheet(isPresented: $showWhatsNew) { WhatsNewView { showWhatsNew = false; WhatsNew.markSeen() } }
+        .onAppear {
+            WhatsNew.recordFreshInstallIfNeeded()
+            if WhatsNew.shouldShow() { showWhatsNew = true }
+        }
         #if os(macOS)
         // macOS menu-bar commands (the "Go" menu + ⌘-shortcuts) post here, since they live at the
         // Scene level and can't set this @State directly. The raw value mirrors Tab's order.
