@@ -1,5 +1,5 @@
 /**
- * VortX sync service v3 (Cloudflare Worker + D1) — END TO END ENCRYPTED.
+ * VortX sync service v3 (Cloudflare Worker + D1): END TO END ENCRYPTED.
  *
  * Login is email + password + a unique case-insensitive username, with QR login. But the server (and
  * any future self-hosted federation node) is a blind store: it only ever holds the email/username, a

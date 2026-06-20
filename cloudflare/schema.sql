@@ -1,4 +1,4 @@
--- VortX sync service schema v3 (Cloudflare D1 / SQLite) — END TO END ENCRYPTED.
+-- VortX sync service schema v3 (Cloudflare D1 / SQLite): END TO END ENCRYPTED.
 --
 -- The server (and any future self-hosted federation node) stores ONLY: the email/username, a
 -- per-account KDF salt, a hash of the client's auth verifier, the data key wrapped by the password
