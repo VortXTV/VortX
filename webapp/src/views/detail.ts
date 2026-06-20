@@ -42,11 +42,16 @@ interface DetailState {
 let state: DetailState | null = null;
 let addons: Addon[] = [];
 let hostEl: HTMLElement | null = null;
+// Monotonic guard for in-flight stream fetches: only the latest request may apply its results. Without
+// it, a slower earlier fetch (e.g. episode A) can resolve after a newer one (episode B) and clobber the
+// open episode's streams - so "Watch" would play the wrong episode's source. Latest request wins.
+let streamReqToken = 0;
 
 /** Open the Detail surface for a title. Loads meta first (so the page paints), then streams. */
 export async function openDetail(host: HTMLElement, installed: Addon[], type: string, id: string): Promise<void> {
   addons = installed;
   hostEl = host;
+  streamReqToken++; // navigating to a new title invalidates any prior in-flight stream fetch
   state = {
     type,
     id,
@@ -80,11 +85,12 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
 /** Fetch streams for a movie or episode id, repainting when each add-on group resolves. */
 async function loadStreams(type: string, id: string): Promise<void> {
   if (!state) return;
+  const token = ++streamReqToken;
   state.streamsLoading = true;
   state.groups = [];
   render();
   const groups = await fetchStreams(addons, type, id);
-  if (!state) return;
+  if (!state || token !== streamReqToken) return; // navigated away, or a newer fetch superseded this one
   state.groups = groups;
   state.streamsLoading = false;
   render();
