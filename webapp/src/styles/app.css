@@ -426,9 +426,10 @@ input:focus-visible {
 .detail-scrim {
   position: absolute;
   inset: 0;
+  /* Exact iOSDetailView.backdrop stops: a vertical fade to canvas + a leading fade for the title column. */
   background:
-    linear-gradient(180deg, transparent 0%, rgba(21, 18, 14, 0.55) 55%, rgba(21, 18, 14, 0.92) 82%, var(--bg) 100%),
-    linear-gradient(90deg, rgba(21, 18, 14, 0.65) 0%, transparent 55%);
+    linear-gradient(180deg, transparent 0%, rgba(21, 18, 14, 0.35) 55%, rgba(21, 18, 14, 0.85) 85%, var(--bg) 100%),
+    linear-gradient(90deg, rgba(21, 18, 14, 0.6) 0%, transparent 50%);
 }
 .back {
   position: absolute;
@@ -437,6 +438,7 @@ input:focus-visible {
   z-index: 3;
   display: inline-flex;
   align-items: center;
+  gap: 0.35rem;
   padding: 0.5rem 0.9rem;
   border-radius: var(--radius-pill);
   background: rgba(0, 0, 0, 0.45);
@@ -487,9 +489,10 @@ input:focus-visible {
   color: var(--accent-bright);
   font-weight: 700;
 }
-/* Readable content column below the hero, blocks separated on the --space-lg rhythm. */
+/* Readable content column below the hero (iOSDetailView caps the source-heavy column at 900 on wide
+   windows), blocks separated on the --space-lg rhythm. */
 .detail-content {
-  max-width: 940px;
+  max-width: 900px;
   margin: 0 auto;
   padding: var(--space-lg) var(--space-edge) var(--space-xl);
   display: flex;
@@ -497,7 +500,7 @@ input:focus-visible {
   gap: var(--space-lg);
 }
 .desc {
-  max-width: 68ch;
+  max-width: 760px;
   color: var(--text);
   margin: 0;
 }
@@ -507,7 +510,7 @@ input:focus-visible {
   flex-direction: column;
   gap: 0.3rem;
   margin: 0;
-  max-width: 68ch;
+  max-width: 760px;
   font-size: 0.92rem;
 }
 .credit-role {
@@ -627,7 +630,11 @@ input:focus-visible {
 }
 .stream-icon {
   color: var(--accent);
-  margin-top: 0.1rem;
+  margin-top: 0.15rem;
+}
+.stream-icon .ico {
+  width: 1.25em;
+  height: 1.25em;
 }
 .stream-text {
   display: flex;
@@ -712,6 +719,10 @@ input:focus-visible {
   display: grid;
   place-items: center;
   color: var(--muted-2);
+}
+.episode-thumb-empty .ico {
+  width: 1.8em;
+  height: 1.8em;
 }
 .episode-text {
   display: flex;

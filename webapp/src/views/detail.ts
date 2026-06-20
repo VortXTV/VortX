@@ -13,6 +13,7 @@ import {
 } from "../lib/streamRanking";
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
+import { icon } from "../lib/icons";
 import { play } from "../lib/player";
 import { cwPosition, cwProgress, inLibrary, toggleLibrary } from "../lib/store";
 
@@ -231,8 +232,8 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
  *  iOSDetailView (the backdrop is a banner, not a full-page wash). */
 function detailHero(meta: MetaItem, logo: string, bg: string, episode?: Video): string {
   const back = episode
-    ? `<button class="back" data-action="close-episode">‹ Episodes</button>`
-    : `<a class="back" href="#/" data-action="nav-home">‹ Home</a>`;
+    ? `<button class="back" data-action="close-episode">${icon("back")}<span>Episodes</span></button>`
+    : `<a class="back" href="#/" data-action="nav-home">${icon("back")}<span>Home</span></a>`;
   const epTitle = episode ? episode.title || episode.name || `Episode ${episode.episode ?? 0}` : "";
   const titleHtml = episode
     ? `<span class="detail-eyebrow t-eyebrow">${escapeHtml(meta.name)}</span><h1 class="detail-title t-hero">${escapeHtml(epTitle)}</h1>`
@@ -291,7 +292,7 @@ function streamSection(groups: RankedGroup[], extraActions: string): string {
     return `
       <div class="stream-section">
         <div class="hero-actions">
-          <button class="btn-primary is-disabled" disabled><span class="play-icon" aria-hidden="true">▷</span> No playable sources</button>
+          <button class="btn-primary is-disabled" disabled>${icon("play")}<span>No playable sources</span></button>
           ${extraActions}
         </div>
         <div class="surface-card stream-empty">
@@ -319,11 +320,11 @@ function streamSection(groups: RankedGroup[], extraActions: string): string {
     resumePos > 0 ? `Resume · ${formatTime(resumePos)}` : `Watch · ${escapeHtml(watchLabel(top))}`;
   const controls = `
     <div class="hero-actions">
-      <button class="btn-primary" data-action="play-best"><span class="play-icon" aria-hidden="true">▷</span> ${watchText}</button>
-      <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">Quality ⌄</button>
-      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${
+      <button class="btn-primary" data-action="play-best">${icon("play")}<span>${watchText}</span></button>
+      <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">${icon("quality")}<span>Quality</span></button>
+      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${icon("sources")}<span>${
         state.showAllSources ? "Hide sources" : `Sources · ${streamCount}`
-      }</button>
+      }</span></button>
       ${extraActions}
     </div>`;
 
@@ -344,7 +345,7 @@ function qualityPicker(groups: RankedGroup[]): string {
   if (!state?.pickerOpen) return "";
   if (state.pickerTier) {
     const variants = variantOptions(groups, state.pickerTier);
-    const back = `<button class="chip" data-action="picker-back">‹ ${escapeHtml(state.pickerTier)}</button>`;
+    const back = `<button class="chip" data-action="picker-back">${icon("back")}<span>${escapeHtml(state.pickerTier)}</span></button>`;
     const opts = variants
       .map(
         (v, i) =>
@@ -391,7 +392,7 @@ function streamRow(group: RankedGroup, stream: Stream, index: number): string {
   const desc = stream.description ? `<div class="stream-desc">${escapeHtml(stream.description)}</div>` : "";
   return `
     <button class="stream" data-action="play-stream" data-base="${escapeHtml(group.base)}" data-index="${index}">
-      <span class="stream-icon" aria-hidden="true">▷</span>
+      <span class="stream-icon">${icon("play")}</span>
       <span class="stream-text">
         <span class="stream-meta">${badge}${torrentBadge}${tags}</span>
         ${name}${desc}
@@ -439,7 +440,7 @@ function episodeRow(v: Video): string {
   const thumb = httpUrl(v.thumbnail);
   const art = thumb
     ? `<img class="episode-thumb" loading="lazy" src="${escapeHtml(thumb)}" alt="${escapeHtml(title)}" />`
-    : `<div class="episode-thumb episode-thumb-empty" aria-hidden="true">▷</div>`;
+    : `<div class="episode-thumb episode-thumb-empty" aria-hidden="true">${icon("play")}</div>`;
   const date = v.released && v.released.length >= 10 ? v.released.slice(0, 10) : "";
   const meta = [code, date].filter(Boolean).join(" · ");
   const overview = v.overview || v.description;
@@ -540,18 +541,20 @@ function youTubeID(value: string): string | undefined {
 }
 
 function trailerButton(): string {
-  return `<button class="chip trailer-chip" data-action="play-trailer">▶ Trailer</button>`;
+  return `<button class="chip trailer-chip" data-action="play-trailer">${icon("trailer")}<span>Trailer</span></button>`;
 }
 
 /** Save/Saved toggle that adds the current title to the local Library (see store.ts). */
 function libraryButton(meta: MetaItem): string {
   const saved = inLibrary(meta.id);
-  return `<button class="chip lib-chip${saved ? " saved" : ""}" data-action="toggle-library" aria-pressed="${saved}">${saved ? "✓ Saved" : "+ Save"}</button>`;
+  return `<button class="chip lib-chip${saved ? " selected" : ""}" data-action="toggle-library" aria-pressed="${saved}">${
+    saved ? `${icon("bookmarkFill")}<span>Saved</span>` : `${icon("bookmark")}<span>Save</span>`
+  }</button>`;
 }
 
 /** Share the current title. The detail route already lives in the URL, so location.href is the link. */
 function shareButton(): string {
-  return `<button class="chip" data-action="share">Share</button>`;
+  return `<button class="chip" data-action="share">${icon("share")}<span>Share</span></button>`;
 }
 async function shareTitle(): Promise<boolean> {
   if (!state?.meta) return true;
@@ -570,12 +573,13 @@ async function shareTitle(): Promise<boolean> {
 }
 /** Brief "Link copied" confirmation on the Share button after a clipboard-fallback copy. */
 function flashShareCopied(): void {
-  const btn = hostEl?.querySelector<HTMLElement>('[data-action="share"]');
-  if (!btn) return;
-  const prev = btn.textContent ?? "Share";
-  btn.textContent = "Link copied";
+  // Swap only the label span, not the whole button - setting textContent would wipe the leading icon.
+  const span = hostEl?.querySelector<HTMLElement>('[data-action="share"] span');
+  if (!span) return;
+  const prev = span.textContent ?? "Share";
+  span.textContent = "Link copied";
   setTimeout(() => {
-    if (btn.textContent === "Link copied") btn.textContent = prev;
+    if (span.textContent === "Link copied") span.textContent = prev;
   }, 1500);
 }
 
@@ -591,7 +595,7 @@ function openTrailer(youtubeId: string): void {
   }
   const src = `${TRAILER_HOST}/embed/${encodeURIComponent(youtubeId)}?autoplay=1&rel=0`;
   frame.innerHTML = `
-    <button class="back trailer-close" data-action="close-trailer">‹ Close</button>
+    <button class="back trailer-close" data-action="close-trailer">${icon("back")}<span>Close</span></button>
     <iframe class="trailer-frame" src="${escapeHtml(src)}" allow="autoplay; encrypted-media; fullscreen"
             allowfullscreen referrerpolicy="strict-origin"></iframe>`;
 }
