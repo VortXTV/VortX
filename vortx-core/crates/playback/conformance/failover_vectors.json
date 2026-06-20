@@ -1,0 +1,47 @@
+{
+  "description": "Cross-language conformance for stream failover + dead-link rot. Each case starts a failover over a candidate list, applies a sequence of failure signals, and pins the (next, rot-emitted) of each step. A permanent ResolveError on a debrid/torrent candidate rots (emits a negative fact); a transient FirstByteTimeout never rots; a direct URL never rots.",
+  "cases": [
+    {
+      "name": "walk_terminates_in_rank_order",
+      "candidates": [
+        { "id": "a" },
+        { "id": "b" },
+        { "id": "c" }
+      ],
+      "signals": ["resolve_error", "resolve_error", "resolve_error"],
+      "expect_steps": [
+        { "next": 1, "rotted": false },
+        { "next": 2, "rotted": false },
+        { "next": null, "rotted": false }
+      ]
+    },
+    {
+      "name": "permanent_debrid_failure_rots",
+      "candidates": [
+        { "id": "rd", "infohash": "aabbccddeeff00112233445566778899aabbccdd", "service": "realdebrid", "file_idx": 0 },
+        { "id": "direct" }
+      ],
+      "signals": ["resolve_error"],
+      "expect_steps": [
+        { "next": 1, "rotted": true }
+      ]
+    },
+    {
+      "name": "transient_timeout_never_rots",
+      "candidates": [
+        { "id": "rd", "infohash": "aabbccddeeff00112233445566778899aabbccdd", "service": "realdebrid", "file_idx": 0 },
+        { "id": "direct" }
+      ],
+      "signals": ["first_byte_timeout"],
+      "expect_steps": [
+        { "next": 1, "rotted": false }
+      ]
+    },
+    {
+      "name": "direct_link_never_rots",
+      "candidates": [{ "id": "a" }, { "id": "b" }],
+      "signals": ["resolve_error"],
+      "expect_steps": [{ "next": 1, "rotted": false }]
+    }
+  ]
+}

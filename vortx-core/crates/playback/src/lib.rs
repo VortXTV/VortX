@@ -19,11 +19,15 @@
 //! route are a later phase that builds on these frozen, tested types.
 
 mod fact;
+mod failover;
 mod model;
 mod resolve;
 mod sprite;
 
 pub use fact::{asset_signing_bytes_for, merge_asset_fact, AssetFact, AssetKey, HiveAssetMap};
+pub use failover::{
+    rot_cache_fact, FailoverStep, FailureSignal, RotFact, StreamCandidate, StreamFailover,
+};
 pub use model::{
     AssetKind, AssetLocator, Chapter, MediaKey, PlaybackAsset, SkipKind, SkipMarker,
     TrickplaySprite,
