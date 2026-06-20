@@ -38,8 +38,9 @@ pub use collab::{
 };
 pub use feature::{cosine, feature_vector, FeatureKey, FeatureVector, MetaFeatures, RuntimeBucket};
 pub use homefeed::{
-    build_home_feed, AllEligible, AllOf, AvailabilitySet, EligibilityFilter, HomeFeed,
-    HomeFeedInput, HomeFeedPrefs, Lane, LaneItem, LaneKind, MaturityGate,
+    build_home_feed, watch_log_from_library, AllEligible, AllOf, AvailabilitySet,
+    EligibilityFilter, HomeFeed, HomeFeedInput, HomeFeedPrefs, Lane, LaneItem, LaneKind,
+    MaturityGate,
 };
 pub use recommend::{recommend, Candidate, Reason, RecoPrefs, Recommendation};
 pub use taste::{build_taste, Engagement, EngagementSignal, TasteProfile, HALF_LIFE_DAYS};

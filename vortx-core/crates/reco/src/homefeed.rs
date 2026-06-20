@@ -19,9 +19,45 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use vortx_state::{maturity_allows, MaturityRating, ParentalFlags, WatchLog, WatchState};
+use vortx_state::{
+    maturity_allows, merge_watch, MaturityRating, ParentalFlags, ProfileLibrary, WatchLog,
+    WatchState,
+};
 
 use crate::recommend::{recommend, Candidate, Reason, RecoPrefs};
+
+/// A resume offset within this fraction (per-mille) of the runtime counts as FINISHED, not in-progress, so
+/// a title you watched to the end never reappears in Up Next.
+const NEAR_END_PERMILLE: u64 = 900;
+
+/// Derive a [`WatchLog`] from a profile's stored library: each resume point becomes an in-progress watch
+/// state (or finished when it is near the end), and each history entry becomes finished. This is how the
+/// engine turns the real continue-watching + history state into the Up Next / Start Watching signals,
+/// reusing the watch-state CRDT merge so the two sources combine domain-correctly.
+pub fn watch_log_from_library(lib: &ProfileLibrary) -> WatchLog {
+    let mut log = WatchLog::new();
+    for (id, rp) in &lib.resume {
+        let near_end = rp.duration_secs > 0
+            && rp.offset_secs.saturating_mul(1000)
+                >= rp.duration_secs.saturating_mul(NEAR_END_PERMILLE);
+        let ws = if near_end {
+            WatchState::finished(rp.updated_at)
+        } else {
+            WatchState::resumed(rp.offset_secs.saturating_mul(1000), rp.updated_at)
+        };
+        merge_into(&mut log, id, ws);
+    }
+    for h in &lib.history {
+        merge_into(&mut log, &h.id, WatchState::finished(h.watched_at));
+    }
+    log
+}
+
+fn merge_into(log: &mut WatchLog, id: &str, ws: WatchState) {
+    log.entry(id.to_string())
+        .and_modify(|e| *e = merge_watch(e, &ws))
+        .or_insert(ws);
+}
 use crate::taste::TasteProfile;
 
 /// The availability gate. The engine plugs in a real source (debrid cache vault + live-catalog set); a
@@ -363,6 +399,30 @@ mod tests {
         // "a" only in Up Next; "b" startable; "d" trending.
         let up: Vec<&str> = feed.lanes[0].items.iter().map(|i| i.meta_id.as_str()).collect();
         assert_eq!(up, vec!["a"]);
+    }
+
+    #[test]
+    fn watch_log_derivation_marks_in_progress_finished_and_history() {
+        use vortx_state::{HistoryEntry, ProfileLibrary, ResumePoint};
+        let mut lib = ProfileLibrary::default();
+        // In-progress: 10 min into a 60 min title.
+        lib.resume.insert(
+            "a".into(),
+            ResumePoint { offset_secs: 600, duration_secs: 3600, updated_at: 100 },
+        );
+        // Near the end: 59 of 60 min -> treated as finished.
+        lib.resume.insert(
+            "b".into(),
+            ResumePoint { offset_secs: 3540, duration_secs: 3600, updated_at: 200 },
+        );
+        // History: explicitly finished.
+        lib.history.push(HistoryEntry { id: "c".into(), video_id: None, watched_at: 300 });
+
+        let log = watch_log_from_library(&lib);
+        assert_eq!(log["a"].resume_ms, 600_000);
+        assert!(!log["a"].is_watched()); // in progress
+        assert!(log["b"].is_watched()); // near-end resume counts as finished
+        assert!(log["c"].is_watched());
     }
 
     #[test]
