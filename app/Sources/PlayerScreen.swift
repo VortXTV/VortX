@@ -296,15 +296,16 @@ struct PlayerScreen: View {
     }
 
     #if os(iOS)
-    /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto` the HLS case is
-    /// already handled in `body` (the minimal HLSPlayerView), so here in auto this is false for everything that
-    /// reaches it, and today's behavior is unchanged. It only goes true when the player-engine override forces
-    /// AVPlayer (the on-device test path for the full-chrome AVPlayer engine). `isDolbyVision` is not yet
-    /// threaded from the stream picker, so DV auto-routing arrives with that wiring.
+    /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: HLS is already
+    /// handled in `body` (the minimal HLSPlayerView), and now a **Dolby Vision** stream in an AVPlayer-playable
+    /// container (MP4/MOV/M4V) auto-routes here for true DV passthrough (libmpv only tone-maps DV to SDR). The
+    /// override (Always libmpv / Prefer AVPlayer) still wins. On an AVPlayer load failure we fall back to libmpv
+    /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
         if avEngineFailed { return false }   // an AVPlayer load failure fell back to libmpv for this stream
         let loopback = url.host == "127.0.0.1" || url.host == "localhost"
-        return PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: false) == .avfoundation
+        let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
+        return PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: isDV) == .avfoundation
     }
     #endif
 

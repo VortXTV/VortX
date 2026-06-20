@@ -22,6 +22,7 @@ Building on the 0.3.8 account work. The headline is that VortX now speaks **32 l
 - **Where to Watch.** The detail page shows where a title streams legally in your region, with provider logos and a link (needs a TMDB key).
 - **Anime skip.** Intro, ending, and recap skipping now covers anime via AniSkip (keyed by MAL id), alongside the existing crowd timestamps.
 - **In-player frame grab.** A Grab button captures the current frame at full quality and opens the share sheet to save or send it (iPhone, iPad, Mac).
+- **True Dolby Vision on iPhone and iPad.** A Dolby Vision stream in an MP4, MOV, or HLS container now plays through Apple's AVPlayer for true DV passthrough on a DV-capable display, instead of being tone-mapped to SDR. Direct and debrid sources benefit; MKV releases and torrents stay on the built-in player (which has no Matroska path in AVPlayer), and an AVPlayer load failure falls back to it automatically. Force either engine in Settings, Playback. tvOS and Mac follow in a later release. (#76)
 - **Ratings on posters (XRDB).** Optionally overlay ratings, quality badges, and provider logos on your posters from an XRDB instance (Settings).
 - **Eight seek-bar styles** for how the scrubber looks during playback (Settings).
 - **One-tap sideload updates.** An AltStore / SideStore source so a sideloaded VortX updates in place.

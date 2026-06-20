@@ -6,9 +6,11 @@ import Foundation
 /// IMPORTANT: evaluate on the RAW (un-proxied) stream URL. `StremioServer.proxiedURL` rewrites the host to
 /// 127.0.0.1, which would make every proxied stream look like a loopback torrent and never reach AVPlayer.
 ///
-/// Pure logic, no platform types, so it compiles on every target. Not yet wired into the player branch
-/// points (PlayerScreen / RootTabView) -- that is the next step; in `auto` with no DV hint it returns the
-/// same decision `HLSPlayerView.handles()` makes today, so wiring it is behavior-preserving.
+/// Pure logic, no platform types, so it compiles on every target. WIRED on iOS: `PlayerScreen.useAVPlayerEngine`
+/// passes the real `isDolbyVision` (from the launching stream's quality text), so DV in an AVPlayer-playable
+/// container now auto-routes to the full-chrome AVPlayer engine for true DV. tvOS routes HLS via its own
+/// branch (RootTabView) and macOS stays on libmpv in `auto` (no AVKit surface yet) -- the tvOS/Mac default
+/// flip + true DV is 0.4 work.
 enum PlayerEngineRouter {
     enum Engine: String { case mpv, avfoundation }
 
@@ -63,8 +65,11 @@ enum PlayerEngineRouter {
         case .auto:         break
         }
 
-        // (3) Dolby Vision -> AVPlayer for true DV passthrough (libmpv/MoltenVK only tone-maps DV to SDR).
-        if isDolbyVision { return .avfoundation }
+        // (3) Dolby Vision -> AVPlayer for true DV passthrough (libmpv/MoltenVK only tone-maps DV to SDR),
+        // but ONLY for a container AVFoundation can demux (MP4/MOV/M4V or HLS). DV in an MKV must stay on
+        // libmpv: AVFoundation has no Matroska demuxer, so routing it to AVPlayer would just fail over to
+        // libmpv anyway (tone-mapped). The AVPlayer->libmpv .failed fallback in the chrome is the backstop.
+        if isDolbyVision, isAVPlayerContainer(url) { return .avfoundation }
 
         // (4) Remote HLS -> AVPlayer for native adaptive bitrate, AirPlay, and PiP.
         if isHLS(url) { return .avfoundation }
@@ -77,5 +82,13 @@ enum PlayerEngineRouter {
     /// True for an adaptive HLS playlist URL. Mirrors the rule `HLSPlayerView.handles` uses today.
     static func isHLS(_ url: URL) -> Bool {
         url.pathExtension.lowercased() == "m3u8" || url.absoluteString.lowercased().contains(".m3u8")
+    }
+
+    /// Containers AVFoundation can demux for the DV path. AVPlayer has no Matroska demuxer, so DV in an
+    /// `.mkv` stays on libmpv; an unknown/extensionless URL also stays on libmpv (safe default). HLS is a
+    /// container AVPlayer handles natively. Used by rule (3) so the DV flip only fires when it can succeed.
+    static func isAVPlayerContainer(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "mp4" || ext == "m4v" || ext == "mov" || isHLS(url)
     }
 }

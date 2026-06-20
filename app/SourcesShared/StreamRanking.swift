@@ -787,6 +787,15 @@ enum StreamRanking {
         return tags.joined(separator: " · ")
     }
 
+    /// True when a stream's quality text advertises Dolby Vision. This is the only DV signal available
+    /// before playback (a text parse); the engine router uses it to route DV to AVPlayer for true DV
+    /// passthrough, which libmpv/MoltenVK cannot do (it only tone-maps DV to SDR). HDR10 is intentionally
+    /// NOT included: libmpv's gpu-next renders HDR10 correctly, so only DV needs the AVPlayer path.
+    static func isDolbyVision(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi") || matches(t, #"\bdv\b"#)
+    }
+
     private static func qualityText(_ s: CoreStream) -> String {
         let key = streamKey(s)
         cacheLock.lock()
