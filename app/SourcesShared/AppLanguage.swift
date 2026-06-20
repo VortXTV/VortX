@@ -25,6 +25,8 @@ enum AppLanguage {
         ("ro", "Română"), ("ru", "Русский"), ("sk", "Slovenčina"), ("sl", "Slovenščina"), ("sr", "Српски"),
         ("sv", "Svenska"), ("ta", "தமிழ்"), ("te", "తెలుగు"), ("th", "ไทย"), ("tr", "Türkçe"),
         ("uk", "Українська"), ("ur", "اردو"), ("vi", "Tiếng Việt"), ("zh-Hans", "简体中文"), ("zh-Hant", "繁體中文"),
+        ("sw", "Kiswahili"), ("kk", "Қазақ"), ("hy", "Հայերեն"), ("ka", "ქართული"),
+        ("pa", "ਪੰਜਾਬੀ"), ("ne", "नेपाली"), ("km", "ខ្មែរ"), ("am", "አማርኛ"),
     ]
 
     private static let appleLanguagesKey = "AppleLanguages"
