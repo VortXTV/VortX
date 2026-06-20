@@ -833,9 +833,20 @@ input:focus-visible {
   line-height: 1;
   cursor: pointer;
   opacity: 0;
+  /* Hidden by default AND not hit-testable, so on a touch device (no hover) tapping the poster's corner
+     opens the title instead of silently removing it. Re-enabled with opacity when revealed. */
+  pointer-events: none;
   transition: opacity var(--duration-normal) var(--ease);
 }
 .card-wrap:hover .card-remove,
 .card-remove:focus-visible {
   opacity: 1;
+  pointer-events: auto;
+}
+/* Touch devices have no hover, so keep the remove control visible and tappable there. */
+@media (hover: none) {
+  .card-remove {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
