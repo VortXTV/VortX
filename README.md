@@ -11,7 +11,7 @@
   <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/vortxtv/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
   <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/vortxtv/VortX/total?color=4c8dff" alt="Downloads"></a>
   <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/vortxtv/VortX?color=4c8dff" alt="License"></a>
-  <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS-4c8dff" alt="Platforms">
+  <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS%20%C2%B7%20macOS-4c8dff" alt="Platforms">
 </p>
 <p align="center">
   <a href="https://www.reddit.com/r/Vortx"><img src="https://github.com/user-attachments/assets/05eced3b-efeb-4238-83af-d3a105d3a8f1" width="26" height="26" alt="reddit"></a>
@@ -22,6 +22,17 @@
 The native streaming client for Apple devices, **formerly StremioX**. Fully native apps for Apple TV, iPhone, iPad, and Mac, built on stremio-core and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
 
 > **StremioX is now VortX, as of v0.3.5.** The app takes its new name, gold-on-obsidian icon, and animated intro starting with this release. It is an in-place update, so your library, add-ons, watch history, and settings are exactly where you left them, signed into the same account. The repository and docs follow next, along with a website, a subreddit, and a Discord. A later update will move VortX to a fresh identity all the way down; when that lands your library and history still return on sign-in, but local settings could start fresh, which is why this release adds **Backup & Restore**.
+
+## New in the 0.3.8 line
+
+The 0.3.8 betas (current: **Beta 5**) added a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext, plus a wave of per-profile and power-user control:
+
+- **40 languages**, following your device automatically, with right-to-left layout for Arabic, Hebrew, Persian, and Urdu.
+- **True Dolby Vision on iPhone and iPad**: a Dolby Vision MP4, MOV, or HLS stream now plays through Apple's AVPlayer for real DV passthrough on a capable display, with an automatic fallback to the built-in libmpv player. Apple TV and Mac follow in a later release. (#76)
+- **Per-profile add-ons** with live **health checks**, **Kids Mode**, **in-app debrid keys** (Real-Debrid, AllDebrid, Premiumize, TorBox), one-tap **quality presets**, **regex source filters**, profile **library export and import**, **Import from Stremio**, **Where to Watch**, **anime skip**, an in-player **frame grab**, **poster rating overlays**, and **eight seek-bar styles**.
+- **In-app updates** with an AltStore / SideStore source, and full **profile management on the web dashboard**.
+
+Full detail is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Backup, restore, and sync
 
