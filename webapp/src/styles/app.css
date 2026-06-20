@@ -1803,3 +1803,28 @@ video::cue {
   height: 1.05rem;
   flex: none;
 }
+
+/* Player speed control (player.ts): pill in the player chrome; cycles 0.5x-2x via click or the [ / ] keys. */
+.player-speed {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  z-index: 3;
+  min-width: 3.1rem;
+  padding: 0.4rem 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background var(--dur-state) var(--ease-spring), color var(--dur-state) var(--ease-spring);
+}
+.player-speed:hover,
+.player-speed:focus-visible {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  outline: none;
+}

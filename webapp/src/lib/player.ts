@@ -38,13 +38,28 @@ function isHls(url: string): boolean {
   return HLS_EXT.test(url);
 }
 
-/** The chrome that wraps the <video>: a Back button, a centered title, and the video itself. */
+/** The chrome that wraps the <video>: a Back button, a centered title, a speed control, and the video. */
 function chrome(title: string): string {
   return `
     <button class="player-close" data-action="close-player" aria-label="Close player">‹ Back</button>
     <div class="player-title" aria-hidden="true">${escapeHtml(title)}</div>
+    <button class="player-speed" id="player-speed" aria-label="Playback speed">1×</button>
     <video class="player-video" id="player-video" controls autoplay playsinline
            crossorigin="anonymous"></video>`;
+}
+
+// Variable playback speed (a CloudStream-parity win). Shared by the speed button and the [ / ] keys.
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+function setSpeed(video: HTMLVideoElement, rate: number): void {
+  video.playbackRate = rate;
+  const btn = el("player-speed");
+  if (btn) btn.textContent = `${rate}×`;
+}
+function stepSpeed(video: HTMLVideoElement, dir: number): void {
+  const cur = video.playbackRate || 1;
+  let i = SPEEDS.findIndex((s) => Math.abs(s - cur) < 0.01);
+  if (i === -1) i = SPEEDS.indexOf(1);
+  setSpeed(video, SPEEDS[(i + dir + SPEEDS.length) % SPEEDS.length]);
 }
 
 /** Open the player overlay and play `url`. `title` is shown as thin chrome over the transport. */
@@ -64,6 +79,7 @@ export async function play(
   if (!video) return;
   if (item) wireProgress(video, item);
   wireKeyboard(video);
+  el("player-speed")?.addEventListener("click", () => stepSpeed(video, 1));
   // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
   // unsupported codec). The hls.js path has its own fatal-error handler; this covers the direct/debrid
   // and native-HLS paths, which would otherwise just show a black player. Teardown clears the source via
@@ -163,6 +179,12 @@ function wireKeyboard(video: HTMLVideoElement): void {
         break;
       case "ArrowDown":
         video.volume = Math.max(0, video.volume - 0.1);
+        break;
+      case "BracketRight":
+        stepSpeed(video, 1);
+        break;
+      case "BracketLeft":
+        stepSpeed(video, -1);
         break;
       case "KeyM":
         video.muted = !video.muted;
