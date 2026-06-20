@@ -13,8 +13,10 @@ import Foundation
 enum AppLanguage {
     /// (code, autonym) for every shipped language, in the catalog's order.
     static let supported: [(code: String, name: String)] = [
-        ("ar", "العربية"), ("bg", "Български"), ("bn", "বাংলা"), ("cs", "Čeština"), ("da", "Dansk"),
+        ("af", "Afrikaans"), ("ar", "العربية"), ("az", "Azərbaycan"), ("bg", "Български"), ("bn", "বাংলা"),
+        ("ca", "Català"), ("cs", "Čeština"), ("da", "Dansk"),
         ("de", "Deutsch"), ("el", "Ελληνικά"), ("en", "English"), ("es", "Español"), ("et", "Eesti"),
+        ("eu", "Euskara"), ("gl", "Galego"), ("is", "Íslenska"), ("mk", "Македонски"), ("sq", "Shqip"),
         ("fa", "فارسی"), ("fi", "Suomi"), ("fil", "Filipino"), ("fr", "Français"), ("gu", "ગુજરાતી"),
         ("he", "עברית"), ("hi", "हिन्दी"), ("hr", "Hrvatski"), ("hu", "Magyar"), ("id", "Bahasa Indonesia"),
         ("it", "Italiano"), ("ja", "日本語"), ("kn", "ಕನ್ನಡ"), ("ko", "한국어"), ("lt", "Lietuvių"),
