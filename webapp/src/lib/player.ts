@@ -149,6 +149,10 @@ function wireKeyboard(video: HTMLVideoElement): void {
         if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
         else void video.requestFullscreen().catch(() => undefined);
         break;
+      case "KeyP":
+        if (document.pictureInPictureElement) void document.exitPictureInPicture().catch(() => undefined);
+        else if (document.pictureInPictureEnabled) void video.requestPictureInPicture().catch(() => undefined);
+        break;
       default:
         handled = false;
     }
