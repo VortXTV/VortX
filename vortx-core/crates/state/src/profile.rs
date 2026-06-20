@@ -2,6 +2,7 @@
 //! one attribute, NOT the profile's identity (the break from stremio-core where a profile is an account).
 
 use serde::{Deserialize, Serialize};
+use vortx_ranking::RankingPrefs;
 
 use crate::ids::ProfileId;
 
@@ -66,10 +67,18 @@ pub struct ProfileSettings {
     /// Add-on transport URLs disabled for this profile (kids-safe filtering, per-profile sources).
     #[serde(default, rename = "disabledAddons")]
     pub disabled_addons: Vec<String>,
+    /// This profile's stream-ranking preferences. Skipped from the wire when all-default so an existing
+    /// serialized profile is byte-identical (and the roster LWW merge key does not shift).
+    #[serde(default, skip_serializing_if = "is_default_ranking")]
+    pub ranking: RankingPrefs,
 }
 
 fn default_text_scale() -> u32 {
     1000
+}
+
+fn is_default_ranking(r: &RankingPrefs) -> bool {
+    *r == RankingPrefs::default()
 }
 
 impl Default for ProfileSettings {
@@ -80,6 +89,7 @@ impl Default for ProfileSettings {
             text_scale: default_text_scale(),
             languages: Vec::new(),
             disabled_addons: Vec::new(),
+            ranking: RankingPrefs::default(),
         }
     }
 }
