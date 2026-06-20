@@ -4,6 +4,33 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased (next)
+
+Building on the 0.3.8 account work. The headline is that VortX now speaks **32 languages**, alongside a wave of per-profile and power-user features. Version and date are set when this is cut.
+
+### Added
+
+- **32 languages.** The interface is now fully localized to Arabic, Chinese (Simplified and Traditional), Czech, Danish, Dutch, Filipino, Finnish, French, German, Greek, Hebrew, Hindi, Hungarian, Indonesian, Italian, Japanese, Korean, Malay, Norwegian, Persian, Polish, Portuguese (Brazil and Portugal), Romanian, Russian, Spanish, Swedish, Thai, Turkish, Ukrainian, and Vietnamese, on top of English. It follows your device language automatically; Arabic, Hebrew, and Persian lay out right-to-left.
+- **Per-profile add-ons.** Turn individual add-ons on or off per profile without removing them from your account, so one profile can drop sources another keeps (Add-ons).
+- **Add-on health.** Each add-on shows an Online / Slow / Unreachable dot from a live check, with a Re-check button (Add-ons).
+- **Kids Mode.** Mark a profile as a Kids profile to always hide adult and CAM/fake sources from it, however its filters are set (Profiles). Pair it with a PIN on your own profile for a full lock.
+- **In-app debrid keys.** Add your Real-Debrid, AllDebrid, Premiumize, or TorBox key once; it's stored in your encrypted account and used everywhere, with no separate configuration site (Settings, Debrid services).
+- **One-tap quality presets.** Best Quality, Balanced, and Data Saver set the source-type order and quality caps together, so you can pick a taste without tuning each control (Settings, Streams).
+- **Regex source filters.** The Hide / Require words can now be full case-insensitive regular expressions (Settings, Streams).
+- **Export and import a profile's library.** Save a profile's titles and watch progress to a file and bring it to another device or profile, no account needed (Settings, Backup & Restore).
+- **Import from Stremio.** A guided screen that points you to sign-in (which pulls your add-ons, library, and history) and installs several add-ons at once from a list of manifest URLs (Settings).
+- **Where to Watch.** The detail page shows where a title streams legally in your region, with provider logos and a link (needs a TMDB key).
+- **Anime skip.** Intro, ending, and recap skipping now covers anime via AniSkip (keyed by MAL id), alongside the existing crowd timestamps.
+- **In-player frame grab.** A Grab button captures the current frame at full quality and opens the share sheet to save or send it (iPhone, iPad, Mac).
+- **Ratings on posters (XRDB).** Optionally overlay ratings, quality badges, and provider logos on your posters from an XRDB instance (Settings).
+- **Eight seek-bar styles** for how the scrubber looks during playback (Settings).
+- **One-tap sideload updates.** An AltStore / SideStore source so a sideloaded VortX updates in place.
+
+### Fixed
+
+- **Saved magnets and pasted links attach to the right title**, with a confidence-gated match so a save never lands on the wrong show. (#81)
+- **Better audio over AirPods and Bluetooth**, with multichannel handled safely so spatial audio works and stereo-only routes don't drop out. (#88)
+
 ## 0.3.8 - 2026-06-19 (pre-release)
 
 The big one: a free, end-to-end-encrypted **VortX account**. Sign in and your profiles and settings follow you between devices, the server only ever holds ciphertext. This build fixes the headline problem from the first beta: your devices now actually sync to each other. Plus in-app add-on management, a catalog manager, optional TMDB-powered recommendations, and a batch of fixes. This is a pre-release for testing; QR sign-in on Apple TV and one-tap Stremio sign-in are coming in 0.3.9.
