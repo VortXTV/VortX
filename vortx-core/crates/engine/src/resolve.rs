@@ -8,8 +8,9 @@
 //! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::Stream;
+use vortx_protocol::{MetaPreview, Stream};
 use vortx_ranking::{rank, RankedStream, RankingPrefs};
+use vortx_reco::visible_catalog;
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
 use crate::engine::Engine;
@@ -34,6 +35,9 @@ pub enum ResolveRequest {
         #[serde(default)]
         prefs: SubtitlePrefs,
     },
+    /// Filter a catalog page through the ACTIVE profile's parental controls before it is shown. A kids
+    /// profile is enforced here, inside the engine, so a host cannot forget to gate a row.
+    Catalog { metas: Vec<MetaPreview> },
 }
 
 /// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
@@ -44,13 +48,15 @@ pub enum ResolveResponse {
     Streams { ranked: Vec<RankedStream> },
     /// The chosen subtitle track, or `null` when nothing was eligible.
     Subtitles { selected: Option<SubtitleSelection> },
+    /// The catalog rows the active profile is allowed to see.
+    Catalog { metas: Vec<MetaPreview> },
     Error { error: String },
 }
 
 /// Resolve one request against the engine. Pure: no I/O, no state mutation. `engine` is threaded for the
 /// resources that will read profile state (catalog/home feed); the streams path is stateless given
 /// explicit prefs.
-pub fn resolve(_engine: &Engine, req: ResolveRequest) -> ResolveResponse {
+pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
     match req {
         ResolveRequest::Streams {
             streams,
@@ -62,6 +68,18 @@ pub fn resolve(_engine: &Engine, req: ResolveRequest) -> ResolveResponse {
         ResolveRequest::Subtitles { tracks, prefs } => ResolveResponse::Subtitles {
             selected: select_subtitle(&tracks, &prefs),
         },
+        ResolveRequest::Catalog { metas } => {
+            // Enforce the active profile's parental controls inside the engine: a kids profile never even
+            // receives an over-ceiling or unrated row.
+            let visible = match engine.store().active_profile() {
+                Some(p) => visible_catalog(&metas, &p.parental)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                None => metas,
+            };
+            ResolveResponse::Catalog { metas: visible }
+        }
     }
 }
 
