@@ -16,10 +16,16 @@ export function renderAddons(host: HTMLElement, addons: Addon[], onChange: () =>
   host.innerHTML = `
     <div class="addons">
       <h1 class="page-title">Add-ons</h1>
-      <p class="muted">
-        VortX web plays direct and debrid (HTTP/HLS) sources. To get playable streams, add a stream
-        add-on that returns direct links, typically one backed by a debrid service. Torrent-only
-        add-ons will list sources but the web app cannot play them (no streaming server).
+      <p class="addon-intro">
+        VortX web plays two kinds of source: <strong>direct HTTPS</strong> streams and
+        <strong>debrid</strong> (RealDebrid, AllDebrid, Premiumize, TorBox). Both play instantly in the
+        browser. Plain torrents are listed but cannot play here yet, the web client has no streaming
+        server, so debrid is how you turn torrents into playable links on the web.
+      </p>
+      <p class="addon-intro muted">
+        For debrid: install a debrid-backed stream add-on (Torrentio, Comet, MediaFusion and similar)
+        configured with your own debrid key. The key lives inside the add-on's manifest URL, never in
+        VortX, so paste the personal manifest URL its configure page gives you into the field below.
       </p>
       <form class="addon-form" id="addon-form">
         <input class="search-input" id="addon-url" type="url" inputmode="url" autocomplete="off"

@@ -1053,3 +1053,14 @@ input:focus-visible {
     transform: none;
   }
 }
+
+/* Add-ons intro: debrid + direct HTTPS explained as two first-class, distinct source types. */
+.addon-intro {
+  max-width: 65ch;
+  line-height: 1.55;
+  margin-bottom: 0.75rem;
+}
+.addon-intro strong {
+  color: var(--text);
+  font-weight: 600;
+}
