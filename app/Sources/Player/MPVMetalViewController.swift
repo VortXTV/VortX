@@ -183,6 +183,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// receiver; Auto downmixes a stereo route but keeps native multichannel for a real receiver.
     private var channelPolicy: String {
         #if canImport(UIKit)
+        // AirPods: prefer a multichannel layout the system can spatialize (#88), never a forced stereo
+        // downmix, unless the viewer explicitly chose Stereo. `auto-safe` stays safe here too: it falls
+        // back to stereo when the route truly cannot take more, so this never silences AirPods.
+        if routeIsAirPods, AudioOutputMode.current != .stereo { return "auto-safe" }
         // A route that can only render stereo (TV built-in speakers, AirPlay) silently fails to open
         // a decoded multichannel layout: force a 2.0 downmix regardless of the chosen mode so the AO
         // always has something it can play (#78). The viewer can still pick a different route's mode
@@ -220,6 +224,16 @@ final class MPVMetalViewController: PlatformViewController {
         default: return false
         }
     }
+
+    /// True when the active route is AirPods (or another A2DP / LE Bluetooth audio sink). They can take a
+    /// system-spatialized multichannel layout (#88 Spatial Audio) but can NEVER take a raw spdif
+    /// bitstream, so passthrough is never armed on this route.
+    private var routeIsAirPods: Bool {
+        switch outputPortType {
+        case .some(.bluetoothA2DP), .some(.bluetoothLE): return true
+        default: return false
+        }
+    }
     #endif
 
     private func configureAudioSession() {
@@ -236,6 +250,13 @@ final class MPVMetalViewController: PlatformViewController {
             let mode: AVAudioSession.Mode = AudioOutputMode.current == .stereo ? .default : .moviePlayback
             try session.setCategory(.playback, mode: mode, options: [])
             try session.setActive(true)
+            // #88: let the system apply AirPods head-tracked Spatial Audio to multichannel content. Set
+            // BEFORE reading the channel count so the route can report its spatial multichannel capability.
+            // Benign on non-AirPods routes (HDMI/ARC/built-in speakers): it is a capability hint, not a
+            // re-route, so the eARC/soundbar PCM path is untouched.
+            if #available(iOS 15.0, tvOS 15.0, *) {
+                try? session.setSupportsMultichannelContent(true)
+            }
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
             outputPortType = session.currentRoute.outputs.first?.portType
@@ -393,7 +414,7 @@ final class MPVMetalViewController: PlatformViewController {
         // EXCEPT a stereo-only route (TV built-in speakers / AirPlay): there, passthrough does not
         // degrade cleanly and instead WEDGES the AO open (#78 "Passthrough freezes"), so never arm
         // spdif on those routes regardless of the chosen mode.
-        if !routeIsStereoOnly, let spdif = AudioOutputMode.current.spdifCodecs {
+        if !routeIsStereoOnly, !routeIsAirPods, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
         }
         // AO-open failure handling, route-aware. On a real external route (HDMI/ARC/eARC, USB, line
