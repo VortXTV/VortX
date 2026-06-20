@@ -258,14 +258,10 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
     <div class="detail-body">
       ${heroHead(meta, logo)}
       ${metaRow(meta)}
-      ${
-        meta.description
-          ? `<p class="desc">${escapeHtml(meta.description)}</p>`
-          : ""
-      }
-      ${creditsRow(meta)}
       ${streamSection(groups, progress)}
       ${trailer ? trailerButton() : ""}
+      ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
+      ${creditsRow(meta)}
     </div>`;
 }
 
@@ -389,8 +385,8 @@ function episodeStreamView(
     <span class="episode-eyebrow">${escapeHtml(meta.name)}</span>
     <h1 class="episode-screen-title">${escapeHtml(title)}</h1>
     <div class="meta-row">${metaParts.map((p) => `<span>${escapeHtml(p)}</span>`).join("")}</div>
-    ${episode.overview ? `<p class="desc">${escapeHtml(episode.overview)}</p>` : ""}
-    ${streamSection(groups, progress)}`;
+    ${streamSection(groups, progress)}
+    ${episode.overview ? `<p class="desc">${escapeHtml(episode.overview)}</p>` : ""}`;
 }
 
 function heroHead(meta: MetaItem, logo: string): string {

@@ -238,7 +238,7 @@ body {
   position: relative;
   z-index: 2;
   max-width: 60rem;
-  margin: 0 auto;
+  margin: 0;
   padding: 42vh 2.5rem 4rem;
 }
 .detail-logo {
