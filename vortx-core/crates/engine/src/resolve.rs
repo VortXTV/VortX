@@ -7,14 +7,19 @@
 //! streams that decision is the ranked, player-ready order from `vortx-ranking` (fixed-point, so the
 //! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use vortx_debrid::{
     DebridService, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
 };
 use vortx_protocol::{MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, RankedStream, RankingPrefs};
-use vortx_reco::visible_catalog;
-use vortx_state::maturity_allows_raw;
+use vortx_reco::{
+    build_home_feed, build_taste, visible_catalog, watch_log_from_library, AllEligible, AllOf,
+    AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
+};
+use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
 use crate::engine::Engine;
@@ -67,6 +72,27 @@ pub enum ResolveRequest {
         #[serde(default)]
         now: u64,
     },
+    /// Build the Home feed from the ACTIVE profile's library (continue-watching + history -> Up Next /
+    /// Start Watching) plus a host popularity list, parental-enforced and availability-filtered THROUGH the
+    /// engine. (The taste-based Because You Watched lane is a follow-up; it needs engagements wired.)
+    HomeFeed {
+        #[serde(default)]
+        trending: Vec<String>,
+        /// Available (playable) meta ids; `null`/absent = treat everything as available.
+        #[serde(default)]
+        available: Option<Vec<String>>,
+        /// Per-meta certification for the parental gate.
+        #[serde(default)]
+        ratings: Vec<RatingEntry>,
+    },
+}
+
+/// A `(meta id, certification)` pair the host supplies so the engine can parental-gate Home feed lanes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RatingEntry {
+    pub meta_id: String,
+    #[serde(default)]
+    pub certification: Option<String>,
 }
 
 /// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
@@ -83,6 +109,8 @@ pub enum ResolveResponse {
     Meta { meta: Option<Box<MetaDetail>> },
     /// The ordered resolve plan (rank 0 = try first).
     Debrid { plan: Vec<ResolveStep> },
+    /// The Home feed lanes (empty lanes dropped).
+    HomeFeed { lanes: Vec<Lane> },
     Error { error: String },
 }
 
@@ -145,6 +173,53 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             );
             let plan = ResolvePlanner::new(user_services).plan(&sources, &view, now);
             ResolveResponse::Debrid { plan }
+        }
+        ResolveRequest::HomeFeed {
+            trending,
+            available,
+            ratings,
+        } => {
+            // Everything the feed reads from the store: the active profile's parental flags, and a watch
+            // log + saved-library list derived from its continue-watching / history.
+            let flags = engine
+                .store()
+                .active_profile()
+                .map(|p| p.parental.clone())
+                .unwrap_or_default();
+            let (watch_log, library_ids) = match engine.store().active_library() {
+                Some(lib) => (
+                    watch_log_from_library(lib),
+                    lib.items.iter().map(|i| i.id().to_string()).collect::<Vec<_>>(),
+                ),
+                None => (Default::default(), Vec::new()),
+            };
+            let ratings_map: HashMap<String, Option<MaturityRating>> = ratings
+                .into_iter()
+                .map(|r| {
+                    let rating = r.certification.as_deref().and_then(parse_certification);
+                    (r.meta_id, rating)
+                })
+                .collect();
+            let taste = build_taste(&[]);
+            let input = HomeFeedInput {
+                watch_log: &watch_log,
+                library: &library_ids,
+                candidates: &[],
+                taste: &taste,
+                trending: &trending,
+            };
+            // Parental controls AND availability are both enforced inside the engine.
+            let gate = MaturityGate {
+                flags: &flags,
+                ratings: &ratings_map,
+            };
+            let avail: Box<dyn EligibilityFilter> = match available {
+                Some(ids) => Box::new(AvailabilitySet::new(ids)),
+                None => Box::new(AllEligible),
+            };
+            let filters: [&dyn EligibilityFilter; 2] = [avail.as_ref(), &gate];
+            let feed = build_home_feed(&input, &AllOf(&filters), &HomeFeedPrefs::default());
+            ResolveResponse::HomeFeed { lanes: feed.lanes }
         }
     }
 }

@@ -1,0 +1,19 @@
+{
+  "description": "Cross-language conformance for the engine Home feed query. With a fresh owner profile the library is empty, so Up Next / Start Watching are empty and only the Trending lane (the host popularity list) appears, with every row visible (owner is not a kids profile). Each case pins the non-empty lanes as (kind, [meta ids]). The kids parental-enforcement path depends on engine state and is proven by the integration + property tests.",
+  "cases": [
+    {
+      "name": "owner_trending_passthrough",
+      "request": { "kind": "home_feed", "trending": ["a", "b", "c"] },
+      "expect_lanes": [
+        { "kind": "trending", "items": ["a", "b", "c"] }
+      ]
+    },
+    {
+      "name": "availability_filters_trending",
+      "request": { "kind": "home_feed", "trending": ["a", "b", "c"], "available": ["a", "c"] },
+      "expect_lanes": [
+        { "kind": "trending", "items": ["a", "c"] }
+      ]
+    }
+  ]
+}
