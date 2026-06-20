@@ -170,18 +170,19 @@ pub fn status() -> PlayerState {
         })
 }
 
-/// The platform-tagged mpv binary name staged in `resources/` (mirrors server.rs's
-/// `node_binary_name()` and the fetch script's per-platform staging). The real binary is dropped in
-/// by the build step documented in scripts/fetch-server-deps.sh; keep these names in lockstep with
-/// that script.
+/// The platform-tagged mpv path under `resources/` (mirrors server.rs's `node_binary_name()` and the
+/// fetch script's per-platform staging). Keep these in lockstep with scripts/fetch-server-deps.sh.
+/// On Windows/Linux the staged artifact is a single self-contained binary; on macOS mpv is dynamically
+/// linked, so the fetch script stages the whole self-contained `mpv.app` and this returns the path to
+/// its inner executable (the bundle's dylibs resolve via @executable_path, so spawning it directly works).
 fn mpv_binary_name() -> &'static str {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        "mpv-darwin-arm64"
+        "mpv-darwin-arm64.app/Contents/MacOS/mpv"
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        "mpv-darwin-x64"
+        "mpv-darwin-x64.app/Contents/MacOS/mpv"
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
