@@ -13,8 +13,19 @@ enum SkipTimestampService {
     /// the player falls back to the other layers, never an error surfaced mid-playback.
     private static let log = Logger(subsystem: "com.stremiox.app", category: "skiptimes")
 
+    /// All skip candidates for a title, merging TheIntroDB (any media) with AniSkip (anime), run
+    /// concurrently. Either source returning [] is normal; the player gets whatever was found and the
+    /// resolver's sanity guards clamp both, so an anime source can never cause a wild mid-episode skip.
     static func candidates(imdbId: String, season: Int?, episode: Int?,
                            durationSeconds: Double) async -> [SegmentCandidate] {
+        async let aniskip = AniSkipService.candidates(metaId: imdbId, episode: episode, durationSeconds: durationSeconds)
+        let crowd = await theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        return crowd + (await aniskip)
+    }
+
+    /// Layer 2a: TheIntroDB crowd spans (any media, keyed by imdb/tmdb/tvdb id).
+    private static func theIntroDB(imdbId: String, season: Int?, episode: Int?,
+                                   durationSeconds: Double) async -> [SegmentCandidate] {
         guard let idItem = queryItem(for: imdbId) else { return [] }
         let key = "\(imdbId):\(season ?? 0):\(episode ?? 0)"
         if let cached = await SkipTimestampStore.shared.entry(for: key) {
@@ -77,7 +88,7 @@ enum SkipTimestampService {
     }
 
     static func supports(metaId: String) -> Bool {
-        queryItem(for: metaId) != nil
+        queryItem(for: metaId) != nil || AniSkipService.supports(metaId: metaId)
     }
 
     private static func candidates(from spans: [StoredSpan], duration: Double) -> [SegmentCandidate] {
@@ -159,6 +170,103 @@ actor SkipTimestampStore {
             entries = decoded
         } else {
             entries = [:]
+        }
+    }
+}
+
+/// Layer 2b: AniSkip (api.aniskip.com), the anime-specialized opening/ending/recap timestamp database
+/// the desktop anime players use. Keyed by MAL id + episode, which TheIntroDB is not, so it fills the
+/// gap for the `kitsu:` / `mal:` ids anime add-ons hand out. Fail-soft throughout: an unmapped id, a
+/// 404, or a network error just yields [], and the SegmentResolver clamps whatever comes back.
+enum AniSkipService {
+    /// Cheap sync check (no network) used by the player's skip gate: AniSkip can handle the anime id
+    /// schemes. The actual MAL resolution + fetch happen in `candidates`, which fails soft if they miss.
+    static func supports(metaId: String) -> Bool {
+        ["kitsu:", "mal:", "anilist:", "anidb:"].contains { metaId.hasPrefix($0) }
+    }
+
+    static func candidates(metaId: String, episode: Int?, durationSeconds: Double) async -> [SegmentCandidate] {
+        guard durationSeconds > 0, let episode, episode > 0, let mal = await malId(for: metaId) else { return [] }
+        guard var components = URLComponents(string: "https://api.aniskip.com/v2/skip-times/\(mal)/\(episode)") else { return [] }
+        components.queryItems = [
+            URLQueryItem(name: "types[]", value: "op"),
+            URLQueryItem(name: "types[]", value: "ed"),
+            URLQueryItem(name: "types[]", value: "recap"),
+            URLQueryItem(name: "episodeLength", value: String(Int(durationSeconds))),
+        ]
+        guard let url = components.url else { return [] }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        guard let (data, resp) = try? await URLSession.shared.data(for: request),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let res = try? JSONDecoder().decode(Response.self, from: data), res.found else { return [] }
+        return res.results.compactMap { r in
+            let kind: SkipSegment.Kind
+            switch r.skipType {
+            case "op": kind = .intro
+            case "ed": kind = .credits
+            case "recap": kind = .recap
+            default: return nil
+            }
+            return SegmentCandidate(kind: kind, start: r.interval.startTime, end: r.interval.endTime,
+                                    source: .crowdAPI, confidence: 0.92)
+        }
+    }
+
+    /// Resolve a MAL id from a Stremio anime id. `mal:` is direct; `kitsu:` resolves through the Kitsu
+    /// mappings API. `anilist:` / `anidb:` are not mapped yet (they need a relations index), so they
+    /// fail soft to nil.
+    private static func malId(for metaId: String) async -> Int? {
+        if metaId.hasPrefix("mal:") {
+            return (metaId.dropFirst(4).split(separator: ":").first).flatMap { Int($0) }
+        }
+        // Take the id token right after the prefix, NOT .last: an episode-qualified id like
+        // "kitsu:123:1:2" must resolve from anime id 123, not the trailing episode number.
+        if metaId.hasPrefix("kitsu:"), let kitsu = metaId.dropFirst(6).split(separator: ":").first, Int(kitsu) != nil {
+            return await kitsuToMal(String(kitsu))
+        }
+        return nil
+    }
+
+    private static func kitsuToMal(_ kitsuId: String) async -> Int? {
+        guard let url = URL(string: "https://kitsu.io/api/edge/anime/\(kitsuId)/mappings") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        request.setValue("application/vnd.api+json", forHTTPHeaderField: "Accept")
+        guard let (data, resp) = try? await URLSession.shared.data(for: request),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["data"] as? [[String: Any]] else { return nil }
+        for row in rows {
+            let attrs = row["attributes"] as? [String: Any]
+            if (attrs?["externalSite"] as? String) == "myanimelist/anime",
+               let ext = attrs?["externalId"] as? String, let id = Int(ext) {
+                return id
+            }
+        }
+        return nil
+    }
+
+    private struct Response: Decodable {
+        let found: Bool
+        let results: [Result]
+        // AniSkip omits `results` entirely on a not-found episode ({"found": false}); decode soft so
+        // that body parses to an empty list instead of throwing a swallowed keyNotFound.
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            found = (try? c.decode(Bool.self, forKey: .found)) ?? false
+            results = (try? c.decode([Result].self, forKey: .results)) ?? []
+        }
+        enum CodingKeys: String, CodingKey { case found, results }
+        struct Result: Decodable {
+            let interval: Interval
+            let skipType: String
+            enum CodingKeys: String, CodingKey { case interval; case skipType = "skip_type" }
+        }
+        struct Interval: Decodable {
+            let startTime: Double
+            let endTime: Double
+            enum CodingKeys: String, CodingKey { case startTime = "start_time"; case endTime = "end_time" }
         }
     }
 }
