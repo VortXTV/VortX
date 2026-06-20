@@ -62,6 +62,9 @@ pub mod hive_constants {
     pub const CACHEFACT_PREFIX: &[u8] = b"vortx-cachefact-v1\n";
     /// Domain-separation prefix for a federated torrent-index entry signature.
     pub const TORRENTINDEX_PREFIX: &[u8] = b"vortx-torrentindex-v1\n";
+    /// Domain-separation prefix for a playback-asset availability fact signature (trickplay sprite /
+    /// skip markers / chapters). Lives beside the others so every signing prefix is frozen in one place.
+    pub const ASSETFACT_PREFIX: &[u8] = b"vortx-assetfact-v1\n";
     /// Reject facts dated more than this far in the future (clock-skew guard), seconds.
     pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
     /// Public-tier facts are capped to this TTL regardless of their stated `ttl`, seconds.
