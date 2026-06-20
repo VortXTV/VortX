@@ -15,6 +15,7 @@ members = [
     "crates/hive",
     "crates/state",
     "crates/ranking",
+    "crates/debrid",
 ]
 
 [workspace.package]
