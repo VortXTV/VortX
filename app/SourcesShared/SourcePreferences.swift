@@ -26,6 +26,30 @@ enum SourceType: String, CaseIterable, Codable {
     }
 }
 
+/// One-tap source presets that set the quality caps + source-type order together, so a viewer can pick a
+/// taste ("biggest/best files" vs "save data") without tuning each control. Applying one writes the same
+/// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and the
+/// source-type order it sets is captured per-profile by the Settings `onChange(of: typeOrder)` exactly like a
+/// manual reorder. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
+enum SourcePreset: String, CaseIterable, Identifiable {
+    case bestQuality, balanced, dataSaver
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .bestQuality: return "Best Quality"
+        case .balanced:    return "Balanced"
+        case .dataSaver:   return "Data Saver"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .bestQuality: return "Highest resolution, no size cap. Best for fast connections and big screens."
+        case .balanced:    return "High quality with a sane size cap, so nothing absurdly large auto-plays."
+        case .dataSaver:   return "Caps at 1080p and small files, instant sources only. Best on cellular or a tight plan."
+        }
+    }
+}
+
 /// Persisted source-ranking preferences.
 /// Observed by SettingsView and read by StreamRanking at score time.
 final class SourcePreferences: ObservableObject {
@@ -210,5 +234,21 @@ final class SourcePreferences: ObservableObject {
         let target = index + direction
         guard target >= 0, target < typeOrder.count else { return }
         typeOrder.swapAt(index, target)
+    }
+
+    /// Apply a one-tap quality preset. Sets instant sources first (debrid/usenet play immediately) and the
+    /// per-preset caps; each assignment goes through the published knobs so the Settings UI, the per-profile
+    /// capture, and the ranking caches all update as if the user had set them by hand.
+    func apply(_ preset: SourcePreset) {
+        typeOrder = [.debrid, .usenet, .torrent, .direct]
+        hideDeadTorrents = true
+        switch preset {
+        case .bestQuality:
+            maxResolution = 0;    maxFileSizeGB = 0;  instantOnly = false; hdrOnly = false; excludeAV1 = false
+        case .balanced:
+            maxResolution = 0;    maxFileSizeGB = 15; instantOnly = false; hdrOnly = false; excludeAV1 = false
+        case .dataSaver:
+            maxResolution = 1080; maxFileSizeGB = 4;  instantOnly = true;  hdrOnly = false; excludeAV1 = true
+        }
     }
 }

@@ -412,6 +412,17 @@ struct iOSSettingsView: View {
 
     @ViewBuilder private var streamsSection: some View {
         Section {
+            Menu {
+                ForEach(SourcePreset.allCases) { preset in
+                    Button { sourcePrefs.apply(preset) } label: {
+                        Text(preset.label)
+                        Text(preset.detail)
+                    }
+                }
+            } label: {
+                Label("Apply a quality preset", systemImage: "wand.and.stars")
+            }
+            .tint(Theme.Palette.accent)
             Toggle("Use add-on ranking order", isOn: $sourcePrefs.useAddonOrder)
                 .tint(Theme.Palette.accent)
 

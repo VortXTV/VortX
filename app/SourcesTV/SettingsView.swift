@@ -375,6 +375,19 @@ struct SettingsView: View {
 
     private var streamsSection: some View {
         section("Streams") {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Text("Quality preset")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                HStack(spacing: Theme.Space.md) {
+                    ForEach(SourcePreset.allCases) { preset in
+                        Button(preset.label) { sourcePrefs.apply(preset) }
+                            .buttonStyle(ChipButtonStyle(selected: false))
+                    }
+                }
+                Text("A one-tap starting point; fine-tune the controls below. Your source-type order saves per profile.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .focusSection()
             Toggle(isOn: $sourcePrefs.useAddonOrder) {
                 Text("Use add-on ranking order")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
