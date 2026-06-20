@@ -21,6 +21,7 @@
 
 mod ids;
 mod library;
+mod maturity;
 mod pin;
 mod profile;
 mod roster;
@@ -28,6 +29,10 @@ mod store;
 mod watch;
 
 pub use ids::ProfileId;
+pub use maturity::{
+    allows as maturity_allows, allows_raw as maturity_allows_raw, effective_ceiling,
+    parse_certification, MaturityRating, DEFAULT_KIDS_CEILING,
+};
 pub use library::{
     CwItem, HistoryEntry, LibraryItem, ProfileLibrary, ResumePoint, StremioLibraryItem,
     WatchedBitfield,

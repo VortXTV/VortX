@@ -1,0 +1,36 @@
+{
+  "description": "Cross-language conformance for the parental-controls maturity gate. Two deterministic, string/integer parts every platform must agree on byte-for-byte. (1) certifications: a raw certification string from any scheme (MPAA / US-TV / BBFC / bare age) reconciles to one age-equivalent u8, or null when unrated/unknown. (2) decisions: given parental flags (kids, maturity_ceiling) and a parsed rating (null = unrated), the allows() gate returns true/false. Fail-closed for kids on unrated content.",
+  "certifications": [
+    { "raw": "G", "age": 0 },
+    { "raw": "TV-Y", "age": 0 },
+    { "raw": "TV-Y7", "age": 7 },
+    { "raw": "PG", "age": 8 },
+    { "raw": "TV-PG", "age": 8 },
+    { "raw": "12A", "age": 12 },
+    { "raw": "PG-13", "age": 13 },
+    { "raw": "TV-14", "age": 14 },
+    { "raw": "15", "age": 15 },
+    { "raw": "R", "age": 17 },
+    { "raw": "TV-MA", "age": 17 },
+    { "raw": "NC-17", "age": 18 },
+    { "raw": "18", "age": 18 },
+    { "raw": "Rated R", "age": 17 },
+    { "raw": "  pg-13  ", "age": 13 },
+    { "raw": "99", "age": 21 },
+    { "raw": "Unrated", "age": null },
+    { "raw": "NR", "age": null },
+    { "raw": "totally-bogus", "age": null }
+  ],
+  "decisions": [
+    { "name": "kids_default_blocks_unrated", "kids": true, "ceiling": null, "rating": null, "allowed": false },
+    { "name": "kids_default_allows_pg", "kids": true, "ceiling": null, "rating": 8, "allowed": true },
+    { "name": "kids_default_blocks_r", "kids": true, "ceiling": null, "rating": 17, "allowed": false },
+    { "name": "kids_explicit_ceiling_14_allows_14", "kids": true, "ceiling": 14, "rating": 14, "allowed": true },
+    { "name": "kids_explicit_ceiling_14_blocks_15", "kids": true, "ceiling": 14, "rating": 15, "allowed": false },
+    { "name": "kids_explicit_ceiling_still_blocks_unrated", "kids": true, "ceiling": 16, "rating": null, "allowed": false },
+    { "name": "nonkids_ceiling_allows_unrated", "kids": false, "ceiling": 13, "rating": null, "allowed": true },
+    { "name": "nonkids_ceiling_blocks_over", "kids": false, "ceiling": 13, "rating": 17, "allowed": false },
+    { "name": "unrestricted_allows_adult", "kids": false, "ceiling": null, "rating": 18, "allowed": true },
+    { "name": "unrestricted_allows_unrated", "kids": false, "ceiling": null, "rating": null, "allowed": true }
+  ]
+}
