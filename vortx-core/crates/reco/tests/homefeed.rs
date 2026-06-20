@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, HashSet};
 use proptest::prelude::*;
 use serde::Deserialize;
 use vortx_reco::{
-    build_home_feed, AllEligible, AvailabilitySet, HomeFeedInput, HomeFeedPrefs, LaneKind,
+    build_home_feed, AllEligible, AllOf, AvailabilitySet, HomeFeedInput, HomeFeedPrefs, LaneKind,
+    MaturityGate,
 };
-use vortx_state::{WatchLog, WatchState};
+use vortx_state::{maturity_allows, MaturityRating, ParentalFlags, WatchLog, WatchState};
 
 #[derive(Deserialize)]
 struct Suite {
@@ -172,5 +173,44 @@ proptest! {
         let a = build_home_feed(&input, &AllEligible, &HomeFeedPrefs::default());
         let b = build_home_feed(&input, &AllEligible, &HomeFeedPrefs::default());
         prop_assert_eq!(a, b);
+    }
+
+    /// A kids profile can NEVER surface a maturity-disallowed title in ANY lane: not over its ceiling, not
+    /// unrated. Drives ids through every lane source with random ratings and a random ceiling.
+    #[test]
+    fn kids_feed_never_shows_blocked_content(
+        watch in prop::collection::vec((id(), watch_state()), 0..8),
+        library in prop::collection::vec(id(), 0..8),
+        trending in prop::collection::vec(id(), 0..8),
+        ratings_seed in prop::collection::vec((id(), proptest::option::of(0u8..20)), 0..6),
+        ceiling in proptest::option::of(0u8..18),
+    ) {
+        let log: WatchLog = watch.into_iter().collect::<BTreeMap<_, _>>();
+        let ratings: std::collections::HashMap<String, Option<MaturityRating>> = ratings_seed
+            .into_iter()
+            .map(|(k, v)| (k, v.map(MaturityRating)))
+            .collect();
+        let flags = ParentalFlags { kids: true, maturity_ceiling: ceiling, ..Default::default() };
+        let taste = vortx_reco::build_taste(&[]);
+        // Everything is "available"; the maturity gate is the only thing that may exclude.
+        let mut all_ids: Vec<String> = library.clone();
+        all_ids.extend(trending.clone());
+        all_ids.extend(log.keys().cloned());
+        let avail = AvailabilitySet::new(all_ids);
+        let gate = MaturityGate { flags: &flags, ratings: &ratings };
+        let input = HomeFeedInput {
+            watch_log: &log,
+            library: &library,
+            candidates: &[],
+            taste: &taste,
+            trending: &trending,
+        };
+        let feed = build_home_feed(&input, &AllOf(&[&avail, &gate]), &HomeFeedPrefs::default());
+        for lane in &feed.lanes {
+            for item in &lane.items {
+                let rating = ratings.get(&item.meta_id).copied().flatten();
+                prop_assert!(maturity_allows(&flags, rating), "{} surfaced but blocked", item.meta_id);
+            }
+        }
     }
 }

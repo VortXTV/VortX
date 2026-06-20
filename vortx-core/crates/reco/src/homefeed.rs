@@ -16,10 +16,10 @@
 //! removed one. The reco lanes reuse [`crate::recommend`] unchanged: its honest reason decomposition is
 //! what splits "Because You Watched" (a taste match) from the popularity-only Trending fallback.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
-use vortx_state::{WatchLog, WatchState};
+use vortx_state::{maturity_allows, MaturityRating, ParentalFlags, WatchLog, WatchState};
 
 use crate::recommend::{recommend, Candidate, Reason, RecoPrefs};
 use crate::taste::TasteProfile;
@@ -57,6 +57,34 @@ pub struct AllEligible;
 impl EligibilityFilter for AllEligible {
     fn is_eligible(&self, _meta_id: &str) -> bool {
         true
+    }
+}
+
+/// Enforces a profile's parental controls as an eligibility gate. A meta is eligible only if its content
+/// rating is within the profile's ceiling; a meta with no known rating is treated as unrated, so a kids
+/// profile fails closed (never surfaces what we cannot prove is within its ceiling). Because
+/// [`build_home_feed`] applies the eligibility filter to EVERY lane before ranking, composing this gate in
+/// enforces parental controls across all lanes and the reco candidate pool at once.
+pub struct MaturityGate<'a> {
+    pub flags: &'a ParentalFlags,
+    /// meta id -> reconciled rating (`None` = unrated/unknown). A missing key is also treated as unrated.
+    pub ratings: &'a HashMap<String, Option<MaturityRating>>,
+}
+
+impl EligibilityFilter for MaturityGate<'_> {
+    fn is_eligible(&self, meta_id: &str) -> bool {
+        let rating = self.ratings.get(meta_id).copied().flatten();
+        maturity_allows(self.flags, rating)
+    }
+}
+
+/// Compose filters with AND: a meta is eligible only if EVERY filter admits it. Pass `AllOf(&[&availability,
+/// &maturity])` to [`build_home_feed`] to enforce availability AND parental controls in one gate.
+pub struct AllOf<'a>(pub &'a [&'a dyn EligibilityFilter]);
+
+impl EligibilityFilter for AllOf<'_> {
+    fn is_eligible(&self, meta_id: &str) -> bool {
+        self.0.iter().all(|f| f.is_eligible(meta_id))
     }
 }
 
@@ -335,5 +363,48 @@ mod tests {
         // "a" only in Up Next; "b" startable; "d" trending.
         let up: Vec<&str> = feed.lanes[0].items.iter().map(|i| i.meta_id.as_str()).collect();
         assert_eq!(up, vec!["a"]);
+    }
+
+    #[test]
+    fn maturity_gate_blocks_over_ceiling_and_unrated_across_lanes() {
+        // A kids profile (default ceiling 12). "r" is over-ceiling, "unrated" has no known rating, "g" is
+        // fine. They sit across Up Next / library / trending; none of the blocked ones may surface.
+        let log = log_of(&[
+            ("g", WatchState::resumed(100, 10)),
+            ("r", WatchState::resumed(200, 20)),
+        ]);
+        let mut ratings: HashMap<String, Option<MaturityRating>> = HashMap::new();
+        ratings.insert("g".into(), Some(MaturityRating(0)));
+        ratings.insert("r".into(), Some(MaturityRating(17)));
+        // "unrated" deliberately absent from the map -> treated as unrated -> fail-closed for kids.
+        let flags = ParentalFlags {
+            kids: true,
+            ..Default::default()
+        };
+        let input = HomeFeedInput {
+            watch_log: &log,
+            library: &["unrated".to_string()],
+            candidates: &[],
+            taste: &crate::build_taste(&[]),
+            trending: &["g".to_string(), "r".to_string()],
+        };
+        let avail = AvailabilitySet::new(["g", "r", "unrated"]);
+        let gate = MaturityGate {
+            flags: &flags,
+            ratings: &ratings,
+        };
+        let feed = build_home_feed(
+            &input,
+            &AllOf(&[&avail, &gate]),
+            &HomeFeedPrefs::default(),
+        );
+        let shown: HashSet<&str> = feed
+            .lanes
+            .iter()
+            .flat_map(|l| l.items.iter().map(|i| i.meta_id.as_str()))
+            .collect();
+        assert!(shown.contains("g"), "g is within ceiling and should show");
+        assert!(!shown.contains("r"), "R is over the kids ceiling");
+        assert!(!shown.contains("unrated"), "unrated is fail-closed for kids");
     }
 }
