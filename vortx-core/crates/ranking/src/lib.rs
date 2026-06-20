@@ -13,12 +13,14 @@
 //! - emits [`RankedStream`] with `reasons` (explainable ranking) plus `is_dolby_vision`/`is_hdr`/`audio`
 //!   so the player router routes DV/HDR/Atmos without re-parsing the label.
 
+mod antifraud;
 mod dedup;
 mod parse;
 mod prefs;
 mod rank;
 mod release;
 
+pub use antifraud::{validate as validate_stream, AntiFraudInput, DropReason, Verdict};
 pub use dedup::{dedup, DedupStream, MergedStream};
 pub use parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
 pub use prefs::RankingPrefs;
