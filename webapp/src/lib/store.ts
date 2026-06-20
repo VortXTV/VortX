@@ -95,11 +95,15 @@ export function toggleLibrary(item: MetaItem): boolean {
 /** Merge synced add-on transport URLs into the installed list (union, https-only, Cinemeta stays first).
  *  Used by account hydration so a signed-in user's add-ons from their other VortX devices appear here.
  *  Never removes - read-only sync, so it can't clobber the account's own add-on set. */
-export function mergeInstalledAddons(urls: string[]): void {
-  const clean = urls
+export function mergeInstalledAddons(urls: string[]): boolean {
+  const existing = new Set(installedUrls());
+  const added = urls
     .filter((u): u is string => typeof u === "string" && /^https:\/\//i.test(u.trim()))
-    .map((u) => u.trim());
-  if (clean.length) persist([...installedUrls(), ...clean]); // persist() de-dupes + pins Cinemeta first
+    .map((u) => u.trim())
+    .filter((u) => !existing.has(u));
+  if (!added.length) return false;
+  persist([...installedUrls(), ...added]); // persist() de-dupes + pins Cinemeta first
+  return true;
 }
 
 /** Merge synced library items into the local library (union by id; existing entries win). Slimmed to the

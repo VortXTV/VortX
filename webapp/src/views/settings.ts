@@ -131,8 +131,8 @@ function accountSection(): string {
 
 function metadataSection(mdblistKey: string, tmdbKey: string): string {
   const body =
-    row("MDBList key", textField("mdblist-key", "mdblist", mdblistKey, "MDBList API key")) +
-    row("TMDB key", textField("tmdb-key", "tmdb", tmdbKey, "TMDB v4 read access token"));
+    row("MDBList key", secretField("mdblist-key", "mdblist", mdblistKey, "MDBList API key")) +
+    row("TMDB key", secretField("tmdb-key", "tmdb", tmdbKey, "TMDB v4 read access token"));
   return group(
     "Metadata",
     body,
@@ -374,6 +374,16 @@ function textField(id: string, key: string, value: string, placeholder: string):
     placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}" autocomplete="off" spellcheck="false" aria-label="${escapeHtml(placeholder)}" />`;
 }
 
+/** A masked (password-dots) field for secrets like API keys, with a Show/Hide reveal toggle. */
+function secretField(id: string, key: string, value: string, placeholder: string): string {
+  return `<span class="secret-field">
+    <input class="field settings-key" type="password" id="${id}" data-text-input="${key}"
+      placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(value)}" autocomplete="off" autocapitalize="none"
+      spellcheck="false" aria-label="${escapeHtml(placeholder)}" />
+    <button type="button" class="chip secret-reveal" data-action="toggle-secret" data-target="${id}" aria-label="Show or hide ${escapeHtml(placeholder)}">Show</button>
+  </span>`;
+}
+
 function langSelect(id: string, value: string, defaultLabel: string): string {
   const opts = LANGS.map((l) => {
     const label = l.code === "" ? defaultLabel : l.name;
@@ -458,6 +468,15 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       signOut();
       rerender();
       return true;
+    case "toggle-secret": {
+      const input = host?.querySelector<HTMLInputElement>("#" + (hit.node.dataset.target ?? ""));
+      if (input) {
+        const masked = input.type === "password";
+        input.type = masked ? "text" : "password";
+        hit.node.textContent = masked ? "Hide" : "Show";
+      }
+      return true;
+    }
     case "export-backup":
       downloadBackup();
       return true;

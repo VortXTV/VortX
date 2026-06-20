@@ -2061,3 +2061,18 @@ video::cue {
     justify-content: center;
   }
 }
+
+/* Masked secret field (API keys): input + Show/Hide reveal toggle. */
+.secret-field {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs, 0.5rem);
+  max-width: 100%;
+}
+.secret-field .field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.secret-reveal {
+  flex: none;
+}

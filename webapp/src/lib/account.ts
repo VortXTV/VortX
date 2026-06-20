@@ -107,10 +107,17 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     const u = addonUrl(a);
     if (u) urls.push(u);
   }
-  mergeInstalledAddons(urls);
+  const addonsChanged = mergeInstalledAddons(urls);
 
   // Owner library (vortx.library: [{id,name,type,poster,...}]).
   mergeLibrary((Array.isArray(vortx.library) ? vortx.library : []) as MetaItem[]);
+
+  // The running app loaded its add-on list at boot; newly-merged add-ons are only in localStorage. Tell
+  // main.ts to reload them + re-render so they appear immediately (Library reads storage fresh, so it
+  // already shows - this closes the "library shows but add-ons don't" gap after sign-in hydration).
+  if (addonsChanged && typeof window !== "undefined") {
+    window.dispatchEvent(new Event("vortx:addons-changed"));
+  }
 }
 
 /** After sign-in, pull the account's encrypted sync document and apply it locally, so the user's add-ons,
