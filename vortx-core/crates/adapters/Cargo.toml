@@ -1,0 +1,15 @@
+[package]
+name = "vortx-adapters"
+description = "VortX source adapters: normalize Nuvio JS-provider results and Eclipse-music responses onto the one vortx-protocol Stream shape, so non-Stremio-protocol sources run on the same engine (ranking/dedup/resolve never know the difference). Pure data mapping; the JS runtime that executes Nuvio providers is a later phase."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortx-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"
