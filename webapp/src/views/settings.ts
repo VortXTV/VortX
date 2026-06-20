@@ -2,6 +2,17 @@ import { actionOf, escapeHtml } from "../lib/dom";
 import { currentSession, signOut } from "../lib/account";
 import { exportBackup, importBackup } from "../lib/store";
 import {
+  profiles,
+  activeProfileId,
+  activeProfile,
+  isOwnerProfile,
+  setActiveProfile,
+  addProfile,
+  updateProfileMeta,
+  deleteProfile,
+  PROFILE_AVATARS,
+} from "../lib/profiles";
+import {
   ACCENTS,
   SUB_COLORS,
   getSettings,
@@ -79,6 +90,7 @@ export function renderSettings(target: HTMLElement): void {
   target.innerHTML = `
     <div class="settings-page">
       <h1 class="t-screen settings-title">Settings</h1>
+      ${profilesSection()}
       ${accountSection()}
       ${metadataSection(s.mdblistKey, s.tmdbKey)}
       ${playbackSection(s.directLinksOnly, s.skipStep, s.preferredQuality, s.autoplayTrailers)}
@@ -111,6 +123,39 @@ function row(label: string, control: string, sub?: string): string {
       </div>
       <div class="settings-row-control">${control}</div>
     </div>`;
+}
+
+function profilesSection(): string {
+  const list = profiles();
+  const activeId = activeProfileId();
+  const chips = list
+    .map(
+      (p) =>
+        `<button class="profile-chip${p.id === activeId ? " selected" : ""}" data-action="switch-profile" data-id="${escapeHtml(p.id)}">
+          <span class="profile-avatar" aria-hidden="true">${escapeHtml(p.avatar)}</span>
+          <span class="profile-name">${escapeHtml(p.name)}</span>
+        </button>`,
+    )
+    .join("");
+  const add = `<button class="profile-chip profile-add" data-action="add-profile" aria-label="Add a profile"><span class="profile-avatar" aria-hidden="true">+</span><span class="profile-name">Add</span></button>`;
+
+  const active = activeProfile();
+  const avatars = PROFILE_AVATARS.map(
+    (a) =>
+      `<button class="avatar-swatch${a === active.avatar ? " selected" : ""}" data-action="set-avatar" data-avatar="${a}" aria-label="Avatar ${a}">${a}</button>`,
+  ).join("");
+  const editor = `
+    <div class="profile-editor">
+      ${row("Name", `<input class="field" id="profile-name" data-text-input="profile-name" value="${escapeHtml(active.name)}" maxlength="24" autocomplete="off" aria-label="Profile name" />`)}
+      ${row("Avatar", `<div class="avatar-swatches">${avatars}</div>`)}
+      ${isOwnerProfile(active.id) ? "" : row("", `<button class="chip chip-danger" data-action="delete-profile" data-id="${escapeHtml(active.id)}">Delete this profile</button>`)}
+    </div>`;
+
+  return group(
+    "Profiles",
+    `<div class="profile-row">${chips}${add}</div>${editor}`,
+    "Each profile keeps its own look and languages; switching applies them instantly. Per-profile library and a PIN lock are coming next.",
+  );
 }
 
 function accountSection(): string {
@@ -468,6 +513,22 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       signOut();
       rerender();
       return true;
+    case "switch-profile":
+      setActiveProfile(d.id ?? ""); // applies the profile's look via updateSettings
+      rerender();
+      return true;
+    case "add-profile":
+      addProfile("New profile", PROFILE_AVATARS[profiles().length % PROFILE_AVATARS.length]);
+      rerender();
+      return true;
+    case "set-avatar":
+      updateProfileMeta(activeProfileId(), { avatar: d.avatar ?? PROFILE_AVATARS[0] });
+      rerender();
+      return true;
+    case "delete-profile":
+      deleteProfile(d.id ?? "");
+      rerender();
+      return true;
     case "toggle-secret": {
       const input = host?.querySelector<HTMLInputElement>("#" + (hit.node.dataset.target ?? ""));
       if (input) {
@@ -552,6 +613,10 @@ function wireSettings(target: HTMLElement): void {
           break;
         case "require":
           updateSettings({ requireWords: val });
+          break;
+        case "profile-name":
+          updateProfileMeta(activeProfileId(), { name: val });
+          rerender(); // reflect the new name in the profile chip
           break;
       }
     });

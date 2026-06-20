@@ -2076,3 +2076,76 @@ video::cue {
 .secret-reveal {
   flex: none;
 }
+
+/* ===== Profiles (Settings) ==================================================================== */
+.profile-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  padding: var(--space-md) 0;
+}
+.profile-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.85rem 0.45rem 0.45rem;
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text);
+  transition: background var(--dur-state) var(--ease), box-shadow var(--dur-state) var(--ease);
+}
+.profile-chip:hover {
+  background: var(--surface-3);
+}
+.profile-chip.selected {
+  background: var(--accent);
+  color: var(--on-accent);
+  box-shadow: var(--glow-accent);
+}
+.profile-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 1.05rem;
+  line-height: 1;
+}
+.profile-chip.selected .profile-avatar {
+  background: rgba(0, 0, 0, 0.18);
+}
+.profile-name {
+  font-weight: 600;
+}
+.profile-add .profile-avatar {
+  font-size: 1.25rem;
+}
+.profile-editor {
+  border-top: 1px solid var(--hairline);
+}
+.avatar-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  justify-content: flex-end;
+}
+.avatar-swatch {
+  width: 2.1rem;
+  height: 2.1rem;
+  border-radius: 50%;
+  background: var(--surface-2);
+  font-size: 1.05rem;
+  line-height: 1;
+  transition: transform var(--dur-state) var(--ease), box-shadow var(--dur-state) var(--ease);
+}
+.avatar-swatch:hover {
+  transform: scale(1.08);
+}
+.avatar-swatch.selected {
+  box-shadow: 0 0 0 2px var(--accent-bright);
+}
+.chip-danger {
+  color: var(--danger);
+}
