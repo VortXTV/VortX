@@ -1526,8 +1526,13 @@ input:focus-visible {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap; /* a wide control (e.g. the 5-option Preferred-quality segmented) wraps below the
+                      label instead of overflowing the card and pushing the page past the viewport */
   gap: var(--space-md);
   padding: var(--space-md) 0;
+}
+.settings-row-label {
+  min-width: 0; /* allow the label to shrink so a long label never forces horizontal overflow */
 }
 .settings-row + .settings-row {
   border-top: 1px solid var(--hairline);
@@ -1580,9 +1585,11 @@ input:focus-visible {
 /* Segmented control */
 .segmented {
   display: inline-flex;
+  flex-wrap: wrap; /* pills wrap to a second row when narrow, instead of overflowing the container */
   gap: 2px;
   background: var(--surface-2);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-control);
+  max-width: 100%;
   padding: 3px;
 }
 .seg {
@@ -2015,7 +2022,7 @@ video::cue {
 }
 
 /* Settings rows: stack label over control on phones so long labels never push the control off-screen. */
-@media (max-width: 640px) {
+@media (max-width: 760px) {
   .settings-row {
     flex-direction: column;
     align-items: flex-start;
