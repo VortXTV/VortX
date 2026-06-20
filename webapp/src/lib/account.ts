@@ -7,7 +7,10 @@
 // vault.ts is the source of truth for crypto + persistence; this module never touches localStorage
 // directly, it goes through vault's saveSession/loadSession/clearSession.
 
-import { loadSession, clearSession, validateSession, saveSession, type Session } from "./vault";
+import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, type Session } from "./vault";
+import { mergeInstalledAddons, mergeLibrary } from "./store";
+import { updateSettings } from "./settings";
+import type { MetaItem } from "./types";
 
 // The in-memory cache. `undefined` = not yet hydrated from storage; `null` = hydrated, signed out.
 // We lazily hydrate from loadSession() on first read so a hard reload restores the signed-in state.
@@ -68,6 +71,57 @@ export async function ensureValidSession(): Promise<Session | null> {
  *  vault already persisted it via saveSession; this updates the cache + notifies the UI. */
 export function adoptSession(session: Session): void {
   setSession(session);
+}
+
+/** Pull a string transport URL out of a synced add-on entry (the app emits {transportUrl,name}; the web
+ *  Stremio import emits plain strings or {transportUrl}). */
+function addonUrl(a: unknown): string | null {
+  if (typeof a === "string") return a;
+  if (a && typeof a === "object" && typeof (a as { transportUrl?: unknown }).transportUrl === "string") {
+    return (a as { transportUrl: string }).transportUrl;
+  }
+  return null;
+}
+
+/** Apply a decrypted sync document to local state (READ-ONLY merge: add-ons, library, metadata keys).
+ *  Pure (no network) so it is unit-testable; hydrateFromAccount fetches the doc then calls this. Tolerant
+ *  of any missing/odd key - a partial or foreign doc never throws. */
+export function applySyncDoc(doc: Record<string, unknown> | null | undefined): void {
+  if (!doc || typeof doc !== "object") return;
+  const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
+
+  // Metadata API keys (the app stores them under doc.apiKeys; Keychain on native, settings here).
+  const keys = (doc.apiKeys && typeof doc.apiKeys === "object" ? doc.apiKeys : {}) as Record<string, unknown>;
+  const patch: Record<string, string> = {};
+  if (typeof keys.tmdb === "string" && keys.tmdb) patch.tmdbKey = keys.tmdb;
+  if (typeof keys.mdblist === "string" && keys.mdblist) patch.mdblistKey = keys.mdblist;
+  if (Object.keys(patch).length) updateSettings(patch);
+
+  // Add-ons: the app summary (vortx.addons: [{transportUrl,name}]) + the web Stremio import (doc.addons).
+  const urls: string[] = [];
+  for (const a of Array.isArray(vortx.addons) ? vortx.addons : []) {
+    const u = addonUrl(a);
+    if (u) urls.push(u);
+  }
+  for (const a of Array.isArray(doc.addons) ? doc.addons : []) {
+    const u = addonUrl(a);
+    if (u) urls.push(u);
+  }
+  mergeInstalledAddons(urls);
+
+  // Owner library (vortx.library: [{id,name,type,poster,...}]).
+  mergeLibrary((Array.isArray(vortx.library) ? vortx.library : []) as MetaItem[]);
+}
+
+/** After sign-in, pull the account's encrypted sync document and apply it locally, so the user's add-ons,
+ *  library, and metadata keys come over from their other VortX devices. Fail-soft: a missing or
+ *  undecryptable doc never blocks sign-in. */
+export async function hydrateFromAccount(session: Session): Promise<void> {
+  try {
+    applySyncDoc(await getSyncDoc(session));
+  } catch {
+    // network / decrypt failure: sign-in still succeeds with local state.
+  }
 }
 
 /** Sign out: clear storage, reset the cache, and notify subscribers so the nav drops back to signed-out. */

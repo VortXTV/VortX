@@ -92,6 +92,36 @@ export function toggleLibrary(item: MetaItem): boolean {
   return !exists;
 }
 
+/** Merge synced add-on transport URLs into the installed list (union, https-only, Cinemeta stays first).
+ *  Used by account hydration so a signed-in user's add-ons from their other VortX devices appear here.
+ *  Never removes - read-only sync, so it can't clobber the account's own add-on set. */
+export function mergeInstalledAddons(urls: string[]): void {
+  const clean = urls
+    .filter((u): u is string => typeof u === "string" && /^https:\/\//i.test(u.trim()))
+    .map((u) => u.trim());
+  if (clean.length) persist([...installedUrls(), ...clean]); // persist() de-dupes + pins Cinemeta first
+}
+
+/** Merge synced library items into the local library (union by id; existing entries win). Slimmed to the
+ *  same id/type/name/poster shape the local library stores. */
+export function mergeLibrary(items: MetaItem[]): void {
+  const valid = items.filter(
+    (m) => m && typeof m.id === "string" && typeof m.type === "string" && typeof m.name === "string",
+  );
+  if (!valid.length) return;
+  const existing = libraryItems();
+  const seen = new Set(existing.map((e) => e.id));
+  const additions = valid
+    .filter((m) => !seen.has(m.id))
+    .map((m) => ({ id: m.id, type: m.type, name: m.name, poster: m.poster }));
+  if (!additions.length) return;
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify([...existing, ...additions]));
+  } catch {
+    /* best-effort */
+  }
+}
+
 // --- Hidden home rails --------------------------------------------------------------------------
 // Catalog rails the user has hidden from Home (competitor-parity home customization; Stremio paywalls
 // catalog hide/reorder). Keys are the catalog identity (type:id:addon). Local to this browser.

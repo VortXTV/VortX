@@ -1,6 +1,6 @@
 import { escapeHtml, actionOf } from "../lib/dom";
 import { navigate } from "../lib/router";
-import { adoptSession, signOut, currentSession } from "../lib/account";
+import { adoptSession, hydrateFromAccount, signOut, currentSession } from "../lib/account";
 import {
   register,
   login,
@@ -289,7 +289,7 @@ async function onSignIn(ev: SubmitEvent): Promise<void> {
   setBusy(btn, needTotp ? "Verifying…" : "Signing in…");
   try {
     const session = await login(loginId, password, totp);
-    succeed(session);
+    await succeed(session);
   } catch (x: unknown) {
     if (x instanceof TotpRequiredError) {
       // 2FA account: reveal the code field IN PLACE and let the user resubmit with it. Do NOT re-render
@@ -337,7 +337,7 @@ async function onRecover(ev: SubmitEvent): Promise<void> {
   setBusy(btn, "Resetting…");
   try {
     const session = await recover(email, code, password);
-    succeed(session);
+    await succeed(session);
   } catch (x: unknown) {
     showError("rec-err", message(x));
     restoreButton(btn, "Reset password");
@@ -417,8 +417,11 @@ function onUsernameInput(): void {
 
 /** vault already saved the session; cache + notify, then go home. (register/reset go via the
  *  recovery-code gate first, then "I saved it, continue" calls goto("dash"); they do not call this.) */
-function succeed(session: Session): void {
+async function succeed(session: Session): Promise<void> {
   adoptSession(session);
+  // Pull the account's add-ons / library / metadata keys before showing Home, so a returning user lands
+  // on their populated app instead of a blank slate. Fail-soft (never blocks sign-in).
+  await hydrateFromAccount(session);
   navigate({ name: "home" });
 }
 
