@@ -3,7 +3,7 @@ import "./styles/app.css";
 import type { Addon } from "./lib/types";
 import { loadInstalledAddons } from "./lib/store";
 import { actionOf, el } from "./lib/dom";
-import { clearProgress, removeFromLibrary } from "./lib/store";
+import { clearProgress, removeFromLibrary, hideRail, clearHiddenRails, hiddenRailCount } from "./lib/store";
 import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { icon } from "./lib/icons";
@@ -216,6 +216,30 @@ function wireGlobalClicks(): void {
         else removeFromLibrary(id);
         hit.node.closest(".card-wrap")?.remove();
       }
+      return;
+    }
+    if (hit?.action === "hide-rail") {
+      // The × on a Home rail header: hide that catalog row (persisted) and yank the section from the DOM,
+      // then surface the "Show N hidden rows" control without a full re-render.
+      ev.preventDefault();
+      const key = hit.node.dataset.railKey;
+      if (key) {
+        hideRail(key);
+        hit.node.closest(".rail-section")?.remove();
+        const btn = document.getElementById("rail-unhide");
+        if (btn) {
+          const n = hiddenRailCount();
+          btn.textContent = `Show ${n} hidden row${n === 1 ? "" : "s"}`;
+          btn.hidden = n === 0;
+        }
+      }
+      return;
+    }
+    if (hit?.action === "show-hidden") {
+      // Restore every hidden rail and re-render Home.
+      ev.preventDefault();
+      clearHiddenRails();
+      void renderRoute(parseRoute());
       return;
     }
     if (hit?.action === "discover-more") {

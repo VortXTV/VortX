@@ -93,6 +93,50 @@ export function toggleLibrary(item: MetaItem): boolean {
   return !exists;
 }
 
+// --- Hidden home rails --------------------------------------------------------------------------
+// Catalog rails the user has hidden from Home (competitor-parity home customization; Stremio paywalls
+// catalog hide/reorder). Keys are the catalog identity (type:id:addon). Local to this browser.
+const HIDDEN_RAILS_KEY = "vortx.web.hiddenRails.v1";
+
+function hiddenRailSet(): Set<string> {
+  try {
+    const raw = localStorage.getItem(HIDDEN_RAILS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? (parsed as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** How many home rails are currently hidden (drives the "Show hidden" affordance in Settings). */
+export function hiddenRailCount(): number {
+  return hiddenRailSet().size;
+}
+
+export function isRailHidden(key: string): boolean {
+  return hiddenRailSet().has(key);
+}
+
+/** Hide a rail by key (persisted; the Board skips it on its next render). */
+export function hideRail(key: string): void {
+  const set = hiddenRailSet();
+  set.add(key);
+  try {
+    localStorage.setItem(HIDDEN_RAILS_KEY, JSON.stringify([...set]));
+  } catch {
+    /* storage disabled/full: best-effort */
+  }
+}
+
+/** Restore every hidden rail. */
+export function clearHiddenRails(): void {
+  try {
+    localStorage.removeItem(HIDDEN_RAILS_KEY);
+  } catch {
+    /* best-effort */
+  }
+}
+
 // --- Continue Watching --------------------------------------------------------------------------
 // In-progress titles, recorded by the player as you watch (position + duration). Local to this browser
 // (the web client has no account sync). A title past 95% is treated as finished and dropped.

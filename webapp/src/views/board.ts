@@ -3,11 +3,16 @@ import { catalogRefs, fetchCatalog, type CatalogRef } from "../lib/addon";
 import { escapeHtml, httpUrl } from "../lib/dom";
 import { hashFor } from "../lib/router";
 import { icon } from "../lib/icons";
-import { continueWatching } from "../lib/store";
+import { continueWatching, hiddenRailCount, isRailHidden } from "../lib/store";
 
 // The Home board: one poster rail per loadable catalog across the installed add-ons (the same shape as
 // desktop/src/main.ts renderBoard, but fetched directly from the add-on protocol instead of read from
 // the engine's `board` model). Rails stream in as their fetches resolve so the page fills progressively.
+
+/** Stable identity for a catalog rail (type:id:addon), used to remember which rails the user hid. */
+function railKey(ref: CatalogRef): string {
+  return `${ref.def.type}:${ref.def.id}:${ref.addon.manifest.id ?? ""}`;
+}
 
 /** Render the static Home shell; rails are filled in by loadBoard as catalogs resolve. */
 export function renderBoardShell(host: HTMLElement, addons: Addon[]): void {
@@ -16,16 +21,25 @@ export function renderBoardShell(host: HTMLElement, addons: Addon[]): void {
     host.innerHTML = emptyBoard();
     return;
   }
+  // Skip hidden rails, but keep the ORIGINAL index so loadBoard's rail-body-${i} lookups stay aligned
+  // (a hidden rail simply has no body element, so loadBoard skips it).
   const rails = refs
-    .map(
-      (ref, i) => `
+    .map((ref, i) => {
+      if (isRailHidden(railKey(ref))) return "";
+      const title = escapeHtml(railTitle(ref));
+      return `
       <section class="rail-section" aria-labelledby="rail-${i}">
-        <h2 class="rail-title" id="rail-${i}">${escapeHtml(railTitle(ref))}</h2>
+        <div class="rail-head">
+          <h2 class="rail-title" id="rail-${i}">${title}</h2>
+          <button class="rail-hide" data-action="hide-rail" data-rail-key="${escapeHtml(railKey(ref))}" title="Hide this row" aria-label="Hide ${title}">×</button>
+        </div>
         <div class="rail" id="rail-body-${i}" role="list">${railSkeleton()}</div>
-      </section>`,
-    )
+      </section>`;
+    })
     .join("");
-  host.innerHTML = `<div class="board"><section class="featured" id="featured" aria-label="Featured" hidden></section>${continueWatchingRail()}${rails}</div>`;
+  const hidden = hiddenRailCount();
+  const tools = `<div class="board-tools"><button id="rail-unhide" class="board-unhide" data-action="show-hidden"${hidden ? "" : " hidden"}>Show ${hidden} hidden row${hidden === 1 ? "" : "s"}</button></div>`;
+  host.innerHTML = `<div class="board">${tools}<section class="featured" id="featured" aria-label="Featured" hidden></section>${continueWatchingRail()}${rails}</div>`;
 }
 
 /** A "Continue Watching" rail of in-progress titles, shown at the top of Home. Empty when nothing is
