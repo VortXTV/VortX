@@ -221,9 +221,11 @@ impl CacheFact {
 
 /// Merge one incoming fact into the map (the state-based delta-CRDT step). Returns `true` if it updated
 /// the map's state. Drops (returns `false`, no state change) a fact that fails signature verification,
-/// is dated beyond the clock-skew guard, or has already expired. State rule: newest `verified_at` wins;
-/// on a tie, the lexicographically greater `signer_pubkey` wins (deterministic). The merge is
-/// commutative, associative, and idempotent, so it converges regardless of gossip order or duplicates.
+/// is dated beyond the clock-skew guard, or has already expired. State rule: a strict total order on
+/// `(verified_at, signer_pubkey, sig)`, newest wins, ties break deterministically by signer then
+/// signature. Because that is a TOTAL order, the merge is commutative, associative, and idempotent, so
+/// it converges to the same state regardless of gossip order or duplicates (proven in the
+/// `crdt_properties` property tests, which exercise thousands of random fact streams).
 pub fn merge_fact(map: &mut HiveCacheMap, incoming: CacheFact, now: u64) -> bool {
     if incoming.verify_signed().is_err() {
         return false;
@@ -241,9 +243,18 @@ pub fn merge_fact(map: &mut HiveCacheMap, incoming: CacheFact, now: u64) -> bool
             true
         }
         Some(cur) => {
-            let wins = incoming.verified_at > cur.verified_at
-                || (incoming.verified_at == cur.verified_at
-                    && incoming.signer_pubkey > cur.signer_pubkey);
+            // A strict total order: newest verified_at wins; on a timestamp tie, the greater
+            // signer_pubkey wins; on a signer tie (the same node signing different content at the same
+            // second), the greater signature wins. A total order makes the merge order-independent.
+            let wins = (
+                incoming.verified_at,
+                incoming.signer_pubkey.as_str(),
+                incoming.sig.as_str(),
+            ) > (
+                cur.verified_at,
+                cur.signer_pubkey.as_str(),
+                cur.sig.as_str(),
+            );
             if wins {
                 map.insert(key, incoming);
                 true
