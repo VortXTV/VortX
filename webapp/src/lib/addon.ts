@@ -135,12 +135,22 @@ function catalogUrl(ref: CatalogRef, extra?: Record<string, string | number>): s
   return `${base}/catalog/${encodeURIComponent(type)}/${encodeURIComponent(id)}${extras}.json`;
 }
 
+/** Keep only well-formed meta items (a non-null object with a string id). A misbehaving add-on can
+ *  return null / non-object entries (or a non-array `metas`); without this they throw in id de-dup or
+ *  blank a whole rail. Mirrors the boundary validation `fetchSubtitles` already does for tracks. */
+function validMetas(list: unknown): MetaItem[] {
+  if (!Array.isArray(list)) return [];
+  return list.filter(
+    (m): m is MetaItem => m !== null && typeof m === "object" && typeof (m as MetaItem).id === "string",
+  );
+}
+
 /** Fetch one catalog page's meta items (empty array on failure so one bad add-on never breaks Home). */
 export async function fetchCatalog(ref: CatalogRef, skip = 0): Promise<MetaItem[]> {
   const url = catalogUrl(ref, skip > 0 ? { skip } : undefined);
   try {
     const data = await fetchJson<CatalogResponse>(url);
-    return data.metas ?? [];
+    return validMetas(data.metas);
   } catch {
     return [];
   }
@@ -171,7 +181,7 @@ export async function search(addons: Addon[], query: string, types: string[]): P
     refs.map(async (ref) => {
       try {
         const data = await fetchJson<CatalogResponse>(catalogUrl(ref, { search: query }));
-        return data.metas ?? [];
+        return validMetas(data.metas);
       } catch {
         return [];
       }
