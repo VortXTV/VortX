@@ -263,6 +263,16 @@ mod tests {
         assert_eq!(parsed.metas.len(), 2);
         assert!(parsed.metas[0].poster.is_none());
         assert_eq!(parsed.metas[1].imdb_rating.as_deref(), Some("8.1"));
+        assert!(parsed.metas[0].certification.is_none()); // absent stays None (unrated)
+    }
+
+    #[test]
+    fn decodes_catalog_certification_for_parental_controls() {
+        let body = r#"{ "metas": [
+            { "id": "tt1", "type": "movie", "name": "A", "certification": "R" }
+        ] }"#;
+        let parsed = parse_catalog(body).expect("catalog parses");
+        assert_eq!(parsed.metas[0].certification.as_deref(), Some("R"));
     }
 
     #[test]

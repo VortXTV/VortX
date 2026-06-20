@@ -94,6 +94,12 @@ pub struct MetaPreview {
         skip_serializing_if = "Option::is_none"
     )]
     pub imdb_rating: Option<String>,
+    /// Content maturity certification as the addon reports it (any scheme: MPAA `R`, US-TV `TV-MA`, BBFC
+    /// `15`, a bare age). The engine reconciles it to one age-equivalent via `vortx_state::parse_
+    /// certification` for parental-controls enforcement; `None` is treated as unrated (fail-closed for a
+    /// kids profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certification: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genres: Option<Vec<String>>,
 }
@@ -131,6 +137,10 @@ pub struct MetaDetail {
         skip_serializing_if = "Option::is_none"
     )]
     pub imdb_rating: Option<String>,
+    /// Content maturity certification (any scheme); reconciled by `vortx_state::parse_certification` for
+    /// parental-controls enforcement. See [`MetaPreview::certification`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certification: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
