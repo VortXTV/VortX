@@ -31,7 +31,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,78 @@ fn set_state(state: PlayerState) {
     if let Ok(mut guard) = STATE.write() {
         *guard = state;
     }
+}
+
+// ---- Playback-progress reporting (Continue Watching / resume) -----------------------------------
+//
+// Desktop used to play but never tell the engine where the user was, so Continue Watching and resume
+// never reflected desktop playback. This samples mpv's position over the IPC we already have and
+// forwards it to the engine Player as a `TimeChanged` action (the same report the Apple apps send).
+// player.rs stays decoupled from the runtime: lib.rs registers a sink closure at init.
+
+/// Forwards a sampled position (time_ms, duration_ms) to the engine. None until lib.rs registers it.
+type ProgressSink = Box<dyn Fn(u64, u64) + Send + Sync>;
+static PROGRESS_SINK: Lazy<RwLock<Option<ProgressSink>>> = Lazy::new(Default::default);
+/// Guards the single long-lived reporter thread so it is spawned at most once.
+static REPORTER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Sampling cadence. Continue Watching only needs a coarse position; a tight loop would spam the
+/// engine (and the IPC). Matches the Apple apps' periodic report, not a per-frame update.
+const PROGRESS_POLL: Duration = Duration::from_secs(5);
+
+/// Register the engine progress sink. Called once from lib.rs at engine init.
+pub fn set_progress_sink(sink: ProgressSink) {
+    if let Ok(mut guard) = PROGRESS_SINK.write() {
+        *guard = Some(sink);
+    }
+}
+
+/// Start the single background thread that, while mpv is Playing, samples its position every
+/// `PROGRESS_POLL` and forwards it to the engine. Idempotent (a second call is a no-op).
+pub fn start_progress_reporter() {
+    if REPORTER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(PROGRESS_POLL);
+        if matches!(status(), PlayerState::Playing) {
+            report_position_now();
+        }
+    });
+}
+
+/// Sample mpv once and forward the position to the sink. A no-op when nothing is playing, the position
+/// is still null during load, or the duration is unknown (so a 0-duration report never lands).
+fn report_position_now() {
+    let Some((time_ms, duration_ms)) = read_position_ms() else {
+        return;
+    };
+    if duration_ms == 0 {
+        return;
+    }
+    if let Ok(guard) = PROGRESS_SINK.read() {
+        if let Some(sink) = guard.as_ref() {
+            sink(time_ms, duration_ms);
+        }
+    }
+}
+
+/// mpv's current position and duration in milliseconds, or None if unavailable (no player, not yet
+/// started, or a property still null during load).
+fn read_position_ms() -> Option<(u64, u64)> {
+    let time = get_property_f64("time-pos")?;
+    let duration = get_property_f64("duration")?;
+    if time < 0.0 || duration <= 0.0 {
+        return None;
+    }
+    Some(((time * 1000.0) as u64, (duration * 1000.0) as u64))
+}
+
+/// Fetch a single numeric mpv property over IPC. None when no player runs or the property is
+/// absent/null (e.g. queried before the file is loaded). Each call uses its own short-lived IPC
+/// connection, so it never contends with the transport command path beyond mpv's own multiplexing.
+fn get_property_f64(name: &str) -> Option<f64> {
+    let reply = command(&json!({ "command": ["get_property", name] })).ok()?;
+    reply.get("data").and_then(Value::as_f64)
 }
 
 /// Current player state, cloned for the Tauri command layer.
@@ -334,6 +406,10 @@ pub fn command(value: &Value) -> Result<Value, String> {
 /// Force-kill the mpv child and reset state. Idempotent. Called on stop, on a failed play, and on
 /// app exit so we never orphan an mpv process. Tries a graceful `quit` over IPC first, then kills.
 pub fn stop() {
+    // Capture the exact position before tearing mpv down, so quitting (or switching titles) records an
+    // accurate resume point. Done while PLAYER still holds the running child, so the IPC read succeeds.
+    report_position_now();
+
     let player = match PLAYER.lock() {
         Ok(mut guard) => guard.take(),
         Err(poisoned) => poisoned.into_inner().take(),

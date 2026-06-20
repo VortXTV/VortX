@@ -113,6 +113,12 @@ fn init_engine<F: Fn(String) + Send + Sync + 'static>(storage_dir: String, on_ev
     }));
 
     *RUNTIME.write().expect("runtime write") = Some(runtime);
+
+    // Forward mpv playback position to the engine Player so Continue Watching + resume work on desktop
+    // (the previously-missing leg: desktop played but never reported a position). Backend wiring only;
+    // the frontend's engine-driven playback supplies the loaded Player this updates.
+    player::set_progress_sink(Box::new(report_progress));
+    player::start_progress_reporter();
 }
 
 /// `{ "field": <DesktopModelField|null>, "action": <Action> }`
@@ -130,9 +136,8 @@ fn engine_schema_version() -> u32 {
 }
 
 /// Dispatch an action (JSON) to the Runtime. No-op if not initialized or the JSON is invalid.
-#[tauri::command]
-fn engine_dispatch(action_json: String) {
-    let dto: ActionDto = match serde_json::from_str(&action_json) {
+fn dispatch_action_json(action_json: &str) {
+    let dto: ActionDto = match serde_json::from_str(action_json) {
         Ok(dto) => dto,
         Err(_) => return,
     };
@@ -144,6 +149,23 @@ fn engine_dispatch(action_json: String) {
             });
         }
     }
+}
+
+/// Dispatch an action (JSON) to the Runtime. No-op if not initialized or the JSON is invalid.
+#[tauri::command]
+fn engine_dispatch(action_json: String) {
+    dispatch_action_json(&action_json);
+}
+
+/// Forward a desktop playback position to the engine Player (ms), so Continue Watching + resume reflect
+/// it. Mirrors the Apple core's reportProgress (Player -> TimeChanged). Registered as the player's
+/// progress sink at init; the engine ignores it unless a Player is loaded, so it is safe to call on
+/// every sample while mpv is playing.
+fn report_progress(time_ms: u64, duration_ms: u64) {
+    let action = format!(
+        r#"{{"field":"player","action":{{"action":"Player","args":{{"action":"TimeChanged","args":{{"time":{time_ms},"duration":{duration_ms},"device":"desktop"}}}}}}}}"#
+    );
+    dispatch_action_json(&action);
 }
 
 /// Serialize a model field to JSON (field name e.g. `"board"`). Returns `"null"` until initialized.
