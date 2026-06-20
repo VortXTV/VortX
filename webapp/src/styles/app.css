@@ -283,7 +283,8 @@ input:focus-visible {
   display: flex;
   gap: 0.85rem;
   overflow-x: auto;
-  padding-bottom: 0.5rem;
+  overflow-y: hidden;
+  padding: 14px 2px;
   scroll-snap-type: x proximity;
   scrollbar-width: thin;
 }
@@ -301,10 +302,10 @@ input:focus-visible {
 .poster {
   display: block;
   border-radius: var(--radius-card);
-  transition: transform var(--duration-normal) var(--ease);
+  transition: transform var(--dur-state) var(--ease-spring);
 }
 .poster:hover {
-  transform: translateY(-4px) scale(1.03);
+  transform: translateY(-6px) scale(1.04);
 }
 .poster-art {
   aspect-ratio: 2 / 3;
@@ -312,7 +313,11 @@ input:focus-visible {
   border-radius: var(--radius-card);
   object-fit: cover;
   background: var(--surface-2);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--elev-rest);
+  transition: box-shadow var(--dur-state) var(--ease);
+}
+.poster:hover .poster-art {
+  box-shadow: var(--elev-focus), var(--glow-accent);
 }
 .poster-art-empty {
   display: grid;
@@ -329,6 +334,10 @@ input:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: color var(--dur-state) var(--ease);
+}
+.poster:hover .poster-name {
+  color: var(--text);
 }
 /* Watched-progress track under a Continue Watching poster (posterCard renders it only when a progress
    fraction is passed). The inner span's inline width is the watched fraction. */
@@ -1324,6 +1333,8 @@ input:focus-visible {
   background-size: cover;
   background-position: center 18%;
   transition: opacity var(--dur-state) var(--ease);
+  /* Slow cinematic zoom; restarts per item (the bg node is replaced on each rotation). */
+  animation: kenburns 22s ease-out both;
 }
 .featured-scrim {
   position: absolute;
@@ -1345,10 +1356,30 @@ input:focus-visible {
   max-width: min(760px, 92%);
   padding: 0 var(--space-edge) var(--space-lg);
   transition: opacity var(--dur-state) var(--ease);
+  /* Fade + rise in per item; `backwards` fill reverts after so the cross-fade-out still works. */
+  animation: heroRise 0.6s var(--ease) backwards;
 }
 .featured.is-swapping .featured-bg,
 .featured.is-swapping .featured-content {
   opacity: 0;
+}
+@keyframes kenburns {
+  from {
+    transform: scale(1);
+  }
+  to {
+    transform: scale(1.08);
+  }
+}
+@keyframes heroRise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 .featured-logo {
   max-width: 320px;
@@ -1405,6 +1436,7 @@ input:focus-visible {
   .featured-bg,
   .featured-content {
     transition: none;
+    animation: none;
   }
 }
 
