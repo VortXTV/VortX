@@ -21,6 +21,7 @@ members = [
     "crates/reco",
     "crates/playback",
     "crates/playback-policy",
+    "crates/engine",
 ]
 
 [workspace.package]
