@@ -17,6 +17,8 @@ export interface Settings {
   subtitlesMode: SubtitlesMode;
   autoplayTrailers: boolean;
   mdblistKey: string; // optional MDBList API key for IMDb/RT/TMDB ratings on the detail page
+  subtitleScale: number; // 0.7 - 1.8, scales the player's subtitle text (video::cue)
+  subtitleBackground: boolean; // a translucent backing behind subtitle text (vs text-only)
 }
 
 /** The accent palette, ported 1:1 from ThemeManager.accents (the app's source of truth). base/bright are
@@ -59,7 +61,13 @@ const DEFAULTS: Settings = {
   subtitlesMode: "on",
   autoplayTrailers: true,
   mdblistKey: "",
+  subtitleScale: 1,
+  subtitleBackground: true,
 };
+
+export const SUB_MIN = 0.7;
+export const SUB_MAX = 1.8;
+export const SUB_STEP = 0.1;
 
 let cache: Settings | null = null;
 const listeners = new Set<(s: Settings) => void>();
@@ -124,6 +132,10 @@ export function applySettings(s: Settings = getSettings()): void {
   // App text size: scale the root font so rem/em-based UI text follows (ThemeManager.textScale twin).
   if (Math.abs(s.textScale - 1) < 0.001) root.style.removeProperty("font-size");
   else root.style.setProperty("font-size", `${Math.round(16 * s.textScale)}px`);
+
+  // Subtitle style: the player's native <track> cues read these via `video::cue` (see app.css).
+  root.style.setProperty("--sub-scale", String(s.subtitleScale));
+  root.style.setProperty("--sub-bg", s.subtitleBackground ? "rgba(0, 0, 0, 0.75)" : "transparent");
 }
 
 /** "#rrggbb" + alpha -> "rgba(r,g,b,a)" for the soft/glow tints. */

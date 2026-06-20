@@ -1739,3 +1739,17 @@ input:focus-visible {
 .settings-key {
   width: min(280px, 52vw);
 }
+
+/* Subtitle style: the player's native <track> cues read the live settings vars (lib/settings). */
+video::cue {
+  font-size: calc(var(--sub-scale, 1) * 100%);
+  background-color: var(--sub-bg, rgba(0, 0, 0, 0.75));
+  color: #fff;
+}
+/* Backup & Restore action buttons sit in a wrapping row. */
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
+  padding: var(--space-md) 0;
+}
