@@ -7,8 +7,11 @@ description = "StremioX native core, Rust ⇄ Swift FFI bridge over stremio-core
 
 [lib]
 name = "stremiox_core"
-# staticlib → bundled into an .xcframework and linked by the tvOS app (like NodeMobile).
-crate-type = ["staticlib"]
+# staticlib → bundled into an .xcframework and linked by the Apple apps (like NodeMobile).
+# cdylib    → libstremiox_core.so loaded by the Android app via System.loadLibrary("stremiox_core").
+# Both are emitted from one build; each host links the artifact it needs. The Android JNI surface
+# (src/android_jni.rs) is `#[cfg(target_os = "android")]` so the Apple build never compiles it.
+crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 # The real Stremio engine.
@@ -31,6 +34,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "time"] }
 # HTTP for Env::fetch, rustls (no system OpenSSL/SecureTransport) so it stays a self-contained static lib.
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Android-only: the JNI bridge to Kotlin (src/android_jni.rs). Target-gated so the Apple staticlib
+# build never pulls it in. 0.21 is the current stable line (mutable-borrow JNIEnv API). Build the
+# .so with `cargo ndk` (see android/app/build.gradle.kts and the integration notes).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
 
 [profile.release]
 opt-level = "s"

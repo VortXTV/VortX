@@ -16,6 +16,12 @@
 mod env;
 mod model;
 
+// Android JNI surface. Same engine, same JSON contract, exposed to Kotlin via the `jni` crate as a
+// cdylib (libstremiox_core.so) instead of the Apple staticlib. Compiled only for the Android target
+// so the Apple build is unaffected. See src/android_jni.rs.
+#[cfg(target_os = "android")]
+mod android_jni;
+
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_void;
 use std::panic::AssertUnwindSafe;
@@ -59,34 +65,26 @@ unsafe impl Sync for Callback {}
 
 static EVENT_CB: Lazy<RwLock<Option<Callback>>> = Lazy::new(Default::default);
 
-/// Smoke milestone (kept): stremio-core's storage schema version.
-#[no_mangle]
-pub extern "C" fn stremiox_core_schema_version() -> u32 {
-    SCHEMA_VERSION
-}
+/// A host-agnostic sink for serialized `RuntimeEvent` JSON. The Apple C ABI wraps its
+/// `(ctx, ptr, len)` callback into one of these; the Android JNI surface wraps a `JavaVM` + Kotlin
+/// listener global-ref into one. The hydrate/build/event-loop body (`init_runtime`) is identical for
+/// both hosts and only differs in where the JSON bytes are delivered.
+pub(crate) type EventSink = Box<dyn Fn(&[u8]) + Send + Sync + 'static>;
 
-/// Initialize the engine. Returns `true` on success (or if already initialized).
+/// Hydrate persisted buckets, build the `Runtime`, and spawn the event loop, delivering each
+/// serialized `RuntimeEvent` to `sink`. Returns `true` on success (or if already initialized).
 ///
-/// # Safety
-/// `storage_dir` and `cache_dir` must be valid NUL-terminated C strings; `on_event`/`cb_ctx` must
-/// remain valid for the lifetime of the app (the event loop never stops).
-#[no_mangle]
-pub extern "C" fn stremiox_core_init(
-    storage_dir: *const c_char,
-    cache_dir: *const c_char,
-    cb_ctx: *mut c_void,
-    on_event: EventCallback,
-) -> bool {
+/// Shared by the Apple C ABI (`stremiox_core_init`) and the Android JNI surface so there is exactly
+/// one copy of the initialization + event-loop logic. `storage_dir`/`cache_dir` are owned Strings so
+/// the caller (FFI or JNI) marshals the host string however it must before calling in.
+pub(crate) fn init_runtime(storage_dir: String, cache_dir: String, sink: EventSink) -> bool {
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if RUNTIME.read().ok().map(|guard| guard.is_some()).unwrap_or(true) {
             return true; // already initialized (or lock poisoned, don't re-init)
         }
-        let storage_dir = unsafe { CStr::from_ptr(storage_dir) }.to_string_lossy().into_owned();
-        let cache_dir = unsafe { CStr::from_ptr(cache_dir) }.to_string_lossy().into_owned();
         env::set_storage_dir(storage_dir);
         // fetch.rs-style HTTP cache lives under TMPDIR; point it at the host's caches dir.
         std::env::set_var("TMPDIR", &cache_dir);
-        *EVENT_CB.write().expect("event cb write") = Some(Callback { cb: on_event, ctx: cb_ctx });
 
         // Run storage-schema migrations (v1..=SCHEMA_VERSION), best-effort.
         let _ = env::block_on(TvosEnv::migrate_storage_schema());
@@ -144,20 +142,88 @@ pub extern "C" fn stremiox_core_init(
         let (runtime, rx) =
             Runtime::<TvosEnv, _>::new(model, effects.into_iter().collect::<Vec<_>>(), 1000);
 
-        // Event loop: serialize each RuntimeEvent to JSON and hand it to the Swift callback.
-        TvosEnv::exec_concurrent(rx.for_each(|event| {
+        // Event loop: serialize each RuntimeEvent to JSON and hand it to the host sink.
+        TvosEnv::exec_concurrent(rx.for_each(move |event| {
             if let Ok(json) = serde_json::to_vec(&event) {
-                if let Ok(guard) = EVENT_CB.read() {
-                    if let Some(callback) = guard.as_ref() {
-                        (callback.cb)(callback.ctx, json.as_ptr(), json.len());
-                    }
-                }
+                sink(&json);
             }
             futures::future::ready(())
         }));
 
         *RUNTIME.write().expect("runtime write") = Some(runtime);
         true
+    }));
+    outcome.unwrap_or(false)
+}
+
+/// Dispatch an already-parsed action JSON string. Shared by the C ABI and JNI. No-op if not
+/// initialized or the JSON is invalid (parse errors are swallowed, matching the FFI contract).
+pub(crate) fn dispatch_json(json: &str) {
+    let dto: ActionDto = match serde_json::from_str(json) {
+        Ok(dto) => dto,
+        Err(_) => return,
+    };
+    if let Ok(guard) = RUNTIME.read() {
+        if let Some(runtime) = guard.as_ref() {
+            runtime.dispatch(RuntimeAction {
+                field: dto.field,
+                action: dto.action,
+            });
+        }
+    }
+}
+
+/// Serialize a model field (given by its JSON field name, e.g. `"board"`) to a JSON String. Shared by
+/// the C ABI and JNI. Returns `"null"` if the field name is unknown or the engine is not ready.
+pub(crate) fn get_state_json(field_json: &str) -> String {
+    let field: TvosModelField = match serde_json::from_str(field_json) {
+        Ok(field) => field,
+        Err(_) => return "null".to_owned(),
+    };
+    match RUNTIME.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(runtime) => match runtime.model() {
+                Ok(model) => model.get_state_json(&field),
+                Err(_) => "null".to_owned(),
+            },
+            None => "null".to_owned(),
+        },
+        Err(_) => "null".to_owned(),
+    }
+}
+
+/// Smoke milestone (kept): stremio-core's storage schema version.
+#[no_mangle]
+pub extern "C" fn stremiox_core_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
+/// Initialize the engine. Returns `true` on success (or if already initialized).
+///
+/// # Safety
+/// `storage_dir` and `cache_dir` must be valid NUL-terminated C strings; `on_event`/`cb_ctx` must
+/// remain valid for the lifetime of the app (the event loop never stops).
+#[no_mangle]
+pub extern "C" fn stremiox_core_init(
+    storage_dir: *const c_char,
+    cache_dir: *const c_char,
+    cb_ctx: *mut c_void,
+    on_event: EventCallback,
+) -> bool {
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let storage_dir = unsafe { CStr::from_ptr(storage_dir) }.to_string_lossy().into_owned();
+        let cache_dir = unsafe { CStr::from_ptr(cache_dir) }.to_string_lossy().into_owned();
+        *EVENT_CB.write().expect("event cb write") = Some(Callback { cb: on_event, ctx: cb_ctx });
+        // The C-ABI sink reads the process-global callback each event so it stays valid for the app's
+        // lifetime, matching the documented "on_event must remain valid forever" contract.
+        let sink: EventSink = Box::new(|json: &[u8]| {
+            if let Ok(guard) = EVENT_CB.read() {
+                if let Some(callback) = guard.as_ref() {
+                    (callback.cb)(callback.ctx, json.as_ptr(), json.len());
+                }
+            }
+        });
+        init_runtime(storage_dir, cache_dir, sink)
     }));
     outcome.unwrap_or(false)
 }
@@ -181,18 +247,7 @@ pub extern "C" fn stremiox_core_dispatch(action_json: *const c_char) {
             Ok(json) => json,
             Err(_) => return,
         };
-        let dto: ActionDto = match serde_json::from_str(json) {
-            Ok(dto) => dto,
-            Err(_) => return,
-        };
-        if let Ok(guard) = RUNTIME.read() {
-            if let Some(runtime) = guard.as_ref() {
-                runtime.dispatch(RuntimeAction {
-                    field: dto.field,
-                    action: dto.action,
-                });
-            }
-        }
+        dispatch_json(json);
     }));
 }
 
@@ -204,21 +259,7 @@ pub extern "C" fn stremiox_core_dispatch(action_json: *const c_char) {
 pub extern "C" fn stremiox_core_get_state(field_json: *const c_char) -> *mut c_char {
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let json = unsafe { CStr::from_ptr(field_json) }.to_str().unwrap_or("null");
-        let field: TvosModelField = match serde_json::from_str(json) {
-            Ok(field) => field,
-            Err(_) => return to_c_string("null"),
-        };
-        let state = match RUNTIME.read() {
-            Ok(guard) => match guard.as_ref() {
-                Some(runtime) => match runtime.model() {
-                    Ok(model) => model.get_state_json(&field),
-                    Err(_) => "null".to_owned(),
-                },
-                None => "null".to_owned(),
-            },
-            Err(_) => "null".to_owned(),
-        };
-        to_c_string(&state)
+        to_c_string(&get_state_json(json))
     }));
     outcome.unwrap_or_else(|_| to_c_string("null"))
 }
