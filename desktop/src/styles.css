@@ -178,7 +178,7 @@ body {
   background: var(--surface-3);
 }
 
-/* Full-bleed backdrop with a multi-stop scrim — the artwork stays vivid up top, the canvas takes
+/* Full-bleed backdrop with a multi-stop scrim: the artwork stays vivid up top, the canvas takes
    over toward the bottom and the leading edge so the text block + rows stay readable. Mirrors
    FullBleedBackdrop in DetailView.swift. */
 .detail-bg {
@@ -546,7 +546,7 @@ body {
   background: var(--surface-3);
   color: var(--muted);
 }
-/* Torrent sources play through the embedded streaming server — flagged distinctly from a direct/
+/* Torrent sources play through the embedded streaming server, flagged distinctly from a direct/
    debrid add-on badge so the source class is legible at a glance. */
 .badge-torrent {
   background: var(--accent-soft);
