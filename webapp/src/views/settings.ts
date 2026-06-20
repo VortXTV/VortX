@@ -125,13 +125,9 @@ function playbackSection(audioLang: string, subtitleLang: string, mode: Subtitle
 
 function aboutSection(): string {
   const body =
-    row("VortX Web", `<span class="settings-row-sub">tvOS Lite (no built-in server)</span>`) +
+    row("Version", `<span class="settings-row-sub">VortX for Web · 0.1</span>`) +
     row("Website", `<a class="inline-link" href="https://vortx.tv" target="_blank" rel="noopener">vortx.tv</a>`);
-  return group(
-    "About",
-    body,
-    "The web app speaks the Stremio add-on protocol directly and plays direct, debrid, and HLS sources. Torrents need a streaming server, so they are listed but not played here.",
-  );
+  return group("About", body);
 }
 
 // ---- Controls -----------------------------------------------------------------------------------

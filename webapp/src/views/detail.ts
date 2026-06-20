@@ -180,7 +180,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
   const trailer = trailerYouTubeID(meta);
-  const extra = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
+  const extra = `${trailer ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
   host.innerHTML = detailShell(
     bg,
     "",
@@ -220,7 +220,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     return;
   }
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
-  const extra = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
+  const extra = `${trailer ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
   host.innerHTML = detailShell(
     bg,
     "",
@@ -549,11 +549,11 @@ function trailerButton(): string {
   return `<button class="chip trailer-chip" data-action="play-trailer">${icon("trailer")}<span>Trailer</span></button>`;
 }
 
-/** Save/Saved toggle that adds the current title to the local Library (see store.ts). */
+/** Add to Library / In Library toggle (the app's wording), adding the title to the local Library. */
 function libraryButton(meta: MetaItem): string {
   const saved = inLibrary(meta.id);
   return `<button class="chip lib-chip${saved ? " selected" : ""}" data-action="toggle-library" aria-pressed="${saved}">${
-    saved ? `${icon("bookmarkFill")}<span>Saved</span>` : `${icon("bookmark")}<span>Save</span>`
+    saved ? `${icon("bookmarkFill")}<span>In Library</span>` : `${icon("bookmark")}<span>Add to Library</span>`
   }</button>`;
 }
 

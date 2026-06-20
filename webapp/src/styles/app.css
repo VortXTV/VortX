@@ -544,14 +544,17 @@ input:focus-visible {
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: stretch;
+  align-items: center;
   gap: var(--space-sm);
 }
-/* Every action (primary + chips) is the same height so the row lines up cleanly (the Trailer/Save/Share
-   chips align with the primary, not float at a different height). */
+/* Every action (primary + chips) is exactly the same height + vertically centered, so the whole row
+   lines up cleanly (no chip floats higher/lower than the primary). */
 .hero-actions .btn-primary,
 .hero-actions .chip {
-  min-height: 50px;
+  height: 48px;
+  min-height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
   display: inline-flex;
   align-items: center;
 }
@@ -780,9 +783,6 @@ input:focus-visible {
 
 /* ---- Trailer ---- */
 
-.trailer-chip {
-  margin-top: 1.25rem;
-}
 .trailer-overlay {
   position: fixed;
   inset: 0;
