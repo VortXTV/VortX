@@ -1,0 +1,65 @@
+{
+  "description": "Cross-language conformance for the playback-policy planner. Every implementation (Rust, TS, Swift, Kotlin) must map the same (kind, hints) to the same PlaybackPlan. All enum/int, no floats, so this is exactly reproducible everywhere.",
+  "cases": [
+    {
+      "name": "cached_debrid_minimal_buffer",
+      "kind": "debrid",
+      "hints": { "bandwidth_kbps": 8000, "metered": false, "device": "handset", "is_cached": true, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 2, "prefetch_window_secs": 30, "abr_ladder_choice": "not_applicable", "torrent_piece_window": 0, "player_engine": "libmpv", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "uncached_http_larger_buffer",
+      "kind": "http_direct",
+      "hints": { "bandwidth_kbps": 8000, "metered": false, "device": "handset", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 8, "prefetch_window_secs": 30, "abr_ladder_choice": "not_applicable", "torrent_piece_window": 0, "player_engine": "libmpv", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "hls_strong_living_room_high",
+      "kind": "hls",
+      "hints": { "bandwidth_kbps": 20000, "metered": false, "device": "living_room", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 6, "prefetch_window_secs": 30, "abr_ladder_choice": "start_high", "torrent_piece_window": 0, "player_engine": "native_abr", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "hls_metered_low",
+      "kind": "hls",
+      "hints": { "bandwidth_kbps": 8000, "metered": true, "device": "handset", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 6, "prefetch_window_secs": 5, "abr_ladder_choice": "start_low", "torrent_piece_window": 0, "player_engine": "native_abr", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "hls_unknown_bandwidth_auto",
+      "kind": "hls",
+      "hints": { "bandwidth_kbps": 0, "metered": false, "device": "handset", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 6, "prefetch_window_secs": 30, "abr_ladder_choice": "auto", "torrent_piece_window": 0, "player_engine": "native_abr", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "hls_constrained_low_software",
+      "kind": "hls",
+      "hints": { "bandwidth_kbps": 20000, "metered": false, "device": "constrained", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 6, "prefetch_window_secs": 30, "abr_ladder_choice": "start_low", "torrent_piece_window": 0, "player_engine": "native_abr", "hw_decode": "software" }
+    },
+    {
+      "name": "torrent_handset_cold_reads_ahead",
+      "kind": "torrent",
+      "hints": { "bandwidth_kbps": 8000, "metered": false, "device": "handset", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 20, "prefetch_window_secs": 15, "abr_ladder_choice": "not_applicable", "torrent_piece_window": 8, "player_engine": "libmpv", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "torrent_living_room_big_window",
+      "kind": "torrent",
+      "hints": { "bandwidth_kbps": 20000, "metered": false, "device": "living_room", "is_cached": false, "is_dolby_vision": false, "is_hdr": false },
+      "expect": { "buffer_target_secs": 20, "prefetch_window_secs": 15, "abr_ladder_choice": "not_applicable", "torrent_piece_window": 24, "player_engine": "libmpv", "hw_decode": "hardware_preferred" }
+    },
+    {
+      "name": "dv_living_room_hardware_required",
+      "kind": "hls",
+      "hints": { "bandwidth_kbps": 20000, "metered": false, "device": "living_room", "is_cached": false, "is_dolby_vision": true, "is_hdr": false },
+      "expect": { "buffer_target_secs": 6, "prefetch_window_secs": 30, "abr_ladder_choice": "start_high", "torrent_piece_window": 0, "player_engine": "native_abr", "hw_decode": "hardware_required" }
+    },
+    {
+      "name": "hdr_constrained_raises_to_preferred",
+      "kind": "http_direct",
+      "hints": { "bandwidth_kbps": 8000, "metered": false, "device": "constrained", "is_cached": false, "is_dolby_vision": false, "is_hdr": true },
+      "expect": { "buffer_target_secs": 8, "prefetch_window_secs": 30, "abr_ladder_choice": "not_applicable", "torrent_piece_window": 0, "player_engine": "libmpv", "hw_decode": "hardware_preferred" }
+    }
+  ]
+}
