@@ -663,12 +663,26 @@ final class ProfileStore: ObservableObject {
     func mergeInRoster(_ incoming: [UserProfile], incomingModified: Date? = nil) {
         guard !incoming.isEmpty else { return }
         let preferIncoming = (incomingModified ?? .distantPast) > rosterModified
+
+        // The account's OWNER profile is a singleton: one account, one owner profile. A fresh install
+        // creates a local placeholder owner ("main") with a NEW uuid, so signing into an account that
+        // already has an owner would union two owner profiles and leave a duplicate, undeletable "main"
+        // (the reported bug). When the incoming roster carries an owner with a DIFFERENT id than the
+        // local one, drop the local placeholder so the account's owner is adopted instead of duplicated.
+        // No-op on the normal path (same owner id), so it only fires on fresh-install-into-existing-account.
+        var localRoster = profiles
+        if let incomingOwner = incoming.first(where: { $0.isOwner }),
+           let localOwner = localRoster.first(where: { $0.isOwner }),
+           localOwner.id != incomingOwner.id {
+            localRoster.removeAll { $0.isOwner && $0.id != incomingOwner.id }
+        }
+
         let incomingByID = Dictionary(incoming.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let localByID = Dictionary(profiles.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let localByID = Dictionary(localRoster.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         // Start from the live order, then append any ids that exist only in the incoming roster, so
         // the union keeps every profile from both sides and preserves a stable, local-first ordering.
-        var merged: [UserProfile] = profiles.map { local in
+        var merged: [UserProfile] = localRoster.map { local in
             guard let remote = incomingByID[local.id] else { return local }
             return preferIncoming ? remote : local
         }
