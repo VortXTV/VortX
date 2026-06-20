@@ -25,6 +25,7 @@ mod pin;
 mod profile;
 mod roster;
 mod store;
+mod watch;
 
 pub use ids::ProfileId;
 pub use library::{
@@ -35,6 +36,7 @@ pub use pin::{hash_pin, pin_preimage, verify_pin};
 pub use profile::{AccountBinding, AddonBinding, ParentalFlags, Profile, ProfileSettings};
 pub use roster::ProfileRoster;
 pub use store::VortxStore;
+pub use watch::{merge as merge_watch, merge_log, WatchLog, WatchState};
 
 /// Errors from profile-state operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
