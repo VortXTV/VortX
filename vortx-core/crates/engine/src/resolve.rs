@@ -26,8 +26,10 @@ pub enum ResolveRequest {
         streams: Vec<Stream>,
         #[serde(default)]
         cached: Vec<bool>,
+        /// Explicit ranking prefs. When omitted, the ACTIVE profile's stored prefs are used, so a profile
+        /// that set its preferences once gets them applied to every stream resolve without re-sending them.
         #[serde(default)]
-        prefs: RankingPrefs,
+        prefs: Option<RankingPrefs>,
     },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
@@ -62,9 +64,19 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             streams,
             cached,
             prefs,
-        } => ResolveResponse::Streams {
-            ranked: rank(&streams, &prefs, &cached),
-        },
+        } => {
+            // Explicit prefs win; otherwise fall back to the active profile's stored ranking prefs.
+            let prefs = prefs.unwrap_or_else(|| {
+                engine
+                    .store()
+                    .active_profile()
+                    .map(|p| p.settings.ranking.clone())
+                    .unwrap_or_default()
+            });
+            ResolveResponse::Streams {
+                ranked: rank(&streams, &prefs, &cached),
+            }
+        }
         ResolveRequest::Subtitles { tracks, prefs } => ResolveResponse::Subtitles {
             selected: select_subtitle(&tracks, &prefs),
         },
@@ -116,7 +128,7 @@ mod tests {
         let req = ResolveRequest::Streams {
             streams: vec![stream("1080p WEB-DL"), stream("2160p WEB-DL")],
             cached: vec![false, false],
-            prefs: RankingPrefs::default(),
+            prefs: None, // falls back to the active (owner) profile's default prefs
         };
         let ResolveResponse::Streams { ranked } = resolve(&engine, req) else {
             panic!("expected streams response");

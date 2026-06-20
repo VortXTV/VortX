@@ -3,9 +3,13 @@
 //! contract, pinned by conformance vectors.
 
 use serde::{Deserialize, Serialize};
+use vortx_ranking::RankingPrefs;
 
 /// An action the host dispatches into the engine. Tagged by `type` (snake_case).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: [`Action::SetRankingPrefs`] carries [`RankingPrefs`], whose `max_filesize_gb: Option<f64>`
+/// is not `Eq`. `PartialEq` is enough for the round-trip conformance checks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     /// Re-point the active profile to an existing, live profile (instant, no re-auth).
@@ -23,6 +27,9 @@ pub enum Action {
         #[serde(default, rename = "maturityCeiling", skip_serializing_if = "Option::is_none")]
         maturity_ceiling: Option<u8>,
     },
+    /// Set a profile's stream-ranking preferences (used as the default when a stream resolve omits prefs).
+    /// Bumps the profile's LWW edit clock.
+    SetRankingPrefs { id: String, prefs: RankingPrefs },
     /// No state change; a way for the host to request a fresh state snapshot.
     GetState,
 }
@@ -35,6 +42,7 @@ pub enum EngineEvent {
     ProfileAdded { id: String },
     ProfileDeleted { id: String },
     ParentalSet { id: String },
+    RankingPrefsSet { id: String },
 }
 
 /// The result of a dispatch: success/failure, an optional error message, and the events produced.

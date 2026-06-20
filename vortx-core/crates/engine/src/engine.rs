@@ -77,6 +77,20 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
                 None => DispatchResult::err("profile not found"),
             }
         }
+        Action::SetRankingPrefs { id, prefs } => {
+            let pid = ProfileId::new(id.clone());
+            match engine.store.roster.get(&pid) {
+                Some(p) => {
+                    let mut updated = p.clone();
+                    updated.settings.ranking = prefs;
+                    updated.rev = updated.rev.saturating_add(1);
+                    updated.updated_at = env.now();
+                    engine.store.roster.upsert(updated);
+                    DispatchResult::ok(vec![EngineEvent::RankingPrefsSet { id }])
+                }
+                None => DispatchResult::err("profile not found"),
+            }
+        }
         Action::GetState => DispatchResult::ok(vec![]),
     }
 }

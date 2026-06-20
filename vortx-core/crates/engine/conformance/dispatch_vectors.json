@@ -29,6 +29,18 @@
       "expect": { "ok": true, "events": [{ "event": "profile_deleted", "id": "guest" }] }
     },
     {
+      "action": { "type": "set_ranking_prefs", "id": "kid", "prefs": { "source_type_order": ["remux"] } },
+      "expect": { "ok": true, "events": [{ "event": "ranking_prefs_set", "id": "kid" }] }
+    },
+    {
+      "action": { "type": "set_parental", "id": "kid", "kids": true },
+      "expect": { "ok": true, "events": [{ "event": "parental_set", "id": "kid" }] }
+    },
+    {
+      "action": { "type": "set_ranking_prefs", "id": "ghost", "prefs": {} },
+      "expect": { "ok": false, "error": "profile not found", "events": [] }
+    },
+    {
       "action": { "type": "get_state" },
       "expect": { "ok": true, "events": [] }
     }
