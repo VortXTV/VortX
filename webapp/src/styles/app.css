@@ -64,11 +64,15 @@
 [hidden] {
   display: none !important;
 }
-html,
-body {
+html {
   height: 100%;
+  /* Responsive base type: the UI leans on many sub-1rem sizes that read small on large displays, so the
+     root scales from 16.5px (mobile) up to 20px (desktop). Multiplied by the user's App-text-size setting
+     (--text-scale), so every rem-based size follows both the viewport and the preference. */
+  font-size: calc(clamp(16.5px, 15px + 0.4vw, 20px) * var(--text-scale, 1));
 }
 body {
+  height: 100%;
   font-family: var(--font);
   color: var(--text);
   background: radial-gradient(90% 50% at 50% 0%, #241a13 0%, var(--bg) 55%), var(--bg);

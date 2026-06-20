@@ -198,9 +198,10 @@ export function applySettings(s: Settings = getSettings()): void {
     for (const v of ["--bg", "--surface", "--surface-2", "--surface-3", "--hairline"]) root.style.removeProperty(v);
   }
 
-  // App text size: scale the root font so rem/em-based UI text follows (ThemeManager.textScale twin).
-  if (Math.abs(s.textScale - 1) < 0.001) root.style.removeProperty("font-size");
-  else root.style.setProperty("font-size", `${Math.round(16 * s.textScale)}px`);
+  // App text size: a unitless multiplier on the responsive root font-size (app.css html calc), so rem/em
+  // UI text follows both the viewport and the preference (ThemeManager.textScale twin).
+  if (Math.abs(s.textScale - 1) < 0.001) root.style.removeProperty("--text-scale");
+  else root.style.setProperty("--text-scale", String(s.textScale));
 
   // Performance: 'reduced' trims animations app-wide (the app's Performance row; also an a11y win). CSS
   // keys off [data-perf="reduced"] to near-zero all transition/animation durations.
