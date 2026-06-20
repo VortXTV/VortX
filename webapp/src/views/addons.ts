@@ -18,7 +18,7 @@ export function renderAddons(host: HTMLElement, addons: Addon[], onChange: () =>
       <h1 class="page-title">Add-ons</h1>
       <p class="muted">
         VortX web plays direct and debrid (HTTP/HLS) sources. To get playable streams, add a stream
-        add-on that returns direct links - typically one backed by a debrid service. Torrent-only
+        add-on that returns direct links, typically one backed by a debrid service. Torrent-only
         add-ons will list sources but the web app cannot play them (no streaming server).
       </p>
       <form class="addon-form" id="addon-form">

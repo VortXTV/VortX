@@ -254,7 +254,7 @@ function streamSection(groups: RankedGroup[]): string {
          streaming server). Use a debrid service (RealDebrid, AllDebrid, Premiumize) with a stream
          add-on for direct links, or open this title in the VortX app.`
       : `None of your add-ons returned a playable source. Add a stream add-on that serves direct or
-         debrid links - the web app plays HTTP(S) and HLS sources only.`;
+         debrid links. The web app plays HTTP(S) and HLS sources only.`;
     return `
       <div class="stream-section">
         <button class="watch disabled" disabled>
