@@ -6,11 +6,11 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.8 Beta 5 - 2026-06-20 (pre-release)
 
-Building on the 0.3.8 account work. The headline is that VortX now speaks **32 languages**, alongside a wave of per-profile and power-user controls: per-profile add-ons, in-app debrid keys, Kids Mode, one-tap quality presets, regex source filters, library export and import, Import from Stremio, Where to Watch, anime skipping, an in-player frame grab, and poster ratings. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+Building on the 0.3.8 account work. The headline is that VortX now speaks **40 languages**, alongside a wave of per-profile and power-user controls: per-profile add-ons, in-app debrid keys, Kids Mode, one-tap quality presets, regex source filters, library export and import, Import from Stremio, Where to Watch, anime skipping, an in-player frame grab, true Dolby Vision on iPhone and iPad, and poster ratings. In-place update, nothing resets. This is a beta, so please install it and report anything off.
 
 ### Added
 
-- **32 languages.** The interface is now fully localized to Arabic, Chinese (Simplified and Traditional), Czech, Danish, Dutch, Filipino, Finnish, French, German, Greek, Hebrew, Hindi, Hungarian, Indonesian, Italian, Japanese, Korean, Malay, Norwegian, Persian, Polish, Portuguese (Brazil and Portugal), Romanian, Russian, Spanish, Swedish, Thai, Turkish, Ukrainian, and Vietnamese, on top of English. It follows your device language automatically; Arabic, Hebrew, and Persian lay out right-to-left.
+- **40 languages.** The interface is now fully localized to Arabic, Bengali, Chinese (Simplified and Traditional), Czech, Danish, Dutch, Filipino, Finnish, French, German, Greek, Gujarati, Hebrew, Hindi, Hungarian, Indonesian, Italian, Japanese, Kannada, Korean, Malay, Malayalam, Marathi, Norwegian, Persian, Polish, Portuguese (Brazil and Portugal), Romanian, Russian, Spanish, Swedish, Tamil, Telugu, Thai, Turkish, Ukrainian, Urdu, and Vietnamese, on top of English. It follows your device language automatically; Arabic, Hebrew, Persian, and Urdu lay out right-to-left.
 - **Per-profile add-ons.** Turn individual add-ons on or off per profile without removing them from your account, so one profile can drop sources another keeps (Add-ons).
 - **Add-on health.** Each add-on shows an Online / Slow / Unreachable dot from a live check, with a Re-check button (Add-ons).
 - **Kids Mode.** Mark a profile as a Kids profile to always hide adult and CAM/fake sources from it, however its filters are set (Profiles). Pair it with a PIN on your own profile for a full lock.
