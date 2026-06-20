@@ -222,3 +222,46 @@ export function removeFromLibrary(id: string): void {
     /* storage disabled or full: best-effort */
   }
 }
+
+// ---- Backup & Restore (export / import the local data as a JSON file) ----
+// Mirrors the apps' Backup & Restore. The account session token is deliberately excluded (it is not
+// portable data; the account itself syncs server-side). Import overwrites these keys, then the caller
+// reloads so every module re-reads fresh state.
+
+const BACKUP_KEYS = [
+  "vortx.web.settings.v1",
+  "vortx.web.addons.v1",
+  "vortx.web.library.v1",
+  "vortx.web.cw.v1",
+  "vortx.web.recent.v1",
+];
+
+/** Serialize the local data (settings, add-ons, library, continue-watching, recent) to a JSON string. */
+export function exportBackup(): string {
+  const data: Record<string, unknown> = {};
+  for (const key of BACKUP_KEYS) {
+    const raw = localStorage.getItem(key);
+    if (raw == null) continue;
+    try {
+      data[key] = JSON.parse(raw);
+    } catch {
+      // skip a corrupt key rather than fail the whole export
+    }
+  }
+  return JSON.stringify({ app: "vortx-web", version: 1, data }, null, 2);
+}
+
+/** Restore from an exportBackup() string. Returns true on success (caller should reload). */
+export function importBackup(json: string): boolean {
+  try {
+    const parsed = JSON.parse(json) as { data?: Record<string, unknown> };
+    const data = parsed?.data;
+    if (!data || typeof data !== "object") return false;
+    for (const key of BACKUP_KEYS) {
+      if (key in data) localStorage.setItem(key, JSON.stringify(data[key]));
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}

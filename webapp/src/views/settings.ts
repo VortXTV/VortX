@@ -1,5 +1,6 @@
 import { actionOf, escapeHtml } from "../lib/dom";
 import { currentSession, signOut } from "../lib/account";
+import { exportBackup, importBackup } from "../lib/store";
 import {
   ACCENTS,
   getSettings,
@@ -7,6 +8,9 @@ import {
   TEXT_MIN,
   TEXT_MAX,
   TEXT_STEP,
+  SUB_MIN,
+  SUB_MAX,
+  SUB_STEP,
   type SubtitlesMode,
 } from "../lib/settings";
 
@@ -42,7 +46,9 @@ export function renderSettings(target: HTMLElement): void {
       ${accountSection()}
       ${appearanceSection(s.accentID, s.background, s.textScale)}
       ${playbackSection(s.audioLang, s.subtitleLang, s.subtitlesMode, s.autoplayTrailers)}
+      ${subtitleStyleSection(s.subtitleScale, s.subtitleBackground)}
       ${ratingsSection(s.mdblistKey)}
+      ${backupSection()}
       ${aboutSection()}
     </div>`;
   wireSettings(target);
@@ -134,6 +140,33 @@ function ratingsSection(mdblistKey: string): string {
   );
 }
 
+function subtitleStyleSection(scale: number, background: boolean): string {
+  const pct = Math.round(scale * 100);
+  const stepper = `
+    <div class="stepper">
+      <button class="stepper-btn" data-action="sub-size" data-dir="-1" ${scale <= SUB_MIN + 0.001 ? "disabled" : ""} aria-label="Smaller subtitles">-</button>
+      <span class="stepper-value">${pct}%</span>
+      <button class="stepper-btn" data-action="sub-size" data-dir="1" ${scale >= SUB_MAX - 0.001 ? "disabled" : ""} aria-label="Larger subtitles">+</button>
+    </div>`;
+  const body =
+    row("Subtitle size", stepper) +
+    row("Background", toggle("toggle-sub-bg", background), "A translucent backing behind subtitle text");
+  return group("Subtitle Style", body, "Applies to the player's subtitle track.");
+}
+
+function backupSection(): string {
+  const body = `
+    <div class="settings-actions">
+      <button class="chip" data-action="export-backup">Export backup</button>
+      <label class="chip backup-import" role="button">Import backup<input type="file" accept="application/json,.json" data-import-backup hidden /></label>
+    </div>`;
+  return group(
+    "Backup & Restore",
+    body,
+    "Export your add-ons, library, continue-watching, and settings to a file, or restore from one. Signed in, these also sync across your devices.",
+  );
+}
+
 function aboutSection(): string {
   const body =
     row("Version", `<span class="settings-row-sub">VortX for Web · 0.1</span>`) +
@@ -199,9 +232,34 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       signOut();
       rerender();
       return true;
+    case "sub-size": {
+      const dir = Number(hit.node.dataset.dir) || 0;
+      const next = clampSub(getSettings().subtitleScale + dir * SUB_STEP);
+      updateSettings({ subtitleScale: next });
+      rerender();
+      return true;
+    }
+    case "toggle-sub-bg":
+      updateSettings({ subtitleBackground: !getSettings().subtitleBackground });
+      rerender();
+      return true;
+    case "export-backup":
+      downloadBackup();
+      return true;
     default:
       return false;
   }
+}
+
+/** Download the local data as a JSON file (Backup). */
+function downloadBackup(): void {
+  const blob = new Blob([exportBackup()], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "vortx-backup.json";
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 /** Attach change listeners for the native <select> controls (language pickers) + the MDBList key input. */
@@ -214,6 +272,30 @@ function wireSettings(target: HTMLElement): void {
   });
   const keyInput = target.querySelector<HTMLInputElement>('input[data-key-input="mdblist"]');
   keyInput?.addEventListener("change", () => updateSettings({ mdblistKey: keyInput.value.trim() }));
+
+  const importInput = target.querySelector<HTMLInputElement>("input[data-import-backup]");
+  importInput?.addEventListener("change", () => {
+    const file = importInput.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (importBackup(String(reader.result))) location.reload();
+      else flashImportError(importInput);
+    };
+    reader.readAsText(file);
+  });
+}
+
+/** Inline "Invalid backup file" feedback on the Import control (no window.alert). */
+function flashImportError(input: HTMLInputElement): void {
+  const label = input.closest<HTMLElement>(".backup-import");
+  if (!label) return;
+  const prev = label.firstChild?.textContent ?? "Import backup";
+  if (label.firstChild) label.firstChild.textContent = "Invalid backup file";
+  input.value = "";
+  setTimeout(() => {
+    if (label.firstChild) label.firstChild.textContent = prev;
+  }, 2000);
 }
 
 function rerender(): void {
@@ -222,4 +304,8 @@ function rerender(): void {
 
 function clampScale(v: number): number {
   return Math.min(TEXT_MAX, Math.max(TEXT_MIN, Math.round(v / TEXT_STEP) * TEXT_STEP));
+}
+
+function clampSub(v: number): number {
+  return Math.min(SUB_MAX, Math.max(SUB_MIN, Math.round(v / SUB_STEP) * SUB_STEP));
 }
