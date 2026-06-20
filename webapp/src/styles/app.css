@@ -5,29 +5,40 @@
    so every surface reads as one product. Motion stays on transform / opacity / shadow only. */
 
 :root {
-  /* Warm near-black chrome, tinted toward the ember hue (matches ThemeManager tintedDark). */
-  --bg: #161310;
-  --surface: #221d18;
-  --surface-2: #2c251f;
-  --surface-3: #392f27;
-  /* Ember accent. */
-  --accent: #f27849;
-  --accent-bright: #ff9163;
-  --accent-soft: rgba(242, 120, 73, 0.18);
-  --on-accent: #1b110b;
+  /* Warm near-black chrome, the exact DESIGN.md tokens (mirrors app/SourcesShared/Theme.swift). */
+  --bg: #15120e;
+  --surface: #211c16;
+  --surface-2: #2d261d;
+  --surface-3: #3a3127;
+  --hairline: #403629; /* 1px separators only */
+  /* VortX brand gold (ThemeManager "vortx" accent, the shipping default, NOT the old StremioX ember):
+     focus / selection / primary action / progress. base #D97706, bright #F59E0B, obsidian ink. */
+  --accent: #d97706;
+  --accent-bright: #f59e0b;
+  --accent-soft: rgba(245, 158, 11, 0.18);
+  --on-accent: #0f0d0a;
   --text: #f6f1e9;
   --muted: #bcb1a1;
   --muted-2: #8c8273;
   --danger: #e0533d;
 
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* UI = SF Pro on Apple platforms; editorial serif = New York for the wordmark + hero. */
+  --font: "SF Pro Display", "SF Pro Text", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --serif: "New York", "Iowan Old Style", Georgia, "Times New Roman", serif;
 
   --radius-card: 16px;
   --radius-chip: 12px;
+  --radius-control: 14px;
   --shadow-card: 0 10px 30px -12px rgba(0, 0, 0, 0.7);
 
+  /* 8pt spacing scale (DESIGN.md): section gaps step on this grid, not ad-hoc values. */
   --space-page: clamp(1rem, 0.5rem + 2vw, 2.5rem);
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 20px;
+  --space-lg: 32px;
+  --space-xl: 48px;
+  --space-xxl: 72px;
 
   --duration-fast: 150ms;
   --duration-normal: 300ms;
@@ -107,18 +118,23 @@ input:focus-visible {
   background: linear-gradient(var(--bg) 60%, transparent);
 }
 .wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.06em;
   font-family: var(--serif);
-  font-size: 1.7rem;
+  font-size: clamp(1.9rem, 1.5rem + 1vw, 2.5rem);
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: -1px;
+  line-height: 1;
 }
-/* The "curvy vortex X": the accented X gets a subtle italic skew + ember glow so it reads as a mark. */
-.wordmark .accent {
+/* The real VortX mark: two ember ribbons crossing into an X with a cream center, the exact curve from
+   SplashView.swift's VortexRibbon. currentColor = --accent so it recolors live with the theme. */
+.vortex-mark {
+  width: 0.9em;
+  height: 0.9em;
   color: var(--accent);
-  font-style: italic;
-  display: inline-block;
-  transform: skewX(-8deg);
-  text-shadow: 0 0 18px var(--accent-soft);
+  filter: drop-shadow(0 0 8px var(--accent-soft));
+  transition: filter var(--duration-normal) var(--ease);
 }
 .topnav {
   display: flex;
@@ -151,6 +167,7 @@ input:focus-visible {
 .page-title {
   font-family: var(--serif);
   font-size: clamp(1.6rem, 1.2rem + 1.5vw, 2.4rem);
+  font-weight: 700;
   letter-spacing: -0.02em;
   margin-bottom: 0.75rem;
 }
@@ -398,6 +415,7 @@ input:focus-visible {
 .detail-title {
   font-family: var(--serif);
   font-size: clamp(2rem, 1.2rem + 4vw, 4rem);
+  font-weight: 700;
   line-height: 1.02;
   letter-spacing: -0.02em;
   margin-bottom: 0.75rem;
@@ -441,12 +459,13 @@ input:focus-visible {
 /* ---- Stream section ---- */
 
 .stream-section {
-  margin-top: 0.5rem;
+  margin-top: var(--space-md);
+  margin-bottom: var(--space-md);
 }
 .stream-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.6rem;
+  gap: 0.75rem;
   align-items: center;
 }
 .watch {
@@ -509,7 +528,7 @@ input:focus-visible {
 .quality-variants {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 0.75rem;
 }
 .quality-variant {
   padding: 0.5rem 0.9rem;
@@ -892,5 +911,145 @@ input:focus-visible {
   .card-remove {
     opacity: 1;
     pointer-events: auto;
+  }
+}
+
+/* ---- Branded splash (markup in index.html #splash). Fixed gold-on-obsidian brand moment, timing
+   mirrors app/SourcesShared/SplashView.swift: glow bloom, ribbon draw-in, shockwave ring, dot pop,
+   tagline. Dismissed by main.ts (once per session). ---- */
+.splash {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #0f0d0a;
+  opacity: 1;
+}
+.splash.fade-out {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.4s ease-in;
+}
+.splash-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 40px;
+}
+.splash-vortex {
+  width: clamp(160px, 26vw, 220px);
+  height: clamp(160px, 26vw, 220px);
+  animation: splashFocus 1.1s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.splash-tagline {
+  font-family: var(--serif);
+  font-size: clamp(2rem, 1.4rem + 2vw, 2.9rem);
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: center;
+  color: #fdf6e3;
+  animation: splashTag 0.55s ease-out 1.3s both;
+}
+.splash-tagline .g {
+  color: #f59e0b;
+}
+@keyframes splashGlow { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+@keyframes splashRib { from { stroke-dashoffset: 600; opacity: 0.2; } to { stroke-dashoffset: 0; opacity: 1; } }
+@keyframes splashRing { from { transform: scale(0.4); opacity: 0.7; } to { transform: scale(1.7); opacity: 0; } }
+@keyframes splashDot { 0% { transform: scale(0.01); } 70% { transform: scale(1.12); } 100% { transform: scale(1); } }
+@keyframes splashTag { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+/* The premium beat from SplashView.swift: the whole mark resolves from a soft blur and settles in
+   scale (ease-out-expo), reading as the vortex coming into focus rather than a static gold X. */
+@keyframes splashFocus { from { filter: blur(16px); transform: scale(0.86); opacity: 0; } to { filter: blur(0); transform: scale(1); opacity: 1; } }
+.splash-glow { transform-box: fill-box; transform-origin: center; animation: splashGlow 0.9s ease-out both; }
+.splash-rib { stroke-dasharray: 600; animation: splashRib 1.05s ease-in-out both; }
+.splash-rib-2 { animation-delay: 0.15s; }
+.splash-ring { transform-box: fill-box; transform-origin: center; animation: splashRing 0.85s ease-out 0.9s both; }
+.splash-dot { transform-box: fill-box; transform-origin: center; animation: splashDot 0.55s ease-out 0.85s both; }
+
+/* ---- Action row: the orphaned Save / Share / Trailer buttons now sit in a flex row with a real gap
+   (was bare adjacent buttons with no spacing). ---- */
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: var(--space-md);
+}
+
+/* ---- Press + keyboard polish (transform/opacity/shadow only). ---- */
+.chip:active,
+.watch:active,
+.topnav-link:active,
+.card-remove:active,
+.quality-variant:active,
+.stream:active,
+.episode:active,
+.discover-more:active,
+.search-more:active {
+  transform: scale(0.98) translateY(1px);
+  transition: transform 100ms cubic-bezier(0.4, 0, 1, 1);
+}
+.watch:active {
+  background: var(--accent);
+}
+.poster:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 3px;
+  border-radius: var(--radius-card);
+}
+.poster:active {
+  transform: scale(0.98);
+}
+.card-remove:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 2px;
+  background: var(--accent-soft);
+}
+.card-remove:active {
+  transform: scale(0.95);
+}
+.search-input:focus {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.stream:active,
+.episode:active {
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash-vortex,
+  .splash-glow,
+  .splash-rib,
+  .splash-ring,
+  .splash-dot,
+  .splash-tagline {
+    animation: none;
+  }
+  .splash-vortex {
+    filter: none;
+    opacity: 1;
+    transform: none;
+  }
+  .splash-rib {
+    stroke-dashoffset: 0;
+  }
+  .splash-ring {
+    display: none;
+  }
+  .chip:active,
+  .watch:active,
+  .topnav-link:active,
+  .card-remove:active,
+  .quality-variant:active,
+  .stream:active,
+  .episode:active,
+  .poster:active,
+  .discover-more:active,
+  .search-more:active {
+    transform: none;
   }
 }

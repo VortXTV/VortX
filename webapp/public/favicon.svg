@@ -1,16 +1,17 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="VortX">
-  <rect width="64" height="64" rx="14" fill="#161310" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="VortX">
+  <rect width="200" height="200" rx="44" fill="#15120e" />
   <defs>
-    <linearGradient id="ember" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+    <linearGradient id="ember" x1="0" y1="0" x2="0" y2="200" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#ff9163" />
-      <stop offset="1" stop-color="#f27849" />
+      <stop offset="0.55" stop-color="#f2784b" />
+      <stop offset="1" stop-color="#92400e" />
     </linearGradient>
   </defs>
-  <!-- The curvy vortex X: two skewed strokes that swirl rather than cross flat. -->
-  <g transform="skewX(-8)" transform-origin="32 32">
-    <path d="M20 16 C30 30 34 34 44 48" stroke="url(#ember)" stroke-width="7"
-          stroke-linecap="round" fill="none" />
-    <path d="M44 16 C34 30 30 34 20 48" stroke="url(#ember)" stroke-width="7"
-          stroke-linecap="round" fill="none" opacity="0.92" />
+  <!-- The canonical VortX mark: two ember ribbons crossing into an X with a cream center, the exact
+       VortexRibbon curve from app/SourcesShared/SplashView.swift. Same geometry as the header mark + splash. -->
+  <g transform="translate(34 34) scale(0.66)">
+    <path d="M22.8 11.4 C88.6 60 114.2 140 180 188.6" fill="none" stroke="url(#ember)" stroke-width="42.8" stroke-linecap="round" />
+    <path d="M180 11.4 C114.2 60 88.6 140 22.8 188.6" fill="none" stroke="#ff9163" stroke-width="42.8" stroke-linecap="round" opacity="0.92" />
+    <circle cx="100" cy="100" r="16" fill="#fdf6e3" />
   </g>
 </svg>
