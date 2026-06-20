@@ -140,6 +140,12 @@ export function cwPosition(resumeId: string): number {
   return rawCW().find((e) => e.resumeId === resumeId)?.position ?? 0;
 }
 
+/** The saved watched FRACTION (0..1) for a played id, or 0 if none / unknown duration. */
+export function cwProgress(resumeId: string): number {
+  const e = rawCW().find((x) => x.resumeId === resumeId);
+  return e && e.duration > 0 ? Math.min(1, e.position / e.duration) : 0;
+}
+
 /** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
  *  drops that played id once past 95% (finished). */
 export function recordProgress(

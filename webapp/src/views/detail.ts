@@ -14,7 +14,7 @@ import {
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { play } from "../lib/player";
-import { inLibrary, toggleLibrary } from "../lib/store";
+import { cwPosition, cwProgress, inLibrary, toggleLibrary } from "../lib/store";
 
 // The Detail page: a full-bleed backdrop with a gradient scrim, a logo/title hero, a meta row
 // (rating, year, runtime, genres), a primary Watch button that plays the best ranked source, a
@@ -270,10 +270,18 @@ function streamSection(groups: RankedGroup[]): string {
       </div>`;
   }
 
+  // If this title/episode has a saved resume position, label the button "Resume … · 12:34" (playback
+  // already seeks to it; this just makes the affordance visible). resumeId is the played id.
+  const resumeId = state.openEpisode?.id ?? state.meta?.id;
+  const resumePos = resumeId ? cwPosition(resumeId) : 0;
+  const watchInner =
+    resumePos > 0
+      ? `<span class="play-icon" aria-hidden="true">▷</span> Resume ${escapeHtml(watchLabel(top))} · ${formatTime(resumePos)}`
+      : `<span class="play-icon" aria-hidden="true">▷</span> Watch in ${escapeHtml(watchLabel(top))}`;
   const controls = `
     <div class="stream-controls">
       <button class="watch" data-action="play-best">
-        <span class="play-icon" aria-hidden="true">▷</span> Watch in ${escapeHtml(watchLabel(top))}
+        ${watchInner}
       </button>
       <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">Quality ⌄</button>
       <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">
@@ -394,13 +402,19 @@ function episodeRow(v: Video): string {
   const meta = [code, date].filter(Boolean).join(" · ");
   const overview = v.overview || v.description;
   const overviewHtml = overview ? `<div class="episode-overview">${escapeHtml(overview)}</div>` : "";
+  // A watched-progress track for an episode that has been started (keyed by the episode video id).
+  const prog = cwProgress(v.id);
+  const bar =
+    prog > 0
+      ? `<span class="cw-progress" aria-hidden="true"><span style="width:${Math.min(100, Math.round(prog * 100))}%"></span></span>`
+      : "";
   return `
     <button class="episode" data-action="open-episode" data-video-id="${escapeHtml(v.id)}">
       ${art}
       <span class="episode-text">
         <span class="episode-meta">${escapeHtml(meta)}</span>
         <span class="episode-title">${escapeHtml(title)}</span>
-        ${overviewHtml}
+        ${overviewHtml}${bar}
       </span>
     </button>`;
 }
@@ -430,6 +444,16 @@ function episodeStreamView(episode: Video, meta: MetaItem): string {
 }
 
 // ---- Links / rating / trailer helpers ----------------------------------------------------------
+
+/** Seconds to a compact timecode: "M:SS" under an hour, "H:MM:SS" past it. */
+function formatTime(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
 
 function genres(meta: MetaItem): string[] {
   if (meta.genres?.length) return meta.genres;
