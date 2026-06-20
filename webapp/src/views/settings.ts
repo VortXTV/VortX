@@ -178,7 +178,32 @@ function notificationsSection(episodeAlerts: boolean): string {
   );
 }
 
+/** One-tap quality presets: each bundles several Streams knobs. "Custom" = none match exactly. */
+const QUALITY_PRESETS: Record<"best" | "balanced" | "fast", Partial<Settings>> = {
+  best: { preferredQuality: 0, maxQuality: 0, maxFileSizeGB: 0, instantOnly: false, hideDeadTorrents: true, safetyFilter: "moderate" },
+  balanced: { preferredQuality: 1080, maxQuality: 1080, maxFileSizeGB: 15, instantOnly: false, hideDeadTorrents: true, safetyFilter: "moderate" },
+  fast: { preferredQuality: 720, maxQuality: 720, maxFileSizeGB: 5, instantOnly: true, hideDeadTorrents: true, safetyFilter: "moderate" },
+};
+
+/** Which quality preset the current settings exactly match, or null (Custom). */
+function presetOf(s: Settings): keyof typeof QUALITY_PRESETS | null {
+  for (const [name, p] of Object.entries(QUALITY_PRESETS) as [keyof typeof QUALITY_PRESETS, Partial<Settings>][]) {
+    if ((Object.keys(p) as (keyof Settings)[]).every((k) => s[k] === p[k])) return name;
+  }
+  return null;
+}
+
 function streamsSection(s: Settings): string {
+  const preset = presetOf(s);
+  const presetSeg = segmented(
+    [
+      { value: "best", label: "Best", on: preset === "best" },
+      { value: "balanced", label: "Balanced", on: preset === "balanced" },
+      { value: "fast", label: "Fast", on: preset === "fast" },
+    ],
+    "set-preset",
+    "preset",
+  );
   const safety = segmented(
     [
       { value: "off", label: "Off", on: s.safetyFilter === "off" },
@@ -199,6 +224,7 @@ function streamsSection(s: Settings): string {
     "ms",
   );
   const body =
+    row("Quality preset", presetSeg, preset === null ? "Custom" : undefined) +
     row("Use add-on ranking order", toggle("toggle-addon-order", s.useAddonOrder)) +
     reorderList(s.sourceOrder) +
     row("Safety filter", safety) +
@@ -390,6 +416,10 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return commit({ preferredQuality: Number(d.q) || 0 });
     case "set-skip":
       return commit({ skipStep: Number(d.skip) || 10 });
+    case "set-preset": {
+      const preset = QUALITY_PRESETS[d.preset as keyof typeof QUALITY_PRESETS];
+      return preset ? commit(preset) : false;
+    }
     case "set-safety":
       return commit({ safetyFilter: (d.safety as SafetyFilter) ?? "off" });
     case "set-maxq":
