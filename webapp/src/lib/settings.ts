@@ -16,6 +16,7 @@ export interface Settings {
   subtitleLang: string; // ISO 639-1, "" = none
   subtitlesMode: SubtitlesMode;
   autoplayTrailers: boolean;
+  mdblistKey: string; // optional MDBList API key for IMDb/RT/TMDB ratings on the detail page
 }
 
 /** The accent palette, ported 1:1 from ThemeManager.accents (the app's source of truth). base/bright are
@@ -57,6 +58,7 @@ const DEFAULTS: Settings = {
   subtitleLang: "",
   subtitlesMode: "on",
   autoplayTrailers: true,
+  mdblistKey: "",
 };
 
 let cache: Settings | null = null;

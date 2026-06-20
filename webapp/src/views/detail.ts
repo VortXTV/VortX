@@ -16,6 +16,8 @@ import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { play } from "../lib/player";
 import { cwPosition, cwProgress, inLibrary, toggleLibrary } from "../lib/store";
+import { getSettings } from "../lib/settings";
+import { fetchRatings, ratingsText, type Ratings } from "../lib/mdblist";
 
 // The Detail page: a full-bleed backdrop with a gradient scrim, a logo/title hero, a meta row
 // (rating, year, runtime, genres), a primary Watch button that plays the best ranked source, a
@@ -38,6 +40,7 @@ interface DetailState {
   pickerTier: string | null;
   selectedSeason: number | null;
   openEpisode: Video | null;
+  ratings: Ratings | null; // MDBList IMDb/RT/TMDB, fetched async when an MDBList key is set
 }
 
 let state: DetailState | null = null;
@@ -65,6 +68,7 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
     pickerTier: null,
     selectedSeason: null,
     openEpisode: null,
+    ratings: null,
   };
   host.innerHTML = `<div class="detail"><div class="detail-loading">Loading…</div></div>`;
 
@@ -80,7 +84,25 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
   if (!isSeries(type, meta)) {
     void loadStreams(type, id);
   }
+  void loadRatings(meta); // IMDb/RT/TMDB, only when an MDBList key is set; repaints when it lands
   render();
+}
+
+/** Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft; repaints on arrival. */
+async function loadRatings(meta: MetaItem): Promise<void> {
+  const key = getSettings().mdblistKey;
+  const imdb = imdbId(meta);
+  if (!key || !imdb) return;
+  const token = streamReqToken; // tie to the current title; a new openDetail bumps this
+  const r = await fetchRatings(imdb, meta.type, key);
+  if (!state || state.meta?.id !== meta.id || token !== streamReqToken) return; // navigated away
+  state.ratings = r;
+  render();
+}
+
+/** The IMDb id for a title (Cinemeta ids are already tt...; otherwise none). */
+function imdbId(meta: MetaItem): string | undefined {
+  return meta.id.startsWith("tt") ? meta.id : undefined;
 }
 
 /** Fetch streams for a movie or episode id, repainting when each add-on group resolves. */
@@ -255,7 +277,14 @@ function titleBlock(meta: MetaItem, logo: string, episode?: Video): string {
     : logo
       ? `<img class="detail-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(meta.name)}" />`
       : `<h1 class="detail-title t-hero">${escapeHtml(meta.name)}</h1>`;
-  return `<div class="detail-titleblock">${titleHtml}${episode ? episodeMetaRow(episode, meta) : metaRow(meta)}</div>`;
+  return `<div class="detail-titleblock">${titleHtml}${episode ? episodeMetaRow(episode, meta) : metaRow(meta)}${ratingsRow()}</div>`;
+}
+
+/** Cross-provider ratings line (IMDb / RT / TMDB), shown only once MDBList ratings have loaded. */
+function ratingsRow(): string {
+  if (!state?.ratings) return "";
+  const text = ratingsText(state.ratings);
+  return text ? `<div class="ratings-row t-label">${escapeHtml(text)}</div>` : "";
 }
 
 /** Single-line meta row (rating star + year/runtime/genres joined), so it never forces the hero wider. */

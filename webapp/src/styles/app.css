@@ -1728,3 +1728,14 @@ input:focus-visible {
   font-size: 1.1rem;
   font-weight: 600;
 }
+
+/* Cross-provider ratings line under the detail meta row (IMDb / RT / TMDB via MDBList). */
+.ratings-row {
+  color: var(--muted);
+  font-weight: 500;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
+}
+/* The MDBList API key input in Settings (wider than a normal control). */
+.settings-key {
+  width: min(280px, 52vw);
+}

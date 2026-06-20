@@ -42,6 +42,7 @@ export function renderSettings(target: HTMLElement): void {
       ${accountSection()}
       ${appearanceSection(s.accentID, s.background, s.textScale)}
       ${playbackSection(s.audioLang, s.subtitleLang, s.subtitlesMode, s.autoplayTrailers)}
+      ${ratingsSection(s.mdblistKey)}
       ${aboutSection()}
     </div>`;
   wireSettings(target);
@@ -123,6 +124,16 @@ function playbackSection(audioLang: string, subtitleLang: string, mode: Subtitle
   return group("Playback & Subtitles", body, "Preferred languages are requested when a source offers multiple tracks.");
 }
 
+function ratingsSection(mdblistKey: string): string {
+  const input = `<input class="field settings-key" type="text" id="mdblist-key" data-key-input="mdblist"
+    placeholder="MDBList API key" value="${escapeHtml(mdblistKey)}" autocomplete="off" spellcheck="false" aria-label="MDBList API key" />`;
+  return group(
+    "Ratings",
+    row("MDBList key", input),
+    `Add a free key from mdblist.com to show IMDb, Rotten Tomatoes, and TMDB ratings on detail pages.`,
+  );
+}
+
 function aboutSection(): string {
   const body =
     row("Version", `<span class="settings-row-sub">VortX for Web · 0.1</span>`) +
@@ -193,7 +204,7 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
   }
 }
 
-/** Attach change listeners for the native <select> controls (language pickers). */
+/** Attach change listeners for the native <select> controls (language pickers) + the MDBList key input. */
 function wireSettings(target: HTMLElement): void {
   target.querySelectorAll<HTMLSelectElement>("select[data-select]").forEach((sel) => {
     sel.addEventListener("change", () => {
@@ -201,6 +212,8 @@ function wireSettings(target: HTMLElement): void {
       else if (sel.dataset.select === "subtitle-lang") updateSettings({ subtitleLang: sel.value });
     });
   });
+  const keyInput = target.querySelector<HTMLInputElement>('input[data-key-input="mdblist"]');
+  keyInput?.addEventListener("change", () => updateSettings({ mdblistKey: keyInput.value.trim() }));
 }
 
 function rerender(): void {
