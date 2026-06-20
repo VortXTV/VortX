@@ -268,6 +268,8 @@ struct PlayerScreen: View {
     @State private var upNextSuppressed = false           // user tapped Watch Credits: hide the band + don't auto-advance this episode
     @State private var apiSkipCandidates: [SegmentCandidate] = []
     @State private var currentSkip: SkipSegment?
+    @State private var autoSkippedStarts: Set<Double> = []   // segment starts already auto-skipped this episode
+    @AppStorage("stremiox.autoSkip") private var autoSkip = false
     @State private var skipFetchKey = ""
     @State private var skipFetchTask: Task<Void, Never>?
 
@@ -1487,6 +1489,15 @@ struct PlayerScreen: View {
 
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
+        // Auto-skip: when the playhead enters a NEW skip segment and the setting is on, seek past it once.
+        // Recording the start means a manual seek back into the same segment won't auto-skip it again.
+        if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
+            autoSkippedStarts.insert(skip.start)
+            coordinator.player?.seek(to: skip.end)
+            currentTime = skip.end
+            if currentSkip != nil { withAnimation { currentSkip = nil } }
+            return
+        }
         if skip?.start != currentSkip?.start {
             withAnimation(.easeInOut(duration: 0.2)) { currentSkip = skip }
         }
@@ -1506,6 +1517,7 @@ struct PlayerScreen: View {
         guard key != skipFetchKey else { return }
         if key != skipFetchKey { apiSkipCandidates = [] }
         skipFetchKey = key
+        autoSkippedStarts = []   // new episode: let its intro/credits auto-skip once
         let dur = duration
         skipFetchTask?.cancel()
         skipFetchTask = Task { @MainActor in
