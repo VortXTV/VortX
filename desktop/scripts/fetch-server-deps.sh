@@ -156,10 +156,40 @@ fi
 
 echo "fetch-server-deps: done. node + server.cjs staged in ${RES_DIR}"
 
-# mpv is intentionally NOT fetched here (see the note below). But the Tauri build bundles
-# resources/mpv-* as a HARD glob that is validated at build-script time, so `cargo check`,
-# `tauri dev`, and `tauri build` all FAIL on an empty glob until at least one mpv binary exists.
-# Warn loudly and actionably now rather than letting Tauri fail later with a cryptic glob error.
+# --- 3) mpv player binary (per-platform, pinned + checksum-verified) -------------------
+# The desktop player spawns mpv as a child process over JSON IPC (src-tauri/src/player.rs), bundled
+# via tauri.conf.json's "resources/mpv-*" glob. Like node above, each CI runner stages the mpv for
+# its own platform. Windows mpv is a single statically-linked mpv.exe (zhongfly build, referenced by
+# mpv.io). macOS/Linux mpv is dynamically linked, so it is staged as a relocatable payload by its own
+# build step (handled separately); this script fetches only the self-contained Windows binary.
+case "${uname_s}" in
+  MINGW* | MSYS* | CYGWIN* | Windows_NT)
+    MPV_WIN_DEST="${RES_DIR}/mpv-win-x64.exe"
+    if [ -f "${MPV_WIN_DEST}" ]; then
+      echo "fetch-server-deps: mpv-win-x64.exe already present, skipping."
+    else
+      # Pinned zhongfly release. Baseline x86-64 build (NOT the -v3/AVX2 build) for broad CPU
+      # compatibility. The checksum is verified on the downloaded bytes.
+      MPV_WIN_TAG="2026-06-19-2d5dfb343a"
+      MPV_WIN_ASSET="mpv-x86_64-20260619-git-2d5dfb343a.7z"
+      MPV_WIN_SHA256="eaa0479b67270b5a1d3f0c6d9a5b6b5749322e5e8848bba544b921669d5d207a"
+      MPV_WIN_URL="https://github.com/zhongfly/mpv-winbuild/releases/download/${MPV_WIN_TAG}/${MPV_WIN_ASSET}"
+      echo "fetch-server-deps: downloading mpv (zhongfly ${MPV_WIN_TAG})..."
+      TMP_MPV="$(mktemp -d)"
+      curl -fsSL "${MPV_WIN_URL}" -o "${TMP_MPV}/mpv.7z"
+      verify_sha256 "${TMP_MPV}/mpv.7z" "${MPV_WIN_SHA256}" "mpv windows ${MPV_WIN_TAG}"
+      # 7-Zip ships on the GitHub windows runner; extract just mpv.exe (flat, ignore the rest).
+      ( cd "${TMP_MPV}" && 7z e -y mpv.7z mpv.exe >/dev/null )
+      cp "${TMP_MPV}/mpv.exe" "${MPV_WIN_DEST}"
+      rm -rf "${TMP_MPV}"
+      echo "fetch-server-deps: staged mpv-win-x64.exe"
+    fi
+    ;;
+esac
+
+# The Tauri build bundles resources/mpv-* as a HARD glob validated at build-script time, so a build
+# FAILS on an empty glob until at least one mpv binary exists. macOS/Linux staging is not wired yet,
+# so warn there (this warn is silent once an mpv-<platform> file is present, e.g. Windows above).
 if ! ls "${RES_DIR}"/mpv-* >/dev/null 2>&1; then
   echo "fetch-server-deps: WARNING - no mpv binary staged in ${RES_DIR}." >&2
   echo "  The Tauri build will FAIL on the 'resources/mpv-*' bundle glob until one exists." >&2
