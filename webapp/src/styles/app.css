@@ -163,6 +163,31 @@ input:focus-visible {
 .tab.active {
   color: var(--accent);
 }
+/* On phones the 7 tabs share the width evenly (labels stay, just smaller) so nothing clips. */
+@media (max-width: 600px) {
+  .tabbar {
+    gap: 0;
+    padding-left: 4px;
+    padding-right: 4px;
+    justify-content: space-between;
+  }
+  .tab {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0.3rem 0.1rem;
+    font-size: 0.6rem;
+  }
+  .tab span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tab .ico {
+    width: 1.4em;
+    height: 1.4em;
+  }
+}
 .page-title {
   font-family: var(--serif);
   font-size: clamp(1.6rem, 1.2rem + 1.5vw, 2.4rem);
