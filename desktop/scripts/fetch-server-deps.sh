@@ -156,6 +156,17 @@ fi
 
 echo "fetch-server-deps: done. node + server.cjs staged in ${RES_DIR}"
 
+# mpv is intentionally NOT fetched here (see the note below). But the Tauri build bundles
+# resources/mpv-* as a HARD glob that is validated at build-script time, so `cargo check`,
+# `tauri dev`, and `tauri build` all FAIL on an empty glob until at least one mpv binary exists.
+# Warn loudly and actionably now rather than letting Tauri fail later with a cryptic glob error.
+if ! ls "${RES_DIR}"/mpv-* >/dev/null 2>&1; then
+  echo "fetch-server-deps: WARNING - no mpv binary staged in ${RES_DIR}." >&2
+  echo "  The Tauri build will FAIL on the 'resources/mpv-*' bundle glob until one exists." >&2
+  echo "  Stage the host mpv binary by hand before building (e.g. macOS arm64 ->" >&2
+  echo "  ${RES_DIR}/mpv-darwin-arm64). See the 'mpv PLAYER BINARY' note below for all paths." >&2
+fi
+
 # ---------------------------------------------------------------------------------------
 # CI / cross-platform note (what each runner must produce):
 #   macOS arm64  -> resources/node-darwin-arm64   (this dev machine; verified here)
@@ -185,9 +196,11 @@ echo "fetch-server-deps: done. node + server.cjs staged in ${RES_DIR}"
 # nodejs.org), a portable mpv with vo=gpu-next + libplacebo + the codec set we want is not a
 # single canonical public artifact across all three OSes (macOS: a notarized build or the
 # mpv.app payload; Windows: shinchiro/zhongfly builds; Linux: usually the system package).
-# For now DROP THE REAL BINARY IN BY HAND (or your CI job copies it) at the path above before
-# `npm run tauri build`. In `tauri dev`, player.rs also falls back to an `mpv` on PATH, so a
-# locally installed mpv (e.g. `brew install mpv`, `apt install mpv`) works without staging.
+# For now DROP A BINARY IN BY HAND (or your CI job copies it) at the path above before ANY build:
+# the `bundle.resources` glob "resources/mpv-*" is validated at build-script time, so `cargo check`,
+# `tauri dev`, and `tauri build` ALL fail until at least one mpv-<platform> file exists - staging is
+# NOT optional for dev. player.rs additionally falls back to an `mpv` on PATH at RUNTIME, so once the
+# build succeeds you may stage a stub/symlink and rely on a locally installed mpv (brew/apt) to play.
 #
 # ALTERNATIVE PACKAGING (Tauri externalBin). Instead of bundle.resources, mpv could be a
 # Tauri sidecar via `bundle.externalBin: ["binaries/mpv"]`, which requires the binary be named
