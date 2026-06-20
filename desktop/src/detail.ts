@@ -183,6 +183,25 @@ function imdbRating(meta: MetaItem): string | undefined {
   return (meta.links ?? []).find((l) => l.category.toLowerCase() === "imdb")?.name;
 }
 
+/** People from the meta's typed links by category (cast/directors/writers). Category strings mirror the
+ *  Apple app's CoreModels.credits(), proven against real Cinemeta data. */
+function credits(meta: MetaItem, categories: string[]): string[] {
+  const set = new Set(categories);
+  return (meta.links ?? []).filter((l) => set.has(l.category.toLowerCase())).map((l) => l.name);
+}
+/** Cast / Director / Writer lines under the synopsis, capped, each shown only when present. */
+function creditsRow(meta: MetaItem): string {
+  const line = (role: string, names: string[]): string =>
+    names.length
+      ? `<div class="credit"><span class="credit-role">${role}</span><span class="credit-names">${escapeHtml(names.join(", "))}</span></div>`
+      : "";
+  const html =
+    line("Cast", credits(meta, ["cast", "actors", "actor"]).slice(0, 5)) +
+    line("Director", credits(meta, ["director", "directors"]).slice(0, 3)) +
+    line("Writer", credits(meta, ["writer", "writers"]).slice(0, 3));
+  return html ? `<div class="credits">${html}</div>` : "";
+}
+
 /** The first trailer's YouTube id, from trailerStreams (ytId) or a "Trailer" link, if present. */
 function trailerYouTubeID(meta: MetaItem): string | undefined {
   const fromStreams = (meta.trailerStreams ?? []).map((s) => s.ytId).find((id) => id && id.length);
@@ -244,6 +263,7 @@ function renderMovie(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nul
           ? `<p class="desc">${escapeHtml(meta.description)}</p>`
           : ""
       }
+      ${creditsRow(meta)}
       ${streamSection(groups, progress)}
       ${trailer ? trailerButton() : ""}
     </div>`;
@@ -273,7 +293,7 @@ function renderSeries(overlay: HTMLElement, meta: MetaItem, md: MetaDetails | nu
     ? episodeStreamView(open, meta, md, ctx)
     : `${heroHead(meta, logo)}${metaRow(meta)}${
         meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${
+      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${
         trailer ? trailerButton() : ""
       }`;
 
