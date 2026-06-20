@@ -493,8 +493,14 @@ enum StreamRanking {
     /// preferences pass everything, so this is a no-op until the user opts in.
     static func passesUserFilters(_ s: CoreStream) -> Bool {
         let prefs = SourcePreferences.shared
-        if prefs.noFiltersActive { return true }   // fast path: nothing opted in
+        let kids = ProfileStore.activeIsKids()
+        if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
         let text = qualityText(s)
+        if kids {
+            // Kids profile: always hide explicit content and CAM/fake junk, whatever the user filters say.
+            if isAdultContent(text) || junkClass(text) != nil { return false }
+        }
+        if prefs.noFiltersActive { return true }
         if prefs.keywordsAreRegex {
             // Power-user regex mode: Hide = drop on match, Require = drop on no-match. An invalid pattern
             // compiled to nil, so it imposes no constraint (fail-open).
@@ -524,6 +530,15 @@ enum StreamRanking {
         return true
     }
 
+    /// Explicit-content blocklist for Kids profiles, matched as bounded tokens in the lowercased
+    /// name+description+filename so an ordinary title is not tripped while an adult release is. This is a
+    /// best-effort source guard (it can't see a catalog's age rating); pair it with PIN-locked adult
+    /// profiles and per-profile add-on hiding for fuller parental control.
+    private static func isAdultContent(_ text: String) -> Bool {
+        let terms = ["xxx", "porn", "porno", "hentai", "brazzers", "onlyfans", "nsfw", "jav", "camgirl"]
+        return terms.contains { boundedMatch(text, $0) }
+    }
+
     /// Drop streams that fail the user filters, and any group left empty. No-op when nothing is set.
     /// Aggregator "reasons / statistics" pseudo-streams (AIOStreams Stream-Expression output, SeaDex/SEL
     /// setups, etc.) are a filter EXPLANATION, not playable video. They inherit the resolution-group tag
@@ -549,7 +564,9 @@ enum StreamRanking {
     static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
         let prefs = SourcePreferences.shared
-        guard !prefs.noFiltersActive else { return groups }
+        // A Kids profile must run passesUserFilters even with zero manual filters (its content guard
+        // lives there), so only take the no-op fast path when not a Kids profile.
+        guard !prefs.noFiltersActive || ProfileStore.activeIsKids() else { return groups }
         return groups.compactMap { group in
             let kept = group.streams.filter { passesUserFilters($0) }
             return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)

@@ -35,6 +35,12 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// without touching anyone else. Follows the profile across devices like the rest of the roster.
     var disabledAddons: [String]? = nil
 
+    /// Kids profile: a parental-controls flag. When this profile is active the source list hides adult
+    /// content and CAM/fake junk regardless of the global source filters (see
+    /// `StreamRanking.passesUserFilters`). Pair it with a PIN on the adult profiles (so a child can't
+    /// switch into them) and per-profile add-on hiding. Default false; follows the profile across devices.
+    var isKids: Bool = false
+
     /// What follows a viewer between profiles: track languages and the subtitle look. Synced
     /// with the roster, so a profile keeps its preferences across devices. Raw-string fields
     /// mirror the UserDefaults representations one-to-one.
@@ -95,16 +101,18 @@ struct UserProfile: Codable, Identifiable, Equatable {
         familyEdit = try c.decodeIfPresent(Bool.self, forKey: .familyEdit) ?? false
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
         disabledAddons = try c.decodeIfPresent([String].self, forKey: .disabledAddons)
+        isKids = try c.decodeIfPresent(Bool.self, forKey: .isKids) ?? false
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
          email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil,
-         disabledAddons: [String]? = nil) {
+         disabledAddons: [String]? = nil, isKids: Bool = false) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
         self.disabledAddons = disabledAddons
+        self.isKids = isKids
     }
 }
 
@@ -144,6 +152,12 @@ final class ProfileStore: ObservableObject {
         Set(UserDefaults.standard.stringArray(forKey: activeDisabledAddonsKey) ?? [])
     }
 
+    /// Flat mirror of the active profile's Kids flag, same off-main pattern as `activeDisabledAddonsKey`,
+    /// so the stream filter (which may run off the main actor) can force the parental content guard on
+    /// without decoding the roster.
+    static let activeKidsKey = "stremiox.profile.isKids"
+    static func activeIsKids() -> Bool { UserDefaults.standard.bool(forKey: activeKidsKey) }
+
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
 
@@ -167,6 +181,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             applyTheme(active)
             UserDefaults.standard.set(active.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
+            UserDefaults.standard.set(active.isKids, forKey: Self.activeKidsKey)
         }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
         // copying it into every profile preserves today's behavior exactly; from then on each
@@ -411,6 +426,7 @@ final class ProfileStore: ObservableObject {
         // board build and streamGroups read, so Home, Discover, and stream sources all honor it the
         // moment this profile becomes active. (Empty array = nothing hidden, the default.)
         d.set(profile.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
+        d.set(profile.isKids, forKey: Self.activeKidsKey)   // Kids content guard for the stream filter
         if let p = profile.playback {
             d.set(p.audioLang, forKey: TrackPreferences.Key.audio)
             d.set(p.subtitleLang, forKey: TrackPreferences.Key.subtitle)

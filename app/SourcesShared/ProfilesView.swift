@@ -402,6 +402,20 @@ struct ProfileEditorView: View {
                         }
                     }
 
+                    if !draft.isOwner {
+                        row("Kids") {
+                            Button("Off") { draft.isKids = false }
+                                .buttonStyle(ChipButtonStyle(selected: !draft.isKids))
+                            Button("Kids profile") { draft.isKids = true }
+                                .buttonStyle(ChipButtonStyle(selected: draft.isKids))
+                        }
+                        if draft.isKids {
+                            Text("Hides adult and CAM/fake sources from this profile. For a full lock, set a PIN on your own profile so it can't be opened from here, and hide adult add-ons under Add-ons.")
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                    }
+
                     HStack(spacing: Theme.Space.md) {
                         Button("Save") { save() }
                             .buttonStyle(PrimaryActionStyle())
