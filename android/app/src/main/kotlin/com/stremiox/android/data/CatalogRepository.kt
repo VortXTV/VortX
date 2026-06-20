@@ -5,6 +5,7 @@ import com.stremiox.android.model.Episode
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.MetaItem
+import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
 import com.stremiox.android.model.StreamSource
 import kotlinx.coroutines.delay
@@ -36,7 +37,18 @@ interface CatalogRepository {
     /// Every playable source for a title, grouped by the add-on that returned it, best first. This is
     /// where the real engine fans out to every installed stream add-on; the preview returns a stub.
     suspend fun streams(type: MediaType, id: String): Result<List<StreamGroup>>
+
+    /// Resolve a chosen [StreamSource] into a directly-playable [Playable] for the player. The engine
+    /// does whatever the source requires: hand a magnet to the in-process streaming server and return
+    /// its local HLS URL, unlock a debrid link, or pass an HTTP link straight through. It also folds in
+    /// the per-profile resume position. The player only ever receives a concrete URL.
+    suspend fun resolve(source: StreamSource): Result<Playable>
 }
+
+/// The canonical name for the engine seam. The screens were built against [CatalogRepository]; the
+/// real stremio-core JNI binding implements this same contract under the `StremioRepository` name.
+/// One interface, two names, zero UI churn when the engine lands.
+typealias StremioRepository = CatalogRepository
 
 /// Offline preview data so the UI builds, runs, and is CI-verifiable before the engine is wired.
 /// Every poster/backdrop is null on purpose: the UI must look intentional without images, since real
@@ -148,4 +160,38 @@ class PreviewCatalogRepository(
             )
         )
     }
+
+    override suspend fun resolve(source: StreamSource): Result<Playable> {
+        delay(latencyMs)
+        // The preview hands back a real, public, royalty-free test stream so the player can be
+        // exercised end to end before the engine + streaming server exist. Torrent sources resolve to
+        // an adaptive HLS asset (the shape a streaming-server resolve produces); direct sources resolve
+        // to a progressive MP4. Both are Google's long-lived ExoPlayer sample assets.
+        val playable = if (source.isTorrent) {
+            Playable(
+                url = SAMPLE_HLS_URL,
+                title = source.title,
+                viaStreamingServer = true,
+            )
+        } else {
+            Playable(
+                url = SAMPLE_MP4_URL,
+                title = source.title,
+                viaStreamingServer = false,
+            )
+        }
+        return Result.success(playable)
+    }
+
+    private companion object {
+        // Public ExoPlayer sample assets (Apache-2.0 test media), used only by the offline preview.
+        const val SAMPLE_HLS_URL =
+            "https://storage.googleapis.com/exoplayer-test-media-1/gen-3/screens/dash-vod-single-segment/master.m3u8"
+        const val SAMPLE_MP4_URL =
+            "https://storage.googleapis.com/exoplayer-test-media-0/play.mp4"
+    }
 }
+
+/// The mock seam the UI runs on until the engine is wired. Same contract, mock data; the JNI engine
+/// impl replaces it wholesale. Named to match [StremioRepository] for clarity at the injection site.
+typealias MockStremioRepository = PreviewCatalogRepository

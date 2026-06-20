@@ -28,6 +28,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,22 +38,43 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.model.MetaDetail
+import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
 import com.stremiox.android.model.StreamSource
 import com.stremiox.android.ui.UiState
 import com.stremiox.android.ui.components.Badge
 import com.stremiox.android.ui.components.ErrorState
 import com.stremiox.android.ui.viewmodel.DetailViewModel
+import com.stremiox.android.ui.viewmodel.Playback
 
 /// Title detail, driven by [DetailViewModel]: a cinematic backdrop + the metadata row (rating · year
 /// · runtime · genres), then the sources list grouped per add-on — the same information hierarchy the
-/// tvOS DetailView leads with. The Watch button and the per-source rows are present but inert:
-/// stream selection and the libmpv player land with the engine, behind the same repository seam.
+/// tvOS DetailView leads with. The Watch button and the per-source rows resolve a source through the
+/// repository and launch the player via [onPlay]; the resolve round-trip (streaming-server hand-off /
+/// debrid unlock) is reflected as a Resolving state so the UI shows progress, not a freeze.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DetailScreen(viewModel: DetailViewModel, title: String, onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun DetailScreen(
+    viewModel: DetailViewModel,
+    title: String,
+    onBack: () -> Unit,
+    onPlay: (Playable) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
+    val playback by viewModel.playback.collectAsStateWithLifecycle()
+
+    // When a source resolves, hand the Playable up to navigation and reset, so returning from the
+    // player lands back on detail rather than immediately re-launching.
+    LaunchedEffect(playback) {
+        (playback as? Playback.Ready)?.let {
+            onPlay(it.playable)
+            viewModel.clearPlayback()
+        }
+    }
+
+    val resolving = playback is Playback.Resolving
 
     Scaffold(
         topBar = {
@@ -81,8 +103,21 @@ fun DetailScreen(viewModel: DetailViewModel, title: String, onBack: () -> Unit, 
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 item { Backdrop(m.data) }
-                item { MetaBlock(m.data) }
-                item { SourcesSection(streamsState) }
+                item {
+                    MetaBlock(
+                        m = m.data,
+                        watchEnabled = viewModel.bestSource() != null && !resolving,
+                        onWatch = { viewModel.bestSource()?.let(viewModel::play) },
+                    )
+                }
+                item {
+                    SourcesSection(
+                        state = streamsState,
+                        resolving = resolving,
+                        failure = (playback as? Playback.Failed)?.message,
+                        onPlay = viewModel::play,
+                    )
+                }
             }
         }
     }
@@ -115,9 +150,10 @@ private fun Backdrop(m: MetaDetail) {
 }
 
 /// Title, the metadata row (rating · year · runtime · genres), the Watch button, and the synopsis —
-/// the lower title band of the tvOS hero.
+/// the lower title band of the tvOS hero. Watch plays the best source; it is disabled until sources
+/// have resolved (and while a resolve is in flight).
 @Composable
-private fun MetaBlock(m: MetaDetail) {
+private fun MetaBlock(m: MetaDetail, watchEnabled: Boolean, onWatch: () -> Unit) {
     Column(
         modifier = Modifier.padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -128,7 +164,7 @@ private fun MetaBlock(m: MetaDetail) {
             color = MaterialTheme.colorScheme.onBackground,
         )
         MetaRow(m)
-        Button(onClick = {}, enabled = false, modifier = Modifier.padding(top = 8.dp)) {
+        Button(onClick = onWatch, enabled = watchEnabled, modifier = Modifier.padding(top = 8.dp)) {
             Icon(Icons.Filled.PlayArrow, contentDescription = null)
             Text("  Watch", style = MaterialTheme.typography.labelLarge)
         }
@@ -181,8 +217,15 @@ private fun MetaText(text: String) {
 /// The sources section: the per-add-on, multi-quality source list the engine fans out. Mirrors the
 /// tvOS `CoreStreamList` hierarchy — a header with the source count, then one labeled block per
 /// add-on, each row carrying the add-on name, a quality/torrent badge, and the add-on's own title.
+/// Tapping a row resolves it through the engine and launches the player; [resolving] dims the rows
+/// while a resolve is in flight, and [failure] surfaces a resolve error inline.
 @Composable
-private fun SourcesSection(state: UiState<List<StreamGroup>>) {
+private fun SourcesSection(
+    state: UiState<List<StreamGroup>>,
+    resolving: Boolean,
+    failure: String?,
+    onPlay: (StreamSource) -> Unit,
+) {
     Column(
         modifier = Modifier.padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -206,12 +249,21 @@ private fun SourcesSection(state: UiState<List<StreamGroup>>) {
                     color = MaterialTheme.colorScheme.onBackground,
                 )
                 Text(
-                    text = "Stream ranking and playback land with the engine and libmpv player.",
+                    text = if (resolving) "Starting source…" else "Tap a source to play.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                failure?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 state.data.forEach { group ->
-                    group.streams.forEach { source -> SourceRow(source) }
+                    group.streams.forEach { source ->
+                        SourceRow(source = source, enabled = !resolving, onPlay = { onPlay(source) })
+                    }
                 }
             }
         }
@@ -219,16 +271,16 @@ private fun SourcesSection(state: UiState<List<StreamGroup>>) {
 }
 
 /// One source row: a leading state icon (download for torrents, play otherwise), the add-on +
-/// quality/torrent badges, and the add-on's human-written title/description. Inert until the engine
-/// wires playback — the row visual is final.
+/// quality/torrent badges, and the add-on's human-written title/description. Tapping resolves the
+/// source and launches the player; disabled while another resolve is in flight.
 @Composable
-private fun SourceRow(source: StreamSource) {
+private fun SourceRow(source: StreamSource, enabled: Boolean, onPlay: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.surface)
-            .clickable(enabled = false) {}
+            .clickable(enabled = enabled, onClick = onPlay)
             .padding(12.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {

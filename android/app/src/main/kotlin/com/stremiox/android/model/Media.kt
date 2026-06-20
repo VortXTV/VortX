@@ -89,3 +89,19 @@ data class StreamGroup(
     val addon: String,
     val streams: List<StreamSource>,
 )
+
+/// A resolved, directly-playable handle for the player. The engine turns a [StreamSource] (which may
+/// be a torrent infohash, a debrid lock, or an HTTP link) into one of these: a concrete [url] the
+/// player can open plus the chrome metadata. For torrents the engine first hands the magnet to the
+/// in-process streaming server and returns the server's local HLS/progressive URL here, so the player
+/// only ever sees a real URL and never has to know how it was produced.
+data class Playable(
+    val url: String,
+    /// What to show in the player title bar (the human source title, falling back to the meta name).
+    val title: String,
+    /// True when the engine resolved this through the streaming server (torrent/debrid), so the player
+    /// can show a "buffering from source" affordance distinct from a plain network stall.
+    val viaStreamingServer: Boolean = false,
+    /// Resume position in milliseconds from per-profile watch history, or 0 to start from the top.
+    val startPositionMs: Long = 0L,
+)

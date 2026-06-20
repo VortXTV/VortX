@@ -30,6 +30,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.stremiox.android.data.CatalogRepository
 import com.stremiox.android.data.PreviewCatalogRepository
 import com.stremiox.android.model.MetaItem
+import com.stremiox.android.model.Playable
+import com.stremiox.android.player.PlayerScreen
 import com.stremiox.android.ui.screens.DetailScreen
 import com.stremiox.android.ui.screens.DiscoverScreen
 import com.stremiox.android.ui.screens.HomeScreen
@@ -62,7 +64,16 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
     StremioXTheme {
         var tab by remember { mutableStateOf(Tab.HOME) }
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var playing by remember { mutableStateOf<Playable?>(null) }
         val onItem: (MetaItem) -> Unit = { detail = it }
+
+        // Player is the topmost layer: when a source resolves to a Playable, it covers everything and
+        // back returns to the detail page underneath.
+        val playable = playing
+        if (playable != null) {
+            PlayerScreen(playable = playable, onBack = { playing = null })
+            return@StremioXTheme
+        }
 
         val current = detail
         if (current != null) {
@@ -74,7 +85,12 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
                     detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
                 ),
             )
-            DetailScreen(viewModel = detailVm, title = current.name, onBack = { detail = null })
+            DetailScreen(
+                viewModel = detailVm,
+                title = current.name,
+                onBack = { detail = null },
+                onPlay = { playing = it },
+            )
             return@StremioXTheme
         }
 
