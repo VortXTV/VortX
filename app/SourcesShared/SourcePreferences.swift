@@ -217,10 +217,33 @@ final class SourcePreferences: ObservableObject {
     /// ranking cache, which is exactly what a source-preference change needs. Call on the main
     /// thread (same contract as the rest of the profile/theme switch path).
     func reload() {
+        let d = UserDefaults.standard
         let order = Self.readOrder()
         if typeOrder != order { typeOrder = order }
-        let addon = UserDefaults.standard.bool(forKey: Self.addonOrderKey)
+        let addon = d.bool(forKey: Self.addonOrderKey)
         if useAddonOrder != addon { useAddonOrder = addon }
+        // Stream filters, so a per-profile switch re-syncs the in-memory @Published values (not just the
+        // type order). Guarded so an unchanged value never churns @Published or rebuilds keyword regexes.
+        let safety = d.string(forKey: Self.safetyKey) ?? "off"
+        if safetyMode != safety { safetyMode = safety }
+        let instant = d.bool(forKey: Self.instantOnlyKey)
+        if instantOnly != instant { instantOnly = instant }
+        let dead = d.bool(forKey: Self.hideDeadKey)
+        if hideDeadTorrents != dead { hideDeadTorrents = dead }
+        let hdr = d.bool(forKey: Self.hdrOnlyKey)
+        if hdrOnly != hdr { hdrOnly = hdr }
+        let av1 = d.bool(forKey: Self.excludeAV1Key)
+        if excludeAV1 != av1 { excludeAV1 = av1 }
+        let exc = d.string(forKey: Self.excludeKey) ?? ""
+        if excludeKeywords != exc { excludeKeywords = exc }
+        let inc = d.string(forKey: Self.includeKey) ?? ""
+        if includeKeywords != inc { includeKeywords = inc }
+        let rx = d.bool(forKey: Self.regexKey)
+        if keywordsAreRegex != rx { keywordsAreRegex = rx }
+        let maxRes = d.integer(forKey: Self.maxResolutionKey)
+        if maxResolution != maxRes { maxResolution = maxRes }
+        let maxGB = d.double(forKey: Self.maxFileSizeKey)
+        if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
     }
 
     /// Dominant-tier score added to a stream so its source type is the primary sort key.

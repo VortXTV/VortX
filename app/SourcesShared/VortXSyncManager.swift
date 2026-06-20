@@ -257,6 +257,16 @@ final class VortXSyncManager: ObservableObject {
                 if let s = pb.subSizeScale { playback["subSizeScale"] = s }
                 if let o = pb.sourceTypeOrder { playback["sourceTypeOrder"] = o }
                 if let u = pb.useAddonOrder { playback["useAddonOrder"] = u }
+                if let v = pb.safetyMode { playback["safetyMode"] = v }
+                if let v = pb.instantOnly { playback["instantOnly"] = v }
+                if let v = pb.hideDeadTorrents { playback["hideDeadTorrents"] = v }
+                if let v = pb.hdrOnly { playback["hdrOnly"] = v }
+                if let v = pb.excludeAV1 { playback["excludeAV1"] = v }
+                if let v = pb.excludeKeywords { playback["excludeKeywords"] = v }
+                if let v = pb.includeKeywords { playback["includeKeywords"] = v }
+                if let v = pb.keywordsAreRegex { playback["keywordsAreRegex"] = v }
+                if let v = pb.maxResolution { playback["maxResolution"] = v }
+                if let v = pb.maxFileSizeGB { playback["maxFileSizeGB"] = v }
                 settings["playback"] = playback
             }
             return ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,

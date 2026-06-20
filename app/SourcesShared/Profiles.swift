@@ -57,6 +57,19 @@ struct UserProfile: Codable, Identifiable, Equatable {
         /// order). Optional so older rosters decode; nil means "leave the flat keys as they are".
         var sourceTypeOrder: [String]? = nil   // raw SourceType values, top priority first
         var useAddonOrder: Bool? = nil
+        // Per-profile stream filters. Optional so older rosters decode; nil means "leave the flat
+        // SourcePreferences keys as they are". Mirrored to stremiox.streaming.* in applyPlayback and
+        // re-read by SourcePreferences.reload() on every profile switch.
+        var safetyMode: String? = nil          // off / balanced / strict
+        var instantOnly: Bool? = nil
+        var hideDeadTorrents: Bool? = nil
+        var hdrOnly: Bool? = nil
+        var excludeAV1: Bool? = nil
+        var excludeKeywords: String? = nil
+        var includeKeywords: String? = nil
+        var keywordsAreRegex: Bool? = nil
+        var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 2160
+        var maxFileSizeGB: Double? = nil       // 0 = no cap
     }
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
@@ -373,7 +386,17 @@ final class ProfileStore: ObservableObject {
             subBackground: d["subBackground"] as? String ?? base?.subBackground ?? "",
             subSizeScale: d["subSizeScale"] as? Double ?? base?.subSizeScale,
             sourceTypeOrder: d["sourceTypeOrder"] as? [String] ?? base?.sourceTypeOrder,
-            useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder)
+            useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder,
+            safetyMode: d["safetyMode"] as? String ?? base?.safetyMode,
+            instantOnly: d["instantOnly"] as? Bool ?? base?.instantOnly,
+            hideDeadTorrents: d["hideDeadTorrents"] as? Bool ?? base?.hideDeadTorrents,
+            hdrOnly: d["hdrOnly"] as? Bool ?? base?.hdrOnly,
+            excludeAV1: d["excludeAV1"] as? Bool ?? base?.excludeAV1,
+            excludeKeywords: d["excludeKeywords"] as? String ?? base?.excludeKeywords,
+            includeKeywords: d["includeKeywords"] as? String ?? base?.includeKeywords,
+            keywordsAreRegex: d["keywordsAreRegex"] as? Bool ?? base?.keywordsAreRegex,
+            maxResolution: (d["maxResolution"] as? Int) ?? base?.maxResolution,
+            maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
@@ -415,7 +438,17 @@ final class ProfileStore: ObservableObject {
             subBackground: d.string(forKey: SubtitleStyle.Key.background) ?? SubtitleStyle.defaultBackground,
             subSizeScale: d.object(forKey: SubtitleStyle.Key.sizeScale) as? Double ?? 1.0,
             sourceTypeOrder: SourcePreferences.shared.typeOrder.map(\.rawValue),
-            useAddonOrder: SourcePreferences.shared.useAddonOrder)
+            useAddonOrder: SourcePreferences.shared.useAddonOrder,
+            safetyMode: SourcePreferences.shared.safetyMode,
+            instantOnly: SourcePreferences.shared.instantOnly,
+            hideDeadTorrents: SourcePreferences.shared.hideDeadTorrents,
+            hdrOnly: SourcePreferences.shared.hdrOnly,
+            excludeAV1: SourcePreferences.shared.excludeAV1,
+            excludeKeywords: SourcePreferences.shared.excludeKeywords,
+            includeKeywords: SourcePreferences.shared.includeKeywords,
+            keywordsAreRegex: SourcePreferences.shared.keywordsAreRegex,
+            maxResolution: SourcePreferences.shared.maxResolution,
+            maxFileSizeGB: SourcePreferences.shared.maxFileSizeGB)
     }
 
     /// Write `profile`'s playback preferences into the flat UserDefaults keys that
@@ -444,6 +477,17 @@ final class ProfileStore: ObservableObject {
             if let addon = p.useAddonOrder {
                 d.set(addon, forKey: "stremiox.streaming.useAddonOrder")
             }
+            // Per-profile stream filters (nil = leave the flat key as-is, for older rosters).
+            if let v = p.safetyMode { d.set(v, forKey: SourcePreferences.safetyKey) }
+            if let v = p.instantOnly { d.set(v, forKey: SourcePreferences.instantOnlyKey) }
+            if let v = p.hideDeadTorrents { d.set(v, forKey: SourcePreferences.hideDeadKey) }
+            if let v = p.hdrOnly { d.set(v, forKey: SourcePreferences.hdrOnlyKey) }
+            if let v = p.excludeAV1 { d.set(v, forKey: SourcePreferences.excludeAV1Key) }
+            if let v = p.excludeKeywords { d.set(v, forKey: SourcePreferences.excludeKey) }
+            if let v = p.includeKeywords { d.set(v, forKey: SourcePreferences.includeKey) }
+            if let v = p.keywordsAreRegex { d.set(v, forKey: SourcePreferences.regexKey) }
+            if let v = p.maxResolution { d.set(v, forKey: SourcePreferences.maxResolutionKey) }
+            if let v = p.maxFileSizeGB { d.set(v, forKey: SourcePreferences.maxFileSizeKey) }
         } else {
             for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
                         TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,
