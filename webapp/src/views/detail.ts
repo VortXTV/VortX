@@ -502,7 +502,13 @@ async function playStream(stream: Stream): Promise<void> {
     stream.url,
     title,
     state?.meta
-      ? { id: state.meta.id, type: state.meta.type, name: state.meta.name, poster: state.meta.poster }
+      ? {
+          id: state.meta.id,
+          type: state.meta.type,
+          name: state.meta.name,
+          poster: state.meta.poster,
+          resumeId: state.openEpisode?.id ?? state.meta.id,
+        }
       : undefined,
     state?.meta
       ? fetchSubtitles(addons, state.meta.type, state.openEpisode?.id ?? state.meta.id)

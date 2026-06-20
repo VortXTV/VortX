@@ -99,36 +99,57 @@ export function toggleLibrary(item: MetaItem): boolean {
 const CW_KEY = "vortx.web.cw.v1";
 
 export interface CWEntry extends MetaItem {
+  /** The actual PLAYED id the position belongs to: the episode id for a series, the title id for a movie.
+   *  `id` (from MetaItem) stays the title/series id so the rail card links to the title's Detail and a
+   *  series collapses to one card. Keying the position by resumeId stops one episode resuming at another's time. */
+  resumeId: string;
   position: number;
   duration: number;
   updatedAt: number;
 }
 
-/** In-progress titles, most-recently-watched first. */
-export function continueWatching(): CWEntry[] {
+/** Every stored progress entry (one per played id), most-recently-watched first. */
+function rawCW(): CWEntry[] {
   try {
     const raw = localStorage.getItem(CW_KEY);
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
-    return (parsed as CWEntry[]).sort((a, b) => b.updatedAt - a.updatedAt);
+    return (parsed as CWEntry[])
+      .filter((e) => e && typeof e.id === "string" && typeof e.resumeId === "string")
+      .sort((a, b) => b.updatedAt - a.updatedAt);
   } catch {
     return [];
   }
 }
 
-/** The saved resume position (seconds) for a title id, or 0 if none. */
-export function cwPosition(id: string): number {
-  return continueWatching().find((e) => e.id === id)?.position ?? 0;
+/** In-progress titles for the rail, most-recent first, collapsed to ONE card per title (a series with
+ *  several watched episodes shows once and links to its Detail). */
+export function continueWatching(): CWEntry[] {
+  const seen = new Set<string>();
+  const out: CWEntry[] = [];
+  for (const e of rawCW()) {
+    if (seen.has(e.id)) continue;
+    seen.add(e.id);
+    out.push(e);
+  }
+  return out;
 }
 
-/** Record playback progress; drops the title (finished) once past 95%. */
+/** The saved resume position (seconds) for a PLAYED id (episode id for a series), or 0 if none. */
+export function cwPosition(resumeId: string): number {
+  return rawCW().find((e) => e.resumeId === resumeId)?.position ?? 0;
+}
+
+/** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
+ *  drops that played id once past 95% (finished). */
 export function recordProgress(
-  item: { id: string; type: string; name: string; poster?: string },
+  item: { id: string; type: string; name: string; poster?: string; resumeId?: string },
   position: number,
   duration: number,
 ): void {
   if (!isFinite(position) || !isFinite(duration) || duration <= 0) return;
-  const others = continueWatching().filter((e) => e.id !== item.id);
+  const resumeId = item.resumeId ?? item.id;
+  const others = rawCW().filter((e) => e.resumeId !== resumeId);
   if (position / duration > 0.95) {
     persistCW(others);
     return;
@@ -138,6 +159,7 @@ export function recordProgress(
     type: item.type,
     name: item.name,
     poster: item.poster,
+    resumeId,
     position,
     duration,
     updatedAt: Date.now(),
@@ -145,9 +167,9 @@ export function recordProgress(
   persistCW([entry, ...others].slice(0, 40));
 }
 
-/** Remove a title from Continue Watching. */
+/** Remove a title from Continue Watching (every played-id entry that shares this display id). */
 export function clearProgress(id: string): void {
-  persistCW(continueWatching().filter((e) => e.id !== id));
+  persistCW(rawCW().filter((e) => e.id !== id));
 }
 
 function persistCW(entries: CWEntry[]): void {

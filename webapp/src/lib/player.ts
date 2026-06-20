@@ -10,6 +10,8 @@ interface CWItem {
   type: string;
   name: string;
   poster?: string;
+  /** The actual played id (episode id for a series); the resume position is keyed by this, not `id`. */
+  resumeId?: string;
 }
 
 // The web player sink. The detail page resolves a direct/debrid HTTP(S) url and hands it here. Unlike
@@ -113,7 +115,7 @@ function wireProgress(video: HTMLVideoElement, item: CWItem): void {
   video.addEventListener(
     "loadedmetadata",
     () => {
-      const pos = cwPosition(item.id);
+      const pos = cwPosition(item.resumeId ?? item.id);
       if (pos > 5 && (!isFinite(video.duration) || pos < video.duration - 10)) video.currentTime = pos;
     },
     { once: true },
