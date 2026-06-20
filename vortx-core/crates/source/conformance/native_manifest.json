@@ -1,0 +1,20 @@
+{
+  "schema": "vortx-source/1",
+  "id": "com.example.myhive",
+  "version": "1.4.0",
+  "name": "My HIVE Scraper",
+  "kind": "native_vortx",
+  "capabilities": ["catalog", "meta", "stream", "subtitles", "ratings", "artwork", "music_catalog", "music_stream"],
+  "types": ["movie", "series"],
+  "idPrefixes": ["tt"],
+  "transport": { "kind": "stremio_http", "manifest_url": "https://example.com/manifest.json" },
+  "streaming": true,
+  "prefetch": ["next-episode", "binge", "warm-debrid"],
+  "debrid": { "yieldsInfohash": true, "cachedCheck": "hive" },
+  "hive": { "contributes": true, "consumes": true, "factTtlSec": 86400 },
+  "ranking": { "emitsScoreInputs": true },
+  "config": { "scope": "per-profile" },
+  "trust": "community",
+  "permissions": ["net:*.example.com", "debrid:read", "hive:write"],
+  "signature": { "alg": "ed25519", "keyId": "did:key:z6Mk", "sig": "AAAA" }
+}

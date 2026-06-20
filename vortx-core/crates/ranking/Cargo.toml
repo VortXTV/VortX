@@ -1,0 +1,16 @@
+[package]
+name = "vortx-ranking"
+description = "VortX stream ranking: the one explainable ranker neither Stremio (no ranking) nor Nuvio (quality-then-install-order) has. Parses release tokens, ranks by a per-profile weight contract (user source preference is the TOP key, cached-first within tier), and emits reasons + DV/HDR/audio tags for the player router."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortx-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Prove the ranker is a deterministic total order over random stream sets.
+proptest = "1"

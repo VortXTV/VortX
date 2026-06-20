@@ -1,0 +1,73 @@
+{
+  "description": "Cross-language conformance for vortx-reco feature extraction. Every implementation (Rust, TS, Swift) must lift the SAME namespaced feature keys off these metas. The f32 weights are intentionally NOT pinned here: they are validated by invariants (cosine(v,v)=1, cosine(disjoint)=0), because IEEE-754 results are not guaranteed byte-identical across platforms. Keys, however, are pure string/integer logic and identical everywhere.",
+  "cases": [
+    {
+      "name": "full_movie_detail",
+      "features": {
+        "type": "movie",
+        "genres": ["Action", "Sci-Fi", "Thriller"],
+        "cast": ["Leonardo DiCaprio", "Joseph Gordon-Levitt", "Elliot Page", "Tom Hardy", "Ken Watanabe", "Cillian Murphy"],
+        "director": ["Christopher Nolan"],
+        "releaseInfo": "2010",
+        "runtime": "148 min"
+      },
+      "expectedKeys": [
+        "cast:Elliot Page",
+        "cast:Joseph Gordon-Levitt",
+        "cast:Ken Watanabe",
+        "cast:Leonardo DiCaprio",
+        "cast:Tom Hardy",
+        "decade:2010",
+        "director:Christopher Nolan",
+        "genre:Action",
+        "genre:Sci-Fi",
+        "genre:Thriller",
+        "runtime:long",
+        "type:movie"
+      ]
+    },
+    {
+      "name": "series_short_runtime",
+      "features": {
+        "type": "series",
+        "genres": ["Comedy"],
+        "cast": ["Steve Carell"],
+        "director": ["Greg Daniels"],
+        "releaseInfo": "2005-2013",
+        "runtime": "22 min"
+      },
+      "expectedKeys": [
+        "cast:Steve Carell",
+        "decade:2000",
+        "director:Greg Daniels",
+        "genre:Comedy",
+        "runtime:short",
+        "type:series"
+      ]
+    },
+    {
+      "name": "catalog_preview_genres_only",
+      "features": {
+        "type": "movie",
+        "genres": ["Horror"],
+        "releaseInfo": "1994"
+      },
+      "expectedKeys": [
+        "decade:1990",
+        "genre:Horror",
+        "type:movie"
+      ]
+    },
+    {
+      "name": "missing_optional_fields_yield_no_bogus_keys",
+      "features": {
+        "type": "movie",
+        "genres": [],
+        "runtime": "n/a"
+      },
+      "expectedKeys": [
+        "type:movie"
+      ]
+    }
+  ]
+}
