@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+# rlib keeps intra-workspace use + `cargo test` working; staticlib/cdylib produce the linkable artifact
+# the Swift (static) and Kotlin/JNI (dynamic) bridges load.
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
 [dependencies]
 vortx-state = { path = "../state" }
 vortx-protocol = { path = "../protocol" }

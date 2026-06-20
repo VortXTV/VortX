@@ -16,6 +16,7 @@
 mod action;
 mod engine;
 mod env;
+pub mod ffi;
 mod resolve;
 
 pub use action::{Action, DispatchResult, EngineEvent};
