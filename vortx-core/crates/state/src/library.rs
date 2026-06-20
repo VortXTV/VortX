@@ -75,12 +75,14 @@ pub struct HistoryEntry {
 }
 
 /// A Continue Watching rail entry (emitted by the engine for the active profile).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CwItem {
     pub id: String,
     pub name: String,
+    /// Playback progress in permille (0..=1000). An integer (not a float) so per-profile sync is
+    /// byte-identical across Rust/TS/Swift.
     #[serde(default)]
-    pub progress: f32,
+    pub progress: u32,
 }
 
 /// A resume point for a video (offset within its duration).

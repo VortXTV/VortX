@@ -56,8 +56,11 @@ pub struct ProfileSettings {
     pub accent: Option<String>,
     #[serde(default)]
     pub oled: bool,
+    /// UI text scale in permille (1000 = 1.0x). An integer, NOT a float, so the roster merge key (which
+    /// serializes the profile) is byte-identical across Rust/TS/Swift; a float serializes differently per
+    /// runtime and would break CRDT convergence on any non-default scale.
     #[serde(default = "default_text_scale", rename = "textScale")]
-    pub text_scale: f32,
+    pub text_scale: u32,
     #[serde(default)]
     pub languages: Vec<String>,
     /// Add-on transport URLs disabled for this profile (kids-safe filtering, per-profile sources).
@@ -65,8 +68,8 @@ pub struct ProfileSettings {
     pub disabled_addons: Vec<String>,
 }
 
-fn default_text_scale() -> f32 {
-    1.0
+fn default_text_scale() -> u32 {
+    1000
 }
 
 impl Default for ProfileSettings {

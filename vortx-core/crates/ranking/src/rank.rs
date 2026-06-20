@@ -242,7 +242,9 @@ fn score_stream(
         reasons.push("repack (+5)".to_string());
     }
     if let Some(g) = gb {
-        s += (g * 0.15).min(12.0);
+        // Clamp to a small NON-NEGATIVE tiebreaker. A malformed negative video_size (i64) must never
+        // drive the score below the junk floor, or an add-on could self-suppress its own streams.
+        s += (g * 0.15).clamp(0.0, 12.0);
     }
 
     s
@@ -339,5 +341,21 @@ mod tests {
         let a = rank(&streams, &prefs, &[false, false, false]);
         let b = rank(&streams, &prefs, &[false, false, false]);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn negative_video_size_is_clamped_not_a_self_suppress() {
+        // Regression: a malformed negative video_size must not sink a legit stream below the junk floor.
+        use vortx_protocol::StreamBehaviorHints;
+        let prefs = RankingPrefs::default();
+        let mut legit = stream("1080p WEB-DL");
+        legit.behavior_hints = Some(StreamBehaviorHints {
+            video_size: Some(i64::MIN),
+            ..Default::default()
+        });
+        let junk = stream("2160p FAKE upscale");
+        let ranked = rank(&[legit, junk], &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 0); // legit still beats junk
+        assert!(ranked[0].score > 0.0);
     }
 }
