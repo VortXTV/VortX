@@ -1828,3 +1828,35 @@ video::cue {
   color: var(--accent-bright);
   outline: none;
 }
+
+/* Per-stream quality chips (detail.ts streamRow): resolution / source / HDR / audio / cache, colored by kind. */
+.qtag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.1rem 0.42rem;
+  border-radius: 0.4rem;
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.5;
+  background: var(--surface-3);
+  border: 1px solid var(--hairline);
+  color: var(--text);
+}
+.qtag-res {
+  color: var(--text);
+  font-weight: 700;
+}
+.qtag-hdr {
+  color: var(--accent-bright);
+  background: var(--accent-soft);
+  border-color: transparent;
+}
+.qtag-cached {
+  color: #0f140f;
+  background: #7ad48d;
+  border-color: transparent;
+}
+.qtag-audio {
+  opacity: 0.78;
+}

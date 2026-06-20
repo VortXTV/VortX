@@ -238,7 +238,9 @@ export function variantOptions(groups: RankedGroup[], wanted: string): QualityOp
 }
 
 /** Source-class / cache tags for a stream row, the way the Apple app's sourceDetail labels them. */
-export function sourceTags(s: Stream): string {
+/** The quality/source signals for a stream, as a list (resolution, source type, HDR, audio, cache). The
+ *  detail UI renders each as its own colored chip; sourceTags keeps the joined-string form for any caller. */
+export function sourceTagList(s: Stream): string[] {
   const t = qualityText(s);
   const tags: string[] = [qualityLabel(s)];
   if (t.includes("remux")) tags.push("Remux");
@@ -250,5 +252,9 @@ export function sourceTags(s: Stream): string {
   else if (t.includes("dts-hd") || t.includes("dts hd")) tags.push("DTS-HD");
   else if (t.includes("dts")) tags.push("DTS");
   if (isCached(s, t)) tags.push("Cached");
-  return tags.join(" · ");
+  return tags.filter(Boolean);
+}
+
+export function sourceTags(s: Stream): string {
+  return sourceTagList(s).join(" · ");
 }
