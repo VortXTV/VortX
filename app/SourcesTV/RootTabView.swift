@@ -96,10 +96,13 @@ struct RootView: View {
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
             if let req = presenter.request {
-                if !req.torrent, HLSPlayerView.handles(req.url) {
-                    // Adaptive-HLS stream: play it natively in AVPlayer (true ABR, vs libmpv locking one
-                    // rendition) on its own, BYPASSING TVPlayerView so the RemoteCatcher's focus-lock never
-                    // fights AVPlayerViewController for the Siri remote.
+                if !req.torrent,
+                   PlayerEngineRouter.engine(for: req.url, isTorrent: req.torrent,
+                                             isDolbyVision: StreamRanking.isDolbyVision(req.sourceHint ?? "")) == .avfoundation {
+                    // AVPlayer-routed: adaptive HLS (true ABR vs libmpv locking one rendition) OR a Dolby
+                    // Vision stream in an MP4/MOV container (true DV passthrough on a DV TV; libmpv/MoltenVK
+                    // only tone-maps DV to SDR). Plays in the bare AVPlayerViewController, BYPASSING
+                    // TVPlayerView so the RemoteCatcher's focus-lock never fights AVKit for the Siri remote.
                     TVHLSPlayer(request: req, onClose: { presenter.request = nil })
                         .id(req.id)
                 } else {

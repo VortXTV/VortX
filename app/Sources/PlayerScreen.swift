@@ -291,7 +291,17 @@ struct PlayerScreen: View {
             mpvBody
         }
         #else
-        mpvBody
+        // macOS: route a Dolby Vision stream (AVPlayer-playable container) to the AVKit VideoPlayer surface
+        // for true DV passthrough; everything else (including HLS, which the node server transcodes) stays on
+        // libmpv. The macOS app has no AVPlayer chrome yet, so DV plays with AVKit's native controls.
+        if PlayerEngineRouter.engine(for: url, isTorrent: recordIsTorrent,
+                                     isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? "")) == .avfoundation {
+            HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
+                          onProgress: onProgress, onClose: onClose)
+                .ignoresSafeArea()
+        } else {
+            mpvBody
+        }
         #endif
     }
 

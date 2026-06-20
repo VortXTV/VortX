@@ -1,6 +1,7 @@
-#if os(iOS) || os(tvOS)
+#if os(iOS) || os(tvOS) || os(macOS)
 import SwiftUI
 import AVKit
+import AVFoundation
 import Combine
 
 /// Native AVPlayer surface for adaptive-HLS (`.m3u8`) streams. libmpv does not do mid-stream adaptive
@@ -37,7 +38,7 @@ struct HLSPlayerView: View {
         ChromeBody(url: url, title: title, headers: headers, resumeSeconds: resumeSeconds,
                    onProgress: onProgress, onClose: onClose)
     }
-    #else
+    #elseif os(tvOS)
     // tvOS: keep the bare AVPlayerViewController. A custom focusable overlay would compete with the
     // Siri-remote focus engine (the hard-won tvOS player-focus area), so AVKit owns the screen here and
     // the VortX chrome rebuild is iOS/Mac-only in this phase.
@@ -48,6 +49,15 @@ struct HLSPlayerView: View {
                 .ignoresSafeArea()
         }
         .onExitCommand { onClose() }   // Siri-remote Menu leaves the HLS player (the tvOS dismiss idiom)
+    }
+    #else
+    // macOS: SwiftUI VideoPlayer over an AVPlayer. AVPlayerLayer is DV / EDR native, which libmpv/MoltenVK
+    // is not (it only tone-maps DV to SDR), so this is the macOS true-Dolby-Vision surface. Native AppKit
+    // transport controls; resume + progress mirror the other engines.
+    var body: some View {
+        MacVideoPlayer(url: url, headers: headers, resumeSeconds: resumeSeconds,
+                       onProgress: onProgress, onClose: onClose)
+            .ignoresSafeArea()
     }
     #endif
 }
@@ -552,6 +562,66 @@ extension HLSPlayerView {
                     onProgress(player.currentTime().seconds, dur)
                 }
             }
+        }
+    }
+}
+#endif
+
+#if os(macOS)
+/// macOS true-Dolby-Vision / HLS surface: a SwiftUI `VideoPlayer` over an `AVPlayer`. AVPlayerLayer is DV /
+/// EDR native (libmpv/MoltenVK only tone-maps DV to SDR), so DV streams the router sends here play in true
+/// Dolby Vision on a capable display. A reference-type model owns the player + observers so the resume seek
+/// and the once-per-second progress report survive SwiftUI value-type re-renders.
+private struct MacVideoPlayer: View {
+    let url: URL
+    var headers: [String: String]? = nil
+    var resumeSeconds: Double = 0
+    var onProgress: (Double, Double) -> Void = { _, _ in }
+    var onClose: () -> Void = {}
+
+    @StateObject private var model = Model()
+
+    var body: some View {
+        VideoPlayer(player: model.player)
+            .ignoresSafeArea()
+            .onAppear { model.start(url: url, headers: headers, resume: resumeSeconds, onProgress: onProgress) }
+            .onDisappear { model.stop(onProgress: onProgress) }
+    }
+
+    final class Model: ObservableObject {
+        let player = AVPlayer()
+        private var timeObserver: Any?
+        private var statusObserver: NSKeyValueObservation?
+        private var didResume = false
+
+        func start(url: URL, headers: [String: String]?, resume: Double, onProgress: @escaping (Double, Double) -> Void) {
+            let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
+            let item = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
+            player.replaceCurrentItem(with: item)
+            player.allowsExternalPlayback = true
+            statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                guard let self, item.status == .readyToPlay, !self.didResume else { return }
+                self.didResume = true
+                if resume > 1 { self.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600)) }
+                self.player.play()
+            }
+            timeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 1, preferredTimescale: 1), queue: .main
+            ) { [weak self] time in
+                guard let self, let dur = self.player.currentItem?.duration.seconds, dur.isFinite, dur > 0 else { return }
+                onProgress(time.seconds, dur)
+            }
+        }
+
+        func stop(onProgress: (Double, Double) -> Void) {
+            if let timeObserver { player.removeTimeObserver(timeObserver) }
+            timeObserver = nil
+            statusObserver?.invalidate(); statusObserver = nil
+            if let dur = player.currentItem?.duration.seconds, dur.isFinite, dur > 0 {
+                onProgress(player.currentTime().seconds, dur)
+            }
+            player.pause()
+            player.replaceCurrentItem(with: nil)
         }
     }
 }

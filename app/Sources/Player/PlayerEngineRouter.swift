@@ -6,11 +6,14 @@ import Foundation
 /// IMPORTANT: evaluate on the RAW (un-proxied) stream URL. `StremioServer.proxiedURL` rewrites the host to
 /// 127.0.0.1, which would make every proxied stream look like a loopback torrent and never reach AVPlayer.
 ///
-/// Pure logic, no platform types, so it compiles on every target. WIRED on iOS: `PlayerScreen.useAVPlayerEngine`
-/// passes the real `isDolbyVision` (from the launching stream's quality text), so DV in an AVPlayer-playable
-/// container now auto-routes to the full-chrome AVPlayer engine for true DV. tvOS routes HLS via its own
-/// branch (RootTabView) and macOS stays on libmpv in `auto` (no AVKit surface yet) -- the tvOS/Mac default
-/// flip + true DV is 0.4 work.
+/// Pure logic, no platform types, so it compiles on every target. WIRED on all three Apple platforms, each
+/// passing the real `isDolbyVision` from the launching stream's quality text so DV in an AVPlayer-playable
+/// container (MP4/MOV/M4V) auto-routes to a DV-native AVPlayer surface for true Dolby Vision:
+///   - iOS:   `PlayerScreen.useAVPlayerEngine` -> the full-chrome `AVPlayerEngineView`.
+///   - tvOS:  `RootTabView` -> `TVHLSPlayer` (bare `AVPlayerViewController`).
+///   - macOS: `PlayerScreen` -> `HLSPlayerView`'s `MacVideoPlayer` (SwiftUI `VideoPlayer`).
+/// HLS also routes to AVPlayer on iOS/tvOS (rule 4); macOS keeps HLS on libmpv (its node server transcodes it)
+/// and routes only DV. Torrents and the override are handled before the platform split.
 enum PlayerEngineRouter {
     enum Engine: String { case mpv, avfoundation }
 
@@ -46,13 +49,6 @@ enum PlayerEngineRouter {
                        isTorrent: Bool,
                        isDolbyVision: Bool,
                        override: Override = currentOverride) -> Engine {
-        #if os(macOS)
-        // macOS stays on libmpv in auto: its out-of-process node server transcodes HLS, and MPVKit cannot
-        // link Catalyst, so there is no AVKit player surface yet. The override still lets an advanced user
-        // force AVPlayer once that surface exists.
-        if override == .auto { return .mpv }
-        #endif
-
         // (1) Torrents always play on libmpv: AVPlayer cannot replay the loopback server URL or run the
         // torrent warm-up. Belt and suspenders: trust the flag AND the loopback host.
         let host = (url.host ?? "").lowercased()
@@ -71,8 +67,12 @@ enum PlayerEngineRouter {
         // libmpv anyway (tone-mapped). The AVPlayer->libmpv .failed fallback in the chrome is the backstop.
         if isDolbyVision, isAVPlayerContainer(url) { return .avfoundation }
 
-        // (4) Remote HLS -> AVPlayer for native adaptive bitrate, AirPlay, and PiP.
+        #if !os(macOS)
+        // (4) Remote HLS -> AVPlayer for native adaptive bitrate, AirPlay, and PiP. macOS keeps HLS on libmpv
+        // (its out-of-process node server transcodes HLS), so this rule is iOS/tvOS only; macOS routes only
+        // Dolby Vision (rule 3) to AVPlayer.
         if isHLS(url) { return .avfoundation }
+        #endif
 
         // (5) Direct / debrid non-HLS containers stay on libmpv (it demuxes arbitrary MP4/MKV/HEVC and
         // applies per-stream request headers).
