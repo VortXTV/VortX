@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use vortx_protocol::Stream;
 use vortx_ranking::{rank, RankedStream, RankingPrefs};
+use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
 use crate::engine::Engine;
 
@@ -27,6 +28,12 @@ pub enum ResolveRequest {
         #[serde(default)]
         prefs: RankingPrefs,
     },
+    /// Pick the best subtitle track from the host-provided candidates for the given preferences.
+    Subtitles {
+        tracks: Vec<SubtitleTrack>,
+        #[serde(default)]
+        prefs: SubtitlePrefs,
+    },
 }
 
 /// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
@@ -35,6 +42,8 @@ pub enum ResolveRequest {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolveResponse {
     Streams { ranked: Vec<RankedStream> },
+    /// The chosen subtitle track, or `null` when nothing was eligible.
+    Subtitles { selected: Option<SubtitleSelection> },
     Error { error: String },
 }
 
@@ -49,6 +58,9 @@ pub fn resolve(_engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             prefs,
         } => ResolveResponse::Streams {
             ranked: rank(&streams, &prefs, &cached),
+        },
+        ResolveRequest::Subtitles { tracks, prefs } => ResolveResponse::Subtitles {
+            selected: select_subtitle(&tracks, &prefs),
         },
     }
 }
