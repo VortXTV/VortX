@@ -235,3 +235,43 @@ export async function fetchStreams(addons: Addon[], type: string, id: string): P
   );
   return groups.filter((g): g is StreamGroup => g !== null);
 }
+
+// ---- Subtitles ---------------------------------------------------------------------------------
+
+/** One subtitle option from a subtitles add-on (OpenSubtitles-style): a downloadable SRT/VTT + its lang. */
+export interface SubtitleTrack {
+  id: string;
+  url: string;
+  lang: string;
+}
+
+/** Fetch subtitle options for a title/episode from every add-on that serves `subtitles` for `type`,
+ *  de-duped to one per language and capped (so the player adds a sane number of <track>s). Empty on
+ *  failure. `id` is the title id for movies, or the episode video id (ttSeries:S:E) for series. */
+export async function fetchSubtitles(addons: Addon[], type: string, id: string): Promise<SubtitleTrack[]> {
+  const candidates = addons.filter((a) => supportsResource(a, "subtitles", type, id));
+  const groups = await Promise.all(
+    candidates.map(async (addon): Promise<SubtitleTrack[]> => {
+      const base = addonBaseDir(addon.transportUrl);
+      const url = `${base}/subtitles/${encodeURIComponent(type)}/${encodeId(id)}.json`;
+      try {
+        const data = await fetchJson<{ subtitles?: SubtitleTrack[] }>(url);
+        return (data.subtitles ?? []).filter(
+          (s) => s && typeof s.url === "string" && typeof s.lang === "string" && /^https?:\/\//i.test(s.url),
+        );
+      } catch {
+        return [];
+      }
+    }),
+  );
+  const seen = new Set<string>();
+  const out: SubtitleTrack[] = [];
+  for (const s of groups.flat()) {
+    const key = s.lang.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+    if (out.length >= 8) break;
+  }
+  return out;
+}

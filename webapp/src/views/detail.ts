@@ -1,5 +1,5 @@
 import type { Addon, MetaItem, Stream, Video } from "../lib/types";
-import { fetchMeta, fetchStreams, type StreamGroup } from "../lib/addon";
+import { fetchMeta, fetchStreams, fetchSubtitles, type StreamGroup } from "../lib/addon";
 import {
   best,
   hasOnlyUnplayable,
@@ -502,6 +502,9 @@ async function playStream(stream: Stream): Promise<void> {
     title,
     state?.meta
       ? { id: state.meta.id, type: state.meta.type, name: state.meta.name, poster: state.meta.poster }
+      : undefined,
+    state?.meta
+      ? fetchSubtitles(addons, state.meta.type, state.openEpisode?.id ?? state.meta.id)
       : undefined,
   );
 }

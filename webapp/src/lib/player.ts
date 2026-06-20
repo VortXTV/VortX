@@ -2,6 +2,7 @@ import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
 import { el, escapeHtml } from "./dom";
 import { cwPosition, recordProgress } from "./store";
+import type { SubtitleTrack } from "./addon";
 
 /** The slim title context the player needs to record Continue Watching progress. */
 interface CWItem {
@@ -28,6 +29,7 @@ const HLS_EXT = /\.m3u8(\?|$)/i;
 
 let hls: Hls | null = null;
 let keyHandler: ((e: KeyboardEvent) => void) | null = null;
+let subtitleBlobs: string[] = [];
 
 /** Whether a url looks like an HLS playlist. */
 function isHls(url: string): boolean {
@@ -44,7 +46,12 @@ function chrome(title: string): string {
 }
 
 /** Open the player overlay and play `url`. `title` is shown as thin chrome over the transport. */
-export async function play(url: string, title: string, item?: CWItem): Promise<void> {
+export async function play(
+  url: string,
+  title: string,
+  item?: CWItem,
+  subtitles?: Promise<SubtitleTrack[]>,
+): Promise<void> {
   const host = el(PLAYER_HOST_ID);
   if (!host) return;
   host.classList.remove("hidden");
@@ -55,6 +62,8 @@ export async function play(url: string, title: string, item?: CWItem): Promise<v
   if (!video) return;
   if (item) wireProgress(video, item);
   wireKeyboard(video);
+  // Non-blocking: playback starts immediately; subtitle <track>s are added when the list resolves.
+  if (subtitles) void subtitles.then((subs) => addSubtitleTracks(video, subs)).catch(() => undefined);
 
   // Native HLS (Safari / iOS) or any non-HLS url: hand the url straight to the element.
   if (!isHls(url) || video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -161,6 +170,48 @@ function wireKeyboard(video: HTMLVideoElement): void {
   document.addEventListener("keydown", keyHandler);
 }
 
+/** Add subtitle <track>s to the video; the native controls then expose a CC menu to pick one. */
+async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[]): Promise<void> {
+  for (const sub of subs) {
+    const url = await toVttUrl(sub);
+    if (!url) continue;
+    const track = document.createElement("track");
+    track.kind = "subtitles";
+    track.srclang = sub.lang;
+    track.label = sub.lang.toUpperCase();
+    track.src = url;
+    video.appendChild(track);
+  }
+}
+
+/** Fetch a subtitle file, convert SRT to WebVTT if needed, and return a blob: URL for a <track>. */
+async function toVttUrl(sub: SubtitleTrack): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const res = await fetch(sub.url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const isVtt = /\.vtt(\?|$)/i.test(sub.url) || /^﻿?\s*WEBVTT/.test(text);
+    const blobUrl = URL.createObjectURL(new Blob([isVtt ? text : srtToVtt(text)], { type: "text/vtt" }));
+    subtitleBlobs.push(blobUrl);
+    return blobUrl;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Minimal SRT to WebVTT: prepend the WEBVTT header and switch cue-time commas to dots. */
+function srtToVtt(srt: string): string {
+  const body = srt
+    .replace(/\r+/g, "")
+    .replace(/^﻿/, "")
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
+  return "WEBVTT\n\n" + body;
+}
+
 /** Render an inline error inside the player overlay (keeps the Back button reachable). */
 function showError(host: HTMLElement, message: string): void {
   const existing = host.querySelector(".player-error");
@@ -181,6 +232,8 @@ export function close(): void {
     document.removeEventListener("keydown", keyHandler);
     keyHandler = null;
   }
+  for (const u of subtitleBlobs) URL.revokeObjectURL(u);
+  subtitleBlobs = [];
   if (hls) {
     hls.destroy();
     hls = null;
