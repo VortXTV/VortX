@@ -28,6 +28,9 @@ let addons: Addon[] = [];
 
 const APP_SHELL = `
   <a class="skip-link" href="#main">Skip to content</a>
+  <header class="brandbar">
+    <a class="brand" href="#/" aria-label="VortX home">Vort<svg class="brand-mark" viewBox="-8 -8 116 116" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="bm-b" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.5" stop-color="#f59e0b"/><stop offset="1" stop-color="#d97706"/></linearGradient><linearGradient id="bm-d" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#b45309"/><stop offset="1" stop-color="#7c2d12"/></linearGradient></defs><path d="M9.2,4 C43.3,29.2 56.7,70.8 90.8,96" stroke="url(#bm-d)" stroke-width="18" stroke-linecap="round" fill="none"/><path d="M90.8,4 C56.7,29.2 43.3,70.8 9.2,96" stroke="url(#bm-b)" stroke-width="18" stroke-linecap="round" fill="none"/><circle cx="50" cy="50" r="7.2" fill="#fdf6e3"/></svg></a>
+  </header>
   <main class="content" id="main"></main>
   <div class="overlay detail-overlay" id="detail-host"></div>
   <div class="overlay player-overlay hidden" id="player" aria-hidden="true"></div>
