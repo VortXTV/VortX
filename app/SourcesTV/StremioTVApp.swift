@@ -48,7 +48,10 @@ struct StremioTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
-                    Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
+                    Task {
+                        await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
+                        VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open
+                    }
                     VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     // The top tab bar can desync (park offscreen) across a background/foreground cycle,
                     // the same "vanishing tab bar" the player-close heal fixes. Re-assert it on return so

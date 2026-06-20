@@ -54,7 +54,10 @@ struct StremioXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
-                        Task { await VortXSyncManager.shared.syncDown() }   // pull other devices' changes on foreground
+                        Task {
+                            await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
+                            VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open, not only on background
+                        }
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     }
                     if phase == .background {
