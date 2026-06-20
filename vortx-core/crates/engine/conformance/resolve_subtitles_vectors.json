@@ -1,0 +1,64 @@
+{
+  "description": "Cross-language conformance for the engine subtitle resolution query. Each case feeds a JSON ResolveRequest{kind:subtitles} through resolve_json; the response selected.track_index (or null) must match. The pick follows the subtitle select ranked-key: preferred-language rank, then forced/HI intent, then format, then source tier, then rating, then id. Order-independent (id is in the key).",
+  "cases": [
+    {
+      "name": "preferred_language_wins",
+      "request": {
+        "kind": "subtitles",
+        "tracks": [
+          { "id": "es1", "lang": "es", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null },
+          { "id": "en1", "lang": "en", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "open_subtitles", "rating": null }
+        ],
+        "prefs": { "languages": ["en"] }
+      },
+      "expect_index": 1
+    },
+    {
+      "name": "no_match_in_required_language_is_null",
+      "request": {
+        "kind": "subtitles",
+        "tracks": [
+          { "id": "fr1", "lang": "fr", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null }
+        ],
+        "prefs": { "languages": ["en"] }
+      },
+      "expect_index": null
+    },
+    {
+      "name": "forced_preference_respected",
+      "request": {
+        "kind": "subtitles",
+        "tracks": [
+          { "id": "enp", "lang": "en", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null },
+          { "id": "enf", "lang": "en", "forced": true, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null }
+        ],
+        "prefs": { "languages": ["en"], "wantForced": true }
+      },
+      "expect_index": 1
+    },
+    {
+      "name": "default_selection_avoids_forced",
+      "request": {
+        "kind": "subtitles",
+        "tracks": [
+          { "id": "enf", "lang": "en", "forced": true, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null },
+          { "id": "enp", "lang": "en", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null }
+        ],
+        "prefs": { "languages": ["en"] }
+      },
+      "expect_index": 1
+    },
+    {
+      "name": "no_language_pref_breaks_ties_on_tier",
+      "request": {
+        "kind": "subtitles",
+        "tracks": [
+          { "id": "gen", "lang": "en", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "generated", "rating": null },
+          { "id": "emb", "lang": "en", "forced": false, "hearing_impaired": false, "format": "srt", "tier": "embedded", "rating": null }
+        ],
+        "prefs": {}
+      },
+      "expect_index": 1
+    }
+  ]
+}

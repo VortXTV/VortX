@@ -15,6 +15,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 vortx-state = { path = "../state" }
 vortx-protocol = { path = "../protocol" }
 vortx-ranking = { path = "../ranking" }
+vortx-subtitles = { path = "../subtitles" }
 serde.workspace = true
 serde_json.workspace = true
 
