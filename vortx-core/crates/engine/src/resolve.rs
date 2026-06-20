@@ -1,0 +1,110 @@
+//! Resource resolution: the QUERY half of the engine, parallel to the command half (`dispatch`). A
+//! command mutates profile state and returns events; a query is read-only and returns a DECISION the host
+//! acts on. They are deliberately separate paths so the FFI surface stays a clean command/query split.
+//!
+//! The engine never does I/O. The host (which owns the network) fetches an addon's raw results and hands
+//! them in; the engine routes them through the pure kernel crates and returns the typed decision. For
+//! streams that decision is the ranked, player-ready order from `vortx-ranking` (fixed-point, so the
+//! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
+
+use serde::{Deserialize, Serialize};
+use vortx_protocol::Stream;
+use vortx_ranking::{rank, RankedStream, RankingPrefs};
+
+use crate::engine::Engine;
+
+/// A resolution request from the host. Tagged by `kind` (snake_case). More resources (catalog / meta /
+/// subtitles) join here as their pure pipelines are wired; streams is the player-critical first path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolveRequest {
+    /// Decide the play order for already-fetched streams. `cached[i]` marks stream `i` debrid-cached (a
+    /// missing entry is treated as not cached). `prefs` are the active profile's ranking preferences.
+    Streams {
+        streams: Vec<Stream>,
+        #[serde(default)]
+        cached: Vec<bool>,
+        #[serde(default)]
+        prefs: RankingPrefs,
+    },
+}
+
+/// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
+/// JSON parse total (a bad request never produces unparseable output).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolveResponse {
+    Streams { ranked: Vec<RankedStream> },
+    Error { error: String },
+}
+
+/// Resolve one request against the engine. Pure: no I/O, no state mutation. `engine` is threaded for the
+/// resources that will read profile state (catalog/home feed); the streams path is stateless given
+/// explicit prefs.
+pub fn resolve(_engine: &Engine, req: ResolveRequest) -> ResolveResponse {
+    match req {
+        ResolveRequest::Streams {
+            streams,
+            cached,
+            prefs,
+        } => ResolveResponse::Streams {
+            ranked: rank(&streams, &prefs, &cached),
+        },
+    }
+}
+
+/// The FFI query entry point: a JSON request string in, a JSON [`ResolveResponse`] string out. A malformed
+/// request yields a well-formed `{ "kind": "error", ... }` rather than an error, so the host always gets
+/// parseable JSON.
+pub fn resolve_json(engine: &Engine, request_json: &str) -> String {
+    let response = match serde_json::from_str::<ResolveRequest>(request_json) {
+        Ok(req) => resolve(engine, req),
+        Err(e) => ResolveResponse::Error {
+            error: format!("bad request: {e}"),
+        },
+    };
+    serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"kind":"error","error":"serialize failed"}"#.to_string()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init_runtime;
+
+    fn stream(label: &str) -> Stream {
+        Stream {
+            name: Some(label.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolves_streams_into_ranked_order() {
+        let engine = init_runtime("owner", "Owner");
+        let req = ResolveRequest::Streams {
+            streams: vec![stream("1080p WEB-DL"), stream("2160p WEB-DL")],
+            cached: vec![false, false],
+            prefs: RankingPrefs::default(),
+        };
+        let ResolveResponse::Streams { ranked } = resolve(&engine, req) else {
+            panic!("expected streams response");
+        };
+        assert_eq!(ranked[0].raw_index, 1); // 2160p outranks 1080p
+        assert!(ranked[0].score > ranked[1].score);
+    }
+
+    #[test]
+    fn resolve_json_round_trips_and_is_panic_free() {
+        let engine = init_runtime("owner", "Owner");
+        let out = resolve_json(
+            &engine,
+            r#"{"kind":"streams","streams":[{"name":"720p WEB-DL"}],"cached":[true]}"#,
+        );
+        assert!(out.contains("\"kind\":\"streams\""));
+        // Malformed input stays parseable as an error.
+        let bad = resolve_json(&engine, "not json");
+        assert!(bad.contains("\"kind\":\"error\""));
+    }
+}

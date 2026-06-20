@@ -16,7 +16,9 @@
 mod action;
 mod engine;
 mod env;
+mod resolve;
 
 pub use action::{Action, DispatchResult, EngineEvent};
 pub use engine::{dispatch, dispatch_json, get_state_json, init_runtime, Engine};
 pub use env::{Env, InMemoryEnv};
+pub use resolve::{resolve, resolve_json, ResolveRequest, ResolveResponse};
