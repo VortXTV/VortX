@@ -23,6 +23,7 @@ members = [
     "crates/playback-policy",
     "crates/engine",
     "crates/subtitles",
+    "crates/nzb",
 ]
 
 [workspace.package]
