@@ -1,4 +1,4 @@
-import type { Addon } from "./types";
+import type { Addon, MetaItem } from "./types";
 import { CINEMETA_URL, loadAddon } from "./addon";
 
 // The installed-add-on store. The web client has no account engine (that is the native app's job), so
@@ -56,4 +56,39 @@ export async function addAddon(transportUrl: string): Promise<Addon> {
 export function removeAddon(transportUrl: string): void {
   if (transportUrl === CINEMETA_URL) return;
   persist(installedUrls().filter((u) => u !== transportUrl));
+}
+
+// --- Library (saved titles) ---------------------------------------------------------------------
+// A local watchlist, separate from the apps' account library (the web client has no account sync).
+// Slim MetaItems (id/type/name/poster) are enough to render a poster card and link to Detail.
+const LIBRARY_KEY = "vortx.web.library.v1";
+
+/** Saved titles, most-recently-added first. */
+export function libraryItems(): MetaItem[] {
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? (parsed as MetaItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Whether a title id is currently saved. */
+export function inLibrary(id: string): boolean {
+  return libraryItems().some((e) => e.id === id);
+}
+
+/** Add or remove a title; returns true if it is now saved. */
+export function toggleLibrary(item: MetaItem): boolean {
+  const current = libraryItems();
+  const exists = current.some((e) => e.id === item.id);
+  const slim: MetaItem = { id: item.id, type: item.type, name: item.name, poster: item.poster };
+  const next = exists ? current.filter((e) => e.id !== item.id) : [slim, ...current];
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify(next));
+  } catch {
+    /* storage disabled or full: library is best-effort */
+  }
+  return !exists;
 }
