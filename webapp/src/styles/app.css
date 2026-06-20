@@ -418,6 +418,23 @@ input:focus-visible {
   line-height: 1.55;
   margin-bottom: 1.5rem;
 }
+/* Cast / Director / Writer lines under the synopsis (web parity with the Apple detail page). */
+.credits {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 1.5rem;
+  max-width: 60ch;
+  font-size: 0.9rem;
+}
+.credit-role {
+  display: inline-block;
+  min-width: 5rem;
+  color: var(--muted-2);
+}
+.credit-names {
+  color: var(--muted);
+}
 
 /* ---- Stream section ---- */
 

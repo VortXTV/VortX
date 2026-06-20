@@ -186,6 +186,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
         ${heroHead(meta, logo)}
         ${metaRow(meta)}
         ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
+        ${creditsRow(meta)}
         ${streamSection(groups)}
         ${libraryButton(meta)}${trailer ? trailerButton() : ""}
       </div>
@@ -208,7 +209,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     ? episodeStreamView(open, meta)
     : `${heroHead(meta, logo)}${metaRow(meta)}${
         meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${trailer ? trailerButton() : ""}`;
+      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${trailer ? trailerButton() : ""}`;
 
   host.innerHTML = `
     <div class="detail">
@@ -458,6 +459,27 @@ function formatTime(seconds: number): string {
 function genres(meta: MetaItem): string[] {
   if (meta.genres?.length) return meta.genres;
   return (meta.links ?? []).filter((l) => l.category.toLowerCase() === "genre").map((l) => l.name);
+}
+
+/** People from the meta's typed links by category, e.g. cast or directors. Category strings mirror the
+ *  Apple app's CoreModels.credits(), which is proven against real Cinemeta data. */
+function credits(meta: MetaItem, categories: string[]): string[] {
+  const set = new Set(categories);
+  return (meta.links ?? []).filter((l) => set.has(l.category.toLowerCase())).map((l) => l.name);
+}
+
+/** Cast / Director / Writer lines under the synopsis, each shown only when present and name-capped so a
+ *  long IMDb cast list doesn't push the action row away (mirrors iOSDetailView's credit lines). */
+function creditsRow(meta: MetaItem): string {
+  const line = (role: string, names: string[]): string =>
+    names.length
+      ? `<div class="credit"><span class="credit-role">${role}</span><span class="credit-names">${escapeHtml(names.join(", "))}</span></div>`
+      : "";
+  const html =
+    line("Cast", credits(meta, ["cast", "actors", "actor"]).slice(0, 5)) +
+    line("Director", credits(meta, ["director", "directors"]).slice(0, 3)) +
+    line("Writer", credits(meta, ["writer", "writers"]).slice(0, 3));
+  return html ? `<div class="credits">${html}</div>` : "";
 }
 
 function imdbRating(meta: MetaItem): string | undefined {
