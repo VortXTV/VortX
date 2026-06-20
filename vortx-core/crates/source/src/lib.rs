@@ -16,6 +16,7 @@
 mod adapters;
 mod canonical;
 mod customization;
+mod identity;
 mod manifest;
 mod registry;
 mod request;
@@ -29,6 +30,7 @@ pub use customization::{
     HomeLayout, LayoutDef, MotionDef, PaletteOverride, RadiusDef, RailDecl, Splash, TabDecl,
     ThemeDef, Wordmark,
 };
+pub use identity::{reconcile, CanonicalId, ExternalId, IdSet, Namespace};
 pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
