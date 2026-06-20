@@ -20,14 +20,21 @@
 //! roster never silently drops a profile.
 
 mod ids;
+mod library;
 mod pin;
 mod profile;
 mod roster;
+mod store;
 
 pub use ids::ProfileId;
+pub use library::{
+    CwItem, HistoryEntry, LibraryItem, ProfileLibrary, ResumePoint, StremioLibraryItem,
+    WatchedBitfield,
+};
 pub use pin::{hash_pin, pin_preimage, verify_pin};
 pub use profile::{AccountBinding, AddonBinding, ParentalFlags, Profile, ProfileSettings};
 pub use roster::ProfileRoster;
+pub use store::VortxStore;
 
 /// Errors from profile-state operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
