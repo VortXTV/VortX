@@ -263,8 +263,26 @@ final class VortXSyncManager: ObservableObject {
             }
             byProfile[p.id.uuidString] = ["library": library]
         }
+        // The owner/main profile's library lives in the account (not a watch overlay), so it was absent
+        // from the dashboard, which only received the byProfile overlay libraries above. Emit it as
+        // vortx.library from the engine's account library so the dashboard's main-profile Library is
+        // populated (excluding removed/temp, which are not "in the library"). Safe here: this type is
+        // @MainActor, so reading CoreBridge's @Published state is on the main actor.
+        let ownerLibrary: [[String: Any]] = (CoreBridge.shared.library?.catalog ?? [])
+            .filter { !($0.removed ?? false) && !($0.temp ?? false) }
+            .map { item in
+                ["id": item.id, "name": item.name, "type": item.type, "poster": item.poster ?? "",
+                 "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000)]
+            }
+        // Installed add-ons, so the dashboard Add-ons page is populated: it reads vortx.addons (and the
+        // web Stremio import under doc.addons), neither of which the app emitted before.
+        let addonList: [[String: Any]] = CoreBridge.shared.addons.map { desc in
+            ["transportUrl": desc.transportUrl, "name": desc.manifest.name]
+        }
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
+        if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
+        if !addonList.isEmpty { v["addons"] = addonList }
         if let active = store.activeID { v["activeProfile"] = active.uuidString }
         return v
     }
