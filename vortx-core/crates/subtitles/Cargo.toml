@@ -1,0 +1,14 @@
+[package]
+name = "vortx-subtitles"
+description = "VortX engine-owned subtitle layer. First capability: deterministic, explainable subtitle auto-selection. Given the available tracks and the profile's preferences (ranked languages, forced/hearing-impaired intent, format and source preferences), it picks the best track via a single total-order sort key, so the choice is pure, order-independent, and byte-reproducible cross-platform. Provider fetching, auto-sync, and whisper generation are later phases."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"
