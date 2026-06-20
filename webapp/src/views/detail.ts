@@ -154,6 +154,8 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
         render();
       }
       return true;
+    case "share":
+      return shareTitle();
     default:
       return false;
   }
@@ -188,7 +190,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
         ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
         ${creditsRow(meta)}
         ${streamSection(groups)}
-        ${libraryButton(meta)}${trailer ? trailerButton() : ""}
+        ${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}
       </div>
     </div>`;
 }
@@ -209,7 +211,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     ? episodeStreamView(open, meta)
     : `${heroHead(meta, logo)}${metaRow(meta)}${
         meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${trailer ? trailerButton() : ""}`;
+      }${creditsRow(meta)}${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
 
   host.innerHTML = `
     <div class="detail">
@@ -519,6 +521,36 @@ function trailerButton(): string {
 function libraryButton(meta: MetaItem): string {
   const saved = inLibrary(meta.id);
   return `<button class="chip lib-chip${saved ? " saved" : ""}" data-action="toggle-library" aria-pressed="${saved}">${saved ? "✓ Saved" : "+ Save"}</button>`;
+}
+
+/** Share the current title. The detail route already lives in the URL, so location.href is the link. */
+function shareButton(): string {
+  return `<button class="chip" data-action="share">Share</button>`;
+}
+async function shareTitle(): Promise<boolean> {
+  if (!state?.meta) return true;
+  const url = location.href; // the detail route (#/detail/type/id) is the shareable link
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: state.meta.name, url });
+    } else if (navigator.clipboard) {
+      await navigator.clipboard.writeText(url);
+      flashShareCopied();
+    }
+  } catch {
+    // User dismissed the share sheet, or clipboard write was denied - nothing to recover.
+  }
+  return true;
+}
+/** Brief "Link copied" confirmation on the Share button after a clipboard-fallback copy. */
+function flashShareCopied(): void {
+  const btn = hostEl?.querySelector<HTMLElement>('[data-action="share"]');
+  if (!btn) return;
+  const prev = btn.textContent ?? "Share";
+  btn.textContent = "Link copied";
+  setTimeout(() => {
+    if (btn.textContent === "Link copied") btn.textContent = prev;
+  }, 1500);
 }
 
 function openTrailer(youtubeId: string): void {
