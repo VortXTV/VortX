@@ -16,6 +16,7 @@
 mod adapters;
 mod canonical;
 mod customization;
+mod fanout;
 mod identity;
 mod manifest;
 mod registry;
@@ -29,6 +30,10 @@ pub use customization::{
     token_keys, AccentDef, AssetRef, BrandingDef, Color, CustomizationCapability, HeroDecl,
     HomeLayout, LayoutDef, MotionDef, PaletteOverride, RadiusDef, RailDecl, Splash, TabDecl,
     ThemeDef, Wordmark,
+};
+pub use fanout::{
+    aggregate, AddonResult, Aggregate, BreakerRegistry, BreakerState, CircuitBreaker,
+    CircuitConfig, FailedAddon, FailureKind, Outcome,
 };
 pub use identity::{reconcile, CanonicalId, ExternalId, IdSet, Namespace};
 pub use manifest::{

@@ -1,0 +1,51 @@
+{
+  "description": "Cross-language conformance for defensive addon fan-out. Each case feeds per-addon outcomes and pins the merged result (items + survivors + isolated failures). Failures contribute no items, so a bad addon never aborts the batch. Deterministic: processed in sorted addon-id order.",
+  "cases": [
+    {
+      "name": "one_poison_addon_isolated",
+      "results": [
+        { "addon_id": "good", "status": "ok", "items": ["s1", "s2"] },
+        { "addon_id": "poison", "status": "malformed" },
+        { "addon_id": "alsogood", "status": "ok", "items": ["s3"] }
+      ],
+      "config": { "failure_threshold": 3, "cooldown_secs": 300 },
+      "now": 1000,
+      "expect": {
+        "items": ["s3", "s1", "s2"],
+        "survivors": ["alsogood", "good"],
+        "failed": [{ "addon_id": "poison", "reason": "malformed" }]
+      }
+    },
+    {
+      "name": "all_succeed",
+      "results": [
+        { "addon_id": "a", "status": "ok", "items": ["x"] },
+        { "addon_id": "b", "status": "ok", "items": ["y"] }
+      ],
+      "config": { "failure_threshold": 3, "cooldown_secs": 300 },
+      "now": 0,
+      "expect": {
+        "items": ["x", "y"],
+        "survivors": ["a", "b"],
+        "failed": []
+      }
+    },
+    {
+      "name": "all_fail_yields_empty_but_no_panic",
+      "results": [
+        { "addon_id": "a", "status": "timeout" },
+        { "addon_id": "b", "status": "error" }
+      ],
+      "config": { "failure_threshold": 3, "cooldown_secs": 300 },
+      "now": 0,
+      "expect": {
+        "items": [],
+        "survivors": [],
+        "failed": [
+          { "addon_id": "a", "reason": "timeout" },
+          { "addon_id": "b", "reason": "error" }
+        ]
+      }
+    }
+  ]
+}
