@@ -31,24 +31,30 @@
     <title>VortX</title>
   </head>
   <body>
-    <!-- Branded splash: painted before any JS so the first frame is the VortX mark, not a blank canvas.
-         Fixed gold-on-obsidian (the brand moment, not the live accent); dismissed by main.ts once per session. -->
+    <!-- First-load splash, ported verbatim from the vortx.tv website (src/components/Splash.astro): the
+         exact woven-ribbon mark (gradient front over deeper back), ember glow bloom, ribbon draw-on, dot
+         pop, then "Everything. / VortXed." rises. A pure-CSS keyframe lifts it away so a JS failure can
+         never strand it; main.ts only handles once-per-session + DOM cleanup. -->
     <div id="splash" class="splash" aria-hidden="true">
-      <div class="splash-stage">
-        <svg class="splash-vortex" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <div class="splash-inner">
+        <svg class="splash-mark" viewBox="-8 -8 116 116" xmlns="http://www.w3.org/2000/svg">
           <defs>
-            <radialGradient id="splashGlow" cx="50%" cy="50%" r="75%">
-              <stop offset="0%" stop-color="#c2440f" stop-opacity="0.55" />
-              <stop offset="100%" stop-color="#c2440f" stop-opacity="0" />
+            <linearGradient id="spl-b" x1="0" y1="0" x2="0.25" y2="1">
+              <stop offset="0" stop-color="#fbbf24" /><stop offset="0.5" stop-color="#f59e0b" /><stop offset="1" stop-color="#d97706" />
+            </linearGradient>
+            <linearGradient id="spl-d" x1="0" y1="0" x2="0.25" y2="1">
+              <stop offset="0" stop-color="#b45309" /><stop offset="1" stop-color="#7c2d12" />
+            </linearGradient>
+            <radialGradient id="spl-e" cx="0.5" cy="0.5" r="0.5">
+              <stop offset="0" stop-color="#c2440f" stop-opacity="0.65" /><stop offset="0.55" stop-color="#c2440f" stop-opacity="0.2" /><stop offset="1" stop-color="#c2440f" stop-opacity="0" />
             </radialGradient>
           </defs>
-          <circle class="splash-glow" cx="100" cy="100" r="150" fill="url(#splashGlow)" />
-          <circle class="splash-ring" cx="100" cy="100" r="75" fill="none" stroke="#f59e0b" stroke-width="3" opacity="0.7" />
-          <path class="splash-rib splash-rib-1" d="M22.8 11.4 C88.6 60 114.2 140 180 188.6" fill="none" stroke="#f59e0b" stroke-width="42.8" stroke-linecap="round" />
-          <path class="splash-rib splash-rib-2" d="M180 11.4 C114.2 60 88.6 140 22.8 188.6" fill="none" stroke="#d97706" stroke-width="42.8" stroke-linecap="round" opacity="0.85" />
-          <circle class="splash-dot" cx="100" cy="100" r="16" fill="#fdf6e3" />
+          <ellipse class="glow" cx="50" cy="52" rx="64" ry="62" fill="url(#spl-e)" />
+          <path class="rib rib-back" pathLength="100" d="M9.2,4 C43.3,29.2 56.7,70.8 90.8,96" stroke="url(#spl-d)" stroke-width="18" stroke-linecap="round" fill="none" />
+          <path class="rib rib-front" pathLength="100" d="M90.8,4 C56.7,29.2 43.3,70.8 9.2,96" stroke="url(#spl-b)" stroke-width="18" stroke-linecap="round" fill="none" />
+          <circle class="dot" cx="50" cy="50" r="7.2" fill="#fdf6e3" />
         </svg>
-        <p class="splash-tagline"><span>Everything. </span><span class="g">VortX</span><span>ed.</span></p>
+        <div class="splash-word"><span class="l1">Everything.</span><span class="l2"><b>VortX</b>ed.</span></div>
       </div>
     </div>
     <div id="app"></div>

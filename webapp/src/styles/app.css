@@ -120,21 +120,21 @@ input:focus-visible {
 .wordmark {
   display: inline-flex;
   align-items: center;
-  gap: 0.06em;
+  gap: 0.04em;
   font-family: var(--serif);
-  font-size: clamp(1.9rem, 1.5rem + 1vw, 2.5rem);
+  font-size: clamp(2.1rem, 1.6rem + 1.2vw, 2.9rem);
   font-weight: 700;
   letter-spacing: -1px;
   line-height: 1;
 }
-/* The real VortX mark: two ember ribbons crossing into an X with a cream center, the exact curve from
-   SplashView.swift's VortexRibbon. currentColor = --accent so it recolors live with the theme. */
+/* The real VortX mark: the woven gradient ribbons from the website's Mark.astro (a bright front ribbon
+   crossing over a deeper back ribbon + a cream center dot), so the header logo matches the site + the
+   app icon. Sized larger than the text so it reads as a proper mark, not a tiny glyph. */
 .vortex-mark {
-  width: 0.9em;
-  height: 0.9em;
-  color: var(--accent);
-  filter: drop-shadow(0 0 8px var(--accent-soft));
-  transition: filter var(--duration-normal) var(--ease);
+  width: 1.08em;
+  height: 1.08em;
+  overflow: visible;
+  filter: drop-shadow(0 0 7px rgba(245, 158, 11, 0.35));
 }
 .topnav {
   display: flex;
@@ -914,60 +914,83 @@ input:focus-visible {
   }
 }
 
-/* ---- Branded splash (markup in index.html #splash). Fixed gold-on-obsidian brand moment, timing
-   mirrors app/SourcesShared/SplashView.swift: glow bloom, ribbon draw-in, shockwave ring, dot pop,
-   tagline. Dismissed by main.ts (once per session). ---- */
+/* ---- Branded splash, ported verbatim from the vortx.tv website (src/components/Splash.astro) so the
+   web client's launch matches the site + apps exactly: warm radial obsidian, the woven gradient mark
+   (bright front ribbon over a deeper back ribbon) with an ember glow bloom + draw-on, the cream dot
+   pops, then "Everything. / VortXed." rises. A pure-CSS splashOut lifts it away (so a JS failure can
+   never strand it); main.ts only does once-per-session + DOM cleanup. ---- */
 .splash {
   position: fixed;
   inset: 0;
-  z-index: 1000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: #0f0d0a;
-  opacity: 1;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(70vmax 70vmax at 50% 46%, #18130c, #0c0a07 72%);
+  animation: splashOut 0.7s cubic-bezier(0.16, 1, 0.3, 1) 2.25s forwards;
 }
-.splash.fade-out {
+.splash-inner {
+  display: grid;
+  justify-items: center;
+  gap: 1.6rem;
+}
+.splash-mark {
+  width: clamp(116px, 17vw, 168px);
+  height: auto;
+  overflow: visible;
+}
+.glow {
   opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.4s ease-in;
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0.7);
+  animation: vxglow 1.1s cubic-bezier(0.16, 1, 0.3, 1) 0.1s forwards;
 }
-.splash-stage {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 40px;
+.rib {
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  animation: vxdraw 0.95s cubic-bezier(0.16, 1, 0.3, 1) 0.18s forwards;
 }
-.splash-vortex {
-  width: clamp(160px, 26vw, 220px);
-  height: clamp(160px, 26vw, 220px);
-  animation: splashFocus 1.1s cubic-bezier(0.16, 1, 0.3, 1) both;
+.rib-front {
+  animation-delay: 0.34s;
 }
-.splash-tagline {
-  font-family: var(--serif);
-  font-size: clamp(2rem, 1.4rem + 2vw, 2.9rem);
-  font-weight: 700;
-  line-height: 1.2;
+.dot {
+  transform-box: fill-box;
+  transform-origin: center;
+  transform: scale(0);
+  animation: vxpop 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) 1.1s forwards;
+}
+.splash-word {
+  display: grid;
+  justify-items: center;
+  gap: 0.1rem;
   text-align: center;
-  color: #fdf6e3;
-  animation: splashTag 0.55s ease-out 1.3s both;
+  font-family: ui-rounded, "SF Pro Rounded", "Baloo 2", system-ui, sans-serif;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  line-height: 1.02;
+  font-size: clamp(1.6rem, 1.1rem + 2.4vw, 2.5rem);
 }
-.splash-tagline .g {
+.splash-word span {
+  opacity: 0;
+  transform: translateY(12px);
+  display: block;
+  color: #fdf6e3;
+}
+.splash-word .l1 {
+  animation: vxrise 0.6s cubic-bezier(0.16, 1, 0.3, 1) 1.3s forwards;
+}
+.splash-word .l2 {
+  animation: vxrise 0.6s cubic-bezier(0.16, 1, 0.3, 1) 1.44s forwards;
+}
+.splash-word .l2 b {
+  font-weight: 800;
   color: #f59e0b;
 }
-@keyframes splashGlow { from { transform: scale(0.6); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-@keyframes splashRib { from { stroke-dashoffset: 600; opacity: 0.2; } to { stroke-dashoffset: 0; opacity: 1; } }
-@keyframes splashRing { from { transform: scale(0.4); opacity: 0.7; } to { transform: scale(1.7); opacity: 0; } }
-@keyframes splashDot { 0% { transform: scale(0.01); } 70% { transform: scale(1.12); } 100% { transform: scale(1); } }
-@keyframes splashTag { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
-/* The premium beat from SplashView.swift: the whole mark resolves from a soft blur and settles in
-   scale (ease-out-expo), reading as the vortex coming into focus rather than a static gold X. */
-@keyframes splashFocus { from { filter: blur(16px); transform: scale(0.86); opacity: 0; } to { filter: blur(0); transform: scale(1); opacity: 1; } }
-.splash-glow { transform-box: fill-box; transform-origin: center; animation: splashGlow 0.9s ease-out both; }
-.splash-rib { stroke-dasharray: 600; animation: splashRib 1.05s ease-in-out both; }
-.splash-rib-2 { animation-delay: 0.15s; }
-.splash-ring { transform-box: fill-box; transform-origin: center; animation: splashRing 0.85s ease-out 0.9s both; }
-.splash-dot { transform-box: fill-box; transform-origin: center; animation: splashDot 0.55s ease-out 0.85s both; }
+@keyframes vxglow { to { opacity: 1; transform: scale(1); } }
+@keyframes vxdraw { to { stroke-dashoffset: 0; } }
+@keyframes vxpop { to { transform: scale(1); } }
+@keyframes vxrise { to { opacity: 1; transform: none; } }
+@keyframes splashOut { to { opacity: 0; visibility: hidden; } }
 
 /* ---- Action row: the orphaned Save / Share / Trailer buttons now sit in a flex row with a real gap
    (was bare adjacent buttons with no spacing). ---- */
@@ -1021,23 +1044,7 @@ input:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .splash-vortex,
-  .splash-glow,
-  .splash-rib,
-  .splash-ring,
-  .splash-dot,
-  .splash-tagline {
-    animation: none;
-  }
-  .splash-vortex {
-    filter: none;
-    opacity: 1;
-    transform: none;
-  }
-  .splash-rib {
-    stroke-dashoffset: 0;
-  }
-  .splash-ring {
+  .splash {
     display: none;
   }
   .chip:active,
