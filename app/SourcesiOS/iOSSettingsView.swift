@@ -275,6 +275,7 @@ struct iOSSettingsView: View {
             }
             Toggle("Auto-skip intro & credits", isOn: $autoSkip)
                 .tint(Theme.Palette.accent)
+            NavigationLink("Seek bar style") { SeekBarStylePicker() }
             Toggle("Autoplay trailers", isOn: $autoplayTrailers)
                 .tint(Theme.Palette.accent)
             #if os(iOS)

@@ -633,8 +633,12 @@ struct TVPlayerView: View {
             let barH: CGFloat = focused ? 10 : 6
             let knob: CGFloat = focused ? 28 : 18
             ZStack(alignment: .leading) {
-                Capsule().fill(Theme.Palette.textPrimary.opacity(0.22)).frame(height: barH)
-                Capsule().fill(Theme.Palette.accent).frame(width: max(0, w * frac), height: barH)
+                // Track + played fill in the viewer's chosen seek-bar style (classic/wave/heartbeat/…).
+                // Only the visual swaps; the knob, chapter ticks, and scrub logic below are unchanged.
+                SeekBarTrack(style: SeekBarStyle.current, progress: frac,
+                             accent: Theme.Palette.accent,
+                             track: Theme.Palette.textPrimary.opacity(0.22))
+                    .frame(width: w, height: focused ? 24 : 16)
                 // Chapter boundary ticks along the bar (decorative; the knob still reads over them).
                 ForEach(chapterFractions, id: \.self) { f in
                     Capsule().fill(.white.opacity(0.5)).frame(width: 2, height: barH).offset(x: w * f)

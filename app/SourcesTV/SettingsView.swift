@@ -202,6 +202,10 @@ struct SettingsView: View {
             choiceRow("Play in", externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            NavigationLink { SeekBarStylePicker() } label: {
+                Label("Seek bar style", systemImage: "slider.horizontal.below.rectangle")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
         }
     }
 
