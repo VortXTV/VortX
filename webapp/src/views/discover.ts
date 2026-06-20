@@ -1,8 +1,8 @@
 import type { Addon, MetaItem } from "../lib/types";
 import { catalogRefs, fetchCatalog, type CatalogRef } from "../lib/addon";
-import { escapeHtml } from "../lib/dom";
+import { escapeHtml, httpUrl } from "../lib/dom";
 import { hashFor } from "../lib/router";
-import { posterCard } from "./board";
+import { mountFeatured, posterCard } from "./board";
 
 // Discover: a single dense poster grid for one content type, merged across every catalog of that type.
 // Where the Board is editorial (rails), Discover is a library-style grid for browsing one type deeply.
@@ -34,6 +34,7 @@ export function renderDiscoverShell(host: HTMLElement, addons: Addon[], type: st
     .join("");
   host.innerHTML = `
     <div class="discover">
+      <section class="featured" id="featured" aria-label="Featured" hidden></section>
       <div class="discover-head">
         <h1 class="page-title">Discover</h1>
         <div class="type-switch" role="tablist" aria-label="Content type">${tabs}</div>
@@ -122,8 +123,10 @@ export async function loadDiscover(addons: Addon[], type: string): Promise<void>
     if (wrap) wrap.innerHTML = "";
     return;
   }
-  grid.innerHTML = fresh.map(posterCard).join("");
+  grid.innerHTML = fresh.map((m) => posterCard(m)).join("");
   if (wrap) wrap.innerHTML = moreButton(p);
+  // Featured hero from the top art-bearing results (the same ambient billboard Home uses).
+  mountFeatured(fresh.filter((m) => Boolean(httpUrl(m.background) || httpUrl(m.poster))).slice(0, 5));
 }
 
 /** Append the next page across the active type's catalogs (the Load more click handler). */

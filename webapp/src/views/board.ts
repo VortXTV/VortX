@@ -133,8 +133,9 @@ function featuredMeta(item: MetaItem): string {
   return `<div class="featured-meta">${star}${factSpan}</div>`;
 }
 
-/** Paint the featured hero from a pool of top items and start the ambient rotation. */
-function mountFeatured(pool: MetaItem[]): void {
+/** Paint the featured hero from a pool of top items and start the ambient rotation. Shared by Home +
+ *  Discover (both render a `#featured` slot; only one is in the DOM at a time). */
+export function mountFeatured(pool: MetaItem[]): void {
   const host = document.getElementById("featured");
   if (!host || !pool.length) return;
   heroPool = pool;
