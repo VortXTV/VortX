@@ -1,5 +1,5 @@
-import type { Addon } from "../lib/types";
-import { search } from "../lib/addon";
+import type { Addon, MetaItem } from "../lib/types";
+import { fetchSearchPage, searchableRefs, type CatalogRef } from "../lib/addon";
 import { discoverTypes } from "./discover";
 import { escapeHtml } from "../lib/dom";
 import { posterCard } from "./board";
@@ -21,20 +21,104 @@ export function renderSearchShell(host: HTMLElement, query: string): void {
         <button class="chip" type="submit">Search</button>
       </form>
       <div class="grid" id="search-grid" role="list">${query ? "" : recentChips()}</div>
+      <div class="search-more-wrap" id="search-more-wrap"></div>
     </div>`;
 }
 
-/** Run the search and paint results (or an empty message). */
+// Paging across the searchable catalogs for the active query, mirroring views/discover: each catalog
+// advances its own skip (so there are no gaps regardless of page size), a catalog is exhausted on an
+// empty page OR when it returns the same first item as its previous page (a search add-on that ignores
+// `skip` would otherwise loop), `seen` de-dupes across pages + catalogs, and a new query (or any new
+// loadSearch) bumps the token + replaces the object so a stale in-flight page is discarded.
+let searchReqToken = 0;
+interface SearchRefPage {
+  ref: CatalogRef;
+  skip: number;
+  done: boolean;
+  lastFirstId?: string;
+}
+interface SearchPaging {
+  token: number;
+  query: string;
+  refs: SearchRefPage[];
+  seen: Set<string>;
+  loading: boolean;
+}
+let paging: SearchPaging | null = null;
+
+/** Fetch the next page from every not-yet-exhausted searchable catalog; return only the fresh metas. */
+async function fetchPage(p: SearchPaging): Promise<MetaItem[]> {
+  const active = p.refs.filter((r) => !r.done);
+  const results = await Promise.all(
+    active.map(async (r) => ({ r, metas: await fetchSearchPage(r.ref, p.query, r.skip) })),
+  );
+  if (p !== paging || p.token !== searchReqToken) return []; // superseded by a newer query
+  const fresh: MetaItem[] = [];
+  for (const { r, metas } of results) {
+    const firstId = metas[0]?.id;
+    if (!metas.length || (firstId !== undefined && firstId === r.lastFirstId)) {
+      r.done = true;
+      continue;
+    }
+    r.lastFirstId = firstId;
+    r.skip += metas.length;
+    for (const m of metas) {
+      if (p.seen.has(m.id)) continue;
+      p.seen.add(m.id);
+      fresh.push(m);
+    }
+  }
+  return fresh;
+}
+
+/** A "Load more" button while any searchable catalog still has pages; empty once all are exhausted. */
+function moreButton(p: SearchPaging): string {
+  return p.refs.some((r) => !r.done)
+    ? `<button class="chip search-more" data-action="search-more">Load more</button>`
+    : "";
+}
+
+/** Run the search and paint the first page of merged results (or an empty message), with Load more. */
 export async function loadSearch(addons: Addon[], query: string): Promise<void> {
+  const token = ++searchReqToken;
   const grid = document.getElementById("search-grid");
+  const wrap = document.getElementById("search-more-wrap");
   if (!grid || !query) return;
   addRecentSearch(query);
   grid.innerHTML = `<p class="muted">Searching for “${escapeHtml(query)}”…</p>`;
   const types = discoverTypes(addons);
-  const results = await search(addons, query, types.length ? types : ["movie", "series"]);
-  grid.innerHTML = results.length
-    ? results.map(posterCard).join("")
-    : `<p class="muted">No results for “${escapeHtml(query)}”.</p>`;
+  const refs = searchableRefs(addons, types.length ? types : ["movie", "series"]);
+  const p: SearchPaging = {
+    token,
+    query,
+    refs: refs.map((ref) => ({ ref, skip: 0, done: false })),
+    seen: new Set<string>(),
+    loading: false,
+  };
+  paging = p;
+  const fresh = await fetchPage(p);
+  if (p !== paging || token !== searchReqToken) return; // a newer query superseded this search
+  if (!fresh.length) {
+    grid.innerHTML = `<p class="muted">No results for “${escapeHtml(query)}”.</p>`;
+    if (wrap) wrap.innerHTML = "";
+    return;
+  }
+  grid.innerHTML = fresh.map(posterCard).join("");
+  if (wrap) wrap.innerHTML = moreButton(p);
+}
+
+/** Append the next page across the active query's catalogs (the Load more click handler). */
+export async function loadMoreSearch(): Promise<void> {
+  const p = paging;
+  if (!p || p.loading || p.token !== searchReqToken) return;
+  p.loading = true;
+  const fresh = await fetchPage(p);
+  p.loading = false;
+  if (p !== paging || p.token !== searchReqToken) return; // a new query superseded this page
+  const grid = document.getElementById("search-grid");
+  if (grid && fresh.length) grid.insertAdjacentHTML("beforeend", fresh.map(posterCard).join(""));
+  const wrap = document.getElementById("search-more-wrap");
+  if (wrap) wrap.innerHTML = moreButton(p);
 }
 
 function prompt(): string {

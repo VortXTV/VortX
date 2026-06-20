@@ -8,7 +8,7 @@ import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { loadBoard, renderBoardShell } from "./views/board";
 import { discoverTypes, loadDiscover, loadMoreDiscover, renderDiscoverShell } from "./views/discover";
-import { loadSearch, renderSearchShell } from "./views/search";
+import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
@@ -184,6 +184,12 @@ function wireGlobalClicks(): void {
       // The Discover "Load more" control: append the next page across the active type's catalogs.
       ev.preventDefault();
       void loadMoreDiscover();
+      return;
+    }
+    if (hit?.action === "search-more") {
+      // The Search "Load more" control: append the next page across the active query's catalogs.
+      ev.preventDefault();
+      void loadMoreSearch();
       return;
     }
     if (hit?.action === "nav-home") {

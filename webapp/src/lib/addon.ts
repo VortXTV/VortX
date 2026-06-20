@@ -172,29 +172,25 @@ function searchableCatalog(addons: Addon[], type: string): CatalogRef | undefine
   return undefined;
 }
 
-/** Search across the installed add-ons for `query`, merged and de-duped by id. */
-export async function search(addons: Addon[], query: string, types: string[]): Promise<MetaItem[]> {
-  const refs = types
+/** The searchable catalog refs (one per type that exposes a search-capable catalog), for paged search.
+ *  The view layer merges + de-dupes across these and pages each one independently (see views/search). */
+export function searchableRefs(addons: Addon[], types: string[]): CatalogRef[] {
+  return types
     .map((type) => searchableCatalog(addons, type))
     .filter((r): r is CatalogRef => r !== undefined);
-  const pages = await Promise.all(
-    refs.map(async (ref) => {
-      try {
-        const data = await fetchJson<CatalogResponse>(catalogUrl(ref, { search: query }));
-        return validMetas(data.metas);
-      } catch {
-        return [];
-      }
-    }),
-  );
-  const seen = new Set<string>();
-  const merged: MetaItem[] = [];
-  for (const meta of pages.flat()) {
-    if (seen.has(meta.id)) continue;
-    seen.add(meta.id);
-    merged.push(meta);
+}
+
+/** Fetch one searchable catalog's page of results for `query`, with an optional `skip` for paging.
+ *  Validated + empty on failure, so one bad add-on never breaks the merged results grid. */
+export async function fetchSearchPage(ref: CatalogRef, query: string, skip = 0): Promise<MetaItem[]> {
+  const extra: Record<string, string | number> = { search: query };
+  if (skip > 0) extra.skip = skip;
+  try {
+    const data = await fetchJson<CatalogResponse>(catalogUrl(ref, extra));
+    return validMetas(data.metas);
+  } catch {
+    return [];
   }
-  return merged;
 }
 
 // ---- Meta --------------------------------------------------------------------------------------
