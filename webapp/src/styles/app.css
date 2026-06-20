@@ -1743,8 +1743,24 @@ input:focus-visible {
 /* Subtitle style: the player's native <track> cues read the live settings vars (lib/settings). */
 video::cue {
   font-size: calc(var(--sub-scale, 1) * 100%);
-  background-color: var(--sub-bg, rgba(0, 0, 0, 0.75));
-  color: #fff;
+  background-color: var(--sub-bg, transparent);
+  color: var(--sub-color, #fff);
+  font-family: var(--sub-font, system-ui, sans-serif);
+  text-shadow: var(--sub-shadow, none);
+}
+/* Source-type priority controls (Streams settings): a paired up/down move control. */
+.reorder-ctl {
+  display: inline-flex;
+  gap: var(--space-xs, 0.4rem);
+}
+/* Performance: 'Reduced' near-zeros animation + transition durations across the whole app. */
+[data-perf="reduced"] *,
+[data-perf="reduced"] *::before,
+[data-perf="reduced"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
 }
 /* Backup & Restore action buttons sit in a wrapping row. */
 .settings-actions {

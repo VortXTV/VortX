@@ -1,6 +1,7 @@
 import type { Addon, MetaItem, Stream, Video } from "../lib/types";
 import { fetchMeta, fetchStreams, fetchSubtitles, type StreamGroup } from "../lib/addon";
 import {
+  applyStreamFilters,
   best,
   hasOnlyUnplayable,
   isTorrent,
@@ -106,6 +107,17 @@ function imdbId(meta: MetaItem): string | undefined {
   return meta.id.startsWith("tt") ? meta.id : undefined;
 }
 
+/** state.groups after the user's Streams filters (Hide/Require/Safety/HDR-only/Max-quality/size/...). */
+function filteredGroups(): StreamGroup[] {
+  return state ? applyStreamFilters(state.groups, getSettings()) : [];
+}
+
+/** The filtered groups, ranked - honoring the "Use add-on ranking order" setting. Every stream list,
+ *  the auto-pick, and the quality picker route through this so settings apply everywhere consistently. */
+function rankedFiltered(): RankedGroup[] {
+  return rankedGroups(filteredGroups(), getSettings().useAddonOrder);
+}
+
 /** Fetch streams for a movie or episode id, repainting when each add-on group resolves. */
 async function loadStreams(type: string, id: string): Promise<void> {
   if (!state) return;
@@ -199,7 +211,7 @@ function render(): void {
 
 function renderMovie(host: HTMLElement, meta: MetaItem): void {
   if (!state) return;
-  const groups = rankedGroups(state.groups);
+  const groups = rankedFiltered();
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
   const trailer = trailerYouTubeID(meta);
@@ -229,7 +241,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
 
   if (open) {
     const bg = httpUrl(open.thumbnail) || httpUrl(meta.background) || httpUrl(meta.poster);
-    const groups = rankedGroups(state.groups);
+    const groups = rankedFiltered();
     const overview = open.overview || open.description;
     host.innerHTML = detailShell(
       bg,
@@ -353,7 +365,7 @@ function streamStatusNote(groups: RankedGroup[]): string {
   if (!state) return "";
   const top = best(groups);
   if (!top && !state.streamsLoading) {
-    const onlyTorrents = hasOnlyUnplayable(state.groups);
+    const onlyTorrents = hasOnlyUnplayable(filteredGroups());
     const explain = onlyTorrents
       ? `The only sources found are torrents, which the web app can't play on its own (no streaming
          server). Use a debrid service (RealDebrid, AllDebrid, Premiumize, TorBox) with a stream add-on
@@ -679,7 +691,7 @@ async function playStream(stream: Stream): Promise<void> {
 async function playBest(): Promise<boolean> {
   if (!state) return true;
   // Honor the user's preferred-quality cap (Settings): the best stream at or under it, else the absolute best.
-  const top = pickPreferred(rankedGroups(state.groups), getSettings().preferredQuality);
+  const top = pickPreferred(rankedFiltered(), getSettings().preferredQuality);
   if (top) await playStream(top);
   return true;
 }
@@ -689,7 +701,7 @@ async function playVariant(node: HTMLElement): Promise<boolean> {
   const tier = node.dataset.tier;
   const index = Number(node.dataset.index);
   if (!tier || Number.isNaN(index)) return true;
-  const variants = variantOptions(rankedGroups(state.groups), tier);
+  const variants = variantOptions(rankedFiltered(), tier);
   const stream = variants[index]?.stream;
   if (stream) await playStream(stream);
   return true;
@@ -700,7 +712,7 @@ async function playStreamRow(node: HTMLElement): Promise<boolean> {
   const base = node.dataset.base;
   const index = Number(node.dataset.index);
   if (Number.isNaN(index)) return true;
-  const groups = rankedGroups(state.groups);
+  const groups = rankedFiltered();
   const group = groups.find((g) => g.base === base);
   const stream = group?.streams[index];
   if (stream) await playStream(stream);

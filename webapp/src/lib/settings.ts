@@ -7,6 +7,12 @@
 
 export type Background = "warm" | "oled";
 export type SubtitlesMode = "off" | "on" | "forced";
+export type SafetyFilter = "off" | "moderate" | "strict";
+export type Performance = "auto" | "full" | "reduced";
+export type SubtitleFont = "modern" | "classic" | "mono";
+export type SubtitleColor = "white" | "yellow" | "cyan" | "mint";
+export type SubtitleEdge = "outline" | "shadow" | "box" | "none";
+export type SourceType = "debrid" | "usenet" | "torrent" | "direct";
 
 export interface Settings {
   accentID: string;
@@ -18,8 +24,35 @@ export interface Settings {
   autoplayTrailers: boolean;
   mdblistKey: string; // optional MDBList API key for IMDb/RT/TMDB ratings on the detail page
   subtitleScale: number; // 0.7 - 1.8, scales the player's subtitle text (video::cue)
-  subtitleBackground: boolean; // a translucent backing behind subtitle text (vs text-only)
+  subtitleBackground: boolean; // legacy translucent-backing flag; superseded by subtitleEdge (kept for migration)
   preferredQuality: number; // auto-pick resolution cap in p (2160/1080/720/480); 0 = Auto (absolute best)
+
+  // ---- Parity with the Apple Settings (the owner's "same settings on every platform" rule) ----
+  // Account / Metadata
+  tmdbKey: string; // optional TMDB v4 key for richer metadata (twin of the app's Metadata row)
+  // Playback
+  directLinksOnly: boolean; // hide torrent/magnet sources; only direct + debrid links play
+  skipStep: number; // player skip granularity in seconds (10 | 15 | 30)
+  // Notifications
+  episodeAlerts: boolean; // browser notification when a new episode of an opened series is about to air
+  // Streams (filter + ranking, the web twin of iOSSettingsView's Streams group)
+  useAddonOrder: boolean; // keep the add-on's own order instead of VortX's ranking
+  sourceOrder: SourceType[]; // source-type priority, highest first
+  safetyFilter: SafetyFilter; // hide CAM / fake-quality sources
+  hideWords: string; // comma-separated words; a source whose label contains any is hidden
+  requireWords: string; // comma-separated words; a source must contain all to be shown
+  instantOnly: boolean; // only cached / instantly-playable sources
+  hideDeadTorrents: boolean; // hide torrent sources with no seeders (limited effect on web)
+  hdrOnly: boolean; // only HDR / Dolby Vision sources
+  hideAV1: boolean; // hide AV1-encoded sources
+  maxQuality: number; // resolution cap in p that FILTERS the source list (0 = unlimited)
+  maxFileSizeGB: number; // file-size cap in GB that filters the list (0 = unlimited)
+  // Appearance
+  performance: Performance; // 'reduced' trims animations app-wide (a11y / low-power)
+  // Subtitle Style
+  subtitleFont: SubtitleFont;
+  subtitleColor: SubtitleColor;
+  subtitleEdge: SubtitleEdge; // outline / drop-shadow / box / none (the app's "Background" subtitle row)
 }
 
 /** The accent palette, ported 1:1 from ThemeManager.accents (the app's source of truth). base/bright are
@@ -47,6 +80,21 @@ export const ACCENTS: Accent[] = [
 /** OLED background overrides (ThemeManager oled branch): true black canvas + neutral surfaces. */
 const OLED = { bg: "#000000", surface1: "#0e0e0f", surface2: "#181819", surface3: "#242426", hairline: "#323234" };
 
+/** Subtitle color presets (the app's Subtitle Style "Color" row). */
+export const SUB_COLORS: Record<SubtitleColor, string> = {
+  white: "#ffffff",
+  yellow: "#f5d061",
+  cyan: "#7fdbff",
+  mint: "#8ce0b0",
+};
+
+/** Subtitle font presets - the app's "Modern / Classic / Mono" choices map to web font stacks. */
+export const SUB_FONTS: Record<SubtitleFont, string> = {
+  modern: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+  classic: "'Times New Roman', Georgia, serif",
+  mono: "'SF Mono', 'Roboto Mono', ui-monospace, monospace",
+};
+
 export const TEXT_MIN = 0.8;
 export const TEXT_MAX = 1.4;
 export const TEXT_STEP = 0.05;
@@ -65,6 +113,25 @@ const DEFAULTS: Settings = {
   subtitleScale: 1,
   subtitleBackground: true,
   preferredQuality: 0,
+  tmdbKey: "",
+  directLinksOnly: false,
+  skipStep: 10,
+  episodeAlerts: false,
+  useAddonOrder: false,
+  sourceOrder: ["debrid", "usenet", "torrent", "direct"],
+  safetyFilter: "off",
+  hideWords: "",
+  requireWords: "",
+  instantOnly: false,
+  hideDeadTorrents: false,
+  hdrOnly: false,
+  hideAV1: false,
+  maxQuality: 0,
+  maxFileSizeGB: 0,
+  performance: "auto",
+  subtitleFont: "modern",
+  subtitleColor: "white",
+  subtitleEdge: "outline",
 };
 
 export const SUB_MIN = 0.7;
@@ -135,9 +202,40 @@ export function applySettings(s: Settings = getSettings()): void {
   if (Math.abs(s.textScale - 1) < 0.001) root.style.removeProperty("font-size");
   else root.style.setProperty("font-size", `${Math.round(16 * s.textScale)}px`);
 
+  // Performance: 'reduced' trims animations app-wide (the app's Performance row; also an a11y win). CSS
+  // keys off [data-perf="reduced"] to near-zero all transition/animation durations.
+  root.dataset.perf = s.performance === "reduced" ? "reduced" : "full";
+
   // Subtitle style: the player's native <track> cues read these via `video::cue` (see app.css).
   root.style.setProperty("--sub-scale", String(s.subtitleScale));
-  root.style.setProperty("--sub-bg", s.subtitleBackground ? "rgba(0, 0, 0, 0.75)" : "transparent");
+  root.style.setProperty("--sub-color", SUB_COLORS[s.subtitleColor] ?? SUB_COLORS.white);
+  root.style.setProperty("--sub-font", SUB_FONTS[s.subtitleFont] ?? SUB_FONTS.modern);
+  applySubtitleEdge(root, s.subtitleEdge);
+}
+
+/** Map the subtitle "Background" choice to the cue backing + text edge (`video::cue` reads both vars). */
+function applySubtitleEdge(root: HTMLElement, edge: SubtitleEdge): void {
+  const outline =
+    "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 4px rgba(0,0,0,0.9)";
+  switch (edge) {
+    case "box":
+      root.style.setProperty("--sub-bg", "rgba(0, 0, 0, 0.75)");
+      root.style.setProperty("--sub-shadow", "none");
+      break;
+    case "shadow":
+      root.style.setProperty("--sub-bg", "transparent");
+      root.style.setProperty("--sub-shadow", "2px 2px 4px rgba(0,0,0,0.95)");
+      break;
+    case "none":
+      root.style.setProperty("--sub-bg", "transparent");
+      root.style.setProperty("--sub-shadow", "none");
+      break;
+    case "outline":
+    default:
+      root.style.setProperty("--sub-bg", "transparent");
+      root.style.setProperty("--sub-shadow", outline);
+      break;
+  }
 }
 
 /** "#rrggbb" + alpha -> "rgba(r,g,b,a)" for the soft/glow tints. */

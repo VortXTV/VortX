@@ -2,6 +2,7 @@ import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
 import { el, escapeHtml } from "./dom";
 import { cwPosition, recordProgress } from "./store";
+import { getSettings } from "./settings";
 import type { SubtitleTrack } from "./addon";
 
 /** The slim title context the player needs to record Continue Watching progress. */
@@ -157,7 +158,8 @@ function wireProgress(video: HTMLVideoElement, item: CWItem): void {
 }
 
 /** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
- *  when the element is focused): Space play/pause, Left/Right seek 10s, Up/Down volume, M mute, F fullscreen.
+ *  when the element is focused): Space play/pause, Left/Right seek by the Skip-step setting, Up/Down volume,
+ *  [ / ] playback speed, M mute, F fullscreen.
  *  Removed on close so keys don't leak to the surfaces underneath. */
 function wireKeyboard(video: HTMLVideoElement): void {
   if (keyHandler) document.removeEventListener("keydown", keyHandler);
@@ -169,10 +171,10 @@ function wireKeyboard(video: HTMLVideoElement): void {
         else video.pause();
         break;
       case "ArrowLeft":
-        video.currentTime = Math.max(0, video.currentTime - 10);
+        video.currentTime = Math.max(0, video.currentTime - getSettings().skipStep);
         break;
       case "ArrowRight":
-        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + getSettings().skipStep);
         break;
       case "ArrowUp":
         video.volume = Math.min(1, video.volume + 0.1);

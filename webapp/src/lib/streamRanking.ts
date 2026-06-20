@@ -1,5 +1,6 @@
 import type { Stream } from "./types";
 import type { StreamGroup } from "./addon";
+import type { Settings } from "./settings";
 
 // Ranks loaded streams so the strongest source surfaces first and "Watch" can auto-pick one, and
 // groups them per add-on for the source filter + quality picker. A focused port of the Apple app's
@@ -144,13 +145,15 @@ export function score(s: Stream): number {
   return value;
 }
 
-/** Group the add-on stream responses into playable, per-add-on, best-first ranked groups. */
-export function rankedGroups(groups: StreamGroup[]): RankedGroup[] {
+/** Group the add-on stream responses into playable, per-add-on, best-first ranked groups. When
+ *  `keepAddonOrder` is set (the "Use add-on ranking order" setting), the add-on's own order is preserved
+ *  instead of VortX's quality ranking. */
+export function rankedGroups(groups: StreamGroup[], keepAddonOrder = false): RankedGroup[] {
   const ranked: RankedGroup[] = [];
   for (const group of groups) {
     const playable = group.streams.filter(isPlayable);
     if (!playable.length) continue;
-    const scored = playable.map((stream, index) => ({ stream, index, s: score(stream) }));
+    const scored = playable.map((stream, index) => ({ stream, index, s: keepAddonOrder ? 0 : score(stream) }));
     scored.sort((a, b) => (a.s !== b.s ? b.s - a.s : a.index - b.index));
     ranked.push({
       base: group.transportUrl,
@@ -280,4 +283,63 @@ export function sourceTagList(s: Stream): string[] {
 
 export function sourceTags(s: Stream): string {
   return sourceTagList(s).join(" · ");
+}
+
+// ---- Source filtering (the Streams settings group) ----------------------------------------------
+
+/** CAM / telesync / screener markers - hidden by the Safety filter (moderate+). */
+const CAM_RE = /(?<![a-z0-9])(?:cam|cam[ .\-_]?rip|hdcam|ts|telesync|tele[ .\-_]?cine|tc|hdts|scr|screener|workprint|wp)(?![a-z0-9])/;
+/** Outright fake / spam markers - hidden by the Safety filter at the strict level. */
+const FAKE_RE = /(?<![a-z0-9])(?:fake|spam|virus|password)(?![a-z0-9])/;
+
+function isAV1(t: string): boolean {
+  return /(?<![a-z0-9])av1(?![a-z0-9])/.test(t);
+}
+
+function isHDRish(t: string): boolean {
+  return t.includes("hdr") || t.includes("dolby vision") || t.includes("dolbyvision") || t.includes("dovi");
+}
+
+/** A torrent source advertising zero seeders (so it would never start). Torrents are unplayable on web
+ *  regardless, but this still prunes them from the surfaced (greyed) list when the user asks. */
+function isDeadTorrent(s: Stream, t: string): boolean {
+  if (!isTorrent(s)) return false;
+  return /(?<![a-z0-9])0\s*(?:seed|seeds|seeders|peers)(?![a-z0-9])/.test(t) || /👤\s*0(?![0-9])/.test(t);
+}
+
+function csvWords(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((w) => w.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/** Apply the user's Streams settings (filters) to the raw add-on responses, before ranking/grouping.
+ *  Returns groups with the same shape but pruned `streams`. Filters that only make sense for torrents
+ *  (dead-torrent, direct-links-only) still run so the surfaced/greyed torrent list honours them too. */
+export function applyStreamFilters(groups: StreamGroup[], s: Settings): StreamGroup[] {
+  const hide = csvWords(s.hideWords);
+  const need = csvWords(s.requireWords);
+  const filterOne = (stream: Stream): boolean => {
+    const t = qualityText(stream);
+    if (s.directLinksOnly && isTorrent(stream)) return false;
+    if (s.instantOnly && !isCached(stream, t)) return false;
+    if (s.hideDeadTorrents && isDeadTorrent(stream, t)) return false;
+    if (s.hdrOnly && !isHDRish(t)) return false;
+    if (s.hideAV1 && isAV1(t)) return false;
+    if (s.safetyFilter !== "off" && CAM_RE.test(t)) return false;
+    if (s.safetyFilter === "strict" && FAKE_RE.test(t)) return false;
+    if (s.maxQuality) {
+      const r = resolutionOf(stream);
+      if (r !== null && r > s.maxQuality) return false;
+    }
+    if (s.maxFileSizeGB) {
+      const gb = sizeGB(t);
+      if (gb > 0 && gb > s.maxFileSizeGB) return false;
+    }
+    if (hide.length && hide.some((w) => t.includes(w))) return false;
+    if (need.length && !need.every((w) => t.includes(w))) return false;
+    return true;
+  };
+  return groups.map((g) => ({ ...g, streams: g.streams.filter(filterOne) }));
 }
