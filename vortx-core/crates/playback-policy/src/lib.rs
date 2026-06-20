@@ -19,9 +19,11 @@
 
 mod abr;
 mod kind;
+mod piece;
 mod plan;
 
 pub use abr::{choose_variant, AbrConfig, AbrDecision, AbrReason, AbrState, AbrVariant};
+pub use piece::{piece_plan, PiecePriority, PiecePriorityConfig, PieceRequest};
 pub use kind::{AbrLadderChoice, DeviceClass, HwDecode, PlayerEngine, StreamKind};
 pub use plan::{
     plan, ConnectionHints, PlaybackPlan, BUFFER_CACHED_MIN, BUFFER_HLS_START, BUFFER_HTTP_UNCACHED,
