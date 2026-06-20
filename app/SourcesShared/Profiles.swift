@@ -911,3 +911,92 @@ final class ProfileStore: ObservableObject {
         return formatter.string(from: Date())
     }
 }
+
+// MARK: - Library import / export (portable file, per-profile-invariant-safe)
+
+extension ProfileStore {
+    /// The active profile's saved library + watch history as portable items. Honours the per-profile
+    /// invariant on the READ side too: the owner profile's library lives in the engine/account, so it
+    /// reads `CoreBridge.library` (folding in Continue Watching progress by id); every other profile
+    /// reads its own private `watch` overlay at full fidelity. Pure read - mutates nothing.
+    func exportActiveLibraryItems() -> [LibraryPortability.Item] {
+        if activeUsesEngineHistory {
+            // Owner: the account library is the source of truth. Merge CW progress in by id so a
+            // half-watched title exports with its offset, not just "saved".
+            let progress = Dictionary(
+                CoreBridge.shared.continueWatching.map { ($0.id, $0.state) },
+                uniquingKeysWith: { first, _ in first })
+            let now = Self.isoNow()
+            return (CoreBridge.shared.library?.catalog ?? [])
+                .filter { $0.removed != true && $0.temp != true }
+                .map { item in
+                    let state = progress[item.id] ?? item.state
+                    return LibraryPortability.Item(
+                        metaId: item.id, type: item.type, name: item.name, poster: item.poster,
+                        videoId: state.videoId, timeOffsetMs: Int(state.timeOffset),
+                        durationMs: Int(state.duration), lastWatched: now, watchedVideoIds: [])
+                }
+        }
+        // Overlay: the private watch overlay already carries everything (progress + watched episodes).
+        return watch.map { metaId, entry in
+            LibraryPortability.Item(
+                metaId: metaId, type: entry.type, name: entry.name, poster: entry.poster,
+                videoId: entry.videoId, timeOffsetMs: entry.timeOffsetMs, durationMs: entry.durationMs,
+                lastWatched: entry.lastWatched, watchedVideoIds: entry.watchedVideoIds)
+        }
+    }
+
+    /// Merge imported items into the ACTIVE profile, honouring the per-profile invariant on the WRITE
+    /// side: the owner adds each real catalog title to the account library through the engine (which
+    /// re-resolves the canonical meta - never a synthetic shape that would poison official-client
+    /// sync); every other profile merges into its private overlay, last-writer-wins by `lastWatched`
+    /// so an import can never roll back newer local progress, and unioning watched episodes so neither
+    /// side loses ticks. Returns the number of items applied.
+    @discardableResult
+    @MainActor
+    func importLibraryItems(_ items: [LibraryPortability.Item]) async -> (applied: Int, skipped: Int) {
+        guard !items.isEmpty else { return (0, 0) }
+
+        if activeUsesEngineHistory {
+            // Only real catalog ids are engine-safe; a synthetic / add-on-specific id (kitsu:, etc.)
+            // would be rejected or poison official-client sync, so it is skipped and reported, never
+            // silently dropped.
+            let accepted = items.filter { $0.metaId.hasPrefix("tt") || $0.metaId.hasPrefix("tmdb") }
+            for item in accepted {
+                await CoreBridge.shared.addCatalogItemToAccount(id: item.metaId, type: item.type)
+            }
+            if !accepted.isEmpty { CoreBridge.shared.loadLibrary() }
+            return (accepted.count, items.count - accepted.count)
+        }
+
+        for item in items {
+            let incoming = WatchEntry(
+                videoId: item.videoId, timeOffsetMs: item.timeOffsetMs, durationMs: item.durationMs,
+                lastWatched: item.lastWatched, name: item.name, type: item.type, poster: item.poster,
+                watchedVideoIds: item.watchedVideoIds)
+            watch[item.metaId] = watch[item.metaId].map { Self.mergedWatch(existing: $0, incoming: incoming) } ?? incoming
+        }
+        saveWatchCache()
+        schedulePushWatch()
+        return (items.count, 0)
+    }
+
+    /// Loss-free merge of two overlay entries for the same title. Unions watched episodes from both
+    /// sides, and for the in-progress episode keeps whichever resume point is further along, so an
+    /// import can never roll back local progress or drop a watched tick (and vice versa) regardless of
+    /// the timestamps involved. Non-progress fields follow the more recently watched side.
+    private static func mergedWatch(existing: WatchEntry, incoming: WatchEntry) -> WatchEntry {
+        let incomingNewer = incoming.lastWatched >= existing.lastWatched
+        var merged = incomingNewer ? incoming : existing
+        let other = incomingNewer ? existing : incoming
+        for vid in other.watchedVideoIds where !merged.watchedVideoIds.contains(vid) {
+            merged.watchedVideoIds.append(vid)
+        }
+        // Same in-progress episode (or both movies, videoId == nil): never reduce the resume point.
+        if existing.videoId == incoming.videoId {
+            merged.timeOffsetMs = max(existing.timeOffsetMs, incoming.timeOffsetMs)
+            merged.durationMs = max(existing.durationMs, incoming.durationMs)
+        }
+        return merged
+    }
+}

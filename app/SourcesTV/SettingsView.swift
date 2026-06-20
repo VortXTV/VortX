@@ -557,6 +557,10 @@ struct SettingsView: View {
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
                 .padding(.top, Theme.Space.xs)
+            Text("Export Library, which saves a profile's titles and watch progress to a file, lives on iPhone, iPad, and Mac (Apple TV has no file picker). On Apple TV your library and history follow you through your VortX account.")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .padding(.top, Theme.Space.xs)
         }
     }
 
