@@ -9,6 +9,14 @@
 //!   - A debrid-cached stream gets a within-tier `+8000` bonus: it clears the within-tier spread but
 //!     cannot jump the `15000` tier step.
 //!   - Source class / HDR / audio are the within-tier spread; size is a small final tiebreaker.
+//!
+//! The score is FIXED-POINT, not floating: it is accumulated as an `i64` in milli-points (each human
+//! weight above times `SCALE` = 1000) plus an integer size term computed by integer division. There is no
+//! `f64` anywhere on the scoring path, so the score, and therefore the ordering, is byte-reproducible on
+//! every platform (iOS, Android, a Cloudflare Worker) and can be pinned by cross-language conformance
+//! vectors. The `reasons` strings keep the readable human magnitudes (e.g. `+100000`), not the scaled
+//! values. The only `f64` left is the user-facing `max_filesize_gb` FILTER, which is a pref comparison,
+//! not part of the deterministic score.
 
 use serde::{Deserialize, Serialize};
 use vortx_protocol::Stream;
@@ -45,7 +53,8 @@ impl Tier {
 pub struct RankedStream {
     /// Index of this stream in the input slice.
     pub raw_index: usize,
-    pub score: f64,
+    /// Fixed-point score in milli-points (human weight x 1000 + integer size term). Byte-reproducible.
+    pub score: i64,
     pub tier: Tier,
     pub reasons: Vec<String>,
     pub is_dolby_vision: bool,
@@ -54,49 +63,71 @@ pub struct RankedStream {
     pub parsed: ParsedData,
 }
 
-const PREF_RANK_WEIGHT: f64 = 100_000.0;
-const CACHED_BONUS: f64 = 8_000.0;
-const JUNK_PENALTY: f64 = -100_000.0;
+/// Milli-point scale: each human weight contributes `weight * SCALE` so the sub-point size tiebreaker
+/// (0..12 points) survives as an integer (0..12000 milli) without any float.
+const SCALE: i64 = 1_000;
+/// Max size tiebreaker in milli-points (12 points).
+const SIZE_MILLI_CAP: i64 = 12_000;
+/// 1 GiB in bytes; the size term is `bytes * 150 / GIB` (= `gb * 0.15 * 1000`), clamped.
+const GIB: i128 = 1_073_741_824;
 
-fn resolution_tier_score(r: Resolution) -> f64 {
+const PREF_RANK_WEIGHT: i64 = 100_000;
+const CACHED_BONUS: i64 = 8_000;
+const JUNK_PENALTY: i64 = -100_000;
+
+fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
-        Resolution::P2160 => 60_000.0,
-        Resolution::P1080 => 45_000.0,
-        Resolution::P720 => 30_000.0,
-        Resolution::P480 => 15_000.0,
-        Resolution::Unknown => 0.0,
+        Resolution::P2160 => 60_000,
+        Resolution::P1080 => 45_000,
+        Resolution::P720 => 30_000,
+        Resolution::P480 => 15_000,
+        Resolution::Unknown => 0,
     }
 }
 
-fn source_class_score(c: SourceClass) -> f64 {
+fn source_class_score(c: SourceClass) -> i64 {
     match c {
-        SourceClass::Remux => 230.0,
-        SourceClass::BluRay => 150.0,
-        SourceClass::WebDl => 90.0,
-        SourceClass::Web => 75.0,
-        SourceClass::Hdtv => 40.0,
-        SourceClass::Cam => 5.0,
-        SourceClass::Unknown => 0.0,
+        SourceClass::Remux => 230,
+        SourceClass::BluRay => 150,
+        SourceClass::WebDl => 90,
+        SourceClass::Web => 75,
+        SourceClass::Hdtv => 40,
+        SourceClass::Cam => 5,
+        SourceClass::Unknown => 0,
     }
 }
 
-fn hdr_score(h: Hdr) -> f64 {
+fn hdr_score(h: Hdr) -> i64 {
     match h {
-        Hdr::DolbyVision => 120.0,
-        Hdr::Hdr10Plus => 80.0,
-        Hdr::Hdr10 => 60.0,
-        Hdr::None => 0.0,
+        Hdr::DolbyVision => 120,
+        Hdr::Hdr10Plus => 80,
+        Hdr::Hdr10 => 60,
+        Hdr::None => 0,
     }
 }
 
-fn audio_score(a: Audio) -> f64 {
+fn audio_score(a: Audio) -> i64 {
     match a {
-        Audio::Atmos => 90.0,
-        Audio::TrueHd => 70.0,
-        Audio::DtsHdMa => 60.0,
-        Audio::DdPlus => 30.0,
-        Audio::None => 0.0,
+        Audio::Atmos => 90,
+        Audio::TrueHd => 70,
+        Audio::DtsHdMa => 60,
+        Audio::DdPlus => 30,
+        Audio::None => 0,
     }
+}
+
+/// The integer size tiebreaker in milli-points: `clamp(bytes * 150 / GiB, 0, 12000)`. A non-positive or
+/// malformed `video_size` yields 0, so it can never sink a stream below the junk floor.
+fn size_milli(bytes: i64) -> i64 {
+    if bytes <= 0 {
+        return 0;
+    }
+    ((bytes as i128 * 150) / GIB).min(SIZE_MILLI_CAP as i128) as i64
+}
+
+/// Raw `video_size` in bytes for the integer score term (distinct from `size_gb`, the f64 filter input).
+fn size_bytes(s: &Stream) -> Option<i64> {
+    s.behavior_hints.as_ref().and_then(|h| h.video_size)
 }
 
 fn label_of(s: &Stream) -> String {
@@ -162,7 +193,7 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
             &parsed,
             prefs,
             cached.get(i).copied().unwrap_or(false),
-            gb,
+            size_bytes(s),
             &mut reasons,
         );
         out.push(RankedStream {
@@ -177,12 +208,8 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
         });
     }
 
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.raw_index.cmp(&b.raw_index))
-    });
+    // Pure integer order: score descending, then original index for a stable tiebreak.
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
     out
 }
 
@@ -190,13 +217,15 @@ fn score_stream(
     p: &ParsedData,
     prefs: &RankingPrefs,
     cached: bool,
-    gb: Option<f64>,
+    bytes: Option<i64>,
     reasons: &mut Vec<String>,
-) -> f64 {
-    let mut s = 0.0;
+) -> i64 {
+    // Accumulated in milli-points: each human weight is added as `weight * SCALE`, the size term is
+    // already in milli. The reasons keep the readable human magnitudes.
+    let mut s: i64 = 0;
 
     if p.junk {
-        s += JUNK_PENALTY;
+        s += JUNK_PENALTY * SCALE;
         reasons.push("junk/fake (-100000)".to_string());
     }
 
@@ -206,45 +235,45 @@ fn score_stream(
             .iter()
             .position(|c| *c == p.source_class)
         {
-            let pref_rank = (prefs.source_type_order.len() - idx) as f64;
+            let pref_rank = (prefs.source_type_order.len() - idx) as i64;
             let bonus = pref_rank * PREF_RANK_WEIGHT;
-            s += bonus;
+            s += bonus * SCALE;
             reasons.push(format!("preferred source {:?} (+{bonus})", p.source_class));
         }
     }
 
     let tier = resolution_tier_score(p.resolution);
-    s += tier;
+    s += tier * SCALE;
     reasons.push(format!("{:?} (+{tier})", p.resolution));
 
     if cached && prefs.cached_first {
-        s += CACHED_BONUS;
+        s += CACHED_BONUS * SCALE;
         reasons.push("cached (+8000)".to_string());
     }
 
     let sc = source_class_score(p.source_class);
-    if sc != 0.0 {
-        s += sc;
+    if sc != 0 {
+        s += sc * SCALE;
         reasons.push(format!("{:?} (+{sc})", p.source_class));
     }
     let h = hdr_score(p.hdr);
-    if h != 0.0 {
-        s += h;
+    if h != 0 {
+        s += h * SCALE;
         reasons.push(format!("{:?} (+{h})", p.hdr));
     }
     let a = audio_score(p.audio);
-    if a != 0.0 {
-        s += a;
+    if a != 0 {
+        s += a * SCALE;
         reasons.push(format!("{:?} (+{a})", p.audio));
     }
     if p.repack {
-        s += 5.0;
+        s += 5 * SCALE;
         reasons.push("repack (+5)".to_string());
     }
-    if let Some(g) = gb {
-        // Clamp to a small NON-NEGATIVE tiebreaker. A malformed negative video_size (i64) must never
-        // drive the score below the junk floor, or an add-on could self-suppress its own streams.
-        s += (g * 0.15).clamp(0.0, 12.0);
+    if let Some(b) = bytes {
+        // A small NON-NEGATIVE integer tiebreaker. A malformed negative video_size (i64) yields 0, so it
+        // can never drive the score below the junk floor or let an add-on self-suppress its own streams.
+        s += size_milli(b);
     }
 
     s
@@ -356,6 +385,6 @@ mod tests {
         let junk = stream("2160p FAKE upscale");
         let ranked = rank(&[legit, junk], &prefs, &[false, false]);
         assert_eq!(ranked[0].raw_index, 0); // legit still beats junk
-        assert!(ranked[0].score > 0.0);
+        assert!(ranked[0].score > 0);
     }
 }
