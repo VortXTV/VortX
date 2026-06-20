@@ -18,6 +18,12 @@ pub enum ResourceKind {
     Artwork,
     MusicCatalog,
     MusicStream,
+    /// Serves theme/accent/palette packs (native only).
+    Theme,
+    /// Serves home/tab arrangements (native only).
+    Layout,
+    /// Serves wordmark/splash/icon overrides (native only).
+    Branding,
 }
 
 impl ResourceKind {
@@ -33,6 +39,9 @@ impl ResourceKind {
             ResourceKind::Artwork => "artwork",
             ResourceKind::MusicCatalog => "music_catalog",
             ResourceKind::MusicStream => "music_stream",
+            ResourceKind::Theme => "theme",
+            ResourceKind::Layout => "layout",
+            ResourceKind::Branding => "branding",
         }
     }
 }
