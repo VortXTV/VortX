@@ -255,6 +255,15 @@ input:focus-visible {
   gap: 0.4rem;
   flex-wrap: wrap;
 }
+/* The Discover "Load more" control sits centered below the grid; empty (no button) until paging starts. */
+.discover-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+.discover-more-wrap:empty {
+  margin-top: 0;
+}
 .search-form {
   display: flex;
   gap: 0.5rem;

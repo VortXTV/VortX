@@ -7,7 +7,7 @@ import { clearProgress, removeFromLibrary } from "./lib/store";
 import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { loadBoard, renderBoardShell } from "./views/board";
-import { discoverTypes, loadDiscover, renderDiscoverShell } from "./views/discover";
+import { discoverTypes, loadDiscover, loadMoreDiscover, renderDiscoverShell } from "./views/discover";
 import { loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
@@ -178,6 +178,12 @@ function wireGlobalClicks(): void {
         else removeFromLibrary(id);
         hit.node.closest(".card-wrap")?.remove();
       }
+      return;
+    }
+    if (hit?.action === "discover-more") {
+      // The Discover "Load more" control: append the next page across the active type's catalogs.
+      ev.preventDefault();
+      void loadMoreDiscover();
       return;
     }
     if (hit?.action === "nav-home") {
