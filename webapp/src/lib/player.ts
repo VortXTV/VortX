@@ -174,8 +174,10 @@ function wireKeyboard(video: HTMLVideoElement): void {
 
 /** Add subtitle <track>s to the video; the native controls then expose a CC menu to pick one. */
 async function addSubtitleTracks(video: HTMLVideoElement, subs: SubtitleTrack[]): Promise<void> {
-  for (const sub of subs) {
-    const url = await toVttUrl(sub);
+  // Convert all in parallel so one slow source does not hold up the rest (sequential awaits could take
+  // up to ~12s x N before the user's language appears). Promise.all preserves the original order.
+  const resolved = await Promise.all(subs.map(async (sub) => ({ sub, url: await toVttUrl(sub) })));
+  for (const { sub, url } of resolved) {
     if (!url) continue;
     const track = document.createElement("track");
     track.kind = "subtitles";
