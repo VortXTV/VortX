@@ -7,6 +7,9 @@ const te = new TextEncoder();
 const enc = (s) => te.encode(s);
 const b64 = (u8) => Buffer.from(u8).toString("base64");
 const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+// Throwaway, policy-meeting test passwords generated per run (no hardcoded secret). Zero-knowledge service:
+// it only sees PBKDF2 verifiers + AES-wrapped keys, never the plaintext.
+const randPw = () => "Aa1!" + b64(wc.getRandomValues(new Uint8Array(24))).replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
 let pass = 0, fail = 0;
 const ok = (c, m) => { (c ? pass++ : fail++); console.log("  " + (c ? "PASS" : "FAIL"), m); };
 
@@ -36,7 +39,8 @@ function totp(secret) { const ctr = Math.floor(Date.now() / 30000); const buf = 
 
 const ITERS = 210000;
 const email = `f${process.env.TS}@vortx.tv`, username = `f${process.env.TS}`.slice(0, 18);
-let pw = "First-Password-1!";
+const firstPw = process.env.E2E_PASSWORD || randPw();
+let pw = firstPw;
 
 async function authVerifier(mk, p) { return b64(await pbkdf2(mk, enc(p), 1)); }
 
@@ -48,7 +52,7 @@ let r = await post("/v1/auth/register", { email, username, kdfSalt: b64(salt), k
 let token = r.json?.token; ok(r.status === 200 && token, "register");
 
 console.log("CHANGE PASSWORD");
-const newPw = "Second-Password-2!";
+const newPw = randPw();
 const nMk = await pbkdf2(enc(newPw), salt, ITERS); // M-4: new master key uses the SAME kdfSalt
 r = await post("/v1/auth/change-password", { oldAuthVerifier: await authVerifier(mk, pw), newAuthVerifier: await authVerifier(nMk, newPw), newWrappedKeyPassword: await seal(nMk, dataKey) }, token);
 ok(r.status === 200 && r.json?.token, `change-password -> 200 + fresh token (${r.status})`);
@@ -67,7 +71,7 @@ r = await post("/v1/auth/login", { login: email, authVerifier: await authVerifie
 const dk = r.json?.wrappedKeyPassword ? await open(lmk, r.json.wrappedKeyPassword) : null;
 ok(r.status === 200 && dk && eq(dk, dataKey), "login with NEW password + same dataKey");
 token = r.json.token; pw = newPw; mk = lmk;
-r = await post("/v1/auth/login", { login: email, authVerifier: await authVerifier(await pbkdf2(enc("First-Password-1!"), unb64(pre.kdfSalt), pre.kdfIters), "First-Password-1!") });
+r = await post("/v1/auth/login", { login: email, authVerifier: await authVerifier(await pbkdf2(enc(firstPw), unb64(pre.kdfSalt), pre.kdfIters), firstPw) });
 ok(r.status === 401, "login with OLD password -> 401");
 
 console.log("2FA (TOTP)");

@@ -29,6 +29,9 @@ const te = new TextEncoder();
 const enc = (s) => te.encode(s);
 const b64 = (u8) => Buffer.from(u8).toString("base64");
 const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+// Throwaway, policy-meeting test password generated per run (no hardcoded secret). Zero-knowledge service:
+// it only sees PBKDF2 verifiers + AES-wrapped keys, never the plaintext.
+const randPw = () => "Aa1!" + b64(wc.getRandomValues(new Uint8Array(24))).replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  PASS", m); } else { fail++; console.log("  FAIL", m); } };
@@ -56,7 +59,7 @@ const ITERS = 210000;
 const ts = process.env.TS || Date.now();
 const email = `reset+${ts}@vortx.tv`;
 const username = `reset${ts}`.slice(0, 20);
-const password = "Sup3r-Secret-Pw!";
+const password = process.env.E2E_PASSWORD || randPw();
 
 // --- register a throwaway account (the standard client crypto contract) ---
 const kdfSaltBytes = wc.getRandomValues(new Uint8Array(16));
@@ -106,7 +109,7 @@ ok(r.json?._code === undefined, "reset/start within reissue cooldown -> no fresh
 
 console.log("RESET/COMPLETE wrong code -> 401, then right code -> 200");
 // The new credentials the client mints (fresh vault: new data key, new password key, new recovery).
-const newPassword = "Even-Better-Pw2!";
+const newPassword = randPw();
 // kdf_salt is NEVER rotated server-side; the new master key reuses the original kdfSaltBytes (M-4).
 const newDataKey = wc.getRandomValues(new Uint8Array(32));
 const newMasterKey = await pbkdf2(enc(newPassword), kdfSaltBytes, ITERS);

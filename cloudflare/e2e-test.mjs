@@ -5,6 +5,9 @@ const te = new TextEncoder(), td = new TextDecoder();
 const enc = (s) => te.encode(s);
 const b64 = (u8) => Buffer.from(u8).toString("base64");
 const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
+// Throwaway, policy-meeting test password generated per run (no hardcoded secret in the repo). The service is
+// zero-knowledge: it only ever receives PBKDF2 verifiers + AES-wrapped keys, never the plaintext password.
+const randPw = () => "Aa1!" + b64(wc.getRandomValues(new Uint8Array(24))).replace(/[^A-Za-z0-9]/g, "").slice(0, 16);
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log("  PASS", m); } else { fail++; console.log("  FAIL", m); } };
@@ -36,7 +39,7 @@ async function post(path, body, token) {
 const ts = process.env.TS;
 const email = `e2e+${ts}@vortx.tv`;
 const username = `e2e${ts}`.slice(0, 20);
-const password = "Sup3r-Secret-Pw!";
+const password = process.env.E2E_PASSWORD || randPw();
 const ITERS = 210000;
 
 // --- build register payload (the client crypto contract) ---
@@ -100,7 +103,7 @@ const rs = (await post("/v1/auth/recover-start", { email })).json;
 const recKey2 = await pbkdf2(enc(recoveryCode), unb64(rs.kdfSalt), rs.kdfIters);
 const recoveredDataKey = await open(recKey2, rs.wrappedKeyRecovery);
 ok(recoveredDataKey && eqBytes(recoveredDataKey, dataKey), "recover-start: dataKey recovered via recovery code");
-const newPw = "Even-Better-Pw2!";
+const newPw = randPw();
 // M-4: derive the new master key from the account's EXISTING kdfSalt (it is never rotated, so the
 // recovery key, also derived from kdfSalt, stays valid for future recoveries).
 const newMk = await pbkdf2(enc(newPw), unb64(rs.kdfSalt), rs.kdfIters);

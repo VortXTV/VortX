@@ -20,7 +20,8 @@ Contract is mirrored by `app/SourcesShared/VortXSyncClient.swift`.
 
 ```bash
 cd cloudflare
-npx wrangler d1 create vortx-sync          # paste database_id into wrangler.toml
+cp wrangler.toml.example wrangler.toml      # wrangler.toml is gitignored (holds your real database_id)
+npx wrangler d1 create vortx-sync          # paste the printed database_id into wrangler.toml
 npx wrangler d1 execute vortx-sync --remote --file=./schema.sql
 npx wrangler deploy
 # Map api.vortx.tv to the Worker (dashboard > Workers > Triggers > Custom Domains),

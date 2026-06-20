@@ -7,5 +7,7 @@ dist/
 .dev.vars.*
 .env
 .env.*
+# wrangler.toml holds the real D1 database_id; keep it local and commit wrangler.toml.example instead
+wrangler.toml
 # agent/editor config
 .claude/

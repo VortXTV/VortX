@@ -2,8 +2,12 @@
 # an opaque account id, plus short-lived pairing records that hand an account from one device to
 # another. It can never read user data (the AES key never leaves the user's devices).
 #
+# SETUP: copy this file to `wrangler.toml` (which is gitignored so the real database_id never lands in
+# version control) and fill in your own database_id from step 1.
+#
 # Deploy:
-#   1. npx wrangler d1 create vortx-sync           # then paste database_id below
+#   0. cp wrangler.toml.example wrangler.toml
+#   1. npx wrangler d1 create vortx-sync           # then paste the printed database_id into wrangler.toml
 #   2. npx wrangler d1 execute vortx-sync --remote --file=./schema.sql
 #   3. npx wrangler deploy
 #   4. Map api.vortx.tv to this Worker (dashboard > Workers > Triggers > Custom Domains),
@@ -19,7 +23,7 @@ routes = [{ pattern = "api.vortx.tv", custom_domain = true }]
 [[d1_databases]]
 binding = "DB"
 database_name = "vortx-sync"
-database_id = "120e186c-2b07-4bfd-9030-e4f17daa9252"
+database_id = "PASTE_YOUR_D1_DATABASE_ID_HERE"
 
 [observability]
 enabled = true
