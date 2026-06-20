@@ -39,7 +39,7 @@ extension View {
     /// compositor-friendly properties (transform + opacity + a stroked overlay, never layout), per
     /// DESIGN.md. Applied only on macOS and only when `isFocused`, so touch / VoiceOver never sees a ring.
     @ViewBuilder func macFocusRing(_ isFocused: Bool, cornerRadius: CGFloat = Theme.Radius.card) -> some View {
-        self
+        let ringed = self
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .strokeBorder(Theme.Palette.accent, lineWidth: isFocused ? 3 : 0)
@@ -47,6 +47,14 @@ extension View {
             .scaleEffect(isFocused ? 1.04 : 1.0)
             .shadow(color: isFocused ? Theme.Palette.accent.opacity(0.35) : .clear, radius: 16, y: 6)
             .animation(Theme.Motion.focus, value: isFocused)
+        // Suppress AppKit's default blue/grey focus ring so our accent ring is the ONLY focus cue (the
+        // reported "weird blue selected line"). `.focusEffectDisabled()` is macOS 14+; the Mac target
+        // deploys to 14, and the guard keeps CI safe on an older slice.
+        if #available(macOS 14.0, *) {
+            ringed.focusEffectDisabled()
+        } else {
+            ringed
+        }
     }
 }
 

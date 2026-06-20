@@ -156,6 +156,16 @@ final class FeaturedHeroModel: ObservableObject {
         interactionHeld = false
     }
 
+    /// Feature a SPECIFIC item in the hero (macOS keyboard browse: the focused poster drives the hero, the
+    /// touch analogue of the tvOS focused-card hero). Holds the ambient rotation while the user navigates so
+    /// the billboard doesn't yank to a different title mid-browse; `noteInteraction()` (called when focus
+    /// leaves the cards) re-arms the resume timer. Enriches the item so its meta row fills in like rotation.
+    func feature(_ item: FeaturedHeroItem) {
+        interactionHeld = true
+        resumeTask?.cancel(); resumeTask = nil
+        show(item, animated: true)
+    }
+
     // MARK: User interaction (pause rotation; resume after inactivity)
 
     /// The user touched the screen (scroll / hover / select). Pause the ambient rotation immediately
