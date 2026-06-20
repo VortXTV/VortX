@@ -152,7 +152,7 @@ const RL_PATHS = new Set([
   "/v1/auth/reset/start", "/v1/auth/reset/complete",
   "/v1/auth/2fa/activate", "/v1/auth/2fa/disable",
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
-  "/v1/qr/start", "/v1/auth/check-username",   // pairing-row spam + username enumeration
+  "/v1/qr/start", "/v1/qr/status", "/v1/auth/check-username",   // pairing-row spam + username enumeration + QR token-poll brute-force
   "/v1/meta/search",                           // Cinemeta proxy for the dashboard's add-to-library
   "/v1/family/create", "/v1/family/invite", "/v1/family/join", "/v1/family/leave",
                                                // household mutations: invite-code spam + join brute-force
@@ -242,7 +242,7 @@ async function route(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const p = url.pathname, m = request.method;
     try {
-      if (env.RL && m === "POST" && RL_PATHS.has(p)) {
+      if (env.RL && RL_PATHS.has(p)) {   // method-agnostic: also rate-limits the GET /v1/qr/status token-delivery poll
         const ip = request.headers.get("CF-Connecting-IP") || "unknown";
         const { success } = await env.RL.limit({ key: `${p}:${ip}` });
         if (!success) return json({ error: "rate_limited" }, 429);
@@ -1022,21 +1022,24 @@ async function familyJoin(req: Request, env: Env): Promise<Response> {
   const inv = await env.DB.prepare("SELECT family_id, code_hash, expires_at FROM family_invites WHERE code_hash = ?")
     .bind(await hmacInvite(env.SESSION_SECRET, code)).first<{ family_id: string; code_hash: string; expires_at: number }>();
   if (!inv || inv.expires_at < Date.now()) return json({ error: "invalid_code" }, 401);
-  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_members WHERE family_id = ?")
-    .bind(inv.family_id).first<{ n: number }>();
-  if ((count?.n ?? 0) >= FAMILY_MAX_MEMBERS) return json({ error: "family_full" }, 409);
   const now = Date.now();
-  // Seat the member and consume the single-use invite atomically. The UNIQUE(account_id) constraint is
-  // the real guard against a double-join race; a violation rolls the batch back.
+  // Seat the member with an ATOMIC cap check: the conditional insert adds the row only while the family
+  // is under the cap, so two simultaneous joins can never both pass a separate COUNT and overfill it
+  // (the prior SELECT COUNT + INSERT had that TOCTOU race). UNIQUE(account_id) still guards a double-join
+  // (throws -> already_in_family). Only consume the single-use invite once the seat is actually taken, so
+  // a cap-full join never burns the invite.
+  let seated = false;
   try {
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO family_members (family_id, account_id, role, joined_at) VALUES (?,?,?,?)")
-        .bind(inv.family_id, id, "member", now),
-      env.DB.prepare("DELETE FROM family_invites WHERE family_id = ?").bind(inv.family_id),
-    ]);
+    const res = await env.DB.prepare(
+      "INSERT INTO family_members (family_id, account_id, role, joined_at) " +
+      "SELECT ?1, ?2, 'member', ?3 WHERE (SELECT COUNT(*) FROM family_members WHERE family_id = ?1) < ?4",
+    ).bind(inv.family_id, id, now, FAMILY_MAX_MEMBERS).run();
+    seated = (res.meta?.changes ?? 0) > 0;
   } catch {
     return json({ error: "already_in_family" }, 409);
   }
+  if (!seated) return json({ error: "family_full" }, 409);
+  await env.DB.prepare("DELETE FROM family_invites WHERE family_id = ?").bind(inv.family_id).run();
   const fam = await env.DB.prepare("SELECT id, name, owner_account_id FROM families WHERE id = ?")
     .bind(inv.family_id).first<{ id: string; name: string; owner_account_id: string }>();
   if (!fam) return json({ error: "invalid_code" }, 401); // family vanished mid-join (owner deleted it)
@@ -1200,9 +1203,15 @@ async function adminAnnounce(req: Request, env: Env): Promise<Response> {
   const heading = isStr(b?.heading, 200) ? (b!.heading as string) : "";
   const lines = Array.isArray(b?.lines) ? (b!.lines as unknown[]).filter((l): l is string => typeof l === "string").slice(0, 20) : [];
   if (!subject || !heading || !lines.length) return json({ error: "bad_request" }, 400);
-  const rows = await env.DB.prepare("SELECT email FROM accounts").all<{ email: string }>();
+  // Paginate so a large user base cannot blow the 30s Worker CPU limit mid-loop (which silently
+  // truncated sends before). The caller pages with `offset` until nextOffset is null.
+  const PAGE = 200;
+  const offset = Number.isFinite(Number(b?.offset)) ? Math.max(0, Math.trunc(Number(b?.offset))) : 0;
+  const rows = await env.DB.prepare("SELECT email FROM accounts ORDER BY rowid ASC LIMIT ? OFFSET ?")
+    .bind(PAGE, offset).all<{ email: string }>();
   const emails = (rows.results ?? []).map((r) => r.email);
   let sent = 0;
   for (const email of emails) { await sendMail(env, email, subject, heading, lines); sent++; }
-  return json({ ok: true, sent, total: emails.length });
+  const nextOffset = emails.length === PAGE ? offset + PAGE : null;
+  return json({ ok: true, sent, nextOffset });
 }
