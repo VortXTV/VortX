@@ -2,6 +2,7 @@ import type { Addon, MetaItem } from "../lib/types";
 import { catalogRefs, fetchCatalog, type CatalogRef } from "../lib/addon";
 import { escapeHtml, httpUrl } from "../lib/dom";
 import { hashFor } from "../lib/router";
+import { continueWatching } from "../lib/store";
 
 // The Home board: one poster rail per loadable catalog across the installed add-ons (the same shape as
 // desktop/src/main.ts renderBoard, but fetched directly from the add-on protocol instead of read from
@@ -23,7 +24,19 @@ export function renderBoardShell(host: HTMLElement, addons: Addon[]): void {
       </section>`,
     )
     .join("");
-  host.innerHTML = `<div class="board">${rails}</div>`;
+  host.innerHTML = `<div class="board">${continueWatchingRail()}${rails}</div>`;
+}
+
+/** A "Continue Watching" rail of in-progress titles, shown at the top of Home. Empty when nothing is
+ *  in progress. Cards reuse posterCard and link to Detail (where re-playing resumes from the saved spot). */
+function continueWatchingRail(): string {
+  const cw = continueWatching();
+  if (!cw.length) return "";
+  return `
+    <section class="rail-section" aria-labelledby="rail-cw">
+      <h2 class="rail-title" id="rail-cw">Continue Watching</h2>
+      <div class="rail" role="list">${cw.map(posterCard).join("")}</div>
+    </section>`;
 }
 
 /** Fetch each catalog and paint its rail; bad add-ons leave an empty rail rather than failing Home. */

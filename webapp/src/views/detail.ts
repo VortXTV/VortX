@@ -497,7 +497,13 @@ async function playStream(stream: Stream): Promise<void> {
   const title = state?.openEpisode
     ? `${state.meta?.name ?? ""} · S${state.openEpisode.season ?? 0}E${state.openEpisode.episode ?? 0}`
     : state?.meta?.name ?? "VortX";
-  await play(stream.url, title);
+  await play(
+    stream.url,
+    title,
+    state?.meta
+      ? { id: state.meta.id, type: state.meta.type, name: state.meta.name, poster: state.meta.poster }
+      : undefined,
+  );
 }
 
 async function playBest(): Promise<boolean> {
