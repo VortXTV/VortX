@@ -16,6 +16,42 @@
             "state": "translated",
             "value": "%@ · toca para obtenerlo"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · touchez pour l'obtenir"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · zum Abrufen tippen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · toque para obter"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · タップして取得"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · 탭하여 가져오기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · 点按获取"
+          }
         }
       }
     },
@@ -38,6 +74,42 @@
             "state": "translated",
             "value": "%@ (%@)"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@（%@）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@（%@）"
+          }
         }
       }
     },
@@ -53,6 +125,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ solo puede editarse desde ese perfil"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ ne peut être modifié que depuis ce profil"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ kann nur über dieses Profil bearbeitet werden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ só pode ser editado por aquele perfil"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ はそのプロファイルからのみ編集できます"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@은(는) 해당 프로필에서만 편집할 수 있습니다"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 只能从该配置文件中编辑"
           }
         }
       }
@@ -76,6 +184,42 @@
             "state": "translated",
             "value": "%@ otro complemento%@ no devolvió fuentes para este título."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ autre add-on%@ n'a renvoyé aucune source pour ce titre."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ weitere Add-on%@ haben für diesen Titel keine Quellen geliefert."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ outro complemento%@ não retornou fontes para este título."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "他の %@ 個のアドオン%@ は、このタイトルのソースを返しませんでした。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다른 부가 기능 %@개%@에서 이 작품에 대한 소스를 찾지 못했습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 个其他附加组件%@ 未返回此影片的任何来源。"
+          }
         }
       }
     },
@@ -97,6 +241,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@: %@"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ : %@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@：%@"
           }
         }
       }
@@ -136,6 +316,42 @@
             "state": "translated",
             "value": "Una copia de seguridad guarda tus perfiles, el tema y las preferencias del reproductor, para que te acompañen y sobrevivan a una futura actualización importante. En iPhone, iPad y Mac puedes guardarla en un archivo desde hoy."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Une sauvegarde conserve vos profils, votre thème et vos préférences de lecture afin qu'ils vous suivent et survivent à une future mise à jour majeure. Sur iPhone, iPad et Mac, vous pouvez dès aujourd'hui les enregistrer dans un fichier."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ein Backup speichert deine Profile, dein Design und deine Player-Einstellungen, sodass sie dich begleiten und ein künftiges großes Update überdauern. Auf iPhone, iPad und Mac kannst du das schon heute in einer Datei sichern."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Um backup salva seus perfis, tema e preferências do player para que eles acompanhem você e sobrevivam a uma futura atualização importante. No iPhone, iPad e Mac você já pode salvar isso em um arquivo hoje."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "バックアップはプロファイル、テーマ、プレーヤー設定を保存し、それらを持ち運べるようにして、今後の大型アップデートでも失われないようにします。iPhone、iPad、Mac では今すぐファイルに保存できます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백업은 프로필, 테마, 플레이어 환경설정을 저장하여 기기 간 이동 시 함께 가져갈 수 있고 향후 주요 업데이트에서도 유지되도록 합니다. iPhone, iPad, Mac에서는 지금 파일로 저장할 수 있습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "备份会保存你的配置文件、主题和播放器偏好，让它们随你迁移并在未来的重大更新中保留下来。在 iPhone、iPad 和 Mac 上，你现在就可以将其保存到文件。"
+          }
         }
       }
     },
@@ -151,6 +367,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Un punto de partida con un solo toque; ajusta los controles de abajo. El orden de los tipos de fuente se guarda por perfil."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Un point de départ en un toucher ; affinez les réglages ci-dessous. L'ordre de vos types de sources est enregistré par profil."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ein Ausgangspunkt mit einem Tipp; feinjustiere die Steuerung unten. Deine Reihenfolge der Quelltypen wird pro Profil gespeichert."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Um ponto de partida com um toque; ajuste os controles abaixo. A ordem dos tipos de fonte é salva por perfil."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ワンタップの出発点です。下のコントロールで微調整できます。ソースタイプの順序はプロファイルごとに保存されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "한 번의 탭으로 시작하고, 아래 컨트롤로 세부 조정하세요. 소스 유형 순서는 프로필별로 저장됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "一键起步，再用下方的控件微调。你的来源类型排序会按配置文件分别保存。"
           }
         }
       }
@@ -168,6 +420,42 @@
             "state": "translated",
             "value": "Acento"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couleur d'accent"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Akzentfarbe"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cor de destaque"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アクセント"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "강조 색상"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "强调色"
+          }
         }
       }
     },
@@ -183,6 +471,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "El acento recolorea el foco, la selección y el progreso en toda la app. OLED Black usa negro puro, ideal en pantallas AMOLED."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La couleur d'accent recolore le focus, la sélection et la progression dans toute l'app. Noir OLED utilise un vrai noir, idéal sur les dalles AMOLED."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Akzentfarbe färbt Fokus, Auswahl und Fortschritt in der gesamten App. OLED Black nutzt echtes Schwarz, ideal für AMOLED-Bildschirme."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A cor de destaque recolore o foco, a seleção e o progresso em todo o app. O Preto OLED usa preto verdadeiro, melhor em telas AMOLED."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アクセントは、アプリ全体のフォーカス、選択、進行状況の色を変更します。OLED Black は真の黒を使用し、AMOLED パネルに最適です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "강조 색상은 앱 전반의 포커스, 선택, 진행 상태에 색을 입힙니다. OLED 블랙은 순수 검정을 사용하며 AMOLED 패널에 가장 적합합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "强调色会为全应用的焦点、选择和进度重新着色。OLED 黑使用纯黑色，在 AMOLED 屏幕上效果最佳。"
           }
         }
       }
@@ -200,6 +524,42 @@
             "state": "translated",
             "value": "El acento recolorea la selección y el progreso en toda la app. OLED Black usa negro puro, ideal en pantallas AMOLED."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La couleur d'accent recolore la sélection et la progression dans toute l'app. Noir OLED utilise un vrai noir, idéal sur les dalles AMOLED."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Akzentfarbe färbt Auswahl und Fortschritt in der gesamten App. OLED Black nutzt echtes Schwarz, ideal für AMOLED-Bildschirme."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A cor de destaque recolore a seleção e o progresso em todo o app. O Preto OLED usa preto verdadeiro, melhor em telas AMOLED."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アクセントは、アプリ全体の選択と進行状況の色を変更します。OLED Black は真の黒を使用し、AMOLED パネルに最適です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "강조 색상은 앱 전반의 선택과 진행 상태에 색을 입힙니다. OLED 블랙은 순수 검정을 사용하며 AMOLED 패널에 가장 적합합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "强调色会为全应用的选择和进度重新着色。OLED 黑使用纯黑色，在 AMOLED 屏幕上效果最佳。"
+          }
         }
       }
     },
@@ -215,6 +575,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Añadir un complemento"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajouter un add-on"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add-on hinzufügen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Adicionar um complemento"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アドオンを追加"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "부가 기능 추가"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加附加组件"
           }
         }
       }
@@ -232,6 +628,42 @@
             "state": "translated",
             "value": "Añadir perfil"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajouter un profil"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Profil hinzufügen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Adicionar perfil"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロファイルを追加"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로필 추가"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加配置文件"
+          }
         }
       }
     },
@@ -247,6 +679,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Añade varios complementos a la vez"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajouter plusieurs add-ons à la fois"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mehrere Add-ons gleichzeitig hinzufügen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Adicionar vários complementos de uma vez"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "複数のアドオンを一度に追加"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "여러 부가 기능을 한 번에 추가"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "一次添加多个附加组件"
           }
         }
       }
@@ -264,6 +732,42 @@
             "state": "translated",
             "value": "Añade tu clave API de debrid una vez y VortX la usa en todas partes, sin un sitio de configuración aparte. Los torrents en caché se resuelven en enlaces directos instantáneos. Tus claves permanecen en este dispositivo y se sincronizan, cifradas, con tu cuenta VortX."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajoutez votre clé API debrid une seule fois et VortX l'utilise partout, sans site de configuration séparé. Les torrents en cache se résolvent en liens directs instantanés. Vos clés restent sur cet appareil et se synchronisent, chiffrées, vers votre compte VortX."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Füge deinen debrid-API-Schlüssel einmal hinzu und VortX verwendet ihn überall, ohne separate Konfigurationsseite. Zwischengespeicherte Torrents werden zu sofortigen Direktlinks aufgelöst. Deine Schlüssel bleiben auf diesem Gerät und werden verschlüsselt mit deinem VortX-Konto synchronisiert."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Adicione sua chave de API debrid uma vez e a VortX a usa em todos os lugares, sem um site de configuração separado. Torrents em cache são resolvidos em links diretos instantâneos. Suas chaves ficam neste dispositivo e sincronizam, criptografadas, com a sua conta VortX."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid の API キーを一度追加すれば、別の設定サイトなしで VortX がどこでも使用します。キャッシュ済みの torrent は瞬時に直接リンクに解決されます。キーはこのデバイスに保存され、暗号化されて VortX アカウントに同期されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid API 키를 한 번만 추가하면 별도의 설정 사이트 없이 VortX가 모든 곳에서 사용합니다. 캐시된 torrent는 즉시 직접 링크로 연결됩니다. 키는 이 기기에 보관되며 암호화되어 VortX 계정에 동기화됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "添加一次 debrid API 密钥，VortX 即可在各处使用，无需单独的配置网站。已缓存的 torrent 会解析为即时直链。你的密钥保留在本设备上，并加密同步到你的 VortX 账户。"
+          }
         }
       }
     },
@@ -279,6 +783,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Complementos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add-ons"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add-ons"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Complementos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アドオン"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "부가 기능"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "附加组件"
           }
         }
       }
@@ -296,6 +836,42 @@
             "state": "translated",
             "value": "Avanzado (opciones de mpv)"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avancé (options mpv)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erweitert (mpv-Optionen)"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avançado (opções do mpv)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "詳細設定（mpv オプション）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "고급 (mpv 옵션)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "高级（mpv 选项）"
+          }
         }
       }
     },
@@ -311,6 +887,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Todos (%@)"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tout (%@)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Alle (%@)"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tudo (%@)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "すべて（%@）"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "전체 (%@)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "全部（%@）"
           }
         }
       }
@@ -328,6 +940,42 @@
             "state": "translated",
             "value": "¿Ya usas Stremio?"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vous utilisez déjà Stremio ?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nutzt du bereits Stremio?"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Já usa o Stremio?"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "すでに Stremio をお使いですか？"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이미 Stremio를 사용 중이신가요?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已在使用 Stremio？"
+          }
         }
       }
     },
@@ -343,6 +991,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Siempre HDR"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Toujours HDR"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Immer HDR"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sempre HDR"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "常に HDR"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "항상 HDR"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "始终 HDR"
           }
         }
       }
@@ -360,6 +1044,42 @@
             "state": "translated",
             "value": "Tamaño del texto  ·  %@%%"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Taille du texte de l'app  ·  %@%%"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "App-Textgröße  ·  %@ %%"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tamanho do texto do app  ·  %@%%"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アプリの文字サイズ  ·  %@%%"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "앱 텍스트 크기  ·  %@%%"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "应用文字大小  ·  %@%%"
+          }
         }
       }
     },
@@ -375,6 +1095,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Apariencia"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apparence"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Darstellung"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aparência"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "外観"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "디자인"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "外观"
           }
         }
       }
@@ -392,6 +1148,42 @@
             "state": "translated",
             "value": "Audio y subtítulos"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Audio et sous-titres"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Audio & Untertitel"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Áudio e legendas"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音声と字幕"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "오디오 및 자막"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音频与字幕"
+          }
         }
       }
     },
@@ -407,6 +1199,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Auto"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatisch"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automático"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自動"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자동"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动"
           }
         }
       }
@@ -424,6 +1252,42 @@
             "state": "translated",
             "value": "Auto mantiene la experiencia completa en los Apple TV más potentes y cambia a una más ligera en modelos más antiguos como el Apple TV HD. Reducido recorta las animaciones y reduce los búferes de reproducción para que el mando siga respondiendo en hardware débil. Reinicia la app tras cambiar esto."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto conserve l'expérience complète sur les Apple TV performantes et bascule vers une version allégée sur les modèles plus anciens comme l'Apple TV HD. Réduit allège les animations et réduit les tampons de lecture pour que la télécommande reste réactive sur un matériel limité. Redémarrez l'app après cette modification."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatisch behält das volle Erlebnis auf leistungsfähigen Apple TVs bei und wechselt auf älteren Modellen wie dem Apple TV HD zu einem schlankeren. Reduziert kürzt Animationen und verkleinert die Wiedergabe-Puffer, damit die Fernbedienung auf schwacher Hardware reaktionsschnell bleibt. Starte die App nach dieser Änderung neu."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O modo Automático mantém a experiência completa em Apple TVs capazes e muda para uma mais leve em modelos mais antigos, como a Apple TV HD. O modo Reduzido corta animações e diminui os buffers de reprodução para que o controle continue responsivo em hardware fraco. Reinicie o app após alterar isto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自動は、対応している Apple TV ではフル体験を維持し、Apple TV HD などの古いモデルでは軽量版に切り替えます。軽量化はアニメーションを減らし、再生バッファを小さくして、性能の低いハードウェアでもリモコンの反応を保ちます。変更後はアプリを再起動してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자동은 성능이 충분한 Apple TV에서는 전체 환경을 유지하고, Apple TV HD 같은 구형 모델에서는 더 가벼운 환경으로 전환합니다. 감소 설정은 애니메이션을 줄이고 재생 버퍼를 축소하여 성능이 낮은 하드웨어에서도 리모컨 반응이 빠르게 유지됩니다. 변경 후 앱을 다시 시작하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自动模式在性能足够的 Apple TV 上保留完整体验，并在 Apple TV HD 等较旧机型上切换为轻量体验。精简模式会减少动画并缩小播放缓冲，让遥控器在低性能硬件上保持灵敏。更改此项后请重启应用。"
+          }
         }
       }
     },
@@ -439,6 +1303,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Auto convierte (tone-map) HDR y Dolby Vision a SDR solo en una pantalla que no puede mostrar HDR. Elige Convertir a SDR si los remux 4K Dolby Vision se ven lavados, verdes o morados; Siempre HDR para forzar el paso directo."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto convertit (tone-mapping) le HDR et le Dolby Vision en SDR uniquement sur un écran incapable d'afficher le HDR. Choisissez Convertir en SDR si les remux 4K Dolby Vision paraissent délavés, verts ou violets ; Toujours HDR pour forcer le passage direct."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatisch wandelt HDR und Dolby Vision nur dann per Tone-Mapping in SDR um, wenn ein Bildschirm kein HDR darstellen kann. Wähle „In SDR umwandeln“, wenn 4K-Dolby-Vision-Remuxe ausgewaschen, grün oder violett aussehen; „Immer HDR“ erzwingt die Durchleitung."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O modo Automático faz tone-mapping de HDR e Dolby Vision para SDR apenas em uma tela que não consegue exibir HDR. Escolha Tone-mapping para SDR se os remuxes 4K em Dolby Vision parecerem desbotados, esverdeados ou roxos; Sempre HDR para forçar a passagem direta."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自動は、HDR を表示できない画面でのみ、HDR と Dolby Vision を SDR にトーンマッピングします。4K Dolby Vision のリマックスが色あせて見えたり、緑や紫がかって見える場合は「SDR にトーンマッピング」を選択してください。「常に HDR」はパススルーを強制します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자동은 HDR을 표시할 수 없는 화면에서만 HDR 및 Dolby Vision을 SDR로 톤 매핑합니다. 4K Dolby Vision remux가 색이 바래거나 녹색 또는 보라색으로 보이면 SDR로 톤 매핑을 선택하고, 패스스루를 강제하려면 항상 HDR을 선택하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仅在无法显示 HDR 的屏幕上，自动将 HDR 和 Dolby Vision 色调映射为 SDR。如果 4K Dolby Vision remux 看起来发白、偏绿或偏紫，请选择映射为 SDR；选择始终 HDR 可强制直通。"
           }
         }
       }
@@ -456,6 +1356,42 @@
             "state": "translated",
             "value": "Auto convierte (tone-map) HDR y Dolby Vision a SDR solo en un televisor que no puede mostrar HDR. Elige Convertir a SDR si los remux 4K Dolby Vision se ven lavados, verdes o morados en tu televisor; Siempre HDR fuerza el paso directo."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto convertit (tone-mapping) le HDR et le Dolby Vision en SDR uniquement sur un téléviseur incapable d'afficher le HDR. Choisissez Convertir en SDR si les remux 4K Dolby Vision paraissent délavés, verts ou violets sur votre téléviseur ; Toujours HDR force le passage direct."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Automatisch wandelt HDR und Dolby Vision nur dann per Tone-Mapping in SDR um, wenn ein Fernseher kein HDR darstellen kann. Wähle „In SDR umwandeln“, wenn 4K-Dolby-Vision-Remuxe auf deinem Fernseher ausgewaschen, grün oder violett aussehen; „Immer HDR“ erzwingt die Durchleitung."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O modo Automático faz tone-mapping de HDR e Dolby Vision para SDR apenas em uma TV que não consegue exibir HDR. Escolha Tone-mapping para SDR se os remuxes 4K em Dolby Vision parecerem desbotados, esverdeados ou roxos na sua TV; Sempre HDR força a passagem direta."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自動は、HDR を表示できないテレビでのみ、HDR と Dolby Vision を SDR にトーンマッピングします。4K Dolby Vision のリマックスがテレビで色あせて見えたり、緑や紫がかって見える場合は「SDR にトーンマッピング」を選択してください。「常に HDR」はパススルーを強制します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자동은 HDR을 표시할 수 없는 TV에서만 HDR 및 Dolby Vision을 SDR로 톤 매핑합니다. 4K Dolby Vision remux가 TV에서 색이 바래거나 녹색 또는 보라색으로 보이면 SDR로 톤 매핑을 선택하고, 항상 HDR은 패스스루를 강제합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仅在无法显示 HDR 的电视上，自动将 HDR 和 Dolby Vision 色调映射为 SDR。如果 4K Dolby Vision remux 在你的电视上看起来发白、偏绿或偏紫，请选择映射为 SDR；始终 HDR 会强制直通。"
+          }
         }
       }
     },
@@ -471,6 +1407,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Fondo"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Arrière-plan"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hintergrund"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Plano de fundo"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "背景"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "배경"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "背景"
           }
         }
       }
@@ -488,6 +1460,42 @@
             "state": "translated",
             "value": "Copia de seguridad y restauración"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sauvegarde et restauration"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup & Wiederherstellung"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup e restauração"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "バックアップと復元"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "백업 및 복원"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "备份与恢复"
+          }
         }
       }
     },
@@ -503,6 +1511,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Equilibrado"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Équilibré"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ausgewogen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Equilibrado"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "バランス"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "균형"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "均衡"
           }
         }
       }
@@ -520,6 +1564,42 @@
             "state": "translated",
             "value": "Reproductor integrado"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lecteur intégré"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Integrierter Player"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Player integrado"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内蔵プレーヤー"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "내장 플레이어"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内置播放器"
+          }
         }
       }
     },
@@ -535,6 +1615,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Busca en Complementos uno que incluya «Streams» (no solo Catálogos o Metadatos). Si cerraste la app a la fuerza hace poco, vuelve a abrirla para que tus complementos se recarguen, o vuelve a añadir un complemento de fuentes."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vérifiez dans Add-ons s'il y en a un qui propose des « Streams » (pas seulement des Catalogues ou des Métadonnées). Si vous avez récemment forcé la fermeture de l'app, rouvrez-la pour recharger vos add-ons, ou réajoutez un add-on de sources."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sieh unter Add-ons nach, ob eines „Streams“ auflistet (nicht nur Kataloge oder Metadaten). Wenn du die App kürzlich beendet hast, öffne sie erneut, damit deine Add-ons neu laden, oder füge ein Stream-Add-on erneut hinzu."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verifique nos Complementos se há algum que liste \"Streams\" (não apenas Catálogos ou Metadados). Se você fechou o app à força recentemente, reabra-o para que seus complementos recarreguem, ou adicione novamente um complemento de streams."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「ストリーム」（カタログやメタデータだけでなく）を提供するアドオンがあるか、アドオンを確認してください。最近アプリを強制終了した場合は、アドオンを再読み込みするために再度開くか、ストリームアドオンを追加し直してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "\"Streams\"를 제공하는 부가 기능을 부가 기능에서 확인하세요(카탈로그나 메타데이터만 제공하는 것이 아닌). 최근에 앱을 강제 종료했다면 부가 기능이 다시 로드되도록 앱을 다시 열거나, 스트림 부가 기능을 다시 추가하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在“附加组件”中查找一个列出“Streams”（而非仅 Catalogs 或 Metadata）的组件。如果你最近强制退出了应用，请重新打开它以重新加载附加组件，或重新添加一个 stream 附加组件。"
           }
         }
       }
@@ -552,6 +1668,42 @@
             "state": "translated",
             "value": "Elige qué filas aparecen en Inicio y en qué orden."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choisissez les rangées affichées sur l'Accueil et l'ordre dans lequel elles apparaissent."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wähle, welche Zeilen auf der Startseite erscheinen und in welcher Reihenfolge."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escolha quais fileiras aparecem na Início e a ordem em que são exibidas."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ホームに表示する行と、その並び順を選択します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "홈에 표시할 행과 그 표시 순서를 선택하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择主屏幕上显示哪些行以及它们的显示顺序。"
+          }
         }
       }
     },
@@ -567,6 +1719,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "No se pudo generar un código para este enlace."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Impossible de générer un code pour ce lien."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Für diesen Link konnte kein Code erstellt werden."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Não foi possível gerar um código para este link."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このリンクのコードを生成できませんでした。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 링크에 대한 코드를 만들 수 없습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法为此链接生成代码。"
           }
         }
       }
@@ -590,6 +1778,42 @@
             "state": "translated",
             "value": "En uso: %@%@"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Actuellement utilisé : %@%@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Derzeit verwendet: %@%@"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Em uso no momento: %@%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "現在使用中: %@%@"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "현재 사용 중: %@%@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "当前使用：%@%@"
+          }
         }
       }
     },
@@ -605,6 +1829,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Personalizar catálogos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Personnaliser les catalogues"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kataloge anpassen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Personalizar catálogos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "カタログをカスタマイズ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "카탈로그 사용자화"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "自定义目录"
           }
         }
       }
@@ -622,6 +1882,42 @@
             "state": "translated",
             "value": "Servicios debrid"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Services debrid"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid-Dienste"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serviços debrid"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid サービス"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid 서비스"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "debrid 服务"
+          }
         }
       }
     },
@@ -637,6 +1933,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Las fuentes directas y debrid se abren automáticamente en el reproductor elegido. Los torrents y el reproductor integrado no se ven afectados."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les streams directs et debrid s'ouvrent automatiquement dans le lecteur que vous avez choisi. Les torrents et le lecteur intégré ne sont pas affectés."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Direkt- und debrid-Streams werden automatisch in deinem gewählten Player geöffnet. Torrents und der integrierte Player sind davon nicht betroffen."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams diretos e debrid abrem automaticamente no player escolhido. Torrents e o player integrado não são afetados."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ダイレクトと debrid のストリームは、選択したプレーヤーで自動的に開きます。torrent と内蔵プレーヤーには影響しません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "직접 및 debrid 스트림은 선택한 플레이어에서 자동으로 열립니다. torrent와 내장 플레이어는 영향을 받지 않습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "直链和 debrid 串流会自动在你选择的播放器中打开。torrent 和内置播放器不受影响。"
           }
         }
       }
@@ -654,6 +1986,42 @@
             "state": "translated",
             "value": "Las fuentes directas y debrid se abren directamente en el reproductor elegido, que luego gestiona la reproducción y la reanudación. Los torrents, las fuentes protegidas por cabeceras y los tráileres siempre usan el reproductor integrado."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les streams directs et debrid s'ouvrent directement dans le lecteur que vous avez choisi, qui gère ensuite la lecture et la reprise. Les torrents, les sources protégées par en-têtes et les bandes-annonces utilisent toujours le lecteur intégré."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Direkt- und debrid-Streams werden direkt in deinem gewählten Player geöffnet, der dann Wiedergabe und Fortsetzen übernimmt. Torrents, header-geschützte Quellen und Trailer nutzen immer den integrierten Player."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams diretos e debrid abrem direto no player escolhido, que então cuida da reprodução e da retomada. Torrents, fontes protegidas por cabeçalho e trailers sempre usam o player integrado."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ダイレクトと debrid のストリームは、選択したプレーヤーで直接開き、そのプレーヤーが再生と再開を処理します。torrent、ヘッダー保護されたソース、予告編は常に内蔵プレーヤーを使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "직접 및 debrid 스트림은 선택한 플레이어에서 바로 열리며, 이후 재생과 이어보기를 해당 플레이어가 처리합니다. torrent, 헤더 보호 소스, 예고편은 항상 내장 플레이어를 사용합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "直链和 debrid 串流会直接在你选择的播放器中打开，并由该播放器处理播放和续播。torrent、带请求头保护的来源和预告片始终使用内置播放器。"
+          }
         }
       }
     },
@@ -669,6 +2037,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Solo enlaces directos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Liens directs uniquement"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nur Direktlinks"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apenas links diretos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ダイレクトリンクのみ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "직접 링크만"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仅直链"
           }
         }
       }
@@ -686,6 +2090,42 @@
             "state": "translated",
             "value": "Descubrir"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Découvrir"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Entdecken"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Descobrir"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "見つける"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "둘러보기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "发现"
+          }
         }
       }
     },
@@ -702,6 +2142,42 @@
             "state": "translated",
             "value": "Introduce el PIN de %@"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Saisissez le code PIN pour %@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN für %@ eingeben"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Digite o PIN de %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ の PIN を入力"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@의 PIN 입력"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "输入 %@ 的 PIN"
+          }
         }
       }
     },
@@ -717,6 +2193,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Exportar biblioteca, que guarda los títulos y el progreso de un perfil en un archivo, está disponible en iPhone, iPad y Mac (Apple TV no tiene selector de archivos). En Apple TV tu biblioteca y tu historial te acompañan a través de tu cuenta VortX."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exporter la bibliothèque, qui enregistre les titres et la progression de visionnage d'un profil dans un fichier, est disponible sur iPhone, iPad et Mac (l'Apple TV n'a pas de sélecteur de fichiers). Sur Apple TV, votre bibliothèque et votre historique vous suivent via votre compte VortX."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bibliothek exportieren, womit die Titel und der Wiedergabefortschritt eines Profils in einer Datei gesichert werden, gibt es auf iPhone, iPad und Mac (Apple TV hat keine Dateiauswahl). Auf Apple TV folgen dir deine Bibliothek und dein Verlauf über dein VortX-Konto."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exportar biblioteca, que salva os títulos e o progresso de exibição de um perfil em um arquivo, existe no iPhone, iPad e Mac (a Apple TV não tem seletor de arquivos). Na Apple TV, sua biblioteca e histórico acompanham você por meio da sua conta VortX."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロファイルのタイトルと視聴進行状況をファイルに保存するライブラリのエクスポートは、iPhone、iPad、Mac で利用できます（Apple TV にはファイルピッカーがありません）。Apple TV では、ライブラリと視聴履歴が VortX アカウントを通じて引き継がれます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로필의 작품과 시청 진행률을 파일로 저장하는 라이브러리 내보내기는 iPhone, iPad, Mac에서 사용할 수 있습니다(Apple TV에는 파일 선택기가 없습니다). Apple TV에서는 라이브러리와 시청 기록이 VortX 계정을 통해 따라옵니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "导出库会将某个配置文件的影片和观看进度保存到文件，该功能在 iPhone、iPad 和 Mac 上可用（Apple TV 没有文件选择器）。在 Apple TV 上，你的库和历史记录通过你的 VortX 账户随你迁移。"
           }
         }
       }
@@ -740,6 +2252,42 @@
             "state": "translated",
             "value": "Buscando la mejor…  %@/%@"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recherche de la meilleure…  %@/%@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Beste wird gesucht …  %@/%@"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Procurando a melhor…  %@/%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最適なものを検索中…  %@/%@"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "최적 소스 찾는 중…  %@/%@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在查找最佳来源…  %@/%@"
+          }
         }
       }
     },
@@ -755,6 +2303,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Tamaño preciso  ·  %@%%"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Réglage précis  ·  %@%%"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Feineinstellung Größe  ·  %@ %%"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajuste fino de tamanho  ·  %@%%"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "微調整サイズ  ·  %@%%"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "미세 크기  ·  %@%%"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "微调大小  ·  %@%%"
           }
         }
       }
@@ -772,6 +2356,42 @@
             "state": "translated",
             "value": "Para usuarios avanzados; una opción=valor por línea. Se aplica sobre los valores predeterminados de VortX la próxima vez que empiece un vídeo."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pour les utilisateurs avancés ; une option=valeur par ligne. Appliqué par-dessus les réglages par défaut de VortX au prochain démarrage d'une vidéo."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Für fortgeschrittene Nutzer; eine Option=Wert pro Zeile. Wird beim nächsten Videostart zusätzlich zu den Standardwerten von VortX angewendet."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Para usuários avançados; uma opção=valor por linha. Aplicada sobre os padrões da VortX na próxima vez que um vídeo iniciar."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上級者向け。1 行に 1 つ option=value を記述します。次回動画開始時に VortX のデフォルト設定に上書き適用されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "고급 사용자용. 한 줄에 option=value 하나씩 입력합니다. 다음 동영상 시작 시 VortX 기본값 위에 적용됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "面向高级用户；每行一个 option=value。下次视频开始播放时会在 VortX 的默认设置之上应用。"
+          }
         }
       }
     },
@@ -787,6 +2407,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Completa"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Complet"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voll"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Completa"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "フル"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "전체"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "完整"
           }
         }
       }
@@ -804,6 +2460,42 @@
             "state": "translated",
             "value": "Recibe una notificación cuando esté a punto de emitirse un nuevo episodio de una serie que abras. Se programa en el dispositivo para los próximos episodios, así que no hace falta seguimiento en segundo plano."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recevez une notification lorsqu'un nouvel épisode d'une série que vous ouvrez est sur le point d'être diffusé. Planifié sur l'appareil pour les épisodes à venir, sans suivi en arrière-plan."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erhalte eine Benachrichtigung, wenn eine neue Folge einer von dir geöffneten Serie demnächst ausgestrahlt wird. Für anstehende Folgen direkt auf dem Gerät geplant, sodass kein Tracking im Hintergrund nötig ist."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Receba uma notificação quando um novo episódio de uma série que você abriu estiver prestes a ir ao ar. Agendado no dispositivo para os próximos episódios, então nenhum rastreamento em segundo plano é necessário."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "開いたシリーズの新しいエピソードが放送される直前に通知を受け取ります。今後のエピソード用にデバイス上でスケジュールされるため、バックグラウンドでの追跡は不要です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "열어본 시리즈의 새 에피소드가 곧 방영될 때 알림을 받으세요. 다가오는 에피소드에 대해 기기에서 예약되므로 백그라운드 추적이 필요 없습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在你打开的某部剧集即将播出新一集时收到通知。会在设备上为即将播出的剧集排定通知，因此无需后台跟踪。"
+          }
         }
       }
     },
@@ -819,6 +2511,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ve a link.stremio.com e introduce este código"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Allez sur link.stremio.com et saisissez ce code"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gehe zu link.stremio.com und gib diesen Code ein"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acesse link.stremio.com e digite este código"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "link.stremio.com にアクセスし、このコードを入力してください"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "link.stremio.com으로 이동하여 이 코드를 입력하세요"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "前往 link.stremio.com 并输入此代码"
           }
         }
       }
@@ -836,6 +2564,42 @@
             "state": "translated",
             "value": "Entendido"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compris"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verstanden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Entendi"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "확인"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "知道了"
+          }
         }
       }
     },
@@ -851,6 +2615,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Palabras a ocultar"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Masquer des mots"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wörter ausblenden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ocultar palavras"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "単語を非表示"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "단어 숨기기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "隐藏词语"
           }
         }
       }
@@ -868,6 +2668,42 @@
             "state": "translated",
             "value": "Oculta las fuentes para adultos y CAM/falsas de este perfil. Para un bloqueo completo, pon un PIN en tu propio perfil para que no se pueda abrir desde aquí, y oculta los complementos para adultos en Complementos."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Masque les sources pour adultes et CAM/de fausse qualité pour ce profil. Pour un verrouillage complet, définissez un code PIN sur votre propre profil afin qu'il ne puisse pas être ouvert d'ici, et masquez les add-ons pour adultes dans Add-ons."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Blendet Inhalte für Erwachsene sowie CAM-/Fake-Quellen in diesem Profil aus. Für eine vollständige Sperre lege eine PIN für dein eigenes Profil fest, damit es von hier aus nicht geöffnet werden kann, und blende Erwachsenen-Add-ons unter Add-ons aus."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oculta fontes adultas e CAM/falsas deste perfil. Para um bloqueio completo, defina um PIN no seu próprio perfil para que ele não possa ser aberto daqui, e oculte complementos adultos em Complementos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このプロファイルからアダルトと CAM/偽のソースを非表示にします。完全にロックするには、自分のプロファイルに PIN を設定してここから開けないようにし、アドオンでアダルトアドオンを非表示にしてください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 프로필에서 성인 및 CAM/가짜 소스를 숨깁니다. 완전히 잠그려면 본인 프로필에 PIN을 설정하여 여기서 열 수 없도록 하고, 부가 기능에서 성인 부가 기능을 숨기세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "对此配置文件隐藏成人内容及 CAM/伪造来源。若需完整锁定，请在你自己的配置文件上设置 PIN，使其无法从这里被打开，并在“附加组件”中隐藏成人附加组件。"
+          }
         }
       }
     },
@@ -883,6 +2719,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Oculta las fuentes mayores que el límite (p. ej. 1080p pero no un archivo de 20 GB). Las fuentes sin tamaño indicado se conservan."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Masque les sources dépassant la limite (par ex. 1080p mais pas un fichier de 20 GB). Les sources sans taille indiquée sont conservées."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Blendet Quellen aus, die größer als das Limit sind (z. B. 1080p, aber keine 20-GB-Datei). Quellen ohne angegebene Größe bleiben erhalten."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oculta fontes maiores que o limite (ex.: 1080p, mas não um arquivo de 20 GB). Fontes sem tamanho informado são mantidas."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上限より大きいソース（例: 1080p だが 20 GB のファイルではない）を非表示にします。サイズが記載されていないソースは残ります。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "용량 상한보다 큰 소스를 숨깁니다(예: 1080p이지만 20 GB 파일은 아님). 용량 정보가 없는 소스는 유지됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "隐藏大于上限的来源（例如 1080p 但不含 20 GB 的文件）。未标注大小的来源会被保留。"
           }
         }
       }
@@ -900,6 +2772,42 @@
             "state": "translated",
             "value": "Si este título debería tener fuentes, el complemento puede estar fuera de línea o su configuración caducada. Prueba otro complemento de fuentes."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Si ce titre devrait avoir des sources, l'add-on est peut-être hors ligne ou sa configuration a expiré. Essayez un autre add-on de sources."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wenn dieser Titel Quellen haben sollte, ist das Add-on möglicherweise offline oder seine Konfiguration abgelaufen. Probiere ein anderes Stream-Add-on."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se este título deveria ter fontes, o complemento pode estar offline ou sua configuração pode ter expirado. Tente outro complemento de streams."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このタイトルにソースがあるはずの場合、アドオンがオフラインか、設定の有効期限が切れている可能性があります。別のストリームアドオンを試してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 작품에 소스가 있어야 한다면, 부가 기능이 오프라인이거나 설정이 만료되었을 수 있습니다. 다른 스트림 부가 기능을 시도해 보세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "如果此影片本应有来源，可能是该附加组件已离线或其配置已过期。请尝试另一个 stream 附加组件。"
+          }
         }
       }
     },
@@ -915,6 +2823,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Importar desde Stremio"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Importer depuis Stremio"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aus Stremio importieren"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Importar do Stremio"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio からインポート"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio에서 가져오기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从 Stremio 导入"
           }
         }
       }
@@ -932,6 +2876,42 @@
             "state": "translated",
             "value": "Instala la nueva versión desde la página de releases de GitHub; tu inicio de sesión y ajustes se conservan."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Installez la nouvelle version depuis la page des releases GitHub ; votre connexion et vos réglages sont conservés."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Installiere den neuen Build von der GitHub-Releases-Seite; deine Anmeldung und Einstellungen werden übernommen."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instale a nova versão pela página de releases do GitHub; seu login e configurações são mantidos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub のリリースページから新しいビルドをインストールしてください。サインインと設定は引き継がれます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 릴리스 페이지에서 새 빌드를 설치하세요. 로그인과 설정은 그대로 유지됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从 GitHub 发布页安装新构建版本；你的登录和设置会随之保留。"
+          }
         }
       }
     },
@@ -947,6 +2927,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Mantiene su propio historial de visualización, sincronizado a través de tu cuenta Stremio en tus otros dispositivos."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conserve son propre historique de visionnage, synchronisé via votre compte Stremio vers vos autres appareils."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Behält einen eigenen Wiedergabeverlauf, der über dein Stremio-Konto mit deinen anderen Geräten synchronisiert wird."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mantém o próprio histórico de exibição, sincronizado pela sua conta Stremio com os seus outros dispositivos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "独自の視聴履歴を保持し、Stremio アカウントを通じて他のデバイスに同期します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자체 시청 기록을 유지하며, Stremio 계정을 통해 다른 기기와 동기화됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保留它自己的观看历史，通过你的 Stremio 账户同步到你的其他设备。"
           }
         }
       }
@@ -964,6 +2980,42 @@
             "state": "translated",
             "value": "Biblioteca"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bibliothèque"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bibliothek"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Biblioteca"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ライブラリ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "라이브러리"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "库"
+          }
         }
       }
     },
@@ -979,6 +3031,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "EN VIVO"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "EN DIRECT"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "LIVE"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "AO VIVO"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ライブ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "라이브"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "直播"
           }
         }
       }
@@ -996,6 +3084,42 @@
             "state": "translated",
             "value": "TV en vivo"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "TV en direct"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Live-TV"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "TV ao vivo"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ライブ TV"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "라이브 TV"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "电视直播"
+          }
         }
       }
     },
@@ -1011,6 +3135,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Hace el texto de cada pantalla más grande o más pequeño. Los cambios se aplican al instante."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Agrandit ou réduit le texte de tous les écrans. Les changements s'appliquent immédiatement."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Macht den Text auf jedem Bildschirm größer oder kleiner. Änderungen werden sofort übernommen."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deixa o texto de cada tela maior ou menor. As alterações são aplicadas instantaneamente."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "すべての画面の文字を大きくまたは小さくします。変更はすぐに適用されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "모든 화면의 텍스트를 더 크거나 작게 만듭니다. 변경 사항은 즉시 적용됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "让每个屏幕的文字变大或变小。更改即时生效。"
           }
         }
       }
@@ -1028,6 +3188,42 @@
             "state": "translated",
             "value": "Tratar las palabras como regex"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Faire correspondre les mots en regex"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wörter als Regex abgleichen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Corresponder palavras como regex"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "単語を正規表現として一致"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "정규식으로 단어 일치"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "按正则匹配词语"
+          }
         }
       }
     },
@@ -1043,6 +3239,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Servicios de metadatos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Services de métadonnées"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Metadaten-Dienste"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serviços de metadados"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "メタデータサービス"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "메타데이터 서비스"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "元数据服务"
           }
         }
       }
@@ -1060,6 +3292,42 @@
             "state": "translated",
             "value": "Aún no hay catálogos. Instala primero un complemento que proporcione catálogos."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aucun catalogue pour l'instant. Installez d'abord un add-on qui fournit des catalogues."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Noch keine Kataloge. Installiere zuerst ein Add-on, das Kataloge bereitstellt."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nenhum catálogo ainda. Instale primeiro um complemento que forneça catálogos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "カタログがまだありません。まずカタログを提供するアドオンをインストールしてください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아직 카탈로그가 없습니다. 먼저 카탈로그를 제공하는 부가 기능을 설치하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暂无目录。请先安装一个提供目录的附加组件。"
+          }
         }
       }
     },
@@ -1075,6 +3343,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Aún no hay registro. Si el servidor se detuvo, reproduce un título torrent para iniciarlo y vuelve aquí."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aucun journal pour l'instant. Si le serveur s'est arrêté, lancez un titre torrent pour le démarrer, puis revenez ici."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Noch kein Protokoll. Falls der Server gestoppt hat, spiele einen Torrent-Titel ab, um ihn zu starten, und kehre dann hierher zurück."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nenhum registro ainda. Se o servidor parou, reproduza um título via torrent para iniciá-lo e volte aqui."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ログがまだありません。サーバーが停止した場合は、torrent のタイトルを再生して起動し、ここに戻ってください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "아직 로그가 없습니다. 서버가 중지되었다면 torrent 작품을 재생하여 서버를 시작한 후 여기로 돌아오세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暂无日志。如果服务器已停止，请播放一部 torrent 影片以启动它，然后返回这里。"
           }
         }
       }
@@ -1098,6 +3402,42 @@
             "state": "translated",
             "value": "Ninguno de tus %@ complemento%@ devolvió una fuente reproducible para este título."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aucun de vos %@ add-on%@ n'a renvoyé de source lisible pour ce titre."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keines deiner %@ Add-on%@ hat für diesen Titel eine abspielbare Quelle geliefert."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nenhum dos seus %@ complemento%@ retornou uma fonte reproduzível para este título."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 個のアドオン%@ のいずれも、このタイトルの再生可能なソースを返しませんでした。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 부가 기능 %@개 중 어느 것도 이 작품에 대해 재생 가능한 소스를 반환하지 않았습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你的 %@ 个附加组件%@ 均未返回此影片的可播放来源。"
+          }
         }
       }
     },
@@ -1113,6 +3453,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Notificaciones"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notifications"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Benachrichtigungen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notificações"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "通知"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "알림"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "通知"
           }
         }
       }
@@ -1130,6 +3506,42 @@
             "state": "translated",
             "value": "Desactivado"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Désactivé"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aus"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Desligado"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "オフ"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "끄기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "关闭"
+          }
         }
       }
     },
@@ -1145,6 +3557,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "확인"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "好"
           }
         }
       }
@@ -1162,6 +3610,42 @@
             "state": "translated",
             "value": "OLED Black"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Noir OLED"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED Black"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preto OLED"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED Black"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED 블랙"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED 黑"
+          }
         }
       }
     },
@@ -1177,6 +3661,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "En Apple TV llegará pronto una copia de seguridad por escaneo con el móvil: Copia de seguridad mostrará un código QR, lo escaneas con el móvil y tus ajustes se guardan en tu cuenta VortX. Restaurar muestra otro código para traerlos de vuelta. Hasta entonces, al iniciar sesión se restauran aquí tu biblioteca, complementos e historial de visualización."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sur Apple TV, une sauvegarde par scan avec votre téléphone arrive : Sauvegarder affichera un code QR, vous le scannez avec votre téléphone, et vos réglages sont enregistrés sur votre compte VortX. Restaurer affiche un autre code pour les récupérer aussitôt. En attendant, la connexion restaure ici votre bibliothèque, vos add-ons et votre historique de visionnage."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auf Apple TV kommt bald ein Backup per Scan mit deinem Telefon: Backup zeigt einen QR-Code, du scannst ihn mit deinem Telefon, und deine Einstellungen werden in deinem VortX-Konto gespeichert. Wiederherstellung zeigt einen weiteren Code, um sie direkt zurückzuholen. Bis dahin stellt die Anmeldung deine Bibliothek, Add-ons und deinen Wiedergabeverlauf hier wieder her."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Na Apple TV está chegando um backup feito com a leitura pelo celular: o Backup mostrará um código QR, você o lê com o celular e suas configurações são salvas na sua conta VortX. Restaurar mostra outro código para trazê-las de volta. Até lá, fazer login restaura sua biblioteca, complementos e histórico de exibição aqui."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apple TV では、スマートフォンでスキャンするバックアップが近日対応予定です。バックアップが QR コードを表示し、スマートフォンでスキャンすると、設定が VortX アカウントに保存されます。復元では別のコードが表示され、すぐに元に戻せます。それまでは、サインインするとライブラリ、アドオン、視聴履歴がここに復元されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apple TV에서는 휴대폰으로 스캔하는 백업이 곧 제공됩니다. 백업이 QR 코드를 표시하면 휴대폰으로 스캔하고, 설정이 VortX 계정에 저장됩니다. 복원은 또 다른 코드를 표시해 바로 가져옵니다. 그때까지는 로그인하면 여기에서 라이브러리, 부가 기능, 시청 기록이 복원됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apple TV 上即将推出用手机扫码的备份方式：备份会显示一个 QR 码，你用手机扫描，设置便会保存到你的 VortX 账户。恢复会显示另一个代码以立即取回它们。在此之前，登录即可在这里恢复你的库、附加组件和观看历史。"
           }
         }
       }
@@ -1194,6 +3714,42 @@
             "state": "translated",
             "value": "Abre Cuenta y sincronización e inicia sesión con tu cuenta Stremio. VortX usa el mismo motor, así que tus complementos, tu biblioteca y Continuar viendo llegan automáticamente y se mantienen sincronizados en todos tus dispositivos. Nada que exportar ni copiar a mano."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ouvrez Compte et synchronisation et connectez-vous avec votre compte Stremio. VortX fonctionne sur le même moteur, donc vos add-ons, votre bibliothèque et la reprise de lecture arrivent automatiquement et restent synchronisés sur vos appareils. Rien à exporter ou à copier à la main."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Öffne „Konto & Synchronisierung“ und melde dich mit deinem Stremio-Konto an. VortX läuft auf derselben Engine, sodass deine Add-ons, deine Bibliothek und „Weiterschauen“ automatisch übernommen werden und über deine Geräte hinweg synchron bleiben. Nichts muss exportiert oder von Hand kopiert werden."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abra Conta e sincronização e faça login com sua conta Stremio. A VortX roda no mesmo engine, então seus complementos, biblioteca e Continuar assistindo vêm automaticamente e ficam sincronizados entre seus dispositivos. Nada para exportar ou copiar à mão."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "「アカウントと同期」を開き、Stremio アカウントでサインインしてください。VortX は同じエンジンで動作するため、アドオン、ライブラリ、続きを見るが自動的に引き継がれ、デバイス間で同期されます。手動でエクスポートやコピーする必要はありません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "계정 및 동기화를 열고 Stremio 계정으로 로그인하세요. VortX는 동일한 엔진에서 실행되므로 부가 기능, 라이브러리, 이어 보기가 자동으로 넘어오고 기기 간에 동기화 상태로 유지됩니다. 직접 내보내거나 복사할 것이 없습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开“账户与同步”并使用你的 Stremio 账户登录。VortX 运行在相同的引擎上，因此你的附加组件、库和继续观看会自动迁移过来，并在你的各设备间保持同步。无需手动导出或复制任何内容。"
+          }
         }
       }
     },
@@ -1209,6 +3765,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Opcional. Una cuenta gratuita y cifrada de extremo a extremo mantiene a salvo tus perfiles, ajustes y biblioteca en todos los dispositivos."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Facultatif. Un compte gratuit et chiffré de bout en bout garde vos profils, vos réglages et votre bibliothèque en sécurité sur tous vos appareils."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional. Ein kostenloses, Ende-zu-Ende-verschlüsseltes Konto hält deine Profile, Einstellungen und Bibliothek geräteübergreifend sicher."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opcional. Uma conta gratuita e com criptografia de ponta a ponta mantém seus perfis, configurações e biblioteca seguros entre dispositivos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "任意。無料のエンドツーエンド暗号化アカウントは、プロファイル、設定、ライブラリをデバイス間で安全に保ちます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택 사항. 무료 종단 간 암호화 계정은 기기 간에 프로필, 설정, 라이브러리를 안전하게 보호합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选。免费的端到端加密账户可在各设备间安全保存你的配置文件、设置和库。"
           }
         }
       }
@@ -1226,6 +3818,42 @@
             "state": "translated",
             "value": "Opcional. Añade tus propias claves de TMDB y MDBList para enriquecer recomendaciones y valoraciones. Nada aquí es obligatorio y tus claves permanecen en este dispositivo (y se sincronizan, cifradas, con tu cuenta VortX)."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Facultatif. Ajoutez vos propres clés TMDB et MDBList pour enrichir les recommandations et les notes. Rien ici n'est obligatoire et vos clés restent sur cet appareil (et se synchronisent, chiffrées, vers votre compte VortX)."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional. Füge deine eigenen TMDB- und MDBList-Schlüssel hinzu, um Empfehlungen und Bewertungen anzureichern. Nichts davon ist erforderlich und deine Schlüssel bleiben auf diesem Gerät (und werden verschlüsselt mit deinem VortX-Konto synchronisiert)."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opcional. Adicione suas próprias chaves do TMDB e do MDBList para enriquecer recomendações e avaliações. Nada aqui é obrigatório e suas chaves ficam neste dispositivo (e sincronizam, criptografadas, com a sua conta VortX)."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "任意。独自の TMDB と MDBList のキーを追加すると、おすすめや評価が充実します。ここでの入力は必須ではなく、キーはこのデバイスに保存されます（暗号化されて VortX アカウントに同期されます）。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택 사항. 직접 보유한 TMDB 및 MDBList 키를 추가하여 추천과 평점을 풍부하게 만드세요. 여기에 필수 항목은 없으며, 키는 이 기기에 보관됩니다(그리고 암호화되어 VortX 계정에 동기화됩니다)."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "可选。添加你自己的 TMDB 和 MDBList 密钥以丰富推荐和评分。此处没有任何项是必需的，你的密钥保留在本设备上（并加密同步到你的 VortX 账户）。"
+          }
         }
       }
     },
@@ -1241,6 +3869,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Pega las URL de manifiesto de los complementos, una por línea, y luego instálalos todos de una vez."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Collez les URL de manifeste des add-ons, une par ligne, puis installez-les toutes en une seule étape."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Füge Add-on-Manifest-URLs ein, eine pro Zeile, und installiere sie dann alle in einem Schritt."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cole os URLs de manifesto dos complementos, um por linha, e instale todos de uma só vez."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アドオンのマニフェスト URL を 1 行に 1 つ貼り付け、一度にすべてインストールします。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "부가 기능 매니페스트 URL을 한 줄에 하나씩 붙여넣은 다음 한 번에 모두 설치하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "粘贴附加组件清单 URL，每行一个，然后一步全部安装。"
           }
         }
       }
@@ -1258,6 +3922,42 @@
             "state": "translated",
             "value": "Auto de rendimiento mantiene la experiencia completa en dispositivos potentes y cambia a una más ligera en hardware más débil. Reducido recorta las animaciones y reduce los búferes de reproducción. Reinicia la app tras cambiar esto."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Performances Auto conserve l'expérience complète sur les appareils performants et bascule vers une version allégée sur le matériel plus faible. Réduit allège les animations et réduit les tampons de lecture. Redémarrez l'app après cette modification."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Leistung „Automatisch“ behält das volle Erlebnis auf leistungsfähigen Geräten bei und wechselt auf schwächerer Hardware zu einem schlankeren. Reduziert kürzt Animationen und verkleinert die Wiedergabe-Puffer. Starte die App nach dieser Änderung neu."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O modo Desempenho Automático mantém a experiência completa em dispositivos capazes e muda para uma mais leve em hardware mais fraco. O modo Reduzido corta animações e diminui os buffers de reprodução. Reinicie o app após alterar isto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "パフォーマンスの自動は、対応デバイスではフル体験を維持し、性能の低いハードウェアでは軽量版に切り替えます。軽量化はアニメーションを減らし、再生バッファを小さくします。変更後はアプリを再起動してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "성능 자동은 성능이 충분한 기기에서는 전체 환경을 유지하고, 성능이 낮은 하드웨어에서는 더 가벼운 환경으로 전환합니다. 감소 설정은 애니메이션을 줄이고 재생 버퍼를 축소합니다. 변경 후 앱을 다시 시작하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "性能“自动”模式在性能足够的设备上保留完整体验，并在较弱的硬件上切换为轻量体验。精简模式会减少动画并缩小播放缓冲。更改此项后请重启应用。"
+          }
         }
       }
     },
@@ -1273,6 +3973,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Elige un archivo"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choisir un fichier"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Datei auswählen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escolher um arquivo"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ファイルを選択"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "파일 선택"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择文件"
           }
         }
       }
@@ -1290,6 +4026,42 @@
             "state": "translated",
             "value": "Elige el aspecto de la barra de progreso durante la reproducción. La vista previa muestra cada diseño."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Choisissez l'apparence de la barre de lecture pendant la lecture. L'aperçu montre chaque style."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wähle, wie der Fortschrittsbalken während der Wiedergabe aussieht. Die Vorschau zeigt jedes Design."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escolha a aparência da barra de progresso durante a reprodução. A pré-visualização mostra cada estilo."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "再生中のスクラバーの見た目を選択します。プレビューで各デザインが表示されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "재생 중 스크러버가 어떻게 보일지 선택하세요. 미리 보기에 각 디자인이 표시됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择播放时进度条的外观。预览会显示每种设计。"
+          }
         }
       }
     },
@@ -1305,6 +4077,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Reproducir un enlace"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lire un lien"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Link abspielen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproduzir um link"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "リンクを再生"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "링크 재생"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放链接"
           }
         }
       }
@@ -1322,6 +4130,42 @@
             "state": "translated",
             "value": "Reproducción"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lecture"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wiedergabe"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reprodução"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "再生"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "재생"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放"
+          }
         }
       }
     },
@@ -1337,6 +4181,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Reproduciendo en %@s"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lecture dans %@ s"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wiedergabe in %@ s"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproduzindo em %@s"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 秒後に再生"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@초 후 재생"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ 秒后播放"
           }
         }
       }
@@ -1354,6 +4234,42 @@
             "state": "translated",
             "value": "Perfiles"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Profils"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Profile"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Perfis"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロファイル"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로필"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "配置文件"
+          }
         }
       }
     },
@@ -1369,6 +4285,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Preajuste de calidad"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Préréglage de qualité"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Qualitätsvoreinstellung"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Predefinição de qualidade"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "画質プリセット"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "화질 프리셋"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "画质预设"
           }
         }
       }
@@ -1386,6 +4338,42 @@
             "state": "translated",
             "value": "Valoraciones en los pósteres"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notes sur les affiches"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bewertungen auf Postern"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avaliações nos pôsteres"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ポスターに評価"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "포스터에 평점 표시"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "海报上显示评分"
+          }
         }
       }
     },
@@ -1401,6 +4389,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Búsquedas recientes"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recherches récentes"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Letzte Suchanfragen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Buscas recentes"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最近の検索"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "최근 검색"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "最近搜索"
           }
         }
       }
@@ -1418,6 +4442,42 @@
             "state": "translated",
             "value": "Reducido"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Réduit"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reduziert"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reduzida"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "軽量化"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "감소"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "精简"
+          }
         }
       }
     },
@@ -1433,6 +4493,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Palabras obligatorias"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exiger des mots"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wörter erforderlich"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exigir palavras"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "単語を必須"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "단어 필수"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "必须包含词语"
           }
         }
       }
@@ -1456,6 +4552,42 @@
             "state": "translated",
             "value": "T%@ · E%@"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "S%@ · E%@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "S%@ · F%@"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "T%@ · E%@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "S%@ · E%@"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "S%@ · E%@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "第 %@ 季 · 第 %@ 集"
+          }
         }
       }
     },
@@ -1471,6 +4603,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "El filtro de seguridad oculta las fuentes CAM y de calidad falsa. Las palabras a ocultar / obligatorias filtran la lista de fuentes por nombre, separadas por comas (p. ej. ocultar «cam, ts», requerir «remux»)."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le filtre de sécurité masque les sources CAM et de fausse qualité. Masquer / Exiger des mots filtre la liste des sources par nom, séparés par des virgules (par ex. masquer « cam, ts », exiger « remux »)."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der Sicherheitsfilter blendet CAM- und Quellen mit gefälschter Qualität aus. „Wörter ausblenden“ / „Wörter erforderlich“ filtern die Quellenliste nach Namen, durch Kommas getrennt (z. B. ausblenden „cam, ts“, erforderlich „remux“)."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O filtro de segurança oculta fontes CAM e de qualidade falsa. Ocultar / Exigir palavras filtra a lista de fontes pelo nome, separadas por vírgula (ex.: ocultar \"cam, ts\", exigir \"remux\")."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "安全フィルターは CAM と偽の画質のソースを非表示にします。単語の非表示／必須は、ソースリストを名前でフィルターします（カンマ区切り、例: 「cam, ts」を非表示、「remux」を必須）。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "안전 필터는 CAM 및 가짜 화질 소스를 숨깁니다. 단어 숨기기/필수는 소스 목록을 이름으로 필터링하며 쉼표로 구분합니다(예: \"cam, ts\" 숨기기, \"remux\" 필수)."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "安全过滤会隐藏 CAM 和伪造画质来源。隐藏／必须包含词语按名称过滤来源列表，以逗号分隔（例如隐藏“cam, ts”，必须包含“remux”）。"
           }
         }
       }
@@ -1488,6 +4656,42 @@
             "state": "translated",
             "value": "Guardar y usar"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enregistrer et utiliser"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speichern & verwenden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salvar e usar"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存して使用"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장 및 사용"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存并使用"
+          }
         }
       }
     },
@@ -1503,6 +4707,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Guarda tus perfiles, el tema y las preferencias de reproducción en un archivo que puedes conservar, para que una futura actualización importante nunca los pierda. Exportar biblioteca lleva los títulos guardados y el progreso del perfil activo a otro dispositivo o perfil, sin necesidad de cuenta."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enregistrez vos profils, votre thème et vos préférences de lecture dans un fichier que vous pouvez conserver, afin qu'une future mise à jour majeure ne puisse jamais les perdre. Exporter la bibliothèque transfère les titres enregistrés et la progression de visionnage du profil actif vers un autre appareil ou profil, sans compte."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speichere deine Profile, dein Design und deine Wiedergabe-Einstellungen in einer Datei, die du behalten kannst, sodass ein künftiges großes Update sie niemals verlieren kann. „Bibliothek exportieren“ überträgt die gespeicherten Titel und den Wiedergabefortschritt des aktiven Profils auf ein anderes Gerät oder Profil, ohne Konto."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salve seus perfis, tema e preferências de reprodução em um arquivo que você pode guardar, para que uma futura atualização importante nunca os perca. Exportar biblioteca leva os títulos salvos e o progresso de exibição do perfil ativo para outro dispositivo ou perfil, sem precisar de conta."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロファイル、テーマ、再生設定を、保管できるファイルに保存します。今後の大型アップデートでも失われることはありません。ライブラリのエクスポートは、アクティブなプロファイルの保存済みタイトルと視聴進行状況を、別のデバイスやプロファイルに引き継ぎます。アカウントは不要です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로필, 테마, 재생 환경설정을 보관할 수 있는 파일로 저장하여 향후 주요 업데이트에서도 절대 손실되지 않도록 하세요. 라이브러리 내보내기는 활성 프로필에 저장된 작품과 시청 진행률을 다른 기기나 프로필로 옮기며, 계정이 필요 없습니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将你的配置文件、主题和播放偏好保存到一个可保留的文件，让未来的重大更新永远不会丢失它们。导出库会将当前配置文件已保存的影片和观看进度带到另一台设备或配置文件，无需账户。"
           }
         }
       }
@@ -1520,6 +4760,42 @@
             "state": "translated",
             "value": "Guarda tu código de recuperación"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enregistrez votre code de récupération"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Speichere deinen Wiederherstellungscode"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salve seu código de recuperação"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "リカバリーコードを保存"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "복구 코드를 저장하세요"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存你的恢复代码"
+          }
         }
       }
     },
@@ -1535,6 +4811,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Guardado"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enregistré"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gespeichert"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salvo"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "保存しました"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "저장됨"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "已保存"
           }
         }
       }
@@ -1552,6 +4864,42 @@
             "state": "translated",
             "value": "Escanea con tu móvil para abrir esta fuente allí  ·  Pulsa Atrás para descartar"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scannez avec votre téléphone pour ouvrir ce stream là-bas  ·  Appuyez sur Retour pour fermer"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mit deinem Telefon scannen, um diesen Stream dort zu öffnen  ·  Zum Schließen Zurück drücken"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Leia com seu celular para abrir este stream lá  ·  Pressione Voltar para dispensar"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "スマートフォンでスキャンしてそこでこのストリームを開く  ·  「戻る」を押して閉じる"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "휴대폰으로 스캔하여 이 스트림을 그곳에서 여세요  ·  뒤로를 눌러 닫기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "用手机扫码即可在那里打开此串流  ·  按返回键关闭"
+          }
         }
       }
     },
@@ -1567,6 +4915,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Estilo de la barra de progreso"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Style de la barre de lecture"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stil des Fortschrittsbalkens"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estilo da barra de progresso"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "シークバーのスタイル"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "탐색 막대 스타일"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "进度条样式"
           }
         }
       }
@@ -1584,6 +4968,42 @@
             "state": "translated",
             "value": "Select = elegir otra fuente    ·    Reproducir/Pausa = reintentar    ·    Menú = atrás"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select = choisir une autre source    ·    Lecture/Pause = réessayer    ·    Menu = retour"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auswählen = andere Quelle wählen    ·    Wiedergabe/Pause = erneut versuchen    ·    Menü = zurück"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select = escolher outra fonte    ·    Reproduzir/Pausar = tentar de novo    ·    Menu = voltar"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select = 別のソースを選ぶ    ·    再生/一時停止 = 再試行    ·    メニュー = 戻る"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택 = 다른 소스 선택    ·    재생/일시정지 = 다시 시도    ·    메뉴 = 뒤로"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择 = 选择另一个来源    ·    播放/暂停 = 重试    ·    菜单 = 返回"
+          }
         }
       }
     },
@@ -1599,6 +5019,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Selecciona un perfil para editarlo. Cada perfil mantiene su propio aspecto, idiomas, PIN y, opcionalmente, su propia cuenta Stremio. Un perfil con PIN lo pide antes de poder editarse."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sélectionnez un profil pour le modifier. Chaque profil conserve sa propre apparence, ses langues, son code PIN et, en option, son propre compte Stremio. Un profil protégé par un code PIN le demande avant toute modification."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wähle ein Profil zum Bearbeiten. Jedes Profil behält sein eigenes Aussehen, seine Sprachen, seine PIN und optional sein eigenes Stremio-Konto. Ein Profil mit PIN verlangt diese, bevor es bearbeitet werden kann."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Selecione um perfil para editá-lo. Cada perfil mantém a própria aparência, idiomas, PIN e, opcionalmente, a própria conta Stremio. Um perfil com PIN o solicita antes de poder ser editado."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "編集するプロファイルを選択してください。各プロファイルは独自の外観、言語、PIN、そして任意で独自の Stremio アカウントを保持します。PIN が設定されたプロファイルは、編集前に PIN の入力を求めます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "편집할 프로필을 선택하세요. 각 프로필은 고유한 모양, 언어, PIN, 그리고 선택적으로 자체 Stremio 계정을 유지합니다. PIN이 설정된 프로필은 편집하기 전에 PIN을 요구합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "选择一个配置文件进行编辑。每个配置文件保留它自己的外观、语言、PIN，以及可选的它自己的 Stremio 账户。设置了 PIN 的配置文件在被编辑前会要求输入 PIN。"
           }
         }
       }
@@ -1616,6 +5072,42 @@
             "state": "translated",
             "value": "Ajustes"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Réglages"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Einstellungen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Configurações"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "設定"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "설정"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "设置"
+          }
         }
       }
     },
@@ -1631,6 +5123,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Instala mediante sideload el nuevo IPA desde la página de releases de GitHub; tu inicio de sesión y ajustes se conservan."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chargez le nouveau IPA en sideload depuis la page des releases GitHub, votre connexion et vos réglages sont conservés."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lade die neue IPA von der GitHub-Releases-Seite per Sideload; deine Anmeldung und Einstellungen werden übernommen."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Faça o sideload do novo IPA pela página de releases do GitHub; seu login e configurações são mantidos."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub のリリースページから新しい IPA をサイドロードしてください。サインインと設定は引き継がれます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "GitHub 릴리스 페이지에서 새 IPA를 사이드로드하세요. 로그인과 설정은 그대로 유지됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "从 GitHub 发布页旁加载新的 IPA，你的登录和设置会随之保留。"
           }
         }
       }
@@ -1648,6 +5176,42 @@
             "state": "translated",
             "value": "Al iniciar sesión, tus complementos y tu biblioteca se cargan en la app. Tu cuenta permanece en este dispositivo."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La connexion importe vos add-ons et votre bibliothèque dans l'app. Votre compte reste sur cet appareil."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Durch die Anmeldung werden deine Add-ons und deine Bibliothek in die App geladen. Dein Konto bleibt auf diesem Gerät."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fazer login traz seus complementos e biblioteca para o app. Sua conta permanece neste dispositivo."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "サインインすると、アドオンとライブラリがアプリに取り込まれます。アカウントはこのデバイスに保持されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로그인하면 부가 기능과 라이브러리가 앱으로 가져와집니다. 계정은 이 기기에 보관됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "登录会将你的附加组件和库拉取到应用中。你的账户保留在本设备上。"
+          }
         }
       }
     },
@@ -1663,6 +5227,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ordenar"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Trier"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sortieren"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordenar"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "並べ替え"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "정렬"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "排序"
           }
         }
       }
@@ -1686,6 +5286,42 @@
             "state": "translated",
             "value": "Fuente fallida, probando otra…  (%@/%@)"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Échec de la source, tentative d'une autre…  (%@/%@)"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quelle fehlgeschlagen, eine andere wird versucht …  (%@/%@)"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A fonte falhou, tentando outra…  (%@/%@)"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ソースが失敗しました。別のものを試しています…  (%@/%@)"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "소스 실패, 다른 소스 시도 중…  (%@/%@)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "来源失败，正在尝试另一个…  (%@/%@)"
+          }
         }
       }
     },
@@ -1702,6 +5338,42 @@
             "state": "translated",
             "value": "Prioridad de tipo de fuente"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Priorité du type de source"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Priorität der Quelltypen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prioridade do tipo de fonte"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ソースタイプの優先順位"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "소스 유형 우선순위"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "来源类型优先级"
+          }
         }
       }
     },
@@ -1717,6 +5389,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Las fuentes del tipo superior se clasifican primero dentro de cada nivel de calidad. Debrid y Usenet son siempre instantáneos; las fuentes Torrent requieren disponibilidad de peers."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les sources correspondant au type prioritaire sont classées en premier au sein de chaque palier de qualité. Debrid et Usenet sont toujours instantanés ; les streams Torrent nécessitent la disponibilité de pairs."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quellen, die zum obersten Typ passen, werden innerhalb jeder Qualitätsstufe zuerst gereiht. debrid und Usenet sind immer sofort verfügbar; Torrent-Streams erfordern verfügbare Peers."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "As fontes que correspondem ao tipo do topo são classificadas primeiro dentro de cada faixa de qualidade. Debrid e Usenet são sempre instantâneos; streams via Torrent dependem da disponibilidade de peers."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "上位のタイプに一致するソースが、各画質ティア内で最初にランク付けされます。debrid と Usenet は常に瞬時です。torrent ストリームにはピアの利用可能性が必要です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "상위 유형과 일치하는 소스가 각 화질 단계 내에서 먼저 순위가 매겨집니다. debrid와 Usenet은 항상 즉시 재생되며, Torrent 스트림은 피어 가용성이 필요합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "匹配最高类型的来源会在各画质层级内优先排序。debrid 和 Usenet 始终即时；torrent 串流需要有可用的 peer。"
           }
         }
       }
@@ -1740,6 +5448,42 @@
             "state": "translated",
             "value": "Buscando más · %@/%@ complementos"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recherche en cours · %@/%@ add-ons"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Es werden noch weitere gesucht · %@/%@ Add-ons"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ainda procurando mais · %@/%@ complementos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "さらに検索中 · %@/%@ アドオン"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "계속 더 찾는 중 · 부가 기능 %@/%@개"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "仍在查找更多 · %@/%@ 个附加组件"
+          }
         }
       }
     },
@@ -1756,6 +5500,42 @@
             "state": "translated",
             "value": "Servidor de streaming"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Serveur de streaming"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streaming-Server"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servidor de streaming"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ストリーミングサーバー"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "스트리밍 서버"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "流媒体服务器"
+          }
         }
       }
     },
@@ -1771,6 +5551,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Streams"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ストリーム"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "스트림"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "串流"
           }
         }
       }
@@ -1794,6 +5610,42 @@
             "state": "translated",
             "value": "Stremio · %@ complementos · %@ fuentes de streaming"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ add-ons · %@ sources de streams"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ Add-ons · %@ Stream-Quellen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ complementos · %@ fontes de stream"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ アドオン · %@ ストリームソース"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · 부가 기능 %@개 · 스트림 소스 %@개"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ 个附加组件 · %@ 个串流来源"
+          }
         }
       }
     },
@@ -1809,6 +5661,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Estricto"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Strict"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streng"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estrita"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "厳格"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "엄격"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "严格"
           }
         }
       }
@@ -1826,6 +5714,42 @@
             "state": "translated",
             "value": "Da estilo a los subtítulos del reproductor integrado. Elige qué pista de subtítulos mostrar desde el reproductor mientras ves algo."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Met en forme les sous-titres du lecteur intégré. Choisissez la piste de sous-titres à afficher depuis le lecteur pendant le visionnage."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Gestaltet die Untertitel des integrierten Players. Wähle während des Schauens im Player, welche Untertitelspur angezeigt wird."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estiliza as legendas do player integrado. Escolha qual faixa de legenda exibir a partir do player enquanto assiste."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内蔵プレーヤーの字幕のスタイルを設定します。視聴中にプレーヤーから表示する字幕トラックを選択できます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "내장 플레이어의 자막 스타일을 지정합니다. 시청 중 플레이어에서 표시할 자막 트랙을 선택하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "为内置播放器的字幕设置样式。在观看时从播放器中选择要显示的字幕轨道。"
+          }
         }
       }
     },
@@ -1841,6 +5765,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Estilo de subtítulos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Style des sous-titres"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Untertitel-Stil"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estilo das legendas"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "字幕スタイル"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "자막 스타일"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "字幕样式"
           }
         }
       }
@@ -1858,6 +5818,42 @@
             "state": "translated",
             "value": "Cambia a %@ para usarlo y editar sus ajustes."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Basculez vers %@ pour l'utiliser et modifier ses réglages."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wechsle zu %@, um es zu verwenden und seine Einstellungen zu bearbeiten."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mude para %@ para usá-lo e editar suas configurações."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ に切り替えて使用し、その設定を編集します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@(으)로 전환하여 사용하고 설정을 편집하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "切换到 %@ 以使用它并编辑其设置。"
+          }
         }
       }
     },
@@ -1873,6 +5869,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ese enlace no responde en este momento. Prueba una fuente diferente."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ce lien ne répond pas pour le moment. Essayez une autre source."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dieser Link antwortet gerade nicht. Probiere eine andere Quelle."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esse link não está respondendo agora. Tente outra fonte."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "そのリンクは現在応答していません。別のソースを試してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "해당 링크가 지금 응답하지 않습니다. 다른 소스를 시도해 보세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "该链接当前没有响应。请尝试其他来源。"
           }
         }
       }
@@ -1890,6 +5922,42 @@
             "state": "translated",
             "value": "Esa fuente de subtítulos no respondió a tiempo. Prueba con otra."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cette source de sous-titres n'a pas répondu à temps. Essayez-en une autre."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diese Untertitelquelle hat nicht rechtzeitig geantwortet. Probiere eine andere."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Essa fonte de legendas não respondeu a tempo. Tente outra."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "その字幕ソースは時間内に応答しませんでした。別のものを試してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "해당 자막 소스가 제때 응답하지 않았습니다. 다른 것을 시도해 보세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "该字幕来源未能及时响应。请尝试另一个。"
+          }
         }
       }
     },
@@ -1905,6 +5973,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "La app se cierra de inmediato. Vuelve a abrirla desde la pantalla de inicio; el servidor de streaming se reinicia con ella."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "L'app se ferme immédiatement. Rouvrez-la depuis l'écran d'accueil ; le serveur de streaming redémarre avec elle."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die App wird sofort beendet. Öffne sie erneut über den Home-Bildschirm; der Streaming-Server startet mit ihr neu."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O app fecha imediatamente. Abra-o novamente pela Tela de Início; o servidor de streaming reinicia junto."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アプリはすぐに終了します。ホーム画面から再度開いてください。ストリーミングサーバーも一緒に再起動します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "앱이 즉시 종료됩니다. 홈 화면에서 다시 여세요. 스트리밍 서버도 함께 다시 시작됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "应用会立即退出。请从主屏幕再次打开它；流媒体服务器会随之重启。"
           }
         }
       }
@@ -1922,6 +6026,42 @@
             "state": "translated",
             "value": "El perfil principal. Usa el propio historial de visualización de tu cuenta Stremio, como antes de que existieran los perfiles."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le profil principal. Il utilise l'historique de visionnage propre à votre compte Stremio, comme avant l'existence des profils."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Das Hauptprofil. Es verwendet den eigenen Wiedergabeverlauf deines Stremio-Kontos, wie vor der Einführung von Profilen."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O perfil principal. Ele usa o histórico de exibição da sua própria conta Stremio, como antes de os perfis existirem."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "メインのプロファイルです。プロファイルが存在する前と同じように、Stremio アカウント独自の視聴履歴を使用します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "기본 프로필입니다. 프로필이 존재하기 전과 마찬가지로 Stremio 계정 자체의 시청 기록을 사용합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "主配置文件。它使用你的 Stremio 账户自己的观看历史，就像配置文件出现之前那样。"
+          }
         }
       }
     },
@@ -1937,6 +6077,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "El reproductor los selecciona automáticamente al empezar un título. Forzados muestra solo los subtítulos de diálogos en idioma extranjero; Siempre muestra los subtítulos completos en tu idioma. Los títulos en idioma extranjero siempre reciben subtítulos completos para que puedas seguirlos."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Le lecteur les sélectionne automatiquement au démarrage d'un titre. Forcés affiche uniquement les sous-titres des dialogues en langue étrangère ; Toujours affiche les sous-titres complets dans votre langue. Les titres en langue étrangère reçoivent toujours des sous-titres complets pour que vous puissiez suivre."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Der Player wählt diese automatisch aus, wenn ein Titel startet. „Erzwungen“ zeigt nur Untertitel für fremdsprachige Dialoge; „Immer“ zeigt vollständige Untertitel in deiner Sprache. Fremdsprachige Titel erhalten immer vollständige Untertitel, damit du folgen kannst."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O player escolhe estas automaticamente quando um título inicia. Forçadas mostra apenas as legendas de diálogos em outros idiomas; Sempre mostra legendas completas no seu idioma. Títulos em idioma estrangeiro sempre recebem legendas completas para você acompanhar."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "タイトル開始時にプレーヤーがこれらを自動選択します。「強制」は外国語のセリフのキャプションのみを表示し、「常に」は使用言語のフル字幕を表示します。外国語のタイトルには、内容を追えるよう常にフル字幕が表示されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "플레이어는 작품이 시작될 때 이를 자동으로 선택합니다. 강제는 외국어 대사 자막만 표시하고, 항상은 사용 언어로 전체 자막을 표시합니다. 외국어 작품은 따라갈 수 있도록 항상 전체 자막이 표시됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "播放器在影片开始时会自动选择这些。强制只显示外语对白字幕；始终会以你的语言显示完整字幕。外语影片始终会获得完整字幕，以便你跟上剧情。"
           }
         }
       }
@@ -1954,6 +6130,42 @@
             "state": "translated",
             "value": "Los perfiles de esta cuenta difieren de los de este dispositivo. Fusiona ambos para conservar todos los perfiles (recomendado), o fuerza un lado."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les profils de ce compte diffèrent de ceux de cet appareil. Fusionnez les deux pour conserver tous les profils (recommandé), ou forcez un côté."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Die Profile dieses Kontos unterscheiden sich von diesem Gerät. Führe beide zusammen, um jedes Profil zu behalten (empfohlen), oder erzwinge eine Seite."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Os perfis desta conta diferem dos deste dispositivo. Mescle os dois para manter todos os perfis (recomendado) ou force um dos lados."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このアカウントのプロファイルは、このデバイスと異なります。両方をマージしてすべてのプロファイルを保持する（推奨）か、いずれか一方を強制してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 계정의 프로필이 이 기기와 다릅니다. 모든 프로필을 유지하려면 양쪽을 병합하거나(권장), 한쪽을 강제 적용하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此账户的配置文件与本设备不同。合并双方以保留每个配置文件（推荐），或强制采用一方。"
+          }
         }
       }
     },
@@ -1969,6 +6181,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Esto se muestra una sola vez. Es la única forma de volver a entrar si olvidas tu contraseña y pierdes tus dispositivos. Guárdalo en un lugar seguro."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ceci n'est affiché qu'une seule fois. C'est le seul moyen de revenir si vous oubliez votre mot de passe et perdez vos appareils. Conservez-le en lieu sûr."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dies wird nur einmal angezeigt. Es ist der einzige Weg zurück, falls du dein Passwort vergisst und deine Geräte verlierst. Bewahre es an einem sicheren Ort auf."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Isto é exibido apenas uma vez. É a única forma de voltar a entrar caso esqueça sua senha e perca seus dispositivos. Guarde-o em um lugar seguro."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "これは一度だけ表示されます。パスワードを忘れてデバイスを失った場合に戻る唯一の方法です。安全な場所に保管してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 코드는 한 번만 표시됩니다. 비밀번호를 잊고 기기를 잃었을 때 다시 들어올 수 있는 유일한 방법입니다. 안전한 곳에 보관하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此内容仅显示一次。这是你忘记密码并丢失设备后唯一的找回方式。请将其存放在安全的地方。"
           }
         }
       }
@@ -1986,6 +6234,42 @@
             "state": "translated",
             "value": "Este magnet tiene %@ vídeos. Elige cuál reproducir."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ce magnet contient %@ vidéos. Choisissez celle à lire."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dieser Magnet enthält %@ Videos. Wähle, welches abgespielt werden soll."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Este magnet tem %@ vídeos. Escolha qual reproduzir."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この magnet には %@ 本の動画があります。再生する動画を選択してください。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 magnet에는 동영상 %@개가 있습니다. 재생할 항목을 선택하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此磁力链接包含 %@ 个视频。请选择要播放的一个。"
+          }
         }
       }
     },
@@ -2001,6 +6285,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Convertir a SDR"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Convertir en SDR"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "In SDR umwandeln"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tone-mapping para SDR"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "SDR にトーンマッピング"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "SDR로 톤 매핑"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "映射为 SDR"
           }
         }
       }
@@ -2018,6 +6338,42 @@
             "state": "translated",
             "value": "Ilimitado"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Illimité"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unbegrenzt"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ilimitado"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "無制限"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "무제한"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无限制"
+          }
         }
       }
     },
@@ -2033,6 +6389,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "A CONTINUACIÓN"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "À SUIVRE"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ALS NÄCHSTES"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A SEGUIR"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "次に再生"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "다음 재생"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "即将播放"
           }
         }
       }
@@ -2050,6 +6442,42 @@
             "state": "translated",
             "value": "Actualización disponible"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mise à jour disponible"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Update verfügbar"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Atualização disponível"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アップデートあり"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "업데이트 사용 가능"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "有可用更新"
+          }
         }
       }
     },
@@ -2065,6 +6493,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Usar el orden de clasificación de los complementos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Utiliser l'ordre de classement des add-ons"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reihenfolge des Add-on-Rankings verwenden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usar a ordem de classificação dos complementos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "アドオンのランキング順を使用"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "부가 기능 순위 순서 사용"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用附加组件的排序顺序"
           }
         }
       }
@@ -2082,6 +6546,42 @@
             "state": "translated",
             "value": "Usar integrado"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Utiliser l'intégré"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Eingebetteten verwenden"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usar integrado"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "内蔵を使用"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "내장 서버 사용"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用内置服务器"
+          }
         }
       }
     },
@@ -2098,6 +6598,42 @@
             "state": "translated",
             "value": "Usa el servidor integrado en este dispositivo, o apunta VortX a un servidor Stremio remoto / dedicado (por ejemplo uno que ejecutes en casa)."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Utilisez le serveur intégré à cet appareil, ou pointez VortX vers un serveur Stremio distant / dédié (par exemple un que vous hébergez chez vous)."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verwende den auf diesem Gerät eingebetteten Server oder richte VortX auf einen entfernten / dedizierten Stremio-Server aus (zum Beispiel einen, den du zu Hause betreibst)."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Use o servidor integrado neste dispositivo ou aponte a VortX para um servidor Stremio remoto / dedicado (por exemplo, um que você rode em casa)."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "このデバイスに内蔵されたサーバーを使用するか、VortX をリモート／専用の Stremio サーバー（例えば自宅で運用しているもの）に向けます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 기기에 내장된 서버를 사용하거나, VortX를 원격/전용 Stremio 서버(예: 집에서 직접 운영하는 서버)로 연결하세요."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用本设备上内置的服务器，或让 VortX 指向远程／专用的 Stremio 服务器（例如你在家运行的服务器）。"
+          }
         }
       }
     },
@@ -2110,6 +6646,42 @@
           }
         },
         "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "zh-Hans": {
           "stringUnit": {
             "state": "translated",
             "value": "Vort"
@@ -2130,6 +6702,42 @@
             "state": "translated",
             "value": "VortX %@"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
         }
       }
     },
@@ -2145,6 +6753,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cuenta VortX"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compte VortX"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX-Konto"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conta VortX"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX アカウント"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX 계정"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX 账户"
           }
         }
       }
@@ -2162,6 +6806,42 @@
             "state": "translated",
             "value": "Cálido"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Chaud"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Warm"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quente"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暖色"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "따뜻함"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "暖色"
+          }
         }
       }
     },
@@ -2177,6 +6857,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ver los créditos"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Regarder le générique"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abspann ansehen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Assistir aos créditos"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "クレジットを見る"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "크레딧 보기"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "观看演职员表"
           }
         }
       }
@@ -2194,6 +6910,42 @@
             "state": "translated",
             "value": "Novedades"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nouveautés"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Neuigkeiten"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Novidades"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新着情報"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "새로운 기능"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "新功能"
+          }
         }
       }
     },
@@ -2209,6 +6961,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Cuando está activado, las fuentes aparecen en el orden en que las devuelven tus complementos. Útil si usas un complemento de clasificación como AIOStreams. Cuando está desactivado, se aplica la clasificación de la app."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lorsque cette option est activée, les streams apparaissent dans l'ordre où vos add-ons les renvoient. Utile si vous utilisez un add-on de classement comme AIOStreams. Lorsqu'elle est désactivée, le classement propre à l'app s'applique."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wenn aktiviert, erscheinen Streams in der Reihenfolge, in der deine Add-ons sie zurückgeben. Nützlich, wenn du ein Ranking-Add-on wie AIOStreams verwendest. Wenn deaktiviert, gilt das eigene Ranking der App."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quando ligado, os streams aparecem na ordem em que seus complementos os retornam. Útil se você usa um complemento de classificação como o AIOStreams. Quando desligado, a classificação própria do app é aplicada."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "オンにすると、アドオンが返した順序でストリームが表示されます。AIOStreams のようなランキングアドオンを使用している場合に便利です。オフにすると、アプリ独自のランキングが適用されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "켜면 스트림이 부가 기능이 반환하는 순서대로 표시됩니다. AIOStreams 같은 순위 부가 기능을 사용할 때 유용합니다. 끄면 앱 자체 순위가 적용됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "开启时，串流会按你的附加组件返回它们的顺序显示。如果你使用 AIOStreams 等排序附加组件，这会很有用。关闭时，将应用应用自身的排序。"
           }
         }
       }
@@ -2226,6 +7014,42 @@
             "state": "translated",
             "value": "Dónde ver"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Où regarder"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wo zu sehen"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Onde assistir"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "視聴できる場所"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "시청 가능한 곳"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "在哪里观看"
+          }
         }
       }
     },
@@ -2241,6 +7065,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "¿Quién está viendo?"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Qui regarde ?"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Wer schaut?"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quem está assistindo?"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "誰が見ていますか？"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "누가 보고 있나요?"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "谁在观看？"
           }
         }
       }
@@ -2258,6 +7118,42 @@
             "state": "translated",
             "value": "PIN incorrecto"
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Code PIN incorrect"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Falsche PIN"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN incorreto"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN が違います"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "잘못된 PIN"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN 错误"
+          }
         }
       }
     },
@@ -2274,6 +7170,42 @@
             "state": "translated",
             "value": "XRDB (extendedratings.com) integra valoraciones de hasta 12 fuentes, insignias de calidad y logotipos de proveedores de streaming en tus pósteres y fondos. Usa tu propia instancia XRDB o una alojada, configura su dirección y tu alias de perfil, y VortX carga sus imágenes en todas partes. Opcional y sin relación con debrid."
           }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB (extendedratings.com) intègre des notes provenant de jusqu'à 12 sources, des badges de qualité et des logos de fournisseurs de streaming sur vos affiches et arrière-plans. Hébergez votre propre instance XRDB ou utilisez-en une hébergée, indiquez son adresse et l'alias de votre profil, et VortX en charge les visuels partout. Facultatif, et sans rapport avec debrid."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB (extendedratings.com) brennt Bewertungen aus bis zu 12 Quellen, Qualitäts-Badges und Logos von Streaming-Anbietern auf deine Poster und Hintergründe. Betreibe deine eigene XRDB-Instanz oder nutze eine gehostete, lege ihre Adresse und deinen Profil-Alias fest, und VortX lädt ihre Artworks überall. Optional und unabhängig von debrid."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "O XRDB (extendedratings.com) imprime nos seus pôsteres e backdrops as avaliações de até 12 fontes, selos de qualidade e logotipos de provedores de streaming. Rode sua própria instância do XRDB ou use uma hospedada, defina seu endereço e o alias do seu perfil, e a VortX carrega as artes em todos os lugares. Opcional e sem relação com debrid."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB（extendedratings.com）は、最大 12 のソースからの評価、品質バッジ、ストリーミングプロバイダーのロゴをポスターと背景に焼き込みます。独自の XRDB インスタンスを運用するか、ホスティング版を使用し、そのアドレスとプロファイルのエイリアスを設定すると、VortX がどこでもそのアートワークを読み込みます。任意で、debrid とは無関係です。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB(extendedratings.com)는 최대 12개 소스의 평점, 화질 배지, 스트리밍 제공업체 로고를 포스터와 배경에 입힙니다. 직접 XRDB 인스턴스를 운영하거나 호스팅된 것을 사용하고, 주소와 프로필 별칭을 설정하면 VortX가 모든 곳에 아트워크를 로드합니다. 선택 사항이며 debrid와는 무관합니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB（extendedratings.com）会将最多 12 个来源的评分、画质徽章和流媒体提供商标志烘焙到你的海报和背景图上。运行你自己的 XRDB 实例或使用托管实例，设置其地址和你的配置文件别名，VortX 即可在各处加载其图像。可选，且与 debrid 无关。"
+          }
         }
       }
     },
@@ -2289,6 +7221,42 @@
           "stringUnit": {
             "state": "translated",
             "value": "Tus perfiles, ajustes y claves de metadatos se sincronizan con esta cuenta, cifrados de extremo a extremo. También se sincronizan automáticamente un momento después de cualquier cambio."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vos profils, vos réglages et vos clés de métadonnées se synchronisent vers ce compte, chiffrés de bout en bout. Ils se synchronisent aussi automatiquement un instant après chaque modification."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Deine Profile, Einstellungen und Metadaten-Schlüssel werden Ende-zu-Ende-verschlüsselt mit diesem Konto synchronisiert. Sie werden außerdem kurz nach jeder Änderung automatisch synchronisiert."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seus perfis, configurações e chaves de metadados sincronizam com esta conta, com criptografia de ponta a ponta. Eles também sincronizam automaticamente um instante após qualquer alteração."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "プロファイル、設定、メタデータのキーが、エンドツーエンド暗号化でこのアカウントに同期されます。変更後も少し経つと自動的に同期されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "프로필, 설정, 메타데이터 키가 종단 간 암호화되어 이 계정에 동기화됩니다. 변경이 있은 직후에도 자동으로 동기화됩니다."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你的配置文件、设置和元数据密钥会端到端加密同步到此账户。它们也会在任何更改后片刻自动同步。"
           }
         }
       }
