@@ -46,6 +46,8 @@ pub enum HiveError {
     FutureFact,
     #[error("malformed infohash (want 40 lowercase hex chars)")]
     MalformedInfohash,
+    #[error("malformed quality tag (no '|' or control chars, max 16 chars)")]
+    MalformedQuality,
     #[error("unknown debrid service")]
     UnknownService,
     #[error("base64url decode error")]

@@ -140,9 +140,27 @@ pub fn signing_bytes_for(
     out
 }
 
+/// Validate and normalize a fact's `quality` tag. It rides mid-payload in the `|`-delimited canonical
+/// signing bytes, so it must not contain `|` or control chars (which would shift downstream fields and let
+/// two distinct facts collide on one signing string), and it is length-capped. `Some("")` normalizes to
+/// `None` so an empty quality is byte-identical to an absent one.
+fn validate_quality(quality: Option<String>) -> Result<Option<String>, HiveError> {
+    match quality {
+        None => Ok(None),
+        Some(q) if q.is_empty() => Ok(None),
+        Some(q) => {
+            if q.chars().count() > 16 || q.chars().any(|c| c == '|' || c.is_control()) {
+                Err(HiveError::MalformedQuality)
+            } else {
+                Ok(Some(q))
+            }
+        }
+    }
+}
+
 impl CacheFact {
-    /// Construct and sign a fact with `identity`. Normalizes the infohash; the signature covers the
-    /// canonical bytes, never the serialized JSON.
+    /// Construct and sign a fact with `identity`. Normalizes the infohash and validates the quality tag;
+    /// the signature covers the canonical bytes, never the serialized JSON.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         identity: &NodeIdentity,
@@ -156,6 +174,7 @@ impl CacheFact {
         ttl: u64,
     ) -> Result<Self, HiveError> {
         let infohash = normalize_infohash(infohash)?;
+        let quality = validate_quality(quality)?;
         let signer_pubkey = identity.public_b64url();
         let bytes = signing_bytes_for(
             &infohash,
@@ -204,9 +223,12 @@ impl CacheFact {
         verify(&self.signer_pubkey, &self.signing_bytes(), &self.sig)
     }
 
-    /// Whether this fact is past `verified_at + ttl` at `now` (unix seconds).
+    /// Whether this fact is past its effective expiry at `now` (unix seconds). The effective lifetime is
+    /// capped at `PUBLIC_TTL_CAP_SECS`, so no signer can mint an immortal fact with a huge `ttl`; a live
+    /// fact must be re-propagated within the cap, which ages out poisonous claims.
     pub fn is_expired(&self, now: u64) -> bool {
-        self.verified_at.saturating_add(self.ttl) < now
+        let effective_ttl = self.ttl.min(crate::hive_constants::PUBLIC_TTL_CAP_SECS);
+        self.verified_at.saturating_add(effective_ttl) < now
     }
 
     /// The merge key for this fact.
@@ -475,5 +497,61 @@ mod tests {
         merge_fact(&mut b, older, now);
 
         assert_eq!(a, b); // newest wins regardless of order
+    }
+
+    #[test]
+    fn quality_with_delimiter_is_rejected() {
+        // Regression: a '|' in quality would shift the canonical signing fields.
+        let id = NodeIdentity::generate().unwrap();
+        let r = CacheFact::create(
+            &id,
+            IH,
+            DebridService::RealDebrid,
+            true,
+            None,
+            None,
+            Some("1080p|fake".into()),
+            1000,
+            100,
+        );
+        assert!(matches!(r, Err(HiveError::MalformedQuality)));
+    }
+
+    #[test]
+    fn empty_quality_normalizes_to_none() {
+        let id = NodeIdentity::generate().unwrap();
+        let f = CacheFact::create(
+            &id,
+            IH,
+            DebridService::RealDebrid,
+            true,
+            None,
+            None,
+            Some(String::new()),
+            1000,
+            100,
+        )
+        .unwrap();
+        assert_eq!(f.quality, None); // Some("") == None canonically
+    }
+
+    #[test]
+    fn huge_ttl_is_capped_not_immortal() {
+        // Regression: a u64::MAX ttl must still age out at the public cap, not live forever.
+        let id = NodeIdentity::generate().unwrap();
+        let f = CacheFact::create(
+            &id,
+            IH,
+            DebridService::RealDebrid,
+            true,
+            None,
+            None,
+            None,
+            1000,
+            u64::MAX,
+        )
+        .unwrap();
+        // Capped at PUBLIC_TTL_CAP_SECS (6h), so dead well before a far-future `now`.
+        assert!(f.is_expired(1000 + crate::hive_constants::PUBLIC_TTL_CAP_SECS + 1));
     }
 }

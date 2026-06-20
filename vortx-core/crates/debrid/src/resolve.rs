@@ -5,7 +5,7 @@
 //! reused [`vortx_hive`] cross-node cache vault, where expired facts are ignored).
 
 use serde::{Deserialize, Serialize};
-use vortx_hive::{DebridService, HiveCacheMap};
+use vortx_hive::{DebridService, HiveCacheMap, TrustStore, TrustTier};
 
 /// A candidate playable source for a title.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,10 +44,16 @@ pub struct ResolveStep {
     pub rank: u8,
 }
 
-/// A read-only view of which infohashes are cached on which of the user's services.
+/// A read-only view of which infohashes are cached on which of the user's services. `file_idx` selects a
+/// file in a multi-file torrent (`None` = the whole torrent); a cache claim must match the SAME file.
 pub trait CacheView {
-    /// The user service this infohash is cached on right now, if any (`now` = unix seconds).
-    fn cached_service(&self, infohash: &str, now: u64) -> Option<DebridService>;
+    /// The user service this `(infohash, file_idx)` is cached on right now, if any (`now` = unix seconds).
+    fn cached_service(
+        &self,
+        infohash: &str,
+        file_idx: Option<u32>,
+        now: u64,
+    ) -> Option<DebridService>;
 }
 
 /// An in-memory cache view (offline planning / tests): explicit `(infohash, service)` cached pairs.
@@ -62,7 +68,13 @@ impl StaticCacheView {
 }
 
 impl CacheView for StaticCacheView {
-    fn cached_service(&self, infohash: &str, _now: u64) -> Option<DebridService> {
+    // Matches by infohash only (this in-memory test/offline view does not track file granularity).
+    fn cached_service(
+        &self,
+        infohash: &str,
+        _file_idx: Option<u32>,
+        _now: u64,
+    ) -> Option<DebridService> {
         self.entries
             .iter()
             .find(|(hash, _)| hash == infohash)
@@ -70,28 +82,58 @@ impl CacheView for StaticCacheView {
     }
 }
 
-/// A cache view backed by the reused hive CacheFact vault, scoped to the user's services. A fact counts
-/// only if it claims `cached` AND is not expired at `now`; the user's service order breaks ties
-/// deterministically (so the planner is order-independent of the underlying HashMap).
+/// A cache view backed by the reused hive CacheFact vault, scoped to the user's services and GATED by the
+/// trust store. A fact only drives an instant-play (rank-1) decision when it claims `cached`, is not
+/// expired, matches the requested `file_idx`, AND is signed by an OWN or TRUSTED (allowlisted, non-
+/// greylisted) signer. Public / DMM-bulk facts are advisory only and never poison playback here, which is
+/// the load-bearing "never play a cache claim without own-debrid or a trusted source" invariant.
+///
+/// Note: full >=3-signer quorum needs every fact per key, but the merged vault keeps only the latest per
+/// key, so this conservatively requires a trusted (or own) signer. Quorum over a multi-fact accumulator is
+/// a later phase; this is the correct minimal gate that restores the trust model on the playback path.
 pub struct VaultCacheView<'a> {
     vault: &'a HiveCacheMap,
     services: &'a [DebridService],
+    trust: &'a TrustStore,
 }
 
 impl<'a> VaultCacheView<'a> {
-    pub fn new(vault: &'a HiveCacheMap, services: &'a [DebridService]) -> Self {
-        Self { vault, services }
+    pub fn new(
+        vault: &'a HiveCacheMap,
+        services: &'a [DebridService],
+        trust: &'a TrustStore,
+    ) -> Self {
+        Self {
+            vault,
+            services,
+            trust,
+        }
     }
 }
 
 impl CacheView for VaultCacheView<'_> {
-    fn cached_service(&self, infohash: &str, now: u64) -> Option<DebridService> {
+    fn cached_service(
+        &self,
+        infohash: &str,
+        file_idx: Option<u32>,
+        now: u64,
+    ) -> Option<DebridService> {
         self.services.iter().copied().find(|service| {
+            // The advisory bulk tier never drives instant-play.
+            if *service == DebridService::DmmPublic {
+                return false;
+            }
             self.vault.values().any(|fact| {
                 fact.cached
                     && fact.service == *service
                     && fact.infohash == infohash
+                    && fact.file_idx == file_idx
                     && !fact.is_expired(now)
+                    && matches!(
+                        self.trust.tier(&fact.signer_pubkey),
+                        TrustTier::Own | TrustTier::Trusted
+                    )
+                    && !self.trust.greylisted(&fact.signer_pubkey, now)
             })
         })
     }
@@ -122,8 +164,8 @@ impl ResolvePlanner {
             .map(|(i, source)| {
                 let (method, rank) = match source {
                     ResolveSource::Direct { .. } => (ResolveMethod::Direct, 0u8),
-                    ResolveSource::Magnet { infohash, .. } => {
-                        if let Some(service) = cache.cached_service(infohash, now) {
+                    ResolveSource::Magnet { infohash, file_idx } => {
+                        if let Some(service) = cache.cached_service(infohash, *file_idx, now) {
                             (
                                 ResolveMethod::Debrid {
                                     service,
@@ -241,33 +283,118 @@ mod tests {
         assert_eq!(plan[0].rank, 2);
     }
 
+    fn signed_fact(
+        id: &NodeIdentity,
+        service: DebridService,
+        file_idx: Option<u32>,
+        verified_at: u64,
+        ttl: u64,
+    ) -> CacheFact {
+        CacheFact::create(
+            id,
+            IH,
+            service,
+            true,
+            file_idx,
+            None,
+            None,
+            verified_at,
+            ttl,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn expired_vault_fact_is_ignored() {
-        // A fact merged while fresh, then queried after it expires, must NOT count as cached.
-        let id = NodeIdentity::generate().unwrap();
+        // An OWN fact merged while fresh, then queried after it expires, must NOT count as cached.
+        let me = NodeIdentity::generate().unwrap();
         let mut vault = HiveCacheMap::new();
-        let fact = CacheFact::create(
-            &id,
-            IH,
-            DebridService::RealDebrid,
-            true,
-            None,
-            None,
-            None,
-            1000, // verified_at
-            100,  // ttl -> dead at 1100
-        )
-        .unwrap();
-        assert!(merge_fact(&mut vault, fact, 1000)); // accepted while fresh
+        assert!(merge_fact(
+            &mut vault,
+            signed_fact(&me, DebridService::RealDebrid, None, 1000, 100),
+            1000
+        ));
         let services = [DebridService::RealDebrid];
-        let view = VaultCacheView::new(&vault, &services);
+        let trust = TrustStore::new(me.public_b64url()); // me = own tier
+        let view = VaultCacheView::new(&vault, &services, &trust);
 
-        // Fresh: counts as cached.
         assert_eq!(
-            view.cached_service(IH, 1000),
+            view.cached_service(IH, None, 1000),
+            Some(DebridService::RealDebrid)
+        ); // fresh
+        assert_eq!(view.cached_service(IH, None, 5000), None); // expired
+    }
+
+    #[test]
+    fn untrusted_signer_does_not_drive_playback() {
+        // Regression (CRITICAL): a cached fact from a stranger (public tier) must NOT be actionable.
+        let me = NodeIdentity::generate().unwrap();
+        let stranger = NodeIdentity::generate().unwrap();
+        let mut vault = HiveCacheMap::new();
+        merge_fact(
+            &mut vault,
+            signed_fact(&stranger, DebridService::RealDebrid, None, 1000, 100),
+            1000,
+        );
+        let services = [DebridService::RealDebrid];
+        let trust = TrustStore::new(me.public_b64url()); // does not trust the stranger
+        let view = VaultCacheView::new(&vault, &services, &trust);
+        assert_eq!(view.cached_service(IH, None, 1000), None);
+    }
+
+    #[test]
+    fn trusted_signer_drives_playback() {
+        let me = NodeIdentity::generate().unwrap();
+        let peer = NodeIdentity::generate().unwrap();
+        let mut vault = HiveCacheMap::new();
+        merge_fact(
+            &mut vault,
+            signed_fact(&peer, DebridService::AllDebrid, None, 1000, 100),
+            1000,
+        );
+        let services = [DebridService::AllDebrid];
+        let mut trust = TrustStore::new(me.public_b64url());
+        trust.trust(peer.public_b64url()); // explicitly trusted
+        let view = VaultCacheView::new(&vault, &services, &trust);
+        assert_eq!(
+            view.cached_service(IH, None, 1000),
+            Some(DebridService::AllDebrid)
+        );
+    }
+
+    #[test]
+    fn file_idx_mismatch_is_not_cached() {
+        // Regression (HIGH): a cached file-0 fact must not make file-1 report cached.
+        let me = NodeIdentity::generate().unwrap();
+        let mut vault = HiveCacheMap::new();
+        merge_fact(
+            &mut vault,
+            signed_fact(&me, DebridService::RealDebrid, Some(0), 1000, 100),
+            1000,
+        );
+        let services = [DebridService::RealDebrid];
+        let trust = TrustStore::new(me.public_b64url());
+        let view = VaultCacheView::new(&vault, &services, &trust);
+        assert_eq!(
+            view.cached_service(IH, Some(0), 1000),
             Some(DebridService::RealDebrid)
         );
-        // Expired: ignored.
-        assert_eq!(view.cached_service(IH, 5000), None);
+        assert_eq!(view.cached_service(IH, Some(1), 1000), None);
+    }
+
+    #[test]
+    fn dmm_public_service_never_drives_playback() {
+        // The advisory bulk tier is never instant-play, even from an own/trusted signer.
+        let me = NodeIdentity::generate().unwrap();
+        let mut vault = HiveCacheMap::new();
+        merge_fact(
+            &mut vault,
+            signed_fact(&me, DebridService::DmmPublic, None, 1000, 100),
+            1000,
+        );
+        let services = [DebridService::DmmPublic];
+        let trust = TrustStore::new(me.public_b64url());
+        let view = VaultCacheView::new(&vault, &services, &trust);
+        assert_eq!(view.cached_service(IH, None, 1000), None);
     }
 }
