@@ -2099,7 +2099,7 @@ struct TVPlayerView: View {
         guard time - lastLocalTrickplayCapture >= 10 else { return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureInFlight = true
-        coordinator.player?.captureFrameJPEGData { data in
+        coordinator.player?.captureFrameJPEGData(maxWidth: 480) { data in
             self.localTrickplayCaptureInFlight = false
             guard let data else { return }
             self.scrubThumbnails.recordCapturedFrameData(data, at: time)

@@ -153,7 +153,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     // MARK: Trickplay / HDR
 
-    func captureFrameJPEGData(completion: @escaping (Data?) -> Void) { completion(nil) }
+    func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) { completion(nil) }
     /// AVPlayerLayer negotiates HDR/DV with the display itself, so there is no app-driven HDR toggle here.
     var hdrAvailable: Bool { false }
 

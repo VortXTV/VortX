@@ -52,7 +52,7 @@ protocol PlayerEngine: AnyObject {
     func setAudioOutputMode(_ mode: AudioOutputMode)
 
     // Trickplay + HDR availability
-    func captureFrameJPEGData(completion: @escaping (Data?) -> Void)
+    func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void)
     var hdrAvailable: Bool { get }
 
     #if os(iOS)

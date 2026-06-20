@@ -1124,7 +1124,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    func captureFrameJPEGData(completion: @escaping (Data?) -> Void) {
+    func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
         // Build or rebuild the pipeline lazily — at VIDEO_RECONFIG time the device/drawableSize may
         // not be set yet (especially on tvOS); calling here retries until everything is ready.
@@ -1143,7 +1143,7 @@ final class MPVMetalViewController: PlatformViewController {
                     completion(nil); return
                 }
                 let tw = CGFloat(texture.width), th = CGFloat(texture.height)
-                let s = 480.0 / tw
+                let s = min(maxWidth, tw) / tw   // never upscale: trickplay passes 480, frame-grab passes full
                 let image = raw.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: -s, tx: 0, ty: th * s))
                 if self.ciContext == nil { self.ciContext = CIContext(mtlDevice: texture.device) }
                 guard let ctx = self.ciContext,

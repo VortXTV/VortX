@@ -202,6 +202,7 @@ struct PlayerScreen: View {
     @State private var subtitleLoadFailed = false    // an add-on subtitle download timed out / failed
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var showShare = false             // system share sheet
+    @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
     // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
     // every Next/Prev/list switch so progress, the watched marker, Continue-Watching, skip timestamps,
     // and add-on subtitles all key off the episode ACTUALLY playing (not the one first opened).
@@ -492,6 +493,7 @@ struct PlayerScreen: View {
             Text("That subtitle source did not respond in time. Try another one.")
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
+        .sheet(item: $grabbedFrame) { ShareSheet(items: [$0.url]) }
     }
 
     // MARK: - Property handling
@@ -654,11 +656,32 @@ struct PlayerScreen: View {
         guard time - lastLocalTrickplayCapture >= 10 else { return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureInFlight = true
-        coordinator.player?.captureFrameJPEGData { data in
+        coordinator.player?.captureFrameJPEGData(maxWidth: 480) { data in
             self.localTrickplayCaptureInFlight = false
             guard let data else { return }
             self.scrubThumbnails.recordCapturedFrameData(data, at: time)
         }
+    }
+
+    /// #24 frame grab: capture the current frame at full quality (reusing the trickplay capture path at a
+    /// higher maxWidth), write it to a temp JPEG, and present the share sheet so the still can be saved or
+    /// sent anywhere. iOS / Mac only — tvOS has no share sheet.
+    private func grabFrame() {
+        coordinator.player?.captureFrameJPEGData(maxWidth: 2560) { data in
+            guard let data else { return }
+            let raw = recordMeta?.name ?? "VortX"
+            let base = raw.components(separatedBy: CharacterSet(charactersIn: "/:\\?%*|\"<>")).joined()
+            let name = "VortX-\(base.isEmpty ? "frame" : base)-\(Int(Date().timeIntervalSince1970)).jpg"
+            let target = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+            guard (try? data.write(to: target)) != nil else { return }
+            DispatchQueue.main.async { self.grabbedFrame = GrabbedFrame(url: target) }
+        }
+    }
+
+    /// A captured still awaiting the share sheet; Identifiable so it drives `.sheet(item:)`.
+    private struct GrabbedFrame: Identifiable {
+        let id = UUID()
+        let url: URL
     }
 
     @ViewBuilder
@@ -1417,6 +1440,8 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) }
                 }
+                Spacer()
+                controlButton("camera.viewfinder", "Grab") { grabFrame() }
                 Spacer()
                 controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel) { openPanel(.sleep) }
             }
