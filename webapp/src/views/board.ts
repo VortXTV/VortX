@@ -1,9 +1,9 @@
 import type { Addon, MetaItem } from "../lib/types";
-import { catalogRefs, fetchCatalog, type CatalogRef } from "../lib/addon";
+import { catalogRefs, fetchCatalog, fetchTopPicks, type CatalogRef } from "../lib/addon";
 import { escapeHtml, httpUrl } from "../lib/dom";
 import { hashFor } from "../lib/router";
 import { icon } from "../lib/icons";
-import { continueWatching, hiddenRailCount, isRailHidden } from "../lib/store";
+import { continueWatching, hiddenRailCount, isRailHidden, libraryItems } from "../lib/store";
 
 // The Home board: one poster rail per loadable catalog across the installed add-ons (the same shape as
 // desktop/src/main.ts renderBoard, but fetched directly from the add-on protocol instead of read from
@@ -39,7 +39,47 @@ export function renderBoardShell(host: HTMLElement, addons: Addon[]): void {
     .join("");
   const hidden = hiddenRailCount();
   const tools = `<div class="board-tools"><button id="rail-unhide" class="board-unhide" data-action="show-hidden"${hidden ? "" : " hidden"}>Show ${hidden} hidden row${hidden === 1 ? "" : "s"}</button></div>`;
-  host.innerHTML = `<div class="board">${tools}<section class="featured" id="featured" aria-label="Featured" hidden></section>${continueWatchingRail()}${rails}</div>`;
+  host.innerHTML = `<div class="board">${tools}<section class="featured" id="featured" aria-label="Featured" hidden></section>${continueWatchingRail()}${topPicksPlaceholder()}${rails}</div>`;
+}
+
+/** The seed titles for Top Picks: recent watch history then library, de-duped by id (recency-first). */
+function topPicksSeeds(): MetaItem[] {
+  const seen = new Set<string>();
+  const seeds: MetaItem[] = [];
+  for (const e of [...continueWatching(), ...libraryItems()]) {
+    if (seen.has(e.id)) continue;
+    seen.add(e.id);
+    seeds.push(e);
+  }
+  return seeds;
+}
+
+/** A hidden "Top Picks for You" placeholder, rendered only when the user has seeds (watch history /
+ *  library). loadTopPicks fills + reveals it, or removes it if there are no recommendations. */
+function topPicksPlaceholder(): string {
+  if (!topPicksSeeds().length) return "";
+  return `
+    <section class="rail-section" id="top-picks" aria-labelledby="rail-top-picks" hidden>
+      <h2 class="rail-title" id="rail-top-picks">Top Picks for You</h2>
+      <div class="rail" id="top-picks-body" role="list">${railSkeleton()}</div>
+    </section>`;
+}
+
+/** Fill the Top Picks rail from genre-similar recommendations off the user's seeds; removes the section
+ *  on cold start / no results. Fail-soft, async (does not block the catalog rails). */
+async function loadTopPicks(addons: Addon[]): Promise<void> {
+  const section = document.getElementById("top-picks");
+  const body = document.getElementById("top-picks-body");
+  if (!section || !body) return;
+  const seeds = topPicksSeeds();
+  const exclude = new Set(seeds.map((s) => s.id));
+  const picks = await fetchTopPicks(addons, seeds, exclude);
+  if (!picks.length) {
+    section.remove();
+    return;
+  }
+  body.innerHTML = picks.map((m) => posterCard(m)).join("");
+  section.hidden = false;
 }
 
 /** A "Continue Watching" rail of in-progress titles, shown at the top of Home. Empty when nothing is
@@ -65,6 +105,7 @@ function continueWatchingRail(): string {
 
 /** Fetch each catalog and paint its rail; bad add-ons leave an empty rail rather than failing Home. */
 export async function loadBoard(addons: Addon[]): Promise<void> {
+  void loadTopPicks(addons); // personalized rail; fills/removes itself, never blocks the catalog rails
   const refs = catalogRefs(addons);
   let heroSeeded = false;
   await Promise.all(

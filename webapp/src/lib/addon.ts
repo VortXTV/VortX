@@ -174,6 +174,35 @@ export async function fetchSimilar(meta: MetaItem): Promise<MetaItem[]> {
   }
 }
 
+/** "Top Picks for you": aggregate genre-similar titles from the user's recent seeds (watch history +
+ *  library). Each seed's meta is fetched for its genres, then its similar list; the lists are interleaved
+ *  by seed so the rail reflects multiple tastes (recency-first). Excludes ids the user has already seen.
+ *  Keyless; returns [] when there are no usable seeds (cold start). */
+export async function fetchTopPicks(
+  addons: Addon[],
+  seeds: MetaItem[],
+  excludeIds: Set<string>,
+): Promise<MetaItem[]> {
+  const top = seeds.slice(0, 3);
+  if (!top.length) return [];
+  const metas = await Promise.all(top.map((s) => fetchMeta(addons, s.type, s.id)));
+  const lists = await Promise.all(metas.map((m) => (m ? fetchSimilar(m) : Promise.resolve([]))));
+  const seen = new Set(excludeIds);
+  const out: MetaItem[] = [];
+  const maxLen = lists.reduce((n, l) => Math.max(n, l.length), 0);
+  for (let i = 0; i < maxLen && out.length < 18; i++) {
+    for (const list of lists) {
+      const m = list[i];
+      if (m && !seen.has(m.id)) {
+        seen.add(m.id);
+        out.push(m);
+        if (out.length >= 18) break;
+      }
+    }
+  }
+  return out;
+}
+
 // ---- Search ------------------------------------------------------------------------------------
 
 /** The first add-on catalog that declares it supports the `search` extra prop for `type` (if any). */
