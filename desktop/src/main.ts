@@ -62,9 +62,47 @@ function renderBoard(board: Board | null): void {
     rails.push(`<section><h2 class="rail-title">${title}</h2><div class="rail">${cards}</div></section>`);
   }
   if (rails.length) {
-    content.innerHTML = rails.join("");
+    content.innerHTML = boardFeatured(board) + rails.join("");
     setStatus("");
   }
+}
+
+/** The featured hero atop the board: the first art-bearing item of the first ready catalog, rendered as
+ *  a full-bleed billboard (matching the webapp Home hero). Empty string when no art-bearing item. */
+function boardFeatured(board: Board): string {
+  for (const group of board.catalogs ?? []) {
+    const page = group.find((p) => p.content?.type === "Ready" && (p.content.content?.length ?? 0) > 0);
+    const item = page?.content?.content?.find((m: MetaItem) => httpUrl(m.background) || httpUrl(m.poster));
+    if (item) return featuredHeroHtml(item);
+  }
+  return "";
+}
+
+function featuredHeroHtml(item: MetaItem): string {
+  const name = escapeHtml(item.name ?? "");
+  const bg = httpUrl(item.background) || httpUrl(item.poster);
+  const logo = httpUrl(item.logo);
+  const title = logo
+    ? `<img class="featured-logo" src="${escapeHtml(logo)}" alt="${name}" />`
+    : `<h2 class="featured-title">${name}</h2>`;
+  const facts: string[] = [];
+  if (item.releaseInfo) facts.push(escapeHtml(item.releaseInfo));
+  if (item.runtime) facts.push(escapeHtml(item.runtime));
+  const g = (item.links ?? []).filter((l) => l.category.toLowerCase() === "genre").map((l) => l.name).slice(0, 3);
+  if (g.length) facts.push(escapeHtml(g.join(" · ")));
+  const meta = facts.length ? `<div class="featured-meta">${facts.join("  ·  ")}</div>` : "";
+  const desc = item.description ? `<p class="featured-synopsis">${escapeHtml(item.description)}</p>` : "";
+  return `
+    <section class="featured" data-type="${escapeHtml(item.type)}" data-id="${escapeHtml(item.id)}">
+      <div class="featured-bg" style="background-image:url('${escapeHtml(bg)}')"></div>
+      <div class="featured-scrim"></div>
+      <div class="featured-content">
+        ${title}
+        ${meta}
+        <div class="featured-actions"><button class="watch" data-action="board-play"><span class="play-icon">▶</span> Play</button></div>
+        ${desc}
+      </div>
+    </section>`;
 }
 
 // ---- Player --------------------------------------------------------------
@@ -89,9 +127,10 @@ function wireClicks(): void {
       return;
     }
 
-    const poster = target.closest<HTMLElement>(".poster");
-    if (poster?.dataset.id && poster.dataset.type) {
-      void openDetail(poster.dataset.type, poster.dataset.id);
+    // A poster card or the featured hero (both carry data-type/data-id) opens the detail.
+    const card = target.closest<HTMLElement>(".poster, .featured");
+    if (card?.dataset.id && card.dataset.type) {
+      void openDetail(card.dataset.type, card.dataset.id);
     }
   });
 }
