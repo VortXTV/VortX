@@ -20,6 +20,7 @@ members = [
     "crates/source",
     "crates/reco",
     "crates/playback",
+    "crates/playback-policy",
 ]
 
 [workspace.package]
