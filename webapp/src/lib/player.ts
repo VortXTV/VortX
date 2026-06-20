@@ -64,6 +64,13 @@ export async function play(
   if (!video) return;
   if (item) wireProgress(video, item);
   wireKeyboard(video);
+  // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
+  // unsupported codec). The hls.js path has its own fatal-error handler; this covers the direct/debrid
+  // and native-HLS paths, which would otherwise just show a black player. Teardown clears the source via
+  // load(), which fires "emptied"/"abort" rather than "error", so this does not fire on close.
+  video.addEventListener("error", () =>
+    showError(host, "This source could not be played. It may be offline or an unsupported format. Try another source."),
+  );
   // Non-blocking: playback starts immediately; subtitle <track>s are added when the list resolves.
   if (subtitles) void subtitles.then((subs) => addSubtitleTracks(video, subs)).catch(() => undefined);
 
