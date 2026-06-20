@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use vortx_adapters::NuvioRepoManifest;
 use vortx_addons::InstalledAddon;
 
+use crate::customization::CustomizationCapability;
 use crate::request::{resource_to_kind, ResourceKind};
 use crate::source::SourceKind;
 
@@ -106,6 +107,9 @@ pub struct VortxAddonManifest {
     pub ranking: Option<RankingCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigCapability>,
+    /// UI customization (themes / layouts / branding). `None` on a content/source addon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customization: Option<CustomizationCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<String>,
     #[serde(default)]
@@ -139,10 +143,29 @@ impl VortxAddonManifest {
             hive: None,
             ranking: None,
             config: None,
+            customization: None,
             trust: None,
             permissions: Vec::new(),
             signature: None,
         }
+    }
+
+    /// A bare native (`vortx-source/1`) manifest with all engine hooks off. The public entry point for
+    /// building a native addon (customization, federated, debrid) in code or tests; populate the
+    /// capability fields afterward.
+    pub fn native(
+        id: impl Into<String>,
+        version: impl Into<String>,
+        name: impl Into<String>,
+        transport: VortxTransport,
+    ) -> Self {
+        Self::base(
+            id.into(),
+            version.into(),
+            name.into(),
+            SourceKind::NativeVortx,
+            transport,
+        )
     }
 }
 

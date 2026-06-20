@@ -14,12 +14,21 @@
 //! engine phase here). Nothing in the shipping engine is touched.
 
 mod adapters;
+mod canonical;
+mod customization;
 mod manifest;
 mod registry;
 mod request;
 mod source;
+mod validate;
 
 pub use adapters::{NuvioProviderSource, StremioAddonSource};
+pub use canonical::canonicalize;
+pub use customization::{
+    token_keys, AccentDef, AssetRef, BrandingDef, Color, CustomizationCapability, HeroDecl,
+    HomeLayout, LayoutDef, MotionDef, PaletteOverride, RadiusDef, RailDecl, Splash, TabDecl,
+    ThemeDef, Wordmark,
+};
 pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
@@ -27,6 +36,7 @@ pub use manifest::{
 pub use registry::SourceRegistry;
 pub use request::{ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
+pub use validate::{has_errors, validate, Issue, Severity};
 
 /// Errors a [`Source`] can return. `resolve` MUST NOT panic; it returns one of these (the orchestrator
 /// treats any error as an empty result so one bad source never poisons a fan-out).
