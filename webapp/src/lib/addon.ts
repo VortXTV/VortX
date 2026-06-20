@@ -58,13 +58,32 @@ function encodeId(id: string): string {
 
 // ---- Manifest / installation -------------------------------------------------------------------
 
-/** Load an add-on's manifest from its transport URL, returning the installable Addon record. */
-export async function loadAddon(transportUrl: string): Promise<Addon> {
-  const manifest = await fetchJson<AddonManifest>(transportUrl);
-  if (!manifest || typeof manifest.id !== "string") {
-    throw new Error(`Not a valid add-on manifest: ${transportUrl}`);
+/** Normalize + validate an add-on transport URL: accept the `stremio://` scheme (rewritten to https) and
+ *  require https. Plain http is rejected - it cannot be fetched from the https web app (mixed content) and
+ *  would expose the manifest (which can embed debrid API keys) to network tampering. */
+function normalizeAddonUrl(raw: string): string {
+  const t = raw.trim().replace(/^stremio:\/\//i, "https://");
+  let u: URL;
+  try {
+    u = new URL(t);
+  } catch {
+    throw new Error("That is not a valid URL.");
   }
-  return { transportUrl, manifest };
+  if (u.protocol !== "https:") {
+    throw new Error("Add-on URLs must use https:// (http is not secure and cannot load in the web app).");
+  }
+  return t;
+}
+
+/** Load an add-on's manifest from its transport URL, returning the installable Addon record. The returned
+ *  transportUrl is the normalized (https) form, so callers persist exactly what was loaded. */
+export async function loadAddon(transportUrl: string): Promise<Addon> {
+  const url = normalizeAddonUrl(transportUrl);
+  const manifest = await fetchJson<AddonManifest>(url);
+  if (!manifest || typeof manifest.id !== "string") {
+    throw new Error(`Not a valid add-on manifest: ${url}`);
+  }
+  return { transportUrl: url, manifest };
 }
 
 /** The resource names an add-on declares it supports (handles both string and object forms). */
