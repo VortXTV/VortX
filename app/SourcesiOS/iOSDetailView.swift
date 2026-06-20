@@ -153,6 +153,9 @@ struct iOSDetailView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile watched set + episode progress
+    // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
+    // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
     // `platformFullScreenPlayerCover(item:)` calls become a `.sheet(item:)`, and two sheets attached to
@@ -373,6 +376,10 @@ struct iOSDetailView: View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
                 backdrop
+                    // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
+                    // shows. Mounted ONLY for VOD with a resolved YouTube id and when motion is allowed; the
+                    // still backdrop underneath is the permanent fallback. Live channels never get a trailer.
+                    .overlay { heroTrailerClip }
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     titleOrLogo
                     metaRow
@@ -434,6 +441,19 @@ struct iOSDetailView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+    }
+
+    /// #44: the muted, looping in-hero trailer (`InHeroTrailerView`) painted over the still backdrop.
+    /// Mounted only when ALL hold: motion is allowed, this is a VOD title (live channels carry no
+    /// trailers and run a stripped page), and the meta resolved a YouTube trailer id. The clip itself
+    /// fades in a beat after the backdrop shows; the still art underneath is the permanent fallback, so a
+    /// missing / slow / blocked embed never blanks the band. Tapping it (or its speaker control) escalates
+    /// to the existing in-app interactive trailer with sound via `playTrailer()`.
+    @ViewBuilder private var heroTrailerClip: some View {
+        if !reduceMotion, !LiveTypes.contains(type),
+           let yt = meta?.trailerYouTubeID, !yt.isEmpty {
+            InHeroTrailerView(youTubeID: yt, height: backdropHeight, onRequestSound: playTrailer)
+        }
     }
 
     /// The title block: the addon-provided logo when present (the editorial signature on the tvOS hero),
