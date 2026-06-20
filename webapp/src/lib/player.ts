@@ -27,6 +27,7 @@ const PLAYER_HOST_ID = "player";
 const HLS_EXT = /\.m3u8(\?|$)/i;
 
 let hls: Hls | null = null;
+let keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
 /** Whether a url looks like an HLS playlist. */
 function isHls(url: string): boolean {
@@ -53,6 +54,7 @@ export async function play(url: string, title: string, item?: CWItem): Promise<v
   const video = el<HTMLVideoElement>("player-video");
   if (!video) return;
   if (item) wireProgress(video, item);
+  wireKeyboard(video);
 
   // Native HLS (Safari / iOS) or any non-HLS url: hand the url straight to the element.
   if (!isHls(url) || video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -116,6 +118,45 @@ function wireProgress(video: HTMLVideoElement, item: CWItem): void {
   });
 }
 
+/** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
+ *  when the element is focused): Space play/pause, Left/Right seek 10s, Up/Down volume, M mute, F fullscreen.
+ *  Removed on close so keys don't leak to the surfaces underneath. */
+function wireKeyboard(video: HTMLVideoElement): void {
+  if (keyHandler) document.removeEventListener("keydown", keyHandler);
+  keyHandler = (e: KeyboardEvent) => {
+    let handled = true;
+    switch (e.code) {
+      case "Space":
+        if (video.paused) void video.play().catch(() => undefined);
+        else video.pause();
+        break;
+      case "ArrowLeft":
+        video.currentTime = Math.max(0, video.currentTime - 10);
+        break;
+      case "ArrowRight":
+        video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
+        break;
+      case "ArrowUp":
+        video.volume = Math.min(1, video.volume + 0.1);
+        break;
+      case "ArrowDown":
+        video.volume = Math.max(0, video.volume - 0.1);
+        break;
+      case "KeyM":
+        video.muted = !video.muted;
+        break;
+      case "KeyF":
+        if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+        else void video.requestFullscreen().catch(() => undefined);
+        break;
+      default:
+        handled = false;
+    }
+    if (handled) e.preventDefault();
+  };
+  document.addEventListener("keydown", keyHandler);
+}
+
 /** Render an inline error inside the player overlay (keeps the Back button reachable). */
 function showError(host: HTMLElement, message: string): void {
   const existing = host.querySelector(".player-error");
@@ -132,6 +173,10 @@ function showError(host: HTMLElement, message: string): void {
 /** Tear down playback: destroy the hls.js instance (if any), stop the element, hide the overlay. */
 export function close(): void {
   const host = el(PLAYER_HOST_ID);
+  if (keyHandler) {
+    document.removeEventListener("keydown", keyHandler);
+    keyHandler = null;
+  }
   if (hls) {
     hls.destroy();
     hls = null;
