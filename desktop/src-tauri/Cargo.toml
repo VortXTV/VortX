@@ -37,6 +37,11 @@ http = "1"
 # app should use the OS trust store, and this avoids the aws-lc-rs/NASM toolchain that rustls needs
 # on Windows CI. (The Apple core uses rustls only to stay a self-contained static lib.)
 reqwest = "0.12"
+# Native window handle (X11 Window / Win32 HWND / macOS NSView) so the mpv player can embed into the
+# main window via `--wid`. Pinned to the same 0.6 line Tauri 2.11 re-exports, so HasWindowHandle and
+# the RawWindowHandle variants match the handle Tauri hands back (a version skew would make the
+# match arms in lib.rs reference a different enum). See src/player.rs.
+raw-window-handle = "0.6"
 
 [features]
 # Used by the default tauri-build setup; harmless when empty.

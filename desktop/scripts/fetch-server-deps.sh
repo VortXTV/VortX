@@ -166,3 +166,34 @@ echo "fetch-server-deps: done. node + server.cjs staged in ${RES_DIR}"
 # server.cjs is the same file on every platform. Run this script on each target runner
 # before `npm run tauri build`; server.rs selects the binary matching the running OS/arch.
 # ---------------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------------------
+# mpv PLAYER BINARY (staged manually for now; NOT fetched by this script yet)
+# ---------------------------------------------------------------------------------------
+# The desktop player is mpv (libmpv), spawned as a child process and driven over JSON IPC
+# (see src-tauri/src/player.rs). Like the node runtime above, mpv ships as a per-platform
+# binary under resources/, bundled via tauri.conf.json's `bundle.resources` ("resources/mpv-*").
+# player.rs::mpv_binary_name() selects the one matching the running OS/arch:
+#
+#   macOS arm64  -> resources/mpv-darwin-arm64
+#   macOS x64    -> resources/mpv-darwin-x64
+#   Linux x64    -> resources/mpv-linux-x64
+#   Linux arm64  -> resources/mpv-linux-arm64
+#   Windows x64  -> resources/mpv-win-x64.exe
+#
+# This script does NOT download mpv yet: unlike Node (a single self-contained binary from
+# nodejs.org), a portable mpv with vo=gpu-next + libplacebo + the codec set we want is not a
+# single canonical public artifact across all three OSes (macOS: a notarized build or the
+# mpv.app payload; Windows: shinchiro/zhongfly builds; Linux: usually the system package).
+# For now DROP THE REAL BINARY IN BY HAND (or your CI job copies it) at the path above before
+# `npm run tauri build`. In `tauri dev`, player.rs also falls back to an `mpv` on PATH, so a
+# locally installed mpv (e.g. `brew install mpv`, `apt install mpv`) works without staging.
+#
+# ALTERNATIVE PACKAGING (Tauri externalBin). Instead of bundle.resources, mpv could be a
+# Tauri sidecar via `bundle.externalBin: ["binaries/mpv"]`, which requires the binary be named
+# with a `-$TARGET_TRIPLE` suffix (e.g. binaries/mpv-aarch64-apple-darwin) and spawned with
+# tauri-plugin-shell's app.shell().sidecar("mpv"). We deliberately mirror the EXISTING node
+# pattern (bundle.resources + std::process::Command from the resource dir) instead, so the mpv
+# spawn path is identical to the already-shipping embedded server and needs no extra plugin or
+# target-triple rename step. If we later move node to externalBin, move mpv with it.
+# ---------------------------------------------------------------------------------------

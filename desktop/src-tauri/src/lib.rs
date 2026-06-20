@@ -5,10 +5,14 @@
 //     the event loop, which emits each RuntimeEvent to the frontend as a `core-event`.
 //   * `engine_dispatch(action_json)` dispatches a `{ field?, action }` to the Runtime.
 //   * `engine_get_state(field_json)` returns a model field as JSON.
-// The libmpv player lands on top of this next.
+// On top of this, the mpv (libmpv) player lands as a spawned child process driven over JSON IPC
+// (see player.rs), exposed through the `mpv_play` / `mpv_command` / `mpv_stop` / `mpv_status`
+// commands; the frontend's resolved (url)=>play sink calls these instead of injecting a webview
+// <video>.
 
 mod engine;
 mod model;
+mod player;
 mod server;
 
 use std::sync::RwLock;
@@ -16,6 +20,7 @@ use std::sync::RwLock;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
+use serde_json::Value;
 use tauri::{Emitter, Manager};
 
 use stremio_core::constants::{
@@ -183,6 +188,93 @@ fn server_is_listening() -> bool {
     server::is_listening()
 }
 
+// ---- mpv player commands -----------------------------------------------------------------------
+
+/// Play `url` in the embedded mpv player. The URL is whatever the frontend's unchanged
+/// prepareTorrent -> resolveUrl pipeline produced: a direct/debrid `https://…` URL, or, for a
+/// torrent, only once the embedded server is listening, a `http://127.0.0.1:11470/<hash>/<idx>`
+/// loopback URL. The TORRENT GATE is enforced twice: primarily by resolveUrl (which returns null
+/// until `isListening()`), and again here by passing the live server-listening state into
+/// `player::play`, which refuses a loopback URL while the server is down.
+///
+/// mpv is embedded into the app's main window surface when a native handle is available, so playback
+/// stays inside the app; otherwise mpv opens its own window. `resource_dir` locates the staged mpv
+/// binary the same way the embedded node server is located.
+#[tauri::command]
+fn mpv_play(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource dir unavailable: {e}"))?;
+    // The embedded server's live liveness, for the defensive torrent-gate backstop in player::play.
+    let server_listening = server::is_listening();
+    // Try to embed mpv into the main window's native surface. A failure to resolve a handle is not
+    // fatal, mpv falls back to its own borderless window.
+    let wid = main_window_handle(&app);
+    player::play(&resource_dir, &url, wid, server_listening)
+}
+
+/// Forward a raw mpv JSON IPC command to the running player and return its reply, e.g.
+/// `{"command":["set_property","pause",true]}` (pause), `{"command":["seek",30,"relative"]}` (skip
+/// 30s), `{"command":["set_property","volume",80]}`. The frontend's transport controls (pause/seek/
+/// volume) go through here; `mpv_stop` handles teardown. Errors if no player is running.
+#[tauri::command]
+fn mpv_command(command: Value) -> Result<Value, String> {
+    player::command(&command)
+}
+
+/// Stop playback and tear down the mpv child (force-killed + reaped so it is never orphaned).
+#[tauri::command]
+fn mpv_stop() {
+    player::stop();
+}
+
+/// The player's current state (`playing` / `idle` / `failed` + reason), for the player UI's empty
+/// and error states. Shape mirrors `server_status`.
+#[tauri::command]
+fn mpv_status() -> player::PlayerState {
+    player::status()
+}
+
+/// Resolve the main window's native handle for mpv embedding (`--wid`): the X11 `Window` / Win32
+/// `HWND` / macOS `NSView*` as an `isize`. Returns None when the handle can't be obtained, in which
+/// case mpv opens its own window. Implemented via raw-window-handle so it stays one code path across
+/// the three windowing systems Tauri targets.
+fn main_window_handle(app: &tauri::AppHandle) -> Option<isize> {
+    let window = app.get_webview_window("main")?;
+    raw_handle_isize(&window)
+}
+
+#[cfg(target_os = "linux")]
+fn raw_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        // X11: mpv's --wid takes the X Window id.
+        RawWindowHandle::Xlib(h) => Some(h.window as isize),
+        // Wayland has no stable --wid embedding for mpv; fall back to mpv's own window.
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn raw_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(isize::from(h.hwnd)),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raw_handle_isize(window: &tauri::WebviewWindow) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        // mpv's --wid on macOS takes an NSView pointer.
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr() as isize),
+        _ => None,
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -219,13 +311,19 @@ pub fn run() {
             engine_get_state,
             server_status,
             server_base_url,
-            server_is_listening
+            server_is_listening,
+            mpv_play,
+            mpv_command,
+            mpv_stop,
+            mpv_status
         ])
         .build(tauri::generate_context!())
         .expect("error while running the StremioX desktop app")
         .run(|_app_handle, event| {
-            // Never orphan the node child: force-kill it when the app is exiting.
+            // Never orphan a child process: force-kill the mpv player and the node server when the
+            // app is exiting.
             if let tauri::RunEvent::Exit = event {
+                player::stop();
                 server::stop();
             }
         });

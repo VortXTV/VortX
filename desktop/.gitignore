@@ -8,3 +8,7 @@ src-tauri/gen
 # (host-platform node runtime ~50-95MB + Stremio's server.cjs). Never committed.
 src-tauri/resources/node-*
 src-tauri/resources/server.cjs
+
+# Embedded mpv player binary (per-platform, staged by hand / CI; see player.rs +
+# fetch-server-deps.sh). Large; never committed.
+src-tauri/resources/mpv-*

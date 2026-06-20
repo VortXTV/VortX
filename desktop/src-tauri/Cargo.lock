@@ -3462,6 +3462,7 @@ dependencies = [
  "futures",
  "http",
  "once_cell",
+ "raw-window-handle",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

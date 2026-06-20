@@ -11,10 +11,12 @@ import {
   setPlayHandler,
 } from "./detail";
 import { primeAvailability } from "./server";
+import { close as closePlayer, play as openPlayer } from "./player";
 
 // StremioX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
 // (backdrop, hero, meta, per-add-on streams + quality selector, trailer) -> click a stream / Watch ->
-// play in an HTML5 video. The detail page lives in detail.ts; this file owns the board + player +
+// play in mpv (libmpv, via the player.ts sink), with a webview <video> fallback for plain H.264/AAC.
+// The detail page lives in detail.ts; the player sink lives in player.ts; this file owns the board +
 // top-level wiring, and re-renders the visible surface whenever the engine emits a `core-event`.
 
 function escapeHtml(value: string): string {
@@ -66,22 +68,8 @@ function renderBoard(board: Board | null): void {
 }
 
 // ---- Player --------------------------------------------------------------
-
-function openPlayer(url: string): void {
-  const player = el("player");
-  if (!player) return;
-  player.classList.remove("hidden");
-  player.innerHTML = `
-    <button class="back" data-action="close-player">‹ Back</button>
-    <video class="video" controls autoplay src="${escapeHtml(url)}"></video>`;
-}
-function closePlayer(): void {
-  const player = el("player");
-  if (!player) return;
-  player.querySelector("video")?.pause();
-  player.innerHTML = "";
-  player.classList.add("hidden");
-}
+// The player sink lives in player.ts (mpv via the Rust mpv_play command, webview <video> fallback).
+// openPlayer / closePlayer are imported from there; this file only routes clicks to them.
 
 // ---- Wiring --------------------------------------------------------------
 
@@ -96,7 +84,10 @@ function wireClicks(): void {
     }
 
     const action = target.closest<HTMLElement>("[data-action]")?.dataset.action;
-    if (action === "close-player") return closePlayer();
+    if (action === "close-player") {
+      void closePlayer();
+      return;
+    }
 
     const poster = target.closest<HTMLElement>(".poster");
     if (poster?.dataset.id && poster.dataset.type) {
@@ -125,7 +116,7 @@ async function start(): Promise<void> {
   wireClicks();
   setPlayHandler((url) => {
     closeDetail();
-    openPlayer(url);
+    void openPlayer(url);
   });
 
   void awaitServer();
