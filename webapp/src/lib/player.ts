@@ -1,6 +1,15 @@
 import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
 import { el, escapeHtml } from "./dom";
+import { cwPosition, recordProgress } from "./store";
+
+/** The slim title context the player needs to record Continue Watching progress. */
+interface CWItem {
+  id: string;
+  type: string;
+  name: string;
+  poster?: string;
+}
 
 // The web player sink. The detail page resolves a direct/debrid HTTP(S) url and hands it here. Unlike
 // the desktop player (libmpv via Tauri) the web client plays in a plain HTML5 <video> element:
@@ -34,7 +43,7 @@ function chrome(title: string): string {
 }
 
 /** Open the player overlay and play `url`. `title` is shown as thin chrome over the transport. */
-export async function play(url: string, title: string): Promise<void> {
+export async function play(url: string, title: string, item?: CWItem): Promise<void> {
   const host = el(PLAYER_HOST_ID);
   if (!host) return;
   host.classList.remove("hidden");
@@ -43,6 +52,7 @@ export async function play(url: string, title: string): Promise<void> {
 
   const video = el<HTMLVideoElement>("player-video");
   if (!video) return;
+  if (item) wireProgress(video, item);
 
   // Native HLS (Safari / iOS) or any non-HLS url: hand the url straight to the element.
   if (!isHls(url) || video.canPlayType("application/vnd.apple.mpegurl")) {
@@ -84,6 +94,26 @@ export async function play(url: string, title: string): Promise<void> {
   // No MSE and not native HLS: last-resort direct assignment (some browsers can still manage).
   video.src = url;
   void video.play().catch(() => undefined);
+}
+
+/** Record Continue Watching progress for `item` while it plays, and resume from the saved position.
+ *  Throttled to once every 5s; passing 95% drops it from Continue Watching (treated as finished). */
+function wireProgress(video: HTMLVideoElement, item: CWItem): void {
+  video.addEventListener(
+    "loadedmetadata",
+    () => {
+      const pos = cwPosition(item.id);
+      if (pos > 5 && (!isFinite(video.duration) || pos < video.duration - 10)) video.currentTime = pos;
+    },
+    { once: true },
+  );
+  let last = 0;
+  video.addEventListener("timeupdate", () => {
+    const now = Date.now();
+    if (now - last < 5000) return;
+    last = now;
+    recordProgress(item, video.currentTime, video.duration);
+  });
 }
 
 /** Render an inline error inside the player overlay (keeps the Back button reachable). */

@@ -92,3 +92,68 @@ export function toggleLibrary(item: MetaItem): boolean {
   }
   return !exists;
 }
+
+// --- Continue Watching --------------------------------------------------------------------------
+// In-progress titles, recorded by the player as you watch (position + duration). Local to this browser
+// (the web client has no account sync). A title past 95% is treated as finished and dropped.
+const CW_KEY = "vortx.web.cw.v1";
+
+export interface CWEntry extends MetaItem {
+  position: number;
+  duration: number;
+  updatedAt: number;
+}
+
+/** In-progress titles, most-recently-watched first. */
+export function continueWatching(): CWEntry[] {
+  try {
+    const raw = localStorage.getItem(CW_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as CWEntry[]).sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch {
+    return [];
+  }
+}
+
+/** The saved resume position (seconds) for a title id, or 0 if none. */
+export function cwPosition(id: string): number {
+  return continueWatching().find((e) => e.id === id)?.position ?? 0;
+}
+
+/** Record playback progress; drops the title (finished) once past 95%. */
+export function recordProgress(
+  item: { id: string; type: string; name: string; poster?: string },
+  position: number,
+  duration: number,
+): void {
+  if (!isFinite(position) || !isFinite(duration) || duration <= 0) return;
+  const others = continueWatching().filter((e) => e.id !== item.id);
+  if (position / duration > 0.95) {
+    persistCW(others);
+    return;
+  }
+  const entry: CWEntry = {
+    id: item.id,
+    type: item.type,
+    name: item.name,
+    poster: item.poster,
+    position,
+    duration,
+    updatedAt: Date.now(),
+  };
+  persistCW([entry, ...others].slice(0, 40));
+}
+
+/** Remove a title from Continue Watching. */
+export function clearProgress(id: string): void {
+  persistCW(continueWatching().filter((e) => e.id !== id));
+}
+
+function persistCW(entries: CWEntry[]): void {
+  try {
+    localStorage.setItem(CW_KEY, JSON.stringify(entries));
+  } catch {
+    /* storage disabled or full: best-effort */
+  }
+}
