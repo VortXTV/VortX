@@ -249,7 +249,7 @@ final class VortXSyncManager: ObservableObject {
             // so the dashboard can verify a PIN entry by re-hashing without ever seeing the digits.
             // `settings` mirrors the per-profile app settings so the dashboard can show + manage them
             // (it writes them back via doc.profileEdits[].settings, applied by ProfileStore.applyProfileEdits).
-            var settings: [String: Any] = ["avatar": p.avatar, "accent": p.accentID, "oled": p.oled, "textScale": p.textScale]
+            var settings: [String: Any] = ["avatar": p.avatar, "accent": p.accentID, "oled": p.oled, "textScale": p.textScale, "isKids": p.isKids]
             if let pb = p.playback {
                 var playback: [String: Any] = ["audioLang": pb.audioLang, "subtitleLang": pb.subtitleLang,
                     "forced": pb.forcedPolicy, "subFont": pb.subFont, "subSize": pb.subSize,

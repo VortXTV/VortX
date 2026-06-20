@@ -315,6 +315,7 @@ final class ProfileStore: ObservableObject {
                         if let ac = st["accent"] as? String, !ac.isEmpty, ac != p.accentID { p.accentID = ac; changed = true }
                         if let o = st["oled"] as? Bool, o != p.oled { p.oled = o; changed = true }
                         if let ts = st["textScale"] as? Double, ts != p.textScale { p.textScale = ts; changed = true }
+                        if let kids = st["isKids"] as? Bool, kids != p.isKids { p.isKids = kids; changed = true }
                         if let pbDict = st["playback"] as? [String: Any] {
                             let next = Self.playbackPrefs(from: pbDict, base: p.playback)
                             if next != p.playback { p.playback = next; changed = true }
