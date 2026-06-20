@@ -13,6 +13,7 @@ import {
 import { primeAvailability } from "./server";
 import { close as closePlayer, play as openPlayer } from "./player";
 import { icon, type IconName } from "./icons";
+import { applySettings, handleSettingsClick, renderSettings } from "./settings";
 
 // VortX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
 // (backdrop, hero, meta, per-add-on streams + quality selector, trailer) -> click a stream / Watch ->
@@ -150,6 +151,10 @@ function renderRoute(): void {
   renderNav(currentRoute);
   if (currentRoute === "home") {
     void getState<Board>("board").then(renderBoard);
+  } else if (currentRoute === "settings") {
+    const content = el("content");
+    if (content) renderSettings(content);
+    setStatus("");
   } else {
     renderScreenPlaceholder(currentRoute);
   }
@@ -186,6 +191,11 @@ function wireClicks(): void {
       return;
     }
 
+    // Settings controls (accent / background / text size) own their clicks while on the Settings route.
+    if (currentRoute === "settings" && handleSettingsClick(target)) {
+      return;
+    }
+
     // A poster card or the featured hero (both carry data-type/data-id) opens the detail.
     const card = target.closest<HTMLElement>(".poster, .featured");
     if (card?.dataset.id && card.dataset.type) {
@@ -211,6 +221,7 @@ async function awaitServer(): Promise<void> {
 }
 
 async function start(): Promise<void> {
+  applySettings(); // theme + text size live before first paint
   wireClicks();
   setPlayHandler((url) => {
     closeDetail();
