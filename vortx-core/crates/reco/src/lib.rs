@@ -26,9 +26,14 @@
 //! not guaranteed byte-identical across platforms.
 
 mod feature;
+mod homefeed;
 mod recommend;
 mod taste;
 
 pub use feature::{cosine, feature_vector, FeatureKey, FeatureVector, MetaFeatures, RuntimeBucket};
+pub use homefeed::{
+    build_home_feed, AllEligible, AvailabilitySet, EligibilityFilter, HomeFeed, HomeFeedInput,
+    HomeFeedPrefs, Lane, LaneItem, LaneKind,
+};
 pub use recommend::{recommend, Candidate, Reason, RecoPrefs, Recommendation};
 pub use taste::{build_taste, Engagement, EngagementSignal, TasteProfile, HALF_LIFE_DAYS};
