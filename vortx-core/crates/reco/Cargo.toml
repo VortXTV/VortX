@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 vortx-protocol = { path = "../protocol" }
 vortx-state = { path = "../state" }
+vortx-hive = { path = "../hive" }
 serde.workspace = true
 serde_json.workspace = true
 
