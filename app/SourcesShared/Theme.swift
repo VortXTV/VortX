@@ -27,6 +27,8 @@ enum Theme {
         static var accentSoft: Color { accent.opacity(0.18) }
         static var onAccent: Color { ThemeManager.shared.onAccent } // accent-adaptive ink (was a fixed warm-brown that read orange on every accent)
         static let danger = rgb(0.871, 0.282, 0.337)            // #DE4856 destructive (log out, remove) — a cooler red so it doesn't read as "leftover orange" next to a non-warm accent
+        static let ok    = rgb(0.298, 0.769, 0.451)             // #4CC473 healthy/online status (add-on reachable), distinct from the gold accent
+        static let warn  = rgb(0.949, 0.659, 0.231)            // #F2A83B caution/slow status, an amber that is not the brand gold
     }
 
     // MARK: Spacing (8pt base, intentional rhythm)
