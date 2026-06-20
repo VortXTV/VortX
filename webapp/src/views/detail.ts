@@ -262,7 +262,7 @@ function titleBlock(meta: MetaItem, logo: string, episode?: Video): string {
 function metaRow(meta: MetaItem): string {
   const facts: string[] = [];
   if (meta.releaseInfo) facts.push(meta.releaseInfo);
-  if (meta.runtime) facts.push(meta.runtime);
+  if (meta.runtime) facts.push(formatRuntime(meta.runtime));
   const g = genres(meta).slice(0, 3);
   if (g.length) facts.push(g.join(" · "));
   const imdb = imdbRating(meta);
@@ -276,7 +276,7 @@ function episodeMetaRow(episode: Video, meta: MetaItem): string {
   const facts: string[] = [`S${episode.season ?? 0} · E${episode.episode ?? 0}`];
   const date = episode.released && episode.released.length >= 10 ? episode.released.slice(0, 10) : "";
   if (date) facts.push(date);
-  if (meta.runtime) facts.push(meta.runtime);
+  if (meta.runtime) facts.push(formatRuntime(meta.runtime));
   const imdb = imdbRating(meta);
   const star = imdb ? `<span class="rating">★ ${escapeHtml(imdb)}</span>` : "";
   return `<div class="meta-row t-label">${star}<span class="meta-facts">${escapeHtml(facts.join("  ·  "))}</span></div>`;
@@ -476,6 +476,18 @@ function formatTime(seconds: number): string {
   const sec = s % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
+/** Runtime to the app's "2h 28min" form. Cinemeta gives "148 min"; we keep an already-formatted value
+ *  (e.g. "2h 28min") or a non-numeric string as-is. */
+function formatRuntime(runtime: string): string {
+  const m = /^(\d+)\s*min/i.exec(runtime.trim());
+  if (!m) return runtime;
+  const mins = parseInt(m[1], 10);
+  if (mins < 60) return `${mins}min`;
+  const h = Math.floor(mins / 60);
+  const rem = mins % 60;
+  return rem ? `${h}h ${rem}min` : `${h}h`;
 }
 
 function genres(meta: MetaItem): string[] {
