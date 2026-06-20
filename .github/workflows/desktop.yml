@@ -65,6 +65,47 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      # Stage Linux mpv as an extracted AppImage (AppDir): linuxdeploy bundles the distro mpv plus its
+      # full .so closure, then we extract it so the app spawns AppRun directly at runtime - no system
+      # mpv, no runtime FUSE. player.rs points the linux mpv path at mpv-linux-x64/AppRun, and
+      # tauri.linux.conf.json bundles the AppDir as a directory resource. Inputs are static (distro
+      # package + pinned tool), no untrusted event data.
+      - name: Stage Linux mpv (extracted AppDir)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y mpv
+          work="$(mktemp -d)"; cd "$work"
+          curl -fsSL -o linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o linuxdeploy-plugin-appimage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x linuxdeploy.AppImage linuxdeploy-plugin-appimage
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          export PATH="$work:$PATH"
+          desktop_file=/usr/share/applications/mpv.desktop
+          if [ ! -f "$desktop_file" ]; then
+            desktop_file="$work/mpv.desktop"
+            printf '[Desktop Entry]\nType=Application\nName=mpv\nExec=mpv\nIcon=mpv\nCategories=AudioVideo;\nTerminal=false\n' > "$desktop_file"
+          fi
+          icon="$(find /usr/share/icons /usr/share/pixmaps -iname 'mpv.*' 2>/dev/null | head -1 || true)"
+          if [ -z "$icon" ]; then
+            icon="$work/mpv.png"
+            echo 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > "$icon"
+          fi
+          ./linuxdeploy.AppImage --appdir AppDir --executable "$(command -v mpv)" \
+            --desktop-file "$desktop_file" --icon-file "$icon" --output appimage
+          out="$(ls *.AppImage | grep -viE '^linuxdeploy' | head -1)"
+          chmod +x "$out"
+          "./$out" --appimage-extract
+          dest="${GITHUB_WORKSPACE}/desktop/src-tauri/resources/mpv-linux-x64"
+          mkdir -p "$(dirname "$dest")"
+          rm -rf "$dest"
+          mv squashfs-root "$dest"
+          test -x "$dest/AppRun"
+          echo "staged Linux mpv AppDir at $dest"
+
       - name: Build the app
         uses: tauri-apps/tauri-action@v0
         with:

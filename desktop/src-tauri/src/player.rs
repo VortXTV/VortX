@@ -186,11 +186,13 @@ fn mpv_binary_name() -> &'static str {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        "mpv-linux-x64"
+        // An extracted AppImage (AppDir) staged by desktop.yml; AppRun sets up the bundled .so
+        // closure and execs mpv, so it runs without a system mpv or runtime FUSE.
+        "mpv-linux-x64/AppRun"
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
-        "mpv-linux-arm64"
+        "mpv-linux-arm64/AppRun"
     }
     #[cfg(target_os = "windows")]
     {
