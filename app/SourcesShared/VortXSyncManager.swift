@@ -270,7 +270,8 @@ final class VortXSyncManager: ObservableObject {
                 settings["playback"] = playback
             }
             return ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,
-                    "familyEdit": p.familyEdit, "pinHash": p.pin ?? "", "settings": settings]
+                    "familyEdit": p.familyEdit, "pinHash": p.pin ?? "", "settings": settings,
+                    "disabledAddons": p.disabledAddons ?? []]
         }
         // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
         // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account

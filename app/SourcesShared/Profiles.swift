@@ -334,6 +334,13 @@ final class ProfileStore: ObservableObject {
                             if next != p.playback { p.playback = next; changed = true }
                         }
                     }
+                    // Per-profile disabled add-ons (top-level edit field, like name/familyEdit). The app owns
+                    // the add-on list (doc.vortx.addons), so the dashboard only toggles which ones are off
+                    // for this profile; that set rides the profileEdits channel, never doc.vortx.
+                    if let da = e["disabledAddons"] as? [String] {
+                        let next = da.isEmpty ? nil : da.sorted()
+                        if next != p.disabledAddons { p.disabledAddons = next; changed = true }
+                    }
                     if changed { update(p) }
                 } else {
                     // CREATE: a new secondary the dashboard added (never an owner). Defaults match a
