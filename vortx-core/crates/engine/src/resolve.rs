@@ -8,9 +8,10 @@
 //! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::{MetaPreview, Stream};
+use vortx_protocol::{MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, RankedStream, RankingPrefs};
 use vortx_reco::visible_catalog;
+use vortx_state::maturity_allows_raw;
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
 use crate::engine::Engine;
@@ -40,6 +41,9 @@ pub enum ResolveRequest {
     /// Filter a catalog page through the ACTIVE profile's parental controls before it is shown. A kids
     /// profile is enforced here, inside the engine, so a host cannot forget to gate a row.
     Catalog { metas: Vec<MetaPreview> },
+    /// Gate a single meta detail (e.g. a deep link) through the active profile's parental controls.
+    /// Boxed: `MetaDetail` is large, so this keeps the request enum small.
+    Meta { meta: Box<MetaDetail> },
 }
 
 /// The engine's decision for a resolution request. Tagged by `kind`; an `error` variant keeps the host's
@@ -52,6 +56,8 @@ pub enum ResolveResponse {
     Subtitles { selected: Option<SubtitleSelection> },
     /// The catalog rows the active profile is allowed to see.
     Catalog { metas: Vec<MetaPreview> },
+    /// The meta detail, or `null` when the active profile's parental controls block it.
+    Meta { meta: Option<Box<MetaDetail>> },
     Error { error: String },
 }
 
@@ -91,6 +97,17 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
                 None => metas,
             };
             ResolveResponse::Catalog { metas: visible }
+        }
+        ResolveRequest::Meta { meta } => {
+            // A blocked meta returns null, so a kids profile cannot open an over-ceiling title even via a
+            // direct deep link, not just by browsing the catalog.
+            let allowed = match engine.store().active_profile() {
+                Some(p) => maturity_allows_raw(&p.parental, meta.certification.as_deref()),
+                None => true,
+            };
+            ResolveResponse::Meta {
+                meta: allowed.then_some(meta),
+            }
         }
     }
 }
