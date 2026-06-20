@@ -127,6 +127,10 @@ function wireProgress(video: HTMLVideoElement, item: CWItem): void {
     last = now;
     recordProgress(item, video.currentTime, video.duration);
   });
+  // Playback ran to the end: force a final record at full duration so the title crosses the 95%
+  // "finished" threshold and drops out of Continue Watching. The 5s-throttled timeupdate above can
+  // miss the last seconds, which would otherwise leave a fully-watched title stuck in the rail.
+  video.addEventListener("ended", () => recordProgress(item, video.duration, video.duration));
 }
 
 /** Global keyboard shortcuts while the player overlay is open (the native <video> controls only respond
