@@ -13,6 +13,7 @@ members = [
     "crates/protocol",
     "crates/addons",
     "crates/hive",
+    "crates/state",
 ]
 
 [workspace.package]
