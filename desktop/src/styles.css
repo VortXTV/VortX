@@ -1,25 +1,27 @@
-/* StremioX desktop. Editorial-cinema direction shared with the Apple TV gold standard: a warm
-   near-black canvas so poster art is the only color on screen, a single ember accent that means
-   focus / selection / primary / progress, a serif hero title, and surface cards that brighten on
-   hover. Palette + type mirror SourcesShared/Theme.swift so the apps read as one product. */
+/* VortX desktop. Editorial-cinema direction shared with the Mac/Apple TV app: a warm near-black canvas
+   so poster art is the only color on screen, the single VortX gold accent that means focus / selection
+   / primary / progress, a serif wordmark + hero, and surface cards that brighten on hover. Palette +
+   type mirror SourcesShared/Theme.swift (the "vortx" gold accent default) so every surface is one product. */
 :root {
-  /* Warm near-black chrome, tinted toward the ember hue (matches ThemeManager tintedDark). */
-  --bg: #161310;
-  --surface: #221d18;
-  --surface-2: #2c251f;
-  --surface-3: #392f27;
-  /* Ember accent (Theme.swift default): base #F27849, bright #FF9163. */
-  --accent: #f27849;
-  --accent-bright: #ff9163;
-  --accent-soft: rgba(242, 120, 73, 0.18);
-  --on-accent: #1b110b;
+  /* Warm near-black chrome, the exact DESIGN.md tokens (mirrors SourcesShared/Theme.swift). */
+  --bg: #15120e;
+  --surface: #211c16;
+  --surface-2: #2d261d;
+  --surface-3: #3a3127;
+  --hairline: #403629;
+  /* VortX brand gold (ThemeManager "vortx" accent, the shipping default, NOT the old StremioX ember). */
+  --accent: #d97706;
+  --accent-bright: #f59e0b;
+  --accent-soft: rgba(245, 158, 11, 0.18);
+  --on-accent: #0f0d0a;
   --text: #f6f1e9;
   --muted: #bcb1a1;
   --muted-2: #8c8273;
-  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font: "SF Pro Display", "SF Pro Text", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --serif: "New York", "Iowan Old Style", Georgia, "Times New Roman", serif;
   --radius-card: 16px;
   --radius-chip: 12px;
+  --radius-control: 14px;
   --ease: cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -55,10 +57,22 @@ body {
   z-index: 2;
 }
 .wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.06em;
   font-family: var(--serif);
-  font-size: 1.7rem;
+  font-size: clamp(1.7rem, 1.4rem + 0.8vw, 2.2rem);
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: -1px;
+  line-height: 1;
+}
+/* The real VortX mark (the VortexRibbon curve from SplashView.swift), currentColor = --accent so it
+   tracks the theme, matching the in-app VortXWordmark. */
+.vortex-mark {
+  width: 0.9em;
+  height: 0.9em;
+  color: var(--accent);
+  filter: drop-shadow(0 0 8px var(--accent-soft));
 }
 .accent {
   color: var(--accent);

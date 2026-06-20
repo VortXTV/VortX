@@ -13,7 +13,7 @@ import {
 import { primeAvailability } from "./server";
 import { close as closePlayer, play as openPlayer } from "./player";
 
-// StremioX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
+// VortX desktop frontend. Flow: Home board (poster rails) -> click a poster -> the detail overlay
 // (backdrop, hero, meta, per-add-on streams + quality selector, trailer) -> click a stream / Watch ->
 // play in mpv (libmpv, via the player.ts sink), with a webview <video> fallback for plain H.264/AAC.
 // The detail page lives in detail.ts; the player sink lives in player.ts; this file owns the board +
