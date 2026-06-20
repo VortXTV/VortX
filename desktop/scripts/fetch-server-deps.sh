@@ -159,9 +159,9 @@ echo "fetch-server-deps: done. node + server.cjs staged in ${RES_DIR}"
 # --- 3) mpv player binary (per-platform, pinned + checksum-verified) -------------------
 # The desktop player spawns mpv as a child process over JSON IPC (src-tauri/src/player.rs), bundled
 # via tauri.conf.json's "resources/mpv-*" glob. Like node above, each CI runner stages the mpv for
-# its own platform. Windows mpv is a single statically-linked mpv.exe (zhongfly build, referenced by
-# mpv.io). macOS/Linux mpv is dynamically linked, so it is staged as a relocatable payload by its own
-# build step (handled separately); this script fetches only the self-contained Windows binary.
+# its own platform. Windows mpv is a single statically-linked mpv.exe (zhongfly build). macOS mpv is
+# dynamically linked, so we stage the whole self-contained mpv.app (stolendata build, listed by mpv.io;
+# its dylibs resolve via @executable_path inside the bundle). Linux mpv is staged by its own step next.
 case "${uname_s}" in
   MINGW* | MSYS* | CYGWIN* | Windows_NT)
     MPV_WIN_DEST="${RES_DIR}/mpv-win-x64.exe"
@@ -183,6 +183,37 @@ case "${uname_s}" in
       cp "${TMP_MPV}/mpv.exe" "${MPV_WIN_DEST}"
       rm -rf "${TMP_MPV}"
       echo "fetch-server-deps: staged mpv-win-x64.exe"
+    fi
+    ;;
+  Darwin)
+    if [ "${uname_m}" = "arm64" ]; then
+      MPV_MAC_DEST="${RES_DIR}/mpv-darwin-arm64.app"
+      if [ -d "${MPV_MAC_DEST}" ]; then
+        echo "fetch-server-deps: mpv-darwin-arm64.app already present, skipping."
+      else
+        # Pinned stolendata build (https://laboratory.stolendata.net/~djinn/mpv_osx/), the macOS build
+        # listed by mpv.io. Self-contained mpv.app, so spawning Contents/MacOS/mpv as a child works.
+        MPV_MAC_VER="0.40.0"
+        MPV_MAC_SHA256="3170fb709defebaba33e9755297d70dc3562220541de54fc3d494a8309ef1260"
+        MPV_MAC_URL="https://laboratory.stolendata.net/~djinn/mpv_osx/mpv-arm64-${MPV_MAC_VER}.tar.gz"
+        echo "fetch-server-deps: downloading mpv (stolendata ${MPV_MAC_VER} arm64)..."
+        TMP_MPVM="$(mktemp -d)"
+        curl -fsSL "${MPV_MAC_URL}" -o "${TMP_MPVM}/mpv.tar.gz"
+        verify_sha256 "${TMP_MPVM}/mpv.tar.gz" "${MPV_MAC_SHA256}" "mpv macOS ${MPV_MAC_VER}"
+        tar -xzf "${TMP_MPVM}/mpv.tar.gz" -C "${TMP_MPVM}"
+        # stolendata's tarball carries mpv.app (find it whether at root or nested).
+        APP_SRC="$(find "${TMP_MPVM}" -maxdepth 2 -name 'mpv.app' -type d | head -1)"
+        if [ -z "${APP_SRC}" ]; then
+          echo "fetch-server-deps: ERROR - mpv.app not found in the stolendata tarball" >&2
+          ls -la "${TMP_MPVM}" >&2
+          exit 1
+        fi
+        mv "${APP_SRC}" "${MPV_MAC_DEST}"
+        rm -rf "${TMP_MPVM}"
+        echo "fetch-server-deps: staged mpv-darwin-arm64.app"
+      fi
+    else
+      echo "fetch-server-deps: no pinned mpv for macOS arch ${uname_m} (only arm64 wired)." >&2
     fi
     ;;
 esac
