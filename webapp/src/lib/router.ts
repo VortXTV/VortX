@@ -10,6 +10,7 @@ export type Route =
   | { name: "detail"; type: string; id: string }
   | { name: "addons" }
   | { name: "library" }
+  | { name: "live" }
   | { name: "settings" }
   | { name: "login" };
 
@@ -34,6 +35,8 @@ export function parseRoute(): Route {
       return { name: "addons" };
     case "library":
       return { name: "library" };
+    case "live":
+      return { name: "live" };
     case "settings":
       return { name: "settings" };
     case "login":
@@ -58,6 +61,8 @@ export function hashFor(route: Route): string {
       return "#/addons";
     case "library":
       return "#/library";
+    case "live":
+      return "#/live";
     case "settings":
       return "#/settings";
     case "login":

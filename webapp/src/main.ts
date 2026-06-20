@@ -28,20 +28,18 @@ let addons: Addon[] = [];
 
 const APP_SHELL = `
   <a class="skip-link" href="#main">Skip to content</a>
-  <header class="topbar">
-    <a class="wordmark" href="#/" aria-label="VortX home">Vort<svg class="vortex-mark" viewBox="-8 -8 116 116" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs><linearGradient id="hdr-b" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#fbbf24"/><stop offset="0.5" stop-color="#f59e0b"/><stop offset="1" stop-color="#d97706"/></linearGradient><linearGradient id="hdr-d" x1="0" y1="0" x2="0.25" y2="1"><stop offset="0" stop-color="#b45309"/><stop offset="1" stop-color="#7c2d12"/></linearGradient></defs><path d="M9.2,4 C43.3,29.2 56.7,70.8 90.8,96" stroke="url(#hdr-d)" stroke-width="18" stroke-linecap="round" fill="none"/><path d="M90.8,4 C56.7,29.2 43.3,70.8 9.2,96" stroke="url(#hdr-b)" stroke-width="18" stroke-linecap="round" fill="none"/><circle cx="50" cy="50" r="7.2" fill="#fdf6e3"/></svg></a>
-    <nav class="topnav" aria-label="Primary">
-      <a class="topnav-link" data-nav="home" href="#/">${icon("home")}<span>Home</span></a>
-      <a class="topnav-link" data-nav="discover" href="#/discover/movie">${icon("discover")}<span>Discover</span></a>
-      <a class="topnav-link" data-nav="library" href="#/library">${icon("library")}<span>Library</span></a>
-      <a class="topnav-link" data-nav="search" href="#/search/">${icon("search")}<span>Search</span></a>
-      <a class="topnav-link" data-nav="addons" href="#/addons">${icon("addons")}<span>Add-ons</span></a>
-      <a class="topnav-link" data-nav="settings" href="#/settings">${icon("settings")}<span>Settings</span></a>
-    </nav>
-  </header>
   <main class="content" id="main"></main>
   <div class="overlay detail-overlay" id="detail-host"></div>
-  <div class="overlay player-overlay hidden" id="player" aria-hidden="true"></div>`;
+  <div class="overlay player-overlay hidden" id="player" aria-hidden="true"></div>
+  <nav class="tabbar" aria-label="Primary">
+    <a class="tab" data-nav="home" href="#/">${icon("home")}<span>Home</span></a>
+    <a class="tab" data-nav="discover" href="#/discover/movie">${icon("discover")}<span>Discover</span></a>
+    <a class="tab" data-nav="live" href="#/live">${icon("live")}<span>Live</span></a>
+    <a class="tab" data-nav="library" href="#/library">${icon("library")}<span>Library</span></a>
+    <a class="tab" data-nav="search" href="#/search/">${icon("search")}<span>Search</span></a>
+    <a class="tab" data-nav="addons" href="#/addons">${icon("addons")}<span>Add-ons</span></a>
+    <a class="tab" data-nav="settings" href="#/settings">${icon("settings")}<span>Settings</span></a>
+  </nav>`;
 
 /** The main content host (everything except the Detail + Player overlays). */
 function mainHost(): HTMLElement {
@@ -59,12 +57,14 @@ function markActiveNav(route: Route): void {
           ? "addons"
           : route.name === "library"
             ? "library"
-            : route.name === "settings"
-              ? "settings"
-              : route.name === "home"
-                ? "home"
-                : "";
-  document.querySelectorAll<HTMLElement>(".topnav-link").forEach((link) => {
+            : route.name === "live"
+              ? "live"
+              : route.name === "settings"
+                ? "settings"
+                : route.name === "home"
+                  ? "home"
+                  : "";
+  document.querySelectorAll<HTMLElement>(".tab").forEach((link) => {
     link.classList.toggle("active", link.dataset.nav === active);
   });
 }
@@ -141,6 +141,14 @@ async function renderRoute(route: Route): Promise<void> {
     }
     case "library": {
       renderLibrary(mainHost());
+      return;
+    }
+    case "live": {
+      // Live = the Discover grid scoped to live catalogs (tv / channel). Empty state if no live add-on.
+      const types = discoverTypes(addons);
+      const liveType = types.find((t) => t === "tv" || t === "channel") ?? "tv";
+      renderDiscoverShell(mainHost(), addons, liveType);
+      await loadDiscover(addons, liveType);
       return;
     }
     case "settings": {

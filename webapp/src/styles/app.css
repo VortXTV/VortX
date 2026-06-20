@@ -45,6 +45,7 @@
   --space-lg: 32px;
   --space-xl: 48px;
   --space-xxl: 72px;
+  --tabbar-h: 68px;
 
   --duration-fast: 150ms;
   --duration-normal: 300ms;
@@ -203,7 +204,44 @@ input:focus-visible {
 
 .content {
   flex: 1;
-  padding: 0.75rem var(--space-page) 3rem;
+  padding: 0.75rem var(--space-page) calc(var(--tabbar-h) + var(--space-lg));
+}
+
+/* ---- Bottom tab bar (matches the Mac/iOS app: a persistent bottom bar, icon over label) ---- */
+.tabbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 15; /* over content + the detail overlay (10); under the player overlay (20) */
+  display: flex;
+  justify-content: center;
+  gap: clamp(0.25rem, 2vw, 2rem);
+  padding: 0.5rem var(--space-page) calc(0.5rem + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(transparent, var(--bg) 38%);
+  backdrop-filter: blur(12px);
+}
+.tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 0.35rem 0.6rem;
+  border-radius: var(--radius-control);
+  color: var(--muted-2);
+  font-size: 0.72rem;
+  font-weight: 600;
+  transition: color var(--dur-state) var(--ease);
+}
+.tab .ico {
+  width: 1.5em;
+  height: 1.5em;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab.active {
+  color: var(--accent);
 }
 .page-title {
   font-family: var(--serif);
@@ -450,7 +488,7 @@ input:focus-visible {
 .detail-body {
   position: relative;
   z-index: 1;
-  padding: clamp(300px, 58vh, 560px) var(--space-edge) var(--space-xl);
+  padding: clamp(300px, 58vh, 560px) var(--space-edge) calc(var(--tabbar-h) + var(--space-lg));
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -1356,7 +1394,7 @@ input:focus-visible {
 .settings-page {
   max-width: 760px;
   margin: 0 auto;
-  padding: var(--space-md) var(--space-edge) var(--space-xl);
+  padding: var(--space-md) var(--space-edge) calc(var(--tabbar-h) + var(--space-lg));
   display: flex;
   flex-direction: column;
   gap: var(--space-lg);
@@ -1529,7 +1567,7 @@ input:focus-visible {
 .auth-screen {
   max-width: 460px;
   margin: 0 auto;
-  padding: var(--space-xl) var(--space-edge);
+  padding: var(--space-xl) var(--space-edge) calc(var(--tabbar-h) + var(--space-xl));
   display: flex;
   flex-direction: column;
   gap: var(--space-md);

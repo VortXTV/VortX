@@ -10,6 +10,8 @@ const PATHS: Record<string, string> = {
   home: '<path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M4 11 12 4l8 7v8a1 1 0 0 1-1 1h-4v-6h-6v6H5a1 1 0 0 1-1-1z"/>',
   discover:
     '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.6 8.4 13 13l-4.6 2.6L11 11z" fill="currentColor"/>',
+  live:
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8.5 8.8a4.5 4.5 0 0 0 0 6.4M15.5 8.8a4.5 4.5 0 0 1 0 6.4M6 6.3a8 8 0 0 0 0 11.4M18 6.3a8 8 0 0 1 0 11.4"/></g><circle cx="12" cy="12" r="2" fill="currentColor"/>',
   library:
     '<g fill="currentColor"><rect x="4" y="10" width="3.6" height="9" rx="1"/><rect x="10.2" y="5" width="3.6" height="14" rx="1"/><rect x="16.4" y="13" width="3.6" height="6" rx="1"/></g>',
   search:
