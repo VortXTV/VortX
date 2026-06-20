@@ -14,6 +14,7 @@ import {
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { play } from "../lib/player";
+import { inLibrary, toggleLibrary } from "../lib/store";
 
 // The Detail page: a full-bleed backdrop with a gradient scrim, a logo/title hero, a meta row
 // (rating, year, runtime, genres), a primary Watch button that plays the best ranked source, a
@@ -141,6 +142,12 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
       return openEpisode(hit.node);
     case "close-episode":
       return closeEpisode();
+    case "toggle-library":
+      if (state.meta) {
+        toggleLibrary(state.meta);
+        render();
+      }
+      return true;
     default:
       return false;
   }
@@ -173,7 +180,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
         ${metaRow(meta)}
         ${meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""}
         ${streamSection(groups)}
-        ${trailer ? trailerButton() : ""}
+        ${libraryButton(meta)}${trailer ? trailerButton() : ""}
       </div>
     </div>`;
 }
@@ -194,7 +201,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     ? episodeStreamView(open, meta)
     : `${heroHead(meta, logo)}${metaRow(meta)}${
         meta.description ? `<p class="desc">${escapeHtml(meta.description)}</p>` : ""
-      }${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${trailer ? trailerButton() : ""}`;
+      }${seasonSelector(seasons)}${episodeList(videos, state.selectedSeason)}${libraryButton(meta)}${trailer ? trailerButton() : ""}`;
 
   host.innerHTML = `
     <div class="detail">
@@ -453,6 +460,12 @@ function youTubeID(value: string): string | undefined {
 
 function trailerButton(): string {
   return `<button class="chip trailer-chip" data-action="play-trailer">▶ Trailer</button>`;
+}
+
+/** Save/Saved toggle that adds the current title to the local Library (see store.ts). */
+function libraryButton(meta: MetaItem): string {
+  const saved = inLibrary(meta.id);
+  return `<button class="chip lib-chip${saved ? " saved" : ""}" data-action="toggle-library" aria-pressed="${saved}">${saved ? "✓ Saved" : "+ Save"}</button>`;
 }
 
 function openTrailer(youtubeId: string): void {

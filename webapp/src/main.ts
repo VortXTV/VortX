@@ -9,6 +9,7 @@ import { loadBoard, renderBoardShell } from "./views/board";
 import { discoverTypes, loadDiscover, renderDiscoverShell } from "./views/discover";
 import { loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
+import { renderLibrary } from "./views/library";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
@@ -27,6 +28,7 @@ const APP_SHELL = `
       <a class="topnav-link" data-nav="home" href="#/">Home</a>
       <a class="topnav-link" data-nav="discover" href="#/discover/movie">Discover</a>
       <a class="topnav-link" data-nav="search" href="#/search/">Search</a>
+      <a class="topnav-link" data-nav="library" href="#/library">Library</a>
       <a class="topnav-link" data-nav="addons" href="#/addons">Add-ons</a>
     </nav>
   </header>
@@ -48,9 +50,11 @@ function markActiveNav(route: Route): void {
         ? "search"
         : route.name === "addons"
           ? "addons"
-          : route.name === "home"
-            ? "home"
-            : "";
+          : route.name === "library"
+            ? "library"
+            : route.name === "home"
+              ? "home"
+              : "";
   document.querySelectorAll<HTMLElement>(".topnav-link").forEach((link) => {
     link.classList.toggle("active", link.dataset.nav === active);
   });
@@ -97,6 +101,10 @@ async function renderRoute(route: Route): Promise<void> {
       const host = mainHost();
       renderAddons(host, addons, () => void reloadAddonsAndRender());
       wireAddons(host);
+      return;
+    }
+    case "library": {
+      renderLibrary(mainHost());
       return;
     }
     case "detail": {
