@@ -1,0 +1,63 @@
+{
+  "description": "Cross-language conformance for the Home feed lane builder. Candidates are intentionally empty so the float-scored Because-You-Watched lane is empty and every pinned value is integer/string deterministic: lane assignment, eligibility gating, cross-lane dedup, and Up Next recency ordering must agree byte-for-byte on every platform. Each watch entry is the merged WatchState (unix-second clocks; 0 = never). Expected lanes list only the non-empty lanes in display order.",
+  "cases": [
+    {
+      "name": "up_next_recency_order_and_finished_excluded",
+      "watch": [
+        { "meta_id": "a", "resume_ms": 1000, "resume_at": 100 },
+        { "meta_id": "b", "resume_ms": 2000, "resume_at": 300 },
+        { "meta_id": "c", "watched_at": 400, "times_watched": 1 }
+      ],
+      "library": [],
+      "trending": [],
+      "eligible": null,
+      "expect_lanes": [
+        { "kind": "up_next", "items": ["b", "a"] }
+      ]
+    },
+    {
+      "name": "cross_lane_dedup_up_next_wins",
+      "watch": [{ "meta_id": "a", "resume_ms": 500, "resume_at": 100 }],
+      "library": ["a", "b"],
+      "trending": ["a", "d"],
+      "eligible": ["a", "b", "d"],
+      "expect_lanes": [
+        { "kind": "up_next", "items": ["a"] },
+        { "kind": "start_watching", "items": ["b"] },
+        { "kind": "trending", "items": ["d"] }
+      ]
+    },
+    {
+      "name": "eligibility_gates_every_lane",
+      "watch": [{ "meta_id": "a", "resume_ms": 500, "resume_at": 100 }],
+      "library": ["b"],
+      "trending": ["c"],
+      "eligible": ["b"],
+      "expect_lanes": [
+        { "kind": "start_watching", "items": ["b"] }
+      ]
+    },
+    {
+      "name": "removed_title_is_not_startable_or_up_next",
+      "watch": [
+        { "meta_id": "a", "resume_ms": 500, "resume_at": 100, "removed_at": 200 }
+      ],
+      "library": ["a", "b"],
+      "trending": [],
+      "eligible": null,
+      "expect_lanes": [
+        { "kind": "start_watching", "items": ["b"] }
+      ]
+    },
+    {
+      "name": "start_watching_preserves_library_order",
+      "watch": [],
+      "library": ["x", "y", "z"],
+      "trending": [],
+      "eligible": null,
+      "expect_lanes": [
+        { "kind": "start_watching", "items": ["x", "y", "z"] }
+      ]
+    }
+  ]
+}
