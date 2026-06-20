@@ -58,6 +58,7 @@ struct TVPlayerView: View {
     // every playhead tick (audit #1): updated only when their inputs change.
     @State private var metadataLine = ""
     @State private var currentSkip: SkipSegment?
+    @State private var autoSkippedStarts: Set<Double> = []   // segment starts already auto-skipped this episode
     /// Cumulative seek amount shown in a brief pill while seeking with the chrome HIDDEN (Netflix-style
     /// L/R seek that doesn't reveal the control bar). nil = no pill. Cleared after a short delay.
     @State private var hiddenSeekDelta: Double?
@@ -94,6 +95,7 @@ struct TVPlayerView: View {
     @State private var upNextSuppressed = false           // user chose Watch Credits: hide band + don't auto-advance this episode
     @State private var upNextWantsCredits = false         // which band button is focused (false = Play Now, true = Watch Credits)
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds ("10"/"15"/"30"), shared with iOS
+    @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
     private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
@@ -1525,6 +1527,14 @@ struct TVPlayerView: View {
     /// so the player body re-renders when the pill appears/disappears, not per tick.
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
+        // Auto-skip: when the playhead enters a NEW skip segment and the setting is on, jump past it once.
+        // Recording the start means a manual seek back into the same segment won't auto-skip it again.
+        if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
+            autoSkippedStarts.insert(skip.start)
+            skipTo(skip)
+            if currentSkip != nil { currentSkip = nil }
+            return
+        }
         if skip?.start != currentSkip?.start { currentSkip = skip }
     }
 
@@ -1550,7 +1560,7 @@ struct TVPlayerView: View {
             return
         }
         let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
-        if key != skipFetchKey { apiSkipCandidates = [] }   // drop spans from the previous episode
+        if key != skipFetchKey { apiSkipCandidates = []; autoSkippedStarts = [] }   // new episode: reset auto-skip
         skipFetchKey = key
         let dur = duration
         plog.info("skip: fetching key=\(key, privacy: .public) dur=\(Int(dur), privacy: .public)")
