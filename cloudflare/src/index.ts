@@ -363,7 +363,8 @@ async function login(req: Request, env: Env): Promise<Response> {
   if (row.totp_secret) {
     const totp = isStr(b?.totp, 8) ? (b!.totp as string).trim() : "";
     if (!totp) return json({ error: "totp_required" }, 401);
-    const step = await verifyTotp(row.totp_secret, totp);
+    const secret = await totpOpen(env, row.totp_secret);
+    const step = secret ? await verifyTotp(secret, totp) : -1;
     if (step < 0) return json({ error: "invalid_totp" }, 401);
     // Anti-replay (F7): record the matched step only if it is newer than the last used one. The
     // conditional UPDATE is atomic; 0 rows changed means this step was already used (a replay) -> reject.
@@ -643,6 +644,37 @@ async function verifyTotp(secretB32: string, code: string): Promise<number> {
   return -1;
 }
 
+// --- TOTP secret encryption at rest (AES-256-GCM). The key is derived from SESSION_SECRET via HKDF, so
+// no new secret binding is needed. Stored as "ivB64:ctB64". A legacy plaintext base32 secret (base32 has
+// no ':') is returned as-is by totpOpen, so already-enrolled users are never locked out; the secret gets
+// re-sealed the next time they re-enroll. A D1 leak alone no longer exposes a usable 2FA seed. ---
+let _totpKey: CryptoKey | null = null;
+async function totpEncKey(env: Env): Promise<CryptoKey> {
+  if (_totpKey) return _totpKey;
+  const ikm = await crypto.subtle.importKey("raw", enc(env.SESSION_SECRET) as BufferSource, "HKDF", false, ["deriveKey"]);
+  _totpKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: enc("vortx-totp-salt") as BufferSource, info: enc("vortx-totp-enc") as BufferSource },
+    ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"],
+  );
+  return _totpKey;
+}
+async function totpSeal(env: Env, secretB32: string): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await totpEncKey(env), enc(secretB32) as BufferSource));
+  return b64(iv) + ":" + b64(ct);
+}
+async function totpOpen(env: Env, stored: string | null | undefined): Promise<string | null> {
+  if (!stored) return null;
+  const ix = stored.indexOf(":");
+  if (ix < 0) return stored;   // legacy plaintext base32 secret (pre-encryption enrollments)
+  try {
+    const iv = unb64(stored.slice(0, ix));
+    const ct = unb64(stored.slice(ix + 1));
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv as BufferSource }, await totpEncKey(env), ct as BufferSource);
+    return td.decode(new Uint8Array(pt));
+  } catch { return null; }
+}
+
 async function twofaEnroll(req: Request, env: Env): Promise<Response> {
   const id = await requireAuth(req, env);
   if (!id) return json({ error: "unauthorized" }, 401);
@@ -650,7 +682,7 @@ async function twofaEnroll(req: Request, env: Env): Promise<Response> {
   if (!row) return json({ error: "unauthorized" }, 401);
   if (row.totp_secret) return json({ error: "already_enabled" }, 409);
   const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
-  await env.DB.prepare("UPDATE accounts SET totp_pending = ? WHERE id = ?").bind(secret, id).run();
+  await env.DB.prepare("UPDATE accounts SET totp_pending = ? WHERE id = ?").bind(await totpSeal(env, secret), id).run();
   const uri = `otpauth://totp/VortX:${encodeURIComponent(row.email)}?secret=${secret}&issuer=VortX&algorithm=SHA1&digits=6&period=30`;
   return json({ secret, otpauth: uri });
 }
@@ -661,7 +693,8 @@ async function twofaActivate(req: Request, env: Env): Promise<Response> {
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
   const row = await env.DB.prepare("SELECT email, totp_pending FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_pending) return json({ error: "no_pending" }, 400);
-  if ((await verifyTotp(row.totp_pending, code)) < 0) return json({ error: "invalid_code" }, 401);
+  const pendingSecret = await totpOpen(env, row.totp_pending);
+  if (!pendingSecret || (await verifyTotp(pendingSecret, code)) < 0) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = totp_pending, totp_pending = NULL WHERE id = ?").bind(id).run();
   await sendMail(env, row.email, "Two-factor is on for your VortX account", "Two-factor authentication enabled", [
     "An authenticator app was just added to your VortX account. You will need a code from it the next time you sign in.",
@@ -676,7 +709,8 @@ async function twofaDisable(req: Request, env: Env): Promise<Response> {
   const code = isStr(b?.code, 8) ? (b!.code as string).trim() : "";
   const row = await env.DB.prepare("SELECT email, totp_secret FROM accounts WHERE id = ?").bind(id).first<any>();
   if (!row?.totp_secret) return json({ error: "not_enabled" }, 400);
-  if ((await verifyTotp(row.totp_secret, code)) < 0) return json({ error: "invalid_code" }, 401);
+  const secret = await totpOpen(env, row.totp_secret);
+  if (!secret || (await verifyTotp(secret, code)) < 0) return json({ error: "invalid_code" }, 401);
   await env.DB.prepare("UPDATE accounts SET totp_secret = NULL, totp_pending = NULL WHERE id = ?").bind(id).run();
   await sendMail(env, row.email, "Two-factor is off for your VortX account", "Two-factor authentication disabled", [
     "Two-factor authentication was just turned off for your VortX account.",
