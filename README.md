@@ -301,7 +301,7 @@ It started out talking to add-ons by hand, and that kept getting small things wr
 
 ## What's next
 
-With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and — on the path to 1.0 — VortX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
+With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and, on the path to 1.0, VortX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/VortXTV/VortX/issues). Requests genuinely shape the roadmap.
 
