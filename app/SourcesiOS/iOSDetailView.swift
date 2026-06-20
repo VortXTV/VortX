@@ -593,6 +593,7 @@ struct iOSDetailView: View {
                 }
                 trailerButton
                 iOSLibraryChip()
+                shareChip
             }
         }
         .padding(.top, Theme.Space.xs)
@@ -664,6 +665,20 @@ struct iOSDetailView: View {
         return min(max(item.state.timeOffset / item.state.duration, 0), 1)
     }
 
+    /// Share chip: shares the title's IMDb page (or its name when there is no imdb id) via the native
+    /// share sheet. Shown in the movie action row and the series hero.
+    @ViewBuilder private var shareChip: some View {
+        if let m = core.metaDetails?.meta {
+            if m.id.hasPrefix("tt"), let url = URL(string: "https://www.imdb.com/title/\(m.id)/") {
+                ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    .buttonStyle(ChipButtonStyle())
+            } else {
+                ShareLink(item: m.name) { Label("Share", systemImage: "square.and.arrow.up") }
+                    .buttonStyle(ChipButtonStyle())
+            }
+        }
+    }
+
     // MARK: Movie — Watch Now + sources
 
     /// The movie hero action row — the touch/Mac twin of the tvOS detail action set: a **Watch**
@@ -701,6 +716,7 @@ struct iOSDetailView: View {
 
             trailerButton
             iOSLibraryChip()
+            shareChip
         }
         .padding(.top, Theme.Space.xs)
     }
