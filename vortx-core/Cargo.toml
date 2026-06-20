@@ -17,6 +17,7 @@ members = [
     "crates/ranking",
     "crates/debrid",
     "crates/adapters",
+    "crates/source",
 ]
 
 [workspace.package]

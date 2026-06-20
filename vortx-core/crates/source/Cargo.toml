@@ -1,0 +1,19 @@
+[package]
+name = "vortx-source"
+description = "The VortX universal addon system: one Source trait + SourceRegistry over every source kind (Stremio addon, Nuvio provider, native VortX, ratings/XRDB, scraper, debrid, federated), plus the signed native vortx-source/1 addon manifest that is a strict superset of the Stremio protocol (streaming results, prefetch, debrid-aware, hive-aware, per-profile, signed). Pure; real I/O is the engine phase."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortx-protocol = { path = "../protocol" }
+vortx-addons = { path = "../addons" }
+vortx-adapters = { path = "../adapters" }
+vortx-hive = { path = "../hive" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
