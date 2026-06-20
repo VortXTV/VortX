@@ -4,9 +4,9 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## Unreleased (next)
+## 0.3.8 Beta 5 - 2026-06-20 (pre-release)
 
-Building on the 0.3.8 account work. The headline is that VortX now speaks **32 languages**, alongside a wave of per-profile and power-user features. Version and date are set when this is cut.
+Building on the 0.3.8 account work. The headline is that VortX now speaks **32 languages**, alongside a wave of per-profile and power-user controls: per-profile add-ons, in-app debrid keys, Kids Mode, one-tap quality presets, regex source filters, library export and import, Import from Stremio, Where to Watch, anime skipping, an in-player frame grab, and poster ratings. In-place update, nothing resets. This is a beta, so please install it and report anything off.
 
 ### Added
 
@@ -320,27 +320,27 @@ The one from the full audit. A 7-area review (layout, code, player, theming, ser
 
 ## 0.3.0 beta 8 (prerelease) - 2026-06-13
 
-The one that fixes the phone. beta 7's real-device testing surfaced an app-freezing sign-in bug and a cluster of iPhone-only layout breakage — this is the fix pass for all of it.
+The one that fixes the phone. beta 7's real-device testing surfaced an app-freezing sign-in bug and a cluster of iPhone-only layout breakage, and this is the fix pass for all of it.
 
 ### Fixed
 
-- **QR / link sign-in no longer freezes and crashes the app.** On iPhone and iPad, finishing a QR sign-in could hang the whole app (no buttons, the phone itself lagging) and then crash. Root cause: the sign-in handler wrote a value that re-triggered itself in an unbounded loop on the main thread. It now runs exactly once. (macOS was unaffected — it has no main-thread watchdog — which is why it only showed on the phone.)
+- **QR / link sign-in no longer freezes and crashes the app.** On iPhone and iPad, finishing a QR sign-in could hang the whole app (no buttons, the phone itself lagging) and then crash. Root cause: the sign-in handler wrote a value that re-triggered itself in an unbounded loop on the main thread. It now runs exactly once. (macOS was unaffected: it has no main-thread watchdog, which is why it only showed on the phone.)
 - **Discover and Library no longer render shifted off the left edge.** On iPhone the whole screen (hero, filter chips, poster grid) could be pushed left and clipped on both edges, intermittently. The content column now pins to the screen width instead of stretching to its widest row. Verified on device.
 - **The streaming server stops crashing seconds after launch on iPhone.** The embedded server was starting subsystems the phone build never needs (a second HTTPS server and its certificate stack), inflating its memory footprint until iOS killed it. The iPhone/iPad build now runs the same lean configuration the official Stremio iOS app uses.
 - **The Add-ons screen and Streaming Server screen fit the phone.** They were using the 10-foot Apple TV screen inset and a fixed 1000pt-wide field, so content spilled off the edge and the "Remove" button was squeezed to one letter per line. They now use a phone-appropriate inset, the field fits, and the button keeps its width.
-- **The featured hero no longer shows a flat black band** while its backdrop loads or if that image fails — it falls back to the poster art underneath.
+- **The featured hero no longer shows a flat black band** while its backdrop loads or if that image fails. It falls back to the poster art underneath.
 
 ### Notes
 
-- "None of the add-ons returned a playable source": this means no streaming/debrid add-on is installed — the metadata add-ons (Debridio TMDB, AIOMetamax, etc.) don't provide playable streams. Install a stream provider (Torrentio, Comet, MediaFusion, or an AIOStreams config) from the Stremio web/mobile app and it syncs down.
+- "None of the add-ons returned a playable source": this means no streaming or debrid add-on is installed. Metadata-only add-ons do not provide playable streams. Install a stream or debrid add-on from the Stremio web or mobile app and it syncs down.
 
 ## 0.3.0 beta 7 (prerelease) - 2026-06-13
 
-The one that actually plays. beta 6 shipped with a macOS player deadlock — this fixes it.
+The one that actually plays. beta 6 shipped with a macOS player deadlock, and this fixes it.
 
 ### Fixed
 
-- **The macOS player no longer freezes the whole app.** Starting a video could hang the entire app (spinning beachball, even Quit dead) and require a force-quit. Root cause: mpv's video-output thread set the layer's HDR/EDR flag via a blocking hop to the main thread _while holding the Metal layer lock_, exactly as the main thread tried to take that same lock to size the drawable — a hard deadlock at the first frame. The EDR flag now updates without blocking the render thread, so playback starts cleanly. Verified end-to-end (open → play → controls → close) with a real video stream.
+- **The macOS player no longer freezes the whole app.** Starting a video could hang the entire app (spinning beachball, even Quit dead) and require a force-quit. Root cause: mpv's video-output thread set the layer's HDR/EDR flag via a blocking hop to the main thread _while holding the Metal layer lock_, exactly as the main thread tried to take that same lock to size the drawable, a hard deadlock at the first frame. The EDR flag now updates without blocking the render thread, so playback starts cleanly. Verified end-to-end (open → play → controls → close) with a real video stream.
 
 ## 0.3.0 beta 6 (prerelease) - 2026-06-13
 
