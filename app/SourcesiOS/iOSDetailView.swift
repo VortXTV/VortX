@@ -1,4 +1,9 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// Torrents: ask the embedded server to start fetching peers before playback. No-op for direct/debrid
 /// URLs (those carry a `url`, so no `/create` is needed). Port of the tvOS `prepareTorrent`, reusing
@@ -679,6 +684,20 @@ struct iOSDetailView: View {
         }
     }
 
+    /// Copy every playable (direct / debrid / HLS) stream link for this title to the clipboard, newline
+    /// separated, for pasting into a debrid panel or another player. Torrent sources with no direct URL are
+    /// skipped (they only resolve through the embedded server at play time).
+    private func copyAllLinks(_ groups: [CoreStreamSourceGroup]) {
+        let urls = groups.flatMap { $0.streams }.compactMap { $0.playableURL?.absoluteString }
+        guard !urls.isEmpty else { return }
+        let text = urls.joined(separator: "\n")
+        #if os(macOS)
+        let pb = NSPasteboard.general; pb.clearContents(); pb.setString(text, forType: .string)
+        #else
+        UIPasteboard.general.string = text
+        #endif
+    }
+
     // MARK: Movie — Watch Now + sources
 
     /// The movie hero action row — the touch/Mac twin of the tvOS detail action set: a **Watch**
@@ -738,6 +757,8 @@ struct iOSDetailView: View {
                         }
                     }
                 }
+                Divider()
+                Button { copyAllLinks(groups) } label: { Label("Copy all links", systemImage: "doc.on.doc") }
             } label: {
                 Label("Quality", systemImage: "chevron.up.chevron.down")
             }
