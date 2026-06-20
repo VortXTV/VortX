@@ -22,3 +22,8 @@ live D1 (`vortx-sync`) as a one-way operation.
 - `schema.sql` (v3) is the current full shape: `accounts`, `backups`, `pairings`. It already includes
   the columns that were added live during the v3 hardening (`session_version`, `totp_secret`,
   `totp_pending`), so a fresh database created from it matches production. No back-migration needed.
+- `0001-add-family.sql` adds family / household grouping: `families`, `family_members`,
+  `family_invites`. Purely additive (three new tables + indexes, all `IF NOT EXISTS`). These tables
+  store server-readable relationship metadata only (who is in whose household); they hold no
+  ciphertext, no wrapped keys, and no sync document, so the zero-knowledge contract is unchanged. The
+  same shape is folded into `schema.sql`, so a fresh database matches a migrated one.

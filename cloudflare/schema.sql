@@ -74,3 +74,43 @@ CREATE TABLE IF NOT EXISTS password_resets (
   expires_at INTEGER NOT NULL,
   attempts   INTEGER NOT NULL DEFAULT 0
 );
+
+-- Family / household grouping. This is server-readable RELATIONSHIP metadata only (who is in whose
+-- household). It is deliberately OUTSIDE the zero-knowledge layer: a family carries NO ciphertext, NO
+-- wrapped keys, and NO sync document. The E2E contract is untouched, each member keeps their own data
+-- key and their own backup blob; the server still cannot read any of it. A family only records that a
+-- set of opaque account ids belong to the same household, so the dashboard can show a roster and the
+-- product can offer household features (e.g. shared add-on suggestions) on top, without ever moving
+-- one member's encrypted data to another.
+CREATE TABLE IF NOT EXISTS families (
+  id               TEXT PRIMARY KEY,        -- uuid
+  name             TEXT NOT NULL,           -- household display name (user-supplied, length-capped)
+  owner_account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, -- the account that created it
+  created_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_families_owner ON families (owner_account_id);
+
+-- One row per (family, member). An account belongs to AT MOST ONE family: account_id is UNIQUE, so a
+-- join while already in a household is rejected. Deleting an account or its family cascades the row
+-- away. role is 'owner' or 'member'; the owner row mirrors families.owner_account_id.
+CREATE TABLE IF NOT EXISTS family_members (
+  family_id  TEXT NOT NULL REFERENCES families(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+  role       TEXT NOT NULL DEFAULT 'member', -- 'owner' | 'member'
+  joined_at  INTEGER NOT NULL,
+  PRIMARY KEY (family_id, account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_family_members_family ON family_members (family_id);
+
+-- Family invite codes. A short-lived join code, HMAC-hashed with SESSION_SECRET (same zero-knowledge
+-- discipline as password_resets: the plaintext code lives only in the response/link the inviter shares,
+-- never at rest). One pending invite per family (PRIMARY KEY family_id, upsert on re-issue). Consuming
+-- an invite (a successful join) deletes the row.
+CREATE TABLE IF NOT EXISTS family_invites (
+  family_id  TEXT PRIMARY KEY REFERENCES families(id) ON DELETE CASCADE,
+  code_hash  TEXT    NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_family_invites_expires ON family_invites (expires_at);

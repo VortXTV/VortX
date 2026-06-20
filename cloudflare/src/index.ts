@@ -152,6 +152,8 @@ const RL_PATHS = new Set([
   "/v1/qr/authorize", "/v1/connect/stremio", "/v1/addon/manifest",
   "/v1/qr/start", "/v1/auth/check-username",   // pairing-row spam + username enumeration
   "/v1/meta/search",                           // Cinemeta proxy for the dashboard's add-to-library
+  "/v1/family/create", "/v1/family/invite", "/v1/family/join", "/v1/family/leave",
+                                               // household mutations: invite-code spam + join brute-force
 ]);
 // Cap the body before parsing so an oversized request cannot tie up the parser (DoS guard). 2 MB sits
 // safely above MAX_DOC (1 MB) so a real backup PUT is never rejected, but blocks pathological bodies.
@@ -267,6 +269,11 @@ async function route(request: Request, env: Env): Promise<Response> {
       if (p === "/v1/qr/status" && m === "GET") return qrStatus(url, env);
       if (p === "/v1/backup" && m === "PUT") return backupPut(request, env);
       if (p === "/v1/backup" && m === "GET") return backupGet(request, env);
+      if (p === "/v1/family" && m === "GET") return familyList(request, env);
+      if (p === "/v1/family/create" && m === "POST") return familyCreate(request, env);
+      if (p === "/v1/family/invite" && m === "POST") return familyInvite(request, env);
+      if (p === "/v1/family/join" && m === "POST") return familyJoin(request, env);
+      if (p === "/v1/family/leave" && m === "POST") return familyLeave(request, env);
       if (p === "/v1/sync/connect" && m === "GET") return syncConnect(request, env);
       if (p === "/v1/admin/stats" && m === "GET") return adminStats(request, env);
       if (p === "/v1/admin/announce" && m === "POST") return adminAnnounce(request, env);
@@ -893,6 +900,186 @@ async function backupGet(req: Request, env: Env): Promise<Response> {
     .bind(id).first<{ document: string; version: number }>();
   if (!row) return noContent(404);
   return json({ document: row.document, version: row.version });
+}
+
+// --- Family / household management. This is a SERVER-READABLE relationship layer that sits ENTIRELY
+// outside the zero-knowledge sync contract: a family records only that a set of opaque account ids
+// belong to the same household. It never touches a member's wrapped keys or ciphertext sync document,
+// each account keeps its own data key and its own backup, and the server still cannot read any of it.
+// An account belongs to at most one family (family_members.account_id is UNIQUE). Mutations require a
+// session and are rate-limited; invite codes are HMAC-hashed with SESSION_SECRET and never stored in
+// plaintext (same discipline as password resets). Logs carry no PII and no raw codes. ---
+const FAMILY_NAME_MAX = 60;
+const FAMILY_MAX_MEMBERS = 8;                 // a household cap; also bounds the roster query
+const FAMILY_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+// Invite code: 8 chars from an unambiguous alphabet (no 0/O/1/I), reusing the QR code8 generator's
+// distribution. The plaintext is returned once (and embedded in the shareable link); only its HMAC
+// is stored. Hashed with SESSION_SECRET so a DB leak does not reveal a usable invite.
+async function hmacInvite(secret: string, code: string): Promise<string> {
+  return b64(new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey(secret), enc("family-invite:" + code))));
+}
+function familyPub(fam: { id: string; name: string; owner_account_id: string },
+                   members: { account_id: string; role: string; username_display: string; joined_at: number }[],
+                   meId: string) {
+  // Roster exposes usernames (already public, the case-insensitive handle other users log in against)
+  // and roles, but NEVER emails: a household member's email is account PII and is not needed to render
+  // the roster. `isMe` lets the dashboard mark the current user without leaking which id is which email.
+  return {
+    id: fam.id,
+    name: fam.name,
+    role: fam.owner_account_id === meId ? "owner" : "member",
+    members: members.map((mb) => ({
+      username: mb.username_display,
+      role: mb.role,
+      joinedAt: mb.joined_at,
+      isMe: mb.account_id === meId,
+    })),
+  };
+}
+async function familyOf(accountId: string, env: Env): Promise<{ id: string; name: string; owner_account_id: string } | null> {
+  return env.DB.prepare(
+    `SELECT f.id, f.name, f.owner_account_id FROM families f
+       JOIN family_members m ON m.family_id = f.id WHERE m.account_id = ?`,
+  ).bind(accountId).first<{ id: string; name: string; owner_account_id: string }>();
+}
+async function familyRoster(familyId: string, env: Env): Promise<{ account_id: string; role: string; username_display: string; joined_at: number }[]> {
+  const rows = await env.DB.prepare(
+    `SELECT m.account_id, m.role, a.username_display, m.joined_at FROM family_members m
+       JOIN accounts a ON a.id = m.account_id WHERE m.family_id = ? ORDER BY m.joined_at ASC LIMIT ?`,
+  ).bind(familyId, FAMILY_MAX_MEMBERS).all<{ account_id: string; role: string; username_display: string; joined_at: number }>();
+  return rows.results ?? [];
+}
+
+async function familyList(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const fam = await familyOf(id, env);
+  if (!fam) return json({ family: null }); // not in a household yet (a normal state, not an error)
+  return json({ family: familyPub(fam, await familyRoster(fam.id, env), id) });
+}
+
+async function familyCreate(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const name = isStr(b?.name, FAMILY_NAME_MAX) ? (b!.name as string).trim() : "";
+  if (!name) return json({ error: "invalid_name" }, 400);
+  if (await familyOf(id, env)) return json({ error: "already_in_family" }, 409);
+  const familyId = crypto.randomUUID(), now = Date.now();
+  // Atomic: create the family AND seat the creator as owner in one D1 transaction (batch runs the
+  // statements sequentially in an implicit transaction and rolls back if either fails). The owner
+  // INSERT also enforces the one-family-per-account rule via the UNIQUE account_id; a race that already
+  // seated this account elsewhere fails the second statement and rolls back the family row too.
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO families (id, name, owner_account_id, created_at, updated_at) VALUES (?,?,?,?,?)")
+        .bind(familyId, name, id, now, now),
+      env.DB.prepare("INSERT INTO family_members (family_id, account_id, role, joined_at) VALUES (?,?,?,?)")
+        .bind(familyId, id, "owner", now),
+    ]);
+  } catch {
+    // The only expected failure is the UNIQUE(account_id) constraint (already in a family); treat any
+    // batch failure as a conflict rather than leaking SQL detail.
+    return json({ error: "already_in_family" }, 409);
+  }
+  const fam = { id: familyId, name, owner_account_id: id };
+  return json({ family: familyPub(fam, await familyRoster(familyId, env), id) });
+}
+
+async function familyInvite(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const fam = await familyOf(id, env);
+  if (!fam) return json({ error: "not_in_family" }, 404);
+  if (fam.owner_account_id !== id) return json({ error: "forbidden" }, 403); // only the owner can invite
+  // Refuse to mint an invite for a full household (a join would be rejected anyway).
+  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_members WHERE family_id = ?")
+    .bind(fam.id).first<{ n: number }>();
+  if ((count?.n ?? 0) >= FAMILY_MAX_MEMBERS) return json({ error: "family_full" }, 409);
+  const code = code8(), now = Date.now(), expiresAt = now + FAMILY_INVITE_TTL_MS;
+  // One pending invite per family: upsert replaces any prior code, so re-inviting invalidates the old
+  // one. Only the HMAC is stored; the plaintext code is returned just once.
+  await env.DB.prepare(
+    `INSERT INTO family_invites (family_id, code_hash, expires_at, created_at) VALUES (?,?,?,?)
+     ON CONFLICT(family_id) DO UPDATE SET code_hash = excluded.code_hash, expires_at = excluded.expires_at, created_at = excluded.created_at`,
+  ).bind(fam.id, await hmacInvite(env.SESSION_SECRET, code), expiresAt, now).run();
+  // The link points at the dashboard route the redesign agent wires up; the code is the shareable secret.
+  return json({ code, link: `https://vortx.tv/family/join?code=${code}`, expiresAt });
+}
+
+async function familyJoin(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const b = await readJSON(req);
+  const code = isStr(b?.code, 16) ? (b!.code as string).trim().toUpperCase() : "";
+  if (!code) return json({ error: "bad_request" }, 400);
+  if (await familyOf(id, env)) return json({ error: "already_in_family" }, 409);
+  // Match the invite by its HMAC (the table never holds plaintext). A missing/expired invite is an
+  // invalid code; do not distinguish the two, so a guesser cannot tell a real family from a wrong code.
+  const inv = await env.DB.prepare("SELECT family_id, code_hash, expires_at FROM family_invites WHERE code_hash = ?")
+    .bind(await hmacInvite(env.SESSION_SECRET, code)).first<{ family_id: string; code_hash: string; expires_at: number }>();
+  if (!inv || inv.expires_at < Date.now()) return json({ error: "invalid_code" }, 401);
+  const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_members WHERE family_id = ?")
+    .bind(inv.family_id).first<{ n: number }>();
+  if ((count?.n ?? 0) >= FAMILY_MAX_MEMBERS) return json({ error: "family_full" }, 409);
+  const now = Date.now();
+  // Seat the member and consume the single-use invite atomically. The UNIQUE(account_id) constraint is
+  // the real guard against a double-join race; a violation rolls the batch back.
+  try {
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO family_members (family_id, account_id, role, joined_at) VALUES (?,?,?,?)")
+        .bind(inv.family_id, id, "member", now),
+      env.DB.prepare("DELETE FROM family_invites WHERE family_id = ?").bind(inv.family_id),
+    ]);
+  } catch {
+    return json({ error: "already_in_family" }, 409);
+  }
+  const fam = await env.DB.prepare("SELECT id, name, owner_account_id FROM families WHERE id = ?")
+    .bind(inv.family_id).first<{ id: string; name: string; owner_account_id: string }>();
+  if (!fam) return json({ error: "invalid_code" }, 401); // family vanished mid-join (owner deleted it)
+  return json({ family: familyPub(fam, await familyRoster(fam.id, env), id) });
+}
+
+// Leave the household, or (owner) remove a named member. With no body the caller leaves; with
+// { username } the owner removes that member. An owner cannot leave or self-remove while others remain
+// (they must remove the others first, which keeps ownership unambiguous); an owner leaving an otherwise
+// empty household deletes the family and any pending invite.
+async function familyLeave(req: Request, env: Env): Promise<Response> {
+  const id = await requireAuth(req, env);
+  if (!id) return json({ error: "unauthorized" }, 401);
+  const fam = await familyOf(id, env);
+  if (!fam) return json({ error: "not_in_family" }, 404);
+  const b = await readJSON(req);
+  const targetName = isStr(b?.username, 20) ? (b!.username as string).trim().toLowerCase() : "";
+  const isOwner = fam.owner_account_id === id;
+
+  if (targetName) {
+    // Owner removing another member by username.
+    if (!isOwner) return json({ error: "forbidden" }, 403);
+    const target = await env.DB.prepare(
+      `SELECT m.account_id FROM family_members m JOIN accounts a ON a.id = m.account_id
+         WHERE m.family_id = ? AND a.username = ?`,
+    ).bind(fam.id, targetName).first<{ account_id: string }>();
+    if (!target) return json({ error: "not_a_member" }, 404);
+    if (target.account_id === id) return json({ error: "cannot_remove_owner" }, 400); // owner uses leave (no body)
+    await env.DB.prepare("DELETE FROM family_members WHERE family_id = ? AND account_id = ?")
+      .bind(fam.id, target.account_id).run();
+    return json({ ok: true, family: familyPub(fam, await familyRoster(fam.id, env), id) });
+  }
+
+  // Self-leave.
+  if (isOwner) {
+    const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_members WHERE family_id = ?")
+      .bind(fam.id).first<{ n: number }>();
+    if ((count?.n ?? 0) > 1) return json({ error: "owner_must_empty_first" }, 409);
+    // Last one out: delete the family. family_members and family_invites cascade on the FK.
+    await env.DB.prepare("DELETE FROM families WHERE id = ?").bind(fam.id).run();
+    return json({ ok: true, family: null });
+  }
+  await env.DB.prepare("DELETE FROM family_members WHERE family_id = ? AND account_id = ?")
+    .bind(fam.id, id).run();
+  return json({ ok: true, family: null });
 }
 
 // --- Real-time sync (WebSocket). A device opens a long-lived socket to its account's SyncRoom DO and
