@@ -1,5 +1,5 @@
 import { libraryItems } from "../lib/store";
-import { posterCard } from "./board";
+import { removableCard } from "./board";
 
 // The Library surface: titles the user saved from a Detail page, newest first. localStorage-backed and
 // separate from the native apps' account library (the web client has no account sync). Reuses the Home
@@ -23,7 +23,7 @@ export function renderLibrary(host: HTMLElement): void {
     <div class="board">
       <section class="rail-section" aria-labelledby="rail-library">
         <h2 class="rail-title" id="rail-library">Library</h2>
-        <div class="rail" role="list">${items.map(posterCard).join("")}</div>
+        <div class="rail" role="list">${items.map((item) => removableCard(item, "lib", "Remove from Library")).join("")}</div>
       </section>
     </div>`;
 }

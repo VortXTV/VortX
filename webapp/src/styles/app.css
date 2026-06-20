@@ -805,3 +805,37 @@ input:focus-visible {
     transform: none;
   }
 }
+
+/* Continue Watching / Library cards: a remove (x) control overlaid on the poster. The wrapper takes the
+   same fixed rail-item sizing the bare .poster had (since it is now the flex child), and the inner poster
+   fills it. The x reveals on hover/focus so it doesn't clutter the rail. */
+.rail .card-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  width: clamp(120px, 14vw, 170px);
+  scroll-snap-align: start;
+}
+.card-wrap .poster {
+  width: 100%;
+}
+.card-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 1.15rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--duration-normal) var(--ease);
+}
+.card-wrap:hover .card-remove,
+.card-remove:focus-visible {
+  opacity: 1;
+}

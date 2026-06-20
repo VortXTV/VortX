@@ -185,3 +185,12 @@ export function addRecentSearch(query: string): void {
     /* storage disabled or full: best-effort */
   }
 }
+
+/** Remove a title from the Library by id (the rail × control). */
+export function removeFromLibrary(id: string): void {
+  try {
+    localStorage.setItem(LIBRARY_KEY, JSON.stringify(libraryItems().filter((e) => e.id !== id)));
+  } catch {
+    /* storage disabled or full: best-effort */
+  }
+}

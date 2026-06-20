@@ -35,7 +35,7 @@ function continueWatchingRail(): string {
   return `
     <section class="rail-section" aria-labelledby="rail-cw">
       <h2 class="rail-title" id="rail-cw">Continue Watching</h2>
-      <div class="rail" role="list">${cw.map(posterCard).join("")}</div>
+      <div class="rail" role="list">${cw.map((item) => removableCard(item, "cw", "Remove from Continue Watching")).join("")}</div>
     </section>`;
 }
 
@@ -71,6 +71,12 @@ export function posterCard(item: MetaItem): string {
       ${inner}
       <span class="poster-name">${name}</span>
     </a>`;
+}
+
+/** A poster card wrapped with a remove (×) control, for the Continue Watching + Library rails. The button
+ *  is a SIBLING of the card anchor (not nested) so clicking it removes rather than navigating. */
+export function removableCard(item: MetaItem, kind: "cw" | "lib", label: string): string {
+  return `<div class="card-wrap">${posterCard(item)}<button class="card-remove" type="button" data-action="remove-saved" data-id="${escapeHtml(item.id)}" data-kind="${kind}" aria-label="${escapeHtml(label)}">×</button></div>`;
 }
 
 function railTitle(ref: CatalogRef): string {

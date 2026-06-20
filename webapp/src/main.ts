@@ -3,6 +3,7 @@ import "./styles/app.css";
 import type { Addon } from "./lib/types";
 import { loadInstalledAddons } from "./lib/store";
 import { actionOf, el } from "./lib/dom";
+import { clearProgress, removeFromLibrary } from "./lib/store";
 import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { loadBoard, renderBoardShell } from "./views/board";
@@ -142,6 +143,18 @@ function wireGlobalClicks(): void {
     if (hit?.action === "close-player") {
       ev.preventDefault();
       closePlayer();
+      return;
+    }
+    if (hit?.action === "remove-saved") {
+      // The × on a Continue Watching / Library card: drop it from the store and yank the card from the DOM
+      // (no full re-render, so the rest of the rail stays put).
+      ev.preventDefault();
+      const id = hit.node.dataset.id;
+      if (id) {
+        if (hit.node.dataset.kind === "cw") clearProgress(id);
+        else removeFromLibrary(id);
+        hit.node.closest(".card-wrap")?.remove();
+      }
       return;
     }
     if (hit?.action === "nav-home") {
