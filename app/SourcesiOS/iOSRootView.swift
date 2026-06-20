@@ -98,9 +98,21 @@ struct iOSRootView: View {
         .animation(.easeOut(duration: 0.25), value: updates.available?.build)
         .animation(.easeOut(duration: 0.25), value: dismissedUpdateVersion)
         .sheet(isPresented: $showWhatsNew) { WhatsNewView { showWhatsNew = false; WhatsNew.markSeen() } }
+        // Automatic update popup: appears once per launch when a newer build exists (and again when the
+        // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
+        .sheet(item: $updates.prompt) { release in
+            UpdatePromptView(release: release) { updates.dismissPrompt() }
+        }
         .onAppear {
             WhatsNew.recordFreshInstallIfNeeded()
-            if WhatsNew.shouldShow() { showWhatsNew = true }
+            if WhatsNew.shouldShow() {
+                // iOS 16 keeps only the first .sheet on a view, so don't arm the update popup while What's New
+                // claims the sheet slot; it'll appear next launch (once-per-launch resets). A build increase
+                // means the user just updated anyway, so there's no pending update to show this launch.
+                showWhatsNew = true
+            } else {
+                updates.startMonitoring()   // launch check + hourly re-check while open
+            }
         }
         #if os(macOS)
         // macOS menu-bar commands (the "Go" menu + ⌘-shortcuts) post here, since they live at the
@@ -142,7 +154,10 @@ struct iOSRootView: View {
     /// Prominent accent bar shown across every tab when a newer release is available and not yet
     /// dismissed for that version. Tapping opens the downloads page; the × remembers this version.
     @ViewBuilder private var updateBanner: some View {
-        if let u = updates.available, u.key != dismissedUpdateVersion {
+        // Suppress while the modal popup is pending so the user isn't nagged twice; the banner is the quiet
+        // fallback for after the popup is dismissed (dismissing it sets dismissedUpdateVersion, so the banner
+        // then stays hidden for that build too).
+        if let u = updates.available, u.key != dismissedUpdateVersion, updates.prompt == nil {
             HStack(spacing: 10) {
                 Image(systemName: "arrow.down.circle.fill").font(.system(size: 18, weight: .semibold))
                 VStack(alignment: .leading, spacing: 1) {

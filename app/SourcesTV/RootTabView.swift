@@ -163,6 +163,7 @@ struct RootView: View {
 struct RootTabView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var updates = UpdateChecker.shared
     @State private var selection = 0
     // Per-tab identity token. Each tab owns its own NavigationStack whose pushed pages persist
     // while the tab stays alive (tvOS keeps tabs mounted). Bumping the token of the tab you LEAVE
@@ -192,7 +193,15 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
-        .onAppear { applyTabBarAccent() }
+        // Automatic update popup on the shell (never over the player, which replaces this view). Appears once
+        // per launch when a newer build exists, and again when the hourly re-check finds a still-newer one.
+        .sheet(item: $updates.prompt) { release in
+            UpdatePromptView(release: release) { updates.dismissPrompt() }
+        }
+        .onAppear {
+            applyTabBarAccent()
+            updates.startMonitoring()   // launch check + hourly re-check while open
+        }
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
         .onChange(of: selection) { old, _ in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }

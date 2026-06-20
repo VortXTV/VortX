@@ -10,6 +10,7 @@ Building on the 0.3.8 account work. The headline is that VortX now speaks **40 l
 
 ### Added
 
+- **Automatic update notifications on every device.** When a newer build is available, VortX now shows a popup once per launch (on iPhone, iPad, Apple TV, and Mac) instead of only flagging it in Settings, and it re-checks once an hour while the app is open so you learn about a release without relaunching. "Get the update" takes you straight to the install. (#90)
 - **48 languages.** The interface is now fully localized to Arabic, Bengali, Bulgarian, Chinese (Simplified and Traditional), Croatian, Czech, Danish, Dutch, Estonian, Filipino, Finnish, French, German, Greek, Gujarati, Hebrew, Hindi, Hungarian, Indonesian, Italian, Japanese, Kannada, Korean, Latvian, Lithuanian, Malay, Malayalam, Marathi, Norwegian, Persian, Polish, Portuguese (Brazil and Portugal), Romanian, Russian, Serbian, Slovak, Slovenian, Spanish, Swedish, Tamil, Telugu, Thai, Turkish, Ukrainian, Urdu, and Vietnamese, on top of English. It follows your device language automatically; Arabic, Hebrew, Persian, and Urdu lay out right-to-left.
 - **Per-profile add-ons.** Turn individual add-ons on or off per profile without removing them from your account, so one profile can drop sources another keeps (Add-ons).
 - **Add-on health.** Each add-on shows an Online / Slow / Unreachable dot from a live check, with a Re-check button (Add-ons).
