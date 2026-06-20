@@ -25,6 +25,9 @@ struct FeaturedHeroView: View {
 
     /// The yt id presented full-screen by the Trailer chip (Bug A in the hero). Drives a cover.
     @State private var trailerEmbedID: String?
+    /// Hero ids whose trailer embed reported a failure (owner disabled embedding, removed video, etc.).
+    /// The clip is suppressed for these so the still backdrop shows instead of YouTube's error card.
+    @State private var failedTrailerIDs: Set<String> = []
 
 
     /// Hero band height. iOS is 380: a bit bigger than the 0.3.0 320 (the user wanted a larger billboard),
@@ -79,8 +82,9 @@ struct FeaturedHeroView: View {
     /// item; the still backdrop underneath is the fallback when no clip plays. Decorative — the title /
     /// meta read first for VoiceOver.
     @ViewBuilder private var heroClip: some View {
-        if !reduceMotion, let hero = model.hero, let yt = hero.trailerYouTubeID, !yt.isEmpty {
-            YouTubeEmbedView(youTubeID: yt, mode: .background)
+        if !reduceMotion, let hero = model.hero, let yt = hero.trailerYouTubeID, !yt.isEmpty,
+           !failedTrailerIDs.contains(hero.id) {
+            YouTubeEmbedView(youTubeID: yt, mode: .background, onFailure: { failedTrailerIDs.insert(hero.id) })
                 .frame(height: heroHeight)
                 .frame(maxWidth: .infinity)
                 .clipped()

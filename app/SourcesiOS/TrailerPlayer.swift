@@ -40,7 +40,7 @@ struct TrailerEmbedCover: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             Color.black.ignoresSafeArea()
-            YouTubeEmbedView(youTubeID: youTubeID, mode: .interactive)
+            YouTubeEmbedView(youTubeID: youTubeID, mode: .interactive, onFailure: openOnYouTube)
                 .ignoresSafeArea()
                 .accessibilityLabel("\(title) trailer")
 
@@ -55,5 +55,15 @@ struct TrailerEmbedCover: View {
             .padding(Theme.Space.md)
             .accessibilityLabel("Close trailer")
         }
+    }
+
+    /// The embed reported it cannot play (the owner disabled embedding, or the video was removed). Rather
+    /// than leave YouTube's "unavailable" card on screen, hand the trailer off to the system (YouTube app
+    /// or browser) where the same video plays unrestricted, then dismiss the cover.
+    private func openOnYouTube() {
+        if let url = URL(string: "https://www.youtube.com/watch?v=\(youTubeID)") {
+            TrailerOpener.open(url)
+        }
+        onClose()
     }
 }

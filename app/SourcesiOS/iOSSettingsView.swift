@@ -21,6 +21,7 @@ struct iOSSettingsView: View {
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
     @State private var serverOnline: Bool?
     @State private var editingProfile: UserProfile?
+    @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
     @State private var showSignIn = false
     #if os(macOS)
     /// Drives the "Share streaming server on this network" toggle (macOS only). Backed by
@@ -55,6 +56,8 @@ struct iOSSettingsView: View {
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
     @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = true
     @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
+    /// App-language override ("system" = follow the device). Applied via AppLanguage; needs a relaunch.
+    @State private var langSelection: String = AppLanguage.current ?? "system"
 
     // Backup & Restore: carry local settings across the StremioX -> VortX move (see SettingsBackup).
     @State private var showBackupExporter = false
@@ -82,6 +85,7 @@ struct iOSSettingsView: View {
                 streamsSection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
+                languageSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
                 subtitleSection.listRowBackground(Theme.Palette.surface1)
                 advancedSection.listRowBackground(Theme.Palette.surface1)
@@ -168,6 +172,16 @@ struct iOSSettingsView: View {
             .platformFullScreenCover(item: $editingProfile) { profile in
                 ProfileEditorView(original: profile)
             }
+            .confirmationDialog(pendingDelete.map { "Delete \($0.name)? Its settings and sign-in are removed." } ?? "",
+                                isPresented: Binding(get: { pendingDelete != nil },
+                                                     set: { if !$0 { pendingDelete = nil } }),
+                                titleVisibility: .visible) {
+                Button("Delete", role: .destructive) {
+                    if let p = pendingDelete { _ = profiles.remove(p) }
+                    pendingDelete = nil
+                }
+                Button("Cancel", role: .cancel) { pendingDelete = nil }
+            }
             // Track-language and subtitle-style edits belong to the ACTIVE profile: fold every
             // flat-key change back into it (the capturePlayback pattern, same as tvOS SettingsView).
             // The equality guard inside capturePlayback stops a profile switch's own flat-key writes
@@ -230,6 +244,17 @@ struct iOSSettingsView: View {
                             }
                         }
                         .buttonStyle(ChipButtonStyle(selected: profile.id == profiles.activeID))
+                        // Discoverable delete without opening the editor: right-click (Mac) / long-press
+                        // (touch). The main profile can't be deleted; deleting the active one is blocked too
+                        // (switch away first). Editor "Delete Profile" still works as the in-editor path.
+                        .contextMenu {
+                            if !profile.isOwner {
+                                Button("Edit Profile") { editingProfile = profile }
+                                if profile.id != profiles.activeID {
+                                    Button("Delete Profile", role: .destructive) { pendingDelete = profile }
+                                }
+                            }
+                        }
                     }
                     Button {
                         editingProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
@@ -253,6 +278,26 @@ struct iOSSettingsView: View {
             Text("Profiles")
         } footer: {
             Text("Select a profile to edit it. Each profile keeps its own look, languages, PIN, and optionally its own Stremio account. A profile with a PIN asks for it before it can be edited.")
+        }
+    }
+
+    // MARK: Language
+
+    @ViewBuilder private var languageSection: some View {
+        Section {
+            Picker("App Language", selection: $langSelection) {
+                Text("System Default").tag("system")
+                ForEach(AppLanguage.supported, id: \.code) { lang in
+                    Text(lang.name).tag(lang.code)
+                }
+            }
+            .onChange(of: langSelection) { newValue in
+                AppLanguage.set(newValue == "system" ? nil : newValue)
+            }
+        } header: {
+            Text("Language")
+        } footer: {
+            Text("Choose the app's language. \"System Default\" follows your device language. A change takes full effect the next time you quit and reopen VortX.")
         }
     }
 

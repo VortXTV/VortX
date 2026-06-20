@@ -33,6 +33,9 @@ struct InHeroTrailerView: View {
 
     /// Flips true after `startDelay`, which cross-fades the clip in over the still backdrop.
     @State private var showClip = false
+    /// Set if the embed reports a failure (embedding disabled, removed video, etc.). Keeps the clip
+    /// hidden so the still backdrop underneath stays visible instead of YouTube's error card.
+    @State private var failed = false
 
     /// Seconds the still backdrop holds before the muted clip dissolves in (the "~2-3s after the hero
     /// backdrop shows" beat). A named constant, not a magic number.
@@ -42,7 +45,7 @@ struct InHeroTrailerView: View {
 
     var body: some View {
         ZStack {
-            if showClip {
+            if showClip, !failed {
                 clip
                     .transition(.opacity)
             }
@@ -55,6 +58,7 @@ struct InHeroTrailerView: View {
         .task(id: youTubeID) {
             // Reset for the new title, then hold the still backdrop before easing the clip in.
             showClip = false
+            failed = false
             try? await Task.sleep(for: Self.startDelay)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: Self.fadeDuration)) { showClip = true }
@@ -69,7 +73,8 @@ struct InHeroTrailerView: View {
     private var clip: some View {
         // A short ~6-second muted window (started a few seconds in to skip studio/title cards) rather than
         // the full trailer: a quick, ambient "clip" of the title that loops behind the hero art.
-        YouTubeEmbedView(youTubeID: youTubeID, mode: .clip(startSeconds: 8, windowSeconds: 6))
+        YouTubeEmbedView(youTubeID: youTubeID, mode: .clip(startSeconds: 8, windowSeconds: 6),
+                         onFailure: { withAnimation(.easeOut(duration: 0.3)) { failed = true } })
             .frame(height: height)
             .frame(maxWidth: .infinity)
             .clipped()
