@@ -13,6 +13,10 @@ import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
+import { handleSettingsClick, renderSettings } from "./views/settings";
+import { handleLoginClick, renderLogin } from "./views/login";
+import { applySettings } from "./lib/settings";
+import { ensureValidSession } from "./lib/account";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
 // hash-routed surfaces (Home board, Discover grid, Search, Detail, Add-ons). Detail resolves streams
@@ -32,6 +36,7 @@ const APP_SHELL = `
       <a class="topnav-link" data-nav="library" href="#/library">${icon("library")}<span>Library</span></a>
       <a class="topnav-link" data-nav="search" href="#/search/">${icon("search")}<span>Search</span></a>
       <a class="topnav-link" data-nav="addons" href="#/addons">${icon("addons")}<span>Add-ons</span></a>
+      <a class="topnav-link" data-nav="settings" href="#/settings">${icon("settings")}<span>Settings</span></a>
     </nav>
   </header>
   <main class="content" id="main"></main>
@@ -54,9 +59,11 @@ function markActiveNav(route: Route): void {
           ? "addons"
           : route.name === "library"
             ? "library"
-            : route.name === "home"
-              ? "home"
-              : "";
+            : route.name === "settings"
+              ? "settings"
+              : route.name === "home"
+                ? "home"
+                : "";
   document.querySelectorAll<HTMLElement>(".topnav-link").forEach((link) => {
     link.classList.toggle("active", link.dataset.nav === active);
   });
@@ -136,6 +143,14 @@ async function renderRoute(route: Route): Promise<void> {
       renderLibrary(mainHost());
       return;
     }
+    case "settings": {
+      renderSettings(mainHost());
+      return;
+    }
+    case "login": {
+      renderLogin(mainHost());
+      return;
+    }
     case "detail": {
       const host = el("detail-host");
       if (!host) return;
@@ -201,6 +216,15 @@ function wireGlobalClicks(): void {
       // Anchor already sets the hash; nothing extra needed, but stop the Detail handler eating it.
       return;
     }
+    // Settings + Login are normal content routes (not overlays), so route their action clicks by route.
+    if (parseRoute().name === "settings" && handleSettingsClick(ev.target)) {
+      ev.preventDefault();
+      return;
+    }
+    if (parseRoute().name === "login" && handleLoginClick(ev.target)) {
+      ev.preventDefault();
+      return;
+    }
     // While the Detail overlay is active, route its action clicks to the Detail handler.
     if (el("detail-host")?.classList.contains("active")) {
       void handleDetailClick(ev.target);
@@ -238,10 +262,12 @@ function dismissSplash(): void {
 async function start(): Promise<void> {
   const app = el("app");
   if (!app) return;
+  applySettings(); // theme + text size live before first paint (overrides the default :root tokens)
   dismissSplash();
   app.innerHTML = APP_SHELL;
   wireGlobalClicks();
 
+  void ensureValidSession(); // clear a revoked token in the background; never blocks first paint
   addons = await loadInstalledAddons();
   onRouteChange((route) => void renderRoute(route));
 }

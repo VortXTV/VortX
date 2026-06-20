@@ -57,6 +57,11 @@
   margin: 0;
   box-sizing: border-box;
 }
+/* The `hidden` attribute must win over any author `display` (e.g. .auth-label{display:grid} would
+   otherwise keep a hidden 2FA field visible). */
+[hidden] {
+  display: none !important;
+}
 html,
 body {
   height: 100%;
@@ -1334,4 +1339,293 @@ input:focus-visible {
   .featured-content {
     transition: none;
   }
+}
+
+/* ---- Settings page (the web twin of the Apple Settings Form) ---- */
+.settings-page {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: var(--space-md) var(--space-edge) var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+}
+.settings-title {
+  margin: 0 0 var(--space-xs);
+}
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+/* Section header: a quiet tertiary eyebrow (the app uses tertiary, not accent, for section titles). */
+.settings-eyebrow {
+  color: var(--muted-2);
+}
+.settings-card {
+  padding: 0 var(--space-md);
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+}
+.settings-row + .settings-row {
+  border-top: 1px solid var(--hairline);
+}
+.settings-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.settings-row-sub {
+  color: var(--muted-2);
+  font-size: 0.85rem;
+}
+.settings-row-control {
+  flex: none;
+  display: flex;
+  align-items: center;
+}
+.settings-footer {
+  margin: 0;
+  padding: 0 0.2rem;
+  color: var(--muted-2);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.settings-signin {
+  margin: var(--space-sm) 0;
+}
+/* Accent swatches */
+.swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--sw);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.3);
+  transition: transform var(--dur-state) var(--ease-spring);
+}
+.swatch:hover {
+  transform: scale(1.12);
+}
+.swatch.selected {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--text);
+}
+/* Segmented control */
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--surface-2);
+  border-radius: var(--radius-pill);
+  padding: 3px;
+}
+.seg {
+  padding: 0.4rem 0.85rem;
+  border-radius: var(--radius-pill);
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background var(--dur-state) var(--ease), color var(--dur-state) var(--ease);
+}
+.seg:hover {
+  color: var(--text);
+}
+.seg.selected {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+/* Stepper */
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  background: var(--surface-2);
+  border-radius: var(--radius-pill);
+  padding: 3px;
+}
+.stepper-btn {
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 50%;
+  color: var(--text);
+  font-size: 1.2rem;
+  line-height: 1;
+  transition: background var(--dur-state) var(--ease);
+}
+.stepper-btn:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+.stepper-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.stepper-value {
+  min-width: 3.2rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+/* Toggle switch */
+.switch {
+  width: 46px;
+  height: 28px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  position: relative;
+  transition: background var(--dur-state) var(--ease);
+}
+.switch.on {
+  background: var(--accent);
+}
+.switch-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform var(--dur-state) var(--ease-spring);
+}
+.switch.on .switch-knob {
+  transform: translateX(18px);
+}
+/* Native select (language pickers) */
+.settings-select {
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.settings-select:focus {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+}
+
+/* ---- Login / account (auth) screen ---- */
+.auth-screen {
+  max-width: 460px;
+  margin: 0 auto;
+  padding: var(--space-xl) var(--space-edge);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+.auth-title {
+  margin: 0;
+}
+.auth-lead {
+  margin: 0;
+  color: var(--muted);
+}
+.auth-footnote {
+  margin: 0;
+  text-align: center;
+  color: var(--muted-2);
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.auth-tabs {
+  display: inline-flex;
+  gap: 0.35rem;
+  align-self: flex-start;
+}
+.auth-card {
+  padding: var(--space-lg);
+  display: grid;
+  gap: var(--space-md);
+}
+.auth-form {
+  display: grid;
+  gap: var(--space-md);
+}
+.auth-label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+.field {
+  width: 100%;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--hairline);
+  font-size: 1rem;
+}
+.field:focus {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 1px;
+}
+.auth-hint {
+  font-size: 0.8rem;
+  color: var(--muted-2);
+}
+.auth-hint.ok {
+  color: #5fbf78;
+}
+.auth-hint.bad {
+  color: var(--danger);
+}
+.auth-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: 0.9rem;
+}
+.auth-links {
+  display: flex;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+}
+.auth-linkbtn {
+  color: var(--accent-bright);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 0.9rem;
+  background: none;
+}
+.auth-note {
+  margin: 0;
+  color: var(--muted-2);
+  font-size: 0.8rem;
+  line-height: 1.5;
+}
+.auth-actions {
+  display: flex;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+.auth-reccode {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 1.1rem;
+  letter-spacing: 0.08em;
+  padding: var(--space-md);
+  border: 1px dashed var(--hairline);
+  border-radius: var(--radius-card);
+  text-align: center;
+  word-break: break-all;
+  background: var(--surface-2);
+}
+.auth-dash {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+.auth-handle {
+  font-size: 1.1rem;
+  font-weight: 600;
 }

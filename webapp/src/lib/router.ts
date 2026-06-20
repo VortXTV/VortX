@@ -9,7 +9,9 @@ export type Route =
   | { name: "search"; query: string }
   | { name: "detail"; type: string; id: string }
   | { name: "addons" }
-  | { name: "library" };
+  | { name: "library" }
+  | { name: "settings" }
+  | { name: "login" };
 
 /** Parse the current `location.hash` into a typed Route, defaulting to Home. */
 export function parseRoute(): Route {
@@ -32,6 +34,10 @@ export function parseRoute(): Route {
       return { name: "addons" };
     case "library":
       return { name: "library" };
+    case "settings":
+      return { name: "settings" };
+    case "login":
+      return { name: "login" };
     default:
       return { name: "home" };
   }
@@ -52,6 +58,10 @@ export function hashFor(route: Route): string {
       return "#/addons";
     case "library":
       return "#/library";
+    case "settings":
+      return "#/settings";
+    case "login":
+      return "#/login";
   }
 }
 
