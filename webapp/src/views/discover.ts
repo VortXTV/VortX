@@ -4,14 +4,14 @@ import { escapeHtml, httpUrl } from "../lib/dom";
 import { hashFor } from "../lib/router";
 import { mountFeatured, posterCard } from "./board";
 
-// Discover: a single dense poster grid for one content type, merged across every catalog of that type.
-// Where the Board is editorial (rails), Discover is a library-style grid for browsing one type deeply.
+// Discover: browse ONE catalog at a time, matching the app. A featured hero, a content-type switch, the
+// catalogs of that type as selectable chips, then the selected catalog's poster grid with Load more.
+// (The old version merged every catalog of a type into one grid; the apps pick a single catalog.)
 
-/** The distinct content types present across installed add-on catalogs, for the type switcher. */
+/** The distinct content types present across installed add-on catalogs, for the type switch. */
 export function discoverTypes(addons: Addon[]): string[] {
   const types = new Set<string>();
   for (const ref of catalogRefs(addons)) types.add(ref.def.type);
-  // Stable, sensible order with the common types first.
   const order = ["movie", "series", "channel", "tv"];
   return Array.from(types).sort((a, b) => {
     const ia = order.indexOf(a);
@@ -21,126 +21,163 @@ export function discoverTypes(addons: Addon[]): string[] {
   });
 }
 
-/** Render the Discover shell (type switcher + an empty grid) for `type`; loadDiscover fills the grid. */
+function catalogsForType(addons: Addon[], type: string): CatalogRef[] {
+  return catalogRefs(addons).filter((r) => r.def.type === type);
+}
+
+/** A stable id for a catalog (unique across add-ons), used as the chip key + selection state. */
+function catalogKey(ref: CatalogRef): string {
+  return `${ref.addon.transportUrl}|${ref.def.type}|${ref.def.id}`;
+}
+
+function catalogLabel(ref: CatalogRef): string {
+  return ref.def.name?.trim() || `${ref.def.id} ${ref.def.type}`.trim();
+}
+
+// Module state: the active type + selected catalog + that catalog's pagination. The selected catalog
+// persists across renders when it is still valid (so switching type, then back, keeps your place).
+let curAddons: Addon[] = [];
+let curType = "";
+let curKey = "";
+let reqToken = 0;
+
+interface CatState {
+  ref: CatalogRef;
+  skip: number;
+  done: boolean;
+  loading: boolean;
+  lastFirstId?: string;
+  seen: Set<string>;
+  token: number;
+}
+let cat: CatState | null = null;
+
+/** Render the Discover shell: featured hero + type chips + catalog chips + an empty grid. */
 export function renderDiscoverShell(host: HTMLElement, addons: Addon[], type: string): void {
-  const types = discoverTypes(addons);
-  const tabs = types
+  curAddons = addons;
+  curType = type;
+  const refs = catalogsForType(addons, type);
+  if (!refs.some((r) => catalogKey(r) === curKey)) curKey = refs[0] ? catalogKey(refs[0]) : "";
+
+  const typeTabs = discoverTypes(addons)
     .map(
       (t) =>
-        `<a class="chip${t === type ? " selected" : ""}" href="${escapeHtml(
-          hashFor({ name: "discover", type: t }),
-        )}">${escapeHtml(titleCase(t))}</a>`,
+        `<a class="chip${t === type ? " selected" : ""}" href="${escapeHtml(hashFor({ name: "discover", type: t }))}">${escapeHtml(
+          titleCase(t),
+        )}</a>`,
     )
     .join("");
+  const catChips = refs
+    .map(
+      (r) =>
+        `<button class="chip${catalogKey(r) === curKey ? " selected" : ""}" data-action="discover-catalog" data-key="${escapeHtml(
+          catalogKey(r),
+        )}">${escapeHtml(catalogLabel(r))}</button>`,
+    )
+    .join("");
+
   host.innerHTML = `
     <div class="discover">
       <section class="featured" id="featured" aria-label="Featured" hidden></section>
       <div class="discover-head">
         <h1 class="page-title">Discover</h1>
-        <div class="type-switch" role="tablist" aria-label="Content type">${tabs}</div>
+        <div class="type-switch" role="tablist" aria-label="Content type">${typeTabs}</div>
       </div>
+      ${catChips ? `<div class="catalog-switch" aria-label="Catalogs">${catChips}</div>` : ""}
       <div class="grid" id="discover-grid" role="list">${gridSkeleton()}</div>
       <div class="discover-more-wrap" id="discover-more-wrap"></div>
     </div>`;
 }
 
-// Monotonic guard: switching Discover type fires a new loadDiscover while the previous one may still be
-// in flight. Both write the fixed `#discover-grid`, so without this a slower earlier type's fetch could
-// resolve last and paint the wrong type's posters. Latest request wins.
-let discoverReqToken = 0;
-
-// Pagination state for the active type. Each catalog of the type advances its OWN skip by the count it
-// actually returned (so there are no gaps regardless of a catalog's page size); `done` is set when a
-// catalog returns an empty page. `seen` de-dupes across pages and across catalogs. A type switch (or any
-// new loadDiscover) replaces this object and bumps the token, so a stale in-flight page is discarded.
-interface RefPage {
-  ref: CatalogRef;
-  skip: number;
-  done: boolean;
-  lastFirstId?: string; // first item id of this catalog's previous page, to detect a skip-ignoring add-on
-}
-interface DiscoverPaging {
-  token: number;
-  refs: RefPage[];
-  seen: Set<string>;
-  loading: boolean;
-}
-let paging: DiscoverPaging | null = null;
-
-/** Fetch the next page from every not-yet-exhausted catalog, advance each ref's skip, de-dupe against
- *  what is already shown, and return only the fresh metas. Bails to [] if a newer load superseded `p`. */
-async function fetchPage(p: DiscoverPaging): Promise<MetaItem[]> {
-  const active = p.refs.filter((r) => !r.done);
-  const results = await Promise.all(active.map(async (r) => ({ r, metas: await fetchCatalog(r.ref, r.skip) })));
-  if (p !== paging || p.token !== discoverReqToken) return []; // superseded by a newer type load
-  const fresh: MetaItem[] = [];
-  for (const { r, metas } of results) {
-    const firstId = metas[0]?.id;
-    // A catalog is exhausted when it returns an empty page, OR returns the same first item as its
-    // previous page - an add-on that ignores `skip` would otherwise loop forever behind a Load more
-    // that adds nothing. Comparing this catalog's OWN previous page (not the global seen set) avoids
-    // prematurely stopping a catalog whose page merely overlaps another catalog's items.
-    if (!metas.length || (firstId !== undefined && firstId === r.lastFirstId)) {
-      r.done = true;
-      continue;
-    }
-    r.lastFirstId = firstId;
-    r.skip += metas.length;
-    for (const m of metas) {
-      if (p.seen.has(m.id)) continue;
-      p.seen.add(m.id);
-      fresh.push(m);
-    }
-  }
-  return fresh;
-}
-
-/** A "Load more" button while any catalog still has pages; empty once every catalog is exhausted. */
-function moreButton(p: DiscoverPaging): string {
-  return p.refs.some((r) => !r.done)
-    ? `<button class="chip discover-more" data-action="discover-more">Load more</button>`
-    : "";
-}
-
-/** Merge the first page of every catalog of `type` into one de-duped grid, with a Load more control. */
+/** Load the selected catalog (defaulting to the first of the type) for `type`. */
 export async function loadDiscover(addons: Addon[], type: string): Promise<void> {
-  const token = ++discoverReqToken;
-  const refs = catalogRefs(addons).filter((r) => r.def.type === type);
-  const p: DiscoverPaging = {
-    token,
-    refs: refs.map((ref) => ({ ref, skip: 0, done: false })),
-    seen: new Set<string>(),
-    loading: false,
-  };
-  paging = p;
-  const fresh = await fetchPage(p);
-  if (p !== paging || token !== discoverReqToken) return; // a newer type switch superseded this load
+  curAddons = addons;
+  curType = type;
+  const refs = catalogsForType(addons, type);
+  if (!refs.some((r) => catalogKey(r) === curKey)) curKey = refs[0] ? catalogKey(refs[0]) : "";
+  await loadSelectedCatalog();
+}
+
+/** Fetch the selected catalog's first page into the grid (+ featured hero + Load more). */
+async function loadSelectedCatalog(): Promise<void> {
+  const token = ++reqToken;
+  const refs = catalogsForType(curAddons, curType);
+  const ref = refs.find((r) => catalogKey(r) === curKey) ?? refs[0];
   const grid = document.getElementById("discover-grid");
   const wrap = document.getElementById("discover-more-wrap");
-  if (!grid) return;
+  if (!ref) {
+    if (grid) grid.innerHTML = `<p class="muted">No catalogs for this type. Add a catalog add-on.</p>`;
+    if (wrap) wrap.innerHTML = "";
+    return;
+  }
+  const state: CatState = { ref, skip: 0, done: false, loading: false, seen: new Set<string>(), token };
+  cat = state;
+  const metas = await fetchCatalog(ref, 0);
+  if (token !== reqToken || !grid) return; // a newer type/catalog selection superseded this load
+  const fresh = dedupe(metas, state);
+  state.skip = metas.length;
+  state.lastFirstId = metas[0]?.id;
+  if (!metas.length) state.done = true;
   if (!fresh.length) {
-    grid.innerHTML = `<p class="muted">No titles found for this type. Add a catalog add-on that serves ${escapeHtml(type)}.</p>`;
+    grid.innerHTML = `<p class="muted">No titles in this catalog yet.</p>`;
     if (wrap) wrap.innerHTML = "";
     return;
   }
   grid.innerHTML = fresh.map((m) => posterCard(m)).join("");
-  if (wrap) wrap.innerHTML = moreButton(p);
-  // Featured hero from the top art-bearing results (the same ambient billboard Home uses).
+  if (wrap) wrap.innerHTML = state.done ? "" : moreButton();
   mountFeatured(fresh.filter((m) => Boolean(httpUrl(m.background) || httpUrl(m.poster))).slice(0, 5));
 }
 
-/** Append the next page across the active type's catalogs (the Load more click handler). */
-export async function loadMoreDiscover(): Promise<void> {
-  const p = paging;
-  if (!p || p.loading || p.token !== discoverReqToken) return;
-  p.loading = true;
-  const fresh = await fetchPage(p);
-  p.loading = false;
-  if (p !== paging || p.token !== discoverReqToken) return; // a type switch superseded this page
+/** Select a catalog chip (no route change): update the selection + reload its grid. */
+export async function selectDiscoverCatalog(key: string): Promise<void> {
+  if (!key || key === curKey) return;
+  curKey = key;
+  document
+    .querySelectorAll<HTMLElement>(".catalog-switch .chip")
+    .forEach((c) => c.classList.toggle("selected", c.dataset.key === key));
   const grid = document.getElementById("discover-grid");
-  if (grid && fresh.length) grid.insertAdjacentHTML("beforeend", fresh.map(posterCard).join(""));
+  if (grid) grid.innerHTML = gridSkeleton();
+  await loadSelectedCatalog();
+}
+
+/** Append the selected catalog's next page (the Load more click handler). */
+export async function loadMoreDiscover(): Promise<void> {
+  const state = cat;
+  if (!state || state.loading || state.done || state.token !== reqToken) return;
+  state.loading = true;
+  const metas = await fetchCatalog(state.ref, state.skip);
+  state.loading = false;
+  if (state !== cat || state.token !== reqToken) return; // superseded
+  const firstId = metas[0]?.id;
+  // Exhausted when a page is empty or repeats its first item (a skip-ignoring add-on).
+  if (!metas.length || (firstId !== undefined && firstId === state.lastFirstId)) {
+    state.done = true;
+    const wrap = document.getElementById("discover-more-wrap");
+    if (wrap) wrap.innerHTML = "";
+    return;
+  }
+  state.lastFirstId = firstId;
+  state.skip += metas.length;
+  const fresh = dedupe(metas, state);
+  const grid = document.getElementById("discover-grid");
+  if (grid && fresh.length) grid.insertAdjacentHTML("beforeend", fresh.map((m) => posterCard(m)).join(""));
   const wrap = document.getElementById("discover-more-wrap");
-  if (wrap) wrap.innerHTML = moreButton(p); // removes the button once every catalog is exhausted
+  if (wrap) wrap.innerHTML = state.done ? "" : moreButton();
+}
+
+/** Keep only items not already shown for this catalog. */
+function dedupe(metas: MetaItem[], state: CatState): MetaItem[] {
+  const fresh: MetaItem[] = [];
+  for (const m of metas) {
+    if (state.seen.has(m.id)) continue;
+    state.seen.add(m.id);
+    fresh.push(m);
+  }
+  return fresh;
+}
+
+function moreButton(): string {
+  return `<button class="chip discover-more" data-action="discover-more">Load more</button>`;
 }
 
 function titleCase(value: string): string {

@@ -373,6 +373,18 @@ input:focus-visible {
   gap: 0.4rem;
   flex-wrap: wrap;
 }
+/* Catalog selector: a horizontal, scrollable row of catalog chips (one catalog shown at a time). */
+.catalog-switch {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  padding-bottom: 0.5rem;
+  margin-bottom: 1.25rem;
+  scrollbar-width: thin;
+}
+.catalog-switch .chip {
+  flex: 0 0 auto;
+}
 /* The Discover / Search "Load more" control sits centered below the grid; empty until paging starts. */
 .discover-more-wrap,
 .search-more-wrap {

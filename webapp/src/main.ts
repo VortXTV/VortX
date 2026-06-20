@@ -8,7 +8,13 @@ import { navigate, onRouteChange, parseRoute, type Route } from "./lib/router";
 import { close as closePlayer, isPlayerOpen } from "./lib/player";
 import { icon } from "./lib/icons";
 import { disposeFeatured, loadBoard, renderBoardShell } from "./views/board";
-import { discoverTypes, loadDiscover, loadMoreDiscover, renderDiscoverShell } from "./views/discover";
+import {
+  discoverTypes,
+  loadDiscover,
+  loadMoreDiscover,
+  renderDiscoverShell,
+  selectDiscoverCatalog,
+} from "./views/discover";
 import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
@@ -212,9 +218,16 @@ function wireGlobalClicks(): void {
       return;
     }
     if (hit?.action === "discover-more") {
-      // The Discover "Load more" control: append the next page across the active type's catalogs.
+      // The Discover "Load more" control: append the selected catalog's next page.
       ev.preventDefault();
       void loadMoreDiscover();
+      return;
+    }
+    if (hit?.action === "discover-catalog") {
+      // A Discover catalog chip: switch the shown catalog (no route change).
+      ev.preventDefault();
+      const key = hit.node.dataset.key;
+      if (key) void selectDiscoverCatalog(key);
       return;
     }
     if (hit?.action === "search-more") {
