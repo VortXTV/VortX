@@ -22,9 +22,16 @@ enum PlayedLinkLibrary {
         // Filenames misclassify, so try the guessed type first, then the other.
         let primary = parsed.isSeries ? "series" : "movie"
         let secondary = parsed.isSeries ? "movie" : "series"
-        var hit = (try? await client.search(type: primary, query: parsed.query))?.first
-        if hit == nil { hit = (try? await client.search(type: secondary, query: parsed.query))?.first }
-        guard let preview = hit else { return }   // unknown title: leave it in SavedLinksStore only
+        // #81: accept a hit ONLY when its title confidently matches the cleaned torrent name. A fan-sub
+        // magnet (e.g. "Kamen Rider [FanSub]") must not adopt an unrelated catalog title just because it
+        // was the first search result. No confident match → leave the raw link in SavedLinksStore only.
+        var preview = bestMatch(in: (try? await client.search(type: primary, query: parsed.query)) ?? [],
+                                query: parsed.query)
+        if preview == nil {
+            preview = bestMatch(in: (try? await client.search(type: secondary, query: parsed.query)) ?? [],
+                                query: parsed.query)
+        }
+        guard let preview else { return }   // unknown title: leave it in SavedLinksStore only
 
         if ProfileStore.shared.activeUsesEngineHistory {
             // Main profile → account library. Hand the engine the full Cinemeta meta object (the same
@@ -95,5 +102,63 @@ enum PlayedLinkLibrary {
     /// Generic placeholders the magnet resolver hands back when it has no real name.
     private static func isPlaceholder(_ q: String) -> Bool {
         ["torrent", "file", "stream", "video", "magnet link"].contains(q.lowercased())
+    }
+
+    /// The result whose title confidently matches the cleaned torrent name, highest score first; nil
+    /// when nothing clears the bar. This is the #81 guard: a fan-sub magnet must not adopt an unrelated
+    /// catalog title just because it was the first search hit.
+    static func bestMatch(in results: [MetaPreview], query: String) -> MetaPreview? {
+        let q = normalize(query)
+        guard !q.isEmpty else { return nil }
+        return results
+            .compactMap { p -> (MetaPreview, Double)? in matchScore(q, normalize(p.name)).map { (p, $0) } }
+            .max { $0.1 < $1.1 }?.0
+    }
+
+    /// A confidence score in (0, 1] when `name` is a trustworthy match for the already-normalized query
+    /// `q`, else nil. Exact match = 1; a pure subtitle/suffix difference (one is a prefix of the other and
+    /// they are close in length) = 0.95; otherwise an edit-distance similarity must clear 0.82. The
+    /// length guard stops a generic short query ("kamen rider") from matching a longer specific title
+    /// ("kamen rider geats").
+    private static func matchScore(_ q: String, _ name: String) -> Double? {
+        guard !q.isEmpty, !name.isEmpty else { return nil }
+        if q == name { return 1.0 }
+        let shorter = q.count <= name.count ? q : name
+        let longer  = q.count <= name.count ? name : q
+        if longer.hasPrefix(shorter), Double(shorter.count) >= 0.7 * Double(longer.count) { return 0.95 }
+        let sim = similarity(q, name)
+        return sim >= 0.82 ? sim : nil
+    }
+
+    /// Lowercased, non-alphanumerics folded to single spaces, trimmed, so "Kamen.Rider_Gavv" and
+    /// "kamen rider gavv" compare equal.
+    private static func normalize(_ s: String) -> String {
+        let mapped = String(s.lowercased().map { ($0.isLetter || $0.isNumber) ? $0 : " " })
+        return mapped.components(separatedBy: .whitespaces).filter { !$0.isEmpty }.joined(separator: " ")
+    }
+
+    /// 1 - (Levenshtein distance / longer length), in [0, 1].
+    private static func similarity(_ a: String, _ b: String) -> Double {
+        let maxLen = max(a.count, b.count)
+        guard maxLen > 0 else { return 1 }
+        return 1.0 - Double(levenshtein(a, b)) / Double(maxLen)
+    }
+
+    /// Classic edit distance, two-row variant (cheap on short title strings).
+    private static func levenshtein(_ a: String, _ b: String) -> Int {
+        let x = Array(a), y = Array(b)
+        if x.isEmpty { return y.count }
+        if y.isEmpty { return x.count }
+        var prev = Array(0...y.count)
+        var cur = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            cur[0] = i
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            }
+            swap(&prev, &cur)
+        }
+        return prev[y.count]
     }
 }
