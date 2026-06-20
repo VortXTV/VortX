@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "resources/server.cjs": "server.cjs",
+      "resources/node-*": "",
+      "resources/mpv-darwin-arm64.app": "mpv-darwin-arm64.app"
+    }
+  }
+}

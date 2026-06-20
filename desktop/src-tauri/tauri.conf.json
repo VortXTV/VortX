@@ -37,8 +37,7 @@
     ],
     "resources": {
       "resources/server.cjs": "server.cjs",
-      "resources/node-*": "",
-      "resources/mpv-*": ""
+      "resources/node-*": ""
     }
   }
 }
