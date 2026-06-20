@@ -226,6 +226,9 @@ struct PlayerScreen: View {
 
     // Load failure / recovery state (mirrors TVPlayerView).
     @State private var loadFailed = false            // playback couldn't start (dead/uncached link)
+    #if os(iOS)
+    @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
+    #endif
     @State private var loadErrorMsg = ""
     @State private var hasStartedPlaying = false
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
@@ -296,6 +299,7 @@ struct PlayerScreen: View {
     /// AVPlayer (the on-device test path for the full-chrome AVPlayer engine). `isDolbyVision` is not yet
     /// threaded from the stream picker, so DV auto-routing arrives with that wiring.
     private var useAVPlayerEngine: Bool {
+        if avEngineFailed { return false }   // an AVPlayer load failure fell back to libmpv for this stream
         let loopback = url.host == "127.0.0.1" || url.host == "localhost"
         return PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: false) == .avfoundation
     }
@@ -584,6 +588,15 @@ struct PlayerScreen: View {
             }
         case MPVProperty.endFileError:
             if !hasStartedPlaying {                  // only flag failures BEFORE playback
+                #if os(iOS)
+                if useAVPlayerEngine, !avEngineFailed {
+                    // AVPlayer could not open this stream (e.g. a Profile 7 DV remux it cannot decode).
+                    // Fall back to libmpv with the same URL rather than dead-ending: flipping this swaps
+                    // playerSurface to the mpv engine, which re-loads initialPlayback from scratch.
+                    avEngineFailed = true
+                    return
+                }
+                #endif
                 handleLoadFailure((data as? String) ?? "")
             }
         case MPVProperty.endFileEof:
