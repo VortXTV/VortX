@@ -10,6 +10,12 @@
             "state": "translated",
             "value": "%@ · tocca per ottenerlo"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · toca para obtenerlo"
+          }
         }
       }
     },
@@ -26,6 +32,12 @@
             "state": "translated",
             "value": "%@ (%@)"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ (%@)"
+          }
         }
       }
     },
@@ -35,6 +47,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ può essere modificato solo da quel profilo"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ solo puede editarse desde ese perfil"
           }
         }
       }
@@ -52,6 +70,12 @@
             "state": "translated",
             "value": "%@ altro componente aggiuntivo%@ non ha restituito sorgenti per questo titolo."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ otro complemento%@ no devolvió fuentes para este título."
+          }
         }
       }
     },
@@ -64,6 +88,12 @@
           }
         },
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@: %@"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "%@: %@"
@@ -100,6 +130,12 @@
             "state": "translated",
             "value": "Un backup salva i tuoi profili, il tema e le preferenze del lettore, così ti seguono ovunque e sopravvivono a un futuro aggiornamento importante. Su iPhone, iPad e Mac puoi salvarlo in un file già da oggi."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Una copia de seguridad guarda tus perfiles, el tema y las preferencias del reproductor, para que te acompañen y sobrevivan a una futura actualización importante. En iPhone, iPad y Mac puedes guardarla en un archivo desde hoy."
+          }
         }
       }
     },
@@ -109,6 +145,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Un punto di partenza con un solo tocco; perfeziona i controlli qui sotto. L'ordine dei tipi di sorgente viene salvato per profilo."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Un punto de partida con un solo toque; ajusta los controles de abajo. El orden de los tipos de fuente se guarda por perfil."
           }
         }
       }
@@ -120,6 +162,12 @@
             "state": "translated",
             "value": "Accento"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Acento"
+          }
         }
       }
     },
@@ -129,6 +177,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "L'accento ricolora il focus, la selezione e l'avanzamento in tutta l'app. OLED Black usa il nero puro, ideale sui pannelli AMOLED."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El acento recolorea el foco, la selección y el progreso en toda la app. OLED Black usa negro puro, ideal en pantallas AMOLED."
           }
         }
       }
@@ -140,6 +194,12 @@
             "state": "translated",
             "value": "L'accento ricolora la selezione e l'avanzamento in tutta l'app. OLED Black usa il nero puro, ideale sui pannelli AMOLED."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El acento recolorea la selección y el progreso en toda la app. OLED Black usa negro puro, ideal en pantallas AMOLED."
+          }
         }
       }
     },
@@ -149,6 +209,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Aggiungi un componente aggiuntivo"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Añadir un complemento"
           }
         }
       }
@@ -160,6 +226,12 @@
             "state": "translated",
             "value": "Aggiungi profilo"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Añadir perfil"
+          }
         }
       }
     },
@@ -169,6 +241,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Aggiungi più componenti aggiuntivi in una volta"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Añade varios complementos a la vez"
           }
         }
       }
@@ -180,6 +258,12 @@
             "state": "translated",
             "value": "Aggiungi la tua chiave API debrid una volta e VortX la usa ovunque, senza un sito di configurazione separato. I torrent in cache si risolvono in link diretti istantanei. Le tue chiavi restano su questo dispositivo e si sincronizzano, cifrate, con il tuo account VortX."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Añade tu clave API de debrid una vez y VortX la usa en todas partes, sin un sitio de configuración aparte. Los torrents en caché se resuelven en enlaces directos instantáneos. Tus claves permanecen en este dispositivo y se sincronizan, cifradas, con tu cuenta VortX."
+          }
         }
       }
     },
@@ -189,6 +273,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Componenti aggiuntivi"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Complementos"
           }
         }
       }
@@ -200,6 +290,12 @@
             "state": "translated",
             "value": "Avanzate (opzioni mpv)"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Avanzado (opciones de mpv)"
+          }
         }
       }
     },
@@ -209,6 +305,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Tutti (%@)"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Todos (%@)"
           }
         }
       }
@@ -220,6 +322,12 @@
             "state": "translated",
             "value": "Usi già Stremio?"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "¿Ya usas Stremio?"
+          }
         }
       }
     },
@@ -229,6 +337,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Sempre HDR"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Siempre HDR"
           }
         }
       }
@@ -240,6 +354,12 @@
             "state": "translated",
             "value": "Dimensione testo app  ·  %@%%"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tamaño del texto  ·  %@%%"
+          }
         }
       }
     },
@@ -249,6 +369,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Aspetto"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Apariencia"
           }
         }
       }
@@ -260,12 +386,24 @@
             "state": "translated",
             "value": "Audio e sottotitoli"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Audio y subtítulos"
+          }
         }
       }
     },
     "Auto": {
       "localizations": {
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "Auto"
@@ -280,6 +418,12 @@
             "state": "translated",
             "value": "Auto mantiene l'esperienza completa sulle Apple TV più potenti e passa a una più leggera sui modelli più vecchi come Apple TV HD. Ridotta riduce le animazioni e i buffer di riproduzione così il telecomando resta reattivo su hardware debole. Riavvia l'app dopo aver cambiato questa impostazione."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto mantiene la experiencia completa en los Apple TV más potentes y cambia a una más ligera en modelos más antiguos como el Apple TV HD. Reducido recorta las animaciones y reduce los búferes de reproducción para que el mando siga respondiendo en hardware débil. Reinicia la app tras cambiar esto."
+          }
         }
       }
     },
@@ -289,6 +433,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Auto converte (tone-map) HDR e Dolby Vision in SDR solo su uno schermo che non può mostrare l'HDR. Scegli Converti in SDR se i remux 4K Dolby Vision appaiono slavati, verdi o viola; Sempre HDR per forzare il pass-through."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto convierte (tone-map) HDR y Dolby Vision a SDR solo en una pantalla que no puede mostrar HDR. Elige Convertir a SDR si los remux 4K Dolby Vision se ven lavados, verdes o morados; Siempre HDR para forzar el paso directo."
           }
         }
       }
@@ -300,6 +450,12 @@
             "state": "translated",
             "value": "Auto converte (tone-map) HDR e Dolby Vision in SDR solo su un TV che non può mostrare l'HDR. Scegli Converti in SDR se i remux 4K Dolby Vision appaiono slavati, verdi o viola sul tuo TV; Sempre HDR forza il pass-through."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto convierte (tone-map) HDR y Dolby Vision a SDR solo en un televisor que no puede mostrar HDR. Elige Convertir a SDR si los remux 4K Dolby Vision se ven lavados, verdes o morados en tu televisor; Siempre HDR fuerza el paso directo."
+          }
         }
       }
     },
@@ -309,6 +465,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Sfondo"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fondo"
           }
         }
       }
@@ -320,6 +482,12 @@
             "state": "translated",
             "value": "Backup e ripristino"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copia de seguridad y restauración"
+          }
         }
       }
     },
@@ -329,6 +497,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Bilanciata"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Equilibrado"
           }
         }
       }
@@ -340,6 +514,12 @@
             "state": "translated",
             "value": "Lettore integrato"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproductor integrado"
+          }
         }
       }
     },
@@ -349,6 +529,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Controlla nei Componenti aggiuntivi se ce n'è uno che elenca «Streams» (non solo Cataloghi o Metadati). Se hai chiuso forzatamente l'app di recente, riaprila così i componenti aggiuntivi si ricaricano, oppure aggiungi di nuovo un componente per le sorgenti."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Busca en Complementos uno que incluya «Streams» (no solo Catálogos o Metadatos). Si cerraste la app a la fuerza hace poco, vuelve a abrirla para que tus complementos se recarguen, o vuelve a añadir un complemento de fuentes."
           }
         }
       }
@@ -360,6 +546,12 @@
             "state": "translated",
             "value": "Scegli quali righe appaiono nella Home e in quale ordine."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Elige qué filas aparecen en Inicio y en qué orden."
+          }
         }
       }
     },
@@ -369,6 +561,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Impossibile generare un codice per questo link."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No se pudo generar un código para este enlace."
           }
         }
       }
@@ -386,6 +584,12 @@
             "state": "translated",
             "value": "In uso: %@%@"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En uso: %@%@"
+          }
         }
       }
     },
@@ -395,6 +599,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Personalizza i cataloghi"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Personalizar catálogos"
           }
         }
       }
@@ -406,6 +616,12 @@
             "state": "translated",
             "value": "Servizi debrid"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servicios debrid"
+          }
         }
       }
     },
@@ -415,6 +631,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Le sorgenti dirette e debrid si aprono automaticamente nel lettore scelto. Torrent e lettore integrato non sono interessati."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Las fuentes directas y debrid se abren automáticamente en el reproductor elegido. Los torrents y el reproductor integrado no se ven afectados."
           }
         }
       }
@@ -426,6 +648,12 @@
             "state": "translated",
             "value": "Le sorgenti dirette e debrid si aprono direttamente nel lettore scelto, che poi gestisce riproduzione e ripresa. Torrent, sorgenti protette da header e trailer usano sempre il lettore integrato."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Las fuentes directas y debrid se abren directamente en el reproductor elegido, que luego gestiona la reproducción y la reanudación. Los torrents, las fuentes protegidas por cabeceras y los tráileres siempre usan el reproductor integrado."
+          }
         }
       }
     },
@@ -435,6 +663,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Solo link diretti"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Solo enlaces directos"
           }
         }
       }
@@ -446,6 +680,12 @@
             "state": "translated",
             "value": "Esplora"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Descubrir"
+          }
         }
       }
     },
@@ -456,6 +696,12 @@
             "state": "translated",
             "value": "Inserisci il PIN per %@"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Introduce el PIN de %@"
+          }
         }
       }
     },
@@ -465,6 +711,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Esporta libreria, che salva i titoli e l'avanzamento di un profilo in un file, è disponibile su iPhone, iPad e Mac (Apple TV non ha un selettore file). Su Apple TV la tua libreria e la cronologia ti seguono tramite il tuo account VortX."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Exportar biblioteca, que guarda los títulos y el progreso de un perfil en un archivo, está disponible en iPhone, iPad y Mac (Apple TV no tiene selector de archivos). En Apple TV tu biblioteca y tu historial te acompañan a través de tu cuenta VortX."
           }
         }
       }
@@ -482,6 +734,12 @@
             "state": "translated",
             "value": "Ricerca della migliore…  %@/%@"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Buscando la mejor…  %@/%@"
+          }
         }
       }
     },
@@ -491,6 +749,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Dimensione precisa  ·  %@%%"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tamaño preciso  ·  %@%%"
           }
         }
       }
@@ -502,12 +766,24 @@
             "state": "translated",
             "value": "Per utenti esperti; una opzione=valore per riga. Applicata sopra le impostazioni predefinite di VortX al successivo avvio di un video."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Para usuarios avanzados; una opción=valor por línea. Se aplica sobre los valores predeterminados de VortX la próxima vez que empiece un vídeo."
+          }
         }
       }
     },
     "Full": {
       "localizations": {
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Completa"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "Completa"
@@ -522,6 +798,12 @@
             "state": "translated",
             "value": "Ricevi una notifica quando sta per uscire un nuovo episodio di una serie che apri. Programmata sul dispositivo per gli episodi in arrivo, quindi non serve alcun tracciamento in background."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recibe una notificación cuando esté a punto de emitirse un nuevo episodio de una serie que abras. Se programa en el dispositivo para los próximos episodios, así que no hace falta seguimiento en segundo plano."
+          }
         }
       }
     },
@@ -531,6 +813,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Vai su link.stremio.com e inserisci questo codice"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ve a link.stremio.com e introduce este código"
           }
         }
       }
@@ -542,6 +830,12 @@
             "state": "translated",
             "value": "Ho capito"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Entendido"
+          }
         }
       }
     },
@@ -551,6 +845,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Parole da nascondere"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Palabras a ocultar"
           }
         }
       }
@@ -562,6 +862,12 @@
             "state": "translated",
             "value": "Nasconde le sorgenti per adulti e CAM/false da questo profilo. Per un blocco completo, imposta un PIN sul tuo profilo così non può essere aperto da qui, e nascondi i componenti aggiuntivi per adulti in Componenti aggiuntivi."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oculta las fuentes para adultos y CAM/falsas de este perfil. Para un bloqueo completo, pon un PIN en tu propio perfil para que no se pueda abrir desde aquí, y oculta los complementos para adultos en Complementos."
+          }
         }
       }
     },
@@ -571,6 +877,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Nasconde le sorgenti più grandi del limite (es. 1080p ma non un file da 20 GB). Le sorgenti senza dimensione indicata vengono mantenute."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Oculta las fuentes mayores que el límite (p. ej. 1080p pero no un archivo de 20 GB). Las fuentes sin tamaño indicado se conservan."
           }
         }
       }
@@ -582,6 +894,12 @@
             "state": "translated",
             "value": "Se questo titolo dovrebbe avere sorgenti, il componente aggiuntivo potrebbe essere offline o la sua configurazione scaduta. Prova un altro componente per le sorgenti."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Si este título debería tener fuentes, el complemento puede estar fuera de línea o su configuración caducada. Prueba otro complemento de fuentes."
+          }
         }
       }
     },
@@ -591,6 +909,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Importa da Stremio"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Importar desde Stremio"
           }
         }
       }
@@ -602,6 +926,12 @@
             "state": "translated",
             "value": "Installa la nuova versione dalla pagina delle release di GitHub; il tuo accesso e le impostazioni vengono mantenuti."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instala la nueva versión desde la página de releases de GitHub; tu inicio de sesión y ajustes se conservan."
+          }
         }
       }
     },
@@ -611,6 +941,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Mantiene la propria cronologia di visione, sincronizzata tramite il tuo account Stremio sugli altri dispositivi."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mantiene su propio historial de visualización, sincronizado a través de tu cuenta Stremio en tus otros dispositivos."
           }
         }
       }
@@ -622,6 +958,12 @@
             "state": "translated",
             "value": "Libreria"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Biblioteca"
+          }
         }
       }
     },
@@ -631,6 +973,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "LIVE"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "EN VIVO"
           }
         }
       }
@@ -642,6 +990,12 @@
             "state": "translated",
             "value": "TV in diretta"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "TV en vivo"
+          }
         }
       }
     },
@@ -651,6 +1005,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Rende il testo di ogni schermata più grande o più piccolo. Le modifiche si applicano subito."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hace el texto de cada pantalla más grande o más pequeño. Los cambios se aplican al instante."
           }
         }
       }
@@ -662,6 +1022,12 @@
             "state": "translated",
             "value": "Confronta le parole come regex"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tratar las palabras como regex"
+          }
         }
       }
     },
@@ -671,6 +1037,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Servizi di metadati"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servicios de metadatos"
           }
         }
       }
@@ -682,6 +1054,12 @@
             "state": "translated",
             "value": "Ancora nessun catalogo. Installa prima un componente aggiuntivo che fornisce cataloghi."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aún no hay catálogos. Instala primero un complemento que proporcione catálogos."
+          }
         }
       }
     },
@@ -691,6 +1069,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ancora nessun log. Se il server si è fermato, riproduci un titolo torrent per avviarlo, poi torna qui."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Aún no hay registro. Si el servidor se detuvo, reproduce un título torrent para iniciarlo y vuelve aquí."
           }
         }
       }
@@ -708,6 +1092,12 @@
             "state": "translated",
             "value": "Nessuno dei tuoi %@ componente aggiuntivo%@ ha restituito una sorgente riproducibile per questo titolo."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ninguno de tus %@ complemento%@ devolvió una fuente reproducible para este título."
+          }
         }
       }
     },
@@ -717,6 +1107,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Notifiche"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notificaciones"
           }
         }
       }
@@ -728,12 +1124,24 @@
             "state": "translated",
             "value": "Off"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Desactivado"
+          }
         }
       }
     },
     "OK": {
       "localizations": {
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OK"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "OK"
@@ -748,6 +1156,12 @@
             "state": "translated",
             "value": "OLED Black"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "OLED Black"
+          }
         }
       }
     },
@@ -757,6 +1171,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Su Apple TV sta arrivando un backup da scansionare col telefono: Backup mostrerà un codice QR, lo scansioni col telefono e le tue impostazioni vengono salvate nel tuo account VortX. Ripristina mostra un altro codice per riportarle indietro. Fino ad allora, accedendo ripristini qui la tua libreria, i componenti aggiuntivi e la cronologia di visione."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "En Apple TV llegará pronto una copia de seguridad por escaneo con el móvil: Copia de seguridad mostrará un código QR, lo escaneas con el móvil y tus ajustes se guardan en tu cuenta VortX. Restaurar muestra otro código para traerlos de vuelta. Hasta entonces, al iniciar sesión se restauran aquí tu biblioteca, complementos e historial de visualización."
           }
         }
       }
@@ -768,6 +1188,12 @@
             "state": "translated",
             "value": "Apri Account e sincronizzazione e accedi con il tuo account Stremio. VortX usa lo stesso motore, quindi i tuoi componenti aggiuntivi, la libreria e Continua a guardare arrivano automaticamente e restano sincronizzati su tutti i tuoi dispositivi. Niente da esportare o copiare a mano."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Abre Cuenta y sincronización e inicia sesión con tu cuenta Stremio. VortX usa el mismo motor, así que tus complementos, tu biblioteca y Continuar viendo llegan automáticamente y se mantienen sincronizados en todos tus dispositivos. Nada que exportar ni copiar a mano."
+          }
         }
       }
     },
@@ -777,6 +1203,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Facoltativo. Un account gratuito e cifrato end-to-end protegge i tuoi profili, le impostazioni e la libreria su tutti i dispositivi."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opcional. Una cuenta gratuita y cifrada de extremo a extremo mantiene a salvo tus perfiles, ajustes y biblioteca en todos los dispositivos."
           }
         }
       }
@@ -788,6 +1220,12 @@
             "state": "translated",
             "value": "Facoltativo. Aggiungi le tue chiavi TMDB e MDBList per arricchire consigli e valutazioni. Nulla qui è obbligatorio e le tue chiavi restano su questo dispositivo (e si sincronizzano, cifrate, con il tuo account VortX)."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opcional. Añade tus propias claves de TMDB y MDBList para enriquecer recomendaciones y valoraciones. Nada aquí es obligatorio y tus claves permanecen en este dispositivo (y se sincronizan, cifradas, con tu cuenta VortX)."
+          }
         }
       }
     },
@@ -797,6 +1235,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Incolla gli URL dei manifest dei componenti aggiuntivi, uno per riga, poi installali tutti in un solo passaggio."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pega las URL de manifiesto de los complementos, una por línea, y luego instálalos todos de una vez."
           }
         }
       }
@@ -808,6 +1252,12 @@
             "state": "translated",
             "value": "Prestazioni Auto mantiene l'esperienza completa sui dispositivi più potenti e passa a una più leggera su hardware più debole. Ridotta riduce le animazioni e i buffer di riproduzione. Riavvia l'app dopo aver cambiato questa impostazione."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Auto de rendimiento mantiene la experiencia completa en dispositivos potentes y cambia a una más ligera en hardware más débil. Reducido recorta las animaciones y reduce los búferes de reproducción. Reinicia la app tras cambiar esto."
+          }
         }
       }
     },
@@ -817,6 +1267,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Scegli un file"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Elige un archivo"
           }
         }
       }
@@ -828,6 +1284,12 @@
             "state": "translated",
             "value": "Scegli l'aspetto della barra di avanzamento durante la riproduzione. L'anteprima mostra ogni stile."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Elige el aspecto de la barra de progreso durante la reproducción. La vista previa muestra cada diseño."
+          }
         }
       }
     },
@@ -837,6 +1299,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Riproduci un link"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproducir un enlace"
           }
         }
       }
@@ -848,6 +1316,12 @@
             "state": "translated",
             "value": "Riproduzione"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproducción"
+          }
         }
       }
     },
@@ -857,6 +1331,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Riproduzione tra %@s"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reproduciendo en %@s"
           }
         }
       }
@@ -868,6 +1348,12 @@
             "state": "translated",
             "value": "Profili"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Perfiles"
+          }
         }
       }
     },
@@ -877,6 +1363,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Preset di qualità"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preajuste de calidad"
           }
         }
       }
@@ -888,6 +1380,12 @@
             "state": "translated",
             "value": "Valutazioni sui poster"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Valoraciones en los pósteres"
+          }
         }
       }
     },
@@ -897,6 +1395,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ricerche recenti"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Búsquedas recientes"
           }
         }
       }
@@ -908,6 +1412,12 @@
             "state": "translated",
             "value": "Ridotta"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reducido"
+          }
         }
       }
     },
@@ -917,6 +1427,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Parole obbligatorie"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Palabras obligatorias"
           }
         }
       }
@@ -934,6 +1450,12 @@
             "state": "translated",
             "value": "S%@ · E%@"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "T%@ · E%@"
+          }
         }
       }
     },
@@ -943,6 +1465,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Il filtro di sicurezza nasconde le sorgenti CAM e di falsa qualità. Le parole da nascondere / obbligatorie filtrano l'elenco delle sorgenti per nome, separate da virgola (es. nascondi «cam, ts», richiedi «remux»)."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El filtro de seguridad oculta las fuentes CAM y de calidad falsa. Las palabras a ocultar / obligatorias filtran la lista de fuentes por nombre, separadas por comas (p. ej. ocultar «cam, ts», requerir «remux»)."
           }
         }
       }
@@ -954,6 +1482,12 @@
             "state": "translated",
             "value": "Salva e usa"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guardar y usar"
+          }
         }
       }
     },
@@ -963,6 +1497,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Salva i tuoi profili, il tema e le preferenze di riproduzione in un file da conservare, così un futuro aggiornamento importante non potrà mai perderli. Esporta libreria porta i titoli salvati e l'avanzamento del profilo attivo su un altro dispositivo o profilo, senza bisogno di un account."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda tus perfiles, el tema y las preferencias de reproducción en un archivo que puedes conservar, para que una futura actualización importante nunca los pierda. Exportar biblioteca lleva los títulos guardados y el progreso del perfil activo a otro dispositivo o perfil, sin necesidad de cuenta."
           }
         }
       }
@@ -974,6 +1514,12 @@
             "state": "translated",
             "value": "Salva il tuo codice di recupero"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda tu código de recuperación"
+          }
         }
       }
     },
@@ -983,6 +1529,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Salvato"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guardado"
           }
         }
       }
@@ -994,6 +1546,12 @@
             "state": "translated",
             "value": "Scansiona col telefono per aprire questa sorgente lì  ·  Premi Indietro per chiudere"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escanea con tu móvil para abrir esta fuente allí  ·  Pulsa Atrás para descartar"
+          }
         }
       }
     },
@@ -1003,6 +1561,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Stile barra di avanzamento"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estilo de la barra de progreso"
           }
         }
       }
@@ -1014,6 +1578,12 @@
             "state": "translated",
             "value": "Select = scegli un'altra sorgente    ·    Play/Pausa = riprova    ·    Menu = indietro"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Select = elegir otra fuente    ·    Reproducir/Pausa = reintentar    ·    Menú = atrás"
+          }
         }
       }
     },
@@ -1023,6 +1593,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Seleziona un profilo per modificarlo. Ogni profilo mantiene il proprio aspetto, le lingue, il PIN e, facoltativamente, il proprio account Stremio. Un profilo con PIN lo richiede prima di poter essere modificato."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Selecciona un perfil para editarlo. Cada perfil mantiene su propio aspecto, idiomas, PIN y, opcionalmente, su propia cuenta Stremio. Un perfil con PIN lo pide antes de poder editarse."
           }
         }
       }
@@ -1034,6 +1610,12 @@
             "state": "translated",
             "value": "Impostazioni"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ajustes"
+          }
         }
       }
     },
@@ -1043,6 +1625,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Installa tramite sideload il nuovo IPA dalla pagina delle release di GitHub; il tuo accesso e le impostazioni vengono mantenuti."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Instala mediante sideload el nuevo IPA desde la página de releases de GitHub; tu inicio de sesión y ajustes se conservan."
           }
         }
       }
@@ -1054,6 +1642,12 @@
             "state": "translated",
             "value": "Accedendo, i tuoi componenti aggiuntivi e la libreria vengono caricati nell'app. Il tuo account resta su questo dispositivo."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Al iniciar sesión, tus complementos y tu biblioteca se cargan en la app. Tu cuenta permanece en este dispositivo."
+          }
         }
       }
     },
@@ -1063,6 +1657,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Ordina"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ordenar"
           }
         }
       }
@@ -1080,6 +1680,12 @@
             "state": "translated",
             "value": "Sorgente non riuscita, ne provo un'altra…  (%@/%@)"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Fuente fallida, probando otra…  (%@/%@)"
+          }
         }
       }
     },
@@ -1090,6 +1696,12 @@
             "state": "translated",
             "value": "Priorità tipo di sorgente"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Prioridad de tipo de fuente"
+          }
         }
       }
     },
@@ -1099,6 +1711,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Le sorgenti del tipo in cima vengono classificate per prime in ogni fascia di qualità. Debrid e Usenet sono sempre istantanei; le sorgenti Torrent richiedono la disponibilità di peer."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Las fuentes del tipo superior se clasifican primero dentro de cada nivel de calidad. Debrid y Usenet son siempre instantáneos; las fuentes Torrent requieren disponibilidad de peers."
           }
         }
       }
@@ -1116,6 +1734,12 @@
             "state": "translated",
             "value": "Ricerca ancora in corso · %@/%@ componenti aggiuntivi"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Buscando más · %@/%@ complementos"
+          }
         }
       }
     },
@@ -1126,12 +1750,24 @@
             "state": "translated",
             "value": "Server di streaming"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Servidor de streaming"
+          }
         }
       }
     },
     "Streams": {
       "localizations": {
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Streams"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "Streams"
@@ -1152,6 +1788,12 @@
             "state": "translated",
             "value": "Stremio · %@ componenti aggiuntivi · %@ sorgenti di streaming"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stremio · %@ complementos · %@ fuentes de streaming"
+          }
         }
       }
     },
@@ -1161,6 +1803,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Rigoroso"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estricto"
           }
         }
       }
@@ -1172,6 +1820,12 @@
             "state": "translated",
             "value": "Definisce lo stile dei sottotitoli del lettore integrato. Scegli quale traccia di sottotitoli mostrare dal lettore durante la visione."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Da estilo a los subtítulos del reproductor integrado. Elige qué pista de subtítulos mostrar desde el reproductor mientras ves algo."
+          }
         }
       }
     },
@@ -1181,6 +1835,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Stile sottotitoli"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Estilo de subtítulos"
           }
         }
       }
@@ -1192,6 +1852,12 @@
             "state": "translated",
             "value": "Passa a %@ per usarlo e modificarne le impostazioni."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cambia a %@ para usarlo y editar sus ajustes."
+          }
         }
       }
     },
@@ -1201,6 +1867,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Questo link non risponde al momento. Prova una sorgente diversa."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ese enlace no responde en este momento. Prueba una fuente diferente."
           }
         }
       }
@@ -1212,6 +1884,12 @@
             "state": "translated",
             "value": "Questa sorgente di sottotitoli non ha risposto in tempo. Provane un'altra."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esa fuente de subtítulos no respondió a tiempo. Prueba con otra."
+          }
         }
       }
     },
@@ -1221,6 +1899,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "L'app si chiude immediatamente. Riaprila dalla schermata Home; il server di streaming si riavvia con essa."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "La app se cierra de inmediato. Vuelve a abrirla desde la pantalla de inicio; el servidor de streaming se reinicia con ella."
           }
         }
       }
@@ -1232,6 +1916,12 @@
             "state": "translated",
             "value": "Il profilo principale. Usa la cronologia di visione del tuo account Stremio, come prima che esistessero i profili."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El perfil principal. Usa el propio historial de visualización de tu cuenta Stremio, como antes de que existieran los perfiles."
+          }
         }
       }
     },
@@ -1241,6 +1931,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Il lettore li seleziona automaticamente all'avvio di un titolo. Forzati mostra solo i sottotitoli dei dialoghi in lingua straniera; Sempre mostra i sottotitoli completi nella tua lingua. I titoli in lingua straniera ricevono sempre i sottotitoli completi così puoi seguirli."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "El reproductor los selecciona automáticamente al empezar un título. Forzados muestra solo los subtítulos de diálogos en idioma extranjero; Siempre muestra los subtítulos completos en tu idioma. Los títulos en idioma extranjero siempre reciben subtítulos completos para que puedas seguirlos."
           }
         }
       }
@@ -1252,6 +1948,12 @@
             "state": "translated",
             "value": "I profili di questo account differiscono da quelli di questo dispositivo. Unisci entrambi per mantenere ogni profilo (consigliato), oppure forza un lato."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Los perfiles de esta cuenta difieren de los de este dispositivo. Fusiona ambos para conservar todos los perfiles (recomendado), o fuerza un lado."
+          }
         }
       }
     },
@@ -1261,6 +1963,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Viene mostrato una sola volta. È l'unico modo per rientrare se dimentichi la password e perdi i tuoi dispositivi. Conservalo in un luogo sicuro."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esto se muestra una sola vez. Es la única forma de volver a entrar si olvidas tu contraseña y pierdes tus dispositivos. Guárdalo en un lugar seguro."
           }
         }
       }
@@ -1272,6 +1980,12 @@
             "state": "translated",
             "value": "Questo magnet contiene %@ video. Scegli quale riprodurre."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Este magnet tiene %@ vídeos. Elige cuál reproducir."
+          }
         }
       }
     },
@@ -1281,6 +1995,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Converti in SDR"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Convertir a SDR"
           }
         }
       }
@@ -1292,6 +2012,12 @@
             "state": "translated",
             "value": "Illimitato"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ilimitado"
+          }
         }
       }
     },
@@ -1301,6 +2027,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "PROSSIMO"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A CONTINUACIÓN"
           }
         }
       }
@@ -1312,6 +2044,12 @@
             "state": "translated",
             "value": "Aggiornamento disponibile"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Actualización disponible"
+          }
         }
       }
     },
@@ -1321,6 +2059,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Usa l'ordine di classificazione dei componenti aggiuntivi"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usar el orden de clasificación de los complementos"
           }
         }
       }
@@ -1332,6 +2076,12 @@
             "state": "translated",
             "value": "Usa integrato"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usar integrado"
+          }
         }
       }
     },
@@ -1342,12 +2092,24 @@
             "state": "translated",
             "value": "Usa il server integrato in questo dispositivo, oppure punta VortX a un server Stremio remoto / dedicato (ad esempio uno che gestisci a casa)."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Usa el servidor integrado en este dispositivo, o apunta VortX a un servidor Stremio remoto / dedicado (por ejemplo uno que ejecutes en casa)."
+          }
         }
       }
     },
     "Vort": {
       "localizations": {
         "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vort"
+          }
+        },
+        "es": {
           "stringUnit": {
             "state": "translated",
             "value": "Vort"
@@ -1362,6 +2124,12 @@
             "state": "translated",
             "value": "VortX %@"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "VortX %@"
+          }
         }
       }
     },
@@ -1371,6 +2139,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Account VortX"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cuenta VortX"
           }
         }
       }
@@ -1382,6 +2156,12 @@
             "state": "translated",
             "value": "Caldo"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cálido"
+          }
         }
       }
     },
@@ -1391,6 +2171,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Guarda i titoli di coda"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ver los créditos"
           }
         }
       }
@@ -1402,6 +2188,12 @@
             "state": "translated",
             "value": "Novità"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Novedades"
+          }
         }
       }
     },
@@ -1411,6 +2203,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Quando è attivo, le sorgenti appaiono nell'ordine in cui i tuoi componenti aggiuntivi le restituiscono. Utile se usi un componente di classificazione come AIOStreams. Quando è disattivo, si applica la classificazione dell'app."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cuando está activado, las fuentes aparecen en el orden en que las devuelven tus complementos. Útil si usas un complemento de clasificación como AIOStreams. Cuando está desactivado, se aplica la clasificación de la app."
           }
         }
       }
@@ -1422,6 +2220,12 @@
             "state": "translated",
             "value": "Dove guardare"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Dónde ver"
+          }
         }
       }
     },
@@ -1431,6 +2235,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "Chi sta guardando?"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "¿Quién está viendo?"
           }
         }
       }
@@ -1442,6 +2252,12 @@
             "state": "translated",
             "value": "PIN errato"
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "PIN incorrecto"
+          }
         }
       }
     },
@@ -1452,6 +2268,12 @@
             "state": "translated",
             "value": "XRDB (extendedratings.com) integra valutazioni da un massimo di 12 fonti, badge di qualità e loghi dei provider di streaming sui tuoi poster e sfondi. Usa una tua istanza XRDB o una ospitata, imposta il suo indirizzo e il tuo alias profilo, e VortX carica le sue immagini ovunque. Facoltativo e non collegato al debrid."
           }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "XRDB (extendedratings.com) integra valoraciones de hasta 12 fuentes, insignias de calidad y logotipos de proveedores de streaming en tus pósteres y fondos. Usa tu propia instancia XRDB o una alojada, configura su dirección y tu alias de perfil, y VortX carga sus imágenes en todas partes. Opcional y sin relación con debrid."
+          }
         }
       }
     },
@@ -1461,6 +2283,12 @@
           "stringUnit": {
             "state": "translated",
             "value": "I tuoi profili, le impostazioni e le chiavi dei metadati si sincronizzano con questo account, cifrati end-to-end. Si sincronizzano anche automaticamente subito dopo ogni modifica."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Tus perfiles, ajustes y claves de metadatos se sincronizan con esta cuenta, cifrados de extremo a extremo. También se sincronizan automáticamente un momento después de cualquier cambio."
           }
         }
       }
