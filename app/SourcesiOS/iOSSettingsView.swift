@@ -277,6 +277,7 @@ struct iOSSettingsView: View {
             } else {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
+            NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Ratings on posters (XRDB)") { XRDBSettingsView() }

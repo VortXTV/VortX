@@ -166,6 +166,10 @@ struct SettingsView: View {
                     }
                     .buttonStyle(PrimaryActionStyle())
                 }
+                NavigationLink { StremioImportView() } label: {
+                    Label("Import from Stremio", systemImage: "square.and.arrow.down.on.square")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { MetadataKeysView() } label: {
                     Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
                 }
