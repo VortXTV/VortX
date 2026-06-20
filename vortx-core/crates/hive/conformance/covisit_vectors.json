@@ -1,0 +1,28 @@
+{
+  "description": "Cross-language conformance for the item-item co-visit fact. (1) signing_bytes: the exact bytes a CoVisitFact signature covers for canonical inputs (item_a <= item_b) must be byte-identical on every platform, or signatures will not verify across clients. (2) canonical: create() must canonicalize an unordered pair to item_a <= item_b and cap the count at 1000, independent of the signing key.",
+  "signing_bytes": [
+    {
+      "item_a": "ttAAA",
+      "item_b": "ttZZZ",
+      "count": 1000,
+      "verified_at": 1718900000,
+      "ttl": 86400,
+      "signer_pubkey": "PUBKEY",
+      "expect": "vortx-covisit-v1\nttAAA|ttZZZ|1000|1718900000|86400|PUBKEY"
+    },
+    {
+      "item_a": "tmdb:550",
+      "item_b": "tt0137523",
+      "count": 3,
+      "verified_at": 0,
+      "ttl": 21600,
+      "signer_pubkey": "K2",
+      "expect": "vortx-covisit-v1\ntmdb:550|tt0137523|3|0|21600|K2"
+    }
+  ],
+  "canonical": [
+    { "item_x": "ttZZZ", "item_y": "ttAAA", "count_in": 99999, "expect_a": "ttAAA", "expect_b": "ttZZZ", "expect_count": 1000 },
+    { "item_x": "a", "item_y": "b", "count_in": 5, "expect_a": "a", "expect_b": "b", "expect_count": 5 },
+    { "item_x": "tt9", "item_y": "tt10", "count_in": 0, "expect_a": "tt10", "expect_b": "tt9", "expect_count": 0 }
+  ]
+}
