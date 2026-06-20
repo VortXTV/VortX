@@ -36,6 +36,30 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
+      # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
+      # needs: the NDK pinned in app/build.gradle.kts (ndkVersion), Rust nightly with the Android
+      # targets (core/ pins nightly via rust-toolchain.toml; the android targets are tier-2, so no
+      # build-std), and the cargo-ndk subcommand. Without these the task fails with
+      # "error: no such command: ndk" / a missing NDK.
+      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
+        run: |
+          yes | sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly + Android targets
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+          components: rust-src
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "core -> target"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "^3" --locked
+
       - name: Build debug APK
         working-directory: android
         run: gradle assembleDebug --no-daemon --stacktrace
