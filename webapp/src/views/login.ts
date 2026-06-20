@@ -292,9 +292,13 @@ async function onSignIn(ev: SubmitEvent): Promise<void> {
     succeed(session);
   } catch (x: unknown) {
     if (x instanceof TotpRequiredError) {
-      // 2FA account: reveal the code field and let the user resubmit with it (do not treat as an error).
+      // 2FA account: reveal the code field IN PLACE and let the user resubmit with it. Do NOT re-render
+      // the form (that rebuilds the inputs and wipes the email/password the user already typed); just
+      // un-hide the existing TOTP row and relabel the button.
       needTotp = true;
-      render();
+      const wrap = field<HTMLElement>("in-totp-wrap");
+      if (wrap) wrap.hidden = false;
+      restoreButton(btn, "Verify and sign in");
       focusField("in-totp");
     } else {
       showError("in-err", message(x));
