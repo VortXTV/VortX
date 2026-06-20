@@ -15,3 +15,7 @@ ed25519-dalek = "2"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
+
+[dev-dependencies]
+# Property-based testing: prove the CacheFact CRDT merge converges across thousands of random streams.
+proptest = "1"
