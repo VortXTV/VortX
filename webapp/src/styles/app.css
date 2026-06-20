@@ -418,30 +418,46 @@ input:focus-visible {
   min-height: 60vh;
   color: var(--muted);
 }
-/* Fixed hero banner: the backdrop is a banner at the top (not a full-page wash); content flows below. */
-.detail-hero {
+/* Immersive detail (matches the Mac app): a tall full-bleed backdrop fills the first screen and the whole
+   content block sits OVER its lower third, flowing onto the canvas below (the scrim fades the backdrop
+   into the canvas so there is no banner seam). */
+.detail-immersive {
   position: relative;
-  height: clamp(320px, 42vh, 560px);
-  overflow: hidden;
+}
+.detail-bg,
+.detail-scrim {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: min(88vh, 900px);
+  z-index: 0;
 }
 .detail-bg {
-  position: absolute;
-  inset: 0;
   background-size: cover;
   background-position: center top;
   filter: saturate(1.05);
 }
 .detail-scrim {
-  position: absolute;
-  inset: 0;
-  /* Exact iOSDetailView.backdrop stops: a vertical fade to canvas + a leading fade for the title column. */
+  /* Vertical fade to canvas (so the lower content reads + the backdrop dissolves into the page) + a
+     leading fade for the title column. */
   background:
-    linear-gradient(180deg, transparent 0%, rgba(21, 18, 14, 0.35) 55%, rgba(21, 18, 14, 0.85) 85%, var(--bg) 100%),
-    linear-gradient(90deg, rgba(21, 18, 14, 0.6) 0%, transparent 50%);
+    linear-gradient(180deg, transparent 0%, rgba(21, 18, 14, 0.2) 45%, rgba(21, 18, 14, 0.72) 78%, var(--bg) 100%),
+    linear-gradient(90deg, rgba(21, 18, 14, 0.65) 0%, transparent 55%);
+}
+/* The content block, pushed down so the title starts over the backdrop's lower third, then everything
+   (meta, actions, synopsis, credits, sources) flows down onto the canvas. */
+.detail-body {
+  position: relative;
+  z-index: 1;
+  padding: clamp(300px, 58vh, 560px) var(--space-edge) var(--space-xl);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-md);
 }
 .back {
   position: absolute;
-  /* Sits below the (now-visible) sticky top nav so the two never collide. */
   top: calc(var(--space-md) + 52px);
   left: var(--space-edge);
   z-index: 3;
@@ -459,25 +475,21 @@ input:focus-visible {
 .back:hover {
   background: rgba(0, 0, 0, 0.65);
 }
-/* Title block anchored bottom-left inside the hero (logo or serif title + a single-line meta row). */
+/* Title block (logo or serif title + the meta row), the first item of the overlaid content block. */
 .detail-titleblock {
-  position: absolute;
-  left: var(--space-edge);
-  right: var(--space-edge);
-  bottom: var(--space-lg);
   display: flex;
   flex-direction: column;
-  gap: 0.55rem;
+  gap: 0.5rem;
 }
 .detail-eyebrow {
   color: var(--accent-bright);
 }
 .detail-logo {
-  max-width: min(340px, 72%);
-  max-height: 108px;
+  max-width: min(360px, 80%);
+  max-height: 120px;
   object-fit: contain;
   object-position: left bottom;
-  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
+  filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
 }
 .detail-title {
   max-width: 20ch;
@@ -490,6 +502,7 @@ input:focus-visible {
   align-items: center;
   gap: 0.6rem;
   color: var(--muted);
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.55);
 }
 .meta-row .rating {
   display: inline-flex;
@@ -497,15 +510,6 @@ input:focus-visible {
   gap: 0.25rem;
   color: var(--accent-bright);
   font-weight: 700;
-}
-/* Content below the hero, LEFT-ALIGNED under the title block (the apps align actions/synopsis to the
-   leading edge, they do NOT center them in a narrow column). Each block self-caps for readability. */
-.detail-content {
-  padding: var(--space-md) var(--space-edge) var(--space-xl);
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--space-md);
 }
 .desc {
   max-width: 760px;
@@ -557,10 +561,17 @@ input:focus-visible {
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: stretch;
   gap: var(--space-sm);
 }
-/* The play CTA dominates its row. */
+/* Every action (primary + chips) is the same height so the row lines up cleanly (the Trailer/Save/Share
+   chips align with the primary, not float at a different height). */
+.hero-actions .btn-primary,
+.hero-actions .chip {
+  min-height: 50px;
+  display: inline-flex;
+  align-items: center;
+}
 .hero-actions .btn-primary {
   font-size: 1.1rem;
 }

@@ -180,16 +180,17 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
   const trailer = trailerYouTubeID(meta);
-  const actions = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
-  host.innerHTML = `
-    <div class="detail">
-      ${detailHero(meta, logo, bg)}
-      <div class="detail-content">
-        ${streamSection(groups, actions)}
-        ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
-        ${creditsRow(meta)}
-      </div>
-    </div>`;
+  const extra = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
+  host.innerHTML = detailShell(
+    bg,
+    "",
+    `${titleBlock(meta, logo)}
+     ${heroActions(groups, extra)}
+     ${streamStatusNote(groups)}
+     ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
+     ${streamPanel(groups)}
+     ${creditsRow(meta)}`,
+  );
 }
 
 function renderSeries(host: HTMLElement, meta: MetaItem): void {
@@ -205,50 +206,56 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
 
   if (open) {
     const bg = httpUrl(open.thumbnail) || httpUrl(meta.background) || httpUrl(meta.poster);
-    host.innerHTML = `
-      <div class="detail">
-        ${detailHero(meta, logo, bg, open)}
-        <div class="detail-content">${episodeStreamView(open)}</div>
-      </div>`;
+    const groups = rankedGroups(state.groups);
+    const overview = open.overview || open.description;
+    host.innerHTML = detailShell(
+      bg,
+      `<button class="back" data-action="close-episode">${icon("back")}<span>Episodes</span></button>`,
+      `${titleBlock(meta, logo, open)}
+       ${heroActions(groups, "")}
+       ${streamStatusNote(groups)}
+       ${overview ? `<p class="desc t-body">${escapeHtml(overview)}</p>` : ""}
+       ${streamPanel(groups)}`,
+    );
     return;
   }
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
-  const actions = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
-  host.innerHTML = `
-    <div class="detail">
-      ${detailHero(meta, logo, bg)}
-      <div class="detail-content">
-        <div class="hero-actions">${actions}</div>
-        ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
-        ${creditsRow(meta)}
-        ${seasonSelector(seasons)}
-        ${episodeList(videos, state.selectedSeason)}
-      </div>
+  const extra = `${libraryButton(meta)}${shareButton()}${trailer ? trailerButton() : ""}`;
+  host.innerHTML = detailShell(
+    bg,
+    "",
+    `${titleBlock(meta, logo)}
+     <div class="hero-actions">${extra}</div>
+     ${meta.description ? `<p class="desc t-body">${escapeHtml(meta.description)}</p>` : ""}
+     ${creditsRow(meta)}
+     ${seasonSelector(seasons)}
+     ${episodeList(videos, state.selectedSeason)}`,
+  );
+}
+
+/** The immersive detail shell: a tall full-bleed backdrop + dual scrim filling the first screen, with
+ *  the content block (`body`) overlaid bottom-left over the backdrop and flowing onto the canvas below
+ *  (the scrim fades the backdrop into the canvas so the seam is invisible). Mirrors the Mac app, where
+ *  the title / meta / actions / synopsis all sit over one immersive backdrop, not a short banner. */
+function detailShell(bg: string, back: string, body: string): string {
+  return `
+    <div class="detail detail-immersive">
+      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
+      <div class="detail-scrim"></div>
+      ${back}
+      <div class="detail-body">${body}</div>
     </div>`;
 }
 
-/** The fixed hero banner: full-bleed backdrop + dual scrim + a bottom-left title block (logo or serif
- *  title + a single-line meta row), with a contextual Back. Content flows BELOW it, mirroring
- *  iOSDetailView (the backdrop is a banner, not a full-page wash). */
-function detailHero(meta: MetaItem, logo: string, bg: string, episode?: Video): string {
-  // The top nav stays visible on detail now, so the root page needs no extra Back chip (use the nav);
-  // only the open-episode view gets a contextual "Episodes" back.
-  const back = episode
-    ? `<button class="back" data-action="close-episode">${icon("back")}<span>Episodes</span></button>`
-    : "";
+/** The title block: logo-or-serif-title (with a series eyebrow for an open episode) + the meta row. */
+function titleBlock(meta: MetaItem, logo: string, episode?: Video): string {
   const epTitle = episode ? episode.title || episode.name || `Episode ${episode.episode ?? 0}` : "";
   const titleHtml = episode
     ? `<span class="detail-eyebrow t-eyebrow">${escapeHtml(meta.name)}</span><h1 class="detail-title t-hero">${escapeHtml(epTitle)}</h1>`
     : logo
       ? `<img class="detail-logo" src="${escapeHtml(logo)}" alt="${escapeHtml(meta.name)}" />`
       : `<h1 class="detail-title t-hero">${escapeHtml(meta.name)}</h1>`;
-  return `
-    <div class="detail-hero">
-      <div class="detail-bg"${bg ? ` style="background-image:url('${escapeHtml(bg)}')"` : ""}></div>
-      <div class="detail-scrim"></div>
-      ${back}
-      <div class="detail-titleblock">${titleHtml}${episode ? episodeMetaRow(episode, meta) : metaRow(meta)}</div>
-    </div>`;
+  return `<div class="detail-titleblock">${titleHtml}${episode ? episodeMetaRow(episode, meta) : metaRow(meta)}</div>`;
 }
 
 /** Single-line meta row (rating star + year/runtime/genres joined), so it never forces the hero wider. */
@@ -276,13 +283,45 @@ function episodeMetaRow(episode: Video, meta: MetaItem): string {
 }
 
 // ---- Stream section (movie + episode share this) -----------------------------------------------
+// The action cluster, the status note, and the sources panel are rendered separately so they slot into
+// the immersive hero body in the app's order: title -> actions -> note -> synopsis -> panel.
 
-function streamSection(groups: RankedGroup[], extraActions: string): string {
+/** The action cluster: the one primary CTA (Watch / Resume / loading / no-source) + Quality + Sources +
+ *  the extra chips (Save / Share / Trailer), all one wrapping, equal-height row. */
+function heroActions(groups: RankedGroup[], extraActions: string): string {
   if (!state) return "";
   const streamCount = groups.reduce((n, g) => n + g.streams.length, 0);
   const top = best(groups);
 
-  // Done loading, nothing playable: a disabled primary + the rest of the cluster, then an explainer card.
+  if (!top && !state.streamsLoading) {
+    return `<div class="hero-actions">
+      <button class="btn-primary is-disabled" disabled>${icon("play")}<span>No playable sources</span></button>
+      ${extraActions}</div>`;
+  }
+  if (!top) {
+    return `<div class="hero-actions">
+      <button class="btn-primary is-disabled" disabled><span class="spinner" aria-hidden="true"></span><span>Finding the best source…</span></button>
+      ${extraActions}</div>`;
+  }
+
+  // Saved resume position -> the primary reads "Resume · 12:34" (playback already seeks to it).
+  const resumeId = state.openEpisode?.id ?? state.meta?.id;
+  const resumePos = resumeId ? cwPosition(resumeId) : 0;
+  const watchText =
+    resumePos > 0 ? `Resume · ${formatTime(resumePos)}` : `Watch · ${escapeHtml(watchLabel(top))}`;
+  return `<div class="hero-actions">
+    <button class="btn-primary" data-action="play-best">${icon("play")}<span>${watchText}</span></button>
+    <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">${icon("quality")}<span>Quality</span></button>
+    <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${icon("sources")}<span>${
+      state.showAllSources ? "Hide sources" : `Sources · ${streamCount}`
+    }</span></button>
+    ${extraActions}</div>`;
+}
+
+/** A slim status line under the actions: the "no playable web source" explainer, or "still finding more". */
+function streamStatusNote(groups: RankedGroup[]): string {
+  if (!state) return "";
+  const top = best(groups);
   if (!top && !state.streamsLoading) {
     const onlyTorrents = hasOnlyUnplayable(state.groups);
     const explain = onlyTorrents
@@ -291,53 +330,19 @@ function streamSection(groups: RankedGroup[], extraActions: string): string {
          for instant direct links, or open this title in the VortX app.`
       : `None of your add-ons returned a playable source. Add a stream add-on that serves direct or
          debrid links. The web app plays HTTP(S) and HLS sources.`;
-    return `
-      <div class="stream-section">
-        <div class="hero-actions">
-          <button class="btn-primary is-disabled" disabled>${icon("play")}<span>No playable sources</span></button>
-          ${extraActions}
-        </div>
-        <p class="stream-note">${explain} <a class="inline-link" href="#/addons" data-action="nav-addons">Manage add-ons</a></p>
-      </div>`;
+    return `<p class="stream-note">${explain} <a class="inline-link" href="#/addons" data-action="nav-addons">Manage add-ons</a></p>`;
   }
+  if (top && state.streamsLoading) return `<p class="muted small">Still finding more sources…</p>`;
+  return "";
+}
 
-  // Still loading, no source yet.
-  if (!top) {
-    return `
-      <div class="stream-section">
-        <div class="hero-actions">
-          <button class="btn-primary is-disabled" disabled><span class="spinner" aria-hidden="true"></span> Finding the best source…</button>
-          ${extraActions}
-        </div>
-      </div>`;
-  }
-
-  // Saved resume position -> the primary reads "Resume · 12:34" (playback already seeks to it).
-  const resumeId = state.openEpisode?.id ?? state.meta?.id;
-  const resumePos = resumeId ? cwPosition(resumeId) : 0;
-  const watchText =
-    resumePos > 0 ? `Resume · ${formatTime(resumePos)}` : `Watch · ${escapeHtml(watchLabel(top))}`;
-  const controls = `
-    <div class="hero-actions">
-      <button class="btn-primary" data-action="play-best">${icon("play")}<span>${watchText}</span></button>
-      <button class="chip" data-action="toggle-picker" aria-expanded="${state.pickerOpen}">${icon("quality")}<span>Quality</span></button>
-      <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${icon("sources")}<span>${
-        state.showAllSources ? "Hide sources" : `Sources · ${streamCount}`
-      }</span></button>
-      ${extraActions}
-    </div>`;
-
-  const stillLoading = state.streamsLoading ? `<p class="muted small">Still finding more sources…</p>` : "";
-  // The quality picker + the all-sources list live in one elevated panel below the cluster, only when
-  // a control is toggled open, so the default detail view stays focused on the primary CTA.
-  const panel =
-    state.pickerOpen || state.showAllSources
-      ? `<div class="surface-card stream-panel">${qualityPicker(groups)}${
-          state.showAllSources ? sourceList(groups, streamCount) : ""
-        }</div>`
-      : "";
-
-  return `<div class="stream-section">${controls}${stillLoading}${panel}</div>`;
+/** The elevated panel holding the quality picker + the all-sources list, shown only when toggled open. */
+function streamPanel(groups: RankedGroup[]): string {
+  if (!state || !(state.pickerOpen || state.showAllSources)) return "";
+  const streamCount = groups.reduce((n, g) => n + g.streams.length, 0);
+  return `<div class="surface-card stream-panel">${qualityPicker(groups)}${
+    state.showAllSources ? sourceList(groups, streamCount) : ""
+  }</div>`;
 }
 
 function qualityPicker(groups: RankedGroup[]): string {
@@ -459,17 +464,6 @@ function episodeRow(v: Video): string {
         ${overviewHtml}${bar}
       </span>
     </button>`;
-}
-
-/** The open-episode body. The episode title / meta / Back now live in the hero (detailHero with the
- *  episode), so this is just the play cluster + the episode synopsis. */
-function episodeStreamView(episode: Video): string {
-  if (!state) return "";
-  const groups = rankedGroups(state.groups);
-  const overview = episode.overview || episode.description;
-  return `${streamSection(groups, "")}${
-    overview ? `<p class="desc t-body">${escapeHtml(overview)}</p>` : ""
-  }`;
 }
 
 // ---- Links / rating / trailer helpers ----------------------------------------------------------
