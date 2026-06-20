@@ -317,16 +317,11 @@ private final class AVPlayerModel: NSObject, ObservableObject {
         self.onProgress = onProgress
         self.resumeSeconds = resumeSeconds
 
-        // Activate .playback before play so PiP and locked-screen/background audio work; PiP refuses to start
-        // without an active .playback session. The libmpv path sets the same category in configureAudioSession,
-        // and only one player is active at a time, so this is idempotent across a HLS->torrent hand-off.
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .moviePlayback, options: [])
-            try session.setActive(true)
-        } catch {
-            // Fail-soft: inline playback still works, only PiP / background audio degrade.
-        }
+        // Activate .playback before play so PiP and locked-screen/background audio work (PiP refuses to start
+        // without an active .playback session) and advertise multichannel so Atmos passes through (#78) and
+        // AirPods get Spatial Audio (#88). The libmpv path sets its own session in configureAudioSession, and
+        // only one player is active at a time, so this is idempotent across a HLS->torrent hand-off.
+        AVPlayerAudioSession.activateForMovie()
 
         let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
         let asset = AVURLAsset(url: url, options: options)
@@ -497,6 +492,10 @@ extension HLSPlayerView {
         func makeCoordinator() -> Coordinator { Coordinator(resumeSeconds: resumeSeconds, onProgress: onProgress) }
 
         func makeUIViewController(context: Context) -> AVPlayerViewController {
+            // Apple TV Atmos passthrough (#78) + AirPods Spatial Audio (#88): claim .playback and advertise
+            // multichannel BEFORE the player starts so AVPlayerViewController negotiates the spatial / Atmos
+            // layout instead of a stereo downmix. This is the path DV (and its frequent Atmos track) takes.
+            AVPlayerAudioSession.activateForMovie()
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
             let asset = AVURLAsset(url: url, options: options)
             let item = AVPlayerItem(asset: asset)

@@ -30,7 +30,7 @@ Building on the 0.3.8 account work. The headline is that VortX now speaks **40 l
 ### Fixed
 
 - **Saved magnets and pasted links attach to the right title**, with a confidence-gated match so a save never lands on the wrong show. (#81)
-- **Better audio over AirPods and Bluetooth**, with multichannel handled safely so spatial audio works and stereo-only routes don't drop out. (#88)
+- **Better audio over AirPods and Bluetooth**, with multichannel handled safely so spatial audio works and stereo-only routes don't drop out. This now applies on both player engines, so a Dolby Vision or HLS stream playing through the system AVPlayer (including on Apple TV) advertises multichannel for Dolby Atmos passthrough and AirPods head-tracked Spatial Audio too, instead of a stereo downmix. (#88, #78)
 
 ## 0.3.8 - 2026-06-19 (pre-release)
 

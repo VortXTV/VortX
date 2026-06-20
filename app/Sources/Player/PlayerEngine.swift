@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// The finite surface the player chrome drives playback through. Today the chrome (`PlayerScreen` on
@@ -80,3 +81,32 @@ extension PlayerEngine {
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance
 /// declaration with zero behavior change. If it ever fails to compile, the protocol drifted from the engine.
 extension MPVMetalViewController: PlayerEngine {}
+
+#if os(iOS) || os(tvOS)
+/// Shared audio-session setup for the AVPlayer engine path (iOS + tvOS). AVPlayer / AVPlayerViewController
+/// negotiate the hardware output format themselves, so this path does NOT need the route-aware channel /
+/// sample-rate policy that libmpv's audiounit AO requires (`MPVMetalViewController.configureAudioSession`).
+/// It only has to:
+///   1. Claim `.playback` + `.moviePlayback` so PiP, background, and locked-screen audio work (PiP refuses
+///      to start without an active `.playback` session), and
+///   2. Advertise multichannel content so the system can pass through Dolby Atmos / multichannel PCM (#78)
+///      AND apply AirPods head-tracked Spatial Audio (#88).
+/// `setSupportsMultichannelContent(true)` is a capability HINT, not a re-route: it is benign on HDMI / eARC /
+/// built-in-speaker routes (the system already negotiates those) and never downmixes a real receiver. It just
+/// unlocks the spatial / multichannel layout on routes that can take it (chiefly AirPods). Idempotent across
+/// engines because only one player is live at a time, so a libmpv -> AVPlayer hand-off is safe.
+enum AVPlayerAudioSession {
+    static func activateForMovie() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .moviePlayback, options: [])
+            try session.setActive(true)
+            // iOS min is 16.0 and tvOS min is 26.x, both above the 15.0 floor of this API, so no #available
+            // guard is needed. #78 Atmos passthrough + #88 AirPods Spatial.
+            try? session.setSupportsMultichannelContent(true)
+        } catch {
+            // Fail-soft: inline playback still works; only PiP / background audio / spatial negotiation degrade.
+        }
+    }
+}
+#endif

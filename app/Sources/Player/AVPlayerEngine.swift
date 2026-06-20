@@ -53,13 +53,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         teardownObservers()
         isReady = false; didStart = false; pendingSeek = nil
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
-        // Claim .playback before play so PiP and locked-screen audio work; idempotent with the libmpv path
-        // since only one engine is live at a time.
-        do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .moviePlayback, options: [])
-            try session.setActive(true)
-        } catch { /* inline playback still works; only PiP / background audio degrade */ }
+        // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
+        // system passes through Atmos (#78) and applies AirPods Spatial Audio (#88). Idempotent with the
+        // libmpv path since only one engine is live at a time.
+        AVPlayerAudioSession.activateForMovie()
         let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
         let newItem = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
         item = newItem
