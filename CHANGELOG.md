@@ -4,6 +4,21 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.8 Beta 6 - 2026-06-21 (pre-release)
+
+A fix-and-polish beta. The headline is that managing your account from [vortx.tv/dashboard](https://vortx.tv/dashboard) now works the way it should: your whole household, your profiles, and almost every per-profile setting are editable from the web and sync straight to your devices. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+
+### Fixed
+
+- **The duplicate "Main" profile is gone.** "Use online account data" could leave two account profiles (a real one plus a leftover "Main") that you could not remove. VortX now keeps a single account profile and quietly retires any leftover, so it becomes an ordinary profile you can delete from the dashboard. This also stops the duplicate from being created in the first place, and never drops your real account profile during the merge.
+- **The family contradiction is fixed.** The household card could say you were "not in a family" while creating one said you "already" were. That mismatch (a leftover membership after a household was deleted) now heals itself, and deleting a household fully cleans up so it cannot happen again.
+
+### Dashboard (vortx.tv/dashboard)
+
+- **Every per-profile control is now on the web**, applied to your devices on the next sync: source priority, Kids Mode, stream filters (safe sources, max quality, max file size, instant-only, hide dead torrents, HDR/Dolby Vision only, skip AV1, hide/require words with regex), per-profile add-ons, and your debrid keys.
+- **Add-on health at a glance.** The Add-ons page now shows an Online / Slow / Unreachable status for each add-on.
+- **Cleaner Library and safer keys.** Library titles no longer appear twice (your VortX and imported Stremio copies are merged), and the metadata API-key fields are masked.
+
 ## 0.3.8 Beta 5 - 2026-06-20 (pre-release)
 
 Building on the 0.3.8 account work. The headline is that VortX now speaks **40 languages**, alongside a wave of per-profile and power-user controls: per-profile add-ons, in-app debrid keys, Kids Mode, one-tap quality presets, regex source filters, library export and import, Import from Stremio, Where to Watch, anime skipping, an in-player frame grab, true Dolby Vision on iPhone and iPad, and poster ratings. In-place update, nothing resets. This is a beta, so please install it and report anything off.
