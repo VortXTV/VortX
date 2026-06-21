@@ -181,6 +181,14 @@ export function clearSession(): void {
 async function deriveMaster(password: string, kdfSalt: string, iters: number): Promise<Uint8Array> {
   return pbkdf2(enc(password), unb64(kdfSalt), iters);
 }
+
+/** Clamp a server-supplied PBKDF2 iteration count to a safe floor. A hostile / compromised prelogin
+ *  returning a tiny kdfIters would collapse key stretching and enable offline brute-force of the auth
+ *  verifier, so never go below ITERS. Legit accounts are always created at ITERS; a higher server value
+ *  (a future migration) is honored. Not applied to the 1-iteration verifiers, which are intentional. */
+function safeIters(n: unknown): number {
+  return Math.max(Number(n) || 0, ITERS);
+}
 /** The auth verifier: a 1-iteration PBKDF2 of the master key salted by the password. Proves password
  *  knowledge to the server without ever sending the password or the master key itself. */
 async function authVerifier(masterKey: Uint8Array, password: string): Promise<string> {
@@ -213,10 +221,9 @@ export async function register(
     wrappedKeyPassword: await seal(masterKey, dataKey),
     wrappedKeyRecovery: await seal(recoveryKey, dataKey),
     recVerifier: b64(await pbkdf2(recoveryKey, enc(recoveryCode), 1)),
-    // Sent ONLY so the Worker can include it in the welcome email; the server never stores it (the
-    // account stays zero-knowledge at rest). This is a deliberate convenience that puts the code in
-    // the user's inbox; the email tells them to save it offline and delete it.
-    recoveryCode,
+    // The plaintext recoveryCode is NEVER sent to the server (zero-knowledge): recVerifier +
+    // wrappedKeyRecovery above are sufficient for the recovery protocol. The code is shown on-screen
+    // once (the "created" step) for the user to copy; the welcome email tells them to save it from there.
   };
   const r = await api("/v1/auth/register", { method: "POST", body });
   if (r.status === 409) {
@@ -246,7 +253,7 @@ export async function login(loginId: string, password: string, totp?: string): P
   const pre = await api("/v1/auth/prelogin", { method: "POST", body: { login: loginId } });
   const preData = pre.data as { kdfSalt: string; kdfIters: number } | null;
   if (!preData?.kdfSalt) throw new Error("Wrong email/username or password.");
-  const masterKey = await deriveMaster(password, preData.kdfSalt, preData.kdfIters);
+  const masterKey = await deriveMaster(password, preData.kdfSalt, safeIters(preData.kdfIters));
   const body: Record<string, unknown> = { login: loginId, authVerifier: await authVerifier(masterKey, password) };
   if (totp) body.totp = totp.trim();
   const r = await api("/v1/auth/login", { method: "POST", body });
@@ -297,12 +304,12 @@ export async function recover(email: string, recoveryCode: string, newPassword: 
   const start = await api("/v1/auth/recover-start", { method: "POST", body: { email } });
   const startData = start.data as { wrappedKeyRecovery?: string; kdfSalt: string; kdfIters: number } | null;
   if (!startData?.wrappedKeyRecovery) throw new Error("No recovery is set up for that email.");
-  const recoveryKey = await pbkdf2(enc(recoveryCode.trim()), unb64(startData.kdfSalt), startData.kdfIters);
+  const recoveryKey = await pbkdf2(enc(recoveryCode.trim()), unb64(startData.kdfSalt), safeIters(startData.kdfIters));
   const dataKey = await open(recoveryKey, startData.wrappedKeyRecovery);
   if (!dataKey) throw new Error("That recovery code is not correct.");
   // Re-derive the new master key from the SAME kdfSalt the account already uses, so the recovery key
   // (also derived from kdfSalt) stays valid after this reset.
-  const newMaster = await pbkdf2(enc(newPassword), unb64(startData.kdfSalt), startData.kdfIters);
+  const newMaster = await pbkdf2(enc(newPassword), unb64(startData.kdfSalt), safeIters(startData.kdfIters));
   const r = await api("/v1/auth/recover-complete", {
     method: "POST",
     body: {
@@ -335,7 +342,7 @@ export async function resetComplete(
   const preData = pre.data as { kdfSalt: string; kdfIters: number } | null;
   if (pre.status !== 200 || !preData?.kdfSalt) throw new Error("Could not start the reset.");
   const kdfSaltBytes = unb64(preData.kdfSalt);
-  const iters = preData.kdfIters;
+  const iters = safeIters(preData.kdfIters);
   // Keep the account's existing kdfSalt so the new recovery key derives consistently.
   const newMaster = await pbkdf2(enc(newPassword), kdfSaltBytes, iters);
   const dataKey = crypto.getRandomValues(new Uint8Array(32)); // fresh vault: the old data is unrecoverable
@@ -367,9 +374,9 @@ export async function changePassword(session: Session, oldPassword: string, newP
   const pre = await api("/v1/auth/prelogin", { method: "POST", body: { login: session.account.email } });
   const preData = pre.data as { kdfSalt: string; kdfIters: number } | null;
   if (!preData?.kdfSalt) throw new Error("Could not change the password.");
-  const oldMaster = await deriveMaster(oldPassword, preData.kdfSalt, preData.kdfIters);
+  const oldMaster = await deriveMaster(oldPassword, preData.kdfSalt, safeIters(preData.kdfIters));
   // Keep the account's kdfSalt so the recovery key still derives correctly afterwards.
-  const newMaster = await deriveMaster(newPassword, preData.kdfSalt, preData.kdfIters);
+  const newMaster = await deriveMaster(newPassword, preData.kdfSalt, safeIters(preData.kdfIters));
   const r = await api("/v1/auth/change-password", {
     method: "POST",
     token: session.token,
@@ -395,14 +402,14 @@ export async function regenerateRecoveryCode(session: Session): Promise<string> 
   const preData = pre.data as { kdfSalt: string; kdfIters: number } | null;
   if (!preData?.kdfSalt) throw new Error("Could not regenerate the recovery code.");
   const recoveryCode = makeRecoveryCode();
-  const recoveryKey = await pbkdf2(enc(recoveryCode), unb64(preData.kdfSalt), preData.kdfIters);
+  const recoveryKey = await pbkdf2(enc(recoveryCode), unb64(preData.kdfSalt), safeIters(preData.kdfIters));
   const r = await api("/v1/auth/recovery/regenerate", {
     method: "POST",
     token: session.token,
     body: {
       wrappedKeyRecovery: await seal(recoveryKey, session.dataKey),
       recVerifier: b64(await pbkdf2(recoveryKey, enc(recoveryCode), 1)),
-      recoveryCode,
+      // plaintext recoveryCode is NOT sent (zero-knowledge); shown on-screen for the user to copy.
     },
   });
   if (r.status !== 200) throw new Error("Could not regenerate the recovery code.");
