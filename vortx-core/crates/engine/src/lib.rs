@@ -20,6 +20,9 @@ pub mod ffi;
 mod resolve;
 
 pub use action::{Action, DispatchResult, EngineEvent};
-pub use engine::{dispatch, dispatch_json, get_state_json, init_runtime, Engine};
+pub use engine::{
+    dispatch, dispatch_json, get_state_delta_json, get_state_json, init_runtime, take_state_delta,
+    Engine, StateDelta,
+};
 pub use env::{Env, InMemoryEnv};
 pub use resolve::{resolve, resolve_json, ResolveRequest, ResolveResponse};

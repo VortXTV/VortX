@@ -10,7 +10,8 @@
 //! Engine* vortx_init_runtime(const char* owner_id, const char* owner_name);   // NULL on bad input
 //! char*   vortx_dispatch_json(Engine*, const char* action_json, uint64_t now_unix); // owned JSON
 //! char*   vortx_resolve_json(const Engine*, const char* request_json);              // owned JSON
-//! char*   vortx_get_state_json(const Engine*);                                      // owned JSON
+//! char*   vortx_get_state_json(const Engine*);                                      // owned JSON (full)
+//! char*   vortx_get_state_delta_json(Engine*);     // owned JSON: changed records only, clears dirty
 //! void    vortx_string_free(char*);    // free a char* returned above
 //! void    vortx_engine_free(Engine*);  // free the runtime
 //! ```
@@ -22,7 +23,10 @@
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
-use crate::{dispatch_json, get_state_json, init_runtime, resolve_json, Engine, InMemoryEnv};
+use crate::{
+    dispatch_json, get_state_delta_json, get_state_json, init_runtime, resolve_json, Engine,
+    InMemoryEnv,
+};
 
 /// Borrow a C string as `&str`. `None` on null or non-UTF-8.
 ///
@@ -116,6 +120,22 @@ pub unsafe extern "C" fn vortx_get_state_json(engine: *const Engine) -> *mut c_c
     }
 }
 
+/// Take the changed records since the last call (incremental persistence) as JSON, clearing the dirty
+/// set. `{}` when nothing changed. Prefer this over `vortx_get_state_json` for ongoing writes: the cost
+/// scales with what changed, not with total library size.
+///
+/// # Safety
+/// `engine` must be a live pointer from [`vortx_init_runtime`]. The returned pointer must be freed with
+/// [`vortx_string_free`].
+#[no_mangle]
+pub unsafe extern "C" fn vortx_get_state_delta_json(engine: *mut Engine) -> *mut c_char {
+    // SAFETY: per the contract `engine` is a live pointer from vortx_init_runtime or null.
+    match engine.as_mut() {
+        Some(engine) => to_c(get_state_delta_json(engine)),
+        None => to_c("{}".to_string()),
+    }
+}
+
 /// Free a string returned by any `vortx_*_json` function. Safe to call with null.
 ///
 /// # Safety
@@ -172,6 +192,12 @@ mod tests {
 
             let state = read_and_free(vortx_get_state_json(eng));
             assert!(state.contains("kid"));
+
+            // Incremental persistence: the delta carries the added profile, then clears.
+            let delta = read_and_free(vortx_get_state_delta_json(eng));
+            assert!(delta.contains("kid"));
+            let empty = read_and_free(vortx_get_state_delta_json(eng));
+            assert!(!empty.contains("kid")); // dirty cleared
 
             vortx_engine_free(eng);
         }
