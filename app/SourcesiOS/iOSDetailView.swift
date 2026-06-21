@@ -91,7 +91,8 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
                                         secondsSinceFirstPlayable: elapsed, rememberedQuality: continuity) { break }
         try? await Task.sleep(for: .milliseconds(250))
     }
-    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge),
+    let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
+    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin),
           let url = best.playableURL else { return nil }
     core.loadEnginePlayer(for: best)
     _ = prepareTorrentStream(best)   // fire-and-forget prime; self-terminating backoff
@@ -158,9 +159,15 @@ struct iOSDetailView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile watched set + episode progress
+    @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + badges/menu (#15)
     // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
     // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// The pin context for this title - a movie pin or a show pin, both keyed by the meta id. The
+    /// resolved pin feeds `StreamRanking` (auto-pick + list order) and the per-row pin menu/badge.
+    private var pinContext: SourcePinContext { SourcePinContext(metaId: id, isSeries: type == "series") }
+    private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
@@ -733,7 +740,7 @@ struct iOSDetailView: View {
     /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
     @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()))
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin)
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
@@ -800,11 +807,12 @@ struct iOSDetailView: View {
     /// component owns the filter / collapse state; it plays a chosen source through `playStream`.
     @ViewBuilder private var sourceSection: some View {
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups())),
+            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
             continuity: rememberedQuality,
+            pinContext: pinContext,
             // Hero already shows Watch + Quality + the "Sources" scroll button, so suppress this list's
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
@@ -912,7 +920,7 @@ struct iOSDetailView: View {
 
     /// The best source for the movie, honoring Direct-links-only and the remembered-quality continuity.
     private var movieBest: CoreStream? {
-        StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality)
+        StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality, pin: sourcePin)
     }
 
     /// Whether stream add-ons are still answering for this movie. Mirrors the tvOS Watch-Now gate:
@@ -1070,10 +1078,11 @@ struct iOSDetailView: View {
     /// remembered-quality continuity hint (live streams don't carry meaningful quality memory).
     @ViewBuilder private var liveSourceSection: some View {
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups())),
+            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
+            pinContext: pinContext,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } }
         )
         .padding(.horizontal, Theme.Space.md)
@@ -1392,6 +1401,11 @@ struct iOSEpisodeStreams: View {
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
+    @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source for this show (#15)
+
+    /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
+    private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
+    private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
 
     private var backdropHeight: CGFloat {
         #if os(macOS)
@@ -1409,11 +1423,12 @@ struct iOSEpisodeStreams: View {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width)
                 iOSSourceList(
-                    groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id))),
+                    groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin),
                     progress: core.streamLoadProgress(forStreamId: video.id),
                     states: core.streamAddonStates(forStreamId: video.id),
                     settleTimedOut: settleTimedOut,
                     continuity: rememberedQuality,
+                    pinContext: pinContext,
                     play: { stream, url in Task { await play(stream, url: url) } }
                 )
                 .padding(.horizontal, Theme.Space.md)
@@ -1610,7 +1625,7 @@ struct iOSEpisodeStreams: View {
                                             secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge),
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin),
               let url = best.playableURL else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         core.loadEnginePlayer(for: best)
@@ -1637,7 +1652,7 @@ struct iOSEpisodeStreams: View {
             }
             for await g in tasks { if let g { groups.append(g) } }
         }
-        guard let best = StreamRanking.best(displayGroups(groups), continuity: rememberedQuality, binge: lastBinge) else { return }
+        guard let best = StreamRanking.best(displayGroups(groups), continuity: rememberedQuality, binge: lastBinge, pin: sourcePin) else { return }
         prepareTorrentStream(best)                       // start peer discovery now (no-op for direct / debrid)
         guard best.url != nil, let url = best.playableURL else { return }   // direct / debrid → pull first bytes to warm the CDN
         var request = URLRequest(url: url)
@@ -1705,6 +1720,7 @@ struct iOSSourceList: View {
     var states: [CoreBridge.StreamAddonState] = []
     var settleTimedOut = false                          // resolution gave up → show "No sources" not a spinner
     var continuity: String? = nil                       // remembered quality signature → same-quality Watch-in pick
+    var pinContext: SourcePinContext? = nil             // title context for the per-row pin source menu/badge (#15)
     /// When false, the primary Watch / Quality / All-sources control bar is hidden and the grouped list is
     /// shown directly. The MOVIE detail page passes false because its hero already shows Watch + Quality +
     /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
@@ -1717,6 +1733,7 @@ struct iOSSourceList: View {
     @State private var collapsed: Set<String> = []      // per-add-on sections the user folded away
     @State private var qualityTier: String? = nil       // second-level quality sheet (a resolution tier)
     @State private var sortMode: SourceSort = .best     // how the rows within each add-on are ordered
+    @ObservedObject private var pinStore = SourcePinStore.shared   // re-render rows when a pin is added/removed (#15)
 
     /// How the streams inside each add-on section are ordered. Best is our ranking (resolution, source
     /// ladder, size, audio); Size and Seeders let a user override it when they want the biggest file or
@@ -2021,13 +2038,43 @@ struct iOSSourceList: View {
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if let url = stream.playableURL {
             Button { play(stream, url) } label: {
-                iOSStreamLabel(addon: addon, stream: stream, enabled: true)
+                iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream))
             }
             .buttonStyle(RowFocusStyle())
+            .contextMenu { pinMenu(addon, stream) }
         } else {
-            iOSStreamLabel(addon: addon, stream: stream, enabled: false)
+            iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false)
                 .background(Theme.Palette.surface1.opacity(0.5),
                             in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        }
+    }
+
+    /// True when this stream is the one the effective pin floats to the top - drives the row's pin badge.
+    private func isPinned(_ addon: String, _ stream: CoreStream) -> Bool {
+        guard let ctx = pinContext, let pin = pinStore.effectivePin(ctx) else { return false }
+        return SourcePinStore.matches(stream, addon: addon, pin: pin)
+    }
+
+    /// Long-press / right-click menu: pin this source for just this title, or for every title, or unpin.
+    /// A pin is a strong preference (it tops the list + auto-pick), not a lock - failover still hops if dead.
+    @ViewBuilder private func pinMenu(_ addon: String, _ stream: CoreStream) -> some View {
+        if let ctx = pinContext {
+            Button {
+                pinStore.pin(stream, addon: addon, scope: .entry, context: ctx)
+            } label: { Label("Pin for this \(ctx.entryNoun)", systemImage: "pin") }
+            Button {
+                pinStore.pin(stream, addon: addon, scope: .global, context: ctx)
+            } label: { Label("Pin everywhere", systemImage: "pin.circle") }
+            if pinStore.entryPin(ctx) != nil {
+                Button(role: .destructive) {
+                    pinStore.unpin(scope: .entry, context: ctx)
+                } label: { Label("Unpin this \(ctx.entryNoun)", systemImage: "pin.slash") }
+            }
+            if pinStore.global != nil {
+                Button(role: .destructive) {
+                    pinStore.unpin(scope: .global, context: ctx)
+                } label: { Label("Unpin everywhere", systemImage: "pin.slash") }
+            }
         }
     }
 
@@ -2048,6 +2095,7 @@ private struct iOSStreamLabel: View {
     let addon: String
     let stream: CoreStream
     let enabled: Bool
+    var pinned: Bool = false
 
     var body: some View {
         let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
@@ -2059,6 +2107,12 @@ private struct iOSStreamLabel: View {
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
+                    if pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(Theme.Palette.accent)
+                            .accessibilityLabel("Pinned source")
+                    }
                     badge(quality, prominent: true)
                     // Skip the add-on badge when it only repeats the resolution: some add-on configs are
                     // literally named "1080p" / "4K", which rendered as a second quality pill next to the

@@ -868,10 +868,17 @@ struct CoreStreamList: View {
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
+    @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
+    /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
+    /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
+    /// shares the one show pin.
+    private var pinContext: SourcePinContext? { meta.map { SourcePinContext(metaId: $0.libraryId, isSeries: $0.type == "series") } }
+    private var sourcePin: ResolvedPin? { pinContext.flatMap { pinStore.effectivePin($0) } }
+
     var body: some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()))   // best source first within each add-on
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin)   // best source first within each add-on
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
@@ -880,7 +887,7 @@ struct CoreStreamList: View {
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        let best = StreamRanking.best(groups, continuity: remembered)
+        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin)
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
@@ -1037,8 +1044,9 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if stream.playableURL != nil {
-            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true) }
+            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream)) }
                 .buttonStyle(RowFocusStyle())
+                .contextMenu { pinMenu(addon, stream) }
         } else {
             // Non-playable (Ratings/RPDB, external/youtube): keep it FOCUSABLE via an inert Button so
             // the tvOS focus engine can land here and keep scrolling DOWN past it. A bare non-focusable
@@ -1049,13 +1057,46 @@ struct CoreStreamList: View {
         }
     }
 
-    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool) -> some View {
+    /// True when this stream matches the effective pin - drives the row's pin badge.
+    private func isPinned(_ addon: String, _ stream: CoreStream) -> Bool {
+        guard let pin = sourcePin else { return false }
+        return SourcePinStore.matches(stream, addon: addon, pin: pin)
+    }
+
+    /// Long-press menu: pin this source for the show/movie or for everything, or unpin. A pin floats its
+    /// source to the top of the list + the one-press Watch pick, but failover still hops off it if dead.
+    @ViewBuilder private func pinMenu(_ addon: String, _ stream: CoreStream) -> some View {
+        if let ctx = pinContext {
+            Button {
+                pinStore.pin(stream, addon: addon, scope: .entry, context: ctx)
+            } label: { Label("Pin for this \(ctx.entryNoun)", systemImage: "pin") }
+            Button {
+                pinStore.pin(stream, addon: addon, scope: .global, context: ctx)
+            } label: { Label("Pin everywhere", systemImage: "pin.circle") }
+            if pinStore.entryPin(ctx) != nil {
+                Button(role: .destructive) {
+                    pinStore.unpin(scope: .entry, context: ctx)
+                } label: { Label("Unpin this \(ctx.entryNoun)", systemImage: "pin.slash") }
+            }
+            if pinStore.global != nil {
+                Button(role: .destructive) {
+                    pinStore.unpin(scope: .global, context: ctx)
+                } label: { Label("Unpin everywhere", systemImage: "pin.slash") }
+            }
+        }
+    }
+
+    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 30))
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
+                    if pinned {
+                        Image(systemName: "pin.fill").font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(Theme.Palette.accent)
+                    }
                     badge(addon.uppercased())
                     if stream.isTorrent { badge("TORRENT") }
                 }

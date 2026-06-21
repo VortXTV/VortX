@@ -83,22 +83,56 @@ enum StreamRanking {
         return 2500
     }
 
+    /// A user-pinned source floats above everything else. The bonus dwarfs the entire score range (the
+    /// quality spread is ~4300, cached is +8000, the source-type tier gap is 15000) so a matching stream
+    /// wins the one-press auto-pick and tops the list - yet it is still only a *score*, so the player's
+    /// invisible failover hops straight off it if it turns out to be dead. See `SourcePinStore.matches`.
+    static func pinBonus(_ s: CoreStream, addon: String, pin: ResolvedPin?) -> Int {
+        guard let pin, SourcePinStore.matches(s, addon: addon, pin: pin) else { return 0 }
+        return 1_000_000
+    }
+
+    /// Coarse release flavor for a pin's human label only: Remux > BluRay > WEB, "" when none is tagged.
+    static func releaseFlavor(_ s: CoreStream) -> String {
+        let text = qualityText(s)
+        if text.contains("remux") { return "Remux" }
+        if text.contains("bluray") || text.contains("blu-ray") || boundedMatch(text, #"b[dr][ .\-_]?rip"#) { return "BluRay" }
+        if boundedMatch(text, "web") { return "WEB" }
+        return ""
+    }
+
     /// best() with the continuity and bingeGroup bonuses applied on top of the base
     /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
     /// heuristic; both fall back to the plain best when absent.
-    static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil) -> CoreStream? {
+    static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
+                     pin: ResolvedPin? = nil) -> CoreStream? {
         let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
+            // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
+            // explicit "play THIS" - so an applicable pin still wins, falling back to add-on order.
+            if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
         }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
-        guard hasHint || hasBinge else { return best(groups) }
-        let candidates = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
+        guard hasHint || hasBinge || pin != nil else { return best(groups, pin: pin) }
+        let candidates = playablePairs(groups)
         return candidates.max { lhs, rhs in
-            (score(lhs) + continuityBonus(lhs, hint: hint) + bingeBonus(lhs, group: binge)) <
-            (score(rhs) + continuityBonus(rhs, hint: hint) + bingeBonus(rhs, group: binge))
-        }
+            (score(lhs.stream) + continuityBonus(lhs.stream, hint: hint) + bingeBonus(lhs.stream, group: binge) + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)) <
+            (score(rhs.stream) + continuityBonus(rhs.stream, hint: hint) + bingeBonus(rhs.stream, group: binge) + pinBonus(rhs.stream, addon: rhs.addon, pin: pin))
+        }?.stream
+    }
+
+    /// Streams paired with their source group's add-on, the form pin matching needs (a flattened stream
+    /// loses which add-on it came from, which the `global`/provider pin keys on).
+    private static func playablePairs(_ groups: [CoreStreamSourceGroup]) -> [(addon: String, stream: CoreStream)] {
+        groups.flatMap { g in g.streams.map { (addon: g.addon, stream: $0) } }.filter { $0.stream.playableURL != nil }
+    }
+
+    /// The first playable stream that matches a pin, in add-on/list order. Used by the add-on-order path.
+    private static func firstPinned(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin?) -> CoreStream? {
+        guard let pin else { return nil }
+        return playablePairs(groups).first { SourcePinStore.matches($0.stream, addon: $0.addon, pin: pin) }?.stream
     }
 
     /// Whether a streams-loading wait should stop now and hand the result to `best(continuity:)`.
@@ -573,13 +607,13 @@ enum StreamRanking {
         }
     }
 
-    static func rankedGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil) -> [CoreStreamSourceGroup] {
         let groups = applyUserFilters(groups)
         guard !SourcePreferences.shared.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {
-                scored.append((stream: stream, score: score(stream), index: i))
+                scored.append((stream: stream, score: score(stream) + pinBonus(stream, addon: group.addon, pin: pin), index: i))
             }
             scored.sort { $0.score != $1.score ? $0.score > $1.score : $0.index < $1.index }
             return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: scored.map { $0.stream })
@@ -587,12 +621,13 @@ enum StreamRanking {
     }
 
     /// The single best playable stream across all groups, for the one-press "Watch Now".
-    static func best(_ groups: [CoreStreamSourceGroup]) -> CoreStream? {
+    static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil) -> CoreStream? {
         let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
+            if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
         }
-        return groups.flatMap { $0.streams }.filter { $0.playableURL != nil }.max { score($0) < score($1) }
+        return playablePairs(groups).max { (score($0.stream) + pinBonus($0.stream, addon: $0.addon, pin: pin)) < (score($1.stream) + pinBonus($1.stream, addon: $1.addon, pin: pin)) }?.stream
     }
 
     /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first — feeds the

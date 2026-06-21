@@ -243,6 +243,7 @@ final class ProfileStore: ObservableObject {
         applyTheme(profile)
         applyPlayback(profile)
         SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on a switch
+        SourcePinStore.shared.reload()      // pinned sources are per-profile too
         loadWatchCache()
         refreshWatchFromServer()
         let nowAccount = keychainAccount(for: profile)
@@ -640,6 +641,7 @@ final class ProfileStore: ObservableObject {
             applyTheme(active)
             applyPlayback(active)
             SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on adopt
+            SourcePinStore.shared.reload()
         }
         persist(touch: false)
         loadWatchCache()
@@ -666,6 +668,7 @@ final class ProfileStore: ObservableObject {
             applyTheme(active)
             applyPlayback(active)
             SourcePreferences.shared.reload()
+            SourcePinStore.shared.reload()
         }
         persist(touch: false)
         loadWatchCache()
@@ -765,6 +768,7 @@ final class ProfileStore: ObservableObject {
             applyTheme(active)
             applyPlayback(active)
             SourcePreferences.shared.reload()
+            SourcePinStore.shared.reload()
         }
         persist(touch: false)   // a merge is not a local edit; never schedule a push from here
         loadWatchCache()

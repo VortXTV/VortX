@@ -992,8 +992,15 @@ struct PlayerScreen: View {
         }
     }
 
+    /// The pinned source for this title (#15), so failover keeps hopping to the pinned provider/quality
+    /// when one is available, and falls back to plain ranking once it is exhausted.
+    private var sourcePin: ResolvedPin? {
+        guard let m = recordMeta else { return nil }
+        return SourcePinStore.shared.effectivePin(SourcePinContext(metaId: m.libraryId, isSeries: m.type == "series"))
+    }
+
     /// The best playable stream not yet tried for this title / episode, honouring the user's source
-    /// ordering + continuity / binge hints. Returns nil when nothing untried remains.
+    /// ordering + continuity / binge hints + any pin. Returns nil when nothing untried remains.
     private func nextUntriedStream() -> CoreStream? {
         let remaining = currentSourceGroups.map { group in
             CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
@@ -1001,7 +1008,7 @@ struct PlayerScreen: View {
                 return u != curURL && !exhaustedURLs.contains(u)
             })
         }
-        return StreamRanking.best(remaining, continuity: recordQualityText, binge: nil)
+        return StreamRanking.best(remaining, continuity: recordQualityText, binge: nil, pin: sourcePin)
     }
 
     /// The playing source is dead (retry / stall budget ran out): mark it exhausted and hop to the

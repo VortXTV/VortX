@@ -19,6 +19,7 @@ struct iOSSettingsView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @EnvironmentObject private var profiles: ProfileStore
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
+    @ObservedObject private var pinStore = SourcePinStore.shared
     @State private var serverOnline: Bool?
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
@@ -543,6 +544,13 @@ struct iOSSettingsView: View {
                 Text("20 GB").tag(20.0)
                 Text("30 GB").tag(30.0)
                 Text("50 GB").tag(50.0)
+            }
+            // Pinned sources (#15): long-press a source on any title to pin it; this clears them all.
+            if pinStore.pinnedCount > 0 {
+                Button(role: .destructive) { pinStore.clearAll() } label: {
+                    Label("Clear pinned sources (\(pinStore.pinnedCount))", systemImage: "pin.slash")
+                }
+                .tint(Theme.Palette.danger)
             }
         } header: {
             Text("Streams")

@@ -17,6 +17,16 @@ struct TVPlayerView: View {
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
+    /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
+    /// user's pinned provider/quality across episodes - and still hop off it if it dies.
+    private var sourcePin: ResolvedPin? {
+        // Use the LIVE episode meta (curMeta), falling back to the launch prop before it is set. For a
+        // series both carry the same show libraryId, but curMeta is the canonical source of truth across
+        // auto-next transitions. Read fresh at each failover/auto-next/preload, so a new pin is honoured.
+        guard let m = curMeta ?? meta else { return nil }
+        return SourcePinStore.shared.effectivePin(SourcePinContext(metaId: m.libraryId, isSeries: m.type == "series"))
+    }
+
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @State private var markedWatched = false   // mark the engine watched once, near end of playback
@@ -1040,7 +1050,7 @@ struct TVPlayerView: View {
                 return url != curURL && !exhaustedURLs.contains(url)
             })
         }
-        return StreamRanking.best(remaining, continuity: curHint, binge: curBinge)
+        return StreamRanking.best(remaining, continuity: curHint, binge: curBinge, pin: sourcePin)
     }
 
     /// The playing source is dead (its retry, stall, or warm-up budget ran out): mark it
@@ -1840,7 +1850,7 @@ struct TVPlayerView: View {
                 let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
                 if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                                 secondsSinceFirstPlayable: elapsed, rememberedQuality: curHint),
-                   let s = StreamRanking.best(groups, continuity: curHint, binge: curBinge), let u = s.playableURL {
+                   let s = StreamRanking.best(groups, continuity: curHint, binge: curBinge, pin: sourcePin), let u = s.playableURL {
                     DiagnosticsLog.log("binge", "auto-next FALLBACK: wanted binge=\(curBinge ?? "nil") got=\(s.behaviorHints?.bingeGroup ?? "nil") name=\(s.name?.prefix(60) ?? "")")
                     curBinge = s.behaviorHints?.bingeGroup
                     curHint = StreamRanking.signature(s)
@@ -1886,6 +1896,7 @@ struct TVPlayerView: View {
         // writes hop back to the main actor.
         let hint = curHint
         let binge = curBinge
+        let pin = sourcePin                     // snapshot on-main; the background rank uses it (#15)
         plog.info("preloading next episode \(next.id, privacy: .public) from \(sources.count, privacy: .public) add-ons")
         Task {
             var groups: [CoreStreamSourceGroup] = []
@@ -1902,7 +1913,7 @@ struct TVPlayerView: View {
             groups.sort { (order[$0.id] ?? .max) < (order[$1.id] ?? .max) }
             let withBinge = groups.flatMap { $0.streams }.filter { ($0.behaviorHints?.bingeGroup?.isEmpty == false) }.count
             DiagnosticsLog.log("binge", "preload next ep: want binge=\(binge ?? "nil"), \(withBinge) of \(groups.flatMap { $0.streams }.count) streams carry a bingeGroup")
-            let best = StreamRanking.best(groups, continuity: hint, binge: binge)
+            let best = StreamRanking.best(groups, continuity: hint, binge: binge, pin: pin)
             // @State writes go back on the main actor (the fetch + rank above intentionally ran off-main).
             await MainActor.run {
                 if let best {
