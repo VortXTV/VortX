@@ -17,14 +17,17 @@ struct iOSRootView: View {
         case home, discover, live, library, search, addons, settings
 
         var title: String {
+            // Localized: rendered via Text(item.title) and used as accessibility labels, where a plain
+            // String does NOT auto-localize (only Text("literal")/LocalizedStringKey does). String(localized:)
+            // routes the value through the String Catalog at runtime AND gets the key extracted into it.
             switch self {
-            case .home: return "Home"
-            case .discover: return "Discover"
-            case .live: return "Live"
-            case .library: return "Library"
-            case .search: return "Search"
-            case .addons: return "Add-ons"
-            case .settings: return "Settings"
+            case .home: return String(localized: "Home")
+            case .discover: return String(localized: "Discover")
+            case .live: return String(localized: "Live")
+            case .library: return String(localized: "Library")
+            case .search: return String(localized: "Search")
+            case .addons: return String(localized: "Add-ons")
+            case .settings: return String(localized: "Settings")
             }
         }
 
@@ -401,7 +404,7 @@ struct iOSHomeView: View {
             }
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .stremioWordmarkTitle("Home", isActive: isActive)
+            .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
             .toolbar {
                 if !account.isSignedIn {
                     ToolbarItem(placement: .primaryAction) {
@@ -571,7 +574,7 @@ struct iOSLibraryView: View {
             }
             .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .stremioWordmarkTitle("Library", isActive: isActive)
+            .stremioWordmarkTitle(String(localized: "Library"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
@@ -662,7 +665,7 @@ struct iOSSearchView: View {
                 .padding(.vertical, Theme.Space.md)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .stremioWordmarkTitle("Search", isActive: isActive)
+            .stremioWordmarkTitle(String(localized: "Search"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
@@ -890,7 +893,7 @@ struct iOSDiscoverView: View {
             }
             .scrollDismissesHeroRotation(model: hero)
             .background(Theme.Palette.canvas.ignoresSafeArea())
-            .stremioWordmarkTitle("Discover", isActive: isActive)
+            .stremioWordmarkTitle(String(localized: "Discover"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }

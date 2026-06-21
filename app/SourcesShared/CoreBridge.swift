@@ -1203,10 +1203,12 @@ final class CoreBridge: ObservableObject {
         case "series":  label = "Shows"
         case "channel": label = "Channels"
         case "tv":      label = "TV"
-        default:        return name
+        default:        return AddonTerms.localize(name)
         }
-        if lower.contains(t) || lower.contains(label.lowercased()) { return name }
-        return "\(name) \(label)"
+        // Capture the add-on's category name + content-type label and localize each against our own term
+        // dictionary (Stremio does the same); unknown add-on names pass through unchanged.
+        if lower.contains(t) || lower.contains(label.lowercased()) { return AddonTerms.localize(name) }
+        return "\(AddonTerms.localize(name)) \(AddonTerms.localize(label))"
     }
 
     private static func catalogKey(base: String, type: String, id: String) -> String {
