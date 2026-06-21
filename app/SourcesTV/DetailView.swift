@@ -955,6 +955,11 @@ struct CoreStreamList: View {
 
                     LibraryChip()
                 }
+                // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
+                if let reason = StreamRanking.pickReason(best) {
+                    Text("Picked for \(reason)")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                }
                 if loadingAddons && addons.total > 0 {
                     Text("Still finding more · \(addons.loaded)/\(addons.total) add-ons")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)

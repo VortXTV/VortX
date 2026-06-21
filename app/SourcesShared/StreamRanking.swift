@@ -822,6 +822,26 @@ enum StreamRanking {
         return tags.joined(separator: " · ")
     }
 
+    /// A one-line rationale for WHY the auto-pick chose this source (#16), shown ONCE on the recommended
+    /// pick - never per row, so it explains the ranking DECISION instead of duplicating the per-row
+    /// attribute tags (`flavorTags`). It surfaces the two decisive factors those tags do not convey as a
+    /// reason: that the source is instant (resolved from a debrid cache, so it beats uncached peers of the
+    /// same quality), and that it sits at the top of the viewer's own source-type order. Returns nil when
+    /// neither applies, so the caption only appears when there is a real reason to show.
+    ///
+    /// NOTE (bitrate / ping, the rest of #16): a true bitrate weight needs per-stream runtime the add-on
+    /// protocol does not carry, and a ping/latency weight needs an async per-source probe; both belong in
+    /// the engine (structured stream metadata + async I/O), see [[vortx-engine-needs]] #2 and #4. They are
+    /// deliberately NOT faked here.
+    static func pickReason(_ s: CoreStream) -> String? {
+        let t = qualityText(s)
+        var why: [String] = []
+        if isCached(s, t) { why.append("instant from cache") }
+        if SourcePreferences.shared.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
+        guard !why.isEmpty else { return nil }
+        return why.joined(separator: " · ")
+    }
+
     /// True when a stream's quality text advertises Dolby Vision. This is the only DV signal available
     /// before playback (a text parse); the engine router uses it to route DV to AVPlayer for true DV
     /// passthrough, which libmpv/MoltenVK cannot do (it only tone-maps DV to SDR). HDR10 is intentionally

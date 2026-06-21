@@ -744,6 +744,7 @@ struct iOSDetailView: View {
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
+        VStack(alignment: .leading, spacing: Theme.Space.xs) {
         FlowLayout(spacing: Theme.Space.sm) {
             Button {
                 Task { await playMovie() }
@@ -771,6 +772,13 @@ struct iOSDetailView: View {
             trailerButton
             iOSLibraryChip()
             shareChip
+        }
+        // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
+        if movieReady, let s = movieBest, let reason = StreamRanking.pickReason(s) {
+            Text("Picked for \(reason)")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textTertiary)
+        }
         }
         .padding(.top, Theme.Space.xs)
     }
