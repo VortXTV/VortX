@@ -281,17 +281,30 @@ final class DebridCoordinator {
     }
 
     /// Which provider has each hash cached (first configured provider that reports it), with the files.
+    /// Queries every configured provider CONCURRENTLY (resolvers are actors, so the captures are Sendable),
+    /// then merges in a deterministic `DebridService.allCases` priority order so the chosen provider for a
+    /// hash is stable. Previously this looped providers sequentially AND in nondeterministic dict order.
     func cacheCheck(hashes: [String]) async -> [String: (service: DebridService, files: [DebridFile])] {
         if resolvers.isEmpty { reload() }
         guard !resolvers.isEmpty, !hashes.isEmpty else { return [:] }
-        var out: [String: (DebridService, [DebridFile])] = [:]
-        for (service, resolver) in resolvers {
-            guard let map = try? await resolver.checkCache(hashes: hashes) else { continue }
+        let maps: [DebridService: [String: [DebridFile]]] = await withTaskGroup(
+            of: (DebridService, [String: [DebridFile]]).self
+        ) { group in
+            for (service, resolver) in resolvers {
+                group.addTask { (service, (try? await resolver.checkCache(hashes: hashes)) ?? [:]) }
+            }
+            var collected: [DebridService: [String: [DebridFile]]] = [:]
+            for await (service, map) in group { collected[service] = map }
+            return collected
+        }
+        var out: [String: (service: DebridService, files: [DebridFile])] = [:]
+        for service in DebridService.allCases {
+            guard let map = maps[service] else { continue }
             for (hash, files) in map where !files.isEmpty && out[hash] == nil {
                 out[hash] = (service, files)
             }
         }
-        return out.mapValues { (service: $0.0, files: $0.1) }
+        return out
     }
 
     /// Resolve a torrent to a direct stream URL via the given (or first available) provider.
