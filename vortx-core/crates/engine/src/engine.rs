@@ -143,6 +143,43 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
                 None => DispatchResult::err("profile not found"),
             }
         }
+        Action::ReportProgress {
+            meta_id,
+            video_id,
+            name,
+            position_ms,
+            duration_ms,
+        } => {
+            engine.store.active_library_mut().report_progress(
+                &meta_id,
+                video_id.as_deref(),
+                position_ms,
+                duration_ms,
+                &name,
+                env.now(),
+            );
+            let pid = engine.store.active_profile_id.clone();
+            engine.dirty.libraries.insert(pid);
+            DispatchResult::ok(vec![EngineEvent::ProgressReported { id: meta_id }])
+        }
+        Action::MarkWatched { meta_id, video_id } => {
+            engine
+                .store
+                .active_library_mut()
+                .mark_watched(&meta_id, video_id.as_deref(), env.now());
+            let pid = engine.store.active_profile_id.clone();
+            engine.dirty.libraries.insert(pid);
+            DispatchResult::ok(vec![EngineEvent::Watched { id: meta_id }])
+        }
+        Action::RemoveFromContinueWatching { meta_id } => {
+            engine
+                .store
+                .active_library_mut()
+                .remove_from_continue_watching(&meta_id);
+            let pid = engine.store.active_profile_id.clone();
+            engine.dirty.libraries.insert(pid);
+            DispatchResult::ok(vec![EngineEvent::RemovedFromCw { id: meta_id }])
+        }
         Action::GetState => DispatchResult::ok(vec![]),
     }
 }

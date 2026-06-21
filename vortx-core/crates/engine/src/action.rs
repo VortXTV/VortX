@@ -30,6 +30,33 @@ pub enum Action {
     /// Set a profile's stream-ranking preferences (used as the default when a stream resolve omits prefs).
     /// Bumps the profile's LWW edit clock.
     SetRankingPrefs { id: String, prefs: RankingPrefs },
+    /// Report playback progress for an item ADDRESSED BY IDENTITY (meta/video), never by a stream object.
+    /// The engine writes the resume point and updates Continue Watching per its own rules, so URL
+    /// transformations (proxy / DV path / debrid reconstruct) are irrelevant to progress tracking.
+    ReportProgress {
+        #[serde(rename = "metaId")]
+        meta_id: String,
+        #[serde(default, rename = "videoId", skip_serializing_if = "Option::is_none")]
+        video_id: Option<String>,
+        #[serde(default)]
+        name: String,
+        #[serde(rename = "positionMs")]
+        position_ms: u64,
+        #[serde(rename = "durationMs")]
+        duration_ms: u64,
+    },
+    /// Mark an item (and optional episode) watched; removes it from Continue Watching.
+    MarkWatched {
+        #[serde(rename = "metaId")]
+        meta_id: String,
+        #[serde(default, rename = "videoId", skip_serializing_if = "Option::is_none")]
+        video_id: Option<String>,
+    },
+    /// Remove an item from Continue Watching (the user dismissed it); the resume point is kept.
+    RemoveFromContinueWatching {
+        #[serde(rename = "metaId")]
+        meta_id: String,
+    },
     /// No state change; a way for the host to request a fresh state snapshot.
     GetState,
 }
@@ -43,6 +70,9 @@ pub enum EngineEvent {
     ProfileDeleted { id: String },
     ParentalSet { id: String },
     RankingPrefsSet { id: String },
+    ProgressReported { id: String },
+    Watched { id: String },
+    RemovedFromCw { id: String },
 }
 
 /// The result of a dispatch: success/failure, an optional error message, and the events produced.
