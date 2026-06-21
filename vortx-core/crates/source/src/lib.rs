@@ -24,6 +24,7 @@ mod pagination;
 mod registry;
 mod request;
 mod source;
+mod transport;
 mod validate;
 
 pub use adapters::{NuvioProviderSource, StremioAddonSource};
@@ -47,6 +48,7 @@ pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
 pub use request::{ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
+pub use transport::{plan_fanout, run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest};
 pub use validate::{has_errors, validate, Issue, Severity};
 
 /// Errors a [`Source`] can return. `resolve` MUST NOT panic; it returns one of these (the orchestrator

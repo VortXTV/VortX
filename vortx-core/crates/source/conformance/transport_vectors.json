@@ -1,0 +1,41 @@
+{
+  "description": "Cross-language conformance for the deadline-bounded fan-out orchestration over the host Fetch boundary. Given candidate (addon_id, url) sources + their circuit breakers + the host's per-source outcomes, run_fanout() plans which to query (skipping circuit-open sources still cooling), realizes each through the host, and settles a merged Aggregate (a source the host did not return is settled as Timeout = partial settlement). Deterministic, sorted-addon-id order. CircuitConfig is the default (failure_threshold 3, cooldown_secs 300).",
+  "cases": [
+    {
+      "name": "failure_isolated_good_items_kept",
+      "candidates": [["good", "http://g"], ["poison", "http://p"]],
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": { "good": { "status": "ok", "items": ["s1", "s2"] }, "poison": { "status": "malformed" } },
+      "expect": { "items": ["s1", "s2"], "survivors": ["good"], "failed": [{ "addon_id": "poison", "reason": "malformed" }] }
+    },
+    {
+      "name": "open_breaker_still_cooling_is_skipped",
+      "candidates": [["good", "http://g"], ["bad", "http://b"]],
+      "breakers": { "bad": { "consecutive_failures": 3, "state": "open", "opened_at": 1000 } },
+      "now": 1100,
+      "budget_ms": 5000,
+      "outcomes": { "good": { "status": "ok", "items": ["s1"] } },
+      "expect": { "items": ["s1"], "survivors": ["good"], "failed": [] }
+    },
+    {
+      "name": "missing_outcome_settles_as_timeout",
+      "candidates": [["a", "http://a"], ["slow", "http://s"]],
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 3000,
+      "outcomes": { "a": { "status": "ok", "items": ["s1"] } },
+      "expect": { "items": ["s1"], "survivors": ["a"], "failed": [{ "addon_id": "slow", "reason": "timeout" }] }
+    },
+    {
+      "name": "two_good_union_in_sorted_addon_id_order",
+      "candidates": [["zeta", "http://z"], ["alpha", "http://a"]],
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": { "zeta": { "status": "ok", "items": ["z1"] }, "alpha": { "status": "ok", "items": ["a1"] } },
+      "expect": { "items": ["a1", "z1"], "survivors": ["alpha", "zeta"], "failed": [] }
+    }
+  ]
+}
