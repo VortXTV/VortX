@@ -35,7 +35,7 @@ pub use maturity::{
 };
 pub use library::{
     CwItem, HistoryEntry, LibraryItem, ProfileLibrary, ResumePoint, StremioLibraryItem,
-    WatchedBitfield,
+    WatchedBitfield, CW_CAP, FINISHED_PERMILLE,
 };
 pub use pin::{hash_pin, pin_preimage, verify_pin};
 pub use profile::{AccountBinding, AddonBinding, ParentalFlags, Profile, ProfileSettings};

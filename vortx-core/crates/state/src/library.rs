@@ -121,6 +121,87 @@ pub struct ProfileLibrary {
     pub search_history: Vec<String>,
 }
 
+/// Playback at or past this permille of the runtime counts as FINISHED (cleared from resume + Continue
+/// Watching, recorded watched). The engine owns this threshold so every platform agrees.
+pub const FINISHED_PERMILLE: u32 = 900;
+/// The Continue Watching rail is capped at this many entries, newest first. The engine owns the cap so the
+/// app renders the list verbatim instead of re-deriving it.
+pub const CW_CAP: usize = 30;
+
+impl ProfileLibrary {
+    /// Record playback progress for an item ADDRESSED BY IDENTITY (`meta_id`, optional `video_id`), never
+    /// by a stream object. The engine owns the Continue-Watching rules: an in-progress item is upserted to
+    /// the FRONT of the rail (newest first, capped at [`CW_CAP`]) with its resume point; once it crosses
+    /// [`FINISHED_PERMILLE`] it is marked watched and removed from the rail. `now` is supplied by the host
+    /// (the kernel has no clock).
+    pub fn report_progress(
+        &mut self,
+        meta_id: &str,
+        video_id: Option<&str>,
+        position_ms: u64,
+        duration_ms: u64,
+        name: &str,
+        now: u64,
+    ) {
+        let permille = position_ms
+            .saturating_mul(1000)
+            .checked_div(duration_ms)
+            .map(|p| p.min(1000) as u32)
+            .unwrap_or(0);
+        // The resume point is keyed by the most specific unit (the episode if present, else the title), so
+        // each episode keeps its own position.
+        let resume_key = video_id.unwrap_or(meta_id).to_string();
+        if permille >= FINISHED_PERMILLE {
+            self.resume.remove(&resume_key);
+            self.mark_watched(meta_id, video_id, now);
+        } else {
+            self.resume.insert(
+                resume_key,
+                ResumePoint {
+                    offset_secs: position_ms / 1000,
+                    duration_secs: duration_ms / 1000,
+                    updated_at: now,
+                },
+            );
+            // Move the title to the front of Continue Watching with its latest progress.
+            self.continue_watching.retain(|c| c.id != meta_id);
+            self.continue_watching.insert(
+                0,
+                CwItem {
+                    id: meta_id.to_string(),
+                    name: name.to_string(),
+                    progress: permille,
+                },
+            );
+            self.continue_watching.truncate(CW_CAP);
+        }
+    }
+
+    /// Mark an item (and optional episode) watched: record the watched video id, drop it from Continue
+    /// Watching, and append a fresh history entry (replacing any prior one for the same item).
+    pub fn mark_watched(&mut self, meta_id: &str, video_id: Option<&str>, now: u64) {
+        if let Some(vid) = video_id {
+            let wb = self.watched.entry(meta_id.to_string()).or_default();
+            if !wb.video_ids.iter().any(|v| v == vid) {
+                wb.video_ids.push(vid.to_string());
+            }
+        }
+        self.continue_watching.retain(|c| c.id != meta_id);
+        self.history
+            .retain(|h| !(h.id == meta_id && h.video_id.as_deref() == video_id));
+        self.history.push(HistoryEntry {
+            id: meta_id.to_string(),
+            video_id: video_id.map(str::to_string),
+            watched_at: now,
+        });
+    }
+
+    /// Remove an item from Continue Watching (the user dismissed it). Leaves the resume point intact.
+    pub fn remove_from_continue_watching(&mut self, meta_id: &str) {
+        self.continue_watching.retain(|c| c.id != meta_id);
+    }
+}
+
 /// The account-library shape that mirrors to api.strem.io: ONLY the fields official Stremio clients
 /// parse. There is intentionally no field for VortX-specific data, so a projection can never leak it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +243,58 @@ impl ProfileLibrary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_upserts_continue_watching_newest_first() {
+        let mut lib = ProfileLibrary::default();
+        lib.report_progress("a", None, 300_000, 600_000, "A", 100); // 50%
+        lib.report_progress("b", None, 60_000, 600_000, "B", 200); // 10%, newer
+        assert_eq!(lib.continue_watching.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["b", "a"]);
+        assert_eq!(lib.continue_watching[1].progress, 500); // 50% permille
+        assert_eq!(lib.resume["a"].offset_secs, 300);
+    }
+
+    #[test]
+    fn re_reporting_moves_to_front_without_duplicating() {
+        let mut lib = ProfileLibrary::default();
+        lib.report_progress("a", None, 60_000, 600_000, "A", 100);
+        lib.report_progress("b", None, 60_000, 600_000, "B", 200);
+        lib.report_progress("a", None, 120_000, 600_000, "A", 300); // bump a
+        let ids: Vec<&str> = lib.continue_watching.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]); // a moved to front, no dupe
+        assert_eq!(lib.continue_watching.len(), 2);
+    }
+
+    #[test]
+    fn finishing_marks_watched_and_drops_from_cw() {
+        let mut lib = ProfileLibrary::default();
+        lib.report_progress("s", Some("s:1:1"), 60_000, 600_000, "S", 100); // in progress
+        assert_eq!(lib.continue_watching.len(), 1);
+        lib.report_progress("s", Some("s:1:1"), 595_000, 600_000, "S", 200); // 99% -> finished
+        assert!(lib.continue_watching.is_empty());
+        assert!(lib.watched["s"].video_ids.contains(&"s:1:1".to_string()));
+        assert!(!lib.resume.contains_key("s:1:1")); // resume cleared on finish
+        assert_eq!(lib.history.last().unwrap().id, "s");
+    }
+
+    #[test]
+    fn cw_is_capped_at_cw_cap_keeping_newest() {
+        let mut lib = ProfileLibrary::default();
+        for i in 0..(CW_CAP + 5) {
+            lib.report_progress(&format!("m{i}"), None, 60_000, 600_000, "M", i as u64);
+        }
+        assert_eq!(lib.continue_watching.len(), CW_CAP);
+        assert_eq!(lib.continue_watching[0].id, format!("m{}", CW_CAP + 4)); // newest at front
+    }
+
+    #[test]
+    fn dismiss_removes_from_cw_but_keeps_resume() {
+        let mut lib = ProfileLibrary::default();
+        lib.report_progress("a", None, 60_000, 600_000, "A", 100);
+        lib.remove_from_continue_watching("a");
+        assert!(lib.continue_watching.is_empty());
+        assert!(lib.resume.contains_key("a"));
+    }
 
     fn mixed_library() -> ProfileLibrary {
         ProfileLibrary {
