@@ -257,6 +257,250 @@ private extension Array {
     }
 }
 
+// MARK: - Real-Debrid resolver (torrents)
+
+/// Real-Debrid native resolver. Base `https://api.real-debrid.com/rest/1.0`, Bearer auth. Real-Debrid REMOVED
+/// its instant cache-check (the old `/torrents/instantAvailability` now returns empty), so `checkCache` is a
+/// no-op and cached torrents resolve through the add-then-poll flow instead (near-instant when cached).
+/// Flow: addMagnet -> selectFiles(all) -> poll info until `downloaded` -> pick the file -> unrestrict its link.
+/// NOTE: the API flow follows the Brain spec (vortx-debrid-implementation.md); it is compile-verified but not
+/// yet live-verified (needs a real key), and stays inert until the source-list/play-path wiring calls it.
+actor RealDebridResolver: DebridResolving {
+    nonisolated let service: DebridService = .realDebrid
+    private let apiKey: String
+    private let session: URLSession
+    private static let base = "https://api.real-debrid.com/rest/1.0"
+
+    init(apiKey: String) {
+        self.apiKey = apiKey
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 20
+        self.session = URLSession(configuration: cfg)
+    }
+
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }   // removed upstream
+
+    private struct AddResp: Decodable { let id: String }
+    private struct Info: Decodable {
+        let status: String
+        let files: [F]?
+        let links: [String]?
+        struct F: Decodable { let id: Int; let path: String; let bytes: Int64; let selected: Int }
+    }
+    private struct Unrestrict: Decodable { let download: String }
+
+    func resolve(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        let add: AddResp = try await form("\(Self.base)/torrents/addMagnet", ["magnet": magnet])
+        let id = add.id
+        // Poll until downloaded, selecting all files the FIRST time RD asks (it won't cache until selection).
+        var info: Info?
+        var didSelect = false
+        for attempt in 0..<12 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }
+            let i: Info = try await get("\(Self.base)/torrents/info/\(id)")
+            if i.status == "downloaded" { info = i; break }
+            if ["magnet_error", "error", "virus", "dead"].contains(i.status) {
+                throw DebridError.providerError("status \(i.status)")
+            }
+            if i.status == "waiting_files_selection", !didSelect {
+                didSelect = true
+                // Select once and PROPAGATE failure: a 401 here surfaces as invalidKey, not a misleading
+                // notReady after the full timeout, and it never re-fires every poll.
+                try await formVoid("\(Self.base)/torrents/selectFiles/\(id)", ["files": "all"])
+            }
+        }
+        guard let info, let links = info.links, !links.isEmpty else { throw DebridError.notReady }
+        // RD's `links` are parallel to the SELECTED files in order, so DebridFile.id is the selected index
+        // and `links[pick.id]` is the matching restricted link to unrestrict.
+        let selected = (info.files ?? []).filter { $0.selected == 1 }
+        let dfiles = selected.enumerated().map { idx, f -> DebridFile in
+            DebridFile(id: idx, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
+        }
+        // The stream's `fileIdx` is a TORRENT-WIDE index, but `dfiles`/`links` here are RD's selected-file
+        // list, so a torrent-wide index would mis-map to the wrong file. Pick by the episode/size heuristic on
+        // RD's own filenames instead (reliable), which keeps `links[pick.id]` aligned (pick.id = selected index).
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
+              links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
+        let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
+        guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
+        return u
+    }
+
+    private func get<T: Decodable>(_ urlString: String) async throws -> T {
+        guard let url = URL(string: urlString) else { throw DebridError.providerError("bad url") }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        return try await send(req)
+    }
+    private func form<T: Decodable>(_ urlString: String, _ fields: [String: String]) async throws -> T {
+        try await send(formRequest(urlString, fields))
+    }
+    private func formVoid(_ urlString: String, _ fields: [String: String]) async throws {
+        let (_, resp) = try await session.data(for: formRequest(urlString, fields))   // selectFiles is 204, no body
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 401 || code == 403 { throw DebridError.invalidKey }
+        guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
+    }
+    private func formRequest(_ urlString: String, _ fields: [String: String]) -> URLRequest {
+        var req = URLRequest(url: URL(string: urlString) ?? Self.fallbackURL)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = DebridForm.encode(fields)
+        return req
+    }
+    private static let fallbackURL = URL(string: "https://api.real-debrid.com")!
+    private func send<T: Decodable>(_ req: URLRequest) async throws -> T { try await DebridHTTP.decode(session, req) }
+}
+
+// MARK: - AllDebrid resolver (torrents)
+
+/// AllDebrid native resolver. Base `https://api.alldebrid.com/v4`, auth via `agent` + `apikey` query params.
+/// Flow: `/magnet/upload` -> poll `/magnet/status` until statusCode 4 (Ready) -> pick the file from the link
+/// list -> `/link/unlock` for the direct URL. `checkCache` is deferred to the wiring tick (resolve is fast for
+/// cached). Spec-derived, compile-verified, not yet live-verified; inert until wired.
+actor AllDebridResolver: DebridResolving {
+    nonisolated let service: DebridService = .allDebrid
+    private let apiKey: String
+    private let session: URLSession
+    private static let base = "https://api.alldebrid.com/v4"
+
+    init(apiKey: String) {
+        self.apiKey = apiKey
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 20
+        self.session = URLSession(configuration: cfg)
+    }
+
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+
+    private struct Env<T: Decodable>: Decodable { let status: String; let data: T? }
+    private struct UploadData: Decodable { let magnets: [UpMagnet]?; struct UpMagnet: Decodable { let id: Int? } }
+    private struct StatusData: Decodable {
+        let magnets: StatusMagnet?
+        struct StatusMagnet: Decodable {
+            let statusCode: Int?
+            let links: [Link]?
+            enum CodingKeys: String, CodingKey { case statusCode, links }
+        }
+        struct Link: Decodable { let link: String; let filename: String?; let size: Int64? }
+    }
+    private struct UnlockData: Decodable { let link: String? }
+
+    func resolve(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        let upEnv: Env<UploadData> = try await get(authed("/magnet/upload", [URLQueryItem(name: "magnets[]", value: magnet)]))
+        guard let id = upEnv.data?.magnets?.first?.id else { throw DebridError.providerError("upload") }
+        var links: [StatusData.Link] = []
+        for attempt in 0..<12 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }
+            let st: Env<StatusData> = try await get(authed("/magnet/status", [URLQueryItem(name: "id", value: String(id))]))
+            guard let m = st.data?.magnets else { continue }
+            if m.statusCode == 4, let ls = m.links, !ls.isEmpty { links = ls; break }   // 4 = Ready
+            if let sc = m.statusCode, sc >= 5 { throw DebridError.providerError("status \(sc)") }   // 5+ = error/expired
+        }
+        guard !links.isEmpty else { throw DebridError.notReady }
+        let dfiles = links.enumerated().map { idx, l -> DebridFile in
+            let name = l.filename ?? ""
+            return DebridFile(id: idx, name: name, shortName: (name as NSString).lastPathComponent, size: l.size ?? 0, mimetype: nil)
+        }
+        // fileIdx is torrent-wide; AD's link list may differ in order/count, so pick by the filename/size
+        // heuristic (which keeps `links[pick.id]` aligned), not by the raw torrent index.
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
+              links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
+        let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: links[pick.id].link)]))
+        guard let s = un.data?.link, let u = URL(string: s) else { throw DebridError.providerError("unlock") }
+        return u
+    }
+
+    private func authed(_ path: String, _ extra: [URLQueryItem]) -> URL {
+        var c = URLComponents(string: Self.base + path)
+        c?.queryItems = [URLQueryItem(name: "agent", value: "vortx"), URLQueryItem(name: "apikey", value: apiKey)] + extra
+        return c?.url ?? URL(string: Self.base)!
+    }
+    private func get<T: Decodable>(_ url: URL) async throws -> T { try await DebridHTTP.decode(session, URLRequest(url: url)) }
+}
+
+// MARK: - Premiumize resolver (torrents)
+
+/// Premiumize native resolver. Base `https://www.premiumize.me/api`, auth via `apikey` query param. One call
+/// does it: `POST /transfer/directdl` with the magnet returns the file list WITH direct links (instant for
+/// cached, so there is no separate unrestrict step). `checkCache` is deferred to the wiring tick. Spec-derived,
+/// compile-verified, not yet live-verified; inert until wired.
+actor PremiumizeResolver: DebridResolving {
+    nonisolated let service: DebridService = .premiumize
+    private let apiKey: String
+    private let session: URLSession
+    private static let base = "https://www.premiumize.me/api"
+
+    init(apiKey: String) {
+        self.apiKey = apiKey
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 20
+        self.session = URLSession(configuration: cfg)
+    }
+
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+
+    private struct DirectDL: Decodable {
+        let status: String
+        let content: [Item]?
+        struct Item: Decodable {
+            let path: String?; let size: Int64?; let link: String?; let streamLink: String?
+            enum CodingKeys: String, CodingKey { case path, size, link; case streamLink = "stream_link" }
+        }
+    }
+
+    func resolve(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        let dl: DirectDL = try await form("/transfer/directdl", ["src": magnet])
+        guard dl.status == "success" else { throw DebridError.providerError("directdl \(dl.status)") }
+        guard let content = dl.content, !content.isEmpty else { throw DebridError.notReady }
+        let dfiles = content.enumerated().map { idx, c -> DebridFile in
+            let name = c.path ?? ""
+            return DebridFile(id: idx, name: name, shortName: (name as NSString).lastPathComponent, size: c.size ?? 0, mimetype: nil)
+        }
+        // fileIdx is torrent-wide; PM's directdl content order may differ, so pick by the filename/size
+        // heuristic (which keeps `content[pick.id]` aligned), not by the raw torrent index.
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
+              content.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
+        let item = content[pick.id]
+        guard let s = item.streamLink ?? item.link, let u = URL(string: s) else { throw DebridError.providerError("no link") }
+        return u
+    }
+
+    private func form<T: Decodable>(_ path: String, _ fields: [String: String]) async throws -> T {
+        var c = URLComponents(string: Self.base + path)
+        c?.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        var req = URLRequest(url: c?.url ?? URL(string: Self.base)!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = DebridForm.encode(fields)
+        return try await DebridHTTP.decode(session, req)
+    }
+}
+
+// MARK: - Shared HTTP helpers (for the query/Bearer-auth resolvers above)
+
+enum DebridForm {
+    /// `application/x-www-form-urlencoded` body from string fields.
+    static func encode(_ fields: [String: String]) -> Data {
+        fields.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
+            .joined(separator: "&").data(using: .utf8) ?? Data()
+    }
+}
+
+enum DebridHTTP {
+    /// Send a request and decode JSON, mapping 401/403 to `.invalidKey`, other non-2xx to `.providerError`,
+    /// and decode failures to `.providerError` — the same contract `TorBoxResolver.send` uses.
+    static func decode<T: Decodable>(_ session: URLSession, _ req: URLRequest) async throws -> T {
+        let (data, response) = try await session.data(for: req)
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if code == 401 || code == 403 { throw DebridError.invalidKey }
+        guard (200...299).contains(code) else { throw DebridError.providerError("HTTP \(code)") }
+        do { return try JSONDecoder().decode(T.self, from: data) }
+        catch { throw DebridError.providerError("decode: \(error.localizedDescription)") }
+    }
+}
+
 // MARK: - Coordinator
 
 /// Builds resolvers from the user's stored keys and drives cache-check + playback resolution. TorBox is
@@ -272,7 +516,9 @@ final class DebridCoordinator {
     func reload(from keys: DebridKeys = .shared) {
         resolvers.removeAll()
         if keys.isConfigured(.torBox) { resolvers[.torBox] = TorBoxResolver(apiKey: keys.key(for: .torBox)) }
-        // TODO(next): RealDebridResolver (add-then-poll), AllDebridResolver, PremiumizeResolver.
+        if keys.isConfigured(.realDebrid) { resolvers[.realDebrid] = RealDebridResolver(apiKey: keys.key(for: .realDebrid)) }
+        if keys.isConfigured(.allDebrid) { resolvers[.allDebrid] = AllDebridResolver(apiKey: keys.key(for: .allDebrid)) }
+        if keys.isConfigured(.premiumize) { resolvers[.premiumize] = PremiumizeResolver(apiKey: keys.key(for: .premiumize)) }
     }
 
     var hasAnyResolver: Bool {
