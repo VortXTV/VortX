@@ -157,7 +157,7 @@ function profilesSection(): string {
   return group(
     "Profiles",
     `<div class="profile-row">${chips}${add}</div>${editor}`,
-    "Each profile keeps its own look and languages; switching applies them instantly. Per-profile library and a PIN lock are coming next.",
+    "Each profile keeps its own look, languages, library, and Continue Watching; switching applies them instantly. A PIN lock is coming next.",
   );
 }
 

@@ -322,6 +322,8 @@ async function start(): Promise<void> {
   onRouteChange((route) => void renderRoute(route));
   // Account hydration (on sign-in) merges synced add-ons into storage; reload + re-render so they appear.
   window.addEventListener("vortx:addons-changed", () => void reloadAddonsAndRender());
+  // Switching profile changes which (scoped) library / Continue Watching the views read; re-render the route.
+  window.addEventListener("vortx:profile-changed", () => void renderRoute(parseRoute()));
 }
 
 void start();

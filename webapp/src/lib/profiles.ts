@@ -118,6 +118,9 @@ export function setActiveProfile(id: string): void {
   }
   updateSettings({ ...p.look }); // re-themes live via applySettings
   listeners.forEach((fn) => fn());
+  // Library, Continue Watching, and Home read per-profile (scoped) storage, so the active route must
+  // re-render against the new profile's space. main.ts listens for this and re-renders.
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("vortx:profile-changed"));
 }
 
 /** Create a new profile seeded from the current look, switch to it, and return it. */

@@ -4,6 +4,16 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased - next beta
+
+### Added
+
+- **Pin a source.** Long-press any source on a movie or show and pin it for just this title, for the whole show (every episode then prefers the same provider and quality), or for everything. A pinned source jumps to the top of one-press Watch and the source list, the next episode keeps using it, and automatic failover still moves on if it ever goes down. Clear pins anytime from Settings, Streams. (#15)
+
+### Web (web.vortx.tv)
+
+The browser app is live at [web.vortx.tv](https://web.vortx.tv) and updates continuously (separate from the app betas). Recent: sign in and your add-ons, library, and metadata keys come over from your account; local profiles, each with their own look, languages, library, and Continue Watching; Settings that match the apps; More Like This and Top Picks rows; a one-tap series Resume; add-on health checks; and a security pass (stronger key handling, the recovery code never leaves your device, tighter cross-origin and import rules). It plays direct, debrid, and HLS sources in the browser; torrents are listed but need the apps to play.
+
 ## 0.3.8 Beta 6 - 2026-06-21 (pre-release)
 
 A fix-and-polish beta. The headline is that managing your account from [vortx.tv/dashboard](https://vortx.tv/dashboard) now works the way it should: your whole household, your profiles, and almost every per-profile setting are editable from the web and sync straight to your devices. In-place update, nothing resets. This is a beta, so please install it and report anything off.

@@ -1,5 +1,14 @@
 import type { Addon, MetaItem } from "./types";
 import { CINEMETA_URL, loadAddon } from "./addon";
+import { activeScope } from "./profiles";
+
+/** Per-profile storage key. The owner profile (scope "") uses the base key, so existing data, account
+ *  hydration, and backup all stay on the canonical keys; overlay profiles get a suffixed key so each
+ *  keeps its own local library and Continue Watching (the web twin of the apps' per-profile history). */
+function scopedKey(base: string): string {
+  const scope = activeScope();
+  return scope ? `${base}.${scope}` : base;
+}
 
 // The installed-add-on store. The web client has no account engine (that is the native app's job), so
 // it keeps the list of installed add-on transport URLs in localStorage and resolves their manifests
@@ -65,7 +74,7 @@ const LIBRARY_KEY = "vortx.web.library.v1";
 /** Saved titles, most-recently-added first. */
 export function libraryItems(): MetaItem[] {
   try {
-    const raw = localStorage.getItem(LIBRARY_KEY);
+    const raw = localStorage.getItem(scopedKey(LIBRARY_KEY));
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? (parsed as MetaItem[]) : [];
   } catch {
@@ -85,7 +94,7 @@ export function toggleLibrary(item: MetaItem): boolean {
   const slim: MetaItem = { id: item.id, type: item.type, name: item.name, poster: item.poster };
   const next = exists ? current.filter((e) => e.id !== item.id) : [slim, ...current];
   try {
-    localStorage.setItem(LIBRARY_KEY, JSON.stringify(next));
+    localStorage.setItem(scopedKey(LIBRARY_KEY), JSON.stringify(next));
   } catch {
     /* storage disabled or full: library is best-effort */
   }
@@ -113,7 +122,16 @@ export function mergeLibrary(items: MetaItem[]): void {
     (m) => m && typeof m.id === "string" && typeof m.type === "string" && typeof m.name === "string",
   );
   if (!valid.length) return;
-  const existing = libraryItems();
+  // Account hydration ALWAYS targets the owner library (base key), never an active overlay profile -
+  // overlay profiles stay local and must never receive or mutate the account library.
+  let existing: MetaItem[] = [];
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as MetaItem[];
+  } catch {
+    existing = [];
+  }
   const seen = new Set(existing.map((e) => e.id));
   const additions = valid
     .filter((m) => !seen.has(m.id))
@@ -188,7 +206,7 @@ export interface CWEntry extends MetaItem {
 /** Every stored progress entry (one per played id), most-recently-watched first. */
 function rawCW(): CWEntry[] {
   try {
-    const raw = localStorage.getItem(CW_KEY);
+    const raw = localStorage.getItem(scopedKey(CW_KEY));
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
     return (parsed as CWEntry[])
@@ -263,7 +281,7 @@ export function clearProgress(id: string): void {
 
 function persistCW(entries: CWEntry[]): void {
   try {
-    localStorage.setItem(CW_KEY, JSON.stringify(entries));
+    localStorage.setItem(scopedKey(CW_KEY), JSON.stringify(entries));
   } catch {
     /* storage disabled or full: best-effort */
   }
@@ -300,7 +318,7 @@ export function addRecentSearch(query: string): void {
 /** Remove a title from the Library by id (the rail × control). */
 export function removeFromLibrary(id: string): void {
   try {
-    localStorage.setItem(LIBRARY_KEY, JSON.stringify(libraryItems().filter((e) => e.id !== id)));
+    localStorage.setItem(scopedKey(LIBRARY_KEY), JSON.stringify(libraryItems().filter((e) => e.id !== id)));
   } catch {
     /* storage disabled or full: best-effort */
   }
