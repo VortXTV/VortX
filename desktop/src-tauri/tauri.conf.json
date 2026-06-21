@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "StremioX",
+  "productName": "VortX",
   "version": "0.3.0",
   "identifier": "com.stremiox.desktop",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "StremioX",
+        "title": "VortX",
         "width": 1280,
         "height": 800,
         "minWidth": 960,
