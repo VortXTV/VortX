@@ -677,6 +677,22 @@ final class ProfileStore: ObservableObject {
         for index in profiles.indices where profiles[index].isOwner {
             profiles[index].usesOwnAccount = false
         }
+        // The owner is a singleton: one account, one owner profile. A restore/merge can leave more than
+        // one (e.g. the account owner adopted alongside a leftover local placeholder: the duplicate-"Main"
+        // bug). Collapse to ONE, direction-independently. Keep the genuine account owner, identified by its
+        // account email (the placeholder default is created with a nil email and the name "Main"; the
+        // account owner carries the email). Demote the rest to ordinary shared profiles, NEVER delete:
+        // a demoted profile keeps its overlay and becomes deletable from the dashboard.
+        let owners = profiles.indices.filter { profiles[$0].isOwner }
+        guard owners.count > 1 else { return }
+        let signedInEmail = UserDefaults.standard.string(forKey: "stremiox.email")
+        let keep = owners.first(where: { signedInEmail != nil && !signedInEmail!.isEmpty && profiles[$0].email == signedInEmail })
+            ?? owners.first(where: { !(profiles[$0].email ?? "").isEmpty })
+            ?? owners.first(where: { profiles[$0].id == activeID })
+            ?? owners[0]
+        for index in owners where index != keep {
+            profiles[index].isOwner = false
+        }
     }
 
     // MARK: Roster merge (UNION by id, so cross-device sync never silently drops a profile)
@@ -716,18 +732,13 @@ final class ProfileStore: ObservableObject {
         guard !incoming.isEmpty else { return }
         let preferIncoming = (incomingModified ?? .distantPast) > rosterModified
 
-        // The account's OWNER profile is a singleton: one account, one owner profile. A fresh install
-        // creates a local placeholder owner ("main") with a NEW uuid, so signing into an account that
-        // already has an owner would union two owner profiles and leave a duplicate, undeletable "main"
-        // (the reported bug). When the incoming roster carries an owner with a DIFFERENT id than the
-        // local one, drop the local placeholder so the account's owner is adopted instead of duplicated.
-        // No-op on the normal path (same owner id), so it only fires on fresh-install-into-existing-account.
-        var localRoster = profiles
-        if let incomingOwner = incoming.first(where: { $0.isOwner }),
-           let localOwner = localRoster.first(where: { $0.isOwner }),
-           localOwner.id != incomingOwner.id {
-            localRoster.removeAll { $0.isOwner && $0.id != incomingOwner.id }
-        }
+        // Owner-singleton is enforced by normalizeOwner() AFTER the union below, direction-independently.
+        // We intentionally do NOT drop an owner here. The earlier direction-sensitive drop assumed
+        // `incoming` was always the account roster, but on the "use online account data" path `incoming`
+        // is the LOCAL placeholder and `profiles` is the account roster, so the drop deleted the REAL
+        // account owner (data loss). The union keeps BOTH owners; normalizeOwner then keeps the account
+        // owner (the one carrying the account email) and demotes the leftover to a deletable shared profile.
+        let localRoster = profiles
 
         let incomingByID = Dictionary(incoming.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let localByID = Dictionary(localRoster.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
