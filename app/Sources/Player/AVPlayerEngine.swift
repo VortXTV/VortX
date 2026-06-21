@@ -13,18 +13,17 @@ import UIKit
 /// HTTP/HLS streams to: libmpv/MoltenVK cannot do true DV passthrough (it tone-maps to SDR), while
 /// AVPlayerLayer is DV/EDR native.
 ///
-/// iOS-only for now: macOS stays on the libmpv path (its out-of-process server transcodes HLS, and MPVKit
-/// cannot link Catalyst), and tvOS keeps a bare AVPlayerViewController (a focusable custom overlay fights the
-/// Siri-remote focus engine).
+/// iOS + macOS (#46): both route Dolby Vision / HLS here under the full PlayerScreen chrome via
+/// `PlayerEngineRouter`, with a fail-soft fallback to libmpv if the AVPlayer item fails to load. tvOS keeps a
+/// bare AVPlayerViewController (a focusable custom overlay fights the Siri-remote focus engine) and adds its
+/// own in-player Episodes + Sources panels through `customInfoViewControllers`.
 ///
-/// STEP 3 of the dual-engine work: this conforms to `PlayerEngine` and emits events, but is NOT yet wired
-/// into the chrome (that is the routing + wiring step). Rendering is owned by a sibling AVPlayerLayer host
-/// that calls `attachLayer`; this object owns playback + state only. Track selection, chapters, subtitle
+/// This conforms to `PlayerEngine` and emits events; rendering is owned by a sibling AVPlayerLayer host that
+/// calls `attachLayer`, while this object owns playback + state only. Track selection, chapters, subtitle
 /// styling, A/V delay, and trickplay are deliberately STUBBED here: AVFoundation has no 1:1 for several of
 /// them, and the adversarial review said not to build them until a DV stream with multiple tracks is a
-/// proven need. They are filled in when this is wired into the chrome. The existing
-/// `HLSPlayerView.AVPlayerModel` keeps serving today's HLS path until then, at which point that minimal
-/// overlay is retired in favour of this engine plus the shared chrome.
+/// proven need, so they are filled in as that need lands. The plain `HLSPlayerView.AVPlayerModel` still
+/// serves the bare iOS/tvOS HLS path that does not need the full chrome.
 @MainActor
 final class AVPlayerEngineController: NSObject, PlayerEngine {
     let player = AVPlayer()

@@ -4,17 +4,40 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## Unreleased - next beta
+## 0.3.8 Beta 7 - 2026-06-21 (pre-release)
+
+The playback and discovery release. The headline: the "Prefer AVPlayer (HLS/DV)" engine, with its true Dolby Vision and clean adaptive HLS, now reaches Apple TV and Mac, and on Apple TV it brings in-player Episodes and Sources panels so you can change what you are watching without leaving the player. There is also a new in-app add-on store, source pinning, a plain-language reason for every auto-picked source, and ratings baked onto your posters with no key to set up. In-place update, nothing resets. This is a beta, so please install it and report anything off.
 
 ### Added
 
+- **Prefer-AVPlayer player on Apple TV and Mac.** The "Prefer AVPlayer (HLS/DV)" engine that iPhone and iPad already use for true Dolby Vision and clean adaptive HLS now reaches the other two platforms. On Mac, HLS and true Dolby Vision play through the same full player chrome as the rest of the app. On Apple TV, the player gains two in-player panels: swipe down on the Siri remote to jump to any episode of the show, or to switch to a different source or quality, all without leaving the player. Both resolve through the engine exactly as Play does, so your pinned source and preferred quality carry over. (#46)
+- **Discover add-ons in the app.** A new browsable store (Add-ons, then Discover add-ons) lists the community add-on collection so you can find and install add-ons without ever leaving VortX. Each one shows whether it is reachable right now (Online, Slow, or Unreachable), search narrows the list by name, type, or description, and one tap installs it to your account so it syncs to your other devices. (#25)
 - **Pin a source.** Long-press any source on a movie or show and pin it for just this title, for the whole show (every episode then prefers the same provider and quality), or for everything. A pinned source jumps to the top of one-press Watch and the source list, the next episode keeps using it, and automatic failover still moves on if it ever goes down. Clear pins anytime from Settings, Streams. (#15)
-- **Prefer-AVPlayer player on Apple TV and Mac.** The "Prefer AVPlayer (HLS/DV)" engine, which iPhone and iPad already use for true Dolby Vision and clean adaptive HLS, now reaches the other two platforms. On Mac, HLS and true Dolby Vision play through the same player chrome as the rest of the app. On Apple TV, the player gains in-player Episodes and Sources panels: swipe down on the Siri remote to jump to any episode of the show, or switch to a different source or quality, all without leaving the player (both resolve through the engine exactly as Play does, so your pinned source and quality carry over). (#46)
-- **Discover add-ons in the app.** A new browsable store (Add-ons, then Discover add-ons) lists the community add-on collection so you can find and install add-ons without leaving VortX. Each one shows whether it is reachable right now, search narrows the list by name, type, or description, and one tap installs it to your account so it syncs to your other devices and the official apps. (#25)
+- **Know why a source was picked.** When VortX auto-picks the recommended source, a short line under Watch now explains the reason in plain terms, for example that it was picked for instant playback from cache or because it matches your preferred source type. (#16)
+- **Ratings without setup.** IMDb, Rotten Tomatoes, Metacritic, and more now come straight from VortX, so there is no key to find or paste. Ratings appear on the detail screen automatically, and they are also baked right onto your posters, on by default, so you can see a title's score at a glance while you browse.
+- **Smarter recommendations.** "More Like This" now leans on shared genres rather than raw popularity, so the suggestions feel closer to what you are actually watching, and "Top Picks" pulls from across your recent watches for more variety.
+- **Your language, everywhere.** Add-on category and genre headers (Popular, Trending, Top, and the full list of genres and types) are now translated across all 64 languages, so the rows that organize your catalogs read in your language too.
+
+### Fixed
+
+- **Live TV no longer shows up empty.** When a live-TV add-on was installed and online, the Live tab could still look empty because its catalogs loaded outside the default Home window. VortX now reaches for those catalogs so live channels appear as expected. Fixed across iPhone, iPad, Mac, and Apple TV.
+- **The whole interface now follows your language.** The tab bar and screen titles (Home, Live, Search) could stay in English even after you switched languages. They now translate properly along with the rest of the app.
 
 ### Web (web.vortx.tv)
 
-The browser app is live at [web.vortx.tv](https://web.vortx.tv) and updates continuously (separate from the app betas). Recent: sign in and your add-ons, library, and metadata keys come over from your account; local profiles, each with their own look, languages, library, and Continue Watching; Settings that match the apps; More Like This and Top Picks rows; a one-tap series Resume; add-on health checks; and a security pass (stronger key handling, the recovery code never leaves your device, tighter cross-origin and import rules). It plays direct, debrid, and HLS sources in the browser; torrents are listed but need the apps to play.
+The browser app is live at [web.vortx.tv](https://web.vortx.tv) and updates continuously, separate from the app betas. Recent additions: each local profile now keeps its own library and Continue Watching, so what one profile watches stays separate from the rest while your account library stays clean. The profile editor also got a polish pass so the avatar color swatches no longer spill out of the Settings card, and a security pass tightened how your encryption key is held in the browser, clamped key-derivation settings, and stopped the recovery code from ever leaving your device.
+
+### Dashboard (vortx.tv/dashboard)
+
+- **Add-on health you can trust.** The Add-ons page now checks each add-on through VortX, so the Online, Slow, and Unreachable status is accurate even for add-ons your browser could not reach directly.
+- **Households just work.** Creating or joining a family now heals itself if an old membership was left behind, so you no longer get told you are "not in a family" while also being told you "already" are. A failed check now offers Retry instead of dropping you back to the create form.
+- **Steadier syncing and cleaner polish.** Saving metadata and debrid settings from the web no longer races itself when two changes land close together, profile editors and add-on rows no longer overflow on small screens, status messages are announced to screen readers, touch targets are larger, and small text across the landing and login pages is easier to read.
+
+### What we're working on now
+
+- True Dolby Vision and the full player chrome reaching more places, and the remaining Apple TV audio work.
+- Bringing your library and watch history into a single cross-device sync that keeps every profile in step.
+- More of the in-app player and discovery experience landing on the web and desktop apps.
 
 ## 0.3.8 Beta 6 - 2026-06-21 (pre-release)
 
