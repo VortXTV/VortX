@@ -1,3 +1,7 @@
+# Backend (Cloudflare sync Worker) is kept PRIVATE, not in the public repo. Local copy stays on disk
+# for deploys; never re-track it. (Owner decision 2026-06-21: backend source must not be public.)
+/cloudflare/
+
 # --- build artifacts & deps (reconstructed by scripts/build-web.sh) ---
 web/
 **/node_modules/
