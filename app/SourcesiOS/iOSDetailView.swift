@@ -841,19 +841,30 @@ struct iOSDetailView: View {
         return id.hasPrefix("tt") ? id : nil
     }
 
-    /// Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft: leaves the row
-    /// hidden on any miss. Skipped for live channels, which carry no ratings.
+    /// Fetch cross-provider ratings for this title. Prefers the VortX ratings service (no user key
+    /// needed: IMDb keyless, RT/Metacritic via VortX's server-side key), then fills any gap from the
+    /// user's own MDBList key if they set one. Fail-soft: leaves the row hidden on any miss. Skipped for
+    /// live channels, which carry no ratings.
     private func loadRatings() {
         guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
         Task {
-            let r = await MDBListClient.ratings(imdbID: imdb, type: type)
-            await MainActor.run { mdbRatings = r }
+            let vx = await VortXRatingsClient.ratings(imdbID: imdb, type: type)
+            // Only reach for the user's MDBList key to fill what VortX did not return (e.g. RT before the
+            // server key is set), so most users need no key at all.
+            let needsMore = vx == nil || vx?.rottenTomatoes == nil
+            let mdb = needsMore ? await MDBListClient.ratings(imdbID: imdb, type: type) : nil
+            let merged = MDBListRatings(
+                imdb: vx?.imdb ?? mdb?.imdb,
+                rottenTomatoes: vx?.rottenTomatoes ?? mdb?.rottenTomatoes,
+                tmdb: vx?.tmdb ?? mdb?.tmdb
+            )
+            await MainActor.run { mdbRatings = merged.hasAny ? merged : nil }
         }
     }
 
-    /// Compact MDBList ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), shown only when the user has set
-    /// an MDBList key AND ratings came back. Renders nothing otherwise (no error UI). Same typography as
-    /// metaRow so it reads as a second fact line under the title.
+    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), fed by the VortX ratings
+    /// service (no user key needed), with the user's MDBList key filling any gap. Shown only when ratings
+    /// came back; renders nothing otherwise (no error UI). Same typography as metaRow.
     @ViewBuilder private var ratingsRow: some View {
         if let text = mdbRatings.flatMap(Self.mdbRatingsText), !text.isEmpty {
             Text(text)
