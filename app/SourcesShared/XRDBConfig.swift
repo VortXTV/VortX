@@ -11,20 +11,24 @@ enum XRDB {
     static let aliasKey = "stremiox.xrdb.configAlias"
     static let enabledKey = "stremiox.xrdb.enabled"
 
-    static var isEnabled: Bool {
-        UserDefaults.standard.bool(forKey: enabledKey) && normalizedBase() != nil
-    }
+    /// On by default: VortX now hosts its own baked-poster service (poster.vortx.tv), so ratings on
+    /// posters work out of the box. A user can turn it off, or point at their own instance.
+    static var enabled: Bool { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
 
-    /// The XRDB image URL for a title, or the `fallback` art when XRDB is off or the id is not
-    /// renderable. `type` is "poster", "backdrop", "thumbnail", or "logo".
+    static var isEnabled: Bool { enabled && normalizedBase() != nil }
+
+    /// The poster-service image URL for a title, or the `fallback` art when disabled or the id is not
+    /// renderable. `type` is "poster", "backdrop", "thumbnail", or "logo". The original poster is passed
+    /// as `fb` so the service can fail-soft to it (and so a non-IMDb id gracefully shows the plain poster).
     static func imageURL(_ type: String = "poster", id: String, fallback: String?) -> String? {
-        guard UserDefaults.standard.bool(forKey: enabledKey),
-              let base = normalizedBase(),
-              let rid = renderableID(id) else { return fallback }
+        guard enabled, let base = normalizedBase(), let rid = renderableID(id) else { return fallback }
         var url = "\(base)/\(type)/\(rid)"
         let alias = (UserDefaults.standard.string(forKey: aliasKey) ?? "").trimmingCharacters(in: .whitespaces)
         if !alias.isEmpty, let q = alias.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
             url += "?config=\(q)"
+        }
+        if let fb = fallback, let e = fb.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            url += (url.contains("?") ? "&" : "?") + "fb=\(e)"
         }
         return url
     }
@@ -37,12 +41,15 @@ enum XRDB {
         return nil
     }
 
-    /// Trimmed base URL, http(s) only, trailing slashes removed; nil if blank or not a web URL.
+    /// Trimmed base URL, http(s) only, trailing slashes removed. Defaults to VortX's own poster service
+    /// when the user has not set a custom instance, so ratings-on-posters ships by default.
+    static let defaultBase = "https://poster.vortx.tv"
     private static func normalizedBase() -> String? {
         var s = (UserDefaults.standard.string(forKey: baseKey) ?? "").trimmingCharacters(in: .whitespaces)
+        if s.isEmpty { return defaultBase }
         guard s.hasPrefix("http://") || s.hasPrefix("https://") else { return nil }
         while s.hasSuffix("/") { s.removeLast() }
-        return s.isEmpty ? nil : s
+        return s.isEmpty ? defaultBase : s
     }
 }
 
@@ -50,7 +57,7 @@ enum XRDB {
 /// Settings. The values are not credentials (the admin key stays on the XRDB instance), so they live in
 /// UserDefaults and ride the existing settings sync.
 struct XRDBSettingsView: View {
-    @AppStorage(XRDB.enabledKey) private var enabled = false
+    @AppStorage(XRDB.enabledKey) private var enabled = true
     @AppStorage(XRDB.baseKey) private var baseURL = ""
     @AppStorage(XRDB.aliasKey) private var alias = ""
 
@@ -58,16 +65,16 @@ struct XRDBSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("Ratings on posters").screenTitleStyle()
-                Text("XRDB (extendedratings.com) bakes ratings from up to 12 sources, quality badges, and streaming-provider logos onto your posters and backdrops. Run your own XRDB instance or use a hosted one, set its address and your profile alias, and VortX loads its artwork everywhere. Optional, and unrelated to debrid.")
+                Text("VortX bakes the rating onto your posters using its own service, no setup and no key needed. It is on by default. Advanced: point at your own XRDB-compatible instance (and profile alias) to use richer multi-source artwork instead. Unrelated to debrid.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
-                Toggle("Use XRDB posters", isOn: $enabled)
+                Toggle("Show ratings on posters", isOn: $enabled)
                     .tint(Theme.Palette.accent)
                     .padding(Theme.Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-                field("Instance URL", text: $baseURL, hint: "e.g. https://xrdb.yourhost.com (or a hosted XRDB endpoint).", url: true)
-                field("Profile alias", text: $alias, hint: "The config profile alias you saved in XRDB's Configurator.", url: false)
+                field("Custom instance URL (optional)", text: $baseURL, hint: "Leave blank to use VortX's own service. Or set your own XRDB-compatible endpoint.", url: true)
+                field("Profile alias (optional)", text: $alias, hint: "Only used with a custom instance: the config profile alias from its Configurator.", url: false)
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)

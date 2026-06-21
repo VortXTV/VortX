@@ -1722,7 +1722,9 @@ private struct PosterCardiOS: View {
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                     .overlay(alignment: .topTrailing) {
-                        if let rating = imdbRating, !rating.isEmpty {
+                        // When the poster service is on, the rating is baked into the image, so skip the
+                        // native overlay to avoid a double badge.
+                        if let rating = imdbRating, !rating.isEmpty, !XRDB.isEnabled {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
