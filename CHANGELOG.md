@@ -10,6 +10,7 @@ A fix-and-polish beta. The headline is that managing your account from [vortx.tv
 
 ### Fixed
 
+- **Continue Watching tracks reliably again.** Progress now records and finished titles clear, even when you resume straight from the Continue Watching rail or after navigating away mid-playback. Two underlying causes are fixed: the engine player is now linked to the right library entry even when the played URL was proxied or routed through AVPlayer (so progress is no longer silently dropped), and a finished movie is marked watched through the library directly (so it leaves Continue Watching instead of lingering).
 - **The duplicate "Main" profile is gone.** "Use online account data" could leave two account profiles (a real one plus a leftover "Main") that you could not remove. VortX now keeps a single account profile and quietly retires any leftover, so it becomes an ordinary profile you can delete from the dashboard. This also stops the duplicate from being created in the first place, and never drops your real account profile during the merge.
 - **The family contradiction is fixed.** The household card could say you were "not in a family" while creating one said you "already" were. That mismatch (a leftover membership after a household was deleted) now heals itself, and deleting a household fully cleans up so it cannot happen again.
 
@@ -40,7 +41,7 @@ Building on the 0.3.8 account work. The headline is that VortX now speaks **40 l
 - **In-player frame grab.** A Grab button captures the current frame at full quality and opens the share sheet to save or send it (iPhone, iPad, Mac).
 - **True Dolby Vision on iPhone, iPad, Apple TV, and Mac.** A Dolby Vision stream in an MP4, MOV, or HLS container now plays through Apple's AVPlayer for true DV passthrough on a DV-capable display, instead of being tone-mapped to SDR. On iPhone and iPad it routes to the full-chrome AVPlayer surface; on Apple TV to a native AVPlayer screen; on Mac to a native video surface. Direct and debrid sources benefit; MKV releases and torrents stay on the built-in player (which has no Matroska path in AVPlayer), and an AVPlayer load failure falls back to it automatically. Force either engine in Settings, Playback. (#76)
 - **Ratings on posters (XRDB).** Optionally overlay ratings, quality badges, and provider logos on your posters from an XRDB instance (Settings).
-- **Eight seek-bar styles** for how the scrubber looks during playback (Settings).
+- **Fourteen seek-bar styles** for how the scrubber looks during playback — Classic, Gradient, Glow, Wave, Heartbeat, Pulse, Dots, Equalizer, Minimal, Neon, Ribbon, Comet, Segments, and Ladder (Settings).
 - **One-tap sideload updates.** An AltStore / SideStore source so a sideloaded VortX updates in place.
 
 ### Fixed
