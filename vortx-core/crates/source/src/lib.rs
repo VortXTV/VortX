@@ -16,6 +16,7 @@
 mod adapters;
 mod canonical;
 mod customization;
+mod exit;
 mod fanout;
 mod identity;
 mod manifest;
@@ -32,6 +33,7 @@ pub use customization::{
     HomeLayout, LayoutDef, MotionDef, PaletteOverride, RadiusDef, RailDecl, Splash, TabDecl,
     ThemeDef, Wordmark,
 };
+pub use exit::{should_stop, ExitConfig, ExitDecision, ExitReason, PartialResult};
 pub use fanout::{
     aggregate, AddonResult, Aggregate, BreakerRegistry, BreakerState, CircuitBreaker,
     CircuitConfig, FailedAddon, FailureKind, Outcome,
