@@ -285,6 +285,29 @@ final class CoreBridge: ObservableObject {
                  field: "board")
     }
 
+    /// Ensure the Live tab can see EVERY installed add-on's live catalogs. The Live surface filters the
+    /// Home board (`liveBoardRows`), but the board only range-loads its first window of rows and widens
+    /// only as Home is scrolled. Add-ons order their tv / channel / live catalogs AFTER their movie and
+    /// series catalogs, so a live catalog (e.g. MediaFusion's "Live TV") routinely falls outside the
+    /// default 30-row window: the catalog never has its content range-loaded, `buildBoardRows` drops it
+    /// (the `items.isEmpty` guard), and the Live tab reads "No Live TV add-ons installed" even though the
+    /// add-on is installed and online. Widen the board to cover every catalog the installed add-ons
+    /// provide so those rows hydrate wherever they sit. Idempotent: a no-op once the window covers them.
+    /// (Engine-lane follow-up: a dedicated typed live-catalog load would avoid hydrating the whole Home
+    /// board here, see [[vortx-engine-needs]] #7 IPTV + the source-registry.)
+    func ensureLiveCatalogsLoaded() {
+        let needed = allCatalogs.count   // total catalogs across enabled add-ons; live ones can be last
+        if boardRows.isEmpty {
+            loadBoard(rows: max(needed, 30))
+            return
+        }
+        guard needed > boardRowsLoaded else { return }   // already wide enough
+        boardRowsLoaded = needed
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
+                 field: "board")
+    }
+
     // MARK: Discover / Library
 
     /// Load Discover's default catalog (the engine picks the first selectable type).

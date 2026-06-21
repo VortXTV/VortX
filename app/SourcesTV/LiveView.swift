@@ -49,9 +49,11 @@ struct LiveView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed() }
+        // Widen the Home board so live catalogs (ordered after an add-on's movie/series catalogs, hence
+        // outside the default window) hydrate here; re-run when add-ons finish loading async.
+        .onAppear { core.ensureLiveCatalogsLoaded(); configureMetaSources(); seed() }
         .onChange(of: core.liveBoardRows.first?.id) { seed() }
-        .onChange(of: core.addons.count) { configureMetaSources() }
+        .onChange(of: core.addons.count) { core.ensureLiveCatalogsLoaded(); configureMetaSources() }
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every channel id scheme resolves.

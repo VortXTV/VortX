@@ -35,6 +35,11 @@ struct iOSLiveView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            // Live catalogs are usually ordered after an add-on's movie/series catalogs, so they fall
+            // outside the Home board's default window. Widen the board so they hydrate here; re-run when
+            // add-ons finish loading (their manifests arrive async, after the first appear).
+            .onAppear { core.ensureLiveCatalogsLoaded() }
+            .onChange(of: core.addons.count) { _ in core.ensureLiveCatalogsLoaded() }
         }
     }
 
