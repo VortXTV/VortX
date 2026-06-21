@@ -974,10 +974,27 @@ function familyPub(fam: { id: string; name: string; owner_account_id: string },
   };
 }
 async function familyOf(accountId: string, env: Env): Promise<{ id: string; name: string; owner_account_id: string } | null> {
-  return env.DB.prepare(
+  const fam = await env.DB.prepare(
     `SELECT f.id, f.name, f.owner_account_id FROM families f
        JOIN family_members m ON m.family_id = f.id WHERE m.account_id = ?`,
   ).bind(accountId).first<{ id: string; name: string; owner_account_id: string }>();
+  if (fam) return fam;
+  // No live family via the JOIN, but a membership row may still exist whose parent `families` row is
+  // gone (an orphan: D1 runs with foreign keys OFF, so the `ON DELETE CASCADE` never fired when the
+  // family was deleted). That orphan makes status say "not in a family" while the UNIQUE(account_id)
+  // guard in create/join says "already in a family" — the reported contradiction. Self-heal it: delete
+  // only membership rows whose parent family is provably absent, never a real membership.
+  const orphan = await env.DB.prepare(
+    `SELECT 1 AS x FROM family_members m
+       WHERE m.account_id = ?1 AND NOT EXISTS (SELECT 1 FROM families f WHERE f.id = m.family_id)`,
+  ).bind(accountId).first<{ x: number }>();
+  if (orphan) {
+    await env.DB.prepare(
+      `DELETE FROM family_members WHERE account_id = ?1
+         AND NOT EXISTS (SELECT 1 FROM families f WHERE f.id = family_members.family_id)`,
+    ).bind(accountId).run();
+  }
+  return null;
 }
 async function familyRoster(familyId: string, env: Env): Promise<{ account_id: string; role: string; username_display: string; joined_at: number }[]> {
   const rows = await env.DB.prepare(
@@ -1112,8 +1129,14 @@ async function familyLeave(req: Request, env: Env): Promise<Response> {
     const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM family_members WHERE family_id = ?")
       .bind(fam.id).first<{ n: number }>();
     if ((count?.n ?? 0) > 1) return json({ error: "owner_must_empty_first" }, 409);
-    // Last one out: delete the family. family_members and family_invites cascade on the FK.
-    await env.DB.prepare("DELETE FROM families WHERE id = ?").bind(fam.id).run();
+    // Last one out: delete the family AND its children explicitly. D1 runs with foreign keys OFF, so the
+    // declared `ON DELETE CASCADE` does NOT fire; deleting only `families` would orphan the owner's own
+    // family_members row, which then reads as "already in a family" forever (the contradiction bug).
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM family_invites WHERE family_id = ?").bind(fam.id),
+      env.DB.prepare("DELETE FROM family_members WHERE family_id = ?").bind(fam.id),
+      env.DB.prepare("DELETE FROM families WHERE id = ?").bind(fam.id),
+    ]);
     return json({ ok: true, family: null });
   }
   await env.DB.prepare("DELETE FROM family_members WHERE family_id = ? AND account_id = ?")
