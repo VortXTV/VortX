@@ -1,8 +1,10 @@
-#if os(iOS)
+#if os(iOS) || os(macOS)
 import Foundation
 import AVKit
 import AVFoundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 /// AVFoundation implementation of `PlayerEngine`. It drives one `AVPlayer` and maps its KVO + a periodic
 /// time observer onto the SAME `MPVProperty` event keys the chrome already listens for, so the full
@@ -55,8 +57,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
         // system passes through Atmos (#78) and applies AirPods Spatial Audio (#88). Idempotent with the
-        // libmpv path since only one engine is live at a time.
+        // libmpv path since only one engine is live at a time. macOS has no AVAudioSession (the system routes
+        // audio automatically), so this is iOS/tvOS only.
+        #if os(iOS) || os(tvOS)
         AVPlayerAudioSession.activateForMovie()
+        #endif
         let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
         let newItem = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
         item = newItem

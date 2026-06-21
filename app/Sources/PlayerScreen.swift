@@ -227,7 +227,7 @@ struct PlayerScreen: View {
 
     // Load failure / recovery state (mirrors TVPlayerView).
     @State private var loadFailed = false            // playback couldn't start (dead/uncached link)
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
     #endif
     @State private var loadErrorMsg = ""
@@ -291,21 +291,14 @@ struct PlayerScreen: View {
             mpvBody
         }
         #else
-        // macOS: route a Dolby Vision stream (AVPlayer-playable container) to the AVKit VideoPlayer surface
-        // for true DV passthrough; everything else (including HLS, which the node server transcodes) stays on
-        // libmpv. The macOS app has no AVPlayer chrome yet, so DV plays with AVKit's native controls.
-        if PlayerEngineRouter.engine(for: url, isTorrent: recordIsTorrent,
-                                     isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? "")) == .avfoundation {
-            HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
-                          onProgress: onProgress, onClose: onClose)
-                .ignoresSafeArea()
-        } else {
-            mpvBody
-        }
+        // macOS (#46): the AVPlayer engine now sits behind the SAME full chrome (playerSurface mounts
+        // AVPlayerEngineView for Dolby Vision / the "Prefer AVPlayer" override, else libmpv), so the Mac no
+        // longer drops to a bare AVKit player without the episode list / quality / sources panels.
+        mpvBody
         #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: HLS is already
     /// handled in `body` (the minimal HLSPlayerView), and now a **Dolby Vision** stream in an AVPlayer-playable
     /// container (MP4/MOV/M4V) auto-routes here for true DV passthrough (libmpv only tone-maps DV to SDR). The
@@ -322,7 +315,7 @@ struct PlayerScreen: View {
     /// The video surface: the AVFoundation engine when routed there, otherwise libmpv. Both bind to the same
     /// Coordinator and feed the same `handleProperty`, so the surrounding overlay drives either unchanged.
     @ViewBuilder private var playerSurface: some View {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         if useAVPlayerEngine {
             AVPlayerEngineView(coordinator: coordinator)
                 .play(initialPlayback.url, headers: initialPlayback.headers)
@@ -603,7 +596,7 @@ struct PlayerScreen: View {
             }
         case MPVProperty.endFileError:
             if !hasStartedPlaying {                  // only flag failures BEFORE playback
-                #if os(iOS)
+                #if os(iOS) || os(macOS)
                 if useAVPlayerEngine, !avEngineFailed {
                     // AVPlayer could not open this stream (e.g. a Profile 7 DV remux it cannot decode).
                     // Fall back to libmpv with the same URL rather than dead-ending: flipping this swaps
