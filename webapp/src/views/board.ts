@@ -247,7 +247,7 @@ export function posterCard(item: MetaItem, progress?: number): string {
   const art = httpUrl(item.poster);
   const href = hashFor({ name: "detail", type: item.type, id: item.id });
   const inner = art
-    ? `<img class="poster-art" loading="lazy" src="${escapeHtml(art)}" alt="${name}" />`
+    ? `<img class="poster-art" loading="lazy" referrerpolicy="no-referrer" src="${escapeHtml(art)}" alt="${name}" />`
     : `<div class="poster-art poster-art-empty" aria-hidden="true">${name.slice(0, 1)}</div>`;
   const bar =
     progress !== undefined && progress > 0

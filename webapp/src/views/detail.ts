@@ -627,10 +627,13 @@ function imdbRating(meta: MetaItem): string | undefined {
 }
 
 function trailerYouTubeID(meta: MetaItem): string | undefined {
-  const fromStreams = (meta.trailerStreams ?? []).map((s) => s.ytId).find((id) => id && id.length);
-  if (fromStreams) return fromStreams;
-  const link = (meta.links ?? []).find((l) => l.category.toLowerCase() === "trailer");
-  return link ? youTubeID(link.name) : undefined;
+  // Validate against the exact 11-char YouTube id format so an add-on-supplied trailerStreams.ytId can't
+  // smuggle anything into the iframe src (defense-in-depth on top of encodeURIComponent).
+  const YT_ID = /^[A-Za-z0-9_-]{11}$/;
+  const candidate =
+    (meta.trailerStreams ?? []).map((s) => s.ytId).find((id) => id && YT_ID.test(id)) ??
+    youTubeID((meta.links ?? []).find((l) => l.category.toLowerCase() === "trailer")?.name ?? "");
+  return candidate && YT_ID.test(candidate) ? candidate : undefined;
 }
 
 function youTubeID(value: string): string | undefined {
@@ -707,6 +710,7 @@ function openTrailer(youtubeId: string): void {
   frame.innerHTML = `
     <button class="back trailer-close" data-action="close-trailer">${icon("back")}<span>Close</span></button>
     <iframe class="trailer-frame" src="${escapeHtml(src)}" allow="autoplay; encrypted-media; fullscreen"
+            sandbox="allow-scripts allow-same-origin allow-presentation"
             allowfullscreen referrerpolicy="strict-origin"></iframe>`;
 }
 

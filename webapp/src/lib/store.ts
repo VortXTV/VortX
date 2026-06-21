@@ -364,7 +364,8 @@ function validBackupValue(key: string, val: unknown): boolean {
     case "vortx.web.settings.v1":
       return !!val && typeof val === "object" && !Array.isArray(val);
     case "vortx.web.addons.v1":
-      return Array.isArray(val) && val.every((u) => typeof u === "string");
+      // https-only: a hostile backup file can't inject http/javascript:/data: add-on URLs.
+      return Array.isArray(val) && val.every((u) => typeof u === "string" && /^https:\/\//i.test(u));
     case "vortx.web.recent.v1":
       return Array.isArray(val) && val.every((s) => typeof s === "string");
     case "vortx.web.library.v1":

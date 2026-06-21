@@ -2161,3 +2161,14 @@ video::cue {
   justify-content: flex-start;
   max-width: 100%;
 }
+
+/* Keyboard focus on profile chips + round avatar swatches (tighter than the generic button rule). */
+.profile-chip:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 2px;
+}
+.avatar-swatch:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 3px;
+  border-radius: 50%;
+}

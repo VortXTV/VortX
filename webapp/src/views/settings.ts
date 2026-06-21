@@ -108,9 +108,9 @@ export function renderSettings(target: HTMLElement): void {
 function group(eyebrow: string, body: string, footer?: string): string {
   return `
     <section class="settings-section">
-      <span class="settings-eyebrow t-eyebrow">${eyebrow}</span>
+      <span class="settings-eyebrow t-eyebrow">${escapeHtml(eyebrow)}</span>
       <div class="surface-card settings-card">${body}</div>
-      ${footer ? `<p class="settings-footer">${footer}</p>` : ""}
+      ${footer ? `<p class="settings-footer">${escapeHtml(footer)}</p>` : ""}
     </section>`;
 }
 
@@ -118,8 +118,8 @@ function row(label: string, control: string, sub?: string): string {
   return `
     <div class="settings-row">
       <div class="settings-row-label">
-        <span>${label}</span>
-        ${sub ? `<span class="settings-row-sub">${sub}</span>` : ""}
+        <span>${escapeHtml(label)}</span>
+        ${sub ? `<span class="settings-row-sub">${escapeHtml(sub)}</span>` : ""}
       </div>
       <div class="settings-row-control">${control}</div>
     </div>`;

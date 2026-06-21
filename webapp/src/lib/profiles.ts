@@ -40,11 +40,10 @@ function lookFromSettings(s: Settings = getSettings()): ProfileLook {
 }
 
 function randomId(): string {
-  // crypto.randomUUID where available; a cheap fallback otherwise (ids are local-only, not security-bearing).
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  let s = "";
-  for (let i = 0; i < 16; i++) s += Math.floor(Math.random() * 16).toString(16);
-  return s;
+  // crypto is a guaranteed browser global; randomUUID where available, else random bytes (never Math.random).
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(b, (x: number) => x.toString(16).padStart(2, "0")).join("");
 }
 
 function persist(profiles: Profile[]): void {
