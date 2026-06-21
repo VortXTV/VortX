@@ -27,6 +27,12 @@ struct HLSPlayerView: View {
     var onProgress: (Double, Double) -> Void = { _, _ in }
     var onClose: () -> Void = {}
 
+    /// tvOS in-player episode list (#46): the playing series' episodes, the one currently playing, and the
+    /// switch callback. Unused on iOS + macOS (their chrome surfaces episodes through their own overlays).
+    var episodes: [CoreVideo] = []
+    var currentVideoId: String = ""
+    var onSelectEpisode: (CoreVideo) -> Void = { _ in }
+
     /// True for a stream AVPlayer should own: a remote HLS playlist. Torrents (loopback) stay on libmpv.
     static func handles(_ url: URL) -> Bool {
         guard let host = url.host, host != "127.0.0.1", host != "localhost" else { return false }
@@ -45,7 +51,8 @@ struct HLSPlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            Controller(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress)
+            Controller(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress,
+                       episodes: episodes, currentVideoId: currentVideoId, onSelectEpisode: onSelectEpisode)
                 .ignoresSafeArea()
         }
         .onExitCommand { onClose() }   // Siri-remote Menu leaves the HLS player (the tvOS dismiss idiom)
@@ -488,6 +495,9 @@ extension HLSPlayerView {
         let headers: [String: String]?
         let resumeSeconds: Double
         let onProgress: (Double, Double) -> Void
+        var episodes: [CoreVideo] = []
+        var currentVideoId: String = ""
+        var onSelectEpisode: (CoreVideo) -> Void = { _ in }
 
         func makeCoordinator() -> Coordinator { Coordinator(resumeSeconds: resumeSeconds, onProgress: onProgress) }
 
@@ -506,10 +516,25 @@ extension HLSPlayerView {
             let vc = AVPlayerViewController()
             vc.player = player
             vc.allowsPictureInPicturePlayback = true
+            // #46: in-player episode list. AVKit owns the focus engine for customInfoViewControllers (the Info
+            // panel revealed by swiping down on the Siri remote), so this adds the episode chrome without a
+            // custom overlay fighting the remote — the reason this HLS / DV player stays bare. Series only.
+            let ordered = episodes.orderedBySeasonEpisode
+            if ordered.count > 1 {
+                let panel = UIHostingController(rootView: TVPlayerEpisodePanel(
+                    episodes: ordered, currentVideoId: currentVideoId, onSelect: onSelectEpisode))
+                panel.title = String(localized: "Episodes")
+                vc.customInfoViewControllers = [panel]
+            }
             return vc
         }
 
-        func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {}
+        func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
+            // The episode panel is baked once in makeUIViewController. RootView presents this player with
+            // `.id(req.id)`, so every episode switch mints a new request id -> full teardown + rebuild, and
+            // `currentVideoId` / `onSelectEpisode` are never stale here. If that invariant ever changes,
+            // rebuild `controller.customInfoViewControllers` in this method.
+        }
 
         static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: Coordinator) {
             coordinator.teardown()

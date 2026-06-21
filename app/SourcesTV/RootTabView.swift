@@ -43,8 +43,11 @@ private struct TVHLSPlayer: View {
     let onClose: () -> Void
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var presenter: PlayerPresenter
     @State private var resumeSeconds: Double = 0
     @State private var ready = false
+    @State private var switching = false
+    @State private var resolveTask: Task<Void, Never>?
 
     var body: some View {
         ZStack {
@@ -57,7 +60,21 @@ private struct TVHLSPlayer: View {
                         core.reportProgress(timeSeconds: pos, durationSeconds: dur)
                         Task { [weak account] in await account?.saveProgress(for: m, positionSeconds: pos, durationSeconds: dur) }
                     },
-                    onClose: onClose)
+                    onClose: onClose,
+                    episodes: request.episodes,
+                    currentVideoId: request.meta?.videoId ?? "",
+                    onSelectEpisode: { switchTo($0) })
+            }
+            if switching {
+                // The current episode keeps playing while the next resolves through the engine; this is just a
+                // hint that the pick registered. Non-focusable + hit-test-off so the bare-player focus
+                // invariant (why this path skips TVPlayerView) is untouched.
+                ProgressView()
+                    .scaleEffect(1.6)
+                    .tint(.white)
+                    .padding(40)
+                    .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 18))
+                    .allowsHitTesting(false)
             }
         }
         .task {
@@ -66,6 +83,29 @@ private struct TVHLSPlayer: View {
                 else { resumeSeconds = await account.resumeOffset(for: m) }
             }
             ready = true   // resume resolved (or no meta) -> mount the player so it seeks to the right spot
+        }
+        // Pressing Menu mid-resolve closes the player; cancel an in-flight switch so it never re-presents an
+        // episode into a slot the viewer already left.
+        .onDisappear { resolveTask?.cancel() }
+    }
+
+    /// Switch to another episode from the in-player Episodes panel: resolve its best stream through the
+    /// engine, then re-present. A fresh request id rebuilds the player (`.id(req.id)` in RootView) on the new
+    /// episode — back to this bare AVPlayer for a non-torrent best, or to TVPlayerView for a torrent. The
+    /// current episode keeps playing until the next is resolved, so there is no dead air.
+    private func switchTo(_ v: CoreVideo) {
+        guard !switching, let m = request.meta, v.id != m.videoId else { return }
+        switching = true
+        resolveTask = Task { @MainActor in
+            defer { switching = false }
+            let next = await tvResolveEpisodeRequest(
+                video: v, in: request.episodes, seriesId: m.libraryId, seriesName: m.name,
+                fallbackPoster: m.poster, continuity: request.sourceHint, binge: request.bingeGroup,
+                core: core, account: account)
+            // Menu-press during the resolve cancels this task (onDisappear): don't re-present an episode
+            // into a player the viewer already closed.
+            guard !Task.isCancelled else { return }
+            if let next { presenter.request = next }
         }
     }
 }
