@@ -6,6 +6,7 @@ import SwiftUI
 /// written by the Settings picker and read by the player at render time.
 enum SeekBarStyle: String, CaseIterable, Identifiable {
     case classic, gradient, glow, wave, heartbeat, pulse, dots, equalizer
+    case minimal, neon, ribbon, comet, segments, ladder
 
     var id: String { rawValue }
 
@@ -19,6 +20,12 @@ enum SeekBarStyle: String, CaseIterable, Identifiable {
         case .pulse:     return "Pulse"
         case .dots:      return "Dots"
         case .equalizer: return "Equalizer"
+        case .minimal:   return "Minimal"
+        case .neon:      return "Neon"
+        case .ribbon:    return "Ribbon"
+        case .comet:     return "Comet"
+        case .segments:  return "Segments"
+        case .ladder:    return "Ladder"
         }
     }
 
@@ -34,7 +41,7 @@ enum SeekBarStyle: String, CaseIterable, Identifiable {
 /// Draws the seek-bar TRACK plus the filled (played) portion in the chosen style, filling its frame.
 /// Pure visual: `progress` is the played fraction (0...1). The caller overlays the knob and chapter
 /// ticks, so this view owns no interaction. Fancy line styles want a little vertical room; thin capsule
-/// styles center themselves, so the same frame height works for all eight.
+/// styles center themselves, so the same frame height works for all of them.
 struct SeekBarTrack: View {
     let style: SeekBarStyle
     let progress: Double
@@ -55,6 +62,18 @@ struct SeekBarTrack: View {
             case .heartbeat: lineStyle(w: w, h: h, p: p, path: heartbeatPath)
             case .dots:      dots(w: w, h: h, p: p)
             case .equalizer: equalizer(w: w, h: h, p: p)
+            // A thin hairline track — the most restrained look (no glow, no knob).
+            case .minimal:   capsuleBar(w: w, h: h, p: p, fill: AnyShapeStyle(accent), glow: false, knob: false, thicknessScale: 0.45)
+            // Gradient fill with a strong double-glow and a bright head — the loudest look.
+            case .neon:      capsuleBar(w: w, h: h, p: p, fill: AnyShapeStyle(LinearGradient(colors: [accent.opacity(0.5), accent], startPoint: .leading, endPoint: .trailing)), glow: true, knob: true, thicknessScale: 1.0)
+            // A thick rounded ribbon, gradient-filled, no knob.
+            case .ribbon:    capsuleBar(w: w, h: h, p: p, fill: AnyShapeStyle(LinearGradient(colors: [accent.opacity(0.7), accent], startPoint: .leading, endPoint: .trailing)), glow: false, knob: false, thicknessScale: 1.6)
+            // Accent fill with a glowing comet head riding the playhead.
+            case .comet:     capsuleBar(w: w, h: h, p: p, fill: AnyShapeStyle(accent), glow: true, knob: true, thicknessScale: 0.7)
+            // Filled rounded blocks across the bar, lit up to the playhead.
+            case .segments:  segments(w: w, h: h, p: p)
+            // Vertical tick marks, like a ruler, lit up to the playhead.
+            case .ladder:    ladder(w: w, h: h, p: p)
             }
         }
     }
@@ -64,8 +83,8 @@ struct SeekBarTrack: View {
     /// Classic / gradient / glow / pulse: a centered capsule track + filled capsule, optional glow and
     /// a soft pulse dot at the playhead.
     @ViewBuilder
-    private func capsuleBar(w: CGFloat, h: CGFloat, p: CGFloat, fill: AnyShapeStyle, glow: Bool, knob: Bool) -> some View {
-        let t = thickness(h) * (knob ? 1.15 : 1)
+    private func capsuleBar(w: CGFloat, h: CGFloat, p: CGFloat, fill: AnyShapeStyle, glow: Bool, knob: Bool, thicknessScale: CGFloat = 1) -> some View {
+        let t = thickness(h) * thicknessScale * (knob ? 1.15 : 1)
         ZStack(alignment: .leading) {
             Capsule().fill(track).frame(height: t)
             Capsule().fill(fill).frame(width: max(0, w * p), height: t)
@@ -145,6 +164,38 @@ struct SeekBarTrack: View {
                 let filled = cx <= size.width * p
                 let rect = CGRect(x: cx - r, y: size.height / 2 - r, width: r * 2, height: r * 2)
                 ctx.fill(Path(ellipseIn: rect), with: .color(filled ? accent : track))
+            }
+        }
+    }
+
+    /// Segments: contiguous rounded blocks across the bar, lit accent up to the playhead.
+    private func segments(w: CGFloat, h: CGFloat, p: CGFloat) -> some View {
+        let count = max(12, Int(w / 20))
+        let spacing = w / CGFloat(count)
+        let bw = spacing * 0.72
+        let bh = thickness(h)
+        return Canvas { ctx, size in
+            for i in 0..<count {
+                let cx = spacing * (CGFloat(i) + 0.5)
+                let filled = cx <= size.width * p
+                let rect = CGRect(x: cx - bw / 2, y: (size.height - bh) / 2, width: bw, height: bh)
+                ctx.fill(Path(roundedRect: rect, cornerRadius: bh / 2), with: .color(filled ? accent : track))
+            }
+        }
+    }
+
+    /// Ladder: thin vertical tick marks like a ruler, lit accent up to the playhead.
+    private func ladder(w: CGFloat, h: CGFloat, p: CGFloat) -> some View {
+        let count = max(16, Int(w / 10))
+        let spacing = w / CGFloat(count)
+        let tw = max(1.5, spacing * 0.22)
+        return Canvas { ctx, size in
+            for i in 0..<count {
+                let cx = spacing * (CGFloat(i) + 0.5)
+                let filled = cx <= size.width * p
+                let th = size.height * (i % 4 == 0 ? 0.95 : 0.55)   // taller every 4th tick
+                let rect = CGRect(x: cx - tw / 2, y: (size.height - th) / 2, width: tw, height: th)
+                ctx.fill(Path(roundedRect: rect, cornerRadius: tw / 2), with: .color(filled ? accent : track))
             }
         }
     }
