@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::watch::{merge, merge_log, WatchLog, WatchState};
+
 /// One entry in a profile's library. `Standard` items mirror to the Stremio account; `NativeMagnet` and
 /// `TorrentPlaylist` are VortX-only and never touch the account library.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +121,17 @@ pub struct ProfileLibrary {
     pub watched: BTreeMap<String, WatchedBitfield>,
     #[serde(default, rename = "searchHistory")]
     pub search_history: Vec<String>,
+    /// The field-level watch-state CRDT for this profile: the cross-device SYNC truth, keyed by the played
+    /// unit (episode video id, else meta id). Each entry's signals are independently clocked, so a
+    /// multi-device merge resolves each by its own meaning (never rewind a resume, never un-finish a watched
+    /// title). The `resume` / `continue_watching` / `watched` fields above are the LOCAL read projections the
+    /// app renders; THIS is the document that syncs and merges.
+    #[serde(
+        default,
+        rename = "watchLog",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub watch_log: WatchLog,
 }
 
 /// Playback at or past this permille of the runtime counts as FINISHED (cleared from resume + Continue
@@ -155,6 +168,9 @@ impl ProfileLibrary {
             self.resume.remove(&resume_key);
             self.mark_watched(meta_id, video_id, now);
         } else {
+            // Record the in-progress signal in the sync document (independently clocked) before the local
+            // projection, so a multi-device merge can resolve resume position correctly.
+            self.bump_watch(&resume_key, WatchState::resumed(position_ms, now));
             self.resume.insert(
                 resume_key,
                 ResumePoint {
@@ -178,7 +194,8 @@ impl ProfileLibrary {
     }
 
     /// Mark an item (and optional episode) watched: record the watched video id, drop it from Continue
-    /// Watching, and append a fresh history entry (replacing any prior one for the same item).
+    /// Watching, append a fresh history entry (replacing any prior one for the same item), and record the
+    /// finished signal in the sync document.
     pub fn mark_watched(&mut self, meta_id: &str, video_id: Option<&str>, now: u64) {
         if let Some(vid) = video_id {
             let wb = self.watched.entry(meta_id.to_string()).or_default();
@@ -194,11 +211,37 @@ impl ProfileLibrary {
             video_id: video_id.map(str::to_string),
             watched_at: now,
         });
+        self.bump_watch(video_id.unwrap_or(meta_id), WatchState::finished(now));
     }
 
-    /// Remove an item from Continue Watching (the user dismissed it). Leaves the resume point intact.
-    pub fn remove_from_continue_watching(&mut self, meta_id: &str) {
+    /// Remove an item from Continue Watching (the user dismissed it). Leaves the resume point intact and
+    /// records a tombstone in the sync document so the dismissal propagates across devices (a later resume or
+    /// watch revives it).
+    pub fn remove_from_continue_watching(&mut self, meta_id: &str, now: u64) {
         self.continue_watching.retain(|c| c.id != meta_id);
+        self.bump_watch(meta_id, WatchState::removed(now));
+    }
+
+    /// Join a delta into the canonical, independently-clocked watch document for one unit. The host supplies
+    /// `now` (the kernel has no clock).
+    fn bump_watch(&mut self, key: &str, delta: WatchState) {
+        let entry = self.watch_log.entry(key.to_string()).or_default();
+        *entry = merge(entry, &delta);
+    }
+
+    /// Merge an incoming per-profile watch document (e.g. from another device) into this one, then re-project
+    /// the converged result onto the local Continue-Watching rail. A pure CRDT join (commutative /
+    /// associative / idempotent), so repeated or out-of-order syncs converge. A unit finished or dismissed on
+    /// another device drops out of this device's Continue Watching; a further-along resume elsewhere never
+    /// rewinds this device's position.
+    pub fn merge_watch_log(&mut self, incoming: &WatchLog) {
+        self.watch_log = merge_log(&self.watch_log, incoming);
+        let log = &self.watch_log;
+        self.continue_watching.retain(|cw| {
+            log.get(&cw.id)
+                .map(|st| !st.is_watched() && !st.is_removed())
+                .unwrap_or(true)
+        });
     }
 }
 
@@ -243,13 +286,20 @@ impl ProfileLibrary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{WatchLog, WatchState};
 
     #[test]
     fn progress_upserts_continue_watching_newest_first() {
         let mut lib = ProfileLibrary::default();
         lib.report_progress("a", None, 300_000, 600_000, "A", 100); // 50%
         lib.report_progress("b", None, 60_000, 600_000, "B", 200); // 10%, newer
-        assert_eq!(lib.continue_watching.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["b", "a"]);
+        assert_eq!(
+            lib.continue_watching
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
         assert_eq!(lib.continue_watching[1].progress, 500); // 50% permille
         assert_eq!(lib.resume["a"].offset_secs, 300);
     }
@@ -260,7 +310,11 @@ mod tests {
         lib.report_progress("a", None, 60_000, 600_000, "A", 100);
         lib.report_progress("b", None, 60_000, 600_000, "B", 200);
         lib.report_progress("a", None, 120_000, 600_000, "A", 300); // bump a
-        let ids: Vec<&str> = lib.continue_watching.iter().map(|c| c.id.as_str()).collect();
+        let ids: Vec<&str> = lib
+            .continue_watching
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["a", "b"]); // a moved to front, no dupe
         assert_eq!(lib.continue_watching.len(), 2);
     }
@@ -291,9 +345,55 @@ mod tests {
     fn dismiss_removes_from_cw_but_keeps_resume() {
         let mut lib = ProfileLibrary::default();
         lib.report_progress("a", None, 60_000, 600_000, "A", 100);
-        lib.remove_from_continue_watching("a");
+        lib.remove_from_continue_watching("a", 200);
         assert!(lib.continue_watching.is_empty());
         assert!(lib.resume.contains_key("a"));
+        // The dismissal is recorded as a tombstone in the sync document so it propagates across devices.
+        assert!(lib.watch_log["a"].is_removed());
+    }
+
+    #[test]
+    fn progress_keeps_the_sync_document_in_lockstep() {
+        let mut lib = ProfileLibrary::default();
+        lib.report_progress("a", None, 60_000, 600_000, "A", 100); // in progress
+        assert_eq!(lib.watch_log["a"].resume_ms, 60_000);
+        assert!(!lib.watch_log["a"].is_watched());
+        lib.report_progress("a", None, 595_000, 600_000, "A", 200); // 99% -> finished
+        assert!(
+            lib.watch_log["a"].is_watched(),
+            "finishing records a watch in the sync document"
+        );
+    }
+
+    #[test]
+    fn merge_drops_a_remotely_finished_title_from_continue_watching() {
+        let mut local = ProfileLibrary::default();
+        local.report_progress("m", None, 60_000, 600_000, "M", 100); // locally in CW
+        assert_eq!(local.continue_watching.len(), 1);
+
+        // Another device finished "m".
+        let mut remote = WatchLog::new();
+        remote.insert("m".into(), WatchState::finished(200));
+        local.merge_watch_log(&remote);
+
+        assert!(
+            local.continue_watching.is_empty(),
+            "a remotely finished title leaves CW"
+        );
+        assert!(local.watch_log["m"].is_watched());
+    }
+
+    #[test]
+    fn merging_own_state_is_a_no_op() {
+        let mut local = ProfileLibrary::default();
+        local.report_progress("m", None, 60_000, 600_000, "M", 100);
+        let before = local.clone();
+        let snapshot = local.watch_log.clone();
+        local.merge_watch_log(&snapshot); // idempotent at the library level
+        assert_eq!(
+            local, before,
+            "merging an identical document changes nothing"
+        );
     }
 
     fn mixed_library() -> ProfileLibrary {

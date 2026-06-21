@@ -46,7 +46,11 @@ impl Dirty {
 /// changed, not with total library size.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateDelta {
-    #[serde(rename = "activeProfileId", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "activeProfileId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_profile_id: Option<ProfileId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<Profile>,
@@ -163,10 +167,11 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
             DispatchResult::ok(vec![EngineEvent::ProgressReported { id: meta_id }])
         }
         Action::MarkWatched { meta_id, video_id } => {
-            engine
-                .store
-                .active_library_mut()
-                .mark_watched(&meta_id, video_id.as_deref(), env.now());
+            engine.store.active_library_mut().mark_watched(
+                &meta_id,
+                video_id.as_deref(),
+                env.now(),
+            );
             let pid = engine.store.active_profile_id.clone();
             engine.dirty.libraries.insert(pid);
             DispatchResult::ok(vec![EngineEvent::Watched { id: meta_id }])
@@ -175,10 +180,16 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
             engine
                 .store
                 .active_library_mut()
-                .remove_from_continue_watching(&meta_id);
+                .remove_from_continue_watching(&meta_id, env.now());
             let pid = engine.store.active_profile_id.clone();
             engine.dirty.libraries.insert(pid);
             DispatchResult::ok(vec![EngineEvent::RemovedFromCw { id: meta_id }])
+        }
+        Action::MergeWatchState { profile_id, log } => {
+            let pid = ProfileId::new(profile_id.clone());
+            engine.store.library_mut(&pid).merge_watch_log(&log);
+            engine.dirty.libraries.insert(pid);
+            DispatchResult::ok(vec![EngineEvent::WatchStateMerged { id: profile_id }])
         }
         Action::GetState => DispatchResult::ok(vec![]),
     }
@@ -215,7 +226,13 @@ pub fn take_state_delta(engine: &mut Engine) -> StateDelta {
         .dirty
         .libraries
         .iter()
-        .filter_map(|id| engine.store.libraries.get(id).map(|lib| (id.clone(), lib.clone())))
+        .filter_map(|id| {
+            engine
+                .store
+                .libraries
+                .get(id)
+                .map(|lib| (id.clone(), lib.clone()))
+        })
         .collect();
     let active_profile_id = engine
         .dirty
@@ -257,14 +274,29 @@ mod tests {
         // Seed many profiles so a full snapshot would be large; one edit must yield a 1-record delta.
         let mut engine = init_runtime("owner", "Owner");
         for i in 0..50 {
-            dispatch(&mut engine, Action::AddProfile { id: format!("p{i}"), name: "P".into() }, &env());
+            dispatch(
+                &mut engine,
+                Action::AddProfile {
+                    id: format!("p{i}"),
+                    name: "P".into(),
+                },
+                &env(),
+            );
         }
         // Persist everything once, then clear by taking the delta.
         let _ = take_state_delta(&mut engine);
         assert!(!engine.has_pending_changes());
 
         // A single edit -> the delta has exactly that one profile, not all 51.
-        dispatch(&mut engine, Action::SetParental { id: "p7".into(), kids: true, maturity_ceiling: None }, &env());
+        dispatch(
+            &mut engine,
+            Action::SetParental {
+                id: "p7".into(),
+                kids: true,
+                maturity_ceiling: None,
+            },
+            &env(),
+        );
         let delta = take_state_delta(&mut engine);
         assert_eq!(delta.profiles.len(), 1); // O(changed), not O(total)
         assert_eq!(delta.profiles[0].id, ProfileId::new("p7"));
@@ -280,10 +312,21 @@ mod tests {
     #[test]
     fn switch_marks_active_and_its_library_in_the_delta() {
         let mut engine = init_runtime("owner", "Owner");
-        dispatch(&mut engine, Action::AddProfile { id: "kid".into(), name: "Kid".into() }, &env());
+        dispatch(
+            &mut engine,
+            Action::AddProfile {
+                id: "kid".into(),
+                name: "Kid".into(),
+            },
+            &env(),
+        );
         let _ = take_state_delta(&mut engine);
 
-        dispatch(&mut engine, Action::SwitchProfile { id: "kid".into() }, &env());
+        dispatch(
+            &mut engine,
+            Action::SwitchProfile { id: "kid".into() },
+            &env(),
+        );
         let delta = take_state_delta(&mut engine);
         assert_eq!(delta.active_profile_id, Some(ProfileId::new("kid")));
         assert!(delta.libraries.contains_key(&ProfileId::new("kid")));
@@ -293,7 +336,14 @@ mod tests {
     #[test]
     fn delta_json_round_trips_and_applies_like_the_full_state() {
         let mut engine = init_runtime("owner", "Owner");
-        dispatch(&mut engine, Action::AddProfile { id: "kid".into(), name: "Kid".into() }, &env());
+        dispatch(
+            &mut engine,
+            Action::AddProfile {
+                id: "kid".into(),
+                name: "Kid".into(),
+            },
+            &env(),
+        );
         let json = get_state_delta_json(&mut engine);
         let back: StateDelta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.profiles.len(), 1);
@@ -346,6 +396,80 @@ mod tests {
         );
         assert!(!r.ok);
         assert_eq!(r.error.as_deref(), Some("cannot delete the owner profile"));
+    }
+
+    #[test]
+    fn merge_watch_state_converges_into_the_named_profile() {
+        use vortx_state::{WatchLog, WatchState};
+        let mut engine = init_runtime("owner", "Owner");
+        // Owner is watching "m" locally (it is in Continue Watching).
+        dispatch(
+            &mut engine,
+            Action::ReportProgress {
+                meta_id: "m".into(),
+                video_id: None,
+                name: "M".into(),
+                position_ms: 60_000,
+                duration_ms: 600_000,
+            },
+            &env(),
+        );
+        assert_eq!(
+            engine
+                .store()
+                .active_library()
+                .unwrap()
+                .continue_watching
+                .len(),
+            1
+        );
+
+        // Another device reports "m" FINISHED; merging that document must converge state here.
+        let mut remote = WatchLog::new();
+        remote.insert("m".into(), WatchState::finished(2000));
+        let r = dispatch(
+            &mut engine,
+            Action::MergeWatchState {
+                profile_id: "owner".into(),
+                log: remote,
+            },
+            &env(),
+        );
+        assert!(r.ok);
+        assert_eq!(
+            r.events,
+            vec![EngineEvent::WatchStateMerged { id: "owner".into() }]
+        );
+        let lib = engine.store().active_library().unwrap();
+        assert!(
+            lib.continue_watching.is_empty(),
+            "remotely finished title left Continue Watching"
+        );
+        assert!(lib.watch_log["m"].is_watched());
+    }
+
+    #[test]
+    fn merge_watch_state_marks_the_library_dirty_for_the_delta() {
+        use vortx_state::{WatchLog, WatchState};
+        let mut engine = init_runtime("owner", "Owner");
+        let _ = take_state_delta(&mut engine); // clear
+        let mut remote = WatchLog::new();
+        remote.insert("m".into(), WatchState::resumed(60_000, 1500));
+        dispatch(
+            &mut engine,
+            Action::MergeWatchState {
+                profile_id: "owner".into(),
+                log: remote,
+            },
+            &env(),
+        );
+        let delta = take_state_delta(&mut engine);
+        // The merged watch document rides out in the changed library bucket.
+        let lib = delta
+            .libraries
+            .get(&ProfileId::new("owner"))
+            .expect("owner library in delta");
+        assert!(lib.watch_log.contains_key("m"));
     }
 
     #[test]

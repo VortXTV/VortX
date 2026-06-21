@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use vortx_ranking::RankingPrefs;
+use vortx_state::WatchLog;
 
 /// An action the host dispatches into the engine. Tagged by `type` (snake_case).
 ///
@@ -24,7 +25,11 @@ pub enum Action {
         id: String,
         #[serde(default)]
         kids: bool,
-        #[serde(default, rename = "maturityCeiling", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "maturityCeiling",
+            skip_serializing_if = "Option::is_none"
+        )]
         maturity_ceiling: Option<u8>,
     },
     /// Set a profile's stream-ranking preferences (used as the default when a stream resolve omits prefs).
@@ -57,6 +62,13 @@ pub enum Action {
         #[serde(rename = "metaId")]
         meta_id: String,
     },
+    /// Merge an incoming per-profile watch document (the field-level watch-state CRDT) from another device
+    /// into the named profile's library. Convergent: repeated or out-of-order merges settle identically.
+    MergeWatchState {
+        #[serde(rename = "profileId")]
+        profile_id: String,
+        log: WatchLog,
+    },
     /// No state change; a way for the host to request a fresh state snapshot.
     GetState,
 }
@@ -73,6 +85,7 @@ pub enum EngineEvent {
     ProgressReported { id: String },
     Watched { id: String },
     RemovedFromCw { id: String },
+    WatchStateMerged { id: String },
 }
 
 /// The result of a dispatch: success/failure, an optional error message, and the events produced.
