@@ -58,6 +58,15 @@ final class AddonHealthStore: ObservableObject {
         }
     }
 
+    /// Probe a SINGLE add-on on demand, skipping the global rate-limit debounce but keeping the per-URL
+    /// dedup. The Discover store calls this per row as rows appear, so a long catalog probes lazily as the
+    /// viewer scrolls (bounded by visible rows) instead of firing a 200-wide burst from `probe`.
+    func probeOne(_ transportUrl: String) {
+        guard status[transportUrl] == nil || status[transportUrl] == .unknown else { return }
+        status[transportUrl] = .checking
+        Task { let health = await Self.check(transportUrl); status[transportUrl] = health }
+    }
+
     nonisolated private static func check(_ transportUrl: String) async -> AddonHealth {
         guard let url = URL(string: transportUrl) else { return .down }
         var req = URLRequest(url: url)
@@ -99,6 +108,7 @@ struct AddonsView: View {
                         hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
                     } else {
                         installSection
+                        discoverLink
                         if core.addons.isEmpty {
                             hint("No add-ons yet. Paste an add-on's manifest URL above to install one.")
                         } else {
@@ -160,6 +170,22 @@ struct AddonsView: View {
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+
+    private var discoverLink: some View {
+        NavigationLink { AddonStoreView() } label: {
+            HStack(spacing: Theme.Space.md) {
+                Label("Discover add-ons", systemImage: "sparkles.rectangle.stack")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Spacer()
+                Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+            }
+            .padding(Theme.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 
     private func install() {
