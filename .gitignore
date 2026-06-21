@@ -1,6 +1,7 @@
-# Backend (Cloudflare sync Worker) is kept PRIVATE, not in the public repo. Local copy stays on disk
-# for deploys; never re-track it. (Owner decision 2026-06-21: backend source must not be public.)
+# Backend (Cloudflare Workers) kept PRIVATE, not in the public repo. Local copies stay on disk for
+# deploys; never re-track them. (Owner decision 2026-06-21: backend source must not be public.)
 /cloudflare/
+/cloudflare-ratings/
 
 # --- build artifacts & deps (reconstructed by scripts/build-web.sh) ---
 web/
