@@ -88,12 +88,17 @@ final class TopPicksModel: ObservableObject {
         let seedIDs = Set(seeds.map(\.id))
         var merged: [MetaPreview] = []
         var added = Set<String>()
-        for bucket in perSeed {
-            for preview in bucket where !owned.contains(preview.id)
-                && !seedIDs.contains(preview.id)
-                && added.insert(preview.id).inserted {
+        // Round-robin across the seed titles (one pick from each recent watch in rotation) instead of
+        // draining the most-recent seed's look-alikes first. This makes Top Picks reflect the BREADTH of
+        // what you have been watching rather than a wall of clones of the single latest title.
+        let maxDepth = perSeed.map(\.count).max() ?? 0
+        outer: for depth in 0..<maxDepth {
+            for bucket in perSeed where depth < bucket.count {
+                let preview = bucket[depth]
+                guard !owned.contains(preview.id), !seedIDs.contains(preview.id),
+                      added.insert(preview.id).inserted else { continue }
                 merged.append(preview)
-                if merged.count >= maxItems { return merged }
+                if merged.count >= maxItems { break outer }
             }
         }
         return merged

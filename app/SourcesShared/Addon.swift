@@ -151,18 +151,24 @@ struct AddonClient {
             }
             var byId: [String: MetaPreview] = [:]
             var keywordIds = Set<String>()
+            var genreHits: [String: Int] = [:]   // how many of the seed's genre lists each item appeared in = shared-genre count
             for await (isKeyword, items) in group {
                 for item in items where item.id != excludingId {
                     byId[item.id] = item
                     if isKeyword { keywordIds.insert(item.id) }
+                    else { genreHits[item.id, default: 0] += 1 }
                 }
             }
-            // Keyword (series) matches get a 3× popularity boost so they rank above genre-only
-            // results of similar raw popularity. Items with no popularity fall back to 0.
-            let results = byId.values.sorted {
-                let aScore = ($0.popularity ?? 0) * (keywordIds.contains($0.id) ? 3 : 1)
-                let bScore = ($1.popularity ?? 0) * (keywordIds.contains($1.id) ? 3 : 1)
-                return aScore > bScore
+            // Rank by how "like this" each result really is, not by raw popularity. A franchise (keyword)
+            // match is the strongest same-series signal; then GENRE OVERLAP - a title appearing in more of
+            // the seed's genre lists shares more of its genres - so a blockbuster matching only ONE genre no
+            // longer outranks a title that matches all of them; popularity only breaks ties within a tier.
+            let results = byId.values.sorted { a, b in
+                let aKw = keywordIds.contains(a.id), bKw = keywordIds.contains(b.id)
+                if aKw != bKw { return aKw }
+                let aOverlap = genreHits[a.id] ?? 0, bOverlap = genreHits[b.id] ?? 0
+                if aOverlap != bOverlap { return aOverlap > bOverlap }
+                return (a.popularity ?? 0) > (b.popularity ?? 0)
             }
             return results
         }
