@@ -33,6 +33,12 @@ struct HLSPlayerView: View {
     var currentVideoId: String = ""
     var onSelectEpisode: (CoreVideo) -> Void = { _ in }
 
+    /// tvOS in-player Sources/Quality list (#46): the ranked sources for the playing title, the playing
+    /// source's ranking signature, and the switch callback. Unused on iOS + macOS.
+    var sources: [CoreStreamSourceGroup] = []
+    var currentSourceSignature: String = ""
+    var onSelectSource: (CoreStream) -> Void = { _ in }
+
     /// True for a stream AVPlayer should own: a remote HLS playlist. Torrents (loopback) stay on libmpv.
     static func handles(_ url: URL) -> Bool {
         guard let host = url.host, host != "127.0.0.1", host != "localhost" else { return false }
@@ -52,7 +58,8 @@ struct HLSPlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             Controller(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress,
-                       episodes: episodes, currentVideoId: currentVideoId, onSelectEpisode: onSelectEpisode)
+                       episodes: episodes, currentVideoId: currentVideoId, onSelectEpisode: onSelectEpisode,
+                       sources: sources, currentSourceSignature: currentSourceSignature, onSelectSource: onSelectSource)
                 .ignoresSafeArea()
         }
         .onExitCommand { onClose() }   // Siri-remote Menu leaves the HLS player (the tvOS dismiss idiom)
@@ -498,6 +505,9 @@ extension HLSPlayerView {
         var episodes: [CoreVideo] = []
         var currentVideoId: String = ""
         var onSelectEpisode: (CoreVideo) -> Void = { _ in }
+        var sources: [CoreStreamSourceGroup] = []
+        var currentSourceSignature: String = ""
+        var onSelectSource: (CoreStream) -> Void = { _ in }
 
         func makeCoordinator() -> Coordinator { Coordinator(resumeSeconds: resumeSeconds, onProgress: onProgress) }
 
@@ -516,24 +526,33 @@ extension HLSPlayerView {
             let vc = AVPlayerViewController()
             vc.player = player
             vc.allowsPictureInPicturePlayback = true
-            // #46: in-player episode list. AVKit owns the focus engine for customInfoViewControllers (the Info
-            // panel revealed by swiping down on the Siri remote), so this adds the episode chrome without a
-            // custom overlay fighting the remote — the reason this HLS / DV player stays bare. Series only.
+            // #46: in-player chrome. AVKit owns the focus engine for customInfoViewControllers (the Info panel
+            // revealed by swiping down on the Siri remote), so these add the episode + source chrome without a
+            // custom overlay fighting the remote — the reason this HLS / DV player stays bare.
+            var panels: [UIViewController] = []
             let ordered = episodes.orderedBySeasonEpisode
             if ordered.count > 1 {
-                let panel = UIHostingController(rootView: TVPlayerEpisodePanel(
+                let ep = UIHostingController(rootView: TVPlayerEpisodePanel(
                     episodes: ordered, currentVideoId: currentVideoId, onSelect: onSelectEpisode))
-                panel.title = String(localized: "Episodes")
-                vc.customInfoViewControllers = [panel]
+                ep.title = String(localized: "Episodes")
+                panels.append(ep)
             }
+            if !sources.isEmpty {
+                let src = UIHostingController(rootView: TVPlayerSourcesPanel(
+                    groups: sources, currentSignature: currentSourceSignature, onSelect: onSelectSource))
+                src.title = String(localized: "Sources")
+                panels.append(src)
+            }
+            if !panels.isEmpty { vc.customInfoViewControllers = panels }
             return vc
         }
 
         func updateUIViewController(_ controller: AVPlayerViewController, context: Context) {
-            // The episode panel is baked once in makeUIViewController. RootView presents this player with
-            // `.id(req.id)`, so every episode switch mints a new request id -> full teardown + rebuild, and
-            // `currentVideoId` / `onSelectEpisode` are never stale here. If that invariant ever changes,
-            // rebuild `controller.customInfoViewControllers` in this method.
+            // Both panels (episodes + sources) are baked once in makeUIViewController. RootView presents this
+            // player with `.id(req.id)`, so every episode OR source switch mints a new request id -> full
+            // teardown + rebuild, and `currentVideoId`/`onSelectEpisode`/`sources`/`currentSourceSignature`/
+            // `onSelectSource` are never stale here. If that invariant ever changes (e.g. a live in-place
+            // refresh of `sources`), rebuild `controller.customInfoViewControllers` in this method.
         }
 
         static func dismantleUIViewController(_ controller: AVPlayerViewController, coordinator: Coordinator) {

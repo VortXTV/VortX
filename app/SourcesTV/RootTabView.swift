@@ -48,6 +48,7 @@ private struct TVHLSPlayer: View {
     @State private var ready = false
     @State private var switching = false
     @State private var resolveTask: Task<Void, Never>?
+    @State private var sources: [CoreStreamSourceGroup] = []
 
     var body: some View {
         ZStack {
@@ -63,7 +64,10 @@ private struct TVHLSPlayer: View {
                     onClose: onClose,
                     episodes: request.episodes,
                     currentVideoId: request.meta?.videoId ?? "",
-                    onSelectEpisode: { switchTo($0) })
+                    onSelectEpisode: { switchTo($0) },
+                    sources: sources,
+                    currentSourceSignature: request.sourceHint ?? "",
+                    onSelectSource: { switchSource($0) })
             }
             if switching {
                 // The current episode keeps playing while the next resolves through the engine; this is just a
@@ -81,6 +85,13 @@ private struct TVHLSPlayer: View {
             if let m = request.meta {
                 if let engine = core.engineResumeSeconds(for: m) { resumeSeconds = engine }
                 else { resumeSeconds = await account.resumeOffset(for: m) }
+                // The engine still holds the playing title's stream groups; rank them (pin-aware) for the
+                // in-player Sources panel. Empty (engine slot moved) just hides the panel. For a series,
+                // filter to THIS episode's stream id so the panel never shows a previous episode's sources
+                // (the engine meta slot can advance); a movie reads the current slot.
+                let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: m.libraryId, isSeries: m.type == "series"))
+                let raw = m.type == "series" ? core.streamGroups(forStreamId: m.videoId) : core.streamGroups()
+                sources = StreamRanking.rankedGroups(raw, pin: pin)
             }
             ready = true   // resume resolved (or no meta) -> mount the player so it seeks to the right spot
         }
@@ -107,6 +118,20 @@ private struct TVHLSPlayer: View {
             guard !Task.isCancelled else { return }
             if let next { presenter.request = next }
         }
+    }
+
+    /// Switch the playing source from the in-player Sources panel. The chosen stream is already resolved (its
+    /// URL is in the loaded group), so this just re-presents on it — no engine wait. RootView re-routes (a
+    /// non-torrent source stays in this bare AVPlayer, a torrent lands in TVPlayerView); the new player's
+    /// resume picks up where playback was (progress is saved every second).
+    private func switchSource(_ s: CoreStream) {
+        guard let url = s.playableURL, url != request.url, let m = request.meta else { return }
+        core.loadEnginePlayer(for: s)
+        tvPrimeTorrentStream(s)   // no-op for direct / debrid; primes a torrent before TVPlayerView opens it
+        presenter.request = PlaybackRequest(
+            url: url, title: request.title, meta: m, episodes: request.episodes,
+            sourceHint: StreamRanking.signature(s), torrent: s.isTorrent,
+            bingeGroup: s.behaviorHints?.bingeGroup, headers: s.requestHeaders)
     }
 }
 

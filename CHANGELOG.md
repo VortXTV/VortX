@@ -9,7 +9,7 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 ### Added
 
 - **Pin a source.** Long-press any source on a movie or show and pin it for just this title, for the whole show (every episode then prefers the same provider and quality), or for everything. A pinned source jumps to the top of one-press Watch and the source list, the next episode keeps using it, and automatic failover still moves on if it ever goes down. Clear pins anytime from Settings, Streams. (#15)
-- **Prefer-AVPlayer player on Apple TV and Mac.** The "Prefer AVPlayer (HLS/DV)" engine, which iPhone and iPad already use for true Dolby Vision and clean adaptive HLS, now reaches the other two platforms. On Mac, HLS and true Dolby Vision play through the same player chrome as the rest of the app. On Apple TV, the player gains an in-player Episodes list: swipe down on the Siri remote, pick any episode of the show, and it jumps straight there without leaving the player (the next episode resolves through the engine exactly as Play does, so quality and your pinned source carry over). (#46)
+- **Prefer-AVPlayer player on Apple TV and Mac.** The "Prefer AVPlayer (HLS/DV)" engine, which iPhone and iPad already use for true Dolby Vision and clean adaptive HLS, now reaches the other two platforms. On Mac, HLS and true Dolby Vision play through the same player chrome as the rest of the app. On Apple TV, the player gains in-player Episodes and Sources panels: swipe down on the Siri remote to jump to any episode of the show, or switch to a different source or quality, all without leaving the player (both resolve through the engine exactly as Play does, so your pinned source and quality carry over). (#46)
 
 ### Web (web.vortx.tv)
 

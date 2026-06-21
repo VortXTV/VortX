@@ -85,6 +85,74 @@ struct TVPlayerEpisodePanel: View {
     }
 }
 
+/// The in-player source / quality list for the bare tvOS AVPlayer (#46), the companion to the Episodes
+/// panel and also hosted in `customInfoViewControllers`. It lists the ranked sources for the playing title,
+/// marks the one playing (by ranking signature), and switches to any other without leaving the player. AVKit
+/// owns the panel focus, same as the Episodes panel, so the Siri-remote focus invariant holds.
+struct TVPlayerSourcesPanel: View {
+    let groups: [CoreStreamSourceGroup]
+    let currentSignature: String
+    let onSelect: (CoreStream) -> Void
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 28) {
+                ForEach(groups, id: \.id) { group in
+                    VStack(alignment: .leading, spacing: 12) {
+                        if !group.addon.isEmpty {
+                            Text(group.addon)
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                        }
+                        ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
+                            if stream.playableURL != nil {
+                                Button { onSelect(stream) } label: {
+                                    SourceRow(stream: stream, isCurrent: StreamRanking.signature(stream) == currentSignature)
+                                }
+                                .buttonStyle(.card)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(60)
+        }
+    }
+
+    /// One source: the add-on's stream label, with a "now playing" marker on the active source.
+    private struct SourceRow: View {
+        let stream: CoreStream
+        let isCurrent: Bool
+
+        var body: some View {
+            HStack(spacing: 16) {
+                if isCurrent {
+                    Image(systemName: "play.fill").font(.caption).foregroundStyle(Color.accentColor)
+                }
+                Text(label)
+                    .font(.title3.weight(isCurrent ? .semibold : .regular))
+                    .foregroundStyle(isCurrent ? Color.accentColor : .primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+
+        /// Mirror of `TVPlayerView.sourceLabel`: the stream name's first line, else the description's, else
+        /// a generic fallback.
+        private var label: String {
+            func firstLine(_ t: String?) -> String {
+                (t ?? "").split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            }
+            let name = firstLine(stream.name)
+            if !name.isEmpty { return name }
+            let desc = firstLine(stream.description)
+            return desc.isEmpty ? String(localized: "Source") : desc
+        }
+    }
+}
+
 /// Resolve another episode of the playing series to a ready-to-present `PlaybackRequest`, the bare tvOS
 /// AVPlayer's twin of `TVPlayerView.play(episode:)` and the iOS `iOSResolveEpisodeStream`. It loads the
 /// episode's streams through the engine, waits on the same settle gate the launch path uses (so it lands on
@@ -127,8 +195,9 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
 
 /// Tell the embedded server to create the torrent engine (POST /{hash}/create) before the player opens its
 /// loopback URL — a self-contained copy of `TVPlayerView.prepareTorrent`, since the re-present path resolves
-/// the episode outside any player view. Stateless and fire-and-forget; a no-op for direct / debrid streams.
-private func tvPrimeTorrentStream(_ stream: CoreStream) {
+/// the episode/source outside any player view. Stateless and fire-and-forget; a no-op for direct / debrid
+/// streams. File-internal (not private) so the Sources-panel switch in RootTabView can prime too.
+func tvPrimeTorrentStream(_ stream: CoreStream) {
     guard !PlaybackSettings.torrentsDisabled else { return }
     guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
           let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
