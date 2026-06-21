@@ -147,7 +147,10 @@ function profilesSection(): string {
   const editor = `
     <div class="profile-editor">
       ${row("Name", `<input class="field" id="profile-name" data-text-input="profile-name" value="${escapeHtml(active.name)}" maxlength="24" autocomplete="off" aria-label="Profile name" />`)}
-      ${row("Avatar", `<div class="avatar-swatches">${avatars}</div>`)}
+      <div class="settings-row avatar-row">
+        <div class="settings-row-label"><span>Avatar</span></div>
+        <div class="avatar-swatches">${avatars}</div>
+      </div>
       ${isOwnerProfile(active.id) ? "" : row("", `<button class="chip chip-danger" data-action="delete-profile" data-id="${escapeHtml(active.id)}">Delete this profile</button>`)}
     </div>`;
 

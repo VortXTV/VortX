@@ -2149,3 +2149,15 @@ video::cue {
 .chip-danger {
   color: var(--danger);
 }
+
+/* Avatar row: stack the swatch grid full-width below the label so the 16 swatches wrap inside the card
+   instead of overflowing it (overrides the earlier flex-end on .avatar-swatches; later rule wins). */
+.avatar-row {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-sm);
+}
+.avatar-swatches {
+  justify-content: flex-start;
+  max-width: 100%;
+}
