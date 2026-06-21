@@ -75,6 +75,12 @@ impl VortxStore {
     pub fn library(&self, id: &ProfileId) -> Option<&ProfileLibrary> {
         self.libraries.get(id)
     }
+
+    /// A specific profile's library, creating an empty bucket if needed (for applying a synced watch
+    /// document to a profile that has no local bucket yet).
+    pub fn library_mut(&mut self, id: &ProfileId) -> &mut ProfileLibrary {
+        self.libraries.entry(id.clone()).or_default()
+    }
 }
 
 #[cfg(test)]
