@@ -292,36 +292,34 @@ actor RealDebridResolver: DebridResolving {
     func resolve(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
         let add: AddResp = try await form("\(Self.base)/torrents/addMagnet", ["magnet": magnet])
         let id = add.id
-        // Poll until downloaded, selecting all files the FIRST time RD asks (it won't cache until selection).
-        var info: Info?
-        var didSelect = false
+        // Wait for RD to parse the magnet into its file list (magnet_conversion -> waiting_files_selection).
+        var fileList: [Info.F] = []
+        for attempt in 0..<12 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 2_000_000_000) }
+            let i: Info = try await get("\(Self.base)/torrents/info/\(id)")
+            if ["magnet_error", "error", "virus", "dead"].contains(i.status) { throw DebridError.providerError("status \(i.status)") }
+            if let fs = i.files, !fs.isEmpty { fileList = fs; break }
+        }
+        guard !fileList.isEmpty else { throw DebridError.notReady }
+        // Pick the ONE target file (DebridFile.id = RD's own file id) by the episode/size heuristic over the
+        // full list, then select ONLY it. This is the verified-against-live-API path: RD packs a MULTI-file
+        // selection into a single RAR link (unstreamable), and selectFiles is a no-op once the torrent has
+        // downloaded — so selecting the wanted file alone, before download, is the only way to get one
+        // streamable link. `links.first` is then that file's restricted link.
+        let dfiles = fileList.map { f -> DebridFile in
+            DebridFile(id: f.id, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
+        }
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil) else { throw DebridError.noMatchingFile }
+        try await formVoid("\(Self.base)/torrents/selectFiles/\(id)", ["files": String(pick.id)])
+        var link: String?
         for attempt in 0..<12 {
             if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }
             let i: Info = try await get("\(Self.base)/torrents/info/\(id)")
-            if i.status == "downloaded" { info = i; break }
-            if ["magnet_error", "error", "virus", "dead"].contains(i.status) {
-                throw DebridError.providerError("status \(i.status)")
-            }
-            if i.status == "waiting_files_selection", !didSelect {
-                didSelect = true
-                // Select once and PROPAGATE failure: a 401 here surfaces as invalidKey, not a misleading
-                // notReady after the full timeout, and it never re-fires every poll.
-                try await formVoid("\(Self.base)/torrents/selectFiles/\(id)", ["files": "all"])
-            }
+            if ["magnet_error", "error", "virus", "dead"].contains(i.status) { throw DebridError.providerError("status \(i.status)") }
+            if i.status == "downloaded", let first = i.links?.first { link = first; break }
         }
-        guard let info, let links = info.links, !links.isEmpty else { throw DebridError.notReady }
-        // RD's `links` are parallel to the SELECTED files in order, so DebridFile.id is the selected index
-        // and `links[pick.id]` is the matching restricted link to unrestrict.
-        let selected = (info.files ?? []).filter { $0.selected == 1 }
-        let dfiles = selected.enumerated().map { idx, f -> DebridFile in
-            DebridFile(id: idx, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
-        }
-        // The stream's `fileIdx` is a TORRENT-WIDE index, but `dfiles`/`links` here are RD's selected-file
-        // list, so a torrent-wide index would mis-map to the wrong file. Pick by the episode/size heuristic on
-        // RD's own filenames instead (reliable), which keeps `links[pick.id]` aligned (pick.id = selected index).
-        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
-              links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
-        let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
+        guard let link else { throw DebridError.notReady }
+        let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": link])
         guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
         return u
     }
