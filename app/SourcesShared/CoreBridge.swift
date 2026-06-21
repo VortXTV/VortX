@@ -646,6 +646,11 @@ final class CoreBridge: ObservableObject {
             dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]])
         } else {
             dispatchMetaDetails(["action": "MarkAsWatched", "args": true])
+            // Belt-and-suspenders: MarkAsWatched routes through the meta_details model, which is a silent
+            // no-op if meta_details isn't currently loaded for this movie (CW direct-resume from Home, or
+            // after the user navigated away mid-playback). Also mark the library item directly via Ctx (by
+            // id, no meta_details dependency) so a finished movie reliably leaves Continue Watching.
+            dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": meta.libraryId, "is_watched": true]])
         }
     }
 
@@ -846,15 +851,28 @@ final class CoreBridge: ObservableObject {
                            ?? metaItems.first)?["request"]
         var rawStream: [String: Any]?
         var streamRequest: Any?
+        var firstReadyStream: [String: Any]?
+        var firstReadyRequest: Any?
         for group in (object["streams"] as? [[String: Any]] ?? []) {
             guard let content = group["content"] as? [String: Any],
                   content["type"] as? String == "Ready",
                   let streams = content["content"] as? [[String: Any]] else { continue }
+            if firstReadyStream == nil, let s = streams.first { firstReadyStream = s; firstReadyRequest = group["request"] }
             if let match = streams.first(where: { streamMatches($0, stream) }) {
                 rawStream = match; streamRequest = group["request"]; break
             }
         }
-        guard let rawStream, let streamRequest, let metaRequest else { return }
+        // Fallback: if the EXACT stream wasn't matched (the played URL was proxied to 127.0.0.1, came from
+        // the AVPlayer/DV path, or is a reconstructed object), still load the Player with ANY ready stream +
+        // this meta's request. The library item + its time_offset key on the META, not the specific stream,
+        // so Continue Watching + resume + progress track correctly regardless of which stream object we hand
+        // the engine. Without this, a match miss silently skipped the Player load -> no library item -> CW
+        // never updated and progress was lost (the "CW stopped working / progress not tracked" report).
+        if rawStream == nil { rawStream = firstReadyStream; streamRequest = firstReadyRequest }
+        guard let rawStream, let streamRequest, let metaRequest else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing) — CW + progress will not track for this item")
+            return
+        }
         let selected: [String: Any] = [
             "stream": rawStream,
             "streamRequest": streamRequest,
