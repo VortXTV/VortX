@@ -20,6 +20,8 @@
 // the wire shapes must stay in lockstep across all of them, so accounts created on one surface sign
 // in on every other. Do NOT change API, ITERS, the KDF, or the seal/open framing in isolation.
 
+import { getDeviceKey } from "./devicekey";
+
 const API = "https://api.vortx.tv";
 const ITERS = 210_000;
 const te = new TextEncoder();
@@ -62,6 +64,30 @@ async function seal(key: Uint8Array, pt: Uint8Array): Promise<string> {
   out.set(iv, 0);
   out.set(ct, 12);
   return b64(out);
+}
+
+/** AES-GCM seal under an existing CryptoKey (the device wrapping key). Same iv||ct framing as seal(),
+ *  but the key never exists as raw bytes in JS - used only to wrap the data key for local persistence. */
+async function sealKey(key: CryptoKey, pt: Uint8Array): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pt as BufferSource));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv, 0);
+  out.set(ct, 12);
+  return b64(out);
+}
+
+/** AES-GCM open under an existing CryptoKey (the device wrapping key). Returns null on any failure so
+ *  callers treat "cannot unwrap" as a clean re-login signal rather than a thrown error. */
+async function openKey(key: CryptoKey, ciphertext: string): Promise<Uint8Array | null> {
+  try {
+    const comb = unb64(ciphertext);
+    return new Uint8Array(
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv: comb.subarray(0, 12) as BufferSource }, key, comb.subarray(12) as BufferSource),
+    );
+  } catch {
+    return null;
+  }
 }
 
 /** AES-GCM open: split iv||ct, decrypt. Returns null on any failure (wrong key, tamper), so callers
@@ -131,8 +157,9 @@ export interface Account {
   usernameChangedAt?: number;
   twoFactorEnabled?: boolean;
 }
-/** A live session: the bearer token, the account fields, and the decrypted data key (kept only in
- *  memory + localStorage on this device; it unlocks only THIS account's synced blob). */
+/** A live session: the bearer token, the account fields, and the decrypted data key (held in memory on
+ *  this device; persisted only AES-GCM-wrapped under the non-extractable device key, never plaintext).
+ *  The data key unlocks only THIS account's synced blob. */
 export interface Session {
   token: string;
   account: Account;
@@ -140,28 +167,55 @@ export interface Session {
 }
 
 // --- Session persistence ------------------------------------------------------------------------
-// The token + account + data key are kept in localStorage so login survives navigation and reloads.
-// The data key only unlocks THIS account's blob; sign-out clears it. The key name is shared with the
-// other surfaces' web clients on this origin and must not change.
+// The token + account are kept in localStorage so login survives navigation and reloads. The data key
+// is NEVER stored in plaintext: it is wrapped (AES-GCM) under a non-extractable device key held in
+// IndexedDB (see devicekey.ts), so a localStorage scrape or at-rest dump yields only useless ciphertext.
+// In memory the Session still carries the raw data key, so re-wrap operations (changePassword,
+// regenerateRecoveryCode) and the cross-surface wire protocol are unchanged. The localStorage key name
+// is shared with the other surfaces' web clients on this origin and must not change.
 const SESSION_KEY = "vortx.session.v1";
 
-export function saveSession(s: Session): void {
+/** Persist the session. Wraps the data key under the device key (v2). If secure storage is unavailable
+ *  we deliberately store NO key material (token + account only): the session cannot be restored on the
+ *  next reload, forcing a clean re-login, which is strictly safer than writing the raw key at rest. */
+export async function saveSession(s: Session): Promise<void> {
   try {
-    localStorage.setItem(
-      SESSION_KEY,
-      JSON.stringify({ token: s.token, account: s.account, dataKey: b64(s.dataKey) }),
-    );
+    const deviceKey = await getDeviceKey();
+    const base = { token: s.token, account: s.account, v: 2 as const };
+    const payload = deviceKey
+      ? { ...base, wrappedDataKey: await sealKey(deviceKey, s.dataKey) }
+      : base; // no secure store: persist no key -> reload requires re-login (never plaintext at rest)
+    localStorage.setItem(SESSION_KEY, JSON.stringify(payload));
   } catch {
     // Private-mode / quota: the in-memory session still works for this tab.
   }
 }
-export function loadSession(): Session | null {
+
+/** Restore the session. Unwraps the v2 data key via the device key; transparently migrates a legacy v1
+ *  plaintext key (re-persisting it wrapped and scrubbing the plaintext). Returns null when nothing can
+ *  be restored (no session, or the wrap key is gone / storage unavailable), so the app shows sign-in. */
+export async function loadSession(): Promise<Session | null> {
   try {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
-    const o = JSON.parse(raw) as { token?: string; account?: Account; dataKey?: string };
-    if (!o?.token || !o?.account || !o?.dataKey) return null;
-    return { token: o.token, account: o.account, dataKey: unb64(o.dataKey) };
+    const o = JSON.parse(raw) as { token?: string; account?: Account; dataKey?: string; wrappedDataKey?: string };
+    if (!o?.token || !o?.account) return null;
+    // Legacy v1: a plaintext data key. Restore it, then re-save in the wrapped v2 form (which drops the
+    // plaintext field), so existing signed-in users migrate seamlessly and the plaintext key is scrubbed.
+    if (typeof o.dataKey === "string") {
+      const session: Session = { token: o.token, account: o.account, dataKey: unb64(o.dataKey) };
+      await saveSession(session);
+      return session;
+    }
+    // v2: unwrap the data key with the device key.
+    if (typeof o.wrappedDataKey === "string") {
+      const deviceKey = await getDeviceKey();
+      if (!deviceKey) return null; // wrap key unavailable -> can't restore -> re-login
+      const dataKey = await openKey(deviceKey, o.wrappedDataKey);
+      if (!dataKey) return null; // device key rotated / cleared / tampered -> re-login
+      return { token: o.token, account: o.account, dataKey };
+    }
+    return null;
   } catch {
     return null;
   }
@@ -390,7 +444,7 @@ export async function changePassword(session: Session, oldPassword: string, newP
   if (r.status !== 200) throw new Error("Could not change the password.");
   if (r.data?.token) {
     session.token = r.data.token as string;
-    saveSession(session);
+    await saveSession(session);
   }
 }
 
@@ -429,13 +483,13 @@ export async function activate2fa(session: Session, code: string): Promise<void>
   const r = await api("/v1/auth/2fa/activate", { method: "POST", token: session.token, body: { code } });
   if (r.status !== 200) throw new Error("That code is not valid. Use the current one from your app.");
   session.account.twoFactorEnabled = true;
-  saveSession(session);
+  await saveSession(session);
 }
 export async function disable2fa(session: Session, code: string): Promise<void> {
   const r = await api("/v1/auth/2fa/disable", { method: "POST", token: session.token, body: { code } });
   if (r.status !== 200) throw new Error("That code is not valid.");
   session.account.twoFactorEnabled = false;
-  saveSession(session);
+  await saveSession(session);
 }
 
 // --- Encrypted sync document --------------------------------------------------------------------

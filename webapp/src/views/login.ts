@@ -318,7 +318,7 @@ async function onCreate(ev: SubmitEvent): Promise<void> {
   try {
     const { session, recoveryCode } = await register(email, username, password);
     // Persist the session now, but gate the user on saving the one-time recovery code first.
-    adoptSession(session);
+    await adoptSession(session);
     pendingRecoveryCode = recoveryCode;
     goto("created");
   } catch (x: unknown) {
@@ -374,7 +374,7 @@ async function onResetComplete(ev: SubmitEvent): Promise<void> {
   setBusy(btn, "Resetting…");
   try {
     const { session, recoveryCode } = await resetComplete(email, code, password);
-    adoptSession(session);
+    await adoptSession(session);
     pendingRecoveryCode = recoveryCode;
     goto("created");
   } catch (x: unknown) {
@@ -415,10 +415,10 @@ function onUsernameInput(): void {
 
 // --- On success ---------------------------------------------------------------------------------
 
-/** vault already saved the session; cache + notify, then go home. (register/reset go via the
- *  recovery-code gate first, then "I saved it, continue" calls goto("dash"); they do not call this.) */
+/** Persist + cache the session (adoptSession), then go home. (register/reset go via the recovery-code
+ *  gate first, then "I saved it, continue" calls goto("dash"); they do not call this.) */
 async function succeed(session: Session): Promise<void> {
-  adoptSession(session);
+  await adoptSession(session);
   // Pull the account's add-ons / library / metadata keys before showing Home, so a returning user lands
   // on their populated app instead of a blank slate. Fail-soft (never blocks sign-in).
   await hydrateFromAccount(session);

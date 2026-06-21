@@ -13,7 +13,8 @@ import { updateSettings } from "./settings";
 import type { MetaItem } from "./types";
 
 // The in-memory cache. `undefined` = not yet hydrated from storage; `null` = hydrated, signed out.
-// We lazily hydrate from loadSession() on first read so a hard reload restores the signed-in state.
+// Hydration is now ASYNC (the data key is unwrapped via the IndexedDB device key), so the boot path must
+// `await hydrateSession()` once before the first render; currentSession() then reads this cache synchronously.
 let cached: Session | null | undefined = undefined;
 
 type Listener = (session: Session | null) => void;
@@ -25,12 +26,19 @@ function setSession(next: Session | null): void {
   notify();
 }
 
-/** The current session (cached). Hydrates from localStorage on first call. This is a SYNCHRONOUS
- *  best-effort read: it does not validate the token with the server (use ensureValidSession on boot
- *  for that), so a revoked token still reads as signed-in until the next validation. */
+/** The current session (cached). SYNCHRONOUS read of the cache populated by hydrateSession() at boot; it
+ *  does not validate the token with the server (use ensureValidSession for that), so a revoked token still
+ *  reads as signed-in until the next validation. Returns null until hydrateSession() has resolved. */
 export function currentSession(): Session | null {
-  if (cached === undefined) cached = loadSession();
-  return cached;
+  return cached ?? null;
+}
+
+/** Restore the persisted session into the cache (async: unwraps the data key via the IndexedDB device
+ *  key). Call once at boot, awaited, before the first render so views read the right signed-in state. */
+export async function hydrateSession(): Promise<Session | null> {
+  const session = await loadSession();
+  setSession(session);
+  return session;
 }
 
 /** Whether there is a stored session on this device (best-effort, not server-validated). */
@@ -50,7 +58,7 @@ export function accountDisplay(): string | null {
  *  is lenient). On success it refreshes account fields and re-persists. Returns the live session or
  *  null. Safe to call once at startup, before painting the nav. */
 export async function ensureValidSession(): Promise<Session | null> {
-  const session = loadSession();
+  const session = currentSession() ?? (await loadSession());
   if (!session) {
     setSession(null);
     return null;
@@ -62,15 +70,16 @@ export async function ensureValidSession(): Promise<Session | null> {
     return null;
   }
   // validateSession refreshes account fields (e.g. twoFactorEnabled) in place; re-persist them.
-  saveSession(session);
+  await saveSession(session);
   setSession(session);
   return session;
 }
 
 /** Adopt a freshly created session (called by the Login screen after register/login/recover/reset).
- *  vault already persisted it via saveSession; this updates the cache + notifies the UI. */
-export function adoptSession(session: Session): void {
+ *  Persists it (wrapped) AND updates the cache + notifies the UI, so the sign-in survives a reload. */
+export async function adoptSession(session: Session): Promise<void> {
   setSession(session);
+  await saveSession(session);
 }
 
 /** Pull a string transport URL out of a synced add-on entry (the app emits {transportUrl,name}; the web
