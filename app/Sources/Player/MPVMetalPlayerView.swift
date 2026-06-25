@@ -24,6 +24,8 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.playUrl = coordinator.playUrl
         mpv.playHeaders = coordinator.playHeaders
         mpv.playUrlLive = coordinator.playLive
+        mpv.startMuted = coordinator.muted
+        mpv.loopPlayback = coordinator.loops
         let coord = context.coordinator
         mpv.onSingleTap = { [weak coord] in coord?.onTap?() }
         context.coordinator.player = mpv
@@ -59,6 +61,14 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         return self
     }
 
+    /// Hero-preview only (#44): mount this libmpv instance muted and looping for an ambient background
+    /// trailer clip. The main player never calls this, so its audio + auto-next behaviour is unchanged.
+    func muted(_ muted: Bool, loop: Bool = false) -> Self {
+        coordinator.muted = muted
+        coordinator.loops = loop
+        return self
+    }
+
     func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
         coordinator.onPropertyChange = handler
         return self
@@ -78,6 +88,9 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         var playUrl : URL?
         var playHeaders: [String: String]?
         var playLive = false
+        /// Hero-preview only (#44): start the libmpv instance muted / looping for an ambient background clip.
+        var muted = false
+        var loops = false
         var onPropertyChange: ((any PlayerEngine, String, Any?) -> Void)?
         var onTap: (() -> Void)?
 

@@ -12,6 +12,10 @@ struct DetailView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
 
+    // #44 in-hero trailer gating, the SAME keys iOS uses: the "Autoplay trailers" setting + reduce-motion.
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
@@ -223,6 +227,9 @@ struct DetailView: View {
     private func moviePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
+            // #44: the muted, looping trailer fades in OVER the still backdrop (full-bleed, behind the
+            // scrolling content). Non-focusable + no hit-testing, so the focus engine is untouched.
+            heroTrailerLayer(m).ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
@@ -403,6 +410,9 @@ struct DetailView: View {
             .frame(height: 560)
             .frame(maxWidth: .infinity)
             .clipped()
+            // #44: the muted, looping trailer fades in OVER the still hero art, clipped to the same band.
+            // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
+            .overlay(heroTrailerLayer(m).frame(height: 560).frame(maxWidth: .infinity).clipped())
             .overlay(LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
                                     startPoint: .top, endPoint: .bottom))
             .overlay(LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
@@ -468,6 +478,21 @@ struct DetailView: View {
             .padding(.bottom, Theme.Space.lg)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// #44 in-hero trailer layer: a muted, looping libmpv clip ({serverBase}/yt/{id}) painted OVER the
+    /// still backdrop on the cinematic detail header, the tvOS twin of the iOS `InHeroTrailerView`. Mounted
+    /// only when ALL hold: the "Autoplay trailers" setting is on, motion is allowed, this is a VOD title
+    /// (live channels carry no trailers), and `TrailerRequest` resolved a PLAYABLE url. The url is nil on the
+    /// Lite build (no `/yt` route) and for a YouTube-only trailer with no server, so the layer never mounts
+    /// there and the still backdrop stays — the same auto-hide the Trailer chip uses. The clip itself only
+    /// reveals once it actually starts decoding and the server is confirmed online (see `TVInHeroTrailerView`),
+    /// so a missing / slow / blocked trailer never blanks the band.
+    @ViewBuilder private func heroTrailerLayer(_ m: CoreMetaItem) -> some View {
+        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
+           let url = TrailerRequest.from(meta: m)?.playableURL {
+            TVInHeroTrailerView(url: url)
+        }
     }
 
     /// Trailer chip. Plays the meta's trailer as a one-off clip through the player (no torrent, no

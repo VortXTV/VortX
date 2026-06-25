@@ -51,6 +51,14 @@ final class MPVMetalViewController: PlatformViewController {
     var playUrlLive = false
     var onSingleTap: (() -> Void)?
     var hdrAvailable : Bool = false
+    /// Hero-preview only (#44): start muted with no audio output and loop the file forever. Set BEFORE
+    /// viewDidLoad / setupMpv so the options apply at init time. The in-hero trailer layer (tvOS
+    /// `TVInHeroTrailerView`) uses this for an ambient, soundless background clip; the main player never
+    /// sets it, so its audio + transport behaviour is unchanged. When muted, the route-aware audio-session
+    /// machinery is skipped entirely so this lightweight preview instance never claims `.playback` or
+    /// disturbs the main player's audio session.
+    var startMuted = false
+    var loopPlayback = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     private var configuredLiveMode = false
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
@@ -291,12 +299,21 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setupMpv() {
-        configureAudioSession()
+        // The in-hero trailer preview (#44) is silent, so it must NOT claim the `.playback` audio
+        // session: doing so would interrupt other audio and fight the main player's session. Only the
+        // real player configures the route-aware audio policy.
+        if !startMuted { configureAudioSession() }
         mpv = mpv_create()
         if mpv == nil {
             print("failed creating context\n")
             exit(1)
         }
+
+        // Hero-preview options (#44), set before mpv_initialize so they take at init time. `mute=yes`
+        // gives a soundless ambient clip (no audio output is ever opened); `loop-file=inf` makes mpv
+        // re-play the trailer forever with no app-side EOF handling. The main player sets neither.
+        if startMuted { checkError(mpv_set_option_string(mpv, "mute", "yes")) }
+        if loopPlayback { checkError(mpv_set_option_string(mpv, "loop-file", "inf")) }
 
         // Do NOT apply mpv's "fast" profile by default. It overrides gpu-next/libplacebo's sharp default
         // upscaler (lanczos) with bilinear and disables debanding/dither, which made upscaled video look
