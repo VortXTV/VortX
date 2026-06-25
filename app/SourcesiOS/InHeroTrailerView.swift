@@ -1,122 +1,166 @@
 import SwiftUI
 
-/// In-hero auto-play trailer for the iOS / iPad / Mac detail page (#44). The static `meta.background`
-/// backdrop renders first; a short beat later this view cross-fades a muted, looping YouTube clip OVER
-/// that backdrop, the same ambient treatment the Home `FeaturedHeroView` uses. The still art underneath
-/// is the permanent fallback, so a missing / slow / blocked clip never leaves the band black.
+/// In-hero auto-play trailer for the iOS / iPad / Mac detail page and Home billboard (#44), now the exact
+/// parity twin of the tvOS `TVInHeroTrailerView`. It plays the trailer through **libmpv** using the
+/// embedded streaming server's `/yt/{id}` route (the same path the Trailer chip uses, resolved by an
+/// InnerTube resolver in server.js), NOT a WKWebView YouTube iframe embed. The old embed path broke under
+/// YouTube's July-2025 Referer enforcement (the cross-origin iframe subresources never carry the WKWebView
+/// Referer), so iOS trailers now ride the identical native path tvOS already uses.
 ///
-/// Why a delay (`startDelay`): the detail hero exists to show the artwork and let the user read the
-/// title / meta first. Slamming a video in on appear fights that. Holding the still backdrop for ~2.5s
-/// before the clip dissolves in keeps the page calm and gives slow networks a moment, while the muted
-/// clip still rewards anyone who lingers. The Home billboard plays immediately because it is an ambient
-/// rotator; a detail page is a destination, so it eases in.
+/// A muted, looping, chromeless libmpv layer fades in OVER the still backdrop a short beat after the hero
+/// settles. The still art underneath is the permanent fallback, so a missing / slow / blocked clip never
+/// leaves the band black.
 ///
-/// Mute / unmute: the clip is muted (the only reliably-allowed inline autoplay on iOS / WKWebView). A
-/// speaker control sits in the corner; tapping the clip OR the control escalates to the full interactive
-/// trailer via `onRequestSound`, which the detail page wires to its existing in-app `TrailerEmbedCover`
-/// (full YouTube controls + audio). This reuses the one trailer-with-sound path the app already ships
-/// rather than poking JS mute state into the shared embed.
+/// Two loop modes (matching tvOS): pass `window` for a short SILENT WINDOW (the DETAIL hero shows a brief
+/// snippet), or leave it nil for the whole muted trailer on a built-in `loop-file=inf` loop (the HOME
+/// featured hero). The same view serves both so the home + detail heroes share one decorative libmpv layer.
 ///
-/// Reduced-motion: the caller gates on `accessibilityReduceMotion` and simply never mounts this view
-/// when motion is reduced, so the hero stays a still backdrop. The view itself is decorative and hidden
-/// from VoiceOver; the title / meta / actions carry the accessible content.
+/// Gating + fallback (mirrors tvOS exactly):
+///   • The caller gates on the `stremiox.autoplayTrailers` setting + `accessibilityReduceMotion`, and only
+///     mounts this view when a trailer's `playableURL` resolved, so reduced-motion / setting-off / no-server
+///     never starts a clip.
+///   • The clip plays only when the embedded server is reachable (checked async on appear). On the Lite
+///     build there is no `/yt` route, so `TrailerRequest.playableURL` is nil and the caller never builds
+///     this view: it cleanly no-ops to the still backdrop.
+///   • If libmpv reports a load failure (`endFileError`, e.g. resolution failed), the clip hides and the
+///     still backdrop stays. No error is ever surfaced.
 ///
-/// tvOS has no WKWebView, so this lives in `SourcesiOS/` (iOS / iPad / Mac only) and is never built for tvOS.
+/// Lifecycle: a dedicated lightweight libmpv `Coordinator` is created per mounted instance and torn down
+/// when the view disappears. Keyed on the trailer URL so rotating A -> B rebuilds the layer for B rather
+/// than painting A's clip over B's backdrop.
 struct InHeroTrailerView: View {
-    /// The resolved YouTube id to play (caller guarantees non-empty).
-    let youTubeID: String
+    /// The resolved trailer playable URL ({serverBase}/yt/{id} or a direct stream). The caller guarantees
+    /// it is non-nil (so the Lite build, where it is nil, never reaches here).
+    let url: URL
     /// The hero band height the clip must fill, matched to the backdrop so the cross-fade is seamless.
     let height: CGFloat
-    /// Escalate to the full interactive trailer (sound + controls). Wired to the detail page's in-app
-    /// `TrailerEmbedCover` presentation.
-    let onRequestSound: () -> Void
 
-    /// Flips true after `startDelay`, which cross-fades the clip in over the still backdrop.
+    /// When set, play a short SILENT WINDOW instead of the whole trailer: seek to `start` on reveal and
+    /// re-seek back to `start` every time playback passes `start + length`, so the band shows a brief
+    /// ambient snippet that loops. The detail hero uses this. When nil, the whole trailer loops via mpv's
+    /// own `loop-file=inf` (the HOME hero uses that, full muted trailer).
+    var window: (start: Double, length: Double)? = nil
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// A muted, looping libmpv instance for the ambient clip. Owned here so it is created and torn down with
+    /// the view, never shared with the main player's coordinator.
+    @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
+
+    /// Flips true once the clip has actually started decoding AND the start-delay beat has passed, which
+    /// cross-fades it in over the still backdrop. Gating the reveal on real playback means a clip that never
+    /// loads (offline server, resolver miss) simply never appears, leaving the still art.
     @State private var showClip = false
-    /// Set if the embed reports a failure (embedding disabled, removed video, etc.). Keeps the clip
-    /// hidden so the still backdrop underneath stays visible instead of YouTube's error card.
+    /// True once libmpv produced its first frame / time-pos, so we only reveal a clip that actually plays.
+    @State private var didStart = false
+    /// Set if libmpv reports a load failure: keeps the clip hidden so the still backdrop stays visible
+    /// instead of a frozen black surface.
     @State private var failed = false
+    /// Set after the async reachability probe confirms the embedded server is up. The clip is only mounted
+    /// when the server is online (a YouTube `/yt` trailer needs the server to resolve it).
+    @State private var serverReady = false
+    /// Gate so the start-delay beat is armed exactly once per mounted URL.
+    @State private var startedDelay = false
 
-    /// Seconds the still backdrop holds before the muted clip dissolves in (the "~2-3s after the hero
-    /// backdrop shows" beat). A named constant, not a magic number.
-    private static let startDelay: Duration = .seconds(2.5)
-    /// Cross-fade duration for the clip reveal, matched to the hero's own art cross-fade feel.
+    /// Seconds the still backdrop holds before the muted clip dissolves in. The owner asked for a ~3s
+    /// settle on iOS (no focus engine, so the hero's displayed item plus this delay stands in for the
+    /// tvOS focus-settle), keeping the page calm and giving slow networks a moment.
+    private static let startDelay: Duration = .seconds(3)
+    /// Cross-fade duration for the clip reveal.
     private static let fadeDuration: Double = 0.6
 
     var body: some View {
         ZStack {
-            if showClip, !failed {
-                clip
-                    .transition(.opacity)
+            if serverReady, !failed {
+                // The muted, looping libmpv surface. Opacity-gated (not conditionally mounted) so the
+                // player keeps decoding behind the scrim while we wait for the start-delay beat; revealing
+                // it is a pure cross-fade with no reload.
+                MPVMetalPlayerView(coordinator: coordinator)
+                    .play(url)
+                    // Windowed mode does its OWN re-seek loop in the property handler, so it must NOT
+                    // hand mpv `loop-file=inf` (that would replay the whole trailer). Full mode keeps
+                    // mpv's built-in inf loop. Muted either way: a silent ambient clip.
+                    .muted(true, loop: window == nil)
+                    .onPropertyChange { engine, name, data in handleProperty(engine, name, data) }
+                    .allowsHitTesting(false)   // ambient: never in the tap path
+                    .opacity(showClip ? 1 : 0)
+                    .animation(reduceMotion ? nil : .easeOut(duration: Self.fadeDuration), value: showClip)
+                    .overlay(scrim)
             }
         }
         .frame(height: height)
         .frame(maxWidth: .infinity)
-        // Reload the whole view (and restart the delay) when the title changes, so navigating A -> B
-        // never leaves A's clip painted over B's backdrop.
-        .id(youTubeID)
-        .task(id: youTubeID) {
-            // Reset for the new title, then hold the still backdrop before easing the clip in.
+        .clipped()
+        // Rebuild the whole layer (new coordinator, restarted delay) when the trailer changes, so A's clip
+        // never lingers over B's backdrop.
+        .id(url)
+        .task(id: url) {
+            // Reset state for the (possibly new) URL, then confirm the server is reachable before mounting.
+            // On a custom/offline server or a slow boot this stays false and the still backdrop holds.
+            serverReady = false
             showClip = false
+            didStart = false
             failed = false
-            try? await Task.sleep(for: Self.startDelay)
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: Self.fadeDuration)) { showClip = true }
+            startedDelay = false
+            if await StremioServer.isOnline() {
+                serverReady = true
+            }
         }
-        // Decorative ambient layer. The hero's title / meta / actions are the accessible content.
+        // Decorative ambient layer; the hero title / actions carry the accessible content.
         .accessibilityHidden(true)
     }
 
-    /// The muted, looping, chromeless clip plus the same dual scrim the backdrop uses (so the title /
-    /// meta stay legible over video and the band still dissolves into the page below), an "Unmute" speaker
-    /// affordance, and a full-surface tap target that opens the trailer with sound.
-    private var clip: some View {
-        // A short ~6-second muted window (started a few seconds in to skip studio/title cards) rather than
-        // the full trailer: a quick, ambient "clip" of the title that loops behind the hero art.
-        YouTubeEmbedView(youTubeID: youTubeID, mode: .clip(startSeconds: 8, windowSeconds: 6),
-                         onFailure: { withAnimation(.easeOut(duration: 0.3)) { failed = true } })
-            .frame(height: height)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            // The embed is ambient: let taps fall through to our own tap layer (below) and to the hero
-            // chrome, exactly as the Home hero clip does.
-            .allowsHitTesting(false)
-            .overlay(
-                LinearGradient(stops: [
-                    .init(color: .clear, location: 0.0),
-                    .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                    .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
-                    .init(color: Theme.Palette.canvas, location: 1.0),
-                ], startPoint: .top, endPoint: .bottom)
-            )
-            .overlay(
-                LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
-                               startPoint: .leading, endPoint: .center)
-            )
-            // A transparent tap layer over the clip: tapping the playing trailer is the natural "give me
-            // sound" gesture, so route it to the full interactive trailer. Placed under the visible speaker
-            // button so the button keeps its own larger hit target.
-            .overlay(
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture { onRequestSound() }
-            )
-            .overlay(alignment: .topTrailing) { unmuteButton }
+    /// The same dual scrim the hero backdrop uses, so the title / meta stay legible over video and the band
+    /// reads consistently whether the still art or the clip is showing.
+    private var scrim: some View {
+        ZStack {
+            LinearGradient(stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
+                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas, location: 1.0),
+            ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
+                           startPoint: .leading, endPoint: .center)
+        }
+        .allowsHitTesting(false)
     }
 
-    /// The corner speaker affordance. The clip is muted; this signals that and offers the one-tap path to
-    /// audio (the full interactive trailer). Styled as the same circular glass control the trailer cover's
-    /// close button uses, so the two read as one family.
-    private var unmuteButton: some View {
-        Button(action: onRequestSound) {
-            Image(systemName: "speaker.slash.fill")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(10)
-                .background(.black.opacity(0.45), in: Circle())
+    /// libmpv property bus: reveal the clip once it actually starts, hide it on a load failure, and (in
+    /// windowed mode) re-seek so only a short snippet loops. Full mode lets mpv's own `loop-file=inf`
+    /// handle repetition, so EOF never reaches here.
+    private func handleProperty(_ engine: any PlayerEngine, _ name: String, _ data: Any?) {
+        switch name {
+        case MPVProperty.timePos:
+            // First decoded time-pos means the clip really started; seek into the window (if any) and
+            // arm the reveal beat exactly once.
+            if !didStart {
+                didStart = true
+                if let window { engine.seek(to: window.start) }
+                armReveal()
+            }
+            // Windowed mode: keep the snippet looping by re-seeking to the start once playback runs past
+            // the window. A small guard band absorbs the time-pos event granularity so we never thrash.
+            if let window, let pos = data as? Double, pos >= window.start + window.length {
+                engine.seek(to: window.start)
+            }
+        case MPVProperty.endFileError:
+            // Resolution failed / dead link: hide the clip so the still backdrop shows. Never an error flash.
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) { failed = true }
+        default:
+            break
         }
-        .buttonStyle(.plain)
-        .padding(Theme.Space.sm)
-        .accessibilityLabel("Play trailer with sound")
+    }
+
+    /// Hold the still backdrop for the start-delay beat after the clip starts, then cross-fade it in. Once
+    /// per mounted URL (guarded by `startedDelay`).
+    private func armReveal() {
+        guard !startedDelay else { return }
+        startedDelay = true
+        Task { @MainActor in
+            try? await Task.sleep(for: Self.startDelay)
+            guard !failed else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: Self.fadeDuration)) { showClip = true }
+        }
     }
 }

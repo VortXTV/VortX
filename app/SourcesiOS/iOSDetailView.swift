@@ -189,21 +189,18 @@ struct iOSDetailView: View {
     /// is the detail page's own fallback, used only when `meta.trailerYouTubeID` is nil.
     @State private var resolvedTrailerID: String?
 
-    /// The one thing presented full-screen at a time: a resolved player stream or the YouTube trailer.
+    /// The one thing presented full-screen at a time: a resolved player stream or the trailer. Both play
+    /// IN-APP through the native libmpv player; there is no longer a YouTube web-embed presentation.
     private enum Presentation: Identifiable {
         case player(PlayerLaunch)
-        /// A non-YouTube (direct) trailer stream plays in the SAME native mpv player as a stream.
-        /// recordMeta is nil for these so a trailer never lands in Continue Watching.
+        /// The trailer, played in the SAME native mpv player as a stream (`isTrailer: true`). The url is a
+        /// direct (non-YouTube) trailer stream OR the embedded server's `/yt/{id}` route (the same path
+        /// tvOS uses). recordMeta is nil for these so a trailer never lands in Continue Watching.
         case trailerPlayer(url: URL, title: String)
-        /// A YouTube trailer (Bug A): plays via the keyless YouTube IFrame embed in a WKWebView
-        /// (`YouTubeEmbedView`, interactive mode). This takes ONLY the yt id, so it can never fall
-        /// through to the feature movie stream the way a stream-pipeline trailer could.
-        case trailerEmbed(youTubeID: String, title: String)
         var id: String {
             switch self {
             case .player(let l): "player-\(l.id)"
             case .trailerPlayer(_, let t): "trailer-\(t)"
-            case .trailerEmbed(let yt, _): "trailer-embed-\(yt)"
             }
         }
     }
@@ -343,28 +340,24 @@ struct iOSDetailView: View {
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
                              recordMeta: nil, isTrailer: true, onClose: { presentation = nil })
                     .ignoresSafeArea()
-            case .trailerEmbed(let youTubeID, let title):
-                TrailerEmbedCover(youTubeID: youTubeID, title: title, onClose: { presentation = nil })
             }
         }
     }
 
-    /// Bug A: present the meta's trailer. A non-YouTube (direct) trailer stream plays natively in mpv;
-    /// a YouTube trailer plays IN-APP via the keyless YouTube IFrame embed (`YouTubeEmbedView`), the
-    /// same mechanism the official Stremio client uses. The embed takes only the yt id, so it can never
-    /// fall through to the feature movie stream — which is exactly the failure Bug A described. The old
-    /// path (external-open / `/yt` ytdl-core resolver, which 403s) is only the last-resort fallback when
-    /// a YouTube-only trailer somehow has no usable id.
+    /// Present the meta's trailer IN-APP through the native libmpv player, the exact path tvOS uses. A
+    /// direct (non-YouTube) trailer stream OR the embedded server's `/yt/{id}` route (resolved by an
+    /// InnerTube resolver in server.js) is handed to `PlayerScreen` with `isTrailer: true`. This removes
+    /// the old WKWebView YouTube embed (broken by YouTube's July-2025 Referer enforcement) and the
+    /// youtube:// deeplink (which errored then bounced to the YouTube app). Only when `playableURL` is nil
+    /// (e.g. the Lite build with no embedded server) does it fall back to opening the public link
+    /// externally, and that fallback is silent (no error flash).
     private func playTrailer() {
         guard let m = meta, let req = TrailerRequest.from(meta: m) else { return }
-        if let direct = req.directURL {
-            // A real (non-YouTube) trailer stream plays natively in mpv.
-            presentation = .trailerPlayer(url: direct, title: "\(m.name) — Trailer")
-        } else if let yt = req.youTubeID, !yt.isEmpty {
-            // YouTube trailer → in-app IFrame embed. No key, no extraction, no Error 153.
-            presentation = .trailerEmbed(youTubeID: yt, title: "\(m.name) — Trailer")
+        if let url = req.playableURL {
+            presentation = .trailerPlayer(url: url, title: "\(m.name) — Trailer")
         } else if let watch = req.watchURL {
-            // Defensive fallback only: open externally if no embeddable id resolved.
+            // No embedded server to resolve the `/yt` route (Lite build): open the public link externally,
+            // silently. No error is ever surfaced.
             TrailerOpener.open(watch)
         }
     }
@@ -464,17 +457,33 @@ struct iOSDetailView: View {
         )
     }
 
-    /// #44: the muted, looping in-hero trailer (`InHeroTrailerView`) painted over the still backdrop.
-    /// Mounted only when ALL hold: motion is allowed, this is a VOD title (live channels carry no
-    /// trailers and run a stripped page), and the meta resolved a YouTube trailer id. The clip itself
-    /// fades in a beat after the backdrop shows; the still art underneath is the permanent fallback, so a
-    /// missing / slow / blocked embed never blanks the band. Tapping it (or its speaker control) escalates
-    /// to the existing in-app interactive trailer with sound via `playTrailer()`.
+    /// #44: the muted, looping in-hero trailer (`InHeroTrailerView`) painted over the still backdrop, now
+    /// played through libmpv via the embedded server's `/yt` route (mirroring tvOS), NOT a YouTube web
+    /// embed. Mounted only when ALL hold: motion is allowed, this is a VOD title (live channels carry no
+    /// trailers and run a stripped page), and the trailer resolved a PLAYABLE url (a direct stream from the
+    /// meta, else the `/yt/{id}` route; nil on the Lite build, so it no-ops to the still backdrop there).
+    /// The clip itself fades in a beat after the backdrop shows; the still art underneath is the permanent
+    /// fallback, so a missing / slow / blocked clip never blanks the band, and no error is ever surfaced.
     @ViewBuilder private var heroTrailerClip: some View {
         if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
-           let yt = (meta?.trailerYouTubeID ?? resolvedTrailerID), !yt.isEmpty {
-            InHeroTrailerView(youTubeID: yt, height: backdropHeight, onRequestSound: playTrailer)
+           let url = detailTrailerURL {
+            // Detail hero = a short SILENT WINDOW (parity with tvOS DetailView's window: start 10, length 8).
+            InHeroTrailerView(url: url, height: backdropHeight, window: (start: 10, length: 8))
         }
+    }
+
+    /// The detail hero's resolved trailer playable URL: prefer the meta's own `TrailerRequest` (which
+    /// covers a direct, non-YouTube trailer stream as well as a YouTube id), else the Cinemeta-fallback
+    /// YouTube id (`resolvedTrailerID`) routed through the embedded server's `/yt`. Nil when neither
+    /// resolves or the embedded server cannot proxy (Lite build), in which case the still backdrop stays.
+    private var detailTrailerURL: URL? {
+        if let m = meta, let req = TrailerRequest.from(meta: m), let url = req.playableURL {
+            return url
+        }
+        if let yt = resolvedTrailerID, !yt.isEmpty {
+            return TrailerRequest(title: meta?.name ?? title, youTubeID: yt, directURL: nil).playableURL
+        }
+        return nil
     }
 
     /// #37 fallback: when the engine's detail meta has no trailer (`trailerYouTubeID == nil`), fetch the
