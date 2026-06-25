@@ -38,6 +38,9 @@ struct HLSPlayerView: View {
     var sources: [CoreStreamSourceGroup] = []
     var currentSourceSignature: String = ""
     var onSelectSource: (CoreStream) -> Void = { _ in }
+    /// tvOS only: AVPlayer reported the item could not load (`.failed`). The caller (TVHLSPlayer) re-presents
+    /// the stream on libmpv. iOS / macOS have their own AVPlayer -> libmpv fallback in PlayerScreen.
+    var onLoadFailed: () -> Void = {}
 
     /// True for a stream AVPlayer should own: a remote HLS playlist. Torrents (loopback) stay on libmpv.
     static func handles(_ url: URL) -> Bool {
@@ -59,7 +62,8 @@ struct HLSPlayerView: View {
             Color.black.ignoresSafeArea()
             Controller(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress,
                        episodes: episodes, currentVideoId: currentVideoId, onSelectEpisode: onSelectEpisode,
-                       sources: sources, currentSourceSignature: currentSourceSignature, onSelectSource: onSelectSource)
+                       sources: sources, currentSourceSignature: currentSourceSignature, onSelectSource: onSelectSource,
+                       onLoadFailed: onLoadFailed)
                 .ignoresSafeArea()
         }
         .onExitCommand { onClose() }   // Siri-remote Menu leaves the HLS player (the tvOS dismiss idiom)
@@ -508,8 +512,9 @@ extension HLSPlayerView {
         var sources: [CoreStreamSourceGroup] = []
         var currentSourceSignature: String = ""
         var onSelectSource: (CoreStream) -> Void = { _ in }
+        var onLoadFailed: () -> Void = {}
 
-        func makeCoordinator() -> Coordinator { Coordinator(resumeSeconds: resumeSeconds, onProgress: onProgress) }
+        func makeCoordinator() -> Coordinator { Coordinator(resumeSeconds: resumeSeconds, onProgress: onProgress, onLoadFailed: onLoadFailed) }
 
         func makeUIViewController(context: Context) -> AVPlayerViewController {
             // Apple TV Atmos passthrough (#78) + AirPods Spatial Audio (#88): claim .playback and advertise
@@ -564,21 +569,33 @@ extension HLSPlayerView {
         final class Coordinator {
             private let resumeSeconds: Double
             private let onProgress: (Double, Double) -> Void
+            private let onLoadFailed: () -> Void
             private weak var player: AVPlayer?
             private var timeObserver: Any?
             private var readyObserver: NSKeyValueObservation?
             private var didResume = false
+            private var didFail = false
 
-            init(resumeSeconds: Double, onProgress: @escaping (Double, Double) -> Void) {
+            init(resumeSeconds: Double, onProgress: @escaping (Double, Double) -> Void, onLoadFailed: @escaping () -> Void = {}) {
                 self.resumeSeconds = resumeSeconds
                 self.onProgress = onProgress
+                self.onLoadFailed = onLoadFailed
             }
 
             func attach(_ player: AVPlayer, item: AVPlayerItem) {
                 self.player = player
-                // Seek to the saved position once the item is ready, then play.
+                // Seek to the saved position once the item is ready, then play. If AVFoundation cannot open
+                // the item (.failed), hand the stream back to the caller so it can re-present on libmpv -
+                // without this, a remote HLS / DV-in-MP4 that AVPlayer chokes on left a black screen with no
+                // recovery (the tvOS "nothing plays" bug). Mirrors PlayerScreen.avEngineFailed on iOS/macOS.
                 readyObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                    guard let self, item.status == .readyToPlay, !self.didResume else { return }
+                    guard let self else { return }
+                    if item.status == .failed, !self.didFail {
+                        self.didFail = true
+                        Task { @MainActor in self.onLoadFailed() }
+                        return
+                    }
+                    guard item.status == .readyToPlay, !self.didResume else { return }
                     self.didResume = true
                     if self.resumeSeconds > 1 {
                         player.seek(to: CMTime(seconds: self.resumeSeconds, preferredTimescale: 600))

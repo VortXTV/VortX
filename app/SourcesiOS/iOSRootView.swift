@@ -405,6 +405,10 @@ struct iOSHomeView: View {
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
+            // iOS-only: a runtime insert/remove of this trailing toolbar item when sign-in flips also
+            // trips the shared-window NSToolbar on macOS (same crash class as the principal item). On
+            // macOS sign-in lives in Settings -> Account ("VortX account & sync").
+            #if os(iOS)
             .toolbar {
                 if !account.isSignedIn {
                     ToolbarItem(placement: .primaryAction) {
@@ -412,6 +416,7 @@ struct iOSHomeView: View {
                     }
                 }
             }
+            #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
@@ -1853,16 +1858,22 @@ extension View {
     func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {
         navigationTitle(pageTitle)
             .navigationBarTitleDisplayModeInlineCompat()
+            // The brand wordmark in the navigation bar's PRINCIPAL slot is iOS-only. On macOS a
+            // `.principal` item is hoisted into the single shared window titlebar, and all seven tab
+            // screens stay mounted at once (opacity-switched to preserve state), so every browse screen
+            // would stamp its own wordmark into the one principal slot and NSToolbar crashes inserting a
+            // duplicate principal item (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, the Beta 7 Mac
+            // crash; the old `isActive` content-toggle did not stop the four ITEMS coexisting). Compile-
+            // gating the whole toolbar out on macOS removes the collision; the Mac keeps the native
+            // `navigationTitle(pageTitle)` in its titlebar. A compile-time gate (not a runtime branch)
+            // leaves the NavigationStack's structural identity unchanged, so there is no scroll/path reset.
+            #if os(iOS)
             .toolbar {
-                // Keep the toolbar item identity STABLE and toggle its CONTENT, rather than adding/removing
-                // the item when isActive flips. On macOS, inserting/removing a `.principal` item mid-update
-                // crashes NSToolbar (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, Bug 12).
                 ToolbarItem(placement: .principal) {
                     if isActive {
-                        // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows
-                        // the theme accent). Sized down for the nav bar. VortXWordmark is already
-                        // fixedSize'd; the horizontal padding widens the measured bounds so macOS's
-                        // unified-titlebar capsule clears the lockup.
+                        // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (follows the theme
+                        // accent). Sized down for the nav bar; the horizontal padding widens the measured
+                        // bounds so the chrome capsule clears the lockup.
                         VortXWordmark(fontSize: 26)
                             .padding(.horizontal, Theme.Space.xs)
                             .accessibilityAddTraits(.isHeader)
@@ -1870,9 +1881,7 @@ extension View {
                 }
             }
             // #4: a translucent (frosted) top bar, so the hero and content read as scrolling under a
-            // blurred chrome rather than a flat opaque strip. iOS-only — macOS hoists the principal
-            // wordmark into the unified window titlebar, which has no navigation-bar background to style.
-            #if os(iOS)
+            // blurred chrome rather than a flat opaque strip.
             .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             #endif

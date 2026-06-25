@@ -62,8 +62,9 @@ struct UpdatePromptView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 4)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(Theme.Palette.accent)
+                // PrimaryActionStyle uses Theme.Palette.onAccent for the label; the old `.borderedProminent`
+                // + `.tint(accent)` auto-picked white text that vanished on the gold accent (invisible-text).
+                .buttonStyle(PrimaryActionStyle())
 
                 Button("Later") { finish() }
                     .buttonStyle(.bordered)

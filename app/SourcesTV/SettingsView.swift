@@ -13,6 +13,9 @@ struct SettingsView: View {
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
+    /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
+    @State private var langSelection: String = AppLanguage.current ?? "system"
+    @State private var showLangRestart = false
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -27,6 +30,7 @@ struct SettingsView: View {
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
+    @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
@@ -208,6 +212,9 @@ struct SettingsView: View {
             choiceRow("Video upscaling", VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow("Player engine", PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
+            Text("Auto plays HLS and Dolby Vision through AVPlayer and everything else through the built-in player. If a stream will not start, choose Always built-in.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow("Auto-skip intro & credits", [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
@@ -347,11 +354,26 @@ struct SettingsView: View {
 
     // MARK: Appearance (accent + chrome)
 
+    /// "System Default" + every shipped language, for the App Language picker on tvOS.
+    private var appLanguageOptions: [(id: String, label: String)] {
+        [(id: "system", label: "System Default")] + AppLanguage.supported.map { (id: $0.code, label: $0.name) }
+    }
+
     private var appearanceSection: some View {
         section("Appearance") {
             ThemeAccentPicker(selection: $theme.accentID).focusSection()
             ThemeBackgroundPicker(oled: $theme.oled).focusSection()
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow("App Language", appLanguageOptions, selection: Binding(
+                get: { langSelection },
+                set: { newValue in
+                    langSelection = newValue
+                    AppLanguage.set(newValue == "system" ? nil : newValue)
+                    showLangRestart = true
+                }))
+            Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow("Dolby Vision / HDR", [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
@@ -368,6 +390,15 @@ struct SettingsView: View {
             choiceRow("Performance", [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
             Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+        .confirmationDialog("Apply language?", isPresented: $showLangRestart, titleVisibility: .visible) {
+            Button("Quit Now", role: .destructive) {
+                DiagnosticsLog.logSync("app", "user requested app restart to apply language")
+                exit(0)
+            }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("VortX needs to quit and reopen to display the app in the new language. Open it again from the Home Screen.")
         }
     }
 

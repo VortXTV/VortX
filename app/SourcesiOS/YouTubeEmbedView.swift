@@ -117,7 +117,14 @@ final class YouTubeEmbedCoordinator: NSObject, WKScriptMessageHandler {
     init(onFailure: (() -> Void)?) { self.onFailure = onFailure }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == YouTubeEmbedConfig.handlerName, !fired else { return }
+        guard message.name == YouTubeEmbedConfig.handlerName else { return }
+        // Diagnostic logs share the one handler. Surface them to the device console (so the real onError
+        // code is visible) but never treat a log as the failure signal.
+        if let s = message.body as? String, s.hasPrefix("log:") {
+            NSLog("[YouTubeEmbed] %@", String(s.dropFirst(4)))
+            return
+        }
+        guard !fired else { return }
         fired = true
         let cb = onFailure
         DispatchQueue.main.async { cb?() }
@@ -210,8 +217,12 @@ private enum YouTubeEmbedHTML {
           <script src="https://www.youtube.com/iframe_api"></script>
           <script>
             var START = \(start), WIN = \(win), loop, failed = false;
+            function log(m) {
+              try { window.webkit.messageHandlers.\(YouTubeEmbedConfig.handlerName).postMessage('log:' + m); } catch (err) {}
+            }
             function fail() {
               if (failed) return; failed = true;
+              log('fail');
               try { window.webkit.messageHandlers.\(YouTubeEmbedConfig.handlerName).postMessage('failed'); } catch (err) {}
             }
             function onYouTubeIframeAPIReady() {
@@ -226,8 +237,16 @@ private enum YouTubeEmbedHTML {
                     \(onReady)
                   },
                   onStateChange: function (e) { \(onStateChange) },
-                  // 2 invalid id, 5 HTML5 error, 100 removed/private, 101 & 150 embedding disabled.
-                  onError: function (e) { fail(); }
+                  // 2 invalid param, 5 HTML5 error, 100 removed/private, 101 & 150 embedding disabled.
+                  // Codes 2 and 5 fire SPURIOUSLY under WKWebView's synthetic-origin loadHTMLString context
+                  // (often within ~0.5s of onReady) even for perfectly embeddable videos, so treating any
+                  // code as fatal killed EVERY trailer. Only 100/101/150 (truly removed / embedding-disabled)
+                  // fall back; transient 2/5 are logged and ignored. The 6s safety-net still catches a
+                  // player that never loads at all.
+                  onError: function (e) {
+                    log('onError code=' + e.data);
+                    if (e.data === 100 || e.data === 101 || e.data === 150) { fail(); }
+                  }
                 }
               });
             }

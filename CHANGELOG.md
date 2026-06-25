@@ -4,6 +4,36 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.8 Beta 8 - 2026-06-25 (pre-release)
+
+The Beta 7 cleanup release. Beta 7 shipped a big playback and discovery wave, and with it a batch of bugs. This release fixes them: the Mac crash, Apple TV playback, the add-on store, the duplicate "Main" profile, the language setting, the invisible buttons, and the trailer. It also makes the seek-bar styles actually come alive and brings the player-engine choice to Apple TV and Mac. In-place update, nothing resets.
+
+### Fixed
+
+- **Mac no longer crashes.** The Mac app could quit the instant you switched tabs, resized the window, or changed the language. Several browse screens were each trying to place the VortX wordmark into the single shared window title bar at once. The wordmark is now iPhone and iPad only; the Mac keeps its native title and the crash is gone. This also unsticks Mac language changes and keyboard navigation, which the crash had been swallowing.
+- **Apple TV plays again.** Some streams opened to a black screen with no way out. When the native AVPlayer cannot open a stream, VortX now hands it straight to the built-in player instead of dead-ending, so playback always starts. You can also force the built-in player from Settings (see Added).
+- **The duplicate "Main" profile is gone.** Signing in or reinstalling could leave a second "Main" profile behind, and it kept coming back. The account owner now has one fixed identity across every device and install, so it can never be duplicated again, and any existing duplicate is cleaned up automatically on launch. Your real profiles and your synced data are untouched; this was a profile-identity bug in the app.
+- **The add-on store scrolls on Apple TV.** The Discover add-ons list could get stuck at the top because the already-installed rows that head the list were not focusable. Every row is reachable now, so the list scrolls all the way down.
+- **Add-on names read normally on iPhone.** In the add-on store, long names like "Torrentio" could stack one letter per line. Names now stay on a single line beside their type tags and the Install button.
+- **The language setting works, and you can find it.** Picking a language such as Hindi appeared to do nothing, because the app must relaunch to switch language and never offered to. It now offers to quit and reopen so the change actually applies, the picker sits near the top of Settings on iPhone, iPad, and Mac, and Apple TV finally has a language picker too, under Appearance.
+- **Invisible buttons are visible again.** The "Install all add-ons" button and the update prompt's "Get the update" button showed white text on the gold accent, so the labels vanished. They now use the correct on-accent color.
+- **Trailers play.** The in-hero and detail trailer errored within half a second and fell back to the still image for almost every title. It now ignores the transient errors that fire under the hood and only falls back when a video genuinely cannot be embedded.
+
+### Added
+
+- **A player-engine choice on Apple TV and Mac.** Settings, Playback now lets you choose how streams play: Auto, Always built-in, or Prefer AVPlayer for HLS and Dolby Vision. If a stream will not start in one engine, switch to Always built-in. iPhone and iPad already had this; now every platform does.
+- **Seek-bar styles that actually move.** The fourteen seek-bar styles were nearly identical and sat still. They are genuinely distinct and animated now: the Wave flows, the Equalizer bounces, the Comet trails a glow, the Heartbeat sweeps like a monitor, Liquid sloshes, Ripple rings out from the playhead, and more. Pick yours in Settings, Playback, Seek bar style; each preview animates the real design.
+
+### Dashboard (vortx.tv/dashboard)
+
+- **One "Main" on the dashboard too.** The dashboard now collapses any leftover duplicate owner profile on sight, so your account shows a single "Main" while your devices update to the fixed app.
+
+### What we're working on now
+
+- True Dolby Vision and the full player chrome reaching more places, and the remaining Apple TV audio work.
+- Bringing your add-ons, library, and sources fully into your VortX account so the app works from your account alone, independent of a live Stremio session.
+- More of the in-app player and discovery experience landing on the web and desktop apps.
+
 ## 0.3.8 Beta 7 - 2026-06-21 (pre-release)
 
 The playback and discovery release. The headline: the "Prefer AVPlayer (HLS/DV)" engine, with its true Dolby Vision and clean adaptive HLS, now reaches Apple TV and Mac, and on Apple TV it brings in-player Episodes and Sources panels so you can change what you are watching without leaving the player. There is also a new in-app add-on store, source pinning, a plain-language reason for every auto-picked source, and ratings baked onto your posters with no key to set up. In-place update, nothing resets. This is a beta, so please install it and report anything off.

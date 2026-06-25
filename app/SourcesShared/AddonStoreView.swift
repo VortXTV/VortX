@@ -154,7 +154,12 @@ struct AddonStoreView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
             VStack(alignment: .leading, spacing: 8) {
+                // Pin the name to its intrinsic one-line width so it can never be compressed to a ~1pt
+                // vertical sliver (the "T / O / R / R / E / N / T / I / O" squeeze) when the chips row
+                // and trailing button demand the row width on a narrow iPhone.
                 Text(addon.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !addon.summary.isEmpty {
                     Text(addon.summary)
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -165,9 +170,11 @@ struct AddonStoreView: View {
                         ForEach(addon.types.prefix(4), id: \.self) { type in
                             Text(type.capitalized)
                                 .font(Theme.Typography.label)
+                                .lineLimit(1)
                                 .padding(.horizontal, 8).padding(.vertical, 3)
                                 .background(Theme.Palette.surface2, in: Capsule())
                                 .foregroundStyle(Theme.Palette.textSecondary)
+                                .fixedSize()   // each chip keeps its intrinsic size, never pressuring the name
                         }
                     }
                 }
@@ -189,10 +196,25 @@ struct AddonStoreView: View {
     @ViewBuilder
     private func installControl(_ addon: StoreAddon, isInstalled: Bool, isInstalling: Bool) -> some View {
         if isInstalled {
+            #if os(tvOS)
+            // tvOS scrolls a ScrollView via the FOCUS ENGINE: the list only scrolls when focus can step to
+            // a focusable row below the fold. The default add-ons that head the collection are all
+            // "Installed", and a plain Label is NOT focusable, so the early rows offered no focus target
+            // and the whole store was stuck at the top (the reported "can't scroll" bug). A no-op Button
+            // styled as the installed state gives each installed row a focusable control (with visible focus
+            // feedback) so focus travels through every row and pulls the scroll. Never `.disabled` (that
+            // would make it unfocusable again). iOS/Mac scroll by touch/trackpad and keep the plain label.
+            Button { } label: {
+                Label("Installed", systemImage: "checkmark").font(Theme.Typography.label)
+            }
+            .buttonStyle(ChipButtonStyle(selected: true))
+            .fixedSize()
+            #else
             Label("Installed", systemImage: "checkmark")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.ok)
                 .fixedSize()
+            #endif
         } else {
             Button(isInstalling ? "Installing…" : "Install") { installStore(addon) }
                 .buttonStyle(PrimaryActionStyle())

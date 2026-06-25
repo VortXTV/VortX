@@ -45,8 +45,11 @@ struct StremioImportView: View {
                         Label(installing ? "Installing…" : "Install all add-ons",
                               systemImage: "square.and.arrow.down.on.square")
                     }
+                    // PrimaryActionStyle paints the label in Theme.Palette.onAccent on the accent fill.
+                    // The old `.tint(accent)` with the default button style let the system auto-pick a
+                    // white label, which vanished on the light gold accent (the invisible-text bug).
+                    .buttonStyle(PrimaryActionStyle())
                     .disabled(installing || trimmedURLs.isEmpty)
-                    .tint(Theme.Palette.accent)
                     if let summary {
                         Text(summary).font(Theme.Typography.label)
                             .foregroundStyle(summaryIsError ? Theme.Palette.warn : Theme.Palette.textSecondary)

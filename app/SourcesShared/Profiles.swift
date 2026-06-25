@@ -94,6 +94,14 @@ struct UserProfile: Codable, Identifiable, Equatable {
         if stored.hasPrefix("sha256:") { return stored == Self.pinHash(input, profileID: id) }
         return stored == input
     }
+
+    /// The one and only owner-profile id. The account owner is a singleton, so it carries a FIXED id on
+    /// every device and install. Minting it with a fresh random `UUID()` per install was the root of the
+    /// duplicate-"Main" bug: the owner ids never matched across installs, so the cross-device UNION merge
+    /// kept all of them (one real owner plus a leftover "Main" clone per install). A fixed id makes the
+    /// owner dedupe by id, so no duplicate can form. (A roster only ever belongs to one account, so a
+    /// fixed shared id is safe here; per-account uniqueness is not required.)
+    static let ownerID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
     /// Whether this profile's history is the account library itself (the owner, and any profile on
     /// its own account) or a private synced overlay (every other shared profile).
     var usesEngineHistory: Bool { isOwner || usesOwnAccount }
@@ -184,10 +192,16 @@ final class ProfileStore: ObservableObject {
             profiles[0].isOwner = true
             persist(touch: false)
         }
+        let rosterBeforeNormalize = profiles
         normalizeOwner()
         if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
             activeID = profiles.first?.id
         }
+        // Persist the owner-singleton heal (the duplicate-"Main" drop + stable-id re-key) so it survives
+        // relaunch and the next account sync carries a clean roster to the cloud and the dashboard. touch:
+        // false so launch never schedules a push (no sync ping-pong); it fires at most once, since after
+        // the heal the roster matches on every later launch.
+        if profiles != rosterBeforeNormalize { persist(touch: false) }
         // The active profile owns the theme; resync in case the stored values drifted. Seed the
         // add-on-visibility flat key too, so the first board build at launch honors the active
         // profile's set (no CoreBridge call here: the board is built later from the engine event).
@@ -537,7 +551,7 @@ final class ProfileStore: ObservableObject {
     private func migrateFromSingleAccount() {
         let email = UserDefaults.standard.string(forKey: "stremiox.email")
         let name = email.flatMap { $0.split(separator: "@").first.map(String.init) }?.capitalized ?? "Main"
-        let first = UserProfile(name: name, avatar: "🍿",
+        let first = UserProfile(id: UserProfile.ownerID, name: name, avatar: "🍿",
                                 accentID: ThemeManager.shared.accentID,
                                 oled: ThemeManager.shared.oled,
                                 textScale: ThemeManager.shared.textScale,
@@ -680,21 +694,40 @@ final class ProfileStore: ObservableObject {
         for index in profiles.indices where profiles[index].isOwner {
             profiles[index].usesOwnAccount = false
         }
-        // The owner is a singleton: one account, one owner profile. A restore/merge can leave more than
-        // one (e.g. the account owner adopted alongside a leftover local placeholder: the duplicate-"Main"
-        // bug). Collapse to ONE, direction-independently. Keep the genuine account owner, identified by its
-        // account email (the placeholder default is created with a nil email and the name "Main"; the
-        // account owner carries the email). Demote the rest to ordinary shared profiles, NEVER delete:
-        // a demoted profile keeps its overlay and becomes deletable from the dashboard.
+        // The owner is a singleton: one account, one owner profile, with a STABLE id (UserProfile.ownerID).
+        // A restore/merge can leave more than one (the account owner adopted alongside a leftover local
+        // placeholder minted with a random id: the duplicate-"Main" bug). Collapse to ONE,
+        // direction-independently. Keep the genuine account owner, identified by its account email (the
+        // placeholder default is created with a nil email and the name "Main"; the account owner carries
+        // the email). The duplicate owners are DROPPED, not demoted: an owner reads the account/engine
+        // history and carries no private watch overlay, so a clone has nothing unique to lose, and dropping
+        // it is what finally removes the leftover "Main" the owner kept seeing. Secondaries are never owners
+        // and are never touched here, so the union's "never silently drop a profile with its own history"
+        // guarantee is preserved.
         let owners = profiles.indices.filter { profiles[$0].isOwner }
-        guard owners.count > 1 else { return }
+        guard let firstOwner = owners.first else { return }
         let signedInEmail = UserDefaults.standard.string(forKey: "stremiox.email")
         let keep = owners.first(where: { signedInEmail != nil && !signedInEmail!.isEmpty && profiles[$0].email == signedInEmail })
             ?? owners.first(where: { !(profiles[$0].email ?? "").isEmpty })
             ?? owners.first(where: { profiles[$0].id == activeID })
-            ?? owners[0]
-        for index in owners where index != keep {
-            profiles[index].isOwner = false
+            ?? firstOwner
+        let keepID = profiles[keep].id
+        if owners.count > 1 {
+            let dropIDs = Set(owners.filter { profiles[$0].id != keepID }.map { profiles[$0].id })
+            profiles.removeAll { $0.isOwner && dropIDs.contains($0.id) }
+            if let a = activeID, dropIDs.contains(a) { activeID = keepID }
+        }
+        // Re-key the surviving owner onto the stable owner id so every device converges and future merges
+        // dedupe by id. Skip if the owner carries a parental PIN (its hash is salted with the current id,
+        // so re-keying would silently break the PIN) or if some other profile already holds the stable id
+        // (avoid an id collision). The drop above already removes the duplicate even without re-keying.
+        if let idx = profiles.firstIndex(where: { $0.isOwner }),
+           profiles[idx].id != UserProfile.ownerID,
+           !(profiles[idx].hasPin),
+           !profiles.contains(where: { $0.id == UserProfile.ownerID && !$0.isOwner }) {
+            let old = profiles[idx].id
+            profiles[idx].id = UserProfile.ownerID
+            if activeID == old { activeID = UserProfile.ownerID }
         }
     }
 

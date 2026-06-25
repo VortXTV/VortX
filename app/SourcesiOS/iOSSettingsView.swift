@@ -47,7 +47,7 @@ struct iOSSettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
-    #if os(iOS)
+    #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
@@ -59,6 +59,9 @@ struct iOSSettingsView: View {
     @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
     /// App-language override ("system" = follow the device). Applied via AppLanguage; needs a relaunch.
     @State private var langSelection: String = AppLanguage.current ?? "system"
+    /// Shown after a language pick to offer the relaunch that actually applies it (the localized bundle is
+    /// chosen once at launch, so the change is invisible until the app quits and reopens).
+    @State private var pendingLangRestart = false
 
     // Backup & Restore: carry local settings across the StremioX -> VortX move (see SettingsBackup).
     @State private var showBackupExporter = false
@@ -80,13 +83,13 @@ struct iOSSettingsView: View {
                 // as warm dark surfaces with canvas showing between them, matching the rest of the app
                 // (and identical on iPadOS, which shares this view).
                 profilesSection.listRowBackground(Theme.Palette.surface1)
+                languageSection.listRowBackground(Theme.Palette.surface1)
                 accountSection.listRowBackground(Theme.Palette.surface1)
                 playbackSection.listRowBackground(Theme.Palette.surface1)
                 notificationsSection.listRowBackground(Theme.Palette.surface1)
                 streamsSection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
-                languageSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
                 subtitleSection.listRowBackground(Theme.Palette.surface1)
                 advancedSection.listRowBackground(Theme.Palette.surface1)
@@ -294,11 +297,18 @@ struct iOSSettingsView: View {
             }
             .onChange(of: langSelection) { newValue in
                 AppLanguage.set(newValue == "system" ? nil : newValue)
+                pendingLangRestart = true
             }
         } header: {
             Text("Language")
         } footer: {
-            Text("Choose the app's language. \"System Default\" follows your device language. A change takes full effect the next time you quit and reopen VortX.")
+            Text("Choose the app's language. \"System Default\" follows your device language. VortX must quit and reopen to apply a new language.")
+        }
+        .confirmationDialog("Apply language?", isPresented: $pendingLangRestart, titleVisibility: .visible) {
+            Button("Quit Now", role: .destructive) { exit(0) }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("VortX needs to quit and reopen to display the app in the new language. Reopen it after it closes.")
         }
     }
 
@@ -353,7 +363,7 @@ struct iOSSettingsView: View {
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
                 ForEach(PlayerEngineRouter.Override.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
