@@ -681,6 +681,13 @@ final class ProfileStore: ObservableObject {
         loadWatchCache()
     }
 
+    /// Apply the LOCAL delete tombstones to the live roster. Called by VortXSyncManager after EVERY sync pull,
+    /// so a profile this device just deleted is removed again even when the pulled doc PREDATES the tombstone
+    /// reaching the cloud (the resurrect-after-delete window: a pull lands the account's old roster back
+    /// between the delete and its debounced push). The local tombstone set is the durable authority, so
+    /// applying it on every pull closes that window. Idempotent; never touches the owner.
+    func applyLocalTombstones() { pruneTombstonedProfiles() }
+
     // MARK: Roster sync (the profile list follows the primary account across devices)
 
     /// Pull the remote roster once the account is reachable; newest side wins wholesale. AuthKeys
@@ -813,6 +820,45 @@ final class ProfileStore: ObservableObject {
             profiles[idx].id = UserProfile.ownerID
             if activeID == old { activeID = UserProfile.ownerID }
         }
+        collapseEmptyDuplicateSecondaries()
+    }
+
+    /// Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
+    /// (trimmed, case-insensitive), an EMPTY one (no watch overlay) is almost always a cross-device sync
+    /// artifact, the same person's profile re-created with a fresh UUID on another device, so the union keeps
+    /// both and the user sees a second "Daksh" that a delete cannot clear (its twin keeps coming back). Drop
+    /// AND tombstone the empty duplicate when a same-name profile is already kept, so it never returns. A
+    /// profile that carries its OWN watch history is NEVER auto-removed, so a genuine same-name conflict is
+    /// left for the user to resolve and no history is ever lost.
+    private func collapseEmptyDuplicateSecondaries() {
+        let secondaries = profiles.filter { !$0.isOwner }
+        guard secondaries.count > 1 else { return }
+        func nameKey(_ p: UserProfile) -> String { p.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        func hasHistory(_ id: UUID) -> Bool {
+            guard let d = UserDefaults.standard.data(forKey: Self.watchCacheKey(id)),
+                  let m = try? JSONDecoder().decode([String: WatchEntry].self, from: d) else { return false }
+            return !m.isEmpty
+        }
+        // History-bearing profiles sort first so they are always the kept one for their name; the rest sort
+        // deterministically. Then, per name, keep the first and drop only the EMPTY duplicates.
+        let ordered = secondaries.sorted {
+            hasHistory($0.id) != hasHistory($1.id) ? hasHistory($0.id) : $0.id.uuidString < $1.id.uuidString
+        }
+        var keptNames = Set<String>()
+        var dropIDs = Set<UUID>()
+        for p in ordered {
+            let k = nameKey(p)
+            if k.isEmpty { continue }
+            if keptNames.contains(k) {
+                if !hasHistory(p.id) { dropIDs.insert(p.id) }   // empty same-name dup: safe to remove
+            } else {
+                keptNames.insert(k)
+            }
+        }
+        guard !dropIDs.isEmpty else { return }
+        for id in dropIDs { tombstone(id) }                      // durable: never resurrects via the union-merge
+        profiles.removeAll { dropIDs.contains($0.id) }
+        if let a = activeID, dropIDs.contains(a) { activeID = profiles.first?.id }
     }
 
     // MARK: Roster merge (UNION by id, so cross-device sync never silently drops a profile)

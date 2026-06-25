@@ -495,16 +495,18 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncDown(force: Bool = false) async -> Bool {
         guard isSignedIn else { return false }
+        // PENDING-EDIT GUARD. When a GENUINE local edit is queued (a settings toggle, a profile delete: the
+        // observer armed hasPendingPush), defer this pull until that edit's debounced push lands. Without it an
+        // interleaved pull re-applies the account's pre-edit value and the change the user just made flips back
+        // within a second: the ERDB / fanart toggle that would not stay off, and the deleted profile that came
+        // straight back. This is SAFE from the Beta 8/9 starvation now that routine touch:false launch
+        // housekeeping is suppressed and no longer arms hasPendingPush (see the observer + suppressHousekeeping):
+        // an idle receiving device has hasPendingPush == false, so it still applies a peer's newer settings. The
+        // queued push fires on its own debounce and syncUp read-merges, so deferring here never loses anything.
+        if !force, hasPendingPush { return false }
         guard let pulled = await pullDocVersioned() else { return false }
-        // VERSION-WINS GUARD. Bail on a version this device already has (the no-op / stale pull); this is also
-        // where hasPendingPush is honored, because a stale pull is exactly what could clobber a queued local
-        // edit. But a STRICTLY NEWER peer version (pulled.version > lastSyncedVersion) is ALWAYS applied, even
-        // while a local push is queued: hasPendingPush exists only to protect a queued local edit from a STALE
-        // pull, not to block a fresh one. The OLD code put `if !force, hasPendingPush { return false }` BEFORE
-        // this check, so on a device with constant pull-time UserDefaults churn (which kept hasPendingPush
-        // ~always true) every WebSocket/poll pull bailed and the peer's newer settings never applied (the
-        // Beta 8/9 regression). The queued local push still fires on its own debounce and syncUp read-merges,
-        // so applying the newer remote first never loses the local edit.
+        // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
+        // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
@@ -526,6 +528,7 @@ final class VortXSyncManager: ObservableObject {
                 restored = true
                 ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
                 ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
+                ProfileStore.shared.applyLocalTombstones()           // a profile deleted this session stays gone even if the pulled doc predates its tombstone (the resurrect window)
                 LastStreamStore.invalidateCache()                    // the restore wrote new lastStream behind the cache; re-read it
             }
         }
