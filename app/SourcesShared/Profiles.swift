@@ -157,6 +157,11 @@ final class ProfileStore: ObservableObject {
     private static let listKey = "stremiox.profiles"
     private static let activeKey = "stremiox.profiles.active"
     private static let modifiedKey = "stremiox.profiles.modified"
+    /// Durable cross-device delete tombstones: profile ids the user has DELETED. The app owns this set
+    /// (it lives in doc.vortx.deletedProfiles, the app's namespace) so a deleted profile can never be
+    /// resurrected by a peer device's union-merge or a stale pre-delete cloud blob. The owner id is
+    /// never tombstoned. See [[vortx-2026-06-25-rootcause-investigation]] section 2.
+    private static let deletedKey = "stremiox.profiles.deleted"
     private static func watchCacheKey(_ id: UUID) -> String { "stremiox.profiles.watch." + id.uuidString }
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
@@ -182,7 +187,13 @@ final class ProfileStore: ObservableObject {
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
 
+    /// Durable delete tombstones (profile id strings). Persisted in UserDefaults, emitted into
+    /// doc.vortx.deletedProfiles by VortXSyncManager, and subtracted from every roster union so a
+    /// deleted profile cannot reappear. The owner id is never added (the owner always exists).
+    private(set) var deletedProfileIDs: Set<String> = []
+
     private init() {
+        loadDeletedTombstones()
         load()
         if profiles.isEmpty { migrateFromSingleAccount() }
         hashLegacyPins()
@@ -306,6 +317,7 @@ final class ProfileStore: ObservableObject {
         profiles.removeAll { $0.id == profile.id }
         if profile.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: profile)) }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(profile.id))
+        tombstone(profile.id)   // durable cross-device delete; the union-merge can no longer resurrect it
         persist()
         if activeID == profile.id, let first = profiles.first { return select(first) }
         return nil
@@ -323,8 +335,16 @@ final class ProfileStore: ObservableObject {
                 let existing = profiles.first(where: { $0.id == uuid })
                 if e["deleted"] as? Bool == true {
                     // DELETE, hard-gated: only a non-owner profile; remove() refuses the last one and
-                    // clears that profile's watch cache + per-profile keychain slot.
-                    if let target = existing, !target.isOwner { remove(target) }
+                    // clears that profile's watch cache + per-profile keychain slot, and now records a
+                    // durable tombstone so a peer device can never resurrect it via the union-merge.
+                    if let target = existing, !target.isOwner {
+                        remove(target)
+                    } else if existing == nil, uuid != UserProfile.ownerID {
+                        // The profile is already gone locally but a peer may still hold it: tombstone the
+                        // id anyway so the next roster union from that peer drops it instead of bringing
+                        // it back. Never tombstone the owner.
+                        tombstone(uuid)
+                    }
                     continue
                 }
                 if var p = existing {
@@ -597,6 +617,56 @@ final class ProfileStore: ObservableObject {
         }
     }
 
+    // MARK: Delete tombstones (durable cross-device delete propagation)
+
+    private func loadDeletedTombstones() {
+        deletedProfileIDs = Set(UserDefaults.standard.stringArray(forKey: Self.deletedKey) ?? [])
+    }
+
+    private func saveDeletedTombstones() {
+        UserDefaults.standard.set(Array(deletedProfileIDs), forKey: Self.deletedKey)
+    }
+
+    /// Record a profile deletion so it sticks across devices. NEVER tombstones the owner (it always
+    /// exists, so a stray tombstone there would erase the account owner). Idempotent.
+    private func tombstone(_ id: UUID) {
+        guard id != UserProfile.ownerID else { return }
+        let key = id.uuidString
+        guard !deletedProfileIDs.contains(key) else { return }
+        deletedProfileIDs.insert(key)
+        saveDeletedTombstones()
+    }
+
+    /// Fold incoming tombstones (from another device's doc.vortx.deletedProfiles) into the local set,
+    /// dropping the owner id defensively. Returns true when the set changed (so callers can prune the
+    /// live roster of any now-tombstoned profile). The union means a tombstone propagates everywhere.
+    @discardableResult
+    func mergeDeletedTombstones(_ incoming: [String]) -> Bool {
+        let add = incoming.filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
+        guard !add.isEmpty else { return false }
+        deletedProfileIDs.formUnion(add)
+        saveDeletedTombstones()
+        pruneTombstonedProfiles()
+        return true
+    }
+
+    /// Remove any live profile whose id is tombstoned (the owner is never tombstoned, so it is safe).
+    /// touch: false so a prune driven by a sync-down never schedules a redundant push.
+    private func pruneTombstonedProfiles() {
+        let before = profiles
+        profiles.removeAll { deletedProfileIDs.contains($0.id.uuidString) && !$0.isOwner }
+        guard profiles != before else { return }
+        if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
+            activeID = profiles.first?.id
+        }
+        if let active {
+            applyTheme(active)
+            applyPlayback(active)
+        }
+        persist(touch: false)
+        loadWatchCache()
+    }
+
     // MARK: Roster sync (the profile list follows the primary account across devices)
 
     /// Pull the remote roster once the account is reachable; newest side wins wholesale. AuthKeys
@@ -788,6 +858,11 @@ final class ProfileStore: ObservableObject {
         for remote in incoming where localByID[remote.id] == nil {
             merged.append(remote)
         }
+
+        // SUBTRACT delete tombstones from the union: a profile the user deleted must NOT come back, even
+        // if a peer device (or the pre-delete cloud blob) still carries it. The owner is never tombstoned,
+        // so this can never remove the account owner.
+        merged.removeAll { deletedProfileIDs.contains($0.id.uuidString) && !$0.isOwner }
 
         // No change once the ids and chosen fields already match: skip the write so this never loops
         // (reloadFromDefaults / syncDown call into here on the foreground/auto path).

@@ -25,7 +25,14 @@ final class VortXSyncManager: ObservableObject {
     private var token: String?
     private var dataKey: Data?
     private var lastSyncedVersion = 0   // newest doc version this device has pushed or applied
-    private var lastAppliedProfileEditsAt: Double = 0  // LWW stamp of the last web profileEdits applied (in-memory; re-apply is idempotent)
+    /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
+    /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
+    /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
+    private static let kEditsAtKey = "vortx.sync.lastAppliedProfileEditsAt"
+    private var lastAppliedProfileEditsAt: Double {
+        get { UserDefaults.standard.double(forKey: Self.kEditsAtKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.kEditsAtKey) }
+    }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
 
     // MARK: - Real-time sync state (WebSocket + while-active poll)
@@ -310,6 +317,11 @@ final class VortXSyncManager: ObservableObject {
         if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
         if !addonList.isEmpty { v["addons"] = addonList }
         if let active = store.activeID { v["activeProfile"] = active.uuidString }
+        // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
+        // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
+        // resurrecting them. Empty set is omitted so a fresh account never writes the key.
+        let deleted = store.deletedProfileIDs
+        if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
         return v
     }
 
@@ -353,11 +365,17 @@ final class VortXSyncManager: ObservableObject {
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
         doc["vortx"] = vortxSummary()   // JSON the dashboard can read (profiles, active selection)
-        var keys: [String: String] = [:]
+        // READ-MERGE, never wholesale-rebuild. Start from the PULLED apiKeys and only SET the keys this
+        // device actually holds; never DELETE a key this device did not author. A device without a TMDB
+        // key (or with no keys at all) used to drop the whole object on push, and because pushes version
+        // with epoch-ms wall-clock they win last-writer-wins over the dashboard's save, wiping the
+        // dashboard's TMDB key. Mirrors the asymmetric read-side debrid guard in syncDown.
+        var keys = (doc["apiKeys"] as? [String: String]) ?? [:]
         if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
         if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
+        // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
         let debrid = DebridKeys.shared
         if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
         if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
@@ -431,6 +449,12 @@ final class VortXSyncManager: ObservableObject {
         // local overlay so a secondary profile's library + CW actually appear in the app on every device, not
         // just the dashboard. ProfileStore.applyRemoteOverlay merges last-writer-wins per item and only ever
         // touches overlay caches, never the owner/engine (account) library.
+        // Cross-device delete tombstones: fold any incoming doc.vortx.deletedProfiles into the local set
+        // FIRST (before applying the roster below), so a profile another device deleted is dropped here
+        // and the union-merge can never bring it back. mergeDeletedTombstones also prunes the live roster.
+        if let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
+            if ProfileStore.shared.mergeDeletedTombstones(deleted) { restored = true }
+        }
         if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
             for (idStr, raw) in byProfile {
                 guard let uuid = UUID(uuidString: idStr),
