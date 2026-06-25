@@ -19,6 +19,26 @@ enum AddonTerms {
     static func localize(_ raw: String) -> String {
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return raw }
-        return NSLocalizedString(key, comment: "Add-on-provided category / genre / content-type name")
+        let whole = NSLocalizedString(key, comment: "Add-on-provided category / genre / content-type name")
+        if whole != key { return whole }   // whole-string translation exists, use it as-is
+        return tokenized(key) ?? whole      // else try word-wise (compound names), else passthrough
+    }
+
+    /// Word-wise fallback for compound add-on names ("Popular Movies", "Top Series") whose whole string is
+    /// not in the catalog but whose individual words are. Localizes each space-separated word and re-joins
+    /// ONLY when every word resolved to a real translation; if any word is unknown it returns nil so the
+    /// caller keeps the original wording untouched. This preserves the whole-string safety invariant (never
+    /// half-translate or reorder a name) while still localizing the common Cinemeta compound titles, which
+    /// is why so many catalog rows read as English even when the per-word vocabulary is present.
+    private static func tokenized(_ key: String) -> String? {
+        let words = key.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard words.count > 1 else { return nil }   // single word already missed the whole-string lookup
+        var out: [String] = []
+        for w in words {
+            let t = NSLocalizedString(w, comment: "Add-on category word")
+            if t == w { return nil }   // an unknown word aborts: keep the original compound name intact
+            out.append(t)
+        }
+        return out.joined(separator: " ")
     }
 }
