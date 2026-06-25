@@ -390,23 +390,31 @@ final class CoreBridge: ObservableObject {
     /// True when the current Discover catalog has another page to load. `selectable.nextPage` is the
     /// authoritative cursor, but the engine only sets it when the add-on declares the `skip` extra. Many
     /// add-ons (e.g. AIO Metadata, KhmerAve) omit `skip`, so the cursor is always nil even though
-    /// `LoadNextPage` pages them fine and the official app paginates them too. For those CURSORLESS catalogs
-    /// (ones that have never shown a cursor) we fall back to a count-driven gate that keeps paging until a
-    /// fully-settled load returns no new items (`discoverExhausted`); a cursored catalog that reached its
-    /// end (cursor went nil after having one) correctly stops.
+    /// `LoadNextPage` pages them fine and the official app paginates them too. For those catalogs we fall
+    /// back to a count-driven gate that keeps paging until a fully-settled load returns no new items
+    /// (`discoverExhausted`).
+    ///
+    /// #95: a catalog can ADVERTISE `skip` (so a cursor appears) yet have its cursor go nil mid-catalog
+    /// while more items still exist (MyTraktSync stops at ~15-20 this way). The old gate latched
+    /// `discoverEverHadCursor` the first time any cursor appeared and then returned `false` forever once the
+    /// cursor went nil, permanently disabling the count-driven fallback and stranding the catalog at one
+    /// page. So we no longer hard-stop on the latch alone: when there is no cursor we defer to the same
+    /// count-driven gate the cursorless catalogs use, which keeps paging only until a settled `LoadNextPage`
+    /// returns no new items (`discoverExhausted`). A genuinely finished cursored catalog therefore makes at
+    /// most ONE extra no-op `LoadNextPage` (the engine ignores it when there is truly no next page) and then
+    /// `discoverExhausted` stops it -- additive, and it does not loop. A healthy catalog that still has its
+    /// cursor returns early on the first line and is unaffected.
     var discoverHasNextPage: Bool {
         if discover?.selectable.nextPage != nil { return true }
-        if discoverEverHadCursor { return false }            // a cursored catalog that hit its last page
-        return !discoverExhausted && (discover?.items.count ?? 0) > 0   // cursorless skip-pagination fallback
+        return !discoverExhausted && (discover?.items.count ?? 0) > 0   // count-driven fallback (#95)
     }
     /// Set while a next-page load is dispatched, cleared when the load SETTLES (not on the interim
     /// "Loading" emit), so a burst of last-item onAppear events from the grid can't fire duplicate loads.
     private var discoverPageInFlight = false
-    /// True once the current catalog has shown a real `next_page` cursor: then we trust the cursor alone
-    /// and skip the cursorless fallback. Reset on every catalog change.
-    private var discoverEverHadCursor = false
-    /// Latched true when a cursorless next-page load settles without growing the list (no more pages), so a
-    /// finite catalog never loops on no-op loads. Reset on every catalog change.
+    /// Latched true when a next-page load settles without growing the list (no more pages), so a finite
+    /// catalog never loops on no-op loads. Reset on every catalog change. #95: this is now the SOLE stop for
+    /// a cursor that went nil (cursorless from the start, or a cursored catalog whose cursor dropped
+    /// mid-catalog), so it must stay accurate for both.
     private var discoverExhausted = false
     /// Item count captured when a next-page load is dispatched, to detect whether the settled load grew the
     /// list (more pages) or not (end of a cursorless catalog).
@@ -427,7 +435,6 @@ final class CoreBridge: ObservableObject {
     /// the next catalog starts fresh and the previous one's exhausted/cursor state never leaks across.
     private func resetDiscoverPagination() {
         discoverPageInFlight = false
-        discoverEverHadCursor = false
         discoverExhausted = false
         discoverCountAtLoad = 0
     }
@@ -1140,11 +1147,10 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreDiscover.self, field: "discover")
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Once a real cursor appears, trust it alone (disable the cursorless fallback for this catalog).
-                if value?.selectable.nextPage != nil { self.discoverEverHadCursor = true }
-                // Cursorless end-stop: a next-page load that has FULLY settled (no page still loading) without
-                // growing the list means there are no more pages. Gate on !isLoadingPage so the interim
-                // "Loading" emit (same count, more coming) never latches exhausted early.
+                // End-stop (#95): a next-page load that has FULLY settled (no page still loading) without
+                // growing the list means there are no more pages, whether the catalog was cursorless or its
+                // cursor went nil mid-catalog. Gate on !isLoadingPage so the interim "Loading" emit (same
+                // count, more coming) never latches exhausted early.
                 if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
                     self.discoverExhausted = true
                 }
