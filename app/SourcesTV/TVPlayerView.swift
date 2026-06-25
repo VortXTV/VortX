@@ -16,6 +16,7 @@ struct TVPlayerView: View {
     var bingeGroup: String? = nil              // the launching stream's release-group tag, for sticky auto-next
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var forceMPV: Bool = false                 // last-resort escape hatch: skip AVPlayer routing, mount libmpv directly
+    var isTrailer: Bool = false                // FIX I: a trailer clip, not a content stream → never fail over to engine streams
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -1117,6 +1118,17 @@ struct TVPlayerView: View {
     /// hop budget is spent or nothing untried remains; the caller then shows the error overlay.
     @discardableResult
     private func hopToNextSource(reason: String) -> Bool {
+        // FIX I: a TRAILER never fails over to the engine's content streams. The trailer request carries no
+        // content stream of its own; nextUntriedStream() would return whatever the engine last loaded for
+        // this (or a still-resident) title, so a dead /yt route would silently play the actual/random movie.
+        // Instead show the load-error overlay ("Trailer unavailable") and stop. Return true so the caller
+        // treats the failure as handled and does not also paint its own (content-stream) error message.
+        if isTrailer {
+            DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
+            loadErrorMsg = "Trailer unavailable."
+            withAnimation { loadFailed = true }
+            return true
+        }
         guard sourceHops < maxSourceHops, let stream = nextUntriedStream() else { return false }
         // switchStream clears the budget (it doubles as the manual-pick path) and resumes at
         // currentTime; snapshot both around the call so the hop keeps its own bookkeeping and a

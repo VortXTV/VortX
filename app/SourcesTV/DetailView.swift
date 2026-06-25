@@ -400,23 +400,21 @@ struct DetailView: View {
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
                       primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
+        // FIX J: the series hero is now FULL-BLEED, matching the movie detail + home hero, instead of the
+        // old fixed ~560pt clipped band that read as a small box. The backdrop uses the shared
+        // FullBleedBackdrop treatment (self-bleeding past safe area horizontally, warm canvas scrims), and
+        // the hero region fills a tall top band proportioned like the movie page hero. The episode list
+        // (CoreSeasonedEpisodes) still renders BELOW it in the seriesPage scroll, unchanged.
         ZStack(alignment: .bottomLeading) {
-            AsyncImage(url: URL(string: m.background ?? m.poster ?? "")) { phase in
-                switch phase {
-                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-                default: Theme.Palette.surface1
-                }
-            }
-            .frame(height: 560)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            // #44: the muted, looping trailer fades in OVER the still hero art, clipped to the same band.
+            FullBleedBackdrop(url: m.background ?? m.poster)
+            // #44: the muted, looping trailer fades in OVER the still hero art, full-bleed behind the title.
             // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
-            .overlay(heroTrailerLayer(m).frame(height: 560).frame(maxWidth: .infinity).clipped())
-            .overlay(LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
-                                    startPoint: .top, endPoint: .bottom))
-            .overlay(LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
-                                    startPoint: .leading, endPoint: .center))
+            heroTrailerLayer(m).ignoresSafeArea()
+            // A bottom canvas scrim under the title/actions block so it stays readable over vivid art.
+            LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
 
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text(m.name)
@@ -477,7 +475,10 @@ struct DetailView: View {
             .padding(.horizontal, Theme.Space.screenEdge)
             .padding(.bottom, Theme.Space.lg)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // FIX J: a tall, full-width hero region so the backdrop fills the top of the screen like the movie
+        // detail + home hero, instead of the old small ~560pt band. The title/actions block stays pinned to
+        // the bottom (ZStack .bottomLeading); the episode list scrolls in below this in seriesPage.
+        .frame(maxWidth: .infinity, minHeight: 760, alignment: .bottomLeading)
     }
 
     /// #44 in-hero trailer layer: a muted, looping libmpv clip ({serverBase}/yt/{id}) painted OVER the
@@ -506,7 +507,9 @@ struct DetailView: View {
     @ViewBuilder private func trailerChip(_ m: CoreMetaItem) -> some View {
         if let req = TrailerRequest.from(meta: m), let url = req.playableURL {
             Button {
-                presenter.request = PlaybackRequest(url: url, title: "\(m.name) — Trailer")
+                // FIX I: tag this as a trailer so a dead /yt route shows "Trailer unavailable" instead
+                // of failing over to the engine's content streams (which would play the actual/random movie).
+                presenter.request = PlaybackRequest(url: url, title: "\(m.name) Trailer", isTrailer: true)
             } label: {
                 Label("Trailer", systemImage: "film")
             }
@@ -920,6 +923,11 @@ struct CoreStreamList: View {
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
+    // FIX H: seat the detail page's initial focus on Watch Now, not the Trailer chip. The movie page
+    // lays the trailer chip out ABOVE this list, so without an explicit default the focus engine parked
+    // on Trailer. Watch Now stays focusable even while gated (the button is never .disabled), so it is a
+    // valid default on appear; this only sets WHERE focus lands, it does not touch the RemoteCatcher model.
+    @FocusState private var watchFocused: Bool
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
@@ -970,6 +978,7 @@ struct CoreStreamList: View {
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(watchReady ? 1 : 0.55)
                     .contextMenu { resolutionMenu(groups) }
+                    .focused($watchFocused)   // FIX H: target of the page's default focus
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
                     // 720p / Others), then the flavors inside it (Dolby Vision · Remux, HDR · Atmos, …).
@@ -1052,6 +1061,9 @@ struct CoreStreamList: View {
         // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
         // enclosing ScrollView centered it — the "black bar with two buttons in the middle" bug.
         .frame(maxWidth: .infinity, alignment: .leading)
+        // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
+        // first focusable view, which on the movie page is the Trailer chip laid out higher up.
+        .defaultFocus($watchFocused, true)
         .task {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true

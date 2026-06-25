@@ -25,6 +25,10 @@ struct PlaybackRequest: Identifiable {
     /// longer needed for the common load failure; it remains for any path that wants to bypass AVPlayer
     /// routing entirely and mount libmpv directly.
     var forceMPV: Bool = false
+    /// FIX I: this request plays a TRAILER clip (the {server}/yt/{id} route), not a content stream. When a
+    /// trailer fails to load, the player must NOT fall back to the engine's content streams (that would
+    /// substitute the actual/random movie for the dead trailer); it shows the error overlay and stops.
+    var isTrailer: Bool = false
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -73,7 +77,7 @@ struct RootView: View {
                 // last-resort escape hatch) just means TVPlayerView mounts libmpv directly.
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
-                             headers: req.headers, forceMPV: req.forceMPV,
+                             headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }
