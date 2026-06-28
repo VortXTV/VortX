@@ -1,25 +1,37 @@
 import Foundation
 import os
 
-/// Layer 2: crowd-sourced skip timestamps from TheIntroDB (theintrodb.org), the community database
-/// behind several media-server skip plugins. Looked up by the IMDB id the app already has from
-/// Cinemeta (+ season/episode for series, nothing for movies); reads are anonymous. Results, and
-/// misses, cache to disk so an episode costs one request, not one per play, which also keeps us far
-/// inside the API's 30-requests-per-10s budget.
+/// Layer 2: crowd-sourced skip timestamps from TheIntroDB (theintrodb.org) and/or SkipDB
+/// (skipdb.tv). Looked up by the IMDB id the app already has from Cinemeta (+
+/// season/episode for series, nothing for movies); reads are anonymous. Results, and misses, cache
+/// to disk so an episode costs one request per provider, not one per play.
 enum SkipTimestampService {
 
-    /// Crowd spans for one title, as resolver candidates. Returns [] quietly on any failure: no
-    /// network, unknown title, or a non-IMDB id (some add-ons use their own id schemes) just means
-    /// the player falls back to the other layers, never an error surfaced mid-playback.
+    /// UserDefaults key for the chosen skip-timestamp provider.
+    /// Values: "theintrodb" (default), "skipdb", "both"
+    static let providerKey = "stremiox.skipProvider"
+
     private static let log = Logger(subsystem: "com.stremiox.app", category: "skiptimes")
 
-    /// All skip candidates for a title, merging TheIntroDB (any media) with AniSkip (anime), run
-    /// concurrently. Either source returning [] is normal; the player gets whatever was found and the
-    /// resolver's sanity guards clamp both, so an anime source can never cause a wild mid-episode skip.
+    private static var provider: String {
+        UserDefaults.standard.string(forKey: providerKey) ?? "both"
+    }
+
+    /// All skip candidates for a title, merging the chosen crowd source(s) with AniSkip (anime).
     static func candidates(imdbId: String, season: Int?, episode: Int?,
                            durationSeconds: Double) async -> [SegmentCandidate] {
         async let aniskip = AniSkipService.candidates(metaId: imdbId, episode: episode, durationSeconds: durationSeconds)
-        let crowd = await theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        let crowd: [SegmentCandidate]
+        switch provider {
+        case "skipdb":
+            crowd = await skipDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        case "both":
+            async let introdb = theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+            async let skipdb  = skipDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+            crowd = await introdb + skipdb
+        default: // "theintrodb"
+            crowd = await theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        }
         return crowd + (await aniskip)
     }
 
@@ -27,7 +39,8 @@ enum SkipTimestampService {
     private static func theIntroDB(imdbId: String, season: Int?, episode: Int?,
                                    durationSeconds: Double) async -> [SegmentCandidate] {
         guard let idItem = queryItem(for: imdbId) else { return [] }
-        let key = "\(imdbId):\(season ?? 0):\(episode ?? 0)"
+        let durationBucket = Int(durationSeconds / 10) * 10
+        let key = "\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
         if let cached = await SkipTimestampStore.shared.entry(for: key) {
             log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
             return candidates(from: cached.spans, duration: durationSeconds)
@@ -67,6 +80,56 @@ enum SkipTimestampService {
             return candidates(from: media.spans, duration: durationSeconds)
         } catch {
             log.info("\(key, privacy: .public): failed, \(String(describing: error), privacy: .public)")
+            return []
+        }
+    }
+
+    /// Layer 2b: SkipDB crowd spans (any media, keyed by IMDB id only).
+    private static func skipDB(imdbId: String, season: Int?, episode: Int?,
+                               durationSeconds: Double) async -> [SegmentCandidate] {
+        guard imdbId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil else { return [] }
+        let durationBucket = Int(durationSeconds / 10) * 10
+        let key = "skipdb:\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
+        if let cached = await SkipTimestampStore.shared.entry(for: key) {
+            log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
+            return candidates(from: cached.spans, duration: durationSeconds)
+        }
+
+        var components = URLComponents(string: "https://api.skipdb.tv/api/segments")!
+        var items: [URLQueryItem] = [URLQueryItem(name: "imdb_id", value: imdbId)]
+        if let season, let episode {
+            items.append(URLQueryItem(name: "season", value: String(season)))
+            items.append(URLQueryItem(name: "episode", value: String(episode)))
+        }
+        if durationSeconds > 0 {
+            items.append(URLQueryItem(name: "duration", value: String(Int(durationSeconds))))
+        }
+        components.queryItems = items
+        guard let url = components.url else { return [] }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return [] }
+            if http.statusCode == 404 {
+                log.info("\(key, privacy: .public): not in SkipDB")
+                await SkipTimestampStore.shared.store(.miss(), for: key)
+                return []
+            }
+            guard http.statusCode == 200 else {
+                log.info("\(key, privacy: .public): SkipDB HTTP \(http.statusCode, privacy: .public)")
+                return []
+            }
+            let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
+            log.debug("SkipDB response for \(key, privacy: .public): \(raw, privacy: .public)")
+            let media = try JSONDecoder().decode(SkipDBResponse.self, from: data)
+            log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from SkipDB")
+            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans)
+            await SkipTimestampStore.shared.store(entry, for: key)
+            return candidates(from: media.spans, duration: durationSeconds)
+        } catch {
+            log.info("\(key, privacy: .public): SkipDB failed, \(String(describing: error), privacy: .public)")
             return []
         }
     }
@@ -117,6 +180,36 @@ enum SkipTimestampService {
             }
             return stored(intro, "intro") + stored(recap, "recap")
                 + stored(credits, "credits") + stored(preview, "preview")
+        }
+    }
+
+    /// SkipDB `/api/segments` shape: one object per type (or null / excluded marker).
+    /// `outro` is SkipDB's name for end-credits — mapped to the `"credits"` kind.
+    private struct SkipDBResponse: Decodable {
+        struct Span: Decodable {
+            let start_ms: Int?
+            let end_ms: Int?
+        }
+        struct Segments: Decodable {
+            let intro:   Span?
+            let recap:   Span?
+            let outro:   Span?   // mapped to kind "credits"
+            let preview: Span?
+        }
+        let segments: Segments
+
+        var spans: [StoredSpan] {
+            func stored(_ span: Span?, kind: String) -> StoredSpan? {
+                // Excluded entries decode as Span with both fields nil; real segments have start_ms.
+                guard let s = span, s.start_ms != nil else { return nil }
+                return StoredSpan(kind: kind, startMs: s.start_ms, endMs: s.end_ms)
+            }
+            return [
+                stored(segments.intro,   kind: "intro"),
+                stored(segments.recap,   kind: "recap"),
+                stored(segments.outro,   kind: "credits"),
+                stored(segments.preview, kind: "preview"),
+            ].compactMap { $0 }
         }
     }
 }
