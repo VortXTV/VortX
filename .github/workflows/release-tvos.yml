@@ -47,6 +47,12 @@ jobs:
           XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           echo "Selecting $XCODE"
           sudo xcode-select -s "$XCODE"
+          # Pin it for EVERY later step via DEVELOPER_DIR (xcodebuild honors it over the global
+          # xcode-select state), so a runner-image default flip or the disk-free cleanup can never
+          # drop the build onto /Library/Developer/CommandLineTools (the Beta-13 build-126 failure).
+          # SELECTED_XCODE guards the cleanup step so it can't delete the Xcode we just selected.
+          echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"
+          echo "SELECTED_XCODE=$XCODE" >> "$GITHUB_ENV"
 
       - name: Show toolchain
         id: toolchain
@@ -66,8 +72,9 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           sudo rm -rf ~/Library/Developer/CoreSimulator/* || true
           sudo rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
-          ACTIVE="$(xcode-select -p | sed 's#/Contents/Developer##')"
-          for x in /Applications/Xcode_*.app; do [ "$x" = "$ACTIVE" ] || sudo rm -rf "$x"; done
+          # Keep the Xcode selected above ($SELECTED_XCODE from GITHUB_ENV); never delete the active one
+          # by re-deriving its path (the brittle string-compare that deleted it on build 126).
+          for x in /Applications/Xcode_*.app; do [ "$x" = "$SELECTED_XCODE" ] || sudo rm -rf "$x"; done
           echo "After:"; df -h /
 
       - name: Install XcodeGen

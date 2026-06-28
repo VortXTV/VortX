@@ -6,11 +6,23 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
 
-The cinematic catalog, rebuilt the right way. Beta 10 tried wide landscape cards and pulled cropped, sometimes wrong art, so Beta 11 went back to posters. This brings the wide cards back on a clean, dependable source: textless TMDB backdrops resolved per title, never an add-on's poster stretched sideways. In-place update, nothing resets. This is a beta, so please install it and tell me how the catalog looks on your TV.
+The big bug-fix wave, plus the cinematic catalog rebuilt the right way. Trailers play again, Home rows keep loading, the catalog goes wide and cinematic, and a batch of Apple TV audio and HDR fixes are in that I need your help testing on real hardware. In-place update, nothing resets. This is a beta, so please install it and report anything off, especially the Apple TV sound and HDR notes at the bottom.
+
+### Fixed
+
+- **Trailers play again, on Apple TV, iPhone, iPad, and Mac.** The in-app trailer resolver used a YouTube path that YouTube quietly shut off, so trailers silently failed. It now uses a current path that returns the actual video and plays it inline in the app's own player. The same fix makes trailer add-ons (like Streailer) playable, and a trailer can never be picked as the movie's source by mistake.
+- **Home catalog rows keep loading.** A catalog row on Home (for example MyTraktSync) stopped after about 20 titles instead of scrolling on. It now loads more as you reach the end of the row, the same as the Discover grid already does (#95).
+- **The Live TV filter is gone when Live TV is off.** Turning Live TV off left a stray "Channel" type filter on the Discover screen. With Live TV off, its content types no longer appear there.
 
 ### Added
 
 - **Cinematic landscape catalog cards.** Catalog rows and the Discover and Library grids now show wide 16:9 cards built from clean, textless TMDB artwork, across Apple TV, iPhone, iPad, and Mac. It is on by default, with a switch in Settings, Appearance, "Cinematic catalog cards," to return to the classic portrait posters any time. It uses your TMDB key (set one under API keys); without a key the catalog stays on portrait posters so it never falls back to a worse-looking card. When a title has no TMDB backdrop, the card fills with a softly blurred copy of the poster behind a fit copy, so the frame still looks intentional.
+
+### Please test on your Apple TV (fixes I cannot verify without the hardware)
+
+- **No sound under Dolby Atmos.** If you set the Apple TV audio to Dolby Atmos or Best Available and a title was silent, this build has the fix. Please test it, and if it is still silent, send me the Console log line that starts with `[#78 audio]`.
+- **HDR10 plus Dolby Vision.** A file that carries both should now play Dolby Vision, not just HDR10. Please confirm the Dolby Vision badge shows on your TV.
+- **AirPods Spatial Audio.** Head-tracked Spatial Audio with AirPods should work in the player now. Please confirm.
 
 ## 0.3.8 Beta 12 - 2026-06-28 (pre-release)
 
