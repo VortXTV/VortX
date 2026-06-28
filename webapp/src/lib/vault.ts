@@ -500,3 +500,133 @@ export async function putSyncDoc(session: Session, doc: Record<string, unknown>)
   });
   if (r.status !== 200) throw new Error("Could not save to your account.");
 }
+
+// --- QR / device sign-in (pairing) --------------------------------------------------------------
+// A new device shows a QR; an already-signed-in device approves it, handing over the data key WITHOUT
+// the server ever seeing it. This reuses the Apple app's PairingCrypto contract byte-for-byte: an
+// ephemeral X25519 key agreement, HKDF-SHA256 (salt "vortx-pairing-salt-v1", info "vortx-pairing-v1")
+// to a 32-byte AES-GCM key, sealing the 32-byte data key in the combined nonce||ct||tag framing, all
+// base64url. So the same flow can later interoperate with the native app as the approver. The worker
+// (/v1/qr/*) relays only ciphertext + ephemeral public keys and mints the session token on approval.
+
+const PAIR_SALT = enc("vortx-pairing-salt-v1");
+const PAIR_INFO = enc("vortx-pairing-v1");
+
+/** base64url (no padding), matching the app's BackupCrypto.base64URL, for ephemeral pubkeys + sealed blobs. */
+function b64url(u8: Uint8Array): string {
+  return b64(u8).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function unb64url(s: string): Uint8Array {
+  return unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4));
+}
+
+/** ECDH(X25519) + HKDF-SHA256 -> the 32-byte one-time wrapping key, from our private key + the peer's
+ *  raw public key (base64url). ECDH is symmetric, so wrap and unwrap derive the same key. */
+async function pairWrappingKey(ourPrivate: CryptoKey, peerPubB64url: string): Promise<Uint8Array> {
+  const peer = await crypto.subtle.importKey("raw", unb64url(peerPubB64url) as BufferSource, { name: "X25519" }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: peer }, ourPrivate, 256));
+  const hk = await crypto.subtle.importKey("raw", secret as BufferSource, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: PAIR_SALT as BufferSource, info: PAIR_INFO as BufferSource },
+    hk,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/** AES-GCM seal in the app's combined framing (nonce||ct||tag), base64url. */
+async function sealPair(key: Uint8Array, pt: Uint8Array): Promise<string> {
+  const k = await crypto.subtle.importKey("raw", key as BufferSource, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, pt as BufferSource));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv, 0);
+  out.set(ct, 12);
+  return b64url(out);
+}
+/** AES-GCM open of a base64url combined sealed blob. Null on any failure (wrong key / tamper). */
+async function openPair(key: Uint8Array, blobB64url: string): Promise<Uint8Array | null> {
+  try {
+    const comb = unb64url(blobB64url);
+    const k = await crypto.subtle.importKey("raw", key as BufferSource, "AES-GCM", false, ["decrypt"]);
+    return new Uint8Array(
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv: comb.subarray(0, 12) as BufferSource }, k, comb.subarray(12) as BufferSource),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Whether this browser has the X25519 WebCrypto the QR flow needs (so the UI can hide it otherwise). */
+export async function qrSupported(): Promise<boolean> {
+  try {
+    await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface QrJoin {
+  pairingID: string;
+  code: string;
+  /** What the QR encodes: an approve deep-link a signed-in device opens. */
+  approveURL: string;
+  /** Kept in memory by the caller until approval; needed to unwrap the approved payload. */
+  ephemeral: CryptoKeyPair;
+}
+
+/** Joiner: start a QR sign-in. Mints an ephemeral X25519 keypair, registers its public key with the
+ *  worker, and returns the pairing id + the human code + the approve URL to render as a QR. */
+export async function qrSignInStart(approveBase: string): Promise<QrJoin> {
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const pub = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const r = await api("/v1/qr/start", { method: "POST", body: { devicePublicKey: pub } });
+  const d = r.data as { pairingID?: string; code?: string } | null;
+  if (r.status !== 200 || !d?.pairingID || !d?.code) throw new Error("Could not start QR sign-in.");
+  const approveURL = `${approveBase}#/approve?c=${encodeURIComponent(d.code)}&k=${encodeURIComponent(pub)}`;
+  return { pairingID: d.pairingID, code: d.code, approveURL, ephemeral };
+}
+
+/** Joiner: poll once. Returns the live Session when approved, null while still pending. Throws on a
+ *  definite failure (expired pairing, undecryptable payload). */
+export async function qrSignInPoll(join: QrJoin): Promise<Session | null> {
+  const r = await api(`/v1/qr/status?id=${encodeURIComponent(join.pairingID)}`);
+  if (r.status === 410 || r.status === 404) throw new Error("This QR code expired. Generate a new one.");
+  const d = r.data as { token?: string; payload?: string; pending?: boolean } | null;
+  if (!d || d.pending || !d.token || !d.payload) return null; // still waiting for approval
+  let parsed: { claim?: string; wrapped?: string };
+  try {
+    parsed = JSON.parse(d.payload) as { claim?: string; wrapped?: string };
+  } catch {
+    throw new Error("Sign-in failed (bad approval payload).");
+  }
+  if (!parsed.claim || !parsed.wrapped) throw new Error("Sign-in failed (incomplete approval).");
+  const wrapKey = await pairWrappingKey(join.ephemeral.privateKey, parsed.claim);
+  const dataKey = await openPair(wrapKey, parsed.wrapped);
+  if (!dataKey || dataKey.length !== 32) throw new Error("Could not unlock your data from the approval.");
+  // The worker minted the session token on approval; fetch the account fields it belongs to.
+  const me = await api("/v1/auth/me", { token: d.token });
+  const account = me.status === 200 ? (me.data?.account as Account | undefined) : undefined;
+  if (!account) throw new Error("Sign-in failed (account lookup).");
+  const session: Session = { token: d.token, account, dataKey };
+  saveSession(session);
+  return session;
+}
+
+/** Approver (signed in): wrap our data key to a joining device's published public key and authorize the
+ *  pairing. `code` + `devicePublicKey` come from the QR the joining device displayed. */
+export async function qrApprove(session: Session, code: string, devicePublicKey: string): Promise<void> {
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const claim = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const wrapKey = await pairWrappingKey(ephemeral.privateKey, devicePublicKey);
+  const wrapped = await sealPair(wrapKey, session.dataKey);
+  const r = await api("/v1/qr/authorize", {
+    method: "POST",
+    token: session.token,
+    body: { code: code.trim().toUpperCase(), wrappedPayload: JSON.stringify({ claim, wrapped }) },
+  });
+  if (r.status === 404) throw new Error("That code was not found. It may have expired.");
+  if (r.status === 410) throw new Error("That code has expired.");
+  if (r.status !== 200) throw new Error("Could not approve the sign-in.");
+}

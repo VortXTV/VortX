@@ -9,6 +9,12 @@ import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 
 let onChanged: (() => void) | null = null;
 
+/** The add-on's configuration page (Stremio convention): strip the trailing /manifest.json from the
+ *  transport URL and point at /configure. Shown only when the manifest declares behaviorHints.configurable. */
+function configureUrl(transportUrl: string): string {
+  return transportUrl.replace(/\/manifest\.json(\?.*)?$/i, "") + "/configure";
+}
+
 const PROBE_TIMEOUT_MS = 6000;
 const SLOW_THRESHOLD_MS = 2500;
 
@@ -63,6 +69,12 @@ function addonRow(addon: Addon): string {
   const removeBtn = isCinemeta
     ? `<span class="chip chip-static">Default</span>`
     : `<button class="chip" data-action="remove-addon" data-url="${escapeHtml(transportUrl)}">Remove</button>`;
+  // Add-ons that expose a configuration page (debrid keys, catalog options) get a Configure link that
+  // opens it in a new tab. Stremio signals this with manifest.behaviorHints.configurable.
+  const configurable = (manifest as { behaviorHints?: { configurable?: boolean } }).behaviorHints?.configurable === true;
+  const configureBtn = configurable
+    ? `<a class="chip" href="${escapeHtml(configureUrl(transportUrl))}" target="_blank" rel="noopener noreferrer">Configure</a>`
+    : "";
   return `
     <div class="addon-card">
       ${art}
@@ -74,7 +86,7 @@ function addonRow(addon: Addon): string {
         <div class="addon-desc">${escapeHtml(manifest.description ?? "")}</div>
         ${types ? `<div class="addon-types">${escapeHtml(types)}</div>` : ""}
       </div>
-      ${removeBtn}
+      <span class="addon-actions">${configureBtn}${removeBtn}</span>
     </div>`;
 }
 

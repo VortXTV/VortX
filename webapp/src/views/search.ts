@@ -78,14 +78,17 @@ function moreButton(p: SearchPaging): string {
     : "";
 }
 
-/** Run the search and paint the first page of merged results (or an empty message), with Load more. */
-export async function loadSearch(addons: Addon[], query: string): Promise<void> {
+/** Run the search and STREAM merged results in as each catalog responds (fast add-ons like Cinemeta
+ *  paint in well under a second instead of waiting on the slowest one), with Load more. `record` adds
+ *  the query to recent searches; the debounced as-you-type path passes false so it doesn't spam them. */
+export async function loadSearch(addons: Addon[], query: string, record = true): Promise<void> {
   const token = ++searchReqToken;
   const grid = document.getElementById("search-grid");
   const wrap = document.getElementById("search-more-wrap");
   if (!grid || !query) return;
-  addRecentSearch(query);
+  if (record) addRecentSearch(query);
   grid.innerHTML = `<p class="muted">Searching for “${escapeHtml(query)}”…</p>`;
+  if (wrap) wrap.innerHTML = "";
   const types = discoverTypes(addons);
   const refs = searchableRefs(addons, types.length ? types : ["movie", "series"]);
   const p: SearchPaging = {
@@ -96,15 +99,44 @@ export async function loadSearch(addons: Addon[], query: string): Promise<void> 
     loading: false,
   };
   paging = p;
-  const fresh = await fetchPage(p);
-  if (p !== paging || token !== searchReqToken) return; // a newer query superseded this search
-  if (!fresh.length) {
-    grid.innerHTML = `<p class="muted">No results for “${escapeHtml(query)}”.</p>`;
-    if (wrap) wrap.innerHTML = "";
+  if (!refs.length) {
+    grid.innerHTML = `<p class="muted">No search-capable add-on is installed yet. Add one on the Add-ons page.</p>`;
     return;
   }
-  grid.innerHTML = fresh.map(posterCard).join("");
-  if (wrap) wrap.innerHTML = moreButton(p);
+  // Fire every searchable catalog at once and append each one's fresh results AS IT RESOLVES, so the page
+  // is not held hostage by the slowest add-on (the old Promise.all-then-render could take ~30s).
+  let painted = false;
+  let settled = 0;
+  await Promise.all(
+    p.refs.map(async (r) => {
+      let metas: MetaItem[] = [];
+      try {
+        metas = await fetchSearchPage(r.ref, p.query, 0);
+      } catch {
+        metas = [];
+      }
+      if (p !== paging || token !== searchReqToken) return; // a newer query superseded this one
+      if (!metas.length) r.done = true;
+      else {
+        r.lastFirstId = metas[0]?.id;
+        r.skip += metas.length;
+      }
+      const fresh = metas.filter((m) => !p.seen.has(m.id));
+      fresh.forEach((m) => p.seen.add(m.id));
+      if (fresh.length) {
+        if (!painted) {
+          painted = true;
+          grid.innerHTML = "";
+        }
+        grid.insertAdjacentHTML("beforeend", fresh.map(posterCard).join(""));
+      }
+      settled++;
+      if (settled === p.refs.length && !painted) {
+        grid.innerHTML = `<p class="muted">No results for “${escapeHtml(query)}”.</p>`;
+      }
+      if (wrap) wrap.innerHTML = moreButton(p);
+    }),
+  );
 }
 
 /** Append the next page across the active query's catalogs (the Load more click handler). */

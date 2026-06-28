@@ -83,6 +83,10 @@ body {
   min-height: 100%;
   display: flex;
   flex-direction: column;
+  /* Rails scroll internally; never let any overflow scroll the whole PAGE sideways (the More-Like-This
+     and catalog rails were pushing the page width on phone + Mac). overflow-x: clip keeps overflow-y
+     visible (unlike hidden), so vertical page scroll is unaffected. */
+  overflow-x: clip;
 }
 
 img {
@@ -283,9 +287,19 @@ input:focus-visible {
   margin-bottom: 0.6rem;
   color: var(--text);
 }
+/* A rail is a horizontal scroller. In a flex column whose items align to flex-start (e.g. .detail-body),
+   the section would otherwise grow to its content width and scroll the whole PAGE sideways; stretch it to
+   the column and bound the widths so the scroll stays INSIDE the rail. */
+.rail-section {
+  align-self: stretch;
+  min-width: 0;
+  max-width: 100%;
+}
 .rail {
   display: flex;
   gap: 0.85rem;
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   padding: 14px 2px;
@@ -958,6 +972,13 @@ input:focus-visible {
   padding: 0.85rem;
   border-radius: var(--radius-card);
   background: var(--surface);
+}
+/* Trailing action cluster (Configure + Remove) so the two chips sit together and never wrap mid-pair. */
+.addon-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex: 0 0 auto;
 }
 .addon-logo {
   width: 44px;

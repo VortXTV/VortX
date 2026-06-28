@@ -185,14 +185,31 @@ async function reloadAddonsAndRender(): Promise<void> {
   await renderRoute(parseRoute());
 }
 
-/** Submit the search form by navigating to the shareable search route. */
+/** Wire the search box: Enter commits to the shareable route; typing runs a debounced live search that
+ *  streams results in (no route churn), so it feels instant like the apps. */
+let searchDebounce = 0;
 function wireSearchForm(): void {
   const form = document.getElementById("search-form") as HTMLFormElement | null;
+  const input = document.getElementById("search-input") as HTMLInputElement | null;
   form?.addEventListener("submit", (ev) => {
     ev.preventDefault();
-    const input = document.getElementById("search-input") as HTMLInputElement | null;
-    const query = input?.value.trim() ?? "";
-    navigate({ name: "search", query });
+    window.clearTimeout(searchDebounce);
+    navigate({ name: "search", query: input?.value.trim() ?? "" });
+  });
+  // As-you-type: debounced, results stream in as each catalog responds; the URL is kept in sync via
+  // replaceState (shareable on the spot) without a full route re-render, and it is not recorded as a
+  // recent search on every keystroke.
+  input?.addEventListener("input", () => {
+    window.clearTimeout(searchDebounce);
+    const q = input.value.trim();
+    searchDebounce = window.setTimeout(() => {
+      try {
+        history.replaceState(null, "", q ? `#/search/${encodeURIComponent(q)}` : "#/search/");
+      } catch {
+        /* hash routing still works without replaceState */
+      }
+      if (q) void loadSearch(addons, q, false);
+    }, 220);
   });
 }
 

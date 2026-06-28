@@ -99,13 +99,20 @@ function asObjArr(v: unknown): Record<string, unknown>[] {
 /** Map synced library items (carrying t/d seconds + lastWatched + v resumeId) to CW entries. Shared by
  *  the owner library and each per-profile (byProfile) library so the logic stays in one place. */
 function cwEntriesFrom(items: unknown): CWEntry[] {
+  const arr = asObjArr(items);
   const out: CWEntry[] = [];
-  for (const it of asObjArr(items)) {
-    if (typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") continue;
+  arr.forEach((it, i) => {
+    if (typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") return;
     const t = Number(it.t);
     const d = Number(it.d);
-    if (!(t > 0) || !(d > 0) || t / d >= 0.95) continue; // not started / already finished
-    const lw = typeof it.lastWatched === "string" ? Date.parse(it.lastWatched) : NaN;
+    if (!(t > 0) || !(d > 0) || t / d >= 0.95) return; // not started / already finished
+    // lastWatched may be an ISO string OR an epoch (seconds or ms). When it is missing or unparseable,
+    // fall back to the source ORDER (earlier in the list = more recently watched) so the rail matches the
+    // app's order instead of collapsing every item to updatedAt 0 and scrambling the order.
+    let updatedAt = NaN;
+    if (typeof it.lastWatched === "string") updatedAt = Date.parse(it.lastWatched);
+    else if (typeof it.lastWatched === "number") updatedAt = it.lastWatched < 1e12 ? it.lastWatched * 1000 : it.lastWatched;
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) updatedAt = Date.now() - i * 1000;
     out.push({
       id: it.id,
       type: it.type,
@@ -114,9 +121,9 @@ function cwEntriesFrom(items: unknown): CWEntry[] {
       resumeId: typeof it.v === "string" && it.v ? it.v : it.id, // overlay items carry the resume episode id
       position: t,
       duration: d,
-      updatedAt: Number.isFinite(lw) ? lw : 0,
+      updatedAt,
     });
-  }
+  });
   return out;
 }
 
