@@ -178,19 +178,29 @@ enum TMDBClient {
         }
         // Over-fetch (some drop for a missing IMDb id), resolve each TMDB id -> tt concurrently, preserve order.
         let slice = Array(rows.prefix(limit * 2))
-        let resolved: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
-            for (i, row) in slice.enumerated() {
-                group.addTask {
-                    guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
-                          let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
-                          row.poster?.isEmpty == false else { return nil }
-                    let type = row.media == "tv" ? "series" : "movie"
-                    return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+        // Resolve external_ids in CAPPED chunks (~6 in flight) instead of spawning all ~36 at once, so the
+        // 9 rails together never burst hundreds of concurrent requests at TMDB (429s silently thin the rails)
+        // and the in-flight count tracks URLSession's per-host socket budget. Order preserved by row index.
+        var resolved: [(Int, MetaPreview)] = []
+        for start in stride(from: 0, to: slice.count, by: 6) {
+            if resolved.count >= limit { break }   // enough resolved; stop the over-fetch early
+            let batch = Array(slice[start..<min(start + 6, slice.count)])
+            let part: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
+                for (offset, row) in batch.enumerated() {
+                    let i = start + offset
+                    group.addTask {
+                        guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
+                              let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
+                              row.poster?.isEmpty == false else { return nil }
+                        let type = row.media == "tv" ? "series" : "movie"
+                        return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+                    }
                 }
+                var out: [(Int, MetaPreview)] = []
+                for await r in group { if let r { out.append(r) } }
+                return out
             }
-            var out: [(Int, MetaPreview)] = []
-            for await r in group { if let r { out.append(r) } }
-            return out
+            resolved.append(contentsOf: part)
         }
         var seen = Set<String>()
         let ordered = resolved.sorted { $0.0 < $1.0 }.map(\.1).filter { seen.insert($0.id).inserted }

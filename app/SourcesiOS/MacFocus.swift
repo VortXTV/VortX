@@ -23,17 +23,6 @@ enum MacBrowseFocus: Hashable {
     case tab(Int)
 }
 
-/// Conditionally applies `.focusSection()` to a rail's card container. `.focusSection()` groups the
-/// focusables inside it so SwiftUI resolves Left/Right WITHIN the row and Up/Down BETWEEN rows by
-/// geometry. Applied only when the rail opts into keyboard focus (Home), so non-focusable rails keep
-/// their plain structure.
-struct MacRailFocusSection: ViewModifier {
-    let enabled: Bool
-    func body(content: Content) -> some View {
-        if enabled { content.focusSection() } else { content }
-    }
-}
-
 extension View {
     /// A visible focus ring for the keyboard-focused poster / tab, using only Theme accent tokens and
     /// compositor-friendly properties (transform + opacity + a stroked overlay, never layout), per

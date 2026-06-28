@@ -120,18 +120,21 @@ final class CoreBridge: ObservableObject {
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
             return "Enter a valid add-on URL (https://…/manifest.json)."
         }
-        if addons.contains(where: { $0.transportUrl == normalized }) {
-            guard replacingExisting else { return "That add-on is already installed." }
-            // Update in place: drop the existing descriptor so InstallAddon takes the freshly-fetched
-            // manifest (refreshes name / logo / version). The engine processes Uninstall before Install.
-            if let existing = rawAddonsByUrl[normalized] { dispatchCtx(["action": "UninstallAddon", "args": existing]) }
-        }
+        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
+        if alreadyInstalled, !replacingExisting { return "That add-on is already installed." }
         do {
             let (data, resp) = try await URLSession.shared.data(from: url)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
                   let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   manifest["id"] != nil, manifest["name"] != nil else {
                 return "That URL did not return a valid add-on manifest."
+            }
+            // Update in place: drop the existing descriptor ONLY now that the new manifest is fetched +
+            // validated, so a flaky fetch / bad manifest can never leave the user with NEITHER the old nor
+            // the new add-on (the install-first invariant the Change-URL path also holds). The engine
+            // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
+            if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
+                dispatchCtx(["action": "UninstallAddon", "args": existing])
             }
             let descriptor: [String: Any] = [
                 "transportUrl": url.absoluteString,

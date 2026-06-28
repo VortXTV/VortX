@@ -1,11 +1,10 @@
 import SwiftUI
 
-/// In-hero auto-play trailer for the iOS / iPad / Mac detail page and Home billboard (#44), now the exact
-/// parity twin of the tvOS `TVInHeroTrailerView`. It plays the trailer through **libmpv** using the
-/// embedded streaming server's `/yt/{id}` route (the same path the Trailer chip uses, resolved by an
-/// InnerTube resolver in server.js), NOT a WKWebView YouTube iframe embed. The old embed path broke under
-/// YouTube's July-2025 Referer enforcement (the cross-origin iframe subresources never carry the WKWebView
-/// Referer), so iOS trailers now ride the identical native path tvOS already uses.
+/// In-hero auto-play trailer for the iOS / iPad / Mac detail page and Home billboard (#44). It plays a
+/// DIRECT (non-YouTube) trailer stream through **libmpv**. NOTE: YouTube trailers on iOS/Mac now play via
+/// the WKWebView IFrame (`YouTubeEmbedView`), NOT this view - tokenless `/yt` extraction is dead, so this
+/// view is used only when a real direct `trailerStreams` URL exists. (The tvOS twin `TVInHeroTrailerView`
+/// is the only libmpv hero-clip path on its platform, since tvOS has no web view.)
 ///
 /// A muted, looping, chromeless libmpv layer fades in OVER the still backdrop a short beat after the hero
 /// settles. The still art underneath is the permanent fallback, so a missing / slow / blocked clip never

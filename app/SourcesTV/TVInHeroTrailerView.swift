@@ -2,8 +2,10 @@ import SwiftUI
 
 /// In-hero auto-play trailer for the **tvOS** detail page (#44), the parity twin of the iOS / iPad / Mac
 /// `InHeroTrailerView`. tvOS has no WKWebView, so the YouTube IFrame embed the touch surfaces use cannot
-/// run here; instead this plays the trailer through **libmpv** using the embedded streaming server's
-/// `/yt/{id}` route (the same path the Trailer chip already uses, resolved by ytdl-core in server.js).
+/// run here; this plays whatever DIRECT URL it is handed through **libmpv**. NOTE: tokenless YouTube
+/// extraction is dead, so `TrailerRequest.playableURL` now yields only a direct (non-YouTube) stream here
+/// (the dead `/yt` route was removed); a YouTube-only trailer has no URL and the layer simply never mounts
+/// (still backdrop stays) until the `trailer.vortx.tv` resolver lands. See TrailerRequest.swift.
 ///
 /// A muted, looping, chromeless libmpv layer fades in OVER the still backdrop a short beat after the hero
 /// appears, the same ambient treatment iOS gives. The still art underneath is the permanent fallback, so a
