@@ -501,6 +501,35 @@ export async function putSyncDoc(session: Session, doc: Record<string, unknown>)
   if (r.status !== 200) throw new Error("Could not save to your account.");
 }
 
+/** Read-modify-write the sync document with optimistic concurrency. Fetches the current doc + version,
+ *  runs `mutate` on it in place, then PUTs at version+1. The worker stores a PUT only when its version
+ *  is strictly greater (ON CONFLICT ... WHERE excluded.version > backups.version) and reports
+ *  `{ accepted }`; a rejected (stale) write means another device won the race, so we re-fetch and retry.
+ *  This is the SAFE alternative to putSyncDoc's blind Date.now() write, which silently loses a concurrent
+ *  change (a 200 with accepted:false reads as success). The `mutate` callback MUST only touch web-owned
+ *  sibling keys (doc.profileEdits, doc.apiKeys, doc.addons) and NEVER doc.vortx.* (app-authoritative). */
+export async function mutateSyncDoc(
+  session: Session,
+  mutate: (doc: Record<string, unknown>) => void,
+): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const status = await fetchSync(session);
+    const base = status.synced ? status.version ?? 0 : 0;
+    const doc = (status.contents as Record<string, unknown>) ?? {};
+    mutate(doc);
+    const ciphertext = await seal(session.dataKey, enc(JSON.stringify(doc)));
+    const r = await api("/v1/backup", {
+      method: "PUT",
+      token: session.token,
+      body: { document: ciphertext, version: base + 1 },
+    });
+    if (r.status !== 200) throw new Error("Could not save to your account.");
+    if (r.data?.accepted !== false) return; // stored (accepted true, or older worker without the field)
+    // accepted === false: a newer version landed between our read and write; loop to re-fetch and merge.
+  }
+  throw new Error("Could not save to your account (kept losing to another device).");
+}
+
 // --- QR / device sign-in (pairing) --------------------------------------------------------------
 // A new device shows a QR; an already-signed-in device approves it, handing over the data key WITHOUT
 // the server ever seeing it. This reuses the Apple app's PairingCrypto contract byte-for-byte: an

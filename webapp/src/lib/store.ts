@@ -52,11 +52,20 @@ export async function loadInstalledAddons(): Promise<Addon[]> {
   return addons;
 }
 
+// When signed in, add/remove pushes the new installed list UP to the account (the doc.addons web sibling)
+// so add-ons added on the web reach the user's other devices. The pusher is INJECTED by account.ts (which
+// owns the session + the encrypted write) to avoid a store -> account import cycle; null when signed out.
+let addonsSyncPusher: (() => void) | null = null;
+export function registerAddonsSyncPusher(fn: (() => void) | null): void {
+  addonsSyncPusher = fn;
+}
+
 /** Add a stream/catalog add-on by transport URL. Validates the manifest before persisting; returns
  *  the resolved Addon so the caller can refresh the UI. Throws if the URL is not a valid add-on. */
 export async function addAddon(transportUrl: string): Promise<Addon> {
   const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
   persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
+  addonsSyncPusher?.(); // fire-and-forget push to the account (no-op signed out)
   return addon;
 }
 
@@ -64,6 +73,7 @@ export async function addAddon(transportUrl: string): Promise<Addon> {
 export function removeAddon(transportUrl: string): void {
   if (transportUrl === CINEMETA_URL) return;
   persist(installedUrls().filter((u) => u !== transportUrl));
+  addonsSyncPusher?.();
 }
 
 // --- Library (saved titles) ---------------------------------------------------------------------
@@ -112,6 +122,31 @@ export function mergeInstalledAddons(urls: string[]): boolean {
     .filter((u) => !existing.has(u));
   if (!added.length) return false;
   persist([...installedUrls(), ...added]); // persist() de-dupes + pins Cinemeta first
+  return true;
+}
+
+/** Apply a synced add-on ORDER to the local list (read-down): take the synced order as canonical for the
+ *  URLs we have installed, then append any local-only URLs in their current order (never drops a local
+ *  add-on). Cinemeta stays pinned first so Home + meta always work. Persists + returns true only when the
+ *  order actually changes, so it never triggers a redundant re-render. https-only, like mergeInstalledAddons. */
+export function applyAddonOrder(orderedUrls: string[]): boolean {
+  const cleanOrder = orderedUrls
+    .filter((u): u is string => typeof u === "string" && /^https:\/\//i.test(u.trim()))
+    .map((u) => u.trim());
+  if (!cleanOrder.length) return false;
+  const current = installedUrls();
+  const currentSet = new Set(current);
+  const ordered: string[] = [];
+  const seen = new Set<string>([CINEMETA_URL]); // Cinemeta is pinned first below, never in the middle
+  for (const u of cleanOrder) {
+    if (currentSet.has(u) && !seen.has(u)) { ordered.push(u); seen.add(u); }
+  }
+  for (const u of current) {
+    if (!seen.has(u)) { ordered.push(u); seen.add(u); }
+  }
+  const next = [CINEMETA_URL, ...ordered];
+  if (next.length === current.length && next.every((u, i) => u === current[i])) return false;
+  persist(next);
   return true;
 }
 
