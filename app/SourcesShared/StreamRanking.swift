@@ -111,7 +111,7 @@ enum StreamRanking {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
             // explicit "play THIS" - so an applicable pin still wins, falling back to add-on order.
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
-            return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
+            return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
         }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
@@ -126,7 +126,8 @@ enum StreamRanking {
     /// Streams paired with their source group's add-on, the form pin matching needs (a flattened stream
     /// loses which add-on it came from, which the `global`/provider pin keys on).
     private static func playablePairs(_ groups: [CoreStreamSourceGroup]) -> [(addon: String, stream: CoreStream)] {
-        groups.flatMap { g in g.streams.map { (addon: g.addon, stream: $0) } }.filter { $0.stream.playableURL != nil }
+        groups.flatMap { g in g.streams.map { (addon: g.addon, stream: $0) } }
+            .filter { $0.stream.playableURL != nil && !$0.stream.isYouTubeTrailer }
     }
 
     /// The first playable stream that matches a pin, in add-on/list order. Used by the add-on-order path.
@@ -157,7 +158,7 @@ enum StreamRanking {
         let torrentOK = prefs.useAddonOrder || prefs.typeOrder.first == .torrent
         let qualityReady = groups.contains { group in
             group.streams.contains { s in
-                s.playableURL != nil && continuityBonus(s, hint: hint) > 0 && (torrentOK || !s.isTorrent)
+                s.playableURL != nil && !s.isYouTubeTrailer && continuityBonus(s, hint: hint) > 0 && (torrentOK || !s.isTorrent)
             }
         }
         return qualityReady || seconds > 16                            // ceiling so a vanished quality cannot hang it
@@ -631,7 +632,7 @@ enum StreamRanking {
         let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
-            return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
+            return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
         }
         return playablePairs(groups).max { (score($0.stream) + pinBonus($0.stream, addon: $0.addon, pin: pin)) < (score($1.stream) + pinBonus($1.stream, addon: $1.addon, pin: pin)) }?.stream
     }
@@ -639,7 +640,7 @@ enum StreamRanking {
     /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first — feeds the
     /// "Watch in 4K" button's resolution dropdown.
     static func resolutionOptions(_ groups: [CoreStreamSourceGroup]) -> [(label: String, stream: CoreStream)] {
-        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
+        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil && !$0.isYouTubeTrailer }
         var bestByLabel: [String: CoreStream] = [:]
         for s in playable {
             let label = qualityLabel(s)
@@ -654,7 +655,7 @@ enum StreamRanking {
     /// combination, labeled the way people actually choose ("4K · Dolby Vision · Remux",
     /// "1080p · BluRay · Atmos"). Best-first, so the top option is what Watch Now would play.
     static func qualityOptions(_ groups: [CoreStreamSourceGroup]) -> [(label: String, stream: CoreStream)] {
-        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
+        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil && !$0.isYouTubeTrailer }
         var best: [String: (score: Int, stream: CoreStream)] = [:]
         for s in playable {
             let t = qualityText(s)
@@ -682,7 +683,7 @@ enum StreamRanking {
     /// The resolution tiers that actually have playable sources, in fixed order, for the first
     /// level of the quality picker. Everything that is not 4K/1080p/720p lands in "Others".
     static func tiers(_ groups: [CoreStreamSourceGroup]) -> [String] {
-        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil }
+        let playable = groups.flatMap { $0.streams }.filter { $0.playableURL != nil && !$0.isYouTubeTrailer }
         var present = Set<String>()
         for s in playable { present.insert(tier(of: s)) }
         return ["4K", "1080p", "720p", "Others"].filter { present.contains($0) }

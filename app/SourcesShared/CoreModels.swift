@@ -437,9 +437,25 @@ struct CoreStream: Decodable, Identifiable {
     var id: String { (url ?? externalUrl ?? infoHash ?? "?") + "#" + (name ?? "") + (description ?? "") }
     var isTorrent: Bool { url == nil && infoHash != nil }
 
+    /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
+    /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
+    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick — otherwise an
+    /// unscored "🎬 Trailer" row could become `StreamRanking.best` and play the trailer in place of
+    /// the movie (and a trailer must never be recorded as Continue Watching).
+    var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
+
     /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
+    ///
+    /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
+    /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the embedded server's
+    /// `/yt/{id}` route — the same InnerTube redirect the Trailer button uses (`TrailerRequest`).
+    /// Gated on `canProxy` so the Lite build (no embedded server) leaves it non-playable, exactly
+    /// as before. Without this, every Streailer stream rendered as an inert lock-icon row.
     var playableURL: URL? {
         if let url, let parsed = URL(string: url) { return parsed }
+        if let ytId, !ytId.isEmpty, StremioServer.canProxy {
+            return URL(string: "\(StremioServer.base)/yt/\(ytId)")
+        }
         guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let hash = infoHash?.lowercased() else { return nil }
         return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
