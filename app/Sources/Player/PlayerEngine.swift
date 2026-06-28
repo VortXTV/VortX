@@ -44,7 +44,7 @@ protocol PlayerEngine: AnyObject {
 
     // Chapters + media info
     func chapters() -> [MPVChapter]
-    func mediaSummary() -> (height: Int, audioCodec: String)
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String)
     func playbackStats() -> [(String, String)]
 
     // Decode + audio routing

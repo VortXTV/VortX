@@ -1036,9 +1036,9 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Current media summary for the player's metadata line: encoded video height (e.g. 2160) and the
     /// active audio codec (e.g. "eac3"). Both can be 0/"" early in load, before the first frame.
-    func mediaSummary() -> (height: Int, audioCodec: String) {
-        guard mpv != nil else { return (0, "") }
-        return (getInt("video-params/h"), getString("audio-codec-name") ?? "")
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
+        guard mpv != nil else { return (0, 0, "") }
+        return (getInt("video-params/w"), getInt("video-params/h"), getString("audio-codec-name") ?? "")
     }
 
     /// Persisted video-size mode, read at startup so the first frame already uses it.

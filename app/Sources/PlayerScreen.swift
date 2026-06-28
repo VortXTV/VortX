@@ -173,6 +173,7 @@ struct PlayerScreen: View {
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var appliedAutoTracks = false
+    @State private var videoWidth = 0           // from mediaSummary; resolution is by WIDTH (2.40:1 4K not mislabeled 1440p)
     @State private var videoHeight = 0          // from mediaSummary, for the metadata line (#20)
     @State private var audioCodec = ""
     @State private var isHDR = false
@@ -588,7 +589,7 @@ struct PlayerScreen: View {
         case MPVProperty.trackList:
             refreshTracks()
             let summary = coordinator.player?.mediaSummary()
-            videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
+            videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
             if !appliedAutoTracks, !audioTracks.isEmpty || !subtitleTracks.isEmpty {
                 appliedAutoTracks = true
@@ -1009,6 +1010,16 @@ struct PlayerScreen: View {
     /// untried remains; the caller then shows the error overlay. Mirrors tvOS `hopToNextSource`.
     @discardableResult
     private func hopToNextSource(reason: String) -> Bool {
+        // A trailer has no content stream of its own; nextUntriedStream() would fall back to whatever the
+        // engine last loaded for this title, so a dead /yt route would silently play the ACTUAL movie.
+        // Mirror tvOS (TVPlayerView.hopToNextSource): show "Trailer unavailable" and stop. Return true so
+        // the caller treats the failure as handled and doesn't paint its own content-stream error.
+        if isTrailer {
+            DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
+            loadErrorMsg = "Trailer unavailable."
+            withAnimation { loadFailed = true }
+            return true
+        }
         guard sourceHops < maxSourceHops, let stream = nextUntriedStream(), let newURL = stream.playableURL else { return false }
         var tried = exhaustedURLs
         if let dead = curURL { tried.insert(dead) }
@@ -1220,12 +1231,15 @@ struct PlayerScreen: View {
     /// shown under the title so the user can tell what they actually got. Recomputed on track/HDR change.
     private func computeMetadataLine() -> String {
         var parts: [String] = []
-        switch videoHeight {
-        case 2000...:     parts.append("4K")
-        case 1300..<2000: parts.append("1440p")
-        case 900..<1300:  parts.append("1080p")
-        case 600..<900:   parts.append("720p")
-        case 1..<600:     parts.append("\(videoHeight)p")
+        // Resolution is defined by WIDTH (4K is ~3840 wide at ANY aspect), so a 2.40:1 4K film (3840x1600)
+        // is NOT mislabeled "1440p" off its 1600 height. Width when known, else a 16:9 height estimate.
+        let res = videoWidth > 0 ? videoWidth : Int(Double(videoHeight) * 16.0 / 9.0)
+        switch res {
+        case 3000...:     parts.append("4K")
+        case 2200..<3000: parts.append("1440p")
+        case 1500..<2200: parts.append("1080p")
+        case 1000..<1500: parts.append("720p")
+        case 1..<1000:    if videoHeight > 0 { parts.append("\(videoHeight)p") }
         default:          break
         }
         if isHDR { parts.append("HDR") }

@@ -165,9 +165,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// Encoded video height (so the chrome's metadata line can label "4K" / "1080p") and the active audio
     /// codec name. Height comes from the item's presentation size (its decoded frame dimensions); the codec
     /// from the selected audible option's media format. Both are best-effort and empty before the item loads.
-    func mediaSummary() -> (height: Int, audioCodec: String) {
-        let height = Int(item?.presentationSize.height ?? 0)
-        return (height, selectedAudioCodec())
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
+        let size = item?.presentationSize ?? .zero
+        return (Int(size.width), Int(size.height), selectedAudioCodec())
     }
 
     /// Live playback stats from AVFoundation's access log (the only per-stream telemetry AVPlayer exposes):

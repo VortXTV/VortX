@@ -37,7 +37,8 @@ struct TVPlayerView: View {
     @State private var isPaused = false
     @State private var currentTime = 0.0
     @State private var duration = 0.0
-    @State private var videoHeight = 0          // metadata line: encoded height (2160 -> "4K")
+    @State private var videoWidth = 0           // metadata line: encoded width (resolution is by WIDTH, so 2.40:1 4K is not mislabeled 1440p)
+    @State private var videoHeight = 0          // metadata line: encoded height
     @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
     @State private var isHDR = false            // metadata line: HDR/DV detected (sig-peak > 1)
     @State private var resumeSeconds: Double? = nil   // nil until fetched; applied once duration known
@@ -362,7 +363,7 @@ struct TVPlayerView: View {
         case MPVProperty.trackList:
             refreshTracks()
             let s = coordinator.player?.mediaSummary()
-            videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
+            videoWidth = s?.width ?? 0; videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
             if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
                 appliedAutoTracks = true
@@ -598,12 +599,16 @@ struct TVPlayerView: View {
     /// Resolution / HDR / audio summary under the title, read live from mpv.
     private func computeMetadataLine() -> String {
         var parts: [String] = []
-        switch videoHeight {
-        case 2000...:     parts.append("4K")
-        case 1300..<2000: parts.append("1440p")
-        case 900..<1300:  parts.append("1080p")
-        case 600..<900:   parts.append("720p")
-        case 1..<600:     parts.append("\(videoHeight)p")
+        // Resolution is defined by WIDTH (4K is ~3840 wide at ANY aspect), so a 2.40:1 4K film (3840x1600)
+        // is NOT mislabeled "1440p" off its 1600 height. Width when known, else a 16:9 height estimate while
+        // the first frame is still loading.
+        let res = videoWidth > 0 ? videoWidth : Int(Double(videoHeight) * 16.0 / 9.0)
+        switch res {
+        case 3000...:     parts.append("4K")
+        case 2200..<3000: parts.append("1440p")
+        case 1500..<2200: parts.append("1080p")
+        case 1000..<1500: parts.append("720p")
+        case 1..<1000:    if videoHeight > 0 { parts.append("\(videoHeight)p") }
         default:          break
         }
         if isHDR { parts.append("HDR") }
