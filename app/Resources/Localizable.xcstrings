@@ -74584,7 +74584,21 @@
     "TheIntroDB": {},
     "SkipDB": {},
     "Both": {},
-    "Skip timestamps source": {}
+    "Skip timestamps source": {},
+    "Add a custom end time": {},
+    "Close editor": {},
+    "Close SkipDB editor": {},
+    "Edit SkipDB segments": {},
+    "episode end": {},
+    "Jump to end": {},
+    "Jump to start": {},
+    "Next chapter": {},
+    "Preview: plays 2s before start, jumps to end": {},
+    "Previous chapter": {},
+    "Resubmit": {},
+    "Set to playhead": {},
+    "Submitted!": {},
+    "Use episode end instead": {}
   },
   "version": "1.0"
 }

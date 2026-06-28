@@ -109,6 +109,9 @@ enum SkipTimestampService {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
+        if let apiKey = ApiKeys.skipDBKey() {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { return [] }
@@ -125,7 +128,8 @@ enum SkipTimestampService {
             log.debug("SkipDB response for \(key, privacy: .public): \(raw, privacy: .public)")
             let media = try JSONDecoder().decode(SkipDBResponse.self, from: data)
             log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from SkipDB")
-            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans)
+            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans,
+                                                 introEstimateMs: media.intro_length_estimate_ms)
             await SkipTimestampStore.shared.store(entry, for: key)
             return candidates(from: media.spans, duration: durationSeconds)
         } catch {
@@ -197,10 +201,10 @@ enum SkipTimestampService {
             let preview: Span?
         }
         let segments: Segments
+        let intro_length_estimate_ms: Int?
 
         var spans: [StoredSpan] {
             func stored(_ span: Span?, kind: String) -> StoredSpan? {
-                // Excluded entries decode as Span with both fields nil; real segments have start_ms.
                 guard let s = span, s.start_ms != nil else { return nil }
                 return StoredSpan(kind: kind, startMs: s.start_ms, endMs: s.end_ms)
             }
@@ -230,7 +234,8 @@ actor SkipTimestampStore {
     struct Entry: Codable {
         let fetchedAt: Date
         let spans: [StoredSpan]
-        static func miss() -> Entry { Entry(fetchedAt: Date(), spans: []) }
+        var introEstimateMs: Int?               // intro_length_estimate_ms from SkipDB (nil = not set or no data)
+        static func miss() -> Entry { Entry(fetchedAt: Date(), spans: [], introEstimateMs: nil) }
     }
 
     private var entries: [String: Entry]?
@@ -251,6 +256,19 @@ actor SkipTimestampStore {
     func store(_ entry: Entry, for key: String) {
         loadIfNeeded()
         entries?[key] = entry
+        if let data = try? JSONEncoder().encode(entries) {
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    func introEstimate(for key: String) -> Int? {
+        loadIfNeeded()
+        return entries?[key]?.introEstimateMs
+    }
+
+    func invalidate(for key: String) {
+        loadIfNeeded()
+        entries?[key] = nil
         if let data = try? JSONEncoder().encode(entries) {
             try? data.write(to: fileURL, options: .atomic)
         }

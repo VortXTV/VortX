@@ -9,11 +9,12 @@ struct MetadataKeysView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("Metadata services").screenTitleStyle()
-                Text("Optional. Add your own TMDB and MDBList keys to enrich recommendations and ratings. Nothing here is required and your keys stay on this device (and sync, encrypted, to your VortX account).")
+                Text("Optional. Add your own TMDB and MDBList keys to enrich recommendations and ratings. Add a SkipDB key to submit and correct skip segments from the player. Keys stay on this device (and sync, encrypted, to your VortX account).")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 keyField("TMDB", text: $keys.tmdb, hint: "Free at themoviedb.org, Settings then API.")
                 keyField("MDBList", text: $keys.mdblist, hint: "Free at mdblist.com, Preferences then API.")
+                keyField("SkipDB", text: $keys.skipdb, hint: "Create an account at skipdb.tv, then generate an API key in Account settings.")
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
