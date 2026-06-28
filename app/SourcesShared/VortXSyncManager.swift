@@ -102,8 +102,26 @@ final class VortXSyncManager: ObservableObject {
     func signOut() {
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
+        HouseholdSyncManager.shared.reset()   // forget the in-memory hhKey: a different account must re-recover
         Keychain.set(nil, for: kcAccount)
     }
+
+    // MARK: - Household sharing bridge (read-only handles for the sibling HouseholdSyncManager)
+    //
+    // HouseholdSyncManager is a sibling @MainActor singleton, not a subclass, so it cannot reach the
+    // private session token / dataKey / account id directly. These narrow accessors hand it exactly the
+    // material it needs (and nothing else): the bearer token to call /v1/household/*, the account's
+    // dataKey to re-seal the recovered hhKey under (doc.household.wrappedHhKey), and this account's id to
+    // tag its own contributions with for the leave-time provenance filter. All nil when signed out.
+
+    /// The current session bearer token, or nil when signed out. Household endpoints are session-authed.
+    var sessionToken: String? { token }
+    /// This account's own dataKey, for sealing the recovered hhKey under for durability across our devices.
+    var accountDataKey: Data? { dataKey }
+    /// This account's opaque VortX id, the `contributorAccountId` stamped on this member's contributions.
+    var accountID: String? { account?.id }
+    /// A household client pointed at the same Worker the manager talks to (api.vortx.tv).
+    var householdClient: VortXSyncClient { VortXSyncClient(baseURL: URL(string: base)) }
 
     // MARK: - HTTP
 
@@ -340,15 +358,16 @@ final class VortXSyncManager: ObservableObject {
                  "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000),
                  "v": item.state.videoId ?? ""]
             }
-        // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle (same
-        // shape as the add-on guard). FLOOR (OFF, default) = UNION the account's already-owned
-        // `doc.vortx.library` with the engine library, so a Stremio removal never removes from VortX and
-        // an empty/degraded engine can never SHRINK it. The `mirror CW` toggle, when OFF, is what keeps a
-        // prior in-progress item's t/d from being zeroed by a Stremio drop (the union preserves it).
-        // MIRROR (ON) = REPLACE: the engine (live Stremio set) is authoritative so removals propagate.
-        // NEVER-ZERO: REPLACE only when the engine library is non-empty; otherwise fall back to UNION.
+        // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle. FLOOR (OFF,
+        // default) = UNION the account's already-owned `doc.vortx.library` with the engine library, so a
+        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. The
+        // `mirror CW` toggle, when OFF, is what keeps a prior in-progress item's t/d from being zeroed by a
+        // Stremio drop (the union preserves it). MIRROR (ON) = REPLACE: the live Stremio set is authoritative
+        // so removals propagate - but ONLY with a live Stremio session AND a non-empty engine library, so a
+        // logged-out / mid-pull shrunken set can never propagate the shrink to every device (the add-on
+        // guard's clobber fix; the library has no official-defaults concept, so no `!engineIsDefaultOnly`).
         var libraryByID: [String: [String: Any]] = [:]
-        let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty
+        let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty && CoreBridge.shared.isLoggedIn()
         if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
@@ -641,12 +660,27 @@ final class VortXSyncManager: ObservableObject {
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons() async {
         guard isSignedIn else { return }
-        guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
-        let owned = Self.ownedAddons(from: doc)
-        if !owned.isEmpty {
-            CoreBridge.shared.hydrateAddonsFromAccount(owned)
+        // The account's OWN add-ons hydrate only from a real `.doc` (a `.failed`/`.empty` pull does nothing:
+        // the never-zero invariant). Household hydration is INDEPENDENT of this: a member whose personal
+        // account is genuinely empty (`.empty`) is the PRIMARY case the feature serves, so it must NOT be
+        // gated behind the account doc existing. It runs unconditionally below.
+        if case let .doc(doc) = await pullSyncDocResult() {
+            let owned = Self.ownedAddons(from: doc)
+            if !owned.isEmpty {
+                CoreBridge.shared.hydrateAddonsFromAccount(owned)
+            }
+            await recoverOwnerLibraryIfEmpty(from: doc)
         }
-        await recoverOwnerLibraryIfEmpty(from: doc)
+        // Household sharing: AFTER the account's OWN add-ons hydrate, layer the household's shared set on
+        // top (the provenance-tagged union of every member's add-ons + library + metadata/debrid keys).
+        // Same install-only, idempotent CoreBridge.hydrateAddonsFromAccount path; guarded on hhKey
+        // availability (no household => silent no-op), never uninstalls, never touches a per-profile
+        // overlay. This is what makes a member's EMPTY personal account show the household's add-ons, so it
+        // is deliberately NOT gated behind the account-doc pull above. Wired here, at the single funnel
+        // every syncDown hydration call site routes through (CoreBridge bootstrapAuth +
+        // scheduleSessionRepair, and the iOS/tvOS app foreground + onAppear hooks), so the household layer
+        // runs after account hydration at ALL of them without duplicating the call.
+        await HouseholdSyncManager.shared.hydrateSharedAddons()
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
@@ -657,15 +691,18 @@ final class VortXSyncManager: ObservableObject {
         var byUrl: [String: VortXOwnedAddon] = [:]
         var order: [String] = []   // preserve install order (AIOManager-compat: collection order = priority)
         func add(_ a: VortXOwnedAddon) {
-            if byUrl[a.transportUrl] == nil { order.append(a.transportUrl) }
-            byUrl[a.transportUrl] = a
+            // First sight wins both the order slot AND the descriptor, so the app/engine-owned set (added
+            // first below) defines the order spine and its richer descriptor is kept for a shared URL.
+            if byUrl[a.transportUrl] == nil { order.append(a.transportUrl); byUrl[a.transportUrl] = a }
         }
-        // doc.addons (web import) first, so doc.vortx.addons can overwrite with the richer app descriptor.
-        if let webAddons = doc["addons"] as? [[String: Any]] {
-            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
-        }
+        // doc.vortx.addons (the app/engine-owned set) FIRST, so it defines the order spine - matching the
+        // write-side spine in vortxSummary - and its richer descriptor wins a URL present in both; then the
+        // web-import-only URLs append after.
         if let vortx = doc["vortx"] as? [String: Any], let appAddons = vortx["addons"] as? [[String: Any]] {
             for raw in appAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
+        }
+        if let webAddons = doc["addons"] as? [[String: Any]] {
+            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
         }
         return order.compactMap { byUrl[$0] }
     }
