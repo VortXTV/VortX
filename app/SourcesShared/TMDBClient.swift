@@ -84,6 +84,33 @@ enum TMDBClient {
         return WatchAvailability(link: link, providers: merged)
     }
 
+    /// The official YouTube trailer id for a title from TMDB's /videos (the source Stremio trailer add-ons
+    /// use). Accepts an IMDb id (tt...) via /find or a `tmdb:[type:]id`. Requires a TMDB key; nil on no key,
+    /// no match, or no trailer. Prefers an official Trailer, then any YouTube Trailer/Teaser/Clip.
+    static func trailerYouTubeID(metaID: String, type: String) async -> String? {
+        guard let key = ApiKeys.tmdbKey() else { return nil }
+        let media = (type == "series") ? "tv" : "movie"
+        var tmdbID: Int?
+        if metaID.hasPrefix("tt") {
+            guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)"),
+                  let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first else { return nil }
+            tmdbID = first["id"] as? Int
+        } else if metaID.hasPrefix("tmdb:") {
+            tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
+        }
+        guard let id = tmdbID,
+              let vids = await get("/\(media)/\(id)/videos?api_key=\(key)"),
+              let results = vids["results"] as? [[String: Any]] else { return nil }
+        let youtube = results.filter { ($0["site"] as? String)?.lowercased() == "youtube" && $0["key"] is String }
+        func firstKey(where pred: ([String: Any]) -> Bool) -> String? {
+            youtube.first(where: pred).flatMap { $0["key"] as? String }
+        }
+        if let k = firstKey(where: { ($0["type"] as? String) == "Trailer" && ($0["official"] as? Bool == true) }) { return k }
+        if let k = firstKey(where: { ($0["type"] as? String) == "Trailer" }) { return k }
+        if let k = firstKey(where: { ["Teaser", "Clip"].contains(($0["type"] as? String) ?? "") }) { return k }
+        return youtube.first.flatMap { $0["key"] as? String }
+    }
+
     private static func get(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: host + path) else { return nil }
         do {

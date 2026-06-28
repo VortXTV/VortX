@@ -197,10 +197,15 @@ struct iOSDetailView: View {
         /// direct (non-YouTube) trailer stream OR the embedded server's `/yt/{id}` route (the same path
         /// tvOS uses). recordMeta is nil for these so a trailer never lands in Continue Watching.
         case trailerPlayer(url: URL, title: String)
+        /// A YouTube trailer played via the keyless IFrame embed (`TrailerEmbedCover`) - the reliable,
+        /// official-Stremio-style path, and the one that needs no streaming server (works on Lite too).
+        /// iOS/iPad/Mac only (WKWebView); tvOS keeps `/yt` via its own DetailView.
+        case trailerEmbed(youTubeID: String, title: String)
         var id: String {
             switch self {
             case .player(let l): "player-\(l.id)"
             case .trailerPlayer(_, let t): "trailer-\(t)"
+            case .trailerEmbed(let yt, _): "trailerEmbed-\(yt)"
             }
         }
     }
@@ -340,6 +345,9 @@ struct iOSDetailView: View {
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
                              recordMeta: nil, isTrailer: true, onClose: { presentation = nil })
                     .ignoresSafeArea()
+            case .trailerEmbed(let youTubeID, let title):
+                TrailerEmbedCover(youTubeID: youTubeID, title: title, onClose: { presentation = nil })
+                    .ignoresSafeArea()
             }
         }
     }
@@ -352,20 +360,27 @@ struct iOSDetailView: View {
     /// (e.g. the Lite build with no embedded server) does it fall back to opening the public link
     /// externally, and that fallback is silent (no error flash).
     private func playTrailer() {
-        guard let m = meta, let req = TrailerRequest.from(meta: m) else { return }
-        if let url = req.playableURL {
-            presentation = .trailerPlayer(url: url, title: "\(m.name) — Trailer")
-        } else if let watch = req.watchURL {
-            // No embedded server to resolve the `/yt` route (Lite build): open the public link externally,
-            // silently. No error is ever surfaced.
-            TrailerOpener.open(watch)
+        guard let m = meta else { return }
+        let title = "\(m.name) Trailer"
+        let req = TrailerRequest.from(meta: m)
+        // A direct (non-YouTube) trailer stream plays in the native player. A YouTube trailer plays via the
+        // keyless IFrame embed (the reliable official-Stremio path), resolving the id from the engine meta
+        // or the Cinemeta/TMDB fallback. No /yt scraping, so it works even on the Lite (no-server) build.
+        if let direct = req?.directURL {
+            presentation = .trailerPlayer(url: direct, title: title)
+        } else if let yt = req?.youTubeID ?? resolvedTrailerID, !yt.isEmpty {
+            presentation = .trailerEmbed(youTubeID: yt, title: title)
+        } else if let watch = req?.watchURL {
+            TrailerOpener.open(watch)   // last resort: hand off to the YouTube app / browser
         }
     }
 
     /// A standalone Trailer chip, shown whenever the meta carries a trailer (direct stream or a YouTube
     /// link). Used in both the movie Watch row and the series hero.
     @ViewBuilder private var trailerButton: some View {
-        if let m = meta, TrailerRequest.from(meta: m) != nil {
+        // Show when ANY trailer source resolves: the engine meta's own trailer OR the Cinemeta/TMDB
+        // fallback id (resolvedTrailerID), so a title whose engine meta carries no trailer still gets one.
+        if let m = meta, TrailerRequest.from(meta: m) != nil || resolvedTrailerID?.isEmpty == false {
             Button { playTrailer() } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }
@@ -491,16 +506,23 @@ struct iOSDetailView: View {
     /// on the detail page just like the Home hero does. IMDB ids only (Cinemeta is keyed by `tt`); a
     /// non-`tt` catalog id simply gets no fallback. Applied only if the title is still on screen.
     private func resolveTrailerIfNeeded(_ m: CoreMetaItem) {
-        guard m.trailerYouTubeID == nil, resolvedTrailerID == nil, m.id.hasPrefix("tt"),
-              let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(m.type)/\(m.id).json") else { return }
+        guard m.trailerYouTubeID == nil, resolvedTrailerID == nil else { return }
         Task {
-            var req = URLRequest(url: url); req.timeoutInterval = 6; req.cachePolicy = .returnCacheDataElseLoad
-            guard let (data, resp) = try? await URLSession.shared.data(for: req),
-                  (resp as? HTTPURLResponse)?.statusCode == 200,
-                  let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
-                  let yt = decoded.meta?.trailerYouTubeID, !yt.isEmpty else { return }
-            await MainActor.run {
-                if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt }
+            // 1) Cinemeta (keyless) for IMDb ids covers most popular titles.
+            if m.id.hasPrefix("tt"), let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(m.type)/\(m.id).json") {
+                var req = URLRequest(url: url); req.timeoutInterval = 6; req.cachePolicy = .returnCacheDataElseLoad
+                if let (data, resp) = try? await URLSession.shared.data(for: req),
+                   (resp as? HTTPURLResponse)?.statusCode == 200,
+                   let decoded = try? JSONDecoder().decode(AddonMetaResponse.self, from: data),
+                   let yt = decoded.meta?.trailerYouTubeID, !yt.isEmpty {
+                    await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt } }
+                    return
+                }
+            }
+            // 2) TMDB /videos (when a TMDB key is set) fills Cinemeta's gaps and covers tmdb: catalog ids
+            //    with no IMDb id (the same source Stremio trailer add-ons use).
+            if let yt = await TMDBClient.trailerYouTubeID(metaID: m.id, type: m.type), !yt.isEmpty {
+                await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedTrailerID = yt } }
             }
         }
     }
