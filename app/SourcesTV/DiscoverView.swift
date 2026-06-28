@@ -87,7 +87,7 @@ struct DiscoverView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: Theme.Space.sm) {
                     ForEach(genre.options) { option in
-                        Button { core.selectDiscover(option.request) } label: { Text(option.label).lineLimit(1) }
+                        Button { core.selectDiscover(option.request) } label: { Text(AddonTerms.localize(option.label)).lineLimit(1) }
                             .buttonStyle(ChipButtonStyle(selected: option.selected))
                     }
                 }

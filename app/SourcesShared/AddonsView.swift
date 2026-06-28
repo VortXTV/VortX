@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreImage   // CIQRCodeGenerator for the Apple TV "Configure" QR
 
 /// Reachability of one installed add-on, from a lightweight manifest probe.
 enum AddonHealth: Equatable {
@@ -98,6 +99,7 @@ struct AddonsView: View {
     @State private var installing = false
     @State private var installMessage: String?
     @State private var installFailed = false
+    @State private var configuring: CoreDescriptor?   // the add-on whose Configure sheet is open
 
     var body: some View {
         NavigationStack {
@@ -144,6 +146,7 @@ struct AddonsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
+            .sheet(item: $configuring) { ConfigureAddonView(addon: $0) }
         }
     }
 
@@ -227,6 +230,13 @@ struct AddonsView: View {
                 }
             }
             Spacer(minLength: Theme.Space.sm)
+            // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
+            // regardless of protected state; protected defaults are not configurable anyway.
+            if addon.isConfigurable {
+                Button { configuring = addon } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
+            }
             if !addon.isProtected {
                 // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
                 Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
@@ -251,4 +261,73 @@ struct AddonsView: View {
             .frame(maxWidth: 820, alignment: .leading)
             .padding(.top, Theme.Space.sm)
     }
+}
+
+/// Configure a configurable add-on. On iPhone, iPad, and Mac it opens the add-on's web configuration
+/// page in the browser; on Apple TV (which has no browser) it shows that page as a QR to finish on a
+/// phone, or points to the web dashboard. After configuring, the add-on hands back a NEW manifest URL,
+/// which the user pastes into Add an add-on to install their configured copy (the Stremio configure flow).
+private struct ConfigureAddonView: View {
+    let addon: CoreDescriptor
+    @Environment(\.openURL) private var openURL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: Theme.Space.lg) {
+            VStack(spacing: Theme.Space.xs) {
+                Text("Configure").font(.title2).fontWeight(.bold)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(addon.manifest.name).font(.subheadline)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            if let url = addon.configureURL {
+                #if os(tvOS)
+                if let qr = Self.qrImage(url.absoluteString) {
+                    Image(decorative: qr, scale: 1)
+                        .interpolation(.none).resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(Theme.Space.md)
+                        .background(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                }
+                Text("Scan with your phone to open this add-on's settings, then paste the configured add-on link back into Add an add-on. You can also configure it on the web dashboard at vortx.tv.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 640)
+                #else
+                Button { openURL(url) } label: {
+                    Label("Open configuration page", systemImage: "safari")
+                        .frame(maxWidth: .infinity).padding(.vertical, 4)
+                }
+                .buttonStyle(PrimaryActionStyle())
+                Text("Configure the add-on in your browser, then copy the configured add-on link it gives you and paste it into Add an add-on to install your version.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 460)
+                #endif
+            }
+            Button("Done") { dismiss() }
+                .buttonStyle(.bordered)
+                .tint(Theme.Palette.textPrimary)
+                .foregroundStyle(Theme.Palette.textPrimary)
+        }
+        .padding(Theme.Space.xl)
+        #if os(macOS)
+        .frame(width: 460)
+        .background(Theme.Palette.canvas)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #endif
+    }
+
+    #if os(tvOS)
+    private static func qrImage(_ string: String) -> CGImage? {
+        guard let data = string.data(using: .utf8),
+              let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+        return CIContext().createCGImage(scaled, from: scaled.extent)
+    }
+    #endif
 }

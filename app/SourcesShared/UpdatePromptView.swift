@@ -66,9 +66,14 @@ struct UpdatePromptView: View {
                 // + `.tint(accent)` auto-picked white text that vanished on the gold accent (invisible-text).
                 .buttonStyle(PrimaryActionStyle())
 
+                // A `.bordered` button paints its label in the tint color; `textSecondary` (mid-grey) on
+                // the dark canvas was too low-contrast to read on tvOS, especially unfocused (same class as
+                // the invisible-text note above). Tint with `textPrimary` so the secondary action stays
+                // legible; the accent-filled "Get the update" above keeps it clearly the primary choice.
                 Button("Later") { finish() }
                     .buttonStyle(.bordered)
-                    .tint(Theme.Palette.textSecondary)
+                    .tint(Theme.Palette.textPrimary)
+                    .foregroundStyle(Theme.Palette.textPrimary)
             }
             .padding(.bottom, Theme.Space.lg)
         }

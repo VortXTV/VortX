@@ -677,10 +677,10 @@ struct iOSLibraryView: View {
         // soft-accent pill with accent ink, so on-chip text follows onAccent and stays legible on
         // light accents (#39) — the old solid-accent + hardcoded-white chip went invisible.
         chipScroll { ForEach(selectable.types) { t in
-            Button(t.label) { core.selectLibrary(t.request) }
+            Button(AddonTerms.localize(t.label)) { core.selectLibrary(t.request) }
                 .buttonStyle(ChipButtonStyle(selected: t.selected)) } }
         chipScroll { ForEach(selectable.sorts) { s in
-            Button(s.label) { core.selectLibrary(s.request) }
+            Button(AddonTerms.localize(s.label)) { core.selectLibrary(s.request) }
                 .buttonStyle(ChipButtonStyle(selected: s.selected)) } }
     }
 
@@ -935,7 +935,7 @@ struct iOSDiscoverView: View {
                             if let genre = discover.selectable.extra.first(where: { $0.name.caseInsensitiveCompare("genre") == .orderedSame }),
                                !genre.options.isEmpty {
                                 chipScroll { ForEach(genre.options) { o in
-                                    Button(o.label) { core.selectDiscover(o.request) }
+                                    Button(AddonTerms.localize(o.label)) { core.selectDiscover(o.request) }
                                         .buttonStyle(ChipButtonStyle(selected: o.selected)) } }
                             }
                         }

@@ -149,6 +149,18 @@ struct CoreDescriptor: Decodable, Identifiable {
     var hasCatalogs: Bool { !manifest.catalogs.isEmpty }
     /// Host only (the full transportUrl can embed a debrid config token).
     var host: String { URL(string: transportUrl)?.host ?? transportUrl }
+    /// True when the add-on declares a web configuration page (manifest behaviorHints.configurable).
+    var isConfigurable: Bool { manifest.behaviorHints?.configurable == true }
+    /// The add-on's configuration page: the manifest URL with the trailing `manifest.json` swapped for
+    /// `configure` (the Stremio convention). Opens in a browser on iPhone/iPad/Mac; on Apple TV the
+    /// Configure sheet shows it as a QR to finish on a phone (or via the web dashboard).
+    var configureURL: URL? {
+        guard isConfigurable else { return nil }
+        if transportUrl.hasSuffix("/manifest.json") {
+            return URL(string: String(transportUrl.dropLast("manifest.json".count)) + "configure")
+        }
+        return URL(string: transportUrl)
+    }
     /// "Catalogs · Streams · Subtitles", the resource kinds the addon exposes.
     var capabilities: String {
         var caps: [String] = []
@@ -164,6 +176,15 @@ struct CoreManifest: Decodable {
     let name: String
     let catalogs: [CoreManifestCatalog]
     let resources: [CoreManifestResource]?
+    /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
+    let behaviorHints: CoreManifestBehaviorHints?
+}
+
+/// Manifest-level `behaviorHints` (distinct from the meta-level + per-stream ones). `configurable` flags
+/// that the add-on has a config page (Stremio convention: its manifest URL with `manifest.json` -> `configure`).
+struct CoreManifestBehaviorHints: Decodable {
+    let configurable: Bool?
+    let configurationRequired: Bool?
 }
 
 /// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
