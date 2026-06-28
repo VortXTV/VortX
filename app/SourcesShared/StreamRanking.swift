@@ -379,11 +379,17 @@ enum StreamRanking {
         let gb = sizeGB(text)
         let mb = gb > 0 ? gb * 1024 : sizeMB(text)
         guard mb > 0 else { return false }   // unknown size: cannot judge
+        // An episode is a fraction of a feature's runtime, so it gets a lower floor than a movie. The
+        // SxxEyy token (or "season"/"episode") is the only content-type signal in the stream text.
+        let isEpisode = firstMatch(text, #"s\d{1,2}[ ._-]?e\d{1,2}"#) != nil
+            || text.contains("season") || text.contains("episode")
         if text.contains("2160") || boundedMatch(text, "4k") || boundedMatch(text, "uhd") {
-            return mb < 250   // a real 4K movie is multi-GB; even a 4K episode clears this easily
+            // A real 4K movie is multi-GB; a 4K episode is hundreds of MB. A 720p file merely TAGGED 4K
+            // (the "200 MB 4K" case) sits far below these floors and is distrusted.
+            return mb < (isEpisode ? 700 : 1800)
         }
         if boundedMatch(text, "1080p?") {
-            return mb < 50    // a 1080p feature under 50 MB is not real video
+            return mb < (isEpisode ? 150 : 600)   // a 1080p feature/episode below this is not real video
         }
         return false           // 720p and below: small files are legitimately common
     }
@@ -802,7 +808,12 @@ enum StreamRanking {
     /// small for 4K, so a low-res file that merely carries a 4k tag isn't promoted to the 4K bucket.
     static func qualityLabel(_ s: CoreStream) -> String {
         let t = qualityText(s)
-        if let r = explicitResolution(t) { return r >= 4000 ? "4K" : "\(r)p" }
+        if let r = explicitResolution(t) {
+            // Even an explicit "2160p" token is only badged 4K when the file size isn't implausibly
+            // small for 4K, so a 720p file carrying a "2160p" tag isn't shown as 4K.
+            if r >= 4000 { return implausibleForResolution(t) ? "Other" : "4K" }
+            return "\(r)p"
+        }
         if (boundedMatch(t, "4k") || boundedMatch(t, "uhd")), !implausibleForResolution(t) { return "4K" }
         return "Other"
     }
