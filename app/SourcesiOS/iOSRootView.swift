@@ -1611,10 +1611,11 @@ private struct PosterGrid: View {
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
     // Center the adaptive tracks so the cards distribute evenly across the available width. Min track
-    // matches the card width: 168pt landscape pills, or 116pt portrait (120pt card + breathing room).
+    // matches the card width: 168pt landscape pills (TMDB key required), else 116pt portrait.
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: catalogPrefs.landscapeCards ? 168 : 116), spacing: Theme.Space.sm, alignment: .center)]
+        [GridItem(.adaptive(minimum: catalogPrefs.landscapeCards && apiKeys.hasTMDB ? 168 : 116), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
@@ -1902,10 +1903,12 @@ private struct PosterCardiOS: View {
     /// Per-card "open details" action, wired into the Continue Watching menu's Details item.
     var onDetails: (() -> Void)? = nil
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
 
-    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting.
-    private var landscape: Bool { catalogPrefs.landscapeCards }
+    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
+    /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
+    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
     private var cardW: CGFloat { landscape ? 168 : 120 }
     private var cardH: CGFloat { landscape ? 95 : 180 }   // 168 * 9/16 ≈ 95
 

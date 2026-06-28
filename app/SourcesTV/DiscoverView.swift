@@ -8,9 +8,10 @@ struct DiscoverView: View {
     @EnvironmentObject private var account: StremioAccount
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
-    /// Cinematic landscape cards are wider, so fewer per row; portrait posters keep the dense 6-up grid.
+    @ObservedObject private var apiKeys = ApiKeys.shared
+    /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
     private var columns: [GridItem] {
-        catalogPrefs.landscapeCards
+        catalogPrefs.landscapeCards && apiKeys.hasTMDB
             ? Array(repeating: GridItem(.fixed(kLandscapeCardWidth), spacing: Theme.Space.lg), count: 3)
             : Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
     }

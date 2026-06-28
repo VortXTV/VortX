@@ -430,7 +430,7 @@ struct SettingsView: View {
 
             choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],
                       selection: Binding(get: { catalogPrefs.landscapeCards ? "1" : "0" }, set: { catalogPrefs.landscapeCards = ($0 == "1") }))
-            Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Choose Portrait for the classic poster grid.")
+            Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)

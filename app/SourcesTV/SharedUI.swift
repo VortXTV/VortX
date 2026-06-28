@@ -472,9 +472,12 @@ struct PosterCard: View {
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
     var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
 
-    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting.
-    private var landscape: Bool { catalogPrefs.landscapeCards }
+    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
+    /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
+    /// users keep the clean portrait grid until they add a key (Settings > API keys).
+    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
     /// Landscape cards use one cinematic width; portrait cards honor the caller's `width`.
     private var cardWidth: CGFloat { landscape ? kLandscapeCardWidth : width }
 
