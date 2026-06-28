@@ -4,6 +4,14 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
+
+The cinematic catalog, rebuilt the right way. Beta 10 tried wide landscape cards and pulled cropped, sometimes wrong art, so Beta 11 went back to posters. This brings the wide cards back on a clean, dependable source: textless TMDB backdrops resolved per title, never an add-on's poster stretched sideways. In-place update, nothing resets. This is a beta, so please install it and tell me how the catalog looks on your TV.
+
+### Added
+
+- **Cinematic landscape catalog cards.** Catalog rows and the Discover and Library grids now show wide 16:9 cards built from clean, textless TMDB artwork, across Apple TV, iPhone, iPad, and Mac. It is on by default, with a switch in Settings, Appearance, "Cinematic catalog cards," to return to the classic portrait posters any time. It uses your TMDB key (set one under API keys); without a key the catalog stays on portrait posters so it never falls back to a worse-looking card. When a title has no TMDB backdrop, the card fills with a softly blurred copy of the poster behind a fit copy, so the frame still looks intentional.
+
 ## 0.3.8 Beta 12 - 2026-06-28 (pre-release)
 
 The Beta 11 follow-up. A focused pass on the bugs you reported: trailers that actually play, Continue Watching that behaves, a Home you can tidy up, sharper resolution labels, and working keyboard navigation on the Mac. In-place update, nothing resets. This is a beta, so please install it and report anything off.
