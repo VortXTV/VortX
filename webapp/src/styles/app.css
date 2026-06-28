@@ -441,6 +441,70 @@ input:focus-visible {
   color: var(--muted-2);
 }
 
+/* ---- Search typeahead (as-you-type suggestions: recents + quick title jumps) ---- */
+.search-bar {
+  position: relative;
+  max-width: 540px;
+}
+.search-suggest {
+  position: absolute;
+  top: calc(100% - 1rem); /* tuck just under the input, above the form's margin-bottom */
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background: var(--surface);
+  border: 1px solid var(--surface-3);
+  border-radius: var(--radius-card);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  padding: 0.3rem;
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  overflow-x: clip;
+}
+.search-suggest[hidden] {
+  display: none;
+}
+.suggest-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: var(--radius-chip);
+  color: var(--text);
+  text-decoration: none;
+  min-width: 0;
+}
+.suggest-row:hover,
+.suggest-row:focus-visible {
+  background: var(--surface-2);
+}
+.suggest-thumb {
+  width: 30px;
+  height: 45px;
+  flex: 0 0 auto;
+  border-radius: 5px;
+  object-fit: cover;
+  background: var(--surface-2);
+}
+.suggest-ico {
+  width: 30px;
+  text-align: center;
+  color: var(--muted-2);
+  flex: 0 0 auto;
+}
+.suggest-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.suggest-year {
+  color: var(--muted-2);
+  font-size: 0.85em;
+  flex: 0 0 auto;
+}
+
 /* ---- Chips ---- */
 
 .chip {

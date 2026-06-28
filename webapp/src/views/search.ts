@@ -15,11 +15,15 @@ export function renderSearchShell(host: HTMLElement, query: string): void {
       <div class="discover-head">
         <h1 class="page-title">Search</h1>
       </div>
-      <form class="search-form" id="search-form" role="search">
-        <input class="search-input" id="search-input" type="search" name="q" autocomplete="off"
-               placeholder="Search movies and series" value="${escapeHtml(query)}" aria-label="Search" />
-        <button class="chip" type="submit">Search</button>
-      </form>
+      <div class="search-bar">
+        <form class="search-form" id="search-form" role="search">
+          <input class="search-input" id="search-input" type="search" name="q" autocomplete="off"
+                 placeholder="Search movies and series" value="${escapeHtml(query)}" aria-label="Search"
+                 role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="search-suggest" />
+          <button class="chip" type="submit">Search</button>
+        </form>
+        <div class="search-suggest" id="search-suggest" role="listbox" aria-label="Suggestions" hidden></div>
+      </div>
       <div class="grid" id="search-grid" role="list">${query ? "" : recentChips()}</div>
       <div class="search-more-wrap" id="search-more-wrap"></div>
     </div>`;
@@ -151,6 +155,84 @@ export async function loadMoreSearch(): Promise<void> {
   if (grid && fresh.length) grid.insertAdjacentHTML("beforeend", fresh.map(posterCard).join(""));
   const wrap = document.getElementById("search-more-wrap");
   if (wrap) wrap.innerHTML = moreButton(p);
+}
+
+// --- As-you-type suggestions --------------------------------------------------------------------
+// A lightweight typeahead under the search box: matching RECENT searches (instant, local) plus the top
+// few TITLE matches from a quick single-catalog lookup. Distinct from the full streaming results in the
+// grid below: this lets you jump straight to a title's Detail or repeat a recent query while typing.
+
+let suggestToken = 0;
+
+/** Top title suggestions for `query` from the first one or two searchable catalogs (fast; suggestions do
+ *  not need every source). De-duped by id, capped at `limit`. [] on any failure. */
+async function fetchSuggestions(addons: Addon[], query: string, limit = 6): Promise<MetaItem[]> {
+  const types = discoverTypes(addons);
+  const refs = searchableRefs(addons, types.length ? types : ["movie", "series"]);
+  if (!refs.length) return [];
+  const seen = new Set<string>();
+  const out: MetaItem[] = [];
+  for (const ref of refs.slice(0, 2)) {
+    let metas: MetaItem[] = [];
+    try {
+      metas = await fetchSearchPage(ref, query, 0);
+    } catch {
+      metas = [];
+    }
+    for (const m of metas) {
+      if (seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push(m);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+function recentRow(q: string): string {
+  return `<a class="suggest-row suggest-recent" role="option" href="#/search/${encodeURIComponent(q)}">
+    <span class="suggest-ico" aria-hidden="true">↩</span><span class="suggest-name">${escapeHtml(q)}</span></a>`;
+}
+function titleRow(m: MetaItem): string {
+  const thumb =
+    typeof m.poster === "string" && /^https:\/\//i.test(m.poster)
+      ? `<img class="suggest-thumb" src="${escapeHtml(m.poster)}" alt="" loading="lazy" />`
+      : `<span class="suggest-thumb suggest-thumb-empty" aria-hidden="true"></span>`;
+  const year = (m as { year?: string | number }).year;
+  const meta = year ? `<span class="suggest-year">${escapeHtml(String(year))}</span>` : "";
+  return `<a class="suggest-row" role="option" href="#/detail/${encodeURIComponent(m.type)}/${encodeURIComponent(m.id)}">
+    ${thumb}<span class="suggest-name">${escapeHtml(m.name)}</span>${meta}</a>`;
+}
+
+function paintSuggest(html: string): void {
+  const panel = document.getElementById("search-suggest");
+  if (!panel) return;
+  panel.innerHTML = html;
+  const open = html.trim().length > 0;
+  panel.hidden = !open;
+  document.getElementById("search-input")?.setAttribute("aria-expanded", String(open));
+}
+
+/** Hide + clear the suggestions panel (on submit, escape, blur, or navigation). */
+export function hideSuggestions(): void {
+  paintSuggest("");
+}
+
+/** Update the typeahead for the current input value: matching recents paint immediately, title
+ *  suggestions append once the quick lookup resolves (token-guarded against stale responses). Empty
+ *  query shows recent searches only. The caller debounces calls so we do not fetch on every keystroke. */
+export async function updateSearchSuggestions(addons: Addon[], query: string): Promise<void> {
+  const q = query.trim();
+  const token = ++suggestToken;
+  const recents = recentSearches().filter(
+    (r) => r.toLowerCase() !== q.toLowerCase() && (!q || r.toLowerCase().includes(q.toLowerCase())),
+  );
+  const recentHtml = recents.slice(0, 5).map(recentRow).join("");
+  paintSuggest(recentHtml); // instant: recents first
+  if (!q) return;
+  const titles = await fetchSuggestions(addons, q);
+  if (token !== suggestToken) return; // a newer keystroke superseded this lookup
+  paintSuggest(recentHtml + titles.map(titleRow).join(""));
 }
 
 function prompt(): string {

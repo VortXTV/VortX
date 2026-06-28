@@ -16,7 +16,7 @@ import {
   renderDiscoverShell,
   selectDiscoverCatalog,
 } from "./views/discover";
-import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
+import { loadMoreSearch, loadSearch, renderSearchShell, updateSearchSuggestions, hideSuggestions } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
 import { loadLive, renderLive } from "./views/live";
@@ -194,11 +194,13 @@ function wireSearchForm(): void {
   form?.addEventListener("submit", (ev) => {
     ev.preventDefault();
     window.clearTimeout(searchDebounce);
+    hideSuggestions();
     navigate({ name: "search", query: input?.value.trim() ?? "" });
   });
-  // As-you-type: debounced, results stream in as each catalog responds; the URL is kept in sync via
-  // replaceState (shareable on the spot) without a full route re-render, and it is not recorded as a
-  // recent search on every keystroke.
+  // As-you-type: debounced, results stream into the grid as each catalog responds; the URL is kept in
+  // sync via replaceState (shareable on the spot) without a full route re-render, and it is not recorded
+  // as a recent search on every keystroke. The typeahead panel updates in the same debounce: recents
+  // paint instantly, title suggestions append once the quick lookup resolves.
   input?.addEventListener("input", () => {
     window.clearTimeout(searchDebounce);
     const q = input.value.trim();
@@ -208,9 +210,17 @@ function wireSearchForm(): void {
       } catch {
         /* hash routing still works without replaceState */
       }
+      void updateSearchSuggestions(addons, q);
       if (q) void loadSearch(addons, q, false);
     }, 220);
   });
+  // Show recent-search suggestions the moment the box is focused (before any typing).
+  input?.addEventListener("focus", () => void updateSearchSuggestions(addons, input.value.trim()));
+  // Escape closes the panel; a delayed blur lets a click on a suggestion land before it hides.
+  input?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hideSuggestions();
+  });
+  input?.addEventListener("blur", () => window.setTimeout(hideSuggestions, 150));
 }
 
 /** Global click delegation: Detail overlay clicks, player close, Escape-like back affordances. */
