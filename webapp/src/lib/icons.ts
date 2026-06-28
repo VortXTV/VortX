@@ -40,6 +40,30 @@ const PATHS: Record<string, string> = {
   back: '<path d="M14.5 5 8 12l6.5 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
   check:
     '<g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8 12.2 2.6 2.6L16 9.4"/></g>',
+
+  // Player chrome
+  pause: '<g fill="currentColor"><rect x="7" y="5" width="3.6" height="14" rx="1"/><rect x="13.4" y="5" width="3.6" height="14" rx="1"/></g>',
+  "chevron-left": '<path d="M15 5 8 12l7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+  rewind:
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4 7 8l4 4"/><path d="M7 8h6a5 5 0 1 1-5 5"/></g>',
+  "fast-forward":
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 4l4 4-4 4"/><path d="M17 8h-6a5 5 0 1 0 5 5"/></g>',
+  subtitles:
+    '<g><rect x="3" y="5" width="18" height="14" rx="2.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M6.5 11.5h4M13.5 11.5h4M6.5 14.5h7M15.5 14.5h2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></g>',
+  cast:
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M3 16a5 5 0 0 1 5 5M3 12a9 9 0 0 1 9 9"/></g><circle cx="3.6" cy="20.4" r="1.2" fill="currentColor"/>',
+  pip:
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2.5"/></g><rect x="12" y="11" width="7" height="6" rx="1.2" fill="currentColor"/>',
+  fullscreen:
+    '<g fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4"/></g>',
+  "volume-x":
+    '<g><path d="M4 9v6h3l5 4V5L7 9z" fill="currentColor"/><path d="m16.5 9.5 5 5M21.5 9.5l-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></g>',
+  "volume-1":
+    '<g><path d="M4 9v6h3l5 4V5L7 9z" fill="currentColor"/><path d="M15.5 9.5a4 4 0 0 1 0 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></g>',
+  "volume-2":
+    '<g><path d="M4 9v6h3l5 4V5L7 9z" fill="currentColor"/><path d="M15.5 9.5a4 4 0 0 1 0 5M18 7a8 8 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></g>',
+  camera:
+    '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><path d="M3 8.5A1.5 1.5 0 0 1 4.5 7H7l1.3-2h7.4L17 7h2.5A1.5 1.5 0 0 1 21 8.5v9A1.5 1.5 0 0 1 19.5 19h-15A1.5 1.5 0 0 1 3 17.5z"/><circle cx="12" cy="13" r="3.2"/></g>',
 };
 
 export type IconName = keyof typeof PATHS;

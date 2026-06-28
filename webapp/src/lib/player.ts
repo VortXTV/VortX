@@ -1,9 +1,10 @@
 import type Hls from "hls.js";
 import type { ErrorData } from "hls.js";
-import { el, escapeHtml } from "./dom";
+import { el } from "./dom";
 import { cwPosition, recordProgress } from "./store";
 import { getSettings } from "./settings";
 import type { SubtitleTrack } from "./addon";
+import { mountControls, type PlayerController } from "./playerControls";
 
 /** The slim title context the player needs to record Continue Watching progress. */
 interface CWItem {
@@ -33,34 +34,20 @@ const HLS_EXT = /\.m3u8(\?|$)/i;
 let hls: Hls | null = null;
 let keyHandler: ((e: KeyboardEvent) => void) | null = null;
 let subtitleBlobs: string[] = [];
+let controller: PlayerController | null = null;
 
 /** Whether a url looks like an HLS playlist. */
 function isHls(url: string): boolean {
   return HLS_EXT.test(url);
 }
 
-/** The chrome that wraps the <video>: a Back button, a centered title, a speed control, and the video. */
-function chrome(title: string): string {
-  return `
-    <button class="player-close" data-action="close-player" aria-label="Close player">‹ Back</button>
-    <div class="player-title" aria-hidden="true">${escapeHtml(title)}</div>
-    <button class="player-speed" id="player-speed" aria-label="Playback speed">1×</button>
-    <video class="player-video" id="player-video" controls autoplay playsinline
-           crossorigin="anonymous"></video>`;
-}
-
-// Variable playback speed (a CloudStream-parity win). Shared by the speed button and the [ / ] keys.
+// Variable playback speed; the control bar reflects changes via the video's ratechange event.
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
-function setSpeed(video: HTMLVideoElement, rate: number): void {
-  video.playbackRate = rate;
-  const btn = el("player-speed");
-  if (btn) btn.textContent = `${rate}×`;
-}
 function stepSpeed(video: HTMLVideoElement, dir: number): void {
   const cur = video.playbackRate || 1;
   let i = SPEEDS.findIndex((s) => Math.abs(s - cur) < 0.01);
   if (i === -1) i = SPEEDS.indexOf(1);
-  setSpeed(video, SPEEDS[(i + dir + SPEEDS.length) % SPEEDS.length]);
+  video.playbackRate = SPEEDS[(i + dir + SPEEDS.length) % SPEEDS.length];
 }
 
 /** Open the player overlay and play `url`. `title` is shown as thin chrome over the transport. */
@@ -74,13 +61,20 @@ export async function play(
   if (!host) return;
   host.classList.remove("hidden");
   host.setAttribute("aria-hidden", "false");
-  host.innerHTML = chrome(title);
+  host.innerHTML = "";
 
-  const video = el<HTMLVideoElement>("player-video");
-  if (!video) return;
+  // The <video> is the media surface; the custom control chrome (playerControls) is layered over it.
+  const video = document.createElement("video");
+  video.className = "player-video";
+  video.id = "player-video";
+  video.autoplay = true;
+  video.playsInline = true;
+  video.crossOrigin = "anonymous";
+  host.appendChild(video);
+  controller = mountControls(host, video, { title, skipStep: getSettings().skipStep });
+
   if (item) wireProgress(video, item);
   wireKeyboard(video);
-  el("player-speed")?.addEventListener("click", () => stepSpeed(video, 1));
   // Surface a clear message when the element fails to load or decode (an expired debrid link, a 404, an
   // unsupported codec). The hls.js path has its own fatal-error handler; this covers the direct/debrid
   // and native-HLS paths, which would otherwise just show a black player. Teardown clears the source via
@@ -88,11 +82,18 @@ export async function play(
   video.addEventListener("error", () =>
     showError(host, "This source could not be played. It may be offline or an unsupported format. Try another source."),
   );
-  // Non-blocking: playback starts immediately; subtitle <track>s are added when the list resolves.
-  if (subtitles) void subtitles.then((subs) => addSubtitleTracks(video, subs)).catch(() => undefined);
+  // Non-blocking: playback starts immediately; subtitle <track>s are added (and the CC menu rebuilt) when
+  // the list resolves.
+  if (subtitles) {
+    void subtitles
+      .then((subs) => addSubtitleTracks(video, subs))
+      .then(() => controller?.refreshSubtitles())
+      .catch(() => undefined);
+  }
 
-  // Native HLS (Safari / iOS) or any non-HLS url: hand the url straight to the element.
-  if (!isHls(url) || video.canPlayType("application/vnd.apple.mpegurl")) {
+  // Direct sources (mp4 / mkv / debrid links): hand the url straight to the element.
+  if (!isHls(url)) {
+    controller.setHls(null);
     video.src = url;
     void video.play().catch(() => {
       /* autoplay can be blocked; the visible controls let the user start it */
@@ -100,35 +101,46 @@ export async function play(
     return;
   }
 
-  // HLS via Media Source Extensions: load hls.js on demand.
-  const mod = await import("hls.js");
-  const HlsCtor = mod.default;
-  if (HlsCtor.isSupported()) {
-    hls = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
-    hls.loadSource(url);
-    hls.attachMedia(video);
-    hls.on(HlsCtor.Events.MEDIA_ATTACHED, () => {
-      void video.play().catch(() => undefined);
-    });
-    hls.on(HlsCtor.Events.ERROR, (_evt: unknown, data: ErrorData) => {
-      if (!data.fatal) return;
-      // Fatal media/network errors: try hls.js's documented recovery once, else surface a message.
-      switch (data.type) {
-        case mod.ErrorTypes.NETWORK_ERROR:
-          hls?.startLoad();
-          break;
-        case mod.ErrorTypes.MEDIA_ERROR:
-          hls?.recoverMediaError();
-          break;
-        default:
-          showError(host, "This stream could not be played. Try another source.");
-          break;
-      }
-    });
-    return;
+  // HLS. Prefer hls.js wherever it is supported, because it powers the custom Quality / Audio-track /
+  // Subtitle menus (the native engine hides those behind its own UI). The exception is Safari / iOS, where
+  // Apple's native HLS is more reliable - notably for fMP4 - so there we defer to native (it does its own
+  // adaptive bitrate + track handling, and our chrome still drives play/seek/volume/speed/fullscreen).
+  const ua = navigator.userAgent;
+  const preferNative =
+    (/iP(ad|hone|od)/.test(ua) || /^((?!chrome|android|crios|fxios).)*safari/i.test(ua)) &&
+    !!video.canPlayType("application/vnd.apple.mpegurl");
+  if (!preferNative) {
+    const mod = await import("hls.js");
+    const HlsCtor = mod.default;
+    if (HlsCtor.isSupported()) {
+      hls = new HlsCtor({ enableWorker: true, lowLatencyMode: false });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      controller.setHls(hls); // wire the Quality + Audio-track menus from the hls levels
+      hls.on(HlsCtor.Events.MEDIA_ATTACHED, () => {
+        void video.play().catch(() => undefined);
+      });
+      hls.on(HlsCtor.Events.ERROR, (_evt: unknown, data: ErrorData) => {
+        if (!data.fatal) return;
+        // Fatal media/network errors: try hls.js's documented recovery once, else surface a message.
+        switch (data.type) {
+          case mod.ErrorTypes.NETWORK_ERROR:
+            hls?.startLoad();
+            break;
+          case mod.ErrorTypes.MEDIA_ERROR:
+            hls?.recoverMediaError();
+            break;
+          default:
+            showError(host, "This stream could not be played. Try another source.");
+            break;
+        }
+      });
+      return;
+    }
   }
 
-  // No MSE and not native HLS: last-resort direct assignment (some browsers can still manage).
+  // Native HLS (Safari / iOS, or hls.js unsupported): hand the playlist straight to the element.
+  controller.setHls(null);
   video.src = url;
   void video.play().catch(() => undefined);
 }
@@ -271,6 +283,9 @@ export function close(): void {
     document.removeEventListener("keydown", keyHandler);
     keyHandler = null;
   }
+  controller?.dispose();
+  controller = null;
+  if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
   for (const u of subtitleBlobs) URL.revokeObjectURL(u);
   subtitleBlobs = [];
   if (hls) {

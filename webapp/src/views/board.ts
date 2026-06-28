@@ -266,11 +266,18 @@ export function removableCard(item: MetaItem, kind: "cw" | "lib", label: string,
   return `<div class="card-wrap">${posterCard(item, progress)}<button class="card-remove" type="button" data-action="remove-saved" data-id="${escapeHtml(item.id)}" data-kind="${kind}" aria-label="${escapeHtml(label)}">×</button></div>`;
 }
 
+const RAIL_TYPE_LABEL: Record<string, string> = { movie: "Movies", series: "Series", channel: "Channels", tv: "TV" };
+
 function railTitle(ref: CatalogRef): string {
-  const label = ref.def.name?.trim() || `${ref.def.id} ${ref.def.type}`.trim();
-  // Many add-ons repeat their own name in the catalog name; keep it but add the add-on as a quiet
-  // suffix only when it adds information.
-  return label;
+  const base = ref.def.name?.trim() || ref.def.id?.trim() || "Catalog";
+  // Qualify with the content type so Cinemeta's duplicate "Popular"/"Featured" movie + series catalogs
+  // are distinguishable ("Popular Movies" vs "Popular Series") instead of two identical rail titles.
+  const typeLabel = RAIL_TYPE_LABEL[ref.def.type] ?? "";
+  if (!typeLabel) return base;
+  const lc = base.toLowerCase();
+  // Skip if the name already names the type (avoids "Top Movies Movies").
+  if (lc.includes(ref.def.type.toLowerCase()) || lc.includes(typeLabel.toLowerCase())) return base;
+  return `${base} ${typeLabel}`;
 }
 
 function railSkeleton(): string {

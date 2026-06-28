@@ -8,7 +8,7 @@
 // directly, it goes through vault's saveSession/loadSession/clearSession.
 
 import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, type Session } from "./vault";
-import { mergeInstalledAddons, mergeLibrary } from "./store";
+import { mergeInstalledAddons, mergeLibrary, mergeContinueWatching, type CWEntry } from "./store";
 import { updateSettings } from "./settings";
 import type { MetaItem } from "./types";
 
@@ -109,13 +109,37 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   }
   const addonsChanged = mergeInstalledAddons(urls);
 
-  // Owner library (vortx.library: [{id,name,type,poster,...}]).
-  mergeLibrary((Array.isArray(vortx.library) ? vortx.library : []) as MetaItem[]);
+  // Owner library (vortx.library: [{id,name,type,poster,t,d,lastWatched,v,...}]). The app emits t/d in
+  // seconds (the dashboard + now the web app derive Continue Watching from each item's progress).
+  const libItems = (Array.isArray(vortx.library) ? vortx.library : []) as Array<Record<string, unknown>>;
+  mergeLibrary(libItems as unknown as MetaItem[]);
 
-  // The running app loaded its add-on list at boot; newly-merged add-ons are only in localStorage. Tell
-  // main.ts to reload them + re-render so they appear immediately (Library reads storage fresh, so it
-  // already shows - this closes the "library shows but add-ons don't" gap after sign-in hydration).
-  if (addonsChanged && typeof window !== "undefined") {
+  // Continue Watching: derive from the synced library items that carry in-progress watch state, so the
+  // user's history from their other VortX devices appears on Home. Web playback is local-only, so without
+  // this the rail is empty for users who watch on the apps. t/d are seconds, matching the web CW store.
+  const cwEntries: CWEntry[] = [];
+  for (const it of libItems) {
+    if (!it || typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") continue;
+    const t = Number(it.t);
+    const d = Number(it.d);
+    if (!(t > 0) || !(d > 0) || t / d >= 0.95) continue; // not started / already finished
+    const lw = typeof it.lastWatched === "string" ? Date.parse(it.lastWatched) : NaN;
+    cwEntries.push({
+      id: it.id,
+      type: it.type,
+      name: it.name,
+      poster: typeof it.poster === "string" ? it.poster : undefined,
+      resumeId: typeof it.v === "string" && it.v ? it.v : it.id, // overlay items carry the resume episode id
+      position: t,
+      duration: d,
+      updatedAt: Number.isFinite(lw) ? lw : 0,
+    });
+  }
+  const cwChanged = mergeContinueWatching(cwEntries);
+
+  // The running app rendered before hydration; tell main.ts to reload add-ons + re-render so newly-merged
+  // add-ons AND Continue Watching appear immediately (Library reads storage fresh, so it already shows).
+  if ((addonsChanged || cwChanged) && typeof window !== "undefined") {
     window.dispatchEvent(new Event("vortx:addons-changed"));
   }
 }

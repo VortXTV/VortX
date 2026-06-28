@@ -24,7 +24,7 @@ import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
 import { handleSettingsClick, renderSettings } from "./views/settings";
 import { handleLoginClick, renderLogin } from "./views/login";
 import { applySettings } from "./lib/settings";
-import { ensureValidSession } from "./lib/account";
+import { ensureValidSession, hydrateFromAccount } from "./lib/account";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
 // hash-routed surfaces (Home board, Discover grid, Search, Detail, Add-ons). Detail resolves streams
@@ -317,7 +317,12 @@ async function start(): Promise<void> {
   wireGlobalClicks();
   initCardMenu(); // right-click / long-press context menu on poster cards
 
-  void ensureValidSession(); // clear a revoked token in the background; never blocks first paint
+  // Validate the token in the background, then pull the account sync doc so a returning (already signed-in)
+  // user's add-ons, library, and Continue Watching refresh on load - not only on a fresh sign-in. Never
+  // blocks first paint; applySyncDoc fires vortx:addons-changed to re-render when something merges.
+  void ensureValidSession().then((session) => {
+    if (session) void hydrateFromAccount(session);
+  });
   addons = await loadInstalledAddons();
   onRouteChange((route) => void renderRoute(route));
   // Account hydration (on sign-in) merges synced add-ons into storage; reload + re-render so they appear.

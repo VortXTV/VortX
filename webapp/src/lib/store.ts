@@ -287,6 +287,51 @@ function persistCW(entries: CWEntry[]): void {
   }
 }
 
+/** Merge externally-sourced Continue Watching entries (derived from the synced account library's watch
+ *  progress) into the OWNER (base) store - account watch history belongs to the owner, never an active
+ *  overlay profile, mirroring how mergeLibrary always targets the base key. Union by resumeId; a fresher
+ *  local entry (newer updatedAt) is never clobbered. Only in-progress entries (0 < position/duration <
+ *  0.95) are kept. Returns whether anything changed (so the caller can trigger a re-render). */
+export function mergeContinueWatching(entries: CWEntry[]): boolean {
+  const incoming = entries.filter(
+    (e) =>
+      e &&
+      typeof e.id === "string" &&
+      typeof e.resumeId === "string" &&
+      e.duration > 0 &&
+      e.position > 0 &&
+      e.position / e.duration < 0.95,
+  );
+  if (!incoming.length) return false;
+  let existing: CWEntry[] = [];
+  try {
+    const raw = localStorage.getItem(CW_KEY); // base (owner) key, NOT the active scope
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
+  } catch {
+    existing = [];
+  }
+  const byResume = new Map(
+    existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]),
+  );
+  let changed = false;
+  for (const e of incoming) {
+    const cur = byResume.get(e.resumeId);
+    if (!cur || e.updatedAt > cur.updatedAt) {
+      byResume.set(e.resumeId, e);
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
+  try {
+    localStorage.setItem(CW_KEY, JSON.stringify(next));
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
 // --- Recent searches ----------------------------------------------------------------------------
 // The last few search queries, newest first, so the Search page can offer one-tap repeats. Local only.
 const RECENT_KEY = "vortx.web.recent.v1";
