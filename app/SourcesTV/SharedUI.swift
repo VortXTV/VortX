@@ -82,6 +82,7 @@ struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
     let metaLine: String      // prebuilt "2026 · ★ 7.6 · Movie" style line
     let overview: String?
     var genreLine: String?    // "Drama · Fantasy · Adventure" (optional so older caches decode)
+    var logo: String?         // clearlogo URL (add-on meta.logo or metahub); optional so older caches decode
 }
 
 /// The standard Stremio background art for an IMDB-identified title: real 16:9 backdrop art at
@@ -89,6 +90,13 @@ struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
 private func metahubBackground(for id: String) -> String? {
     guard id.hasPrefix("tt") else { return nil }
     return "https://images.metahub.space/background/big/\(id)/img"
+}
+
+/// The standard Stremio clearlogo (transparent PNG) for an IMDB-identified title, mirroring the iOS hero
+/// seed. Only `tt` ids have metahub art; other id schemes fall back to the add-on `meta.logo` via enrichment.
+private func metahubLogo(for id: String) -> String? {
+    guard id.hasPrefix("tt") else { return nil }
+    return "https://images.metahub.space/logo/medium/\(id)/img"
 }
 
 extension CoreMeta {
@@ -101,7 +109,7 @@ extension CoreMeta {
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: background ?? metahubBackground(for: id) ?? poster,
                            metaLine: parts.joined(separator: "  ·  "), overview: description,
-                           genreLine: genreLine)
+                           genreLine: genreLine, logo: logo ?? metahubLogo(for: id))
     }
 }
 
@@ -113,7 +121,7 @@ extension CoreCWItem {
         let line = pct > 0 ? "\(type.capitalized)  ·  \(pct)% watched" : type.capitalized
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: metahubBackground(for: id) ?? poster,
-                           metaLine: line, overview: nil, genreLine: nil)
+                           metaLine: line, overview: nil, genreLine: nil, logo: metahubLogo(for: id))
     }
 }
 
@@ -163,7 +171,8 @@ extension CoreCWItem {
         return FocusedHero(id: hero.id, type: hero.type, title: hero.title,
                            backdrop: cached.backdrop ?? hero.backdrop,
                            metaLine: line, overview: cached.overview ?? hero.overview,
-                           genreLine: cached.genreLine ?? hero.genreLine)
+                           genreLine: cached.genreLine ?? hero.genreLine,
+                           logo: cached.logo ?? hero.logo)
     }
 
     /// Capture what the detail page knows (the engine resolves EVERY id scheme, tmdb: included), so
@@ -180,7 +189,7 @@ extension CoreCWItem {
         let genreLine = (genres?.isEmpty == false) ? genres!.prefix(3).joined(separator: " · ") : nil
         let hero = FocusedHero(id: id, type: type, title: title, backdrop: backdrop,
                                metaLine: parts.joined(separator: "  ·  "), overview: overview,
-                               genreLine: genreLine)
+                               genreLine: genreLine, logo: metahubLogo(for: id))
         guard enrichmentCache[id] != hero else { return }
         enrichmentCache[id] = hero
         saveCache()
@@ -259,7 +268,8 @@ extension CoreCWItem {
                 let enriched = FocusedHero(id: hero.id, type: hero.type, title: hero.title,
                                            backdrop: meta.background ?? hero.backdrop,
                                            metaLine: parts.joined(separator: "  ·  "),
-                                           overview: meta.description, genreLine: genreLine)
+                                           overview: meta.description, genreLine: genreLine,
+                                           logo: meta.logo ?? hero.logo)
                 await MainActor.run {
                     Self.enrichmentCache[hero.id] = enriched
                     Self.saveCache()
@@ -288,6 +298,7 @@ private struct AddonMetaResponse: Decodable {
         let background: String?
         let runtime: String?
         let genres: [String]?
+        let logo: String?
     }
     let meta: Meta?
 }
@@ -328,6 +339,9 @@ struct BrowseHeroBackdrop: View {
     /// even as the tab bar shows or hides and shifts the top safe area.
     var detailsBottom: CGFloat? = nil
     @EnvironmentObject private var theme: ThemeManager
+    /// The focused title's clean TMDB clearlogo (textless PNG), resolved by id like the landscape cards.
+    /// nil until it resolves (or when TMDB has none / no key) - the title then falls back to styled text.
+    @State private var heroLogo: UIImage?
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -347,6 +361,9 @@ struct BrowseHeroBackdrop: View {
         }
         .animation(.easeOut(duration: 0.35), value: model.hero?.id)
         .animation(.easeOut(duration: 0.25), value: model.detailsVisible)
+        // Resolve the focused title's clearlogo by id (TMDB, same source as the landscape cards) so the
+        // hero shows the logo in place of the serif title text, matching the iOS/Mac hero. Re-runs per hero.
+        .task(id: model.hero?.id) { await loadHeroLogo() }
         // No ignoresSafeArea here: the image layer handles its own full-bleed, and keeping this
         // container inside the safe area lets the tab bar reclaim focus when you press up at the top.
     }
@@ -365,11 +382,19 @@ struct BrowseHeroBackdrop: View {
     /// reads as one composed unit instead of evenly stacked lines.
     private func detailsBlock(_ hero: FocusedHero) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(hero.title)
-                .font(Theme.Typography.screenTitle)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .lineLimit(2).minimumScaleFactor(0.7)
-                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+            if let heroLogo {
+                // The clearlogo IS the title in image form; expose the name to VoiceOver, not the art.
+                Image(uiImage: heroLogo).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 540, maxHeight: 180, alignment: .leading)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                    .accessibilityLabel(hero.title)
+            } else {
+                Text(hero.title)
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(2).minimumScaleFactor(0.7)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+            }
             Text(hero.metaLine)
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
@@ -390,6 +415,27 @@ struct BrowseHeroBackdrop: View {
             }
         }
         .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
+    }
+
+    /// Resolve + load the focused hero's clearlogo. Resets immediately on every hero change so the title
+    /// text shows at once, then swaps to the logo when it resolves (nil = TMDB has none / no key = text stays).
+    private func loadHeroLogo() async {
+        heroLogo = nil
+        guard let hero = model.hero,
+              let lg = PosterArtwork.logo(id: hero.id, fallback: hero.logo ?? metahubLogo(for: hero.id)),
+              let img = await fetchHeroImage(lg) else { return }
+        heroLogo = img
+    }
+
+    private func fetchHeroImage(_ raw: String) async -> UIImage? {
+        guard !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
+        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
+              let img = UIImage(data: data) else { return nil }
+        posterMemoryCache.setObject(img, forKey: url as NSURL)
+        return img
     }
 }
 
