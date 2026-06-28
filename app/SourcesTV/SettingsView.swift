@@ -33,6 +33,7 @@ struct SettingsView: View {
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
+    @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
     // ON = VortX tracks Stremio (adds and removes) for that category.
@@ -261,6 +262,8 @@ struct SettingsView: View {
             choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
+            choiceRow(String(localized: "Skip timestamps source"), [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
+                      selection: $skipProvider)
             choiceRow(String(localized: "Play in"), externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

@@ -53,6 +53,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
+    @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
@@ -400,6 +401,11 @@ struct iOSSettingsView: View {
             }
             Toggle("Auto-skip intro & credits", isOn: $autoSkip)
                 .tint(Theme.Palette.accent)
+            Picker("Skip timestamps source", selection: $skipProvider) {
+                Text("TheIntroDB").tag("theintrodb")
+                Text("SkipDB").tag("skipdb")
+                Text("Both").tag("both")
+            }
             NavigationLink("Seek bar style") { SeekBarStylePicker() }
             Toggle("Autoplay trailers", isOn: $autoplayTrailers)
                 .tint(Theme.Palette.accent)
