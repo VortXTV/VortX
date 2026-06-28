@@ -1,0 +1,107 @@
+{
+  "description": "Cross-language conformance for resolve_streams(): the bridge from the source registry to the deadline-bounded host fan-out. Given installed sources (each declaring caps + whether supports() passes + whether it plans a fetch) and a request, the registry routes by capability + id-space, each matching source plans its own FetchRequest, run_fanout realizes them through the host Fetch boundary, and the merged item keys parse back into typed Streams. A source with supports=false (or lacking the cap) is never routed; a routed source with plans=false (local-only) is never turned into a fetch candidate; a malformed item key is dropped but its source still survives; a failing source is isolated and removes no sibling's streams. Deterministic: candidates planned in registry order, merged in sorted-addon-id order. CircuitConfig default (failure_threshold 3, cooldown_secs 300). expect is the serialized ResolvedStreams wire form.",
+  "cases": [
+    {
+      "name": "two_sources_fuse_in_sorted_addon_id_order",
+      "sources": [
+        { "id": "zeta", "caps": ["stream"], "supports": true, "plans": true },
+        { "id": "alpha", "caps": ["stream"], "supports": true, "plans": true }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": {
+        "zeta": { "status": "ok", "items": ["{\"url\":\"http://z/1\"}"] },
+        "alpha": { "status": "ok", "items": ["{\"url\":\"http://a/1\"}"] }
+      },
+      "expect": {
+        "streams": [{ "url": "http://a/1" }, { "url": "http://z/1" }],
+        "survivors": ["alpha", "zeta"],
+        "failed": []
+      }
+    },
+    {
+      "name": "malformed_source_isolated_good_streams_kept",
+      "sources": [
+        { "id": "good", "caps": ["stream"], "supports": true, "plans": true },
+        { "id": "poison", "caps": ["stream"], "supports": true, "plans": true }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": {
+        "good": { "status": "ok", "items": ["{\"url\":\"http://g/1\"}"] },
+        "poison": { "status": "malformed" }
+      },
+      "expect": {
+        "streams": [{ "url": "http://g/1" }],
+        "survivors": ["good"],
+        "failed": [{ "addon_id": "poison", "reason": "malformed" }]
+      }
+    },
+    {
+      "name": "unparseable_item_key_dropped_source_still_survives",
+      "sources": [
+        { "id": "src", "caps": ["stream"], "supports": true, "plans": true }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": {
+        "src": { "status": "ok", "items": ["not json", "{\"url\":\"http://s/1\"}"] }
+      },
+      "expect": {
+        "streams": [{ "url": "http://s/1" }],
+        "survivors": ["src"],
+        "failed": []
+      }
+    },
+    {
+      "name": "source_that_cannot_answer_is_never_queried",
+      "sources": [
+        { "id": "wrong-id", "caps": ["stream"], "supports": false, "plans": true },
+        { "id": "meta-only", "caps": ["meta"], "supports": true, "plans": true }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": {},
+      "expect": { "streams": [], "survivors": [], "failed": [] }
+    },
+    {
+      "name": "local_only_source_routed_but_plans_no_fetch",
+      "sources": [
+        { "id": "local", "caps": ["stream"], "supports": true, "plans": false }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": {},
+      "now": 1000,
+      "budget_ms": 5000,
+      "outcomes": {},
+      "expect": { "streams": [], "survivors": [], "failed": [] }
+    },
+    {
+      "name": "open_breaker_still_cooling_is_skipped",
+      "sources": [
+        { "id": "good", "caps": ["stream"], "supports": true, "plans": true },
+        { "id": "bad", "caps": ["stream"], "supports": true, "plans": true }
+      ],
+      "request": { "kind": "stream", "type": "movie", "id": "tt1" },
+      "breakers": { "bad": { "consecutive_failures": 3, "state": "open", "opened_at": 1000 } },
+      "now": 1100,
+      "budget_ms": 5000,
+      "outcomes": {
+        "good": { "status": "ok", "items": ["{\"url\":\"http://g/1\"}"] }
+      },
+      "expect": {
+        "streams": [{ "url": "http://g/1" }],
+        "survivors": ["good"],
+        "failed": []
+      }
+    }
+  ]
+}

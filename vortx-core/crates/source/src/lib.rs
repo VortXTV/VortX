@@ -20,6 +20,7 @@ mod exit;
 mod fanout;
 mod identity;
 mod manifest;
+mod orchestrate;
 mod pagination;
 mod registry;
 mod request;
@@ -44,6 +45,7 @@ pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
 };
+pub use orchestrate::{parse_stream_item, resolve_streams, ResolvedStreams};
 pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
 pub use request::{ResourceKind, ResourceRequest};
