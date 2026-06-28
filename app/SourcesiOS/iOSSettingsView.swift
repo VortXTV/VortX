@@ -330,6 +330,7 @@ struct iOSSettingsView: View {
             // Lead with the VortX account (the app's own end-to-end-encrypted account + sync); the Stremio
             // account is shown beneath it as a connected source.
             NavigationLink("VortX account & sync") { SyncSettingsView() }
+            NavigationLink("Household sharing") { HouseholdSettingsView() }
             if account.isSignedIn {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(account.email ?? String(localized: "Signed in"))
