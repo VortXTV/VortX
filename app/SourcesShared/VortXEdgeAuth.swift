@@ -41,6 +41,7 @@ enum VortXEdgeAuth {
         "poster.vortx.tv",
         "erdb.vortx.tv",
         "trailer.vortx.tv",
+        "catalogs.vortx.tv",
     ]
 
     /// The shared secret, read once from Info.plist. Empty string when absent (signing becomes a

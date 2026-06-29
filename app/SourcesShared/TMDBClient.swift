@@ -11,7 +11,8 @@ enum TMDBClient {
     /// Recommendations whose ORIGIN/language matches the source are surfaced first, so a Korean drama
     /// suggests Korean, a Bollywood film suggests Bollywood, not just same-genre Hollywood.
     static func recommendations(imdbID: String, type: String) async -> [String] {
-        guard let key = ApiKeys.tmdbKey(), imdbID.hasPrefix("tt") else { return [] }
+        guard imdbID.hasPrefix("tt") else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"
         guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
               let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first,
@@ -59,7 +60,8 @@ enum TMDBClient {
     static var deviceRegion: String { Locale.current.region?.identifier ?? "US" }
 
     static func watchProviders(imdbID: String, type: String, region: String = TMDBClient.deviceRegion) async -> WatchAvailability? {
-        guard let key = ApiKeys.tmdbKey(), imdbID.hasPrefix("tt") else { return nil }
+        guard imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"
         guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
               let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first,
@@ -88,7 +90,7 @@ enum TMDBClient {
     /// use). Accepts an IMDb id (tt...) via /find or a `tmdb:[type:]id`. Requires a TMDB key; nil on no key,
     /// no match, or no trailer. Prefers an official Trailer, then any YouTube Trailer/Teaser/Clip.
     static func trailerYouTubeID(metaID: String, type: String) async -> String? {
-        guard let key = ApiKeys.tmdbKey() else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"
         var tmdbID: Int?
         if metaID.hasPrefix("tt") {
@@ -116,7 +118,7 @@ enum TMDBClient {
     /// posters). Requires a TMDB key; accepts an IMDb id (tt..., via /find) or a `tmdb:[type:]id`. Either URL
     /// is nil when absent. The card layer caches the result so each title resolves once.
     static func landscapeImages(metaID: String, type: String) async -> (backdrop: String?, logo: String?) {
-        guard let key = ApiKeys.tmdbKey() else { return (nil, nil) }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"
         var tmdbID: Int?
         if metaID.hasPrefix("tt") {
@@ -166,7 +168,7 @@ enum TMDBClient {
     /// add-on). Name + poster come from the discover row itself, so this is one discover call + one
     /// external_ids call per title (capped), not a full meta fetch per card.
     static func streamingProviderTitles(providerID: Int, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         async let movieRows = discoverProviderPage(media: "movie", providerID: providerID, region: region, key: key)
         async let tvRows = discoverProviderPage(media: "tv", providerID: providerID, region: region, key: key)
         let movies = await movieRows, series = await tvRows
@@ -241,7 +243,7 @@ enum TMDBClient {
     /// engine-playable Cinemeta (tt) previews. [] with no TMDB key or nothing found; the caller then falls
     /// back to Cinemeta genre catalogs (which need no key) so the Genres group still fills.
     static func genreTitles(_ genre: Genre, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         async let movieRows = discoverGenrePage(media: "movie", genreID: genre.movieGenreID, key: key)
         // Only fetch a TV bucket for genres that map to a TMDB TV genre (Thriller / Horror / Romance are
         // movie-only here); otherwise the rail is movies-only.
@@ -259,7 +261,7 @@ enum TMDBClient {
     /// "Top New": the most popular movies + shows released in the last `newWindowMonths`, merged and
     /// resolved to tt previews. Sorted by popularity (what's hot right now among recent releases).
     static func topNewTitles(region: String = deviceRegion, limit: Int = 24) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         let (from, to) = newWindow()
         async let movieRows = discoverRecentPage(media: "movie", sort: "popularity.desc", from: from, to: to, region: region, key: key)
         async let tvRows = discoverRecentPage(media: "tv", sort: "popularity.desc", from: from, to: to, region: region, key: key)
@@ -269,7 +271,7 @@ enum TMDBClient {
     /// "New": the freshest movies + shows by release / air date (newest first) within the last
     /// `newWindowMonths`, merged and resolved to tt previews. This is the "just landed" rail.
     static func justNewTitles(region: String = deviceRegion, limit: Int = 24) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         let (from, to) = newWindow()
         async let movieRows = discoverRecentPage(media: "movie", sort: "primary_release_date.desc", from: from, to: to, region: region, key: key)
         async let tvRows = discoverRecentPage(media: "tv", sort: "first_air_date.desc", from: from, to: to, region: region, key: key)
@@ -418,7 +420,7 @@ enum TMDBClient {
     /// to the front by `featuredProviderRank`, the rest by TMDB's region display_priority, capped. Merges
     /// the movie + TV provider lists (some services are TV-only or movie-only). [] with no TMDB key.
     static func regionProviders(region: String = deviceRegion, limit: Int = 36) async -> [ProviderTile] {
-        guard ApiKeys.tmdbKey() != nil else { return [] }
+        // No user-key guard: the keyless edge serves providers too, so the hub populates for everyone.
         async let movieList = providerPage(media: "movie", region: region)
         async let tvList = providerPage(media: "tv", region: region)
         var byID: [Int: (tile: ProviderTile, priority: Int)] = [:]
@@ -436,8 +438,8 @@ enum TMDBClient {
     }
 
     private static func providerPage(media: String, region: String) async -> [(tile: ProviderTile, priority: Int)] {
-        guard let key = ApiKeys.tmdbKey(),
-              let obj = await get("/watch/providers/\(media)?api_key=\(key)&watch_region=\(region)"),
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/watch/providers/\(media)?api_key=\(key)&watch_region=\(region)"),
               let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { p in
             guard let id = p["provider_id"] as? Int, let name = p["provider_name"] as? String else { return nil }
@@ -450,7 +452,7 @@ enum TMDBClient {
     /// previews. `path` is the endpoint without query, e.g. "/trending/movie/week", "/movie/popular",
     /// "/movie/now_playing", "/movie/upcoming". Paginated. Fails soft to [] with no key / nothing found.
     static func listTitles(path: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = path.contains("/tv") ? "tv" : "movie"
         let full = "\(path)?api_key=\(key)&language=en-US&page=\(page)&region=\(region)"
         return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
@@ -460,7 +462,7 @@ enum TMDBClient {
     /// date windows), resolved to tt previews. `extra` is a pre-built query fragment (no leading `&`). The
     /// sub-catalog grids (Movies / Shows / New / Top week-month-year / Trending) are built from this.
     static func discoverTitles(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
-        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
         let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
         return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
     }
@@ -469,7 +471,7 @@ enum TMDBClient {
     /// bucket (movie bucket preferred; TV when the genre is movies-only), as a w780 URL. One discover call,
     /// fail-soft to nil. Lets the Collections-hub genre tiles show real artwork instead of a flat gradient.
     static func genreBackdrop(movieGenre: Int?, tvGenre: Int?, keyword: Int?, lang: String?, region: String = deviceRegion) async -> String? {
-        guard let key = ApiKeys.tmdbKey() else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
         let media = movieGenre != nil ? "movie" : "tv"
         let genreID = movieGenre ?? tvGenre
         var parts = ["api_key=\(key)", "sort_by=popularity.desc", "watch_region=\(region)",
@@ -502,7 +504,8 @@ enum TMDBClient {
     /// Movie budget + box-office (revenue) from TMDB /movie/{id}, resolved from an IMDb id. Movies only
     /// (TMDB carries no TV financials). nil with no key / a series / nothing found / both values zero.
     static func details(imdbID: String, type: String) async -> Financials? {
-        guard let key = ApiKeys.tmdbKey(), type != "series", imdbID.hasPrefix("tt") else { return nil }
+        guard type != "series", imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
         guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
               let first = (found["movie_results"] as? [[String: Any]])?.first,
               let tmdbID = first["id"] as? Int,
@@ -523,10 +526,44 @@ enum TMDBClient {
         return "$\(value)"
     }
 
+    /// VortX's keyless catalog edge: a cached, app-gated TMDB proxy that injects OUR key server-side, so
+    /// users with no TMDB key still get the hub. Path here mirrors TMDB's /3 namespace.
+    private static let edgeBase = "https://catalogs.vortx.tv/3"
+
+    /// Single fetch choke point. ROUTE by whether the user supplied their OWN TMDB key:
+    ///   - user key present -> talk to TMDB directly (the path already carries their key);
+    ///   - no user key      -> route through the keyless edge (it injects its own key + caches), signed so
+    ///                          the gate attributes the call to VortX. The bundled key is stripped from the
+    ///                          path on this route; if the edge is unreachable we fall back to TMDB direct
+    ///                          with the bundled key (the path still carries it) so the hub degrades, never
+    ///                          dies. `path` is "/...?api_key=<effective>&...".
     private static func get(_ path: String) async -> [String: Any]? {
-        guard let url = URL(string: host + path) else { return nil }
+        if ApiKeys.tmdbKey() != nil {
+            return await fetchJSON(URL(string: host + path), sign: false)
+        }
+        if let edgeURL = edgeURL(forPath: path), let obj = await fetchJSON(edgeURL, sign: true) {
+            return obj
+        }
+        return await fetchJSON(URL(string: host + path), sign: false)   // edge down -> bundled-key direct
+    }
+
+    /// Build the edge URL for a TMDB path: prefix /3 (already in `host` for direct calls) and DROP the
+    /// `api_key` param, since the worker injects its own key server-side.
+    private static func edgeURL(forPath path: String) -> URL? {
+        guard var comps = URLComponents(string: edgeBase + path) else { return nil }
+        comps.queryItems = (comps.queryItems ?? []).filter { $0.name != "api_key" }
+        if comps.queryItems?.isEmpty == true { comps.queryItems = nil }
+        return comps.url
+    }
+
+    /// GET + decode JSON. Signs the request via `VortXEdgeAuth` when `sign` (only our edge host is gated;
+    /// the helper no-ops for any other host), so the same call is safe whether it targets TMDB or the edge.
+    private static func fetchJSON(_ url: URL?, sign: Bool) async -> [String: Any]? {
+        guard let url else { return nil }
+        var req = URLRequest(url: url)
+        if sign { VortXEdgeAuth.sign(&req) }
         do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
+            let (data, resp) = try await URLSession.shared.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         } catch { return nil }

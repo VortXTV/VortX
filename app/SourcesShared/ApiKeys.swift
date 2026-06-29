@@ -44,6 +44,16 @@ final class ApiKeys: ObservableObject {
     nonisolated static func tmdbKey() -> String? {
         let k = Keychain.string("vortx.apikey.tmdb"); return (k?.isEmpty == false) ? k : nil
     }
+
+    /// VortX's own TMDB read key, used ONLY as the last-resort fallback when the keyless edge
+    /// (catalogs.vortx.tv, which holds this key server-side) is unreachable. A free public read key, so
+    /// shipping it costs little; the edge is the primary keyless path and keeps it off the wire normally.
+    nonisolated static let bundledTMDBKey = "d131017ccc6e5462a81c9304d21476de"
+
+    /// The key TMDB calls build their `api_key=` with: the user's key when set, else VortX's bundled key
+    /// so the catalogs/hub work with NO user key. `TMDBClient.get` decides the ROUTE from `tmdbKey()`
+    /// (a real user key -> TMDB direct; no user key -> the keyless edge, which injects its own key).
+    nonisolated static func effectiveTMDBKey() -> String { tmdbKey() ?? bundledTMDBKey }
     nonisolated static func mdblistKey() -> String? {
         let k = Keychain.string("vortx.apikey.mdblist"); return (k?.isEmpty == false) ? k : nil
     }

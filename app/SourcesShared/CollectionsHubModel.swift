@@ -255,8 +255,9 @@ final class CollectionsHubModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var genreTask: Task<Void, Never>?
 
-    /// True when the hub can populate (TMDB key present). The hub hides entirely without a key.
-    static var isAvailable: Bool { ApiKeys.tmdbKey() != nil }
+    /// Always available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres)
+    /// even with no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
+    static var isAvailable: Bool { true }
 
     /// Load the provider tiles for the region. Uses the cadence-throttled cache: if a fresh cached list
     /// exists it is shown immediately and no network call is made; otherwise it fetches and re-caches.
