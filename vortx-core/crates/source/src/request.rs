@@ -18,6 +18,9 @@ pub enum ResourceKind {
     Artwork,
     MusicCatalog,
     MusicStream,
+    /// Live TV programme guide (EPG): the programmes airing in a time window, optionally for one channel id.
+    /// Carries an [`EpgWindow`] on the request; the listing is the live-TV analogue of a catalog.
+    Epg,
     /// Serves theme/accent/palette packs (native only).
     Theme,
     /// Serves home/tab arrangements (native only).
@@ -39,6 +42,7 @@ impl ResourceKind {
             ResourceKind::Artwork => "artwork",
             ResourceKind::MusicCatalog => "music_catalog",
             ResourceKind::MusicStream => "music_stream",
+            ResourceKind::Epg => "epg",
             ResourceKind::Theme => "theme",
             ResourceKind::Layout => "layout",
             ResourceKind::Branding => "branding",
@@ -96,6 +100,42 @@ pub struct ResourceRequest {
     pub extra: Vec<(String, String)>,
     #[serde(default, rename = "profileId", skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The EPG time window for an [`ResourceKind::Epg`] request: only programmes airing in
+    /// `[start_unix, end_unix)` are wanted. A TYPED window (not a stringly-typed `extra` pair) so the kernel
+    /// reasons about it deterministically. Absent (and skip-serialized) on every non-EPG request, so existing
+    /// request vectors stay byte-identical.
+    #[serde(default, rename = "epgWindow", skip_serializing_if = "Option::is_none")]
+    pub epg_window: Option<EpgWindow>,
+}
+
+/// A half-open EPG time window `[start_unix, end_unix)` in Unix seconds (the standard EPG clock). The host
+/// supplies the clock, so the kernel stays clockless. `contains` / `overlaps` are pure helpers later live-TV
+/// chunks use to clamp a programme listing to the requested window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpgWindow {
+    #[serde(rename = "startUnix")]
+    pub start_unix: i64,
+    #[serde(rename = "endUnix")]
+    pub end_unix: i64,
+}
+
+impl EpgWindow {
+    pub fn new(start_unix: i64, end_unix: i64) -> Self {
+        Self {
+            start_unix,
+            end_unix,
+        }
+    }
+
+    /// Whether an instant (Unix seconds) falls in the half-open window `[start, end)`.
+    pub fn contains(&self, unix: i64) -> bool {
+        unix >= self.start_unix && unix < self.end_unix
+    }
+
+    /// Whether a programme spanning `[start, end)` overlaps this window at all (half-open).
+    pub fn overlaps(&self, start_unix: i64, end_unix: i64) -> bool {
+        start_unix < self.end_unix && end_unix > self.start_unix
+    }
 }
 
 impl ResourceRequest {
@@ -106,6 +146,7 @@ impl ResourceRequest {
             id: id.into(),
             extra: Vec::new(),
             profile_id: None,
+            epg_window: None,
         }
     }
 
@@ -116,6 +157,12 @@ impl ResourceRequest {
 
     pub fn for_profile(mut self, profile_id: impl Into<String>) -> Self {
         self.profile_id = Some(profile_id.into());
+        self
+    }
+
+    /// Attach an EPG time window (for an [`ResourceKind::Epg`] request).
+    pub fn with_epg_window(mut self, start_unix: i64, end_unix: i64) -> Self {
+        self.epg_window = Some(EpgWindow::new(start_unix, end_unix));
         self
     }
 }

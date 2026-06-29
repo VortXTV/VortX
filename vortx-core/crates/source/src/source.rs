@@ -21,6 +21,8 @@ pub enum SourceKind {
     DebridStore,
     Federated,
     Music,
+    /// A live TV source family (M3U playlists + XMLTV/EPG): live channels + programme guide.
+    Iptv,
 }
 
 /// One source of catalogs / meta / streams / ratings / etc. The orchestrator queries every matching
