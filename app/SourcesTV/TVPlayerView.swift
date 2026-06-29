@@ -2139,6 +2139,15 @@ struct TVPlayerView: View {
     /// engine is leaked.
     private func leavePlayback() {
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
+        // Force the OLD engine to halt decode + network and BEGIN teardown synchronously, right now, instead
+        // of leaving it to whenever SwiftUI gets around to dismantle*. This is THE debrid crash fix: a debrid
+        // title holds the FULL remote demuxer read-ahead + a 4K decoder, and without this stop() that engine
+        // was still alive when the next title's player allocated its own buffers -- two decoding players
+        // straddling on a 2 GB Apple TV jetsam-killed the whole device (the owner's "finish/stop, browse, open
+        // another -> hang"). stop() is idempotent (guards on a live handle/item) so SwiftUI's later dismantle
+        // is a harmless no-op, and this runs ONLY on a genuine exit (Back, close, terminal auto-advance), never
+        // on an in-place source/episode switch or an onDisappear rebuild, so normal playback is untouched.
+        coordinator.player?.stop()
         onClose()
     }
 

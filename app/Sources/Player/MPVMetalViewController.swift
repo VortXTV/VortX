@@ -783,7 +783,12 @@ final class MPVMetalViewController: PlatformViewController {
                                     "reconnect=1,reconnect_streamed=0,reconnect_delay_max=1")
         } else {
             mpv_set_property_string(mpv, "demuxer-readahead-secs", "300")
-            mpv_set_property_string(mpv, "demuxer-max-back-bytes", "64MiB")
+            // On the 2 GB Apple TV HD (PerformanceMode.reduced) trim the already-played seek-back buffer from
+            // 64 to 24 MiB: it is held per active mpv instance for a remote VOD/debrid stream, so it is part of
+            // the per-instance footprint that DOUBLES during a debrid finish-then-reopen straddle. Shaving it
+            // (negligible seek-back cost) widens the jetsam headroom; non-reduced devices keep 64 MiB. The
+            // forward read-ahead cap is intentionally left alone so a fast debrid link stays resilient.
+            mpv_set_property_string(mpv, "demuxer-max-back-bytes", PerformanceMode.reduced ? "24MiB" : "64MiB")
             mpv_set_property_string(mpv, "demuxer-lavf-o", "")
             mpv_set_property_string(mpv, "stream-lavf-o",
                                     "reconnect=1,reconnect_streamed=1,reconnect_delay_max=7")
