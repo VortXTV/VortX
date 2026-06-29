@@ -12,11 +12,13 @@
 //! in a later phase) that maps them onto these same types, so the rest of the engine only ever sees
 //! one shape.
 
+mod audio;
 mod content;
 mod manifest;
 mod resource;
 mod transport;
 
+pub use audio::{Artist, AudioAlbum, AudioCodec, AudioTrack};
 pub use content::{ContentClass, ContentKind};
 pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
