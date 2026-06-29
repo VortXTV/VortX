@@ -20,8 +20,8 @@ use vortx_reco::{
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
 use vortx_source::{
-    cached_vector, plan_streams, settle_catalog, settle_streams, BreakerRegistry, CircuitConfig,
-    FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
+    cached_vector, plan_streams, settle_catalog, settle_meta, settle_streams, BreakerRegistry,
+    CircuitConfig, FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
 };
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
@@ -133,6 +133,36 @@ pub enum ResolveRequest {
         #[serde(default)]
         now: u64,
     },
+    /// PLAN phase of a META LOAD: the third leg of the LOAD trio. Same stateless effect model + the SAME
+    /// `plan_streams` planner (a meta request yields meta fetch URLs). The host realizes the plan, then settles.
+    MetaLoad {
+        req: ResourceRequest,
+        #[serde(default, rename = "registrySnapshot")]
+        registry_snapshot: Vec<SourceEntry>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default = "default_budget_ms", rename = "budgetMs")]
+        budget_ms: u64,
+    },
+    /// SETTLE phase of a META LOAD: the host hands back the per-source outcomes; the engine settles them into
+    /// a SINGULAR meta detail (the highest-priority source that answered wins), enforces the ACTIVE profile's
+    /// parental gate (a blocked or absent meta is `null`, the same gate as the one-shot `Meta`), and returns
+    /// the updated breaker snapshot for the host to upsert. PURE over the breaker snapshot.
+    SettleMeta {
+        plan: Vec<FetchRequest>,
+        #[serde(default)]
+        outcomes: BTreeMap<String, FetchOutcome>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+    },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
         tracks: Vec<SubtitleTrack>,
@@ -209,6 +239,15 @@ pub enum ResolveResponse {
     /// also returns the breaker snapshot the host must persist.
     SettledCatalog {
         metas: Vec<MetaPreview>,
+        #[serde(rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+    },
+    /// The fetch plan for a meta LOAD (circuit-open sources skipped, sorted by addon id).
+    MetaLoadPlan { requests: Vec<FetchRequest> },
+    /// The settled meta LOAD: the singular parental-gated meta detail (`null` if blocked or no source
+    /// answered) + the updated breaker snapshot the host upserts.
+    SettledMeta {
+        meta: Option<Box<MetaDetail>>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
     },
@@ -355,6 +394,47 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             };
             ResolveResponse::SettledCatalog {
                 metas,
+                circuit_snapshot,
+            }
+        }
+        ResolveRequest::MetaLoad {
+            req,
+            registry_snapshot,
+            circuit_snapshot,
+            circuit_cfg,
+            now,
+            budget_ms,
+        } => {
+            // The meta leg of the LOAD trio: the same resource-generic planner routes the meta request.
+            ResolveResponse::MetaLoadPlan {
+                requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
+            }
+        }
+        ResolveRequest::SettleMeta {
+            plan,
+            outcomes,
+            mut circuit_snapshot,
+            circuit_cfg,
+            now,
+        } => {
+            // Settle the outcomes into the singular meta (highest-priority source that answered) on a LOCAL
+            // breaker copy, then enforce the active profile's parental gate (the SAME gate as the one-shot
+            // Meta query): a blocked or absent meta is null, so a kids profile cannot open it even via a LOAD.
+            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let resolved = settle_meta(&plan, &outcomes, &mut circuit_snapshot, &circuit_cfg, now);
+            let allowed = match (resolved.meta.as_ref(), engine.store().active_profile()) {
+                (Some(m), Some(p)) => maturity_allows_raw(&p.parental, m.certification.as_deref()),
+                _ => true,
+            };
+            ResolveResponse::SettledMeta {
+                meta: allowed.then(|| resolved.meta.map(Box::new)).flatten(),
                 circuit_snapshot,
             }
         }

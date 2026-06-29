@@ -15,7 +15,7 @@
 //! source kind, and a malformed key is dropped rather than poisoning the batch.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::{MetaPreview, Stream};
+use vortx_protocol::{MetaDetail, MetaPreview, Stream};
 
 use crate::fanout::{Aggregate, BreakerRegistry, CircuitConfig, FailedAddon};
 use crate::registry::SourceRegistry;
@@ -131,6 +131,47 @@ fn resolved_catalog_from(agg: Aggregate) -> ResolvedCatalog {
     }
 }
 
+/// The result of a META LOAD: a SINGULAR meta detail (a title has one canonical detail, so the merge picks
+/// the highest-priority source that answered, not a list), plus survivor/failure attribution. The third leg
+/// of the stream/catalog/meta LOAD trio; same effect model and fan-out, only the item type + arity differ.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResolvedMeta {
+    pub meta: Option<MetaDetail>,
+    pub survivors: Vec<String>,
+    pub failed: Vec<FailedAddon>,
+}
+
+/// Parse one host-returned item key into a typed [`MetaDetail`]. Same uniform item-key contract as the
+/// stream/catalog parsers; a malformed key yields `None` (dropped), never a panic.
+pub fn parse_meta_item(item: &str) -> Option<MetaDetail> {
+    serde_json::from_str::<MetaDetail>(item).ok()
+}
+
+/// Settle the host's outcomes for an already-issued meta [`FetchRequest`] plan into a SINGULAR meta detail
+/// (the SETTLE half of the LOAD effect model, meta flavor). Reuses the EXACT same [`settle_fanout`] as
+/// streams/catalog (failure isolation, missing -> Timeout, breaker update); the merged items are in
+/// deterministic sorted-addon-id order, so the FIRST successfully-parsed item is the highest-priority source's
+/// detail. Pure over the breaker snapshot.
+pub fn settle_meta(
+    plan: &[FetchRequest],
+    outcomes: &[(String, FetchOutcome)],
+    breakers: &mut BreakerRegistry,
+    cfg: &CircuitConfig,
+    now: u64,
+) -> ResolvedMeta {
+    resolved_meta_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+}
+
+/// Parse a settled [`Aggregate`] into a singular meta detail: the first parseable item wins (highest-priority
+/// source that answered, since items are merged in sorted-addon-id order).
+fn resolved_meta_from(agg: Aggregate) -> ResolvedMeta {
+    ResolvedMeta {
+        meta: agg.items.iter().find_map(|k| parse_meta_item(k)),
+        survivors: agg.survivors,
+        failed: agg.failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +255,10 @@ mod tests {
     }
 
     fn catalog_item(id: &str, name: &str) -> String {
+        format!(r#"{{"id":"{id}","type":"movie","name":"{name}"}}"#)
+    }
+
+    fn meta_item(id: &str, name: &str) -> String {
         format!(r#"{{"id":"{id}","type":"movie","name":"{name}"}}"#)
     }
 
@@ -458,5 +503,29 @@ mod tests {
         assert_eq!(out.survivors, vec!["alpha", "zeta"]);
         assert_eq!(out.failed.len(), 1);
         assert_eq!(out.failed[0].addon_id, "down");
+    }
+
+    #[test]
+    fn settle_meta_picks_the_first_surviving_source_and_isolates_failures() {
+        // Singular meta: the highest-priority source that answered wins (sorted-id merge -> alpha first).
+        let plan = vec![
+            FetchRequest { addon_id: "alpha".into(), url: "http://a".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "zeta".into(), url: "http://z".into(), budget_ms: 5000 },
+        ];
+        let outcomes = vec![
+            ("alpha".to_string(), FetchOutcome::Ok { items: vec![meta_item("tt1", "Alpha Detail")] }),
+            ("zeta".to_string(), FetchOutcome::Ok { items: vec![meta_item("tt1", "Zeta Detail")] }),
+        ];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_meta(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        let meta = out.meta.expect("a meta");
+        assert_eq!(meta.name, "Alpha Detail"); // alpha (first by id) wins
+        assert_eq!(out.survivors, vec!["alpha", "zeta"]);
+
+        // No source answers -> None (and the missing sources are isolated as Timeout).
+        let mut b2 = BreakerRegistry::new();
+        let empty = settle_meta(&plan, &[], &mut b2, &CircuitConfig::default(), 1000);
+        assert!(empty.meta.is_none());
+        assert_eq!(empty.failed.len(), 2);
     }
 }
