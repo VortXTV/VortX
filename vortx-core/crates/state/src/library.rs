@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use vortx_protocol::ContentKind;
 
+use crate::finish::{finished, FinishPolicy};
 use crate::watch::{merge, merge_log, WatchLog, WatchState};
 
 /// One entry in a profile's library. `Standard` items mirror to the Stremio account; `NativeMagnet` and
@@ -142,13 +144,39 @@ pub const FINISHED_PERMILLE: u32 = 900;
 pub const CW_CAP: usize = 30;
 
 impl ProfileLibrary {
-    /// Record playback progress for an item ADDRESSED BY IDENTITY (`meta_id`, optional `video_id`), never
-    /// by a stream object. The engine owns the Continue-Watching rules: an in-progress item is upserted to
-    /// the FRONT of the rail (newest first, capped at [`CW_CAP`]) with its resume point; once it crosses
-    /// [`FINISHED_PERMILLE`] it is marked watched and removed from the rail. `now` is supplied by the host
-    /// (the kernel has no clock).
+    /// Record playback progress for a VIDEO item (the byte-identical default: the frozen video finish
+    /// policy). Audiobooks/podcasts call [`report_progress_kind`](Self::report_progress_kind) so their
+    /// tail-aware finish applies.
     pub fn report_progress(
         &mut self,
+        meta_id: &str,
+        video_id: Option<&str>,
+        position_ms: u64,
+        duration_ms: u64,
+        name: &str,
+        now: u64,
+    ) {
+        self.report_progress_kind(
+            ContentKind::Movie,
+            meta_id,
+            video_id,
+            position_ms,
+            duration_ms,
+            name,
+            now,
+        );
+    }
+
+    /// Record playback progress for an item ADDRESSED BY IDENTITY (`meta_id`, optional `video_id`), never
+    /// by a stream object, under the finish policy for `content_kind`. The engine owns the Continue-Watching
+    /// rules: an in-progress item is upserted to the FRONT of the rail (newest first, capped at [`CW_CAP`])
+    /// with its resume point; once it FINISHES (per [`FinishPolicy::for_kind`]: the frozen `permille >= 900`
+    /// for video, tail-aware for audio) it is marked watched and removed from the rail. `now` is supplied by
+    /// the host (the kernel has no clock).
+    #[allow(clippy::too_many_arguments)]
+    pub fn report_progress_kind(
+        &mut self,
+        content_kind: ContentKind,
         meta_id: &str,
         video_id: Option<&str>,
         position_ms: u64,
@@ -164,10 +192,11 @@ impl ProfileLibrary {
         // The resume point is keyed by the most specific unit (the episode if present, else the title), so
         // each episode keeps its own position.
         let resume_key = video_id.unwrap_or(meta_id).to_string();
-        // The finish decision routes through the pure tail-aware policy. The VIDEO policy (tail_grace 0)
-        // reduces EXACTLY to `permille >= FINISHED_PERMILLE`, so this is byte-identical to the prior check;
-        // SH3 threads the per-content-kind policy here so audiobook/podcast finish tail-aware.
-        if crate::finish::finished(position_ms, duration_ms, &crate::finish::FinishPolicy::VIDEO) {
+        // The finish decision routes through the pure tail-aware policy for this content kind. For video
+        // (the default) the policy is VIDEO (tail_grace 0), which reduces EXACTLY to `permille >= 900`, so a
+        // video report is byte-identical to the prior check; an audiobook/podcast gets the tail-aware AUDIO
+        // policy and finishes in the outro.
+        if finished(position_ms, duration_ms, &FinishPolicy::for_kind(content_kind)) {
             self.resume.remove(&resume_key);
             self.mark_watched(meta_id, video_id, now);
         } else {
@@ -332,6 +361,26 @@ mod tests {
         assert!(lib.watched["s"].video_ids.contains(&"s:1:1".to_string()));
         assert!(!lib.resume.contains_key("s:1:1")); // resume cleared on finish
         assert_eq!(lib.history.last().unwrap().id, "s");
+    }
+
+    #[test]
+    fn audiobook_finishes_in_the_tail_grace_where_a_movie_would_not() {
+        // A 40-min unit stopped at 35:00 (87.5%, below 90%). As an audiobook it is FINISHED (within the
+        // 5-minute tail grace); as a movie it stays in Continue Watching (the frozen video policy).
+        let mut audio = ProfileLibrary::default();
+        audio.report_progress_kind(ContentKind::Audiobook, "ab", None, 2_100_000, 2_400_000, "AB", 100);
+        assert!(audio.continue_watching.is_empty(), "audiobook finished via tail grace");
+        assert_eq!(audio.history.last().unwrap().id, "ab"); // finish recorded in history
+        assert!(!audio.resume.contains_key("ab")); // resume cleared on finish
+
+        let mut movie = ProfileLibrary::default();
+        movie.report_progress_kind(ContentKind::Movie, "mv", None, 2_100_000, 2_400_000, "MV", 100);
+        assert_eq!(movie.continue_watching.len(), 1, "movie at 87.5% stays in CW (frozen video policy)");
+        assert!(movie.history.is_empty()); // not finished -> no history entry
+        // The plain report_progress wrapper is the video policy, byte-identical to report_progress_kind(Movie).
+        let mut wrapped = ProfileLibrary::default();
+        wrapped.report_progress("mv", None, 2_100_000, 2_400_000, "MV", 100);
+        assert_eq!(wrapped.continue_watching.len(), 1);
     }
 
     #[test]

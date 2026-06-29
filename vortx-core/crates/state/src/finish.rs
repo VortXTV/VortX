@@ -9,6 +9,7 @@
 //! 90-95% that drifts between clients.
 
 use serde::{Deserialize, Serialize};
+use vortx_protocol::{ContentClass, ContentKind};
 
 use crate::library::FINISHED_PERMILLE;
 
@@ -42,6 +43,17 @@ impl FinishPolicy {
         finished_permille: FINISHED_PERMILLE,
         tail_grace_ms: 300_000,
     };
+
+    /// The library finish policy for a content kind: [`AUDIO`](FinishPolicy::AUDIO) (tail-aware) for the
+    /// audio class, [`VIDEO`](FinishPolicy::VIDEO) (the frozen permille-only policy) for video and live. A
+    /// video/series/movie/unknown title is byte-identical to the prior behavior; only audio diverges (into
+    /// tail-aware finish).
+    pub fn for_kind(kind: ContentKind) -> FinishPolicy {
+        match kind.class() {
+            ContentClass::Audio => FinishPolicy::AUDIO,
+            ContentClass::Video | ContentClass::Live => FinishPolicy::VIDEO,
+        }
+    }
 }
 
 /// Whether playback at `position_ms` of `duration_ms` counts as FINISHED under `policy`. PURE + integer:
@@ -109,5 +121,15 @@ mod tests {
     fn zero_duration_never_finishes_under_any_policy() {
         assert!(!finished(1_000, 0, &FinishPolicy::VIDEO));
         assert!(!finished(1_000, 0, &FinishPolicy::AUDIO)); // tail grace must not fire on unknown duration
+    }
+
+    #[test]
+    fn for_kind_selects_audio_only_for_the_audio_class() {
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Movie), FinishPolicy::VIDEO);
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Series), FinishPolicy::VIDEO);
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Channel), FinishPolicy::VIDEO); // live -> video
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Unknown), FinishPolicy::VIDEO);
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Audiobook), FinishPolicy::AUDIO);
+        assert_eq!(FinishPolicy::for_kind(ContentKind::Podcast), FinishPolicy::AUDIO);
     }
 }

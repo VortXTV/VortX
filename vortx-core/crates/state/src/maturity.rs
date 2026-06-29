@@ -12,8 +12,29 @@
 //!    non-kids profile that merely set a ceiling is fail-open on unrated content (a softer preference).
 
 use serde::{Deserialize, Serialize};
+use vortx_protocol::{ContentClass, ContentKind};
 
 use crate::profile::ParentalFlags;
+
+/// How a content rating is ENFORCED for a content kind. Video and audio are hard-gated (a kids profile never
+/// receives an over-ceiling title; the existing [`allows`] filter applies). Live TV is ADVISORY: a live
+/// channel's current-programme rating is surfaced as an advisory rather than hard-blocking the channel,
+/// because a live stream changes over time and cannot be pre-filtered the same way. This only adds the
+/// per-kind enforcement MODE that the live chunks consume; [`allows`]/[`parse_certification`] are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatingMode {
+    Hard,
+    Advisory,
+}
+
+/// The maturity enforcement mode for a content kind: live is advisory, everything else is hard-gated.
+pub fn gating_mode(kind: ContentKind) -> GatingMode {
+    match kind.class() {
+        ContentClass::Live => GatingMode::Advisory,
+        ContentClass::Video | ContentClass::Audio => GatingMode::Hard,
+    }
+}
 
 /// A content maturity rating reconciled to a single age-equivalent in years. `0` = suitable for all ages.
 /// `Ord`, so `rating <= ceiling` is the whole comparison.

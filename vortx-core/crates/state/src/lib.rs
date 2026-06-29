@@ -33,8 +33,8 @@ mod watch;
 pub use finish::{finished, FinishPolicy};
 pub use ids::ProfileId;
 pub use maturity::{
-    allows as maturity_allows, allows_raw as maturity_allows_raw, effective_ceiling,
-    parse_certification, MaturityRating, DEFAULT_KIDS_CEILING,
+    allows as maturity_allows, allows_raw as maturity_allows_raw, effective_ceiling, gating_mode,
+    parse_certification, GatingMode, MaturityRating, DEFAULT_KIDS_CEILING,
 };
 pub use library::{
     CwItem, HistoryEntry, LibraryItem, ProfileLibrary, ResumePoint, StremioLibraryItem,

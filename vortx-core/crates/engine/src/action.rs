@@ -3,6 +3,7 @@
 //! contract, pinned by conformance vectors.
 
 use serde::{Deserialize, Serialize};
+use vortx_protocol::ContentKind;
 use vortx_ranking::RankingPrefs;
 use vortx_state::WatchLog;
 
@@ -49,6 +50,10 @@ pub enum Action {
         position_ms: u64,
         #[serde(rename = "durationMs")]
         duration_ms: u64,
+        /// The content kind, so the finish decision uses the per-kind policy (audiobook/podcast finish
+        /// tail-aware). Omitted = the frozen video policy, byte-identical to the prior behavior.
+        #[serde(default, rename = "contentKind", skip_serializing_if = "Option::is_none")]
+        content_kind: Option<ContentKind>,
     },
     /// Mark an item (and optional episode) watched; removes it from Continue Watching.
     MarkWatched {

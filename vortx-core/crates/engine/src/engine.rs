@@ -153,8 +153,12 @@ pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchR
             name,
             position_ms,
             duration_ms,
+            content_kind,
         } => {
-            engine.store.active_library_mut().report_progress(
+            // Omitted content kind = the frozen video finish policy (byte-identical to the prior dispatch);
+            // an audiobook/podcast kind selects the tail-aware finish.
+            engine.store.active_library_mut().report_progress_kind(
+                content_kind.unwrap_or(vortx_protocol::ContentKind::Unknown),
                 &meta_id,
                 video_id.as_deref(),
                 position_ms,
@@ -411,6 +415,7 @@ mod tests {
                 name: "M".into(),
                 position_ms: 60_000,
                 duration_ms: 600_000,
+                content_kind: None,
             },
             &env(),
         );

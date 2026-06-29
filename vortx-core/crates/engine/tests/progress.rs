@@ -83,6 +83,7 @@ proptest! {
                     name: "M".into(),
                     position_ms: pos_ms.min(dur_ms),
                     duration_ms: dur_ms,
+                    content_kind: None,
                 },
                 &InMemoryEnv::new(1000 + i as u64),
             );
