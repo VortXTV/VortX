@@ -28,5 +28,5 @@ pub use episode::{
 };
 pub use parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 pub use prefs::RankingPrefs;
-pub use rank::{rank, RankedStream, Tier};
+pub use rank::{rank, rank_for, RankProfile, RankedStream, Tier};
 pub use release::{parse_release, ReleaseMeta};

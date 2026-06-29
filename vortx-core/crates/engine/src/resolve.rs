@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use vortx_debrid::{
     DebridService, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
 };
-use vortx_protocol::{MetaDetail, MetaPreview, Stream};
-use vortx_ranking::{rank, RankedStream, RankingPrefs};
+use vortx_protocol::{ContentKind, MetaDetail, MetaPreview, Stream};
+use vortx_ranking::{rank, rank_for, RankedStream, RankingPrefs};
 use vortx_reco::{
     build_home_feed, build_taste, visible_catalog, watch_log_from_library, AllEligible, AllOf,
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
@@ -51,6 +51,10 @@ pub enum ResolveRequest {
         /// that set its preferences once gets them applied to every stream resolve without re-sending them.
         #[serde(default)]
         prefs: Option<RankingPrefs>,
+        /// The content kind, so the engine selects the per-kind ranking profile. Omitted = the frozen video
+        /// profile (byte-identical to the prior behavior), so existing requests rank unchanged.
+        #[serde(default, rename = "contentKind", skip_serializing_if = "Option::is_none")]
+        content_kind: Option<ContentKind>,
     },
     /// PLAN phase of a stream LOAD: given a snapshot of the host's installed sources + their circuit
     /// breakers, decide WHICH to query and return the deadline-stamped fetch requests (circuit-open sources
@@ -94,6 +98,9 @@ pub enum ResolveRequest {
         /// Explicit ranking prefs; when omitted, the active profile's stored prefs are used.
         #[serde(default)]
         prefs: Option<RankingPrefs>,
+        /// The content kind for per-kind ranking-profile selection; omitted = the frozen video profile.
+        #[serde(default, rename = "contentKind", skip_serializing_if = "Option::is_none")]
+        content_kind: Option<ContentKind>,
     },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
@@ -186,6 +193,7 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             streams,
             cached,
             prefs,
+            content_kind,
         } => {
             // Explicit prefs win; otherwise fall back to the active profile's stored ranking prefs.
             let prefs = prefs.unwrap_or_else(|| {
@@ -195,9 +203,12 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
                     .map(|p| p.settings.ranking.clone())
                     .unwrap_or_default()
             });
-            ResolveResponse::Streams {
-                ranked: rank(&streams, &prefs, &cached),
-            }
+            // Select the per-kind ranking profile; omitted kind = the frozen video ranker (unchanged).
+            let ranked = match content_kind {
+                Some(k) => rank_for(k, &streams, &prefs, &cached),
+                None => rank(&streams, &prefs, &cached),
+            };
+            ResolveResponse::Streams { ranked }
         }
         ResolveRequest::StreamLoad {
             req,
@@ -229,6 +240,7 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             now,
             user_services,
             prefs,
+            content_kind,
         } => {
             // Settle the host's outcomes into typed streams (failures isolated; missing -> Timeout), updating
             // the breaker snapshot on a LOCAL copy that is returned for the host to upsert. The engine holds
@@ -251,8 +263,12 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
                     .map(|p| p.settings.ranking.clone())
                     .unwrap_or_default()
             });
+            let ranked = match content_kind {
+                Some(k) => rank_for(k, &resolved.streams, &prefs, &cached),
+                None => rank(&resolved.streams, &prefs, &cached),
+            };
             ResolveResponse::SettledStreams {
-                ranked: rank(&resolved.streams, &prefs, &cached),
+                ranked,
                 circuit_snapshot,
             }
         }
@@ -378,12 +394,44 @@ mod tests {
             streams: vec![stream("1080p WEB-DL"), stream("2160p WEB-DL")],
             cached: vec![false, false],
             prefs: None, // falls back to the active (owner) profile's default prefs
+            content_kind: None,
         };
         let ResolveResponse::Streams { ranked } = resolve(&engine, req) else {
             panic!("expected streams response");
         };
         assert_eq!(ranked[0].raw_index, 1); // 2160p outranks 1080p
         assert!(ranked[0].score > ranked[1].score);
+    }
+
+    #[test]
+    fn content_kind_movie_ranks_identically_to_the_default() {
+        // The per-kind selector: a movie (video class) ranks byte-identically to omitting the kind.
+        let engine = init_runtime("owner", "Owner");
+        let streams = vec![stream("1080p WEB-DL"), stream("2160p WEB-DL")];
+        let with_kind = resolve(
+            &engine,
+            ResolveRequest::Streams {
+                streams: streams.clone(),
+                cached: vec![false, false],
+                prefs: None,
+                content_kind: Some(ContentKind::Movie),
+            },
+        );
+        let without = resolve(
+            &engine,
+            ResolveRequest::Streams {
+                streams,
+                cached: vec![false, false],
+                prefs: None,
+                content_kind: None,
+            },
+        );
+        let (ResolveResponse::Streams { ranked: a }, ResolveResponse::Streams { ranked: b }) =
+            (with_kind, without)
+        else {
+            panic!("expected streams responses");
+        };
+        assert_eq!(a, b); // video profile == frozen default
     }
 
     #[test]

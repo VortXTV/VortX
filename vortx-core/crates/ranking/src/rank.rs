@@ -19,7 +19,7 @@
 //! not part of the deterministic score.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::{Stream, VortxStreamHints};
+use vortx_protocol::{ContentClass, ContentKind, Stream, VortxStreamHints};
 
 use crate::parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 use crate::prefs::RankingPrefs;
@@ -293,6 +293,49 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
     // Pure integer order: score descending, then original index for a stable tiebreak.
     out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
     out
+}
+
+/// The scoring profile a ranking runs under, selected by content class. `Video` is the FROZEN current ranker
+/// (every existing vector + the plain [`rank`] entry are byte-identical under it). `Live` and `Audio`
+/// currently reuse the video scoring as placeholders and are specialized in later chunks (a live
+/// stream-health profile; `rank_audio` for lossless/bitrate). The selection point exists now so those chunks
+/// slot in without changing callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankProfile {
+    Video,
+    Live,
+    Audio,
+}
+
+impl RankProfile {
+    /// Select the scoring profile for a content kind via its coarse [`ContentClass`].
+    pub fn for_kind(kind: ContentKind) -> RankProfile {
+        match kind.class() {
+            ContentClass::Video => RankProfile::Video,
+            ContentClass::Live => RankProfile::Live,
+            ContentClass::Audio => RankProfile::Audio,
+        }
+    }
+}
+
+/// Rank `streams` under the profile selected by `kind`. The `Video` profile is the byte-identical current
+/// [`rank`] (so `rank_for(Movie, ..)` equals `rank(..)` exactly, forever). `Live` and `Audio` reuse it as
+/// placeholders until their dedicated profiles land; the per-kind branch is structured here so those chunks
+/// slot in without touching callers. Each arm is intentionally the same scoring for now.
+#[allow(clippy::match_same_arms)]
+pub fn rank_for(
+    kind: ContentKind,
+    streams: &[Stream],
+    prefs: &RankingPrefs,
+    cached: &[bool],
+) -> Vec<RankedStream> {
+    match RankProfile::for_kind(kind) {
+        RankProfile::Video => rank(streams, prefs, cached),
+        // placeholder: a live stream-health profile (no resolution tiers, bitrate/uptime first) lands in LT.
+        RankProfile::Live => rank(streams, prefs, cached),
+        // placeholder: rank_audio (lossless > high-bitrate-lossy, codec/bit-depth) lands in AU.
+        RankProfile::Audio => rank(streams, prefs, cached),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -694,5 +737,40 @@ mod tests {
         let ranked = rank(&[s], &prefs, &[false]);
         // 1080p webdl base = (45000 + 90)*1000 = 45090000; + size_milli(10 GiB) = 1500.
         assert_eq!(ranked[0].score, 45_091_500);
+    }
+
+    #[test]
+    fn profile_selection_maps_class_to_profile() {
+        assert_eq!(RankProfile::for_kind(ContentKind::Movie), RankProfile::Video);
+        assert_eq!(RankProfile::for_kind(ContentKind::Series), RankProfile::Video);
+        assert_eq!(RankProfile::for_kind(ContentKind::Unknown), RankProfile::Video);
+        assert_eq!(RankProfile::for_kind(ContentKind::Channel), RankProfile::Live);
+        assert_eq!(RankProfile::for_kind(ContentKind::Audiobook), RankProfile::Audio);
+    }
+
+    #[test]
+    fn video_kind_ranks_byte_identically_to_the_frozen_ranker() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            stream("1080p WEB-DL"),
+            stream("2160p BluRay REMUX Dolby Vision Atmos"),
+            stream("720p HDTV"),
+        ];
+        let cached = [false, true, false];
+        // The video profile IS the frozen rank(): same scores, same order, forever.
+        assert_eq!(
+            rank_for(ContentKind::Movie, &streams, &prefs, &cached),
+            rank(&streams, &prefs, &cached)
+        );
+    }
+
+    #[test]
+    fn live_and_audio_currently_delegate_to_the_video_profile() {
+        // Placeholder behavior (documents the current state; updated when the live/audio profiles specialize).
+        let prefs = RankingPrefs::default();
+        let streams = [stream("1080p WEB-DL"), stream("2160p WEB-DL")];
+        let base = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]), base);
+        assert_eq!(rank_for(ContentKind::Podcast, &streams, &prefs, &[false, false]), base);
     }
 }
