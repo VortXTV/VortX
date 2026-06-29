@@ -1,0 +1,45 @@
+{
+  "description": "Cross-language conformance for the M3U/M3U8 IPTV playlist parser (LT1). Each case pins a playlist text to the parsed Playlist wire form. The parser is tolerant (bare URLs, unknown directives, malformed EXTINF), captures #EXTVLCOPT as HTTP headers (http-user-agent -> User-Agent, http-referrer -> Referer) and #KODIPROP as raw props, splits the display name at the first UNQUOTED comma, and truncates a fractional duration to an integer (-1 for live).",
+  "cases": [
+    {
+      "name": "full_channel_with_attrs_headers_props_and_epg_url",
+      "text": "#EXTM3U url-tvg=\"http://epg.xml\"\n#EXTINF:-1 tvg-id=\"cnn.us\" tvg-name=\"CNN\" tvg-logo=\"http://l/cnn.png\" group-title=\"News\" tvg-chno=\"5\",CNN HD\n#EXTVLCOPT:http-user-agent=Mozilla/5.0\n#EXTVLCOPT:http-referrer=http://ref\n#KODIPROP:inputstream.adaptive.license_type=clearkey\nhttp://stream/cnn.m3u8\n",
+      "expect": {
+        "epg_urls": ["http://epg.xml"],
+        "entries": [
+          {
+            "url": "http://stream/cnn.m3u8",
+            "duration_secs": -1,
+            "tvg_id": "cnn.us",
+            "tvg_name": "CNN",
+            "tvg_logo": "http://l/cnn.png",
+            "group_title": "News",
+            "display_name": "CNN HD",
+            "attributes": [["tvg-chno", "5"]],
+            "headers": [["User-Agent", "Mozilla/5.0"], ["Referer", "http://ref"]],
+            "props": [["inputstream.adaptive.license_type", "clearkey"]]
+          }
+        ]
+      }
+    },
+    {
+      "name": "comma_inside_quoted_group_does_not_cut_the_name",
+      "text": "#EXTINF:-1 group-title=\"News, Sports\",My Channel\nhttp://x\n",
+      "expect": {
+        "entries": [
+          { "url": "http://x", "duration_secs": -1, "group_title": "News, Sports", "display_name": "My Channel" }
+        ]
+      }
+    },
+    {
+      "name": "bare_urls_and_fractional_vod_duration",
+      "text": "#EXTM3U\nhttp://a\n#EXTINF:7200.5 tvg-id=\"m\",Movie\nhttp://m\n",
+      "expect": {
+        "entries": [
+          { "url": "http://a", "duration_secs": 0, "display_name": "" },
+          { "url": "http://m", "duration_secs": 7200, "tvg_id": "m", "display_name": "Movie" }
+        ]
+      }
+    }
+  ]
+}

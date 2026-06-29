@@ -1,0 +1,15 @@
+[package]
+name = "vortx-live"
+description = "VortX native Live TV (IPTV/EPG) engine: pure parsers + decision policy for M3U/M3U8 playlists, XMLTV EPG, channel identity/dedup, catchup/timeshift URL templating, live-channel ranking, and signed channel-health/correction federation. No network, no clock, no float on any ordering/identity path: the kernel parses the bytes the host fetched and emits plans (the host does all HTTP + storage), so live TV rides the same parse/rank/resolve/finish machinery as video. stremio-core has no live-TV concept; VortX owns it natively."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest = "1"

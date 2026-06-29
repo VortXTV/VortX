@@ -24,6 +24,7 @@ members = [
     "crates/engine",
     "crates/subtitles",
     "crates/nzb",
+    "crates/live",
 ]
 
 [workspace.package]
