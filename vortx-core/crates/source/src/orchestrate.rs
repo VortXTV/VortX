@@ -172,6 +172,35 @@ fn resolved_meta_from(agg: Aggregate) -> ResolvedMeta {
     }
 }
 
+/// The RAW merged item keys of a settled LOAD, for a resource whose typed item lives OUTSIDE this crate's
+/// dependency set (subtitles, whose `SubtitleTrack` is in `vortx-subtitles`). The caller (which has the typed
+/// dep) parses the keys itself. Same `settle_fanout` machinery + survivor/failure attribution; the items are
+/// the deterministic sorted-addon-id union, so the caller's parse stays cross-platform-stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResolvedItems {
+    pub items: Vec<String>,
+    pub survivors: Vec<String>,
+    pub failed: Vec<FailedAddon>,
+}
+
+/// Settle a LOAD into its RAW merged item keys (the generic SETTLE half, for a resource this crate cannot
+/// type because its item lives in another crate). Reuses the EXACT same `settle_fanout` as the typed settles;
+/// the caller parses each returned key into its own type. Pure over the breaker snapshot.
+pub fn settle_items(
+    plan: &[FetchRequest],
+    outcomes: &[(String, FetchOutcome)],
+    breakers: &mut BreakerRegistry,
+    cfg: &CircuitConfig,
+    now: u64,
+) -> ResolvedItems {
+    let agg = settle_fanout(plan, outcomes, breakers, cfg, now);
+    ResolvedItems {
+        items: agg.items,
+        survivors: agg.survivors,
+        failed: agg.failed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +556,26 @@ mod tests {
         let empty = settle_meta(&plan, &[], &mut b2, &CircuitConfig::default(), 1000);
         assert!(empty.meta.is_none());
         assert_eq!(empty.failed.len(), 2);
+    }
+
+    #[test]
+    fn settle_items_returns_the_raw_merged_keys_in_sorted_order() {
+        // The generic raw settle: the caller parses the keys (subtitles, whose type is in another crate).
+        let plan = vec![
+            FetchRequest { addon_id: "alpha".into(), url: "http://a".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "zeta".into(), url: "http://z".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "down".into(), url: "http://d".into(), budget_ms: 5000 },
+        ];
+        let outcomes = vec![
+            ("alpha".to_string(), FetchOutcome::Ok { items: vec!["a1".into(), "a2".into()] }),
+            ("zeta".to_string(), FetchOutcome::Ok { items: vec!["z1".into()] }),
+            ("down".to_string(), FetchOutcome::Error),
+        ];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_items(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        assert_eq!(out.items, vec!["a1", "a2", "z1"]); // alpha before zeta (sorted-id merge)
+        assert_eq!(out.survivors, vec!["alpha", "zeta"]);
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].addon_id, "down");
     }
 }

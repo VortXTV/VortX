@@ -54,7 +54,8 @@ pub use manifest::{
 pub use native::NativeVortxSource;
 pub use orchestrate::{
     parse_catalog_item, parse_meta_item, parse_stream_item, resolve_streams, settle_catalog,
-    settle_meta, settle_streams, ResolvedCatalog, ResolvedMeta, ResolvedStreams,
+    settle_items, settle_meta, settle_streams, ResolvedCatalog, ResolvedItems, ResolvedMeta,
+    ResolvedStreams,
 };
 pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;

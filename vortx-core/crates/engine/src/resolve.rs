@@ -20,8 +20,8 @@ use vortx_reco::{
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
 use vortx_source::{
-    cached_vector, plan_streams, settle_catalog, settle_meta, settle_streams, BreakerRegistry,
-    CircuitConfig, FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
+    cached_vector, plan_streams, settle_catalog, settle_items, settle_meta, settle_streams,
+    BreakerRegistry, CircuitConfig, FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
 };
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
@@ -163,6 +163,39 @@ pub enum ResolveRequest {
         #[serde(default)]
         now: u64,
     },
+    /// PLAN phase of a SUBTITLES LOAD: the 4th leg of the LOAD quartet. Same stateless effect model + the SAME
+    /// `plan_streams` planner (a subtitles request yields subtitles fetch URLs). The host realizes, then settles.
+    SubtitlesLoad {
+        req: ResourceRequest,
+        #[serde(default, rename = "registrySnapshot")]
+        registry_snapshot: Vec<SourceEntry>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default = "default_budget_ms", rename = "budgetMs")]
+        budget_ms: u64,
+    },
+    /// SETTLE phase of a SUBTITLES LOAD: the host hands back the per-source outcomes; the engine settles the
+    /// raw merged keys (`settle_items`), parses them into `SubtitleTrack`s (the typed parse lives here because
+    /// `SubtitleTrack` is in `vortx-subtitles`, keeping the source crate dep-clean), and runs the EXISTING
+    /// `select` over the multi-source merge -- so the LOAD feeds the same selection logic as the one-shot
+    /// `Subtitles`. Returns the chosen track + the updated breaker snapshot. PURE over the breaker snapshot.
+    SettleSubtitles {
+        plan: Vec<FetchRequest>,
+        #[serde(default)]
+        outcomes: BTreeMap<String, FetchOutcome>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default)]
+        prefs: SubtitlePrefs,
+    },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
         tracks: Vec<SubtitleTrack>,
@@ -248,6 +281,15 @@ pub enum ResolveResponse {
     /// answered) + the updated breaker snapshot the host upserts.
     SettledMeta {
         meta: Option<Box<MetaDetail>>,
+        #[serde(rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+    },
+    /// The fetch plan for a subtitles LOAD (circuit-open sources skipped, sorted by addon id).
+    SubtitlesLoadPlan { requests: Vec<FetchRequest> },
+    /// The settled subtitles LOAD: the chosen track (or `null`) selected over the multi-source merge, + the
+    /// updated breaker snapshot the host upserts.
+    SettledSubtitles {
+        selected: Option<SubtitleSelection>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
     },
@@ -435,6 +477,49 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             };
             ResolveResponse::SettledMeta {
                 meta: allowed.then(|| resolved.meta.map(Box::new)).flatten(),
+                circuit_snapshot,
+            }
+        }
+        ResolveRequest::SubtitlesLoad {
+            req,
+            registry_snapshot,
+            circuit_snapshot,
+            circuit_cfg,
+            now,
+            budget_ms,
+        } => {
+            // The subtitles leg of the LOAD quartet: the same resource-generic planner routes the request.
+            ResolveResponse::SubtitlesLoadPlan {
+                requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
+            }
+        }
+        ResolveRequest::SettleSubtitles {
+            plan,
+            outcomes,
+            mut circuit_snapshot,
+            circuit_cfg,
+            now,
+            prefs,
+        } => {
+            // Settle the raw merged keys on a LOCAL breaker copy, parse them into typed SubtitleTracks (the
+            // parse lives here, where SubtitleTrack is in scope, so the source crate stays dep-clean), and run
+            // the EXISTING select over the multi-source merge -- the LOAD feeds the same selection as one-shot.
+            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let resolved = settle_items(&plan, &outcomes, &mut circuit_snapshot, &circuit_cfg, now);
+            let tracks: Vec<SubtitleTrack> = resolved
+                .items
+                .iter()
+                .filter_map(|k| serde_json::from_str::<SubtitleTrack>(k).ok())
+                .collect();
+            ResolveResponse::SettledSubtitles {
+                selected: select_subtitle(&tracks, &prefs),
                 circuit_snapshot,
             }
         }
