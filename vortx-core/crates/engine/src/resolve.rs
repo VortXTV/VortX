@@ -19,6 +19,9 @@ use vortx_reco::{
     build_home_feed, build_taste, visible_catalog, watch_log_from_library, AllEligible, AllOf,
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
+use vortx_source::{
+    plan_streams, BreakerRegistry, CircuitConfig, FetchRequest, ResourceRequest, SourceEntry,
+};
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
 
@@ -47,6 +50,25 @@ pub enum ResolveRequest {
         /// that set its preferences once gets them applied to every stream resolve without re-sending them.
         #[serde(default)]
         prefs: Option<RankingPrefs>,
+    },
+    /// PLAN phase of a stream LOAD: given a snapshot of the host's installed sources + their circuit
+    /// breakers, decide WHICH to query and return the deadline-stamped fetch requests (circuit-open sources
+    /// skipped, sorted by addon id). The engine holds no source state of its own, so the request carries the
+    /// snapshots + the host clock (`now`); the kernel stays pure and clockless. The host realizes the plan
+    /// through its Fetch boundary, then settles it (the settle phase, host-side, updates the breakers). This
+    /// is the stateless half of the LOAD effect model.
+    StreamLoad {
+        req: ResourceRequest,
+        #[serde(default, rename = "registrySnapshot")]
+        registry_snapshot: Vec<SourceEntry>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default = "default_budget_ms", rename = "budgetMs")]
+        budget_ms: u64,
     },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
@@ -87,6 +109,11 @@ pub enum ResolveRequest {
     },
 }
 
+/// Default per-request fetch budget (ms) for a stream LOAD plan when the host omits it.
+fn default_budget_ms() -> u64 {
+    5000
+}
+
 /// A `(meta id, certification)` pair the host supplies so the engine can parental-gate Home feed lanes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RatingEntry {
@@ -101,6 +128,9 @@ pub struct RatingEntry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolveResponse {
     Streams { ranked: Vec<RankedStream> },
+    /// The fetch plan for a stream LOAD: the deadline-stamped requests the host should perform (circuit-open
+    /// sources skipped, sorted by addon id). The host fetches these, then settles via the host-side settle.
+    StreamLoadPlan { requests: Vec<FetchRequest> },
     /// The chosen subtitle track, or `null` when nothing was eligible.
     Subtitles { selected: Option<SubtitleSelection> },
     /// The catalog rows the active profile is allowed to see.
@@ -134,6 +164,28 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             });
             ResolveResponse::Streams {
                 ranked: rank(&streams, &prefs, &cached),
+            }
+        }
+        ResolveRequest::StreamLoad {
+            req,
+            registry_snapshot,
+            circuit_snapshot,
+            circuit_cfg,
+            now,
+            budget_ms,
+        } => {
+            // Pure stateless planning: route the request over the host's source snapshot and circuit-filter
+            // it. The engine owns the WHICH/HOW decision; the host owns the bytes, the breaker state, and the
+            // clock. No engine state is read or mutated.
+            ResolveResponse::StreamLoadPlan {
+                requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
             }
         }
         ResolveRequest::Subtitles { tracks, prefs } => ResolveResponse::Subtitles {

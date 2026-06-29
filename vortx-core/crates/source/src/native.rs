@@ -8,9 +8,9 @@
 use vortx_protocol::{ResourcePath, Stream};
 
 use crate::manifest::{VortxAddonManifest, VortxTransport};
-use crate::request::{ResourceKind, ResourceRequest};
+use crate::request::{id_space_allows, ResourceKind, ResourceRequest};
 use crate::source::{Source, SourceKind};
-use crate::transport::FetchRequest;
+use crate::transport::{source_base, FetchRequest};
 use crate::verify::{verify_manifest, ManifestVerification};
 use crate::SourceError;
 
@@ -52,16 +52,6 @@ impl NativeVortxSource {
     }
 }
 
-/// The HTTP base for a native source: strip the native (`/manifest.vortx.json`) or plain (`/manifest.json`)
-/// manifest filename, else trim a trailing slash. `base_url` in `vortx-protocol` only strips `/manifest.json`,
-/// so a native manifest URL needs this first or the resource path would be built under the manifest file.
-fn native_base(manifest_url: &str) -> &str {
-    manifest_url
-        .strip_suffix("/manifest.vortx.json")
-        .or_else(|| manifest_url.strip_suffix("/manifest.json"))
-        .unwrap_or_else(|| manifest_url.trim_end_matches('/'))
-}
-
 impl Source for NativeVortxSource {
     fn id(&self) -> &str {
         &self.manifest.id
@@ -76,28 +66,12 @@ impl Source for NativeVortxSource {
     }
 
     fn supports(&self, req: &ResourceRequest) -> bool {
-        if !self.manifest.capabilities.contains(&req.kind) {
-            return false;
-        }
-        if !self.manifest.types.is_empty() && !self.manifest.types.contains(&req.type_) {
-            return false;
-        }
-        // idPrefixes gate CONTENT ids only (catalog ids are addon-defined), mirroring the Stremio rule.
-        let gates_id = matches!(
-            req.kind,
-            ResourceKind::Meta | ResourceKind::Stream | ResourceKind::Subtitles
-        );
-        if gates_id
-            && !self.manifest.id_prefixes.is_empty()
-            && !self
-                .manifest
-                .id_prefixes
-                .iter()
-                .any(|p| req.id.starts_with(p))
-        {
-            return false;
-        }
-        true
+        id_space_allows(
+            &self.manifest.capabilities,
+            &self.manifest.types,
+            &self.manifest.id_prefixes,
+            req,
+        )
     }
 
     fn plan(&self, req: &ResourceRequest, budget_ms: u64) -> Option<FetchRequest> {
@@ -108,7 +82,7 @@ impl Source for NativeVortxSource {
         // manifest path differs (/manifest.vortx.json). Non-HTTP transports (Federated / Nuvio / Debrid)
         // resolve through a different host seam, not a plain GET, so they plan no fetch here.
         let base = match &self.manifest.transport {
-            VortxTransport::StremioHttp { manifest_url } => native_base(manifest_url),
+            VortxTransport::StremioHttp { manifest_url } => source_base(manifest_url),
             _ => return None,
         };
         Some(FetchRequest {

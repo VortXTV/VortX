@@ -58,6 +58,33 @@ pub(crate) fn resource_to_kind(name: &str) -> Option<ResourceKind> {
     }
 }
 
+/// The shared id-space gate: whether a source declaring `capabilities` / `types` / `id_prefixes` can answer
+/// `req`. The request kind must be a declared capability, the type must match (unless the source declares no
+/// types = all), and `idPrefixes` gate CONTENT ids only (meta/stream/subtitles) since catalog ids are
+/// addon-defined. Pure and cheap (no network). Used by every source that gates from flat capability lists
+/// (the native source and the lightweight [`crate::SourceEntry`] snapshot).
+pub(crate) fn id_space_allows(
+    capabilities: &[ResourceKind],
+    types: &[String],
+    id_prefixes: &[String],
+    req: &ResourceRequest,
+) -> bool {
+    if !capabilities.contains(&req.kind) {
+        return false;
+    }
+    if !types.is_empty() && !types.contains(&req.type_) {
+        return false;
+    }
+    let gates_id = matches!(
+        req.kind,
+        ResourceKind::Meta | ResourceKind::Stream | ResourceKind::Subtitles
+    );
+    if gates_id && !id_prefixes.is_empty() && !id_prefixes.iter().any(|p| req.id.starts_with(p)) {
+        return false;
+    }
+    true
+}
+
 /// A request for a resource, scoped to a profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRequest {

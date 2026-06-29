@@ -1,0 +1,70 @@
+{
+  "description": "Cross-language conformance for the engine stream LOAD plan query (the pure stateless half of the LOAD effect model). The host supplies the resource request + a snapshot of its installed sources + a circuit-breaker snapshot + the clock; the engine routes by capability + id-space, builds each matching source's byte-exact fetch URL, skips circuit-open sources still cooling, and returns the deadline-stamped requests sorted by addon id. The engine holds no source state and does no I/O. circuitCfg defaults to failure_threshold 3 / cooldown_secs 300.",
+  "cases": [
+    {
+      "name": "plans_matching_sources_sorted_with_correct_urls",
+      "request": {
+        "kind": "stream_load",
+        "req": { "kind": "stream", "type": "movie", "id": "tt0111161" },
+        "registrySnapshot": [
+          { "id": "zeta", "url": "https://z.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": ["movie"], "idPrefixes": ["tt"] },
+          { "id": "alpha", "url": "https://a.tv/manifest.vortx.json", "kind": "native_vortx", "capabilities": ["stream"], "types": ["movie"], "idPrefixes": ["tt"] }
+        ],
+        "now": 1000,
+        "budgetMs": 5000
+      },
+      "requests": [
+        { "addon_id": "alpha", "url": "https://a.tv/stream/movie/tt0111161.json", "budgetMs": 5000 },
+        { "addon_id": "zeta", "url": "https://z.tv/stream/movie/tt0111161.json", "budgetMs": 5000 }
+      ]
+    },
+    {
+      "name": "routes_out_sources_that_cannot_answer",
+      "request": {
+        "kind": "stream_load",
+        "req": { "kind": "stream", "type": "movie", "id": "tt0111161" },
+        "registrySnapshot": [
+          { "id": "meta-only", "url": "https://m.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["meta"], "types": [], "idPrefixes": [] },
+          { "id": "wrong-prefix", "url": "https://w.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": [], "idPrefixes": ["kitsu"] },
+          { "id": "good", "url": "https://g.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": [], "idPrefixes": ["tt"] }
+        ],
+        "now": 1000,
+        "budgetMs": 5000
+      },
+      "requests": [
+        { "addon_id": "good", "url": "https://g.tv/stream/movie/tt0111161.json", "budgetMs": 5000 }
+      ]
+    },
+    {
+      "name": "circuit_open_source_still_cooling_is_skipped",
+      "request": {
+        "kind": "stream_load",
+        "req": { "kind": "stream", "type": "movie", "id": "tt0111161" },
+        "registrySnapshot": [
+          { "id": "good", "url": "https://g.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": [], "idPrefixes": ["tt"] },
+          { "id": "bad", "url": "https://b.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": [], "idPrefixes": ["tt"] }
+        ],
+        "circuitSnapshot": { "bad": { "consecutive_failures": 3, "state": "open", "opened_at": 1000 } },
+        "now": 1100,
+        "budgetMs": 5000
+      },
+      "requests": [
+        { "addon_id": "good", "url": "https://g.tv/stream/movie/tt0111161.json", "budgetMs": 5000 }
+      ]
+    },
+    {
+      "name": "default_budget_when_omitted",
+      "request": {
+        "kind": "stream_load",
+        "req": { "kind": "stream", "type": "movie", "id": "tt1" },
+        "registrySnapshot": [
+          { "id": "s", "url": "https://s.tv/manifest.json", "kind": "stremio_addon", "capabilities": ["stream"], "types": [], "idPrefixes": [] }
+        ],
+        "now": 1000
+      },
+      "requests": [
+        { "addon_id": "s", "url": "https://s.tv/stream/movie/tt1.json", "budgetMs": 5000 }
+      ]
+    }
+  ]
+}

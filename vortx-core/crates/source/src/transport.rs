@@ -23,6 +23,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::fanout::{aggregate, AddonResult, Aggregate, BreakerRegistry, CircuitConfig, Outcome};
 
+/// The HTTP base for a source URL: strip the native (`/manifest.vortx.json`) or plain (`/manifest.json`)
+/// manifest filename, else trim a trailing slash. `vortx_protocol::base_url` only strips `/manifest.json`, so
+/// a native manifest URL needs this first or a resource path would be built under the manifest file. Shared
+/// by the native source and the [`crate::SourceEntry`] snapshot planner.
+pub(crate) fn source_base(url: &str) -> &str {
+    url.strip_suffix("/manifest.vortx.json")
+        .or_else(|| url.strip_suffix("/manifest.json"))
+        .unwrap_or_else(|| url.trim_end_matches('/'))
+}
+
 /// One planned fetch the host should perform. `budget_ms` is the per-request time budget the host enforces
 /// (returning [`FetchOutcome::Timeout`] if exceeded); the engine stamps it, the host honors it. The kernel
 /// stays clockless in milliseconds: it carries the budget, never a wall-clock deadline.
