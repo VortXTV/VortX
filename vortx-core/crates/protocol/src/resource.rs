@@ -143,6 +143,11 @@ pub struct MetaDetail {
     pub certification: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Exact total duration in milliseconds, when known: the precise basis for the deterministic finish
+    /// policy (SH6) on a single-file title (a movie / a one-file audiobook), distinct from the free-text
+    /// `runtime`. Absent on a plain Stremio meta.
+    #[serde(default, rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genres: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +188,29 @@ pub struct Video {
     /// Some add-ons embed the playable streams directly on the episode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<Stream>,
+    /// Exact duration in milliseconds of this episode / chapter unit, when known. The precise timeline basis
+    /// for per-chapter resume and the deterministic finish policy (SH6), distinct from the free-text runtime.
+    /// A native vortx-source/1 or audio source supplies it; absent on a plain Stremio episode.
+    #[serde(default, rename = "durationMs", skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Chapter / segment markers within this unit: audiobook chapters, podcast segments, or skip ranges.
+    /// Empty (and absent on the wire) for a plain video episode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<Chapter>,
+}
+
+/// A chapter or segment marker inside a [`Video`] unit (an audiobook chapter, a podcast segment, a skip
+/// range). `start_ms` is the offset from the unit start; `end_ms` is the next boundary, or the unit end when
+/// absent. Byte-frozen wire keys (`startMs`/`endMs`) so cross-platform chapter resume agrees. It only ever
+/// appears inside `Video.chapters` (skip-if-empty), so a plain video episode never serializes one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Chapter {
+    #[serde(rename = "startMs")]
+    pub start_ms: i64,
+    #[serde(default, rename = "endMs", skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A playable stream. The SOURCE is one of: a direct `url`, a YouTube `ytId`, a torrent

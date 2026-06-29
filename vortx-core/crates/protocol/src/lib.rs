@@ -22,9 +22,9 @@ pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
 };
 pub use resource::{
-    AddonCatalogResponse, AddonDescriptor, CatalogResponse, MetaDetail, MetaPreview, MetaResponse,
-    Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle, SubtitlesResponse, Video,
-    VortxStreamHints,
+    AddonCatalogResponse, AddonDescriptor, CatalogResponse, Chapter, MetaDetail, MetaPreview,
+    MetaResponse, Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle,
+    SubtitlesResponse, Video, VortxStreamHints,
 };
 pub use transport::{base_url, ResourcePath};
 

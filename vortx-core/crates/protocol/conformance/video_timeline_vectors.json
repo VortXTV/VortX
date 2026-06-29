@@ -1,0 +1,23 @@
+{
+  "description": "Cross-language conformance for the SH5 timeline schema additions: Video.durationMs + Video.chapters[{startMs,endMs,title}] and MetaDetail.durationMs. All are skip_serializing_if-default, so a plain Stremio Video/MetaDetail without them serializes byte-identically to before SH5 (the no-regression guarantee). Chapter wire keys are startMs/endMs; the parsed fields are snake_case. end_ms is null when a chapter omits endMs.",
+  "videos": [
+    {
+      "name": "episode_with_duration_and_chapters",
+      "json": { "id": "tt1:1:1", "name": "Ep 1", "durationMs": 2700000, "chapters": [ { "startMs": 0, "title": "Intro" }, { "startMs": 90000, "endMs": 2640000, "title": "Main" } ] },
+      "duration_ms": 2700000,
+      "chapters": [ { "start_ms": 0, "end_ms": null, "title": "Intro" }, { "start_ms": 90000, "end_ms": 2640000, "title": "Main" } ]
+    },
+    {
+      "name": "audiobook_chapter_unit",
+      "json": { "id": "asin:B1:ch3", "durationMs": 1800000, "chapters": [ { "startMs": 0, "endMs": 1800000, "title": "Chapter 3" } ] },
+      "duration_ms": 1800000,
+      "chapters": [ { "start_ms": 0, "end_ms": 1800000, "title": "Chapter 3" } ]
+    },
+    {
+      "name": "plain_episode_has_no_timeline_fields",
+      "json": { "id": "tt1:1:2", "name": "Ep 2" },
+      "duration_ms": null,
+      "chapters": []
+    }
+  ]
+}
