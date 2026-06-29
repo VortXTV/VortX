@@ -18,6 +18,7 @@ A stability pass aimed straight at the Apple TV crash where the whole device han
 ### Added
 
 - **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It uses the same air-date data the new-episode reminders already gather, routes to the show when you open a card, and simply does not appear when nothing is upcoming.
+- **Debrid-cached sources are marked and ranked up.** If you have a debrid account (Real-Debrid, AllDebrid, Premiumize, or TorBox) set under API keys, sources your account already has cached now show a small "cached" chip and rank higher in the source list, so the quick pick lands on one your debrid holds. Without a debrid key nothing changes. (Playing straight from the cached debrid link, instead of starting the torrent, is the next step.)
 
 ## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
 
