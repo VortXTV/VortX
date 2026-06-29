@@ -277,22 +277,30 @@ extension DownloadManager: URLSessionDownloadDelegate {
     nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                                 didFinishDownloadingTo location: URL) {
         let dest = destinations.url(for: downloadTask.taskIdentifier)
+        // The source size BEFORE any move (the temp is gone after a successful move). 0 bytes here means the
+        // SOURCE returned nothing - usually a torrent with no running server / no debrid, or a dead link - not
+        // a save bug. Captured so a "cannot create file" is actually diagnosable.
+        let srcBytes = ((try? FileManager.default.attributesOfItem(atPath: location.path))?[.size] as? Int) ?? -1
         var moveError: Error?
         if let dest {
             try? FileManager.default.removeItem(at: dest)
-            // Ensure the destination directory exists before the move/copy. If the Downloads dir was
-            // never created (or was reclaimed by the OS), moveItem/copyItem fails and the user sees
-            // "cannot create file" on completion. createDirectory is a no-op when it already exists.
-            try? FileManager.default.createDirectory(at: dest.deletingLastPathComponent(),
-                                                     withIntermediateDirectories: true)
-            do { try FileManager.default.moveItem(at: location, to: dest) }
-            catch {
-                // A cross-volume move can fail with EXDEV; fall back to a copy.
-                do { try FileManager.default.copyItem(at: location, to: dest) } catch { moveError = error }
+            // Ensure the destination directory exists before the move/copy (surface a dir-creation failure
+            // instead of swallowing it, so a path/permission problem is no longer an opaque "cannot create file").
+            do { try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true) }
+            catch { moveError = error }
+            if moveError == nil {
+                do { try FileManager.default.moveItem(at: location, to: dest) }
+                catch {
+                    // A cross-volume move can fail with EXDEV; fall back to a copy.
+                    do { try FileManager.default.copyItem(at: location, to: dest) } catch { moveError = error }
+                }
             }
         }
         let failed = (dest == nil) || (moveError != nil)
-        let failureText = moveError?.localizedDescription
+        let failureText: String? = failed
+            ? (moveError.map { e in let ns = e as NSError; return "\(ns.localizedDescription) [\(ns.domain) \(ns.code), src \(srcBytes)B]" }
+               ?? "Could not save the download (no destination)")
+            : nil
         Task { @MainActor [weak self] in
             guard let self, let id = self.recordID(for: downloadTask) else { return }
             self.store.update(id: id) {
