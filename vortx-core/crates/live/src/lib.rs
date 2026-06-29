@@ -9,15 +9,18 @@
 //!
 //! LT1 (`m3u`): the M3U/M3U8 playlist parser. LT2 (`epg`): the XMLTV parser with the timezone -> UTC integer
 //! fence. LT3 (`channel`): canonical channel identity + cross-provider dedup, with the `Secret` redaction
-//! primitive (`secret`) and a stable FNV-1a hash (`hash`). The EPG query views (LT4) build on these.
+//! primitive (`secret`) and a stable FNV-1a hash (`hash`). LT4 (`guide`): pure EPG now/next + windowed grid
+//! query views over the LT2 programme corpus.
 
 mod channel;
 mod epg;
+mod guide;
 mod hash;
 mod m3u;
 mod secret;
 
 pub use channel::{build_channels, ChannelFeed, ChannelModel, ProviderPlaylist};
 pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Program};
+pub use guide::{grid, now_next, ChannelGrid, EpgWindow, GridProgram, NowNext};
 pub use m3u::{parse_m3u, M3uEntry, Playlist};
 pub use secret::Secret;
