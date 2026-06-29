@@ -12,10 +12,12 @@
 //! in a later phase) that maps them onto these same types, so the rest of the engine only ever sees
 //! one shape.
 
+mod content;
 mod manifest;
 mod resource;
 mod transport;
 
+pub use content::{ContentClass, ContentKind};
 pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
 };
