@@ -20,7 +20,7 @@ use vortx_protocol::Stream;
 use crate::fanout::{Aggregate, BreakerRegistry, CircuitConfig, FailedAddon};
 use crate::registry::SourceRegistry;
 use crate::request::ResourceRequest;
-use crate::transport::{run_fanout, Fetch};
+use crate::transport::{run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest};
 
 /// The result of resolving a request across the matching sources: the parsed streams (the union of every
 /// surviving source, in the fan-out's deterministic sorted-addon-id order), plus which sources survived and
@@ -61,9 +61,31 @@ pub fn resolve_streams<F: Fetch + ?Sized>(
         .map(|fr| (fr.addon_id, fr.url))
         .collect();
     let agg: Aggregate = run_fanout(fetcher, &candidates, breakers, cfg, now, budget_ms);
-    let streams = agg.items.iter().filter_map(|k| parse_stream_item(k)).collect();
+    resolved_from(agg)
+}
+
+/// Settle the host's outcomes for an already-issued [`FetchRequest`] plan into typed streams (the SETTLE half
+/// of the stateless LOAD effect model). The PLAN phase returned the requests; the host realized them through
+/// its `Fetch` boundary and now hands back the outcomes. `settle_fanout` isolates failures (a missing outcome
+/// settles as Timeout) and updates the breakers IN PLACE; the parsed merged items become the typed streams.
+/// Pure over the breaker snapshot: the engine never holds it, so the caller passes a snapshot in and reads
+/// the mutated snapshot back out (the host upserts it). The kernel itself stays stateless.
+pub fn settle_streams(
+    plan: &[FetchRequest],
+    outcomes: &[(String, FetchOutcome)],
+    breakers: &mut BreakerRegistry,
+    cfg: &CircuitConfig,
+    now: u64,
+) -> ResolvedStreams {
+    resolved_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+}
+
+/// Parse a settled [`Aggregate`] (the merged item keys + survivor/failure attribution) into typed streams.
+/// Shared by the end-to-end [`resolve_streams`] and the settle-only [`settle_streams`] so both agree on the
+/// uniform item-key parse contract.
+fn resolved_from(agg: Aggregate) -> ResolvedStreams {
     ResolvedStreams {
-        streams,
+        streams: agg.items.iter().filter_map(|k| parse_stream_item(k)).collect(),
         survivors: agg.survivors,
         failed: agg.failed,
     }
@@ -332,5 +354,35 @@ mod tests {
         assert!(out.streams.is_empty());
         assert!(out.survivors.is_empty());
         assert!(out.failed.is_empty());
+    }
+
+    #[test]
+    fn settle_streams_parses_outcomes_isolates_failures_and_updates_breakers() {
+        let plan = vec![
+            FetchRequest { addon_id: "good".into(), url: "http://g".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "poison".into(), url: "http://p".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "slow".into(), url: "http://s".into(), budget_ms: 5000 },
+        ];
+        // The host returned good + poison; "slow" is missing -> settles as Timeout.
+        let outcomes = vec![
+            (
+                "good".to_string(),
+                FetchOutcome::Ok {
+                    items: vec![stream_item("http://g/1")],
+                },
+            ),
+            ("poison".to_string(), FetchOutcome::Malformed),
+        ];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_streams(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].url.as_deref(), Some("http://g/1"));
+        assert_eq!(out.survivors, vec!["good"]);
+        // poison (malformed) + slow (missing -> timeout) are both isolated, sorted by addon id.
+        assert_eq!(out.failed.len(), 2);
+        // The breakers were updated in place: the good source reset, the two failures recorded.
+        assert_eq!(breakers.get("good").unwrap().consecutive_failures, 0);
+        assert_eq!(breakers.get("poison").unwrap().consecutive_failures, 1);
+        assert_eq!(breakers.get("slow").unwrap().consecutive_failures, 1);
     }
 }

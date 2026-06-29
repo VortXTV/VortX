@@ -1,0 +1,48 @@
+{
+  "description": "Cross-language conformance for the engine stream LOAD settle query (the stateful half of the LOAD effect model, but pure over the breaker snapshot). The host supplies the plan it executed + the per-source outcomes + the breaker snapshot + the user's debrid services; the engine settles (a planned source missing from outcomes = Timeout; failures isolated), parses the merged items into streams, marks cached from each stream's typed cachedServices, ranks with the active (owner default) profile's prefs, and returns the ranked order + the UPDATED breaker snapshot for the host to upsert. ranked is pinned as a {raw_index, score} projection (reasons are not pinned). Owner default prefs: cached_first true.",
+  "cases": [
+    {
+      "name": "settles_two_streams_isolates_a_missing_source_and_ranks_by_tier",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [
+          { "addon_id": "good", "url": "http://g", "budgetMs": 5000 },
+          { "addon_id": "slow", "url": "http://s", "budgetMs": 5000 }
+        ],
+        "outcomes": {
+          "good": { "status": "ok", "items": ["{\"url\":\"http://g/1\",\"name\":\"1080p WEB-DL\"}", "{\"url\":\"http://g/2\",\"name\":\"2160p WEB-DL\"}"] }
+        },
+        "now": 1000
+      },
+      "ranked": [
+        { "raw_index": 1, "score": 60090000 },
+        { "raw_index": 0, "score": 45090000 }
+      ],
+      "circuitSnapshot": {
+        "good": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 },
+        "slow": { "consecutive_failures": 1, "state": "closed", "opened_at": 0 }
+      }
+    },
+    {
+      "name": "a_cached_stream_floats_to_the_top_of_its_tier",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [
+          { "addon_id": "good", "url": "http://g", "budgetMs": 5000 }
+        ],
+        "outcomes": {
+          "good": { "status": "ok", "items": ["{\"url\":\"http://g/1\",\"name\":\"1080p WEB-DL\"}", "{\"url\":\"http://g/2\",\"name\":\"1080p WEB-DL\",\"behaviorHints\":{\"vortx\":{\"cachedServices\":[\"realdebrid\"]}}}"] }
+        },
+        "userServices": ["realdebrid"],
+        "now": 1000
+      },
+      "ranked": [
+        { "raw_index": 1, "score": 53090000 },
+        { "raw_index": 0, "score": 45090000 }
+      ],
+      "circuitSnapshot": {
+        "good": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 }
+      }
+    }
+  ]
+}

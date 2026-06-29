@@ -7,7 +7,7 @@
 //! streams that decision is the ranked, player-ready order from `vortx-ranking` (fixed-point, so the
 //! ranking is byte-reproducible across the Swift, Kotlin, and TS bridges that call this).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use vortx_debrid::{
@@ -20,7 +20,8 @@ use vortx_reco::{
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
 use vortx_source::{
-    plan_streams, BreakerRegistry, CircuitConfig, FetchRequest, ResourceRequest, SourceEntry,
+    cached_vector, plan_streams, settle_streams, BreakerRegistry, CircuitConfig, FetchOutcome,
+    FetchRequest, ResourceRequest, SourceEntry,
 };
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
@@ -69,6 +70,30 @@ pub enum ResolveRequest {
         now: u64,
         #[serde(default = "default_budget_ms", rename = "budgetMs")]
         budget_ms: u64,
+    },
+    /// SETTLE phase of a stream LOAD: the host realized the plan through its Fetch boundary and hands back the
+    /// per-source outcomes. The engine settles them (a missing outcome = Timeout; failures isolated), parses
+    /// the merged items into streams, and ranks them with the cached-availability vector + the active
+    /// profile's prefs. PURE over the breaker snapshot: it comes in, is updated on a local copy, and is
+    /// returned for the host to upsert; the kernel holds no breaker state.
+    SettleStreams {
+        plan: Vec<FetchRequest>,
+        /// Per-source outcomes the host fetched, keyed by addon id. A planned source missing here settles as
+        /// Timeout (partial-result settlement).
+        #[serde(default)]
+        outcomes: BTreeMap<String, FetchOutcome>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        /// The user's enabled debrid services, used to mark a stream cached (from its typed cachedServices).
+        #[serde(default, rename = "userServices")]
+        user_services: Vec<DebridService>,
+        /// Explicit ranking prefs; when omitted, the active profile's stored prefs are used.
+        #[serde(default)]
+        prefs: Option<RankingPrefs>,
     },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
@@ -131,6 +156,14 @@ pub enum ResolveResponse {
     /// The fetch plan for a stream LOAD: the deadline-stamped requests the host should perform (circuit-open
     /// sources skipped, sorted by addon id). The host fetches these, then settles via the host-side settle.
     StreamLoadPlan { requests: Vec<FetchRequest> },
+    /// The settled stream LOAD: the ranked player-ready order, plus the updated circuit-breaker snapshot the
+    /// host upserts (the engine holds no breaker state). Kept distinct from `Streams` so the host can pick up
+    /// the breaker snapshot from the LOAD path without changing the one-shot rank response shape.
+    SettledStreams {
+        ranked: Vec<RankedStream>,
+        #[serde(rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+    },
     /// The chosen subtitle track, or `null` when nothing was eligible.
     Subtitles { selected: Option<SubtitleSelection> },
     /// The catalog rows the active profile is allowed to see.
@@ -186,6 +219,41 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
                     now,
                     budget_ms,
                 ),
+            }
+        }
+        ResolveRequest::SettleStreams {
+            plan,
+            outcomes,
+            mut circuit_snapshot,
+            circuit_cfg,
+            now,
+            user_services,
+            prefs,
+        } => {
+            // Settle the host's outcomes into typed streams (failures isolated; missing -> Timeout), updating
+            // the breaker snapshot on a LOCAL copy that is returned for the host to upsert. The engine holds
+            // no breaker state, so this stays a pure (snapshot_in, outcomes) -> (ranked, snapshot_out) query.
+            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let resolved = settle_streams(
+                &plan,
+                &outcomes,
+                &mut circuit_snapshot,
+                &circuit_cfg,
+                now,
+            );
+            // Mark cached from each stream's typed cachedServices vs the user's services, and rank with the
+            // explicit prefs or the active profile's stored prefs.
+            let cached = cached_vector(&resolved.streams, &user_services);
+            let prefs = prefs.unwrap_or_else(|| {
+                engine
+                    .store()
+                    .active_profile()
+                    .map(|p| p.settings.ranking.clone())
+                    .unwrap_or_default()
+            });
+            ResolveResponse::SettledStreams {
+                ranked: rank(&resolved.streams, &prefs, &cached),
+                circuit_snapshot,
             }
         }
         ResolveRequest::Subtitles { tracks, prefs } => ResolveResponse::Subtitles {
