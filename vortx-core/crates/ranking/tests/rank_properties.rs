@@ -77,4 +77,31 @@ proptest! {
         prop_assert_eq!(a[0].score, b[0].score);
         prop_assert_eq!(a[0].tier, b[0].tier);
     }
+
+    // Seeders are a monotonic, BOUNDED within-tier bonus: a larger swarm never lowers the score, and the
+    // bonus can never reach the 15000-milli-point resolution tier step (so it cannot reorder across tiers).
+    #[test]
+    fn seeders_bonus_is_monotonic_and_bounded(lo in 0i64..2_000_000, delta in 0i64..2_000_000) {
+        let hi = lo.saturating_add(delta);
+        let mk = |seeders: i64| Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some("1080p".to_string()),
+                    tags: vec!["web-dl".to_string()],
+                    seeders: Some(seeders),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let prefs = RankingPrefs::default();
+        let base = 45_090_000i64; // 1080p web-dl, no seeders
+        let s_lo = rank(&[mk(lo)], &prefs, &[false])[0].score;
+        let s_hi = rank(&[mk(hi)], &prefs, &[false])[0].score;
+        prop_assert!(s_hi >= s_lo);                 // monotonic
+        prop_assert!(s_hi - base <= 20_000);        // bounded by the seeders cap
+        prop_assert!(s_hi - base < 15_000 * 1_000); // can never jump a resolution tier
+    }
 }

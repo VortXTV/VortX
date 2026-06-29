@@ -75,6 +75,17 @@ const PREF_RANK_WEIGHT: i64 = 100_000;
 const CACHED_BONUS: i64 = 8_000;
 const JUNK_PENALTY: i64 = -100_000;
 
+/// Swarm health (seeders) is a within-tier tiebreaker with DIMINISHING returns: each doubling of seeders
+/// adds a fixed step (integer log2 via `leading_zeros`, so byte-reproducible, no float), saturating so a
+/// healthy swarm refines ties but can never override the resolution tier or the AV-quality signals. The cap
+/// is reached around 512+ seeders. Only a typed `vortx.seeders` feeds this; a plain stream has none.
+const SEEDERS_PER_BIT_MILLI: i64 = 2_000;
+const SEEDERS_MILLI_CAP: i64 = 20_000;
+/// Distinct-source confidence (anti-fake) saturates at the hive N=3 quorum: 3+ distinct nodes vouching for
+/// an infohash is full confidence. A small within-tier nudge, below seeders and the AV-quality signals.
+const SOURCES_PER_NODE_MILLI: i64 = 2_000;
+const SOURCES_MILLI_CAP: i64 = 6_000;
+
 fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
         Resolution::P2160 => 60_000,
@@ -125,15 +136,37 @@ fn size_milli(bytes: i64) -> i64 {
     ((bytes as i128 * 150) / GIB).min(SIZE_MILLI_CAP as i128) as i64
 }
 
-/// The typed `behaviorHints.vortx` side-channel, but ONLY when it carries ranking-relevant score inputs
-/// (a `resolution` token or `tags`). A vortx object with neither (e.g. an nzb row carrying only `nzbHash`)
-/// does NOT divert ranking off the title; it falls back to the parser. This is the stream-level proxy for
-/// the source manifest's `ranking.emitsScoreInputs` capability.
+/// The typed `behaviorHints.vortx` side-channel on a stream, if any (a vortx-native source emits it; a plain
+/// Stremio stream does not). The raw accessor; the seeders/sources/size signals read from this directly.
+fn vortx(s: &Stream) -> Option<&VortxStreamHints> {
+    s.behavior_hints.as_ref().and_then(|h| h.vortx.as_ref())
+}
+
+/// The typed side-channel ONLY when it carries title-replacing score inputs (a `resolution` token or
+/// `tags`). A vortx object with neither (e.g. an nzb row carrying only `nzbHash`/`seeders`) does NOT divert
+/// the parsed resolution/source/hdr/audio off the title; those fall back to the parser (the seeders/sources
+/// bonuses still apply). This is the stream-level proxy for the manifest's `ranking.emitsScoreInputs`.
 fn typed_score_inputs(s: &Stream) -> Option<&VortxStreamHints> {
-    s.behavior_hints
-        .as_ref()
-        .and_then(|h| h.vortx.as_ref())
-        .filter(|v| v.resolution.is_some() || !v.tags.is_empty())
+    vortx(s).filter(|v| v.resolution.is_some() || !v.tags.is_empty())
+}
+
+/// Seeders -> a diminishing-returns within-tier bonus in milli-points: integer log2 (floor(log2(n))+1 via
+/// `leading_zeros`) times a fixed per-doubling step, capped. 0 or a malformed negative yields 0. No float,
+/// so it is byte-reproducible across platforms.
+fn seeders_milli(seeders: i64) -> i64 {
+    if seeders <= 0 {
+        return 0;
+    }
+    let doublings = (i64::BITS - (seeders as u64).leading_zeros()) as i64;
+    (doublings * SEEDERS_PER_BIT_MILLI).min(SEEDERS_MILLI_CAP)
+}
+
+/// Distinct-source confidence -> a small within-tier bonus in milli-points, saturating at the N=3 quorum.
+fn sources_milli(sources: i64) -> i64 {
+    if sources <= 0 {
+        return 0;
+    }
+    (sources * SOURCES_PER_NODE_MILLI).min(SOURCES_MILLI_CAP)
 }
 
 /// The ranking score-inputs for a stream: derived from the TYPED vortx fields when present (so the engine
@@ -149,10 +182,9 @@ fn parsed_for(s: &Stream, label: &str) -> ParsedData {
 /// generic `behaviorHints.videoSize`, falling back to it for a plain Stremio stream (distinct from
 /// `size_gb`, the f64 filter input, which is derived from the same precedence).
 fn size_bytes(s: &Stream) -> Option<i64> {
-    let bh = s.behavior_hints.as_ref();
-    bh.and_then(|h| h.vortx.as_ref())
+    vortx(s)
         .and_then(|v| v.size_bytes)
-        .or_else(|| bh.and_then(|h| h.video_size))
+        .or_else(|| s.behavior_hints.as_ref().and_then(|h| h.video_size))
 }
 
 fn label_of(s: &Stream) -> String {
@@ -211,11 +243,14 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
         }
 
         let mut reasons = Vec::new();
+        let typed = vortx(s);
         let score = score_stream(
             &parsed,
             prefs,
             cached.get(i).copied().unwrap_or(false),
             size_bytes(s),
+            typed.and_then(|v| v.seeders),
+            typed.and_then(|v| v.sources),
             &mut reasons,
         );
         out.push(RankedStream {
@@ -235,11 +270,14 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn score_stream(
     p: &ParsedData,
     prefs: &RankingPrefs,
     cached: bool,
     bytes: Option<i64>,
+    seeders: Option<i64>,
+    sources: Option<i64>,
     reasons: &mut Vec<String>,
 ) -> i64 {
     // Accumulated in milli-points: each human weight is added as `weight * SCALE`, the size term is
@@ -296,6 +334,20 @@ fn score_stream(
         // A small NON-NEGATIVE integer tiebreaker. A malformed negative video_size (i64) yields 0, so it
         // can never drive the score below the junk floor or let an add-on self-suppress its own streams.
         s += size_milli(b);
+    }
+    if let Some(sd) = seeders {
+        let m = seeders_milli(sd);
+        if m > 0 {
+            s += m;
+            reasons.push(format!("{sd} seeders (+{})", m / SCALE));
+        }
+    }
+    if let Some(src) = sources {
+        let m = sources_milli(src);
+        if m > 0 {
+            s += m;
+            reasons.push(format!("{src} sources (+{})", m / SCALE));
+        }
     }
 
     s
@@ -479,6 +531,58 @@ mod tests {
         });
         let ranked = rank(&[s], &prefs, &[false]);
         assert_eq!(ranked[0].tier, Tier::Fhd); // from the title, not Unknown
+    }
+
+    /// A typed stream with the given resolution token + tags + optional seeders/sources.
+    fn typed_full(resolution: &str, tags: &[&str], seeders: Option<i64>, sources: Option<i64>) -> Stream {
+        Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some(resolution.to_string()),
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    seeders,
+                    sources,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn more_seeders_breaks_a_within_tier_tie() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_full("1080p", &["web-dl"], Some(4), None),
+            typed_full("1080p", &["web-dl"], Some(1024), None),
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // 1024 seeders wins the tie
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("seeders")));
+    }
+
+    #[test]
+    fn seeders_never_jump_the_resolution_tier() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_full("720p", &[], Some(999_999), None), // huge swarm, lower tier
+            typed_full("1080p", &[], None, None),         // higher tier, no seeders
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // 1080p still wins; seeders are bounded below the tier step
+    }
+
+    #[test]
+    fn distinct_sources_confidence_saturates_at_quorum() {
+        let prefs = RankingPrefs::default();
+        // sources 3 and 5 both saturate at the N=3 quorum cap, so they tie; 1 source ranks below.
+        let three = rank(&[typed_full("1080p", &["web-dl"], None, Some(3))], &prefs, &[false])[0].score;
+        let five = rank(&[typed_full("1080p", &["web-dl"], None, Some(5))], &prefs, &[false])[0].score;
+        let one = rank(&[typed_full("1080p", &["web-dl"], None, Some(1))], &prefs, &[false])[0].score;
+        assert_eq!(three, five); // saturated at quorum
+        assert!(one < three);
     }
 
     #[test]

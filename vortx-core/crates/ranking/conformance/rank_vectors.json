@@ -60,6 +60,42 @@
         { "raw_index": 0, "score": 60440000 },
         { "raw_index": 1, "score": 45090000 }
       ]
+    },
+    {
+      "name": "seeders_break_a_within_tier_tie_with_diminishing_returns",
+      "prefs": {},
+      "streams": [
+        { "label": "1080p WEB-DL", "vortx": { "resolution": "1080p", "tags": ["web-dl"], "seeders": 1024 } },
+        { "label": "1080p WEB-DL", "vortx": { "resolution": "1080p", "tags": ["web-dl"], "seeders": 4 } }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 45110000 },
+        { "raw_index": 1, "score": 45096000 }
+      ]
+    },
+    {
+      "name": "distinct_sources_confidence_saturates_at_quorum",
+      "prefs": {},
+      "streams": [
+        { "label": "1080p WEB-DL", "vortx": { "resolution": "1080p", "tags": ["web-dl"], "sources": 5 } },
+        { "label": "1080p WEB-DL", "vortx": { "resolution": "1080p", "tags": ["web-dl"], "sources": 1 } }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 45096000 },
+        { "raw_index": 1, "score": 45092000 }
+      ]
+    },
+    {
+      "name": "seeders_never_jump_the_resolution_tier",
+      "prefs": {},
+      "streams": [
+        { "label": "720p", "vortx": { "resolution": "720p", "seeders": 99999 } },
+        { "label": "1080p", "vortx": { "resolution": "1080p" } }
+      ],
+      "expect": [
+        { "raw_index": 1, "score": 45000000 },
+        { "raw_index": 0, "score": 30020000 }
+      ]
     }
   ]
 }
