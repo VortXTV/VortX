@@ -65,7 +65,7 @@ jobs:
           rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Cache cargo
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -85,7 +85,7 @@ jobs:
 
       - name: Cache stremio-core xcframework
         id: cache-core-xcframework
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: app/Vendor/StremioXCore.xcframework
           key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
