@@ -28,7 +28,7 @@ struct iOSCollectionsHub: View {
             }
             hubSection(title: "Browse by Genre") {
                 ForEach(model.genres, id: \.self) { g in
-                    NavigationLink(value: HubTarget.genre(g)) { iOSGenreTile(genre: g) }.buttonStyle(.plain)
+                    NavigationLink(value: HubTarget.genre(g)) { iOSGenreTile(genre: g, backdrop: model.genreBackdrops[g.title]) }.buttonStyle(.plain)
                 }
             }
         }
@@ -93,14 +93,20 @@ struct iOSServiceTile: View {
 
 struct iOSGenreTile: View {
     let genre: GenreSpec
+    let backdrop: String?
     var body: some View {
-        ZStack {
+        ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [genre.tint.opacity(0.9), genre.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            VStack(spacing: 4) {
-                Image(systemName: genre.symbol).font(.system(size: 20, weight: .semibold)).foregroundStyle(.white)
-                Text(genre.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+            if let backdrop, let url = URL(string: backdrop) {
+                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
             }
-            .padding(6)
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
+            HStack(spacing: 5) {
+                Image(systemName: genre.symbol).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                Text(genre.title).font(.system(size: 12, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+            }
+            .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
+            .padding(7)
         }
         .frame(width: kiOSTileWidth, height: kiOSTileWidth * 0.62)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))

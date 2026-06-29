@@ -31,7 +31,7 @@ struct TVCollectionsHub: View {
             }
             section(title: "Browse by Genre", eyebrow: "Browse by genre") {
                 ForEach(model.genres, id: \.self) { g in
-                    NavigationLink { TVCategoryBrowse(target: .genre(g)) } label: { TVGenreTile(genre: g) }
+                    NavigationLink { TVCategoryBrowse(target: .genre(g)) } label: { TVGenreTile(genre: g, backdrop: model.genreBackdrops[g.title]) }
                         .buttonStyle(CardFocusStyle())
                 }
             }
@@ -103,16 +103,22 @@ struct TVServiceTile: View {
     }
 }
 
-/// A genre tile: an SF Symbol over a tinted surface, with the genre name.
+/// A genre tile: real representative artwork (resolved async) under a legibility scrim, with the genre's
+/// symbol + name. The tint gradient is the base and the fallback until/unless a backdrop resolves.
 struct TVGenreTile: View {
     let genre: GenreSpec
+    let backdrop: String?
     var body: some View {
-        ZStack {
+        ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [genre.tint.opacity(0.9), genre.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            VStack(spacing: Theme.Space.sm) {
-                Image(systemName: genre.symbol).font(.system(size: 34, weight: .semibold)).foregroundStyle(.white)
-                Text(genre.title).font(.system(size: 19, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+            if backdrop != nil { RemoteCover(url: backdrop) }
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: genre.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)
+                Text(genre.title).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(1)
             }
+            .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+            .padding(Theme.Space.md)
         }
         .frame(width: kHubTileWidth, height: kHubTileWidth * 0.6)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
@@ -127,6 +133,25 @@ struct RemoteLogo: View {
     var body: some View {
         Group {
             if let image { Image(uiImage: image).resizable().aspectRatio(contentMode: .fit) }
+            else { Color.clear }
+        }
+        .task(id: url) { await load() }
+    }
+    private func load() async {
+        guard let url, let u = URL(string: url) else { return }
+        var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
+        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) { image = img }
+    }
+}
+
+/// A cached remote cover image, `.fill`-scaled (for genre tiles). The host frame + clipShape clip the
+/// overflow. Same URLCache policy as `RemoteLogo`; a cancel just retries on the next appear.
+struct RemoteCover: View {
+    let url: String?
+    @State private var image: UIImage?
+    var body: some View {
+        Group {
+            if let image { Image(uiImage: image).resizable().aspectRatio(contentMode: .fill) }
             else { Color.clear }
         }
         .task(id: url) { await load() }

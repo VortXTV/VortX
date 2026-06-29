@@ -465,6 +465,25 @@ enum TMDBClient {
         return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
     }
 
+    /// A representative 16:9 backdrop for a genre tile: the most popular in-region title in that genre's
+    /// bucket (movie bucket preferred; TV when the genre is movies-only), as a w780 URL. One discover call,
+    /// fail-soft to nil. Lets the Collections-hub genre tiles show real artwork instead of a flat gradient.
+    static func genreBackdrop(movieGenre: Int?, tvGenre: Int?, keyword: Int?, lang: String?, region: String = deviceRegion) async -> String? {
+        guard let key = ApiKeys.tmdbKey() else { return nil }
+        let media = movieGenre != nil ? "movie" : "tv"
+        let genreID = movieGenre ?? tvGenre
+        var parts = ["api_key=\(key)", "sort_by=popularity.desc", "watch_region=\(region)",
+                     "language=en-US", "page=1", "include_adult=false", "vote_count.gte=150"]
+        if let genreID { parts.append("with_genres=\(genreID)") }
+        if let keyword { parts.append("with_keywords=\(keyword)") }
+        if let lang { parts.append("with_original_language=\(lang)") }
+        guard let obj = await get("/discover/\(media)?" + parts.joined(separator: "&")),
+              let results = obj["results"] as? [[String: Any]] else { return nil }
+        // First result that actually carries a backdrop; the scrim in the tile keeps the label legible.
+        let bd = results.compactMap { $0["backdrop_path"] as? String }.first
+        return bd.map { "https://image.tmdb.org/t/p/w780\($0)" }
+    }
+
     /// ISO `yyyy-MM-dd` for `daysAgo` days before now (0 = today). Bounds the Top-This-Week/Month/Year and
     /// "new"/"upcoming" date windows for the sub-catalog discover queries.
     static func isoDate(daysAgo: Int) -> String {

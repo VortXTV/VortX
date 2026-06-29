@@ -244,12 +244,16 @@ final class CollectionsHubModel: ObservableObject {
     static let shared = CollectionsHubModel()
 
     @Published private(set) var providers: [TMDBClient.ProviderTile] = []
+    /// Genre title -> representative backdrop URL, resolved + cached on the same cadence as the providers.
+    /// Empty until resolved; the genre tiles fall back to their tint gradient for any title not yet present.
+    @Published private(set) var genreBackdrops: [String: String] = [:]
 
     let discover = DiscoverList.allCases
     let genres = CollectionsHubModel.genreList
 
     private var loadedRegion: String?
     private var loadTask: Task<Void, Never>?
+    private var genreTask: Task<Void, Never>?
 
     /// True when the hub can populate (TMDB key present). The hub hides entirely without a key.
     static var isAvailable: Bool { ApiKeys.tmdbKey() != nil }
@@ -258,7 +262,8 @@ final class CollectionsHubModel: ObservableObject {
     /// exists it is shown immediately and no network call is made; otherwise it fetches and re-caches.
     /// Idempotent for a region per app run.
     func load(region: String = TMDBClient.deviceRegion) {
-        guard Self.isAvailable else { providers = []; loadedRegion = nil; return }
+        guard Self.isAvailable else { providers = []; genreBackdrops = [:]; loadedRegion = nil; return }
+        loadGenreBackdrops(region: region)   // independent cadence-cached resolve (runs even when providers are cache-fresh)
         guard loadTask == nil else { return }   // never run two fetches at once
         // Already loaded for this region AND the cache is still fresh -> nothing to do. (A stale cache for the
         // same region falls through so the cadence refresh actually fires; the old `loadedRegion != region`
@@ -282,7 +287,60 @@ final class CollectionsHubModel: ObservableObject {
 
     func clear() {
         loadTask?.cancel(); loadTask = nil
-        providers = []; loadedRegion = nil
+        genreTask?.cancel(); genreTask = nil
+        providers = []; genreBackdrops = [:]; loadedRegion = nil
+    }
+
+    // MARK: genre backdrops (cadence-cached representative artwork per genre)
+
+    /// Resolve a representative backdrop for each genre. Paints instantly from the region cache, then (if the
+    /// cache is stale) refetches all genres in small 429-safe batches and re-caches. Independent of the
+    /// provider load so a fresh provider cache never blocks the artwork refresh.
+    private func loadGenreBackdrops(region: String) {
+        if let cached = Self.cachedGenreBackdrops(region: region) { genreBackdrops = cached }
+        if Self.genreCacheIsFresh(region: region) { return }
+        guard genreTask == nil else { return }
+        genreTask = Task { [weak self] in
+            var out: [String: String] = [:]
+            let genres = CollectionsHubModel.genreList
+            let batchSize = 4   // cap concurrency: a once-daily op, kept gentle on TMDB to avoid 429s
+            var i = 0
+            while i < genres.count {
+                let slice = Array(genres[i..<min(i + batchSize, genres.count)])
+                await withTaskGroup(of: (String, String?).self) { group in
+                    for g in slice {
+                        group.addTask {
+                            (g.title, await TMDBClient.genreBackdrop(movieGenre: g.movieGenreID, tvGenre: g.tvGenreID,
+                                                                     keyword: g.keyword, lang: g.originLang, region: region))
+                        }
+                    }
+                    for await (title, url) in group { if let url { out[title] = url } }
+                }
+                if Task.isCancelled { break }
+                i += batchSize
+            }
+            guard let self, !Task.isCancelled, !out.isEmpty else { self?.genreTask = nil; return }
+            self.genreBackdrops = out          // keep the prior cache on an all-empty fetch (don't blank the tiles)
+            self.genreTask = nil
+            Self.cacheGenreBackdrops(out, region: region)
+        }
+    }
+
+    private static func genreCacheKey(_ region: String) -> String { "vortx.collections.genreBackdrops.\(region)" }
+    private static func genreCacheAtKey(_ region: String) -> String { "vortx.collections.genreBackdropsAt.\(region)" }
+
+    private static func cacheGenreBackdrops(_ map: [String: String], region: String) {
+        UserDefaults.standard.set(map, forKey: genreCacheKey(region))
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: genreCacheAtKey(region))
+    }
+    private static func cachedGenreBackdrops(region: String) -> [String: String]? {
+        let map = UserDefaults.standard.dictionary(forKey: genreCacheKey(region)) as? [String: String]
+        return (map?.isEmpty == false) ? map : nil
+    }
+    private static func genreCacheIsFresh(region: String) -> Bool {
+        let at = UserDefaults.standard.double(forKey: genreCacheAtKey(region))
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
     }
 
     // MARK: provider cache (UserDefaults, region-keyed, cadence-throttled)
