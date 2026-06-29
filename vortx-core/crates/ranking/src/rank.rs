@@ -19,7 +19,7 @@
 //! not part of the deterministic score.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::{ContentClass, ContentKind, Stream, VortxStreamHints};
+use vortx_protocol::{AudioCodec, ContentClass, ContentKind, Stream, VortxStreamHints};
 
 use crate::parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 use crate::prefs::RankingPrefs;
@@ -93,6 +93,14 @@ const SOURCES_MILLI_CAP: i64 = 6_000;
 /// (foreign-dub demotion). Unknown languages (a plain stream / empty list) are NOT penalized: fail-open.
 const LANG_MATCH: i64 = 500;
 const LANG_FOREIGN: i64 = -500;
+
+/// The AUDIO-only lossless preference: a lossless codec (FLAC/ALAC/WAV/AIFF/DSD) outranks any lossy one
+/// regardless of bitrate or size. 100 human-points sits comfortably ABOVE the within-tier tiebreaker band
+/// (size <= 12, seeders <= 20, sources <= 6 = at most ~38 points combined), so a small FLAC beats a large
+/// 320k MP3, yet two lossless files still tiebreak by those existing terms. It sits BELOW language preference
+/// (500) and the cached bonus (8000), so availability and the user's language still come first. This term
+/// fires ONLY for the Audio profile; the Video/Live paths never see it (byte-identical).
+const LOSSLESS_BONUS: i64 = 100;
 
 fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
@@ -333,8 +341,56 @@ pub fn rank_for(
         RankProfile::Video => rank(streams, prefs, cached),
         // placeholder: a live stream-health profile (no resolution tiers, bitrate/uptime first) lands in LT.
         RankProfile::Live => rank(streams, prefs, cached),
-        // placeholder: rank_audio (lossless > high-bitrate-lossy, codec/bit-depth) lands in AU.
-        RankProfile::Audio => rank(streams, prefs, cached),
+        RankProfile::Audio => rank_audio(streams, prefs, cached),
+    }
+}
+
+/// The AUDIO scoring profile: the frozen [`rank`] base plus a lossless-codec preference. Built as a pure
+/// post-pass over [`rank`] (NOT a fork of the scorer) so the shared base stays the single source of truth and
+/// the Video path is provably untouched. A surviving stream whose resolved [`AudioCodec`] is lossless gains
+/// [`LOSSLESS_BONUS`]; the list is then re-sorted with the same stable order (score desc, original index).
+/// FAIL-OPEN: an unknown / absent codec is neutral, so a plain stream is byte-identical to its [`rank`] score.
+pub fn rank_audio(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<RankedStream> {
+    let mut out = rank(streams, prefs, cached);
+    for r in &mut out {
+        if audio_codec_of(&streams[r.raw_index]).is_lossless() {
+            r.score += LOSSLESS_BONUS * SCALE;
+            r.reasons
+                .push(format!("lossless audio (+{LOSSLESS_BONUS})"));
+        }
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
+    out
+}
+
+/// Resolve a stream's audio codec for ranking. TYPED path first (the `vortx.tags` channel, scanned through
+/// [`AudioCodec::from_wire`], preferring a lossless match); only if no codec is recognized there does it fall
+/// back to parsing the stream label tokens. FAIL-OPEN: returns [`AudioCodec::Unknown`] when nothing matches.
+fn audio_codec_of(s: &Stream) -> AudioCodec {
+    let mut best = AudioCodec::Unknown;
+    if let Some(v) = vortx(s) {
+        for t in &v.tags {
+            best = merge_codec(best, t);
+        }
+    }
+    if best == AudioCodec::Unknown {
+        let label = label_of(s);
+        for tok in label.split(|c: char| !c.is_ascii_alphanumeric()) {
+            best = merge_codec(best, tok);
+        }
+    }
+    best
+}
+
+/// Fold one token into the running codec choice: ignore unrecognized tokens, take the first recognized codec,
+/// and upgrade a lossy choice to a lossless one (lossless wins) but never the reverse.
+fn merge_codec(best: AudioCodec, token: &str) -> AudioCodec {
+    let c = AudioCodec::from_wire(token);
+    match (c, best) {
+        (AudioCodec::Unknown, _) => best,
+        (_, AudioCodec::Unknown) => c,
+        _ if !best.is_lossless() && c.is_lossless() => c,
+        _ => best,
     }
 }
 
@@ -571,7 +627,7 @@ mod tests {
         assert!(ranked[0].is_dolby_vision);
         assert_eq!(ranked[0].audio, Audio::Atmos);
         assert!(!ranked[0].parsed.junk); // the "hdcam" in the title did NOT make it junk
-        // (60000 tier + 230 remux + 120 dv + 90 atmos) * 1000
+                                         // (60000 tier + 230 remux + 120 dv + 90 atmos) * 1000
         assert_eq!(ranked[0].score, 60_440_000);
     }
 
@@ -613,7 +669,12 @@ mod tests {
     }
 
     /// A typed stream with the given resolution token + tags + optional seeders/sources.
-    fn typed_full(resolution: &str, tags: &[&str], seeders: Option<i64>, sources: Option<i64>) -> Stream {
+    fn typed_full(
+        resolution: &str,
+        tags: &[&str],
+        seeders: Option<i64>,
+        sources: Option<i64>,
+    ) -> Stream {
         Stream {
             name: Some("x".to_string()),
             behavior_hints: Some(StreamBehaviorHints {
@@ -657,9 +718,24 @@ mod tests {
     fn distinct_sources_confidence_saturates_at_quorum() {
         let prefs = RankingPrefs::default();
         // sources 3 and 5 both saturate at the N=3 quorum cap, so they tie; 1 source ranks below.
-        let three = rank(&[typed_full("1080p", &["web-dl"], None, Some(3))], &prefs, &[false])[0].score;
-        let five = rank(&[typed_full("1080p", &["web-dl"], None, Some(5))], &prefs, &[false])[0].score;
-        let one = rank(&[typed_full("1080p", &["web-dl"], None, Some(1))], &prefs, &[false])[0].score;
+        let three = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(3))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
+        let five = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(5))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
+        let one = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(1))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
         assert_eq!(three, five); // saturated at quorum
         assert!(one < three);
     }
@@ -689,7 +765,10 @@ mod tests {
         let streams = [typed_langs(&["ja"]), typed_langs(&["en", "ja"])];
         let ranked = rank(&streams, &prefs, &[false, false]);
         assert_eq!(ranked[0].raw_index, 1); // the one carrying "en"
-        assert!(ranked[0].reasons.iter().any(|r| r.contains("preferred language")));
+        assert!(ranked[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("preferred language")));
         assert!(ranked[1].reasons.iter().any(|r| r.contains("foreign dub")));
     }
 
@@ -720,7 +799,10 @@ mod tests {
             ..Default::default()
         };
         let ranked = rank(&[typed_langs(&["en"])], &prefs, &[false]);
-        assert!(ranked[0].reasons.iter().any(|r| r.contains("preferred language")));
+        assert!(ranked[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("preferred language")));
     }
 
     #[test]
@@ -741,11 +823,26 @@ mod tests {
 
     #[test]
     fn profile_selection_maps_class_to_profile() {
-        assert_eq!(RankProfile::for_kind(ContentKind::Movie), RankProfile::Video);
-        assert_eq!(RankProfile::for_kind(ContentKind::Series), RankProfile::Video);
-        assert_eq!(RankProfile::for_kind(ContentKind::Unknown), RankProfile::Video);
-        assert_eq!(RankProfile::for_kind(ContentKind::Channel), RankProfile::Live);
-        assert_eq!(RankProfile::for_kind(ContentKind::Audiobook), RankProfile::Audio);
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Movie),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Series),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Unknown),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Channel),
+            RankProfile::Live
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Audiobook),
+            RankProfile::Audio
+        );
     }
 
     #[test]
@@ -765,12 +862,67 @@ mod tests {
     }
 
     #[test]
-    fn live_and_audio_currently_delegate_to_the_video_profile() {
-        // Placeholder behavior (documents the current state; updated when the live/audio profiles specialize).
+    fn live_still_delegates_to_the_video_profile() {
+        // The live profile is not specialized yet; it stays byte-identical to the frozen video ranker.
         let prefs = RankingPrefs::default();
         let streams = [stream("1080p WEB-DL"), stream("2160p WEB-DL")];
         let base = rank(&streams, &prefs, &[false, false]);
-        assert_eq!(rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]), base);
-        assert_eq!(rank_for(ContentKind::Podcast, &streams, &prefs, &[false, false]), base);
+        assert_eq!(
+            rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]),
+            base
+        );
+    }
+
+    #[test]
+    fn audio_lossless_outranks_lossy_of_equal_everything_else() {
+        let prefs = RankingPrefs::default();
+        let streams = [stream("Some Album 320 MP3"), stream("Some Album FLAC")];
+        let ranked = rank_for(ContentKind::MusicTrack, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // the FLAC floats to the top
+        assert!(ranked[0].score > ranked[1].score);
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("lossless")));
+    }
+
+    #[test]
+    fn audio_without_a_codec_signal_is_byte_identical_to_the_base_rank() {
+        // Fail-open: no recognized codec -> no bonus -> the audio profile equals the frozen rank().
+        let prefs = RankingPrefs::default();
+        let streams = [stream("Episode 12 The Interview"), stream("Episode 13")];
+        let base = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(
+            rank_for(ContentKind::Podcast, &streams, &prefs, &[false, false]),
+            base
+        );
+    }
+
+    #[test]
+    fn the_lossless_bonus_never_fires_on_the_video_profile() {
+        // A video release with a FLAC audio track in its title must NOT get the audio lossless bonus.
+        let prefs = RankingPrefs::default();
+        let streams = [stream("1080p BluRay REMUX FLAC")];
+        let base = rank(&streams, &prefs, &[false]);
+        assert_eq!(
+            rank_for(ContentKind::Movie, &streams, &prefs, &[false]),
+            base
+        );
+    }
+
+    #[test]
+    fn the_typed_tags_codec_wins_over_a_misleading_label() {
+        // The label says MP3; the typed vortx tags say flac. The typed path must win -> lossless bonus.
+        let prefs = RankingPrefs::default();
+        let s = Stream {
+            name: Some("Album 128k MP3".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    tags: vec!["flac".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ranked = rank_for(ContentKind::MusicTrack, &[s], &prefs, &[false]);
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("lossless")));
     }
 }
