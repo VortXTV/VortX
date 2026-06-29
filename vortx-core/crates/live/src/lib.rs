@@ -12,6 +12,8 @@
 //! primitive (`secret`) and a stable FNV-1a hash (`hash`). LT4 (`guide`): pure EPG now/next + windowed grid
 //! query views over the LT2 programme corpus. LT-BIND (`bind`): reconcile LT3 channel identity to the LT2 EPG
 //! channel ids (tvg-id exact, else normalized display name, else none) so a channel can fetch its programmes.
+//! LT-CATCHUP (`catchup`): the timeshift URL template engine. LT-XTREAM (`xtream`): pure Xtream Codes
+//! `player_api` + stream/timeshift URL builders, with credentials kept in a redaction-only `Secret`.
 
 mod bind;
 mod catchup;
@@ -21,6 +23,7 @@ mod guide;
 mod hash;
 mod m3u;
 mod secret;
+mod xtream;
 
 pub use bind::{bind_epg, epg_channel_id_for};
 pub use catchup::{catchup_url_for, render_catchup, CatchupCtx, CivilTime};
@@ -29,3 +32,4 @@ pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Progra
 pub use guide::{grid, now_next, ChannelGrid, EpgWindow, GridProgram, NowNext};
 pub use m3u::{parse_m3u, M3uEntry, Playlist};
 pub use secret::Secret;
+pub use xtream::{StreamKind, XtreamPortal};

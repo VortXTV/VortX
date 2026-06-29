@@ -1,0 +1,23 @@
+{
+  "description": "Cross-language conformance for the LT-XTREAM URL builders. Credentials are encodeURIComponent-encoded (RFC 3986 unreserved kept: A-Za-z0-9 - . _ ~; everything else %XX uppercase). player_api.php carries username/password + an optional action + literal-key encoded-value params. Stream URLs are {base}/{kind}/{user}/{pass}/{id}.{ext} (kind: live/movie/series). Timeshift is {base}/timeshift/{user}/{pass}/{duration_min}/{Y-m-d:H-M}/{id}.ts with the datetime from the shared LT-CATCHUP engine and duration in whole minutes. The fixed portal is base=http://host:8080, username=alice, password=p@ss/word (-> p%40ss%2Fword). A port must reproduce every URL byte-for-byte.",
+  "portal": { "base_url": "http://host:8080/", "username": "alice", "password": "p@ss/word" },
+  "player_api": [
+    { "name": "auth", "action": null, "params": [], "expect": "http://host:8080/player_api.php?username=alice&password=p%40ss%2Fword" },
+    { "name": "get_live_categories", "action": "get_live_categories", "params": [], "expect": "http://host:8080/player_api.php?username=alice&password=p%40ss%2Fword&action=get_live_categories" },
+    { "name": "get_live_streams_cat", "action": "get_live_streams", "params": [["category_id", "5"]], "expect": "http://host:8080/player_api.php?username=alice&password=p%40ss%2Fword&action=get_live_streams&category_id=5" },
+    { "name": "get_series_info", "action": "get_series_info", "params": [["series_id", "42"]], "expect": "http://host:8080/player_api.php?username=alice&password=p%40ss%2Fword&action=get_series_info&series_id=42" },
+    { "name": "get_short_epg_limited", "action": "get_short_epg", "params": [["stream_id", "123"], ["limit", "10"]], "expect": "http://host:8080/player_api.php?username=alice&password=p%40ss%2Fword&action=get_short_epg&stream_id=123&limit=10" }
+  ],
+  "streams": [
+    { "name": "live_ts", "kind": "live", "stream_id": "123", "ext": "ts", "expect": "http://host:8080/live/alice/p%40ss%2Fword/123.ts" },
+    { "name": "vod_mkv", "kind": "vod", "stream_id": "99", "ext": "mkv", "expect": "http://host:8080/movie/alice/p%40ss%2Fword/99.mkv" },
+    { "name": "series_mp4", "kind": "series", "stream_id": "7", "ext": "mp4", "expect": "http://host:8080/series/alice/p%40ss%2Fword/7.mp4" }
+  ],
+  "timeshift": {
+    "stream_id": "123",
+    "start_utc_ms": 1782741600000,
+    "stop_utc_ms": 1782745200000,
+    "now_ms": 1782745800000,
+    "expect": "http://host:8080/timeshift/alice/p%40ss%2Fword/60/2026-06-29:14-00/123.ts"
+  }
+}
