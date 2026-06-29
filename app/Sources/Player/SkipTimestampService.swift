@@ -17,9 +17,12 @@ enum SkipTimestampService {
         UserDefaults.standard.string(forKey: providerKey) ?? "both"
     }
 
-    /// All skip candidates for a title, merging the chosen crowd source(s) with AniSkip (anime).
+    /// All skip candidates for a title, merging our own skip.vortx.tv worker (primary, keyless) with
+    /// the chosen third-party crowd source(s) and AniSkip (anime). The VortX worker already aggregates
+    /// SkipDB plus capture-on-miss server-side, so it leads; the other providers stay as fallback.
     static func candidates(imdbId: String, season: Int?, episode: Int?,
                            durationSeconds: Double) async -> [SegmentCandidate] {
+        async let vortx   = vortxSkip(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
         async let aniskip = AniSkipService.candidates(metaId: imdbId, episode: episode, durationSeconds: durationSeconds)
         let crowd: [SegmentCandidate]
         switch provider {
@@ -32,7 +35,56 @@ enum SkipTimestampService {
         default: // "theintrodb"
             crowd = await theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
         }
-        return crowd + (await aniskip)
+        return (await vortx) + crowd + (await aniskip)
+    }
+
+    /// Cache key for the VortX worker, bucketed by runtime like the other providers so a different
+    /// rip of the same title re-derives clamped segments instead of reusing one file's duration.
+    static func vortxCacheKey(imdbId: String, season: Int?, episode: Int?, durationSeconds: Double) -> String {
+        let durationBucket = Int(durationSeconds / 10) * 10
+        return "vortx:\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
+    }
+
+    /// Layer 2 (primary): our self-hosted, keyless skip.vortx.tv worker. It aggregates SkipDB plus a
+    /// capture-on-miss pipeline server-side, so it is the leading source. Keyed by `imdb:tt#:S:E` for
+    /// an episode or `imdb:tt#` for a film. Fail-soft: any non-200, timeout, or parse error yields [].
+    private static func vortxSkip(imdbId: String, season: Int?, episode: Int?,
+                                  durationSeconds: Double) async -> [SegmentCandidate] {
+        guard imdbId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil else { return [] }
+        let key = vortxCacheKey(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        if let cached = await SkipTimestampStore.shared.entry(for: key) {
+            log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
+            return candidates(from: cached.spans, duration: durationSeconds, confidence: 0.95)
+        }
+
+        let lookup: String
+        if let season, let episode {
+            lookup = "imdb:\(imdbId):\(season):\(episode)"
+        } else {
+            lookup = "imdb:\(imdbId)"
+        }
+        guard var components = URLComponents(string: "https://skip.vortx.tv/skip") else { return [] }
+        components.queryItems = [URLQueryItem(name: "key", value: lookup)]
+        guard let url = components.url else { return [] }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                log.info("\(key, privacy: .public): VortX skip non-200")
+                return []
+            }
+            let media = try JSONDecoder().decode(VortXSkipResponse.self, from: data)
+            log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from VortX")
+            // A miss returns {"segments": {}} 200; store it so a missing title costs one ask per day.
+            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans, introEstimateMs: nil)
+            await SkipTimestampStore.shared.store(entry, for: key)
+            return candidates(from: media.spans, duration: durationSeconds, confidence: 0.95)
+        } catch {
+            log.info("\(key, privacy: .public): VortX skip failed, \(String(describing: error), privacy: .public)")
+            return []
+        }
     }
 
     /// Layer 2a: TheIntroDB crowd spans (any media, keyed by imdb/tmdb/tvdb id).
@@ -109,6 +161,9 @@ enum SkipTimestampService {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
+        if let apiKey = ApiKeys.skipDBKey() {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { return [] }
@@ -125,7 +180,8 @@ enum SkipTimestampService {
             log.debug("SkipDB response for \(key, privacy: .public): \(raw, privacy: .public)")
             let media = try JSONDecoder().decode(SkipDBResponse.self, from: data)
             log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from SkipDB")
-            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans)
+            let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans,
+                                                 introEstimateMs: media.intro_length_estimate_ms)
             await SkipTimestampStore.shared.store(entry, for: key)
             return candidates(from: media.spans, duration: durationSeconds)
         } catch {
@@ -154,12 +210,13 @@ enum SkipTimestampService {
         queryItem(for: metaId) != nil || AniSkipService.supports(metaId: metaId)
     }
 
-    private static func candidates(from spans: [StoredSpan], duration: Double) -> [SegmentCandidate] {
+    private static func candidates(from spans: [StoredSpan], duration: Double,
+                                   confidence: Double = 0.9) -> [SegmentCandidate] {
         spans.compactMap { span in
             guard let kind = SkipSegment.Kind(rawValue: span.kind) else { return nil }
             let start = span.startMs.map { Double($0) / 1000 } ?? 0          // null intro start = from 0
             let end = span.endMs.map { Double($0) / 1000 } ?? duration       // null credits end = to end of file
-            return SegmentCandidate(kind: kind, start: start, end: end, source: .crowdAPI, confidence: 0.9)
+            return SegmentCandidate(kind: kind, start: start, end: end, source: .crowdAPI, confidence: confidence)
         }
     }
 
@@ -184,7 +241,7 @@ enum SkipTimestampService {
     }
 
     /// SkipDB `/api/segments` shape: one object per type (or null / excluded marker).
-    /// `outro` is SkipDB's name for end-credits — mapped to the `"credits"` kind.
+    /// `outro` is SkipDB's name for end-credits, mapped to the `"credits"` kind.
     private struct SkipDBResponse: Decodable {
         struct Span: Decodable {
             let start_ms: Int?
@@ -197,10 +254,42 @@ enum SkipTimestampService {
             let preview: Span?
         }
         let segments: Segments
+        let intro_length_estimate_ms: Int?
 
         var spans: [StoredSpan] {
             func stored(_ span: Span?, kind: String) -> StoredSpan? {
-                // Excluded entries decode as Span with both fields nil; real segments have start_ms.
+                guard let s = span, s.start_ms != nil else { return nil }
+                return StoredSpan(kind: kind, startMs: s.start_ms, endMs: s.end_ms)
+            }
+            return [
+                stored(segments.intro,   kind: "intro"),
+                stored(segments.recap,   kind: "recap"),
+                stored(segments.outro,   kind: "credits"),
+                stored(segments.preview, kind: "preview"),
+            ].compactMap { $0 }
+        }
+    }
+
+    /// skip.vortx.tv `/skip` shape: `{ "segments": { "<type>": { "start_ms", "end_ms", "votes",
+    /// "source" }, ... } }`. A type may be absent and a miss returns `{ "segments": {} }`. Types are
+    /// intro / recap / outro / preview / post_credit; `outro` maps to the `"credits"` kind and
+    /// `post_credit` is dropped (no matching SkipSegment.Kind).
+    private struct VortXSkipResponse: Decodable {
+        struct Span: Decodable {
+            let start_ms: Int?
+            let end_ms: Int?
+        }
+        struct Segments: Decodable {
+            let intro:       Span?
+            let recap:       Span?
+            let outro:       Span?   // mapped to kind "credits"
+            let preview:     Span?
+            let post_credit: Span?   // no SkipSegment.Kind, dropped on read
+        }
+        let segments: Segments
+
+        var spans: [StoredSpan] {
+            func stored(_ span: Span?, kind: String) -> StoredSpan? {
                 guard let s = span, s.start_ms != nil else { return nil }
                 return StoredSpan(kind: kind, startMs: s.start_ms, endMs: s.end_ms)
             }
@@ -230,7 +319,8 @@ actor SkipTimestampStore {
     struct Entry: Codable {
         let fetchedAt: Date
         let spans: [StoredSpan]
-        static func miss() -> Entry { Entry(fetchedAt: Date(), spans: []) }
+        var introEstimateMs: Int? = nil         // intro_length_estimate_ms from SkipDB (nil = not set or no data)
+        static func miss() -> Entry { Entry(fetchedAt: Date(), spans: [], introEstimateMs: nil) }
     }
 
     private var entries: [String: Entry]?
@@ -251,6 +341,19 @@ actor SkipTimestampStore {
     func store(_ entry: Entry, for key: String) {
         loadIfNeeded()
         entries?[key] = entry
+        if let data = try? JSONEncoder().encode(entries) {
+            try? data.write(to: fileURL, options: .atomic)
+        }
+    }
+
+    func introEstimate(for key: String) -> Int? {
+        loadIfNeeded()
+        return entries?[key]?.introEstimateMs
+    }
+
+    func invalidate(for key: String) {
+        loadIfNeeded()
+        entries?[key] = nil
         if let data = try? JSONEncoder().encode(entries) {
             try? data.write(to: fileURL, options: .atomic)
         }

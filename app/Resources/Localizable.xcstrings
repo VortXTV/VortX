@@ -3,6 +3,20 @@
   "strings": {
     "@%@": {},
     "%@": {},
+    "Add a custom end time": {},
+    "Close editor": {},
+    "Close skip editor": {},
+    "Edit skip segments": {},
+    "episode end": {},
+    "Jump to end": {},
+    "Jump to start": {},
+    "Next chapter": {},
+    "Preview: plays 2s before start, jumps to end": {},
+    "Previous chapter": {},
+    "Resubmit": {},
+    "Set to playhead": {},
+    "Submitted!": {},
+    "Use episode end instead": {},
     "%@ · tap to get it": {
       "localizations": {
         "it": {

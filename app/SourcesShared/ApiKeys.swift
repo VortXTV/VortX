@@ -10,20 +10,24 @@ final class ApiKeys: ObservableObject {
     private let tmdbAccount = "vortx.apikey.tmdb"
     private let mdblistAccount = "vortx.apikey.mdblist"
     private let fanartAccount = "vortx.apikey.fanart"
+    private let skipdbAccount = "vortx.apikey.skipdb"
 
     @Published var tmdb: String { didSet { Keychain.set(tmdb.isEmpty ? nil : tmdb, for: tmdbAccount); VortXSyncManager.shared.requestSyncSoon() } }
     @Published var mdblist: String { didSet { Keychain.set(mdblist.isEmpty ? nil : mdblist, for: mdblistAccount); VortXSyncManager.shared.requestSyncSoon() } }
     @Published var fanart: String { didSet { Keychain.set(fanart.isEmpty ? nil : fanart, for: fanartAccount); VortXSyncManager.shared.requestSyncSoon() } }
+    @Published var skipdb: String { didSet { Keychain.set(skipdb.isEmpty ? nil : skipdb, for: skipdbAccount); VortXSyncManager.shared.requestSyncSoon() } }
 
     private init() {
         tmdb = Keychain.string(tmdbAccount) ?? ""
         mdblist = Keychain.string(mdblistAccount) ?? ""
         fanart = Keychain.string(fanartAccount) ?? ""
+        skipdb = Keychain.string(skipdbAccount) ?? ""
     }
 
     var hasTMDB: Bool { !tmdb.isEmpty }
     var hasMDBList: Bool { !mdblist.isEmpty }
     var hasFanart: Bool { !fanart.isEmpty }
+    var hasSkipDB: Bool { !skipdb.isEmpty }
 
     /// Read the keys off the main actor (for use inside async network code).
     nonisolated static func tmdbKey() -> String? {
@@ -34,5 +38,8 @@ final class ApiKeys: ObservableObject {
     }
     nonisolated static func fanartKey() -> String? {
         let k = Keychain.string("vortx.apikey.fanart"); return (k?.isEmpty == false) ? k : nil
+    }
+    nonisolated static func skipDBKey() -> String? {
+        let k = Keychain.string("vortx.apikey.skipdb"); return (k?.isEmpty == false) ? k : nil
     }
 }
