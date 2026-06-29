@@ -27,6 +27,9 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 - **Budget and box office on a movie's page.** A movie now shows its budget, box office, and profit under the ratings. Movies only, needs a TMDB key, and you can hide it in Settings. On Apple TV, iPhone, iPad, and Mac.
 - **Spoiler-safe episodes.** Episode thumbnails you have not watched yet are blurred so a future episode's art does not spoil you. Watched episodes stay clear; turn it off in Settings. On Apple TV, iPhone, iPad, and Mac.
 - **AirPlay from the player.** iPhone and iPad now show an AirPlay button in the player overlay, so you can start AirPlay without leaving the app.
+- **Download queue.** Downloads now run a few at a time and the rest wait in line, starting automatically as each one finishes, so queueing a season no longer hammers your connection all at once.
+- **Player haptics on iPhone and iPad** for play/pause, accepting a skip, and copying a link.
+- **Cached debrid torrents play instantly.** Add your Real-Debrid, TorBox, AllDebrid, or Premiumize key under Settings, Debrid, and a cached torrent now plays straight from your debrid account instead of starting the torrent, with more than one service checked at once.
 
 ## 0.3.8 Beta 14 - 2026-06-29 (pre-release)
 
