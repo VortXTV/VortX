@@ -75,4 +75,23 @@ proptest! {
             prop_assert!(with_tail, "tail grace must not un-finish");
         }
     }
+
+    // The min-duration guard: the tail branch fires ONLY when the unit is longer than the grace. For a unit
+    // at/below the grace length the result is the pure permille comparison (no early "finished at 0"); for a
+    // longer unit it is the original tail-OR-permille behavior (byte-identical to before the guard).
+    #[test]
+    fn tail_grace_guard_only_changes_units_at_or_below_the_grace(
+        position_ms in 0u64..10_000_000,
+        duration_ms in 1u64..10_000_000,
+        tail in 1u64..600_000,
+    ) {
+        let got = finished(position_ms, duration_ms, &FinishPolicy { finished_permille: 900, tail_grace_ms: tail });
+        let permille = old_permille(position_ms, duration_ms) >= 900;
+        if duration_ms <= tail {
+            prop_assert_eq!(got, permille); // tail disabled -> pure permille
+        } else {
+            let old_tail = position_ms.saturating_add(tail) >= duration_ms;
+            prop_assert_eq!(got, old_tail || permille); // long unit -> unchanged tail-OR-permille
+        }
+    }
 }

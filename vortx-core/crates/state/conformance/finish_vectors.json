@@ -8,6 +8,10 @@
     { "name": "audio_tail_grace_finishes_below_percent", "position_ms": 2100000, "duration_ms": 2400000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": true },
     { "name": "audio_one_ms_before_tail_not_finished", "position_ms": 2099999, "duration_ms": 2400000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false },
     { "name": "audio_percent_path_still_finishes", "position_ms": 2200000, "duration_ms": 2400000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": true },
-    { "name": "zero_duration_never_finishes", "position_ms": 1000, "duration_ms": 0, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false }
+    { "name": "zero_duration_never_finishes", "position_ms": 1000, "duration_ms": 0, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false },
+    { "name": "short_audio_not_finished_at_start", "position_ms": 0, "duration_ms": 180000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false },
+    { "name": "short_audio_one_ms_before_percent_not_finished", "position_ms": 161999, "duration_ms": 180000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false },
+    { "name": "short_audio_finishes_at_percent", "position_ms": 162000, "duration_ms": 180000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": true },
+    { "name": "audio_exactly_grace_length_uses_percent_path", "position_ms": 0, "duration_ms": 300000, "finished_permille": 900, "tail_grace_ms": 300000, "expect": false }
   ]
 }

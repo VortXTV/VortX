@@ -64,7 +64,15 @@ pub fn finished(position_ms: u64, duration_ms: u64, policy: &FinishPolicy) -> bo
     if duration_ms == 0 {
         return false;
     }
-    if policy.tail_grace_ms > 0 && position_ms.saturating_add(policy.tail_grace_ms) >= duration_ms {
+    // The tail grace only applies when the unit is LONGER than the grace itself. Otherwise a unit shorter
+    // than the grace (a sub-5-min podcast/track under the AUDIO policy) would be "finished" at ANY position,
+    // even 0, before it is played. Such a unit falls through to the permille path (finished only at the
+    // percent threshold). The guard is a strict no-op for the tail-grace-0 policies (VIDEO/SCROBBLE), and for
+    // long units (duration > grace) it leaves the existing tail behavior byte-identical.
+    if policy.tail_grace_ms > 0
+        && duration_ms > policy.tail_grace_ms
+        && position_ms.saturating_add(policy.tail_grace_ms) >= duration_ms
+    {
         return true;
     }
     let permille = (position_ms.saturating_mul(1000) / duration_ms).min(1000) as u32;
@@ -86,7 +94,13 @@ mod tests {
 
     #[test]
     fn video_policy_reduces_exactly_to_the_permille_900_comparison() {
-        for &(pos, dur) in &[(0, 600_000), (539_999, 600_000), (540_000, 600_000), (600_000, 600_000), (1, 0)] {
+        for &(pos, dur) in &[
+            (0, 600_000),
+            (539_999, 600_000),
+            (540_000, 600_000),
+            (600_000, 600_000),
+            (1, 0),
+        ] {
             assert_eq!(
                 finished(pos, dur, &FinishPolicy::VIDEO),
                 old_permille(pos, dur) >= 900,
@@ -113,7 +127,7 @@ mod tests {
         let dur = 2_400_000; // 40 min
         assert!(finished(2_100_000, dur, &FinishPolicy::AUDIO)); // 35:00, tail boundary
         assert!(!finished(2_099_999, dur, &FinishPolicy::AUDIO)); // 1ms earlier: 87.49% < 90%, outside tail
-        // And the percent path still finishes a long audiobook well before any tail.
+                                                                  // And the percent path still finishes a long audiobook well before any tail.
         assert!(finished(3_600_000, dur, &FinishPolicy::AUDIO)); // past 90%
     }
 
@@ -124,12 +138,57 @@ mod tests {
     }
 
     #[test]
+    fn a_short_audio_unit_is_not_finished_at_the_start() {
+        // A 3-minute podcast is SHORTER than the 5-min AUDIO tail grace. The tail branch must NOT fire (it
+        // would mark it finished at position 0); it falls through to the percent path.
+        let dur = 180_000; // 3 min < 300_000 grace
+        assert!(!finished(0, dur, &FinishPolicy::AUDIO)); // not finished before it is played
+        assert!(!finished(161_999, dur, &FinishPolicy::AUDIO)); // 89.99% < 90%
+        assert!(finished(162_000, dur, &FinishPolicy::AUDIO)); // 90% -> finished via permille
+    }
+
+    #[test]
+    fn a_long_audio_unit_keeps_the_tail_grace_behavior() {
+        // A 60-minute audiobook is LONGER than the grace, so the tail still applies (unchanged): stopping at
+        // 57:00 (within 5 min of the end) is finished even though it is below 90%.
+        let dur = 3_600_000; // 60 min > 300_000 grace
+        assert!(finished(3_420_000, dur, &FinishPolicy::AUDIO)); // 57:00, within tail
+        assert!(!finished(3_119_999, dur, &FinishPolicy::AUDIO)); // 1ms before the tail and below 90%
+    }
+
+    #[test]
+    fn a_unit_exactly_the_grace_length_uses_the_percent_path() {
+        // duration == tail_grace is NOT "longer than the grace", so the tail branch is skipped (boundary).
+        let dur = 300_000; // exactly the grace
+        assert!(!finished(0, dur, &FinishPolicy::AUDIO));
+        assert!(finished(270_000, dur, &FinishPolicy::AUDIO)); // 90%
+    }
+
+    #[test]
     fn for_kind_selects_audio_only_for_the_audio_class() {
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Movie), FinishPolicy::VIDEO);
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Series), FinishPolicy::VIDEO);
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Channel), FinishPolicy::VIDEO); // live -> video
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Unknown), FinishPolicy::VIDEO);
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Audiobook), FinishPolicy::AUDIO);
-        assert_eq!(FinishPolicy::for_kind(ContentKind::Podcast), FinishPolicy::AUDIO);
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Movie),
+            FinishPolicy::VIDEO
+        );
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Series),
+            FinishPolicy::VIDEO
+        );
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Channel),
+            FinishPolicy::VIDEO
+        ); // live -> video
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Unknown),
+            FinishPolicy::VIDEO
+        );
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Audiobook),
+            FinishPolicy::AUDIO
+        );
+        assert_eq!(
+            FinishPolicy::for_kind(ContentKind::Podcast),
+            FinishPolicy::AUDIO
+        );
     }
 }
