@@ -52,7 +52,10 @@ pub use manifest::{
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
 };
 pub use native::NativeVortxSource;
-pub use orchestrate::{parse_stream_item, resolve_streams, settle_streams, ResolvedStreams};
+pub use orchestrate::{
+    parse_catalog_item, parse_stream_item, resolve_streams, settle_catalog, settle_streams,
+    ResolvedCatalog, ResolvedStreams,
+};
 pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
 pub use request::{EpgWindow, ResourceKind, ResourceRequest};

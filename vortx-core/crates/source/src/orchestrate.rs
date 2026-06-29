@@ -15,7 +15,7 @@
 //! source kind, and a malformed key is dropped rather than poisoning the batch.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::Stream;
+use vortx_protocol::{MetaPreview, Stream};
 
 use crate::fanout::{Aggregate, BreakerRegistry, CircuitConfig, FailedAddon};
 use crate::registry::SourceRegistry;
@@ -86,6 +86,46 @@ pub fn settle_streams(
 fn resolved_from(agg: Aggregate) -> ResolvedStreams {
     ResolvedStreams {
         streams: agg.items.iter().filter_map(|k| parse_stream_item(k)).collect(),
+        survivors: agg.survivors,
+        failed: agg.failed,
+    }
+}
+
+/// The result of a CATALOG LOAD: the parsed catalog rows (the deterministic union of every surviving
+/// source), plus survivor/failure attribution. The catalog analogue of [`ResolvedStreams`]: the SAME LOAD
+/// effect model and fan-out machinery, only the item type differs ([`MetaPreview`] instead of [`Stream`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResolvedCatalog {
+    pub metas: Vec<MetaPreview>,
+    pub survivors: Vec<String>,
+    pub failed: Vec<FailedAddon>,
+}
+
+/// Parse one host-returned item key into a typed [`MetaPreview`] (a catalog row). Same uniform item-key
+/// contract as [`parse_stream_item`]: the host turned a 2xx catalog body into individual validated meta JSON
+/// strings, so a malformed key yields `None` (dropped), never a panic.
+pub fn parse_catalog_item(item: &str) -> Option<MetaPreview> {
+    serde_json::from_str::<MetaPreview>(item).ok()
+}
+
+/// Settle the host's outcomes for an already-issued catalog [`FetchRequest`] plan into typed catalog rows (the
+/// SETTLE half of the LOAD effect model, catalog flavor). Reuses the EXACT same [`settle_fanout`] as streams
+/// (failure isolation, missing -> Timeout, breaker update in place); only the item parse differs. Pure over
+/// the breaker snapshot: the caller passes it in and reads the mutated snapshot back out.
+pub fn settle_catalog(
+    plan: &[FetchRequest],
+    outcomes: &[(String, FetchOutcome)],
+    breakers: &mut BreakerRegistry,
+    cfg: &CircuitConfig,
+    now: u64,
+) -> ResolvedCatalog {
+    resolved_catalog_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+}
+
+/// Parse a settled [`Aggregate`] into catalog rows (the catalog twin of [`resolved_from`]).
+fn resolved_catalog_from(agg: Aggregate) -> ResolvedCatalog {
+    ResolvedCatalog {
+        metas: agg.items.iter().filter_map(|k| parse_catalog_item(k)).collect(),
         survivors: agg.survivors,
         failed: agg.failed,
     }
@@ -171,6 +211,10 @@ mod tests {
 
     fn stream_item(url: &str) -> String {
         format!(r#"{{"url":"{url}"}}"#)
+    }
+
+    fn catalog_item(id: &str, name: &str) -> String {
+        format!(r#"{{"id":"{id}","type":"movie","name":"{name}"}}"#)
     }
 
     fn req() -> ResourceRequest {
@@ -384,5 +428,35 @@ mod tests {
         assert_eq!(breakers.get("good").unwrap().consecutive_failures, 0);
         assert_eq!(breakers.get("poison").unwrap().consecutive_failures, 1);
         assert_eq!(breakers.get("slow").unwrap().consecutive_failures, 1);
+    }
+
+    #[test]
+    fn settle_catalog_parses_metas_and_isolates_failures_like_streams() {
+        // Same LOAD machinery as settle_streams; only the item type differs (MetaPreview, sorted-id merge).
+        let plan = vec![
+            FetchRequest { addon_id: "alpha".into(), url: "http://a".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "zeta".into(), url: "http://z".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "down".into(), url: "http://d".into(), budget_ms: 5000 },
+        ];
+        let outcomes = vec![
+            (
+                "alpha".to_string(),
+                FetchOutcome::Ok { items: vec![catalog_item("tt1", "A"), "not json".into()] },
+            ),
+            (
+                "zeta".to_string(),
+                FetchOutcome::Ok { items: vec![catalog_item("tt2", "Z")] },
+            ),
+            ("down".to_string(), FetchOutcome::Error),
+        ];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_catalog(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        // alpha before zeta (sorted-id merge); the bad key was dropped, the Error source isolated.
+        assert_eq!(out.metas.len(), 2);
+        assert_eq!(out.metas[0].id, "tt1");
+        assert_eq!(out.metas[1].id, "tt2");
+        assert_eq!(out.survivors, vec!["alpha", "zeta"]);
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].addon_id, "down");
     }
 }

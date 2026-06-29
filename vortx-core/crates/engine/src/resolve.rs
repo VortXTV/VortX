@@ -20,8 +20,8 @@ use vortx_reco::{
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
 use vortx_source::{
-    cached_vector, plan_streams, settle_streams, BreakerRegistry, CircuitConfig, FetchOutcome,
-    FetchRequest, ResourceRequest, SourceEntry,
+    cached_vector, plan_streams, settle_catalog, settle_streams, BreakerRegistry, CircuitConfig,
+    FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
 };
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
@@ -102,6 +102,37 @@ pub enum ResolveRequest {
         #[serde(default, rename = "contentKind", skip_serializing_if = "Option::is_none")]
         content_kind: Option<ContentKind>,
     },
+    /// PLAN phase of a CATALOG LOAD: the catalog twin of [`StreamLoad`]. Same stateless effect model and the
+    /// SAME `plan_streams` planner (it routes by the request's `ResourceKind`, so a catalog request yields
+    /// catalog fetch URLs); the engine holds no source state. The host realizes the plan, then settles it.
+    CatalogLoad {
+        req: ResourceRequest,
+        #[serde(default, rename = "registrySnapshot")]
+        registry_snapshot: Vec<SourceEntry>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default = "default_budget_ms", rename = "budgetMs")]
+        budget_ms: u64,
+    },
+    /// SETTLE phase of a CATALOG LOAD: the host hands back the per-source outcomes; the engine settles them
+    /// (missing -> Timeout, failures isolated), parses the merged items into catalog rows, and enforces the
+    /// ACTIVE profile's parental controls (a kids profile never receives an over-ceiling/unrated row, the same
+    /// gate as the one-shot `Catalog` query). PURE over the breaker snapshot (in -> updated copy -> out).
+    SettleCatalog {
+        plan: Vec<FetchRequest>,
+        #[serde(default)]
+        outcomes: BTreeMap<String, FetchOutcome>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+    },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
         tracks: Vec<SubtitleTrack>,
@@ -168,6 +199,16 @@ pub enum ResolveResponse {
     /// the breaker snapshot from the LOAD path without changing the one-shot rank response shape.
     SettledStreams {
         ranked: Vec<RankedStream>,
+        #[serde(rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+    },
+    /// The fetch plan for a catalog LOAD (circuit-open sources skipped, sorted by addon id).
+    CatalogLoadPlan { requests: Vec<FetchRequest> },
+    /// The settled catalog LOAD: the parental-filtered catalog rows + the updated breaker snapshot the host
+    /// upserts. Distinct from `Catalog` (the one-shot filter of already-fetched rows) because the LOAD path
+    /// also returns the breaker snapshot the host must persist.
+    SettledCatalog {
+        metas: Vec<MetaPreview>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
     },
@@ -269,6 +310,51 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             };
             ResolveResponse::SettledStreams {
                 ranked,
+                circuit_snapshot,
+            }
+        }
+        ResolveRequest::CatalogLoad {
+            req,
+            registry_snapshot,
+            circuit_snapshot,
+            circuit_cfg,
+            now,
+            budget_ms,
+        } => {
+            // The catalog twin of StreamLoad: the same pure stateless planner routes the catalog request over
+            // the host source snapshot (plan_streams keys off req's ResourceKind), returning the fetch plan.
+            ResolveResponse::CatalogLoadPlan {
+                requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
+            }
+        }
+        ResolveRequest::SettleCatalog {
+            plan,
+            outcomes,
+            mut circuit_snapshot,
+            circuit_cfg,
+            now,
+        } => {
+            // Settle the catalog outcomes into rows (failures isolated; missing -> Timeout) on a LOCAL breaker
+            // copy returned for the host to upsert, then enforce the active profile's parental controls (the
+            // same gate as the one-shot Catalog query) so a kids profile never receives a blocked row.
+            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let resolved = settle_catalog(&plan, &outcomes, &mut circuit_snapshot, &circuit_cfg, now);
+            let metas = match engine.store().active_profile() {
+                Some(p) => visible_catalog(&resolved.metas, &p.parental)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+                None => resolved.metas,
+            };
+            ResolveResponse::SettledCatalog {
+                metas,
                 circuit_snapshot,
             }
         }
