@@ -296,6 +296,64 @@ pub struct StreamBehaviorHints {
     pub video_size: Option<i64>,
     #[serde(default, rename = "videoHash", skip_serializing_if = "Option::is_none")]
     pub video_hash: Option<String>,
+    /// The typed VortX score-input side-channel carried by a native `vortx-source/1` stream. When present,
+    /// the engine ranks from these typed fields INSTEAD of regex-parsing the release title, which is what
+    /// makes ranking byte-reproducible across platforms. Absent on plain Stremio streams (they fall back to
+    /// the title parser). See [`VortxStreamHints`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vortx: Option<VortxStreamHints>,
+}
+
+/// The typed score-input side-channel a native `vortx-source/1` stream carries in `behaviorHints.vortx`.
+/// This is the single most important federation-alignment point: the engine reads these typed fields rather
+/// than parsing the title string for quality / seeders / pack info, so a stream ranks IDENTICALLY on every
+/// platform (Apple, Android, a Cloudflare Worker, wasm) instead of drifting on per-platform title regex.
+///
+/// Byte-frozen to the Singularity Worker's emitted shape (the `behaviorHints.vortx` object); the engine is
+/// the consumer, the Worker is the conformance target. EVERY field is optional so a partial object (an
+/// `http` stream has no `seeders`; an `nzb` stream has an `nzbHash` but no `infohash`) and a plain Stremio
+/// stream (no object at all) both degrade cleanly to the title-parse fallback rather than erroring.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VortxStreamHints {
+    /// `SourceKind` discriminator (`"torrent" | "http" | "nzb"`); selects the engine resolve path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Debrid service wire-strings this infohash is cached on (the hive cached-check result). Byte-equal to
+    /// the engine `DebridService` enum; the engine treats the infohash as instant-cached on exactly these,
+    /// with no token minted (facts-never-tokens; the user's own debrid re-confirms on play).
+    #[serde(
+        default,
+        rename = "cachedServices",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cached_services: Vec<String>,
+    /// Swarm health (torrent only); a ranking score input, NOT parsed from the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeders: Option<i64>,
+    /// Exact size in bytes; the size tiebreaker, NOT parsed from a `[2.1GB]` token in the title.
+    #[serde(default, rename = "sizeBytes", skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    /// Canonical resolution token (e.g. `"2160p"`); a ranking score input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Audio languages; feeds language preference + foreign-audio demotion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
+    /// Release tags (`hdr`/`dv`/`remux`/`cam`/...); feeds tag filters + fraud penalties + source class.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Distinct-node confidence count (anti-fake-infohash); a ranking input + `minSourceNodes` gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<i64>,
+    /// Season-pack indicator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<bool>,
+    /// Exact file index inside a pack (or the row's own file index), so no client picker is needed.
+    #[serde(default, rename = "fileIdx", skip_serializing_if = "Option::is_none")]
+    pub file_idx: Option<u32>,
+    /// NZB MD5, for the on-device usenet resolver (`nzb` kind only).
+    #[serde(default, rename = "nzbHash", skip_serializing_if = "Option::is_none")]
+    pub nzb_hash: Option<String>,
 }
 
 /// A subtitle track.

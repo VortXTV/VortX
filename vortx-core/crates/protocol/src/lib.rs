@@ -22,6 +22,7 @@ pub use manifest::{
 pub use resource::{
     AddonCatalogResponse, AddonDescriptor, CatalogResponse, MetaDetail, MetaPreview, MetaResponse,
     Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle, SubtitlesResponse, Video,
+    VortxStreamHints,
 };
 pub use transport::{base_url, ResourcePath};
 
