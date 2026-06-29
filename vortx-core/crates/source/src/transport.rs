@@ -121,6 +121,22 @@ pub fn settle_fanout(
     aggregate(&results, breakers, cfg, now)
 }
 
+/// Realize a `plan` (the `FetchRequest`s the engine emitted, e.g. an engine `StreamLoadPlan`) into the
+/// `(addon_id, outcome)` pairs that [`settle_fanout`] / the engine `SettleStreams` query consume. This is the
+/// canonical kernel-side bridge from the PLAN phase to the SETTLE phase: a synchronous host (or a test)
+/// drives the round-trip with this; a host with a real async runtime instead fetches the same requests
+/// CONCURRENTLY with a deadline and returns the same `Vec` (settlement is order-independent, so concurrency
+/// never changes the result). The async runtime (native `tokio`/`reqwest`, wasm `fetch`) lives OUTSIDE the
+/// kernel, behind [`Fetch`]; this helper keeps the kernel itself clockless and runtime-free.
+pub fn execute_plan<F: Fetch + ?Sized>(
+    plan: &[FetchRequest],
+    fetcher: &F,
+) -> Vec<(String, FetchOutcome)> {
+    plan.iter()
+        .map(|req| (req.addon_id.clone(), fetcher.fetch(req)))
+        .collect()
+}
+
 /// The full deadline-bounded fan-out, generic over a host [`Fetch`]: plan which sources to query, realize
 /// each through the host boundary, then settle into an [`Aggregate`]. Pure over the injected fetcher, so a
 /// mock proves the orchestration with no I/O. For TRUE parallelism the host instead calls [`plan_fanout`],
@@ -134,10 +150,7 @@ pub fn run_fanout<F: Fetch + ?Sized>(
     budget_ms: u64,
 ) -> Aggregate {
     let plan = plan_fanout(candidates, breakers, cfg, now, budget_ms);
-    let outcomes: Vec<(String, FetchOutcome)> = plan
-        .iter()
-        .map(|req| (req.addon_id.clone(), fetcher.fetch(req)))
-        .collect();
+    let outcomes = execute_plan(&plan, fetcher);
     settle_fanout(&plan, &outcomes, breakers, cfg, now)
 }
 
@@ -237,6 +250,28 @@ mod tests {
         assert_eq!(agg.failed[0].reason, FailureKind::Malformed);
         // The failure was recorded against the poison breaker.
         assert_eq!(breakers.get("poison").unwrap().consecutive_failures, 1);
+    }
+
+    #[test]
+    fn execute_plan_realizes_each_request_in_plan_order() {
+        // The kernel-side bridge: a plan + a host Fetch -> the (id, outcome) pairs settle consumes.
+        let fetch = MockFetch {
+            map: BTreeMap::from([("a".into(), FetchOutcome::Ok { items: vec!["s1".into()] })]),
+        };
+        let plan = vec![
+            FetchRequest { addon_id: "a".into(), url: "http://a".into(), budget_ms: 5000 },
+            FetchRequest { addon_id: "b".into(), url: "http://b".into(), budget_ms: 5000 },
+        ];
+        let outcomes = execute_plan(&plan, &fetch);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].0, "a"); // plan order preserved
+        assert_eq!(outcomes[0].1, FetchOutcome::Ok { items: vec!["s1".into()] });
+        assert_eq!(outcomes[1].0, "b");
+        assert_eq!(outcomes[1].1, FetchOutcome::Timeout); // b not mapped -> mock default
+        // execute_plan + settle_fanout composes to exactly run_fanout's result (same plan).
+        let mut b1 = BreakerRegistry::new();
+        let composed = settle_fanout(&plan, &outcomes, &mut b1, &CircuitConfig::default(), 1000);
+        assert_eq!(composed.items, vec!["s1"]);
     }
 
     #[test]

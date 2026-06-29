@@ -57,7 +57,9 @@ pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
 pub use request::{EpgWindow, ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
-pub use transport::{plan_fanout, run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest};
+pub use transport::{
+    execute_plan, plan_fanout, run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest,
+};
 pub use validate::{has_errors, validate, Issue, Severity};
 pub use verify::{manifest_signing_bytes, verify_manifest, ManifestVerification};
 
