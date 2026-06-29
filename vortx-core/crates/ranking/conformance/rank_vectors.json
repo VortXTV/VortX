@@ -96,6 +96,38 @@
         { "raw_index": 1, "score": 45000000 },
         { "raw_index": 0, "score": 30020000 }
       ]
+    },
+    {
+      "name": "preferred_language_floats_above_foreign_dub",
+      "prefs": { "preferred_languages": ["en"] },
+      "streams": [
+        { "label": "1080p", "vortx": { "resolution": "1080p", "languages": ["en", "ja"] } },
+        { "label": "1080p", "vortx": { "resolution": "1080p", "languages": ["ja"] } }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 45500000 },
+        { "raw_index": 1, "score": 44500000 }
+      ]
+    },
+    {
+      "name": "empty_preferred_languages_is_a_no_op",
+      "prefs": {},
+      "streams": [
+        { "label": "1080p", "vortx": { "resolution": "1080p", "languages": ["ja"] } }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 45000000 }
+      ]
+    },
+    {
+      "name": "unknown_languages_are_not_penalized",
+      "prefs": { "preferred_languages": ["en"] },
+      "streams": [
+        { "label": "1080p", "vortx": { "resolution": "1080p" } }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 45000000 }
+      ]
     }
   ]
 }

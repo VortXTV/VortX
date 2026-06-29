@@ -86,6 +86,14 @@ const SEEDERS_MILLI_CAP: i64 = 20_000;
 const SOURCES_PER_NODE_MILLI: i64 = 2_000;
 const SOURCES_MILLI_CAP: i64 = 6_000;
 
+/// A preferred-language match is a STRONG within-tier signal: above the AV-quality band (a profile would
+/// rather have its language than slightly better audio), but below the cached bonus and far below the
+/// resolution tier step, so it reorders same-tier ties decisively yet never overrides availability or
+/// resolution. A stream that declares languages but none preferred is demoted by the same amount
+/// (foreign-dub demotion). Unknown languages (a plain stream / empty list) are NOT penalized: fail-open.
+const LANG_MATCH: i64 = 500;
+const LANG_FOREIGN: i64 = -500;
+
 fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
         Resolution::P2160 => 60_000,
@@ -169,6 +177,21 @@ fn sources_milli(sources: i64) -> i64 {
     (sources * SOURCES_PER_NODE_MILLI).min(SOURCES_MILLI_CAP)
 }
 
+/// The language-preference contribution in human-points (the caller scales by SCALE). Fail-open: no
+/// preference set, or no known stream languages, yields 0. A preferred language present -> +LANG_MATCH; a
+/// stream that declares languages but none preferred -> LANG_FOREIGN (a demotion). Case-insensitive match.
+fn language_points(stream_langs: &[String], preferred: &[String]) -> i64 {
+    if preferred.is_empty() || stream_langs.is_empty() {
+        return 0;
+    }
+    let is_preferred = |lang: &String| preferred.iter().any(|p| p.eq_ignore_ascii_case(lang));
+    if stream_langs.iter().any(is_preferred) {
+        LANG_MATCH
+    } else {
+        LANG_FOREIGN
+    }
+}
+
 /// The ranking score-inputs for a stream: derived from the TYPED vortx fields when present (so the engine
 /// never regex-parses a fragile title and ranks identically across platforms), else parsed from the title.
 fn parsed_for(s: &Stream, label: &str) -> ParsedData {
@@ -244,6 +267,7 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
 
         let mut reasons = Vec::new();
         let typed = vortx(s);
+        let empty_langs: &[String] = &[];
         let score = score_stream(
             &parsed,
             prefs,
@@ -251,6 +275,7 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
             size_bytes(s),
             typed.and_then(|v| v.seeders),
             typed.and_then(|v| v.sources),
+            typed.map(|v| v.languages.as_slice()).unwrap_or(empty_langs),
             &mut reasons,
         );
         out.push(RankedStream {
@@ -278,6 +303,7 @@ fn score_stream(
     bytes: Option<i64>,
     seeders: Option<i64>,
     sources: Option<i64>,
+    stream_langs: &[String],
     reasons: &mut Vec<String>,
 ) -> i64 {
     // Accumulated in milli-points: each human weight is added as `weight * SCALE`, the size term is
@@ -348,6 +374,16 @@ fn score_stream(
             s += m;
             reasons.push(format!("{src} sources (+{})", m / SCALE));
         }
+    }
+    let lang = language_points(stream_langs, &prefs.preferred_languages);
+    if lang != 0 {
+        s += lang * SCALE;
+        let label = if lang > 0 {
+            "preferred language"
+        } else {
+            "foreign dub"
+        };
+        reasons.push(format!("{label} ({lang:+})"));
     }
 
     s
@@ -583,6 +619,65 @@ mod tests {
         let one = rank(&[typed_full("1080p", &["web-dl"], None, Some(1))], &prefs, &[false])[0].score;
         assert_eq!(three, five); // saturated at quorum
         assert!(one < three);
+    }
+
+    /// A typed stream carrying the given audio languages (resolution 1080p, no tags).
+    fn typed_langs(langs: &[&str]) -> Stream {
+        Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some("1080p".to_string()),
+                    languages: langs.iter().map(|l| l.to_string()).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preferred_language_floats_above_a_foreign_dub() {
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["en".to_string()],
+            ..Default::default()
+        };
+        let streams = [typed_langs(&["ja"]), typed_langs(&["en", "ja"])];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // the one carrying "en"
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("preferred language")));
+        assert!(ranked[1].reasons.iter().any(|r| r.contains("foreign dub")));
+    }
+
+    #[test]
+    fn empty_preferred_languages_is_a_no_op() {
+        let prefs = RankingPrefs::default(); // preferred_languages empty
+        let with = rank(&[typed_langs(&["ja"])], &prefs, &[false])[0].score;
+        let plain = rank(&[typed_langs(&[])], &prefs, &[false])[0].score;
+        assert_eq!(with, plain); // languages present but no preference -> no effect
+    }
+
+    #[test]
+    fn unknown_languages_are_not_penalized() {
+        // A stream that declares NO languages is never demoted (fail-open), even with a preference set.
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["en".to_string()],
+            ..Default::default()
+        };
+        let unknown = rank(&[typed_langs(&[])], &prefs, &[false])[0].score;
+        let foreign = rank(&[typed_langs(&["ja"])], &prefs, &[false])[0].score;
+        assert!(unknown > foreign); // the foreign dub is demoted; the unknown one is not
+    }
+
+    #[test]
+    fn language_match_is_case_insensitive() {
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["EN".to_string()],
+            ..Default::default()
+        };
+        let ranked = rank(&[typed_langs(&["en"])], &prefs, &[false]);
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("preferred language")));
     }
 
     #[test]

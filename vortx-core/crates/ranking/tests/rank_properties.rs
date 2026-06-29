@@ -104,4 +104,44 @@ proptest! {
         prop_assert!(s_hi - base <= 20_000);        // bounded by the seeders cap
         prop_assert!(s_hi - base < 15_000 * 1_000); // can never jump a resolution tier
     }
+
+    // The language term is bounded (|effect| <= 500 human-points = below the tier step), an empty
+    // preference is a strict no-op, and an unknown-language stream is never demoted (fail-open).
+    #[test]
+    fn language_term_is_bounded_and_failopen(
+        langs in prop::collection::vec(prop_oneof!["en", "ja", "fr", "de"], 0..3usize),
+        prefer_en in any::<bool>(),
+    ) {
+        let mk = |langs: &[String]| Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some("1080p".to_string()),
+                    languages: langs.to_vec(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let preferred: Vec<String> = if prefer_en { vec!["en".to_string()] } else { vec![] };
+        let base = 45_000_000i64; // 1080p, no tags, no langs effect
+
+        let with_pref = RankingPrefs { preferred_languages: preferred, ..Default::default() };
+        let scored = rank(&[mk(&langs)], &with_pref, &[false])[0].score;
+
+        // Bounded by +-500 human-points (well below the 15000 tier step).
+        prop_assert!((scored - base).abs() <= 500_000);
+
+        // Empty preference is a strict no-op.
+        let no_pref = RankingPrefs::default();
+        let unscored = rank(&[mk(&langs)], &no_pref, &[false])[0].score;
+        prop_assert_eq!(unscored, base);
+
+        // An unknown-language stream is never demoted even with a preference set.
+        let unknown = rank(&[mk(&[])], &RankingPrefs {
+            preferred_languages: vec!["en".to_string()], ..Default::default()
+        }, &[false])[0].score;
+        prop_assert_eq!(unknown, base);
+    }
 }
