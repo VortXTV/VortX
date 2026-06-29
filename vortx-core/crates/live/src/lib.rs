@@ -7,9 +7,11 @@
 //! playlists, XMLTV EPG, Xtream JSON) and EMITS plans/decisions (channel identity, EPG windowed-query plans,
 //! catchup URLs, failover switches); the host does all HTTP, byte transfer, and storage.
 //!
-//! LT1 (this module): the M3U/M3U8 playlist parser. Channel identity/dedup (LT3), XMLTV (LT2), and the EPG
-//! query views (LT4) build on it.
+//! LT1 (`m3u`): the M3U/M3U8 playlist parser. LT2 (`epg`): the XMLTV parser with the timezone -> UTC integer
+//! fence. Channel identity/dedup (LT3) and the EPG query views (LT4) build on these.
 
+mod epg;
 mod m3u;
 
+pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Program};
 pub use m3u::{parse_m3u, M3uEntry, Playlist};
