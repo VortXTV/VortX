@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use vortx_debrid::{
     DebridService, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
 };
+use vortx_live::{parse_xmltv, Epg};
 use vortx_protocol::{ContentKind, MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, rank_for, RankedStream, RankingPrefs};
 use vortx_reco::{
@@ -196,6 +197,39 @@ pub enum ResolveRequest {
         #[serde(default)]
         prefs: SubtitlePrefs,
     },
+    /// PLAN phase of an EPG LOAD: the FIRST live LOAD, bringing live TV onto the same effect model as VOD.
+    /// Same stateless planner (`plan_streams` routes the `Epg` request to the EPG fetch URL). The host
+    /// realizes the plan (fetching the XMLTV document), then settles it.
+    EpgLoad {
+        req: ResourceRequest,
+        #[serde(default, rename = "registrySnapshot")]
+        registry_snapshot: Vec<SourceEntry>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+        #[serde(default = "default_budget_ms", rename = "budgetMs")]
+        budget_ms: u64,
+    },
+    /// SETTLE phase of an EPG LOAD: the host hands back the per-source outcomes. UNLIKE the other LOADs, the
+    /// item key here is the WHOLE raw XMLTV document text (one item per source, not pre-split rows), so the
+    /// engine parses it with the LT2 `parse_xmltv` (whose tz -> UTC integer fence makes the result
+    /// off-by-an-hour-proof and cross-platform). EPG is singular per source, so the FIRST source whose
+    /// document parses to a non-empty `Epg` wins (first-survivor, like meta). Returns the parsed `Epg` + the
+    /// updated breaker snapshot. PURE over the breaker snapshot.
+    SettleEpg {
+        plan: Vec<FetchRequest>,
+        #[serde(default)]
+        outcomes: BTreeMap<String, FetchOutcome>,
+        #[serde(default, rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+        #[serde(default, rename = "circuitCfg")]
+        circuit_cfg: CircuitConfig,
+        #[serde(default)]
+        now: u64,
+    },
     /// Pick the best subtitle track from the host-provided candidates for the given preferences.
     Subtitles {
         tracks: Vec<SubtitleTrack>,
@@ -290,6 +324,16 @@ pub enum ResolveResponse {
     /// updated breaker snapshot the host upserts.
     SettledSubtitles {
         selected: Option<SubtitleSelection>,
+        #[serde(rename = "circuitSnapshot")]
+        circuit_snapshot: BreakerRegistry,
+    },
+    /// The fetch plan for an EPG LOAD (circuit-open sources skipped, sorted by addon id).
+    EpgLoadPlan { requests: Vec<FetchRequest> },
+    /// The settled EPG LOAD: the parsed `Epg` (channels + programmes, times in UTC ms via the LT2 fence) from
+    /// the first source whose XMLTV document parsed non-empty (or an empty `Epg`), + the updated breaker
+    /// snapshot the host upserts.
+    SettledEpg {
+        epg: Epg,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
     },
@@ -520,6 +564,49 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
                 .collect();
             ResolveResponse::SettledSubtitles {
                 selected: select_subtitle(&tracks, &prefs),
+                circuit_snapshot,
+            }
+        }
+        ResolveRequest::EpgLoad {
+            req,
+            registry_snapshot,
+            circuit_snapshot,
+            circuit_cfg,
+            now,
+            budget_ms,
+        } => {
+            // The first LIVE leg of the LOAD model: the same resource-generic planner routes the EPG request.
+            ResolveResponse::EpgLoadPlan {
+                requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
+            }
+        }
+        ResolveRequest::SettleEpg {
+            plan,
+            outcomes,
+            mut circuit_snapshot,
+            circuit_cfg,
+            now,
+        } => {
+            // Settle the raw item keys (each a whole XMLTV document) on a LOCAL breaker copy, then parse with
+            // the LT2 tz->UTC fence. EPG is singular per source: the first document that parses to a non-empty
+            // Epg wins (a blank/malformed body falls through to the next source, never panics).
+            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let resolved = settle_items(&plan, &outcomes, &mut circuit_snapshot, &circuit_cfg, now);
+            let epg = resolved
+                .items
+                .iter()
+                .map(|doc| parse_xmltv(doc))
+                .find(|e| !e.channels.is_empty() || !e.programs.is_empty())
+                .unwrap_or_default();
+            ResolveResponse::SettledEpg {
+                epg,
                 circuit_snapshot,
             }
         }

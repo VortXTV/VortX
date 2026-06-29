@@ -19,6 +19,7 @@ vortx-subtitles = { path = "../subtitles" }
 vortx-reco = { path = "../reco" }
 vortx-debrid = { path = "../debrid" }
 vortx-source = { path = "../source" }
+vortx-live = { path = "../live" }
 serde.workspace = true
 serde_json.workspace = true
 
