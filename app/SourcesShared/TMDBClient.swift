@@ -375,6 +375,135 @@ enum TMDBClient {
         }
     }
 
+    // MARK: - Collections hub (Discover cards, streaming-service tiles, sub-catalog grids)
+
+    /// A streaming/SVOD provider available in the viewer's region, for the Streaming-Services tile row.
+    /// `providerID` is the TMDB/JustWatch watch-provider id; `logoURL` is TMDB's OFFICIAL logo (so we ship
+    /// no copyrighted brand art). Built from /watch/providers, region-filtered, majors boosted to the front.
+    struct ProviderTile: Identifiable, Hashable {
+        let providerID: Int
+        let name: String
+        let logoPath: String?
+        var id: Int { providerID }
+        var logoURL: String? { logoPath.map { "https://image.tmdb.org/t/p/w154\($0)" } }
+    }
+
+    /// Curated front-of-row ordering for well-known SVOD services (lower = earlier). Anything not listed
+    /// keeps TMDB's region `display_priority` (appended after). Includes anime + K-drama services so they
+    /// surface high where the region carries them (Crunchyroll, Rakuten Viki, HiDive, Disney+ Hotstar, ...).
+    private static let featuredProviderRank: [Int: Int] = [
+        8: 0,                 // Netflix
+        9: 1, 119: 1,         // Amazon Prime Video
+        337: 2,               // Disney+
+        1899: 3, 384: 3,      // Max / HBO Max
+        15: 4,                // Hulu
+        350: 5, 2: 5,         // Apple TV+
+        531: 6,               // Paramount+
+        386: 7,               // Peacock
+        283: 8,               // Crunchyroll (anime)
+        344: 9,               // Rakuten Viki (K-drama / Asian)
+        430: 10,              // HiDive (anime)
+        122: 11,              // Disney+ Hotstar
+        43: 12,               // Starz
+        37: 13,               // Showtime
+        526: 14,              // AMC+
+        520: 15, 524: 15,     // Discovery+
+        38: 16,               // BBC iPlayer
+        73: 17,               // Tubi
+        300: 18,              // Pluto TV
+        11: 19,               // MUBI
+    ]
+
+    /// The streaming-service tiles for the region: every provider TMDB lists in-region, the majors boosted
+    /// to the front by `featuredProviderRank`, the rest by TMDB's region display_priority, capped. Merges
+    /// the movie + TV provider lists (some services are TV-only or movie-only). [] with no TMDB key.
+    static func regionProviders(region: String = deviceRegion, limit: Int = 36) async -> [ProviderTile] {
+        guard ApiKeys.tmdbKey() != nil else { return [] }
+        async let movieList = providerPage(media: "movie", region: region)
+        async let tvList = providerPage(media: "tv", region: region)
+        var byID: [Int: (tile: ProviderTile, priority: Int)] = [:]
+        for entry in (await movieList) + (await tvList) {
+            // Keep the smaller (more prominent) display_priority when a provider is in both lists.
+            if let existing = byID[entry.tile.providerID], existing.priority <= entry.priority { continue }
+            byID[entry.tile.providerID] = entry
+        }
+        let ranked = byID.values.sorted { a, b in
+            let ra = featuredProviderRank[a.tile.providerID] ?? (1000 + a.priority)
+            let rb = featuredProviderRank[b.tile.providerID] ?? (1000 + b.priority)
+            return ra != rb ? ra < rb : a.tile.name < b.tile.name
+        }
+        return Array(ranked.map(\.tile).prefix(limit))
+    }
+
+    private static func providerPage(media: String, region: String) async -> [(tile: ProviderTile, priority: Int)] {
+        guard let key = ApiKeys.tmdbKey(),
+              let obj = await get("/watch/providers/\(media)?api_key=\(key)&watch_region=\(region)"),
+              let results = obj["results"] as? [[String: Any]] else { return [] }
+        return results.compactMap { p in
+            guard let id = p["provider_id"] as? Int, let name = p["provider_name"] as? String else { return nil }
+            let priority = (p["display_priority"] as? Int) ?? 999
+            return (ProviderTile(providerID: id, name: name, logoPath: p["logo_path"] as? String), priority)
+        }
+    }
+
+    /// One TMDB LIST endpoint (trending / popular / now_playing / upcoming) resolved to engine-playable tt
+    /// previews. `path` is the endpoint without query, e.g. "/trending/movie/week", "/movie/popular",
+    /// "/movie/now_playing", "/movie/upcoming". Paginated. Fails soft to [] with no key / nothing found.
+    static func listTitles(path: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
+        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let media = path.contains("/tv") ? "tv" : "movie"
+        let full = "\(path)?api_key=\(key)&language=en-US&page=\(page)&region=\(region)"
+        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
+    }
+
+    /// One TMDB /discover page with arbitrary extra params (with_watch_providers / with_genres / sort_by /
+    /// date windows), resolved to tt previews. `extra` is a pre-built query fragment (no leading `&`). The
+    /// sub-catalog grids (Movies / Shows / New / Top week-month-year / Trending) are built from this.
+    static func discoverTitles(media: String, extra: String, region: String = deviceRegion, page: Int = 1, limit: Int = 40) async -> [MetaPreview] {
+        guard let key = ApiKeys.tmdbKey() else { return [] }
+        let full = "/discover/\(media)?api_key=\(key)&language=en-US&watch_region=\(region)&page=\(page)&\(extra)"
+        return await resolveRows(parseDiscover(await get(full), media: media), key: key, limit: limit)
+    }
+
+    /// ISO `yyyy-MM-dd` for `daysAgo` days before now (0 = today). Bounds the Top-This-Week/Month/Year and
+    /// "new"/"upcoming" date windows for the sub-catalog discover queries.
+    static func isoDate(daysAgo: Int) -> String {
+        let date = Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date()) ?? Date()
+        let fmt = DateFormatter()
+        fmt.calendar = Calendar(identifier: .iso8601)
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: date)
+    }
+
+    // MARK: - Movie financials (budget + box office)
+
+    struct Financials: Hashable { let budget: Int; let revenue: Int }
+
+    /// Movie budget + box-office (revenue) from TMDB /movie/{id}, resolved from an IMDb id. Movies only
+    /// (TMDB carries no TV financials). nil with no key / a series / nothing found / both values zero.
+    static func details(imdbID: String, type: String) async -> Financials? {
+        guard let key = ApiKeys.tmdbKey(), type != "series", imdbID.hasPrefix("tt") else { return nil }
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found["movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int,
+              let movie = await get("/movie/\(tmdbID)?api_key=\(key)") else { return nil }
+        let budget = movie["budget"] as? Int ?? 0
+        let revenue = movie["revenue"] as? Int ?? 0
+        guard budget > 0 || revenue > 0 else { return nil }
+        return Financials(budget: budget, revenue: revenue)
+    }
+
+    /// Compact USD for the detail facts row: "$1.5K" / "$200M" / "$2.4B". nil for a non-positive amount.
+    static func shortMoney(_ value: Int) -> String? {
+        guard value > 0 else { return nil }
+        let v = Double(value)
+        if v >= 1_000_000_000 { return String(format: "$%.1fB", v / 1_000_000_000) }
+        if v >= 1_000_000 { return String(format: "$%.0fM", v / 1_000_000) }
+        if v >= 1_000 { return String(format: "$%.0fK", v / 1_000) }
+        return "$\(value)"
+    }
+
     private static func get(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: host + path) else { return nil }
         do {

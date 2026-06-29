@@ -10,10 +10,8 @@ struct HomeView: View {
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
-    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails (needs a TMDB key)
-    @StateObject private var groups = HomeGroupsModel()   // nested collections: grouped Streaming / Genres / Top New / New rails
-    @AppStorage("vortx.home.showCollectionGroups") private var showCollectionGroups = true   // toggle the whole nested-collection section (mostly TMDB-backed)
+    @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
+    @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -60,6 +58,12 @@ struct HomeView: View {
                             // history inside CoreBridge.removeFromLibrary.
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
                         }
+                        // Collections hub (Discover cards, Streaming-service tiles, Genre tiles), right after
+                        // Continue Watching per the owner's row order. Each tile opens a sub-catalog browse grid.
+                        // Needs a TMDB key; hidden without one. Replaces the old flat streaming rails + nested groups.
+                        if showCollectionsHub, CollectionsHubModel.isAvailable {
+                            TVCollectionsHub(model: collectionsHub)
+                        }
                         // Local recommendations seeded from this profile's recent watch history (#0.3.9).
                         // Hidden when there's no TMDB key, no history to seed from, or no results.
                         if !topPicks.items.isEmpty {
@@ -73,25 +77,6 @@ struct HomeView: View {
                         }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
-                        }
-                        // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service
-                        // in-region, from TMDB watch providers. Discovery only; cards play through the engine
-                        // like any catalog card. Hidden with no TMDB key; each rail drops when empty in-region.
-                        // Suppressed when the nested-collection section is on, since its "Streaming" GROUP
-                        // (group 1) reproduces these exact rails — showing both would duplicate the rows.
-                        if showStreamingRails && (!showCollectionGroups || ApiKeys.tmdbKey() == nil) {
-                            ForEach(streaming.collections) { collection in
-                                StreamingRow(title: collection.title, items: collection.items, focusModel: focusModel)
-                            }
-                        }
-                        // Nested collections (grouped rails): big group headers (Streaming / Genres / Top New /
-                        // New) each over their child rails, BELOW every flat rail above. Additive + empty-state
-                        // safe — a group with no rails is never built, and the whole section needs (mostly) a
-                        // TMDB key, so with no key + no network this renders nothing and the Home is unchanged.
-                        if showCollectionGroups {
-                            ForEach(groups.groups) { group in
-                                CollectionGroupSection(group: group, focusModel: focusModel)
-                            }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
@@ -110,9 +95,8 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showStreamingRails { streaming.load() }; if showCollectionGroups { groups.load() } }
-        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
-        .onChange(of: showCollectionGroups) { show in if show { groups.load() } else { groups.clear() } }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }

@@ -18,7 +18,10 @@ struct SettingsView: View {
     @State private var langSelection: String = AppLanguage.current ?? "system"
     @State private var showLangRestart = false
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
+    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
+    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -458,9 +461,22 @@ struct SettingsView: View {
             Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow(String(localized: "Streaming-service rows"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { showStreamingRails ? "1" : "0" }, set: { showStreamingRails = ($0 == "1") }))
-            Text("Show 'what's on Netflix / Disney+ / ...' rows on Home, from TMDB watch providers. Needs a TMDB key.")
+            choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showHubHome ? "1" : "0" }, set: { showHubHome = ($0 == "1") }))
+            choiceRow(String(localized: "Collections on Discover"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showHubDiscover ? "1" : "0" }, set: { showHubDiscover = ($0 == "1") }))
+            choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
+                      selection: $hubCadence)
+            NavigationLink { TVReorderServicesView() } label: {
+                Label("Reorder streaming services", systemImage: "arrow.up.arrow.down")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("Discover cards, Streaming-service tiles, and Genre tiles high on Home and Discover; tap a tile to browse its catalogs (Movies, Shows, New, Top week/month/year, Trending). Needs a TMDB key.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Budget & box office"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showFinancials ? "1" : "0" }, set: { showFinancials = ($0 == "1") }))
+            Text("Show a movie's budget, box office, and profit on its detail page. Movies only; needs a TMDB key.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)

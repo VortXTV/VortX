@@ -53,7 +53,10 @@ struct iOSSettingsView: View {
     @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
+    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
+    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
@@ -797,8 +800,16 @@ struct iOSSettingsView: View {
             // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
             // cannot remove from Home" report).
             Toggle("Show editorial Home rows", isOn: $showCuratedRails)
-            // Browse-by-streaming-service rails (Netflix, Disney+, ...), from TMDB watch providers; needs a TMDB key.
-            Toggle("Show streaming-service rows", isOn: $showStreamingRails)
+            // Collections hub (Discover cards + Streaming-service tiles + Genre tiles) on Home / Discover; needs a TMDB key.
+            Toggle("Collections on Home", isOn: $showHubHome)
+            Toggle("Collections on Discover", isOn: $showHubDiscover)
+            Picker("Refresh collections", selection: $hubCadence) {
+                Text("Daily").tag("daily")
+                Text("Twice daily").tag("twiceDaily")
+                Text("4x daily").tag("fourTimesDaily")
+            }
+            NavigationLink("Reorder streaming services") { iOSReorderServicesView() }
+            Toggle("Budget & box office", isOn: $showFinancials)
             // Cinematic 16:9 landscape catalog cards (clean TMDB backdrops) vs the legacy portrait posters.
             Toggle("Cinematic landscape cards", isOn: $catalogPrefs.landscapeCards)
 

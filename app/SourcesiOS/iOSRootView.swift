@@ -306,11 +306,9 @@ struct iOSHomeView: View {
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
-    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails on Home (needs a TMDB key)
-    @StateObject private var groups = HomeGroupsModel()   // nested collections: grouped Streaming / Genres / Top New / New rails
-    @AppStorage("vortx.home.showCollectionGroups") private var showCollectionGroups = true   // toggle the whole nested-collection section (mostly TMDB-backed)
-    @State private var path: [FeaturedHeroItem] = []
+    @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton)
+    @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    @State private var path = NavigationPath()
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
     #if os(macOS)
@@ -349,12 +347,6 @@ struct iOSHomeView: View {
         if showCuratedRails {
             out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         }
-        if showStreamingRails {
-            out += streaming.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
-        }
-        if showCollectionGroups {
-            out += groups.groups.flatMap { $0.rails }.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
-        }
         return out
     }
 
@@ -367,14 +359,6 @@ struct iOSHomeView: View {
         for row in core.boardRows where !row.items.isEmpty { rails.append((row.title, row.items.map(\.id))) }
         if showCuratedRails {
             for c in curated.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
-        }
-        if showStreamingRails && !showCollectionGroups {
-            for c in streaming.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
-        }
-        if showCollectionGroups {
-            for g in groups.groups {
-                for c in g.rails where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
-            }
         }
         return rails
     }
@@ -409,8 +393,6 @@ struct iOSHomeView: View {
     private var macRailSeedKey: Int {
         continueWatchingItems.count + topPicks.items.count + core.boardRows.count
             + (showCuratedRails ? curated.collections.count : 0)
-            + (showStreamingRails ? streaming.collections.count : 0)
-            + (showCollectionGroups ? groups.groups.reduce(0) { $0 + $1.rails.count } : 0)
     }
 
     /// Seed keyboard focus onto the first card once the rails exist, so a card is the first responder and the
@@ -463,6 +445,12 @@ struct iOSHomeView: View {
                         homeRail(PosterRail(title: "Continue Watching", items: continueWatchingItems,
                                             onTap: handleContinueWatchingTap, menu: .continueWatching,
                                             onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
+                    }
+                    // Collections hub (Discover cards, Streaming-service tiles, Genre tiles), right after
+                    // Continue Watching per the owner's row order. Each tile pushes a sub-catalog browse grid.
+                    // Needs a TMDB key; hidden without one. Replaces the old flat streaming rails + nested groups.
+                    if showCollectionsHub, CollectionsHubModel.isAvailable {
+                        iOSCollectionsHub(model: collectionsHub)
                     }
                     // Local recommendations seeded from this profile's recent watch history (#0.3.9).
                     // Hidden when there's no TMDB key, no history to seed from, or no results.
@@ -521,38 +509,6 @@ struct iOSHomeView: View {
                                                              poster: $0.poster, progress: 0)
                                                 },
                                                 onTap: handleTap))
-                        }
-                    }
-                    // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service in the
-                    // viewer's region, from TMDB watch providers. Discovery only - cards play through the engine
-                    // like any other. Each rail fails soft / drops when empty; the whole section needs a TMDB key.
-                    // Suppressed when the nested-collection section is on, since its "Streaming" GROUP reproduces
-                    // these exact rails (group 1) — showing both would duplicate the rows and their focus keys.
-                    if showStreamingRails && (!showCollectionGroups || ApiKeys.tmdbKey() == nil) {
-                        ForEach(streaming.collections) { collection in
-                            homeRail(PosterRail(title: collection.title,
-                                                items: collection.items.map {
-                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                             poster: $0.poster, progress: 0)
-                                                },
-                                                onTap: handleTap))
-                        }
-                    }
-                    // Nested collections (grouped rails): a big group header per group (Streaming / Genres /
-                    // Top New / New) over its child rails, BELOW every flat rail above. Additive + empty-state
-                    // safe — a group with no rails is never built; the section is mostly TMDB-backed, so with no
-                    // key + no network it renders nothing and the Home is unchanged.
-                    if showCollectionGroups {
-                        ForEach(groups.groups) { group in
-                            iOSGroupHeader(eyebrow: group.eyebrow, title: group.title)
-                            ForEach(group.rails) { rail in
-                                homeRail(PosterRail(title: rail.title,
-                                                    items: rail.items.map {
-                                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                                 poster: $0.poster, progress: 0)
-                                                    },
-                                                    onTap: handleTap))
-                            }
                         }
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
@@ -614,6 +570,9 @@ struct iOSHomeView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            .navigationDestination(for: HubTarget.self) { target in
+                iOSCategoryBrowse(target: target, path: $path)
+            }
             .iOSPlayerCover($player, account: account, core: core)
         }
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
@@ -631,8 +590,7 @@ struct iOSHomeView: View {
             // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
             // already loaded or in flight, and retries on the next appearance if the first fetch failed.
             if showCuratedRails { curated.load() }
-            if showStreamingRails { streaming.load() }
-            if showCollectionGroups { groups.load() }
+            if showCollectionsHub { collectionsHub.load() }
         }
         .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks(); refreshReleaseCalendar() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
@@ -642,8 +600,7 @@ struct iOSHomeView: View {
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
-        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
-        .onChange(of: showCollectionGroups) { show in if show { groups.load() } else { groups.clear() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -1228,7 +1185,9 @@ struct iOSDiscoverView: View {
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
-    @State private var path: [FeaturedHeroItem] = []
+    @ObservedObject private var collectionsHub = CollectionsHubModel.shared
+    @AppStorage("vortx.discover.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Discover (needs a TMDB key)
+    @State private var path = NavigationPath()
 
     /// The hero pool: the first few items of the currently selected catalog. Catalog metas carry their
     /// own `background` + preview fields, so the hero is rich immediately and enriches for logo/trailer.
@@ -1247,6 +1206,9 @@ struct iOSDiscoverView: View {
                 // on the cross axis — it always takes the full viewport width — so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
                 LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                    if showCollectionsHub, CollectionsHubModel.isAvailable {
+                        iOSCollectionsHub(model: collectionsHub)
+                    }
                     if let discover = core.discover {
                         // Hero is an ambient billboard scroll-header above the chips + grid, shown once
                         // a catalog has loaded; its Play / Trailer buttons stay tappable. It fades
@@ -1299,12 +1261,17 @@ struct iOSDiscoverView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            .navigationDestination(for: HubTarget.self) { target in
+                iOSCategoryBrowse(target: target, path: $path)
+            }
             .onAppear { if core.discover == nil { core.loadDiscover() } }
         }
         .onAppear {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            if showCollectionsHub { collectionsHub.load() }
         }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
         // The grid changes whenever a different type/catalog/genre is selected, which bumps revision —
         // reseed so the hero pool tracks the visible catalog.
         .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion) }
@@ -1937,7 +1904,7 @@ private enum OpenLinkMagnet {
 /// row width that gives even, balanced columns — a `.leading`-aligned adaptive grid bunched cards to
 /// the left and left a ragged right gutter, which read as "left-aligned". Centering the columns and
 /// the trailing remainder keeps the grid even across the width at every breakpoint (iPhone → Mac).
-private struct PosterGrid: View {
+struct PosterGrid: View {
     let items: [RailItem]
     let onTap: (RailItem) -> Void
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces

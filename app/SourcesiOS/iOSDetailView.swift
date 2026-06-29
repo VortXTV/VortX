@@ -191,6 +191,8 @@ struct iOSDetailView: View {
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
+    @State private var financials: TMDBClient.Financials?
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true   // budget + box office on movie detail (movies only, needs a TMDB key)
     /// #37: a trailer id fetched from Cinemeta when the engine's detail meta carries none. Some catalog
     /// add-ons (e.g. a TMDB catalog) return a meta WITHOUT trailerStreams, so the in-hero trailer never
     /// mounted on the detail page even though the Home hero (which enriches via Cinemeta) had one. This
@@ -305,7 +307,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); resolveTrailerIfNeeded(m) }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -320,7 +322,7 @@ struct iOSDetailView: View {
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
             resolvedTrailerID = nil   // new title: drop the previous fallback before re-resolving
-            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); resolveTrailerIfNeeded(m) }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -460,6 +462,7 @@ struct iOSDetailView: View {
                     titleOrLogo
                     metaRow
                     ratingsRow
+                    financialsRow
                 }
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
@@ -1006,6 +1009,39 @@ struct iOSDetailView: View {
         if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
         if let v = r.tmdb { parts.append("TMDB \(v)%") }
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
+    }
+
+    /// Fetch the movie budget + box office (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadFinancials() {
+        guard showFinancials, type != "series", let imdb = ratingsImdbID, financials == nil else { return }
+        Task {
+            let f = await TMDBClient.details(imdbID: imdb, type: type)
+            await MainActor.run { financials = f }
+        }
+    }
+
+    /// Movie budget + box office (+ profit multiple), a fact line under the ratings. Opt-out via the
+    /// "Show budget & box office" setting; movies-only, hidden when TMDB has no figures.
+    @ViewBuilder private var financialsRow: some View {
+        if showFinancials, type != "series", let f = financials {
+            let text = Self.financialsText(f)
+            if !text.isEmpty {
+                Text(text)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// "Budget $200M  ·  Box Office $1.4B  ·  Profit 7.0x" - both values (Arvio shows budget only) plus a profit multiple.
+    private static func financialsText(_ f: TMDBClient.Financials) -> String {
+        var parts: [String] = []
+        if let b = TMDBClient.shortMoney(f.budget) { parts.append("Budget \(b)") }
+        if let r = TMDBClient.shortMoney(f.revenue) { parts.append("Box Office \(r)") }
+        if f.budget > 0, f.revenue > 0 { parts.append(String(format: "Profit %.1fx", Double(f.revenue) / Double(f.budget))) }
+        return parts.joined(separator: "  ·  ")
     }
 
     /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.

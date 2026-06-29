@@ -19,6 +19,8 @@ struct DetailView: View {
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
+    @State private var financials: TMDBClient.Financials?
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true   // budget + box office on movie detail (movies only, needs a TMDB key)
 
     var body: some View {
         Group {
@@ -62,7 +64,7 @@ struct DetailView: View {
                 core.loadMeta(type: type, id: id)
             }
             captureHero()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials() }
         }
         .onDisappear {
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
@@ -73,7 +75,7 @@ struct DetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials() }
         }
     }
 
@@ -91,6 +93,15 @@ struct DetailView: View {
         Task {
             let r = await MDBListClient.ratings(imdbID: imdb, type: type)
             await MainActor.run { mdbRatings = r }
+        }
+    }
+
+    /// Fetch the movie budget + box office (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadFinancials() {
+        guard showFinancials, type != "series", let imdb = ratingsImdbID, financials == nil else { return }
+        Task {
+            let f = await TMDBClient.details(imdbID: imdb, type: type)
+            await MainActor.run { financials = f }
         }
     }
 
@@ -238,6 +249,7 @@ struct DetailView: View {
                             titleOrLogo(m)
                             metaRow(m)
                             ratingsRow()
+                            financialsRow()
                             if let d = m.description, !d.isEmpty {
                                 Text(d)
                                     .font(Theme.Typography.body)
@@ -418,6 +430,7 @@ struct DetailView: View {
                     .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                 metaRow(m)
                 ratingsRow()
+                financialsRow()
                 if let d = m.description, !d.isEmpty {
                     Text(d)
                         .font(Theme.Typography.body)
@@ -546,6 +559,26 @@ struct DetailView: View {
         if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
         if let v = r.tmdb { parts.append("TMDB \(v)%") }
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
+    }
+
+    /// Movie budget + box office (+ profit multiple), a third fact line under the ratings. Opt-out via the
+    /// "Show budget & box office" setting; movies-only and hidden when TMDB has no figures.
+    @ViewBuilder private func financialsRow() -> some View {
+        if showFinancials, type != "series", let f = financials {
+            let text = Self.financialsText(f)
+            if !text.isEmpty {
+                Text(text).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
+        }
+    }
+
+    /// "Budget $200M  ·  Box Office $1.4B  ·  Profit 7.0x" - both values (Arvio shows budget only) plus a profit multiple.
+    private static func financialsText(_ f: TMDBClient.Financials) -> String {
+        var parts: [String] = []
+        if let b = TMDBClient.shortMoney(f.budget) { parts.append("Budget \(b)") }
+        if let r = TMDBClient.shortMoney(f.revenue) { parts.append("Box Office \(r)") }
+        if f.budget > 0, f.revenue > 0 { parts.append(String(format: "Profit %.1fx", Double(f.revenue) / Double(f.budget))) }
+        return parts.joined(separator: "  ·  ")
     }
 
     /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
