@@ -20,6 +20,7 @@ mod exit;
 mod fanout;
 mod identity;
 mod manifest;
+mod native;
 mod orchestrate;
 mod pagination;
 mod registry;
@@ -27,6 +28,7 @@ mod request;
 mod source;
 mod transport;
 mod validate;
+mod verify;
 
 pub use adapters::{NuvioProviderSource, StremioAddonSource};
 pub use canonical::canonicalize;
@@ -45,6 +47,7 @@ pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
 };
+pub use native::NativeVortxSource;
 pub use orchestrate::{parse_stream_item, resolve_streams, ResolvedStreams};
 pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
@@ -52,6 +55,7 @@ pub use request::{ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
 pub use transport::{plan_fanout, run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest};
 pub use validate::{has_errors, validate, Issue, Severity};
+pub use verify::{manifest_signing_bytes, verify_manifest, ManifestVerification};
 
 /// Errors a [`Source`] can return. `resolve` MUST NOT panic; it returns one of these (the orchestrator
 /// treats any error as an empty result so one bad source never poisons a fan-out).
