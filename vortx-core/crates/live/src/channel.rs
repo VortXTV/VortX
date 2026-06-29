@@ -295,8 +295,9 @@ fn split_list(s: &str) -> Vec<String> {
 }
 
 /// Normalize a tvg-id into a stable identity token (trim + ASCII lowercase, structure preserved); `None`
-/// when empty so a blank `tvg-id=""` does not become a signal.
-fn norm_tvg(raw: Option<&str>) -> Option<String> {
+/// when empty so a blank `tvg-id=""` does not become a signal. `pub(crate)` so EPG binding (LT-BIND) reuses
+/// the EXACT same tvg normalization that produced the `t:<tvg-id>` channel id.
+pub(crate) fn norm_tvg(raw: Option<&str>) -> Option<String> {
     let t = raw?.trim();
     if t.is_empty() {
         None
@@ -306,8 +307,9 @@ fn norm_tvg(raw: Option<&str>) -> Option<String> {
 }
 
 /// Normalize a display name to an identity key: ASCII alphanumerics only, lowercased (mirrors the source
-/// crate's title dedup), so "CNN HD" / "cnn-hd" fold together but distinct names stay distinct.
-fn normalize_name(s: &str) -> String {
+/// crate's title dedup), so "CNN HD" / "cnn-hd" fold together but distinct names stay distinct. `pub(crate)`
+/// so EPG binding (LT-BIND) matches display names with the EXACT same normalization used for channel identity.
+pub(crate) fn normalize_name(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
