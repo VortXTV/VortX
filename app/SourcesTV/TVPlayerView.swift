@@ -640,7 +640,7 @@ struct TVPlayerView: View {
                 Spacer(minLength: Theme.Space.lg)
                 VStack(alignment: .trailing, spacing: 6) {
                     if !curTitle.isEmpty {
-                        Text(curTitle).font(Theme.Typography.sectionTitle)
+                        Text(displayTitle).font(Theme.Typography.sectionTitle)
                             .foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
                     }
                     if !metadataLine.isEmpty {
@@ -1835,6 +1835,28 @@ struct TVPlayerView: View {
     private var episodeIndex: Int? { allEpisodes.firstIndex { $0.id == curMeta?.videoId } }
     private var hasNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodes.count } ?? false }
     private var hasPrevEpisode: Bool { (episodeIndex ?? 0) > 0 }
+
+    /// The `CoreVideo` for the episode currently playing, resolved from the loaded episode list.
+    /// Matches on the engine video id first (canonical), falling back to season+episode for direct
+    /// resumes whose `curMeta.videoId` predates the freshly loaded list. Nil for movies / live.
+    private var currentEpisodeVideo: CoreVideo? {
+        guard let m = curMeta, m.type == "series" else { return nil }
+        if let v = allEpisodes.first(where: { $0.id == m.videoId }) { return v }
+        guard let s = m.season, let e = m.episode else { return nil }
+        return allEpisodes.first { $0.season == s && $0.episode == e }
+    }
+
+    /// Top-right label text. Appends the episode title to the launch title when a *distinct* one
+    /// is known (the model's `episodeTitle` falls back to a generic "Episode N", which we suppress
+    /// to avoid noise). `play(episode:)` already bakes the title into `curTitle`, so guard against
+    /// duplicating it there. Movies / live / title-less episodes show `curTitle` unchanged.
+    private var displayTitle: String {
+        guard let v = currentEpisodeVideo,
+              let t = v.title, !t.isEmpty,           // a real episode title, not the "Episode N" fallback
+              !curTitle.contains(t)                  // don't double-append (play(episode:) already added it)
+        else { return curTitle }
+        return "\(curTitle) · \(t)"
+    }
 
     private func playNext() { if let i = episodeIndex, i + 1 < allEpisodes.count { play(episode: allEpisodes[i + 1]) } }
     private func playPrevious() { if let i = episodeIndex, i > 0 { play(episode: allEpisodes[i - 1]) } }
