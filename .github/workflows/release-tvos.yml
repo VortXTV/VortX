@@ -40,12 +40,32 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - name: Select the newest Xcode on the runner
         run: |
-          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
-          echo "Selecting $XCODE"
+          # Pick the newest Xcode whose toolchain ACTUALLY WORKS, then resolve it to its REAL path. A
+          # rotated runner image ships a newest-by-version entry (e.g. Xcode_26.3.0.app) that is a SYMLINK
+          # to a real bundle. `xcodebuild -version` works through the symlink at selection time, but the
+          # disk-free cleanup below then deletes the symlink's real TARGET (it only spared the symlink path
+          # by name), leaving Contents/Developer dangling, so the build dies with "missing DEVELOPER_DIR
+          # path" (the Beta-14 failure: same workflow passed on a runner with a real Xcode_26.6 and failed
+          # on one where 26.3.0 was a symlink). Fix: resolve the chosen app to its canonical directory and
+          # pin THAT, so DEVELOPER_DIR points at the real bundle and the cleanup compares real paths.
+          XCODE=""
+          for c in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -Vr); do
+            dev="$c/Contents/Developer"
+            xb="$dev/usr/bin/xcodebuild"
+            if [ -d "$dev" ] && [ -x "$xb" ] && DEVELOPER_DIR="$dev" "$xb" -version >/dev/null 2>&1; then
+              XCODE="$c"; break
+            fi
+            echo "Skipping $c (no working toolchain at $dev)"
+          done
+          if [ -z "$XCODE" ]; then XCODE="$(dirname "$(dirname "$(xcode-select -p)")")"; fi
+          # Canonicalize: if $XCODE is a symlink, follow it to the real .app so the cleanup can't orphan it.
+          XCODE_REAL="$(cd "$XCODE" && pwd -P)"
+          echo "Selected Xcode: $XCODE -> $XCODE_REAL ($("$XCODE_REAL/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1))"
+          XCODE="$XCODE_REAL"
           sudo xcode-select -s "$XCODE"
           # Pin it for EVERY later step via DEVELOPER_DIR (xcodebuild honors it over the global
           # xcode-select state), so a runner-image default flip or the disk-free cleanup can never
@@ -72,9 +92,15 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
           sudo rm -rf ~/Library/Developer/CoreSimulator/* || true
           sudo rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
-          # Keep the Xcode selected above ($SELECTED_XCODE from GITHUB_ENV); never delete the active one
-          # by re-deriving its path (the brittle string-compare that deleted it on build 126).
-          for x in /Applications/Xcode_*.app; do [ "$x" = "$SELECTED_XCODE" ] || sudo rm -rf "$x"; done
+          # Keep the Xcode selected above ($SELECTED_XCODE, already canonicalized to its real path);
+          # never delete the active one by re-deriving its path (the brittle string-compare that deleted
+          # it on build 126). Compare REAL paths so a leftover symlink-Xcode and the real bundle it points
+          # to are both spared: deleting the symlink's target (which is $SELECTED_XCODE) was the Beta-14
+          # "missing DEVELOPER_DIR path" failure. skip the entry whenever its resolved path matches.
+          for x in /Applications/Xcode_*.app; do
+            xr="$(cd "$x" 2>/dev/null && pwd -P || echo "$x")"
+            [ "$xr" = "$SELECTED_XCODE" ] || sudo rm -rf "$x"
+          done
           echo "After:"; df -h /
 
       - name: Install XcodeGen
@@ -86,7 +112,7 @@ jobs:
           rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -106,7 +132,7 @@ jobs:
 
       - name: Cache stremio-core xcframework
         id: cache-core-xcframework
-        uses: actions/cache@v6
+        uses: actions/cache@v5
         with:
           path: app/Vendor/StremioXCore.xcframework
           key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
