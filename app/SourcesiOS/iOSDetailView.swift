@@ -456,7 +456,10 @@ struct iOSDetailView: View {
     private var backdrop: some View {
         AsyncImage(url: URL(string: meta?.background ?? meta?.poster ?? "")) { phase in
             switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+            // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
+            // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
+            // it to black bars (the "shows all have cut off hero image" report), so series fit instead.
+            case .success(let img): img.resizable().aspectRatio(contentMode: type == "series" ? .fit : .fill)
             default: Theme.Palette.surface1
             }
         }

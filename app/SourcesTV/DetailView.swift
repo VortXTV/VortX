@@ -397,7 +397,10 @@ struct DetailView: View {
         // the hero region fills a tall top band proportioned like the movie page hero. The episode list
         // (CoreSeasonedEpisodes) still renders BELOW it in the seriesPage scroll, unchanged.
         ZStack(alignment: .bottomLeading) {
-            FullBleedBackdrop(url: m.background ?? m.poster)
+            // For a SERIES the engine often has no landscape `background` and falls back to the portrait
+            // poster, which .fill would crop in this wide hero band (the "cut off hero"). Series render the
+            // backdrop with .fit (no crop); movies keep .fill since they carry a 16:9 background.
+            FullBleedBackdrop(url: m.background ?? m.poster, contentMode: m.type == "series" ? .fit : .fill)
             // #44: the muted, looping trailer fades in OVER the still hero art, full-bleed behind the title.
             // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
             heroTrailerLayer(m).ignoresSafeArea()
@@ -872,6 +875,10 @@ struct CoreEpisodeStreams: View {
 /// while the image stays vivid up top. Content scrolls over it.
 struct FullBleedBackdrop: View {
     let url: String?
+    // Series often have no landscape `background` and fall back to the PORTRAIT poster: .fill would crop a
+    // tall image inside the wide hero band, so the series hero passes .fit. Defaults to .fill (movies + all
+    // other call sites have a 16:9 backdrop and want it edge-to-edge), keeping those paths unchanged.
+    var contentMode: ContentMode = .fill
     @EnvironmentObject private var theme: ThemeManager
 
     var body: some View {
@@ -879,7 +886,7 @@ struct FullBleedBackdrop: View {
             .overlay {
                 AsyncImage(url: URL(string: url ?? "")) { phase in
                     switch phase {
-                    case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+                    case .success(let img): img.resizable().aspectRatio(contentMode: contentMode)
                     default: Theme.Palette.surface1
                     }
                 }
