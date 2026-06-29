@@ -8,10 +8,16 @@
 //! catchup URLs, failover switches); the host does all HTTP, byte transfer, and storage.
 //!
 //! LT1 (`m3u`): the M3U/M3U8 playlist parser. LT2 (`epg`): the XMLTV parser with the timezone -> UTC integer
-//! fence. Channel identity/dedup (LT3) and the EPG query views (LT4) build on these.
+//! fence. LT3 (`channel`): canonical channel identity + cross-provider dedup, with the `Secret` redaction
+//! primitive (`secret`) and a stable FNV-1a hash (`hash`). The EPG query views (LT4) build on these.
 
+mod channel;
 mod epg;
+mod hash;
 mod m3u;
+mod secret;
 
+pub use channel::{build_channels, ChannelFeed, ChannelModel, ProviderPlaylist};
 pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Program};
 pub use m3u::{parse_m3u, M3uEntry, Playlist};
+pub use secret::Secret;

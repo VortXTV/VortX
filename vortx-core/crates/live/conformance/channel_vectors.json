@@ -1,0 +1,100 @@
+{
+  "description": "Cross-language conformance for canonical channel identity + dedup (LT3). channel_id is deterministic and cross-device-stable: t:<normalized-tvg-id> when a tvg-id is known, else c:<fnv1a64-hex> of normalized-name + 0x00 + number, else u:<fnv1a64-hex> of the stream URL. build_channels collapses N provider feeds into one ChannelModel via connected-components over shared identity signals (tvg-id, normalized name+number), ranks feeds by provider order then entry order, and is order-independent. A port in another language must reproduce every id and merge below byte-for-byte.",
+  "cases": [
+    {
+      "name": "tvg_id_is_the_canonical_id_normalized",
+      "providers": [
+        {
+          "provider": "a",
+          "entries": [
+            { "url": "http://a/cnn", "duration_secs": -1, "tvg_id": "CNN.us", "tvg_logo": "http://l/cnn.png", "group_title": "News", "display_name": "CNN HD" }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "channel_id": "t:cnn.us",
+          "display_name": "CNN HD",
+          "group": "News",
+          "logo_url": "http://l/cnn.png",
+          "source_provenance": ["a"],
+          "feeds": [
+            { "provider": "a", "url": "http://a/cnn", "duration_secs": -1 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "name_plus_number_hash_when_no_tvg_id",
+      "providers": [
+        {
+          "provider": "a",
+          "entries": [
+            { "url": "http://a/m", "duration_secs": -1, "display_name": "Movies", "attributes": [["tvg-chno", "1"]] }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "channel_id": "c:5a9f217db9f2b8b7",
+          "display_name": "Movies",
+          "channel_number": 1,
+          "source_provenance": ["a"],
+          "feeds": [
+            { "provider": "a", "url": "http://a/m", "duration_secs": -1 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "two_provider_feeds_of_one_channel_merge_ranked_by_provider_order",
+      "providers": [
+        {
+          "provider": "provA",
+          "entries": [
+            { "url": "http://a/cnn", "duration_secs": -1, "tvg_id": "cnn.us", "display_name": "CNN" }
+          ]
+        },
+        {
+          "provider": "provB",
+          "entries": [
+            { "url": "http://b/cnn", "duration_secs": -1, "tvg_id": "cnn.us", "display_name": "CNN HD", "tvg_logo": "http://l/cnn.png" }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "channel_id": "t:cnn.us",
+          "display_name": "CNN",
+          "logo_url": "http://l/cnn.png",
+          "source_provenance": ["provA", "provB"],
+          "feeds": [
+            { "provider": "provA", "url": "http://a/cnn", "duration_secs": -1 },
+            { "provider": "provB", "url": "http://b/cnn", "duration_secs": -1 }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "anonymous_feed_uses_a_url_id",
+      "providers": [
+        {
+          "provider": "a",
+          "entries": [
+            { "url": "http://a", "duration_secs": -1, "display_name": "" }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "channel_id": "u:47935331f4e19ffe",
+          "display_name": "",
+          "source_provenance": ["a"],
+          "feeds": [
+            { "provider": "a", "url": "http://a", "duration_secs": -1 }
+          ]
+        }
+      ]
+    }
+  ]
+}
