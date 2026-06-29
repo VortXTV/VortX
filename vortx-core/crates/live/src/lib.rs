@@ -14,6 +14,7 @@
 //! channel ids (tvg-id exact, else normalized display name, else none) so a channel can fetch its programmes.
 
 mod bind;
+mod catchup;
 mod channel;
 mod epg;
 mod guide;
@@ -22,6 +23,7 @@ mod m3u;
 mod secret;
 
 pub use bind::{bind_epg, epg_channel_id_for};
+pub use catchup::{catchup_url_for, render_catchup, CatchupCtx, CivilTime};
 pub use channel::{build_channels, ChannelFeed, ChannelModel, ProviderPlaylist};
 pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Program};
 pub use guide::{grid, now_next, ChannelGrid, EpgWindow, GridProgram, NowNext};
