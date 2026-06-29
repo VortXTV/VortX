@@ -19,6 +19,7 @@
 //! never serialized into a Stremio `libraryItem`; the account token stays in the Keychain only; the
 //! roster never silently drops a profile.
 
+mod finish;
 mod ids;
 mod library;
 mod maturity;
@@ -29,6 +30,7 @@ mod scrobble;
 mod store;
 mod watch;
 
+pub use finish::{finished, FinishPolicy};
 pub use ids::ProfileId;
 pub use maturity::{
     allows as maturity_allows, allows_raw as maturity_allows_raw, effective_ceiling,

@@ -73,7 +73,16 @@ pub fn scrobble(
         },
         PlaybackEvent::Stop => ScrobbleAction::Stop {
             progress_permille: progress,
-            watched: progress >= cfg.watched_at_permille,
+            // Route the watched decision through the shared pure finish policy. With tail_grace 0 it reduces
+            // EXACTLY to `progress >= watched_at_permille`, so this is byte-identical to the prior check.
+            watched: crate::finish::finished(
+                position_ms,
+                duration_ms,
+                &crate::finish::FinishPolicy {
+                    finished_permille: cfg.watched_at_permille,
+                    tail_grace_ms: 0,
+                },
+            ),
         },
     }
 }

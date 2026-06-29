@@ -164,7 +164,10 @@ impl ProfileLibrary {
         // The resume point is keyed by the most specific unit (the episode if present, else the title), so
         // each episode keeps its own position.
         let resume_key = video_id.unwrap_or(meta_id).to_string();
-        if permille >= FINISHED_PERMILLE {
+        // The finish decision routes through the pure tail-aware policy. The VIDEO policy (tail_grace 0)
+        // reduces EXACTLY to `permille >= FINISHED_PERMILLE`, so this is byte-identical to the prior check;
+        // SH3 threads the per-content-kind policy here so audiobook/podcast finish tail-aware.
+        if crate::finish::finished(position_ms, duration_ms, &crate::finish::FinishPolicy::VIDEO) {
             self.resume.remove(&resume_key);
             self.mark_watched(meta_id, video_id, now);
         } else {
