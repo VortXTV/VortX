@@ -23,6 +23,12 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private let store = DownloadStore.shared
 
+    /// Most downloads we run at once. Beyond this, new downloads are created `.queued` and start
+    /// automatically as running ones finish / fail / are cancelled / are paused (start-next-on-finish).
+    /// Kept small: each transfer is a multi-GB media file, and torrent transfers also pin the loopback
+    /// node server, so a low cap avoids thrashing bandwidth + disk + (for torrents) the server.
+    private static let maxConcurrentDownloads = 2
+
     /// Maps a live URLSession task to the record it's filling, both ways, so a delegate callback (which
     /// arrives with only a task) resolves to a record id, and a pause/cancel(id:) resolves to its task.
     private var taskForRecord: [UUID: URLSessionDownloadTask] = [:]
@@ -73,22 +79,31 @@ final class DownloadManager: NSObject, ObservableObject {
             return existing
         }
 
+        // Honor the concurrency cap: only start now if a slot is free; otherwise create the record
+        // `.queued` and let it start when a running download finishes / fails / is cancelled / paused.
         let id = UUID()
         let ext = fileExtension(for: resolvedURL)
+        let canStartNow = activeCount < Self.maxConcurrentDownloads
         let record = DownloadRecord(
             id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
             name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
             sourceName: sourceName, qualityText: qualityText, isTorrent: stream.isTorrent,
             headers: stream.requestHeaders, remoteURL: resolvedURL.absoluteString,
-            localFilename: "\(id.uuidString).\(ext)", state: .downloading)
+            localFilename: "\(id.uuidString).\(ext)", state: canStartNow ? .downloading : .queued)
         store.upsert(record)
 
-        startTask(for: record, url: resolvedURL)
+        if canStartNow { startTask(for: record, url: resolvedURL) }
         return record
     }
 
     func pause(id: UUID) {
-        guard let task = taskForRecord[id] else { return }
+        // A queued item has no live task yet: just mark it paused so it stops being eligible to start.
+        guard let task = taskForRecord[id] else {
+            if store.record(id: id)?.state == .queued {
+                store.update(id: id) { $0.state = .paused }
+            }
+            return
+        }
         task.cancel(byProducingResumeData: { [weak self] data in
             Task { @MainActor in
                 guard let self else { return }
@@ -101,6 +116,13 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func resume(id: UUID) {
         guard let record = store.record(id: id) else { return }
+        // Respect the concurrency cap on resume too: if every slot is busy, re-queue instead of
+        // starting now, so resuming several paused items can't blow past the cap. It starts when a
+        // slot frees (start-next-on-finish), exactly like a freshly-queued download.
+        guard activeCount < Self.maxConcurrentDownloads else {
+            store.update(id: id) { $0.state = .queued }
+            return
+        }
         store.update(id: id) { $0.state = .downloading }
         // Background-session resume data must be resumed on the SAME session kind it was produced on.
         let session = record.isTorrent ? foregroundSession : backgroundSession
@@ -159,6 +181,32 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         taskForRecord[id] = nil
         endForegroundAssertionIfIdle()
+        // A slot just freed (finish / fail / pause / cancel): pull the next queued download in.
+        startNextQueued()
+    }
+
+    // MARK: Concurrency queue
+
+    /// Live download tasks in flight. A `.queued` / `.paused` record has no task, so this is exactly the
+    /// count of running downloads, which is what the cap gates on.
+    private var activeCount: Int { taskForRecord.count }
+
+    /// Start the oldest `.queued` download if a slot is free. Picks the earliest-added queued record so
+    /// the queue drains in the order downloads were requested. Fail-soft: a queued record whose source
+    /// URL no longer parses is marked `.failed` and skipped, so one bad URL can't wedge the queue.
+    private func startNextQueued() {
+        guard activeCount < Self.maxConcurrentDownloads else { return }
+        guard let next = store.records
+            .filter({ $0.state == .queued })
+            .min(by: { $0.addedAt < $1.addedAt }) else { return }
+        guard let url = URL(string: next.remoteURL) else {
+            store.update(id: next.id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
+            // Skipping a broken record freed nothing, but another queued record may now be startable.
+            startNextQueued()
+            return
+        }
+        store.update(id: next.id) { $0.state = .downloading }
+        startTask(for: next, url: url)
     }
 
     private func recordID(for task: URLSessionTask) -> UUID? { recordForTask[task.taskIdentifier] }

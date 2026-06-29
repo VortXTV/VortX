@@ -97,7 +97,7 @@ struct DebridKeysView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 Text("Debrid services").screenTitleStyle()
-                Text("Add your debrid API keys here. They stay on this device and sync, encrypted, to your VortX account. Native playback of cached torrents straight from your debrid account is coming soon.")
+                Text("Add your debrid API keys here. They stay on this device and sync, encrypted, to your VortX account. Cached torrents now play instantly straight from your debrid account, and adding more than one service checks them all at once.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 ForEach(DebridService.allCases) { service in

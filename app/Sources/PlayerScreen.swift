@@ -503,6 +503,7 @@ struct PlayerScreen: View {
             }
             Button("Share or open in…") { showShare = true }
             Button("Copy stream link") {
+                Haptics.tap()
                 #if canImport(UIKit)
                 UIPasteboard.general.url = curURL ?? url
                 #elseif canImport(AppKit)
@@ -511,10 +512,25 @@ struct PlayerScreen: View {
             }
             if let magnet = magnetLink {
                 Button("Copy magnet link") {
+                    Haptics.tap()
                     #if canImport(UIKit)
                     UIPasteboard.general.string = magnet.absoluteString
                     #elseif canImport(AppKit)
                     NSPasteboard.general.clearContents(); NSPasteboard.general.setString(magnet.absoluteString, forType: .string)
+                    #endif
+                }
+            }
+            // Every playable source loaded for this title, newline-joined — handy for sending the whole
+            // ranked list at once. Only shown when more than one source is actually loaded (a single
+            // source is already covered by "Copy stream link").
+            if allSourceLinks.count > 1 {
+                Button("Copy all source links") {
+                    Haptics.tap()
+                    let joined = allSourceLinks.joined(separator: "\n")
+                    #if canImport(UIKit)
+                    UIPasteboard.general.string = joined
+                    #elseif canImport(AppKit)
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(joined, forType: .string)
                     #endif
                 }
             }
@@ -1418,7 +1434,7 @@ struct PlayerScreen: View {
             if !isLive {
                 seekButton("gobackward.\(seekStep)", by: -seekStepSeconds)
             }
-            Button { coordinator.player?.togglePause(); scheduleHide() } label: {
+            Button { Haptics.tap(); coordinator.player?.togglePause(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
                     .frame(width: 100, height: 100)
@@ -1981,6 +1997,7 @@ struct PlayerScreen: View {
             HStack {
                 Spacer()
                 Button {
+                    Haptics.success()
                     coordinator.player?.seek(to: segment.end)
                     currentTime = segment.end
                     updateCurrentSkip(at: segment.end)
@@ -2400,6 +2417,21 @@ struct PlayerScreen: View {
             if let e = raw.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) { s += "&tr=\(e)" }
         }
         return URL(string: s)
+    }
+
+    /// Every distinct playable link across all loaded sources for the current title / episode, in the
+    /// engine's ranked order. Backs the "Copy all source links" menu action so the whole ranked list can
+    /// be grabbed at once, de-duplicated so the same URL surfaced by two add-ons appears once.
+    private var allSourceLinks: [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for group in currentSourceGroups {
+            for stream in group.streams {
+                guard let link = stream.playableURL?.absoluteString else { continue }
+                if seen.insert(link).inserted { out.append(link) }
+            }
+        }
+        return out
     }
 
     /// More than one distinct resolution is available for the current title, so the Quality picker is worth
