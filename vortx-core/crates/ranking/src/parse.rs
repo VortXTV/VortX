@@ -3,6 +3,7 @@
 //! the same tokens on every platform (pinned by conformance vectors), so ranking is consistent everywhere.
 
 use serde::{Deserialize, Serialize};
+use vortx_protocol::VortxStreamHints;
 
 /// Video resolution tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +203,27 @@ pub fn parse(label: &str) -> ParsedData {
         repack,
         junk,
     }
+}
+
+/// Derive the ranking score-inputs from the TYPED `behaviorHints.vortx` side-channel instead of the
+/// free-text title. The typed `resolution` token and `tags` are fed through the SAME matchers [`parse`]
+/// uses, so the typed path and the title path can never disagree on what a token means (one vocabulary, no
+/// drift). This is the determinism win the singularity contract calls for: a native source emits clean
+/// typed tokens, so the engine never regex-parses a fragile release title. The synthetic token string is
+/// space-padded so a boundary-sensitive token (e.g. ` dv `) still matches as the first or last tag.
+/// season/episode are not carried by the typed object (it has `pack`/`fileIdx` instead) and are not score
+/// inputs, so they stay `None` here.
+pub fn parse_typed(hints: &VortxStreamHints) -> ParsedData {
+    let mut tokens = String::from(" ");
+    if let Some(resolution) = &hints.resolution {
+        tokens.push_str(resolution);
+        tokens.push(' ');
+    }
+    for tag in &hints.tags {
+        tokens.push_str(tag);
+        tokens.push(' ');
+    }
+    parse(&tokens)
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ pub use dedup::{dedup, DedupStream, MergedStream};
 pub use episode::{
     absolute_from_seasonal, map_episode, EpisodeRequest, FileMatch, MatchKind, PackFile,
 };
-pub use parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
+pub use parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 pub use prefs::RankingPrefs;
 pub use rank::{rank, RankedStream, Tier};
 pub use release::{parse_release, ReleaseMeta};

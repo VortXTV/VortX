@@ -3,7 +3,7 @@
 //! a stream list ranked on iOS, Android, and a Worker would diverge.
 
 use serde::Deserialize;
-use vortx_protocol::{Stream, StreamBehaviorHints};
+use vortx_protocol::{Stream, StreamBehaviorHints, VortxStreamHints};
 use vortx_ranking::{rank, RankingPrefs};
 
 #[derive(Deserialize)]
@@ -26,6 +26,9 @@ struct StreamSpec {
     cached: bool,
     #[serde(default)]
     video_size: Option<i64>,
+    /// The typed behaviorHints.vortx side-channel; when present the ranker reads it instead of the title.
+    #[serde(default)]
+    vortx: Option<VortxStreamHints>,
 }
 
 #[derive(Deserialize)]
@@ -44,13 +47,21 @@ fn rank_matches_conformance_vectors() {
         let streams: Vec<Stream> = case
             .streams
             .iter()
-            .map(|s| Stream {
-                name: Some(s.label.clone()),
-                behavior_hints: s.video_size.map(|v| StreamBehaviorHints {
-                    video_size: Some(v),
+            .map(|s| {
+                let behavior_hints = if s.video_size.is_some() || s.vortx.is_some() {
+                    Some(StreamBehaviorHints {
+                        video_size: s.video_size,
+                        vortx: s.vortx.clone(),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
+                Stream {
+                    name: Some(s.label.clone()),
+                    behavior_hints,
                     ..Default::default()
-                }),
-                ..Default::default()
+                }
             })
             .collect();
         let cached: Vec<bool> = case.streams.iter().map(|s| s.cached).collect();

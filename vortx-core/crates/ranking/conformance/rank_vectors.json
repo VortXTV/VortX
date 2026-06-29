@@ -48,6 +48,18 @@
       "expect": [
         { "raw_index": 0, "score": 68440000 }
       ]
+    },
+    {
+      "name": "typed_vortx_score_inputs_beat_the_title",
+      "prefs": {},
+      "streams": [
+        { "label": "Movie 2024 480p HDCAM", "vortx": { "resolution": "2160p", "tags": ["remux", "dv", "atmos"] } },
+        { "label": "Movie 2024 1080p WEB-DL" }
+      ],
+      "expect": [
+        { "raw_index": 0, "score": 60440000 },
+        { "raw_index": 1, "score": 45090000 }
+      ]
     }
   ]
 }

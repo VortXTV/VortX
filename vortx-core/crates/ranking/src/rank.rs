@@ -19,9 +19,9 @@
 //! not part of the deterministic score.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::Stream;
+use vortx_protocol::{Stream, VortxStreamHints};
 
-use crate::parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
+use crate::parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 use crate::prefs::RankingPrefs;
 
 /// The resolution tier a ranked stream falls into.
@@ -125,9 +125,34 @@ fn size_milli(bytes: i64) -> i64 {
     ((bytes as i128 * 150) / GIB).min(SIZE_MILLI_CAP as i128) as i64
 }
 
-/// Raw `video_size` in bytes for the integer score term (distinct from `size_gb`, the f64 filter input).
+/// The typed `behaviorHints.vortx` side-channel, but ONLY when it carries ranking-relevant score inputs
+/// (a `resolution` token or `tags`). A vortx object with neither (e.g. an nzb row carrying only `nzbHash`)
+/// does NOT divert ranking off the title; it falls back to the parser. This is the stream-level proxy for
+/// the source manifest's `ranking.emitsScoreInputs` capability.
+fn typed_score_inputs(s: &Stream) -> Option<&VortxStreamHints> {
+    s.behavior_hints
+        .as_ref()
+        .and_then(|h| h.vortx.as_ref())
+        .filter(|v| v.resolution.is_some() || !v.tags.is_empty())
+}
+
+/// The ranking score-inputs for a stream: derived from the TYPED vortx fields when present (so the engine
+/// never regex-parses a fragile title and ranks identically across platforms), else parsed from the title.
+fn parsed_for(s: &Stream, label: &str) -> ParsedData {
+    match typed_score_inputs(s) {
+        Some(v) => parse_typed(v),
+        None => parse(label),
+    }
+}
+
+/// Raw size in bytes for the integer score term. The typed `vortx.sizeBytes` takes precedence over the
+/// generic `behaviorHints.videoSize`, falling back to it for a plain Stremio stream (distinct from
+/// `size_gb`, the f64 filter input, which is derived from the same precedence).
 fn size_bytes(s: &Stream) -> Option<i64> {
-    s.behavior_hints.as_ref().and_then(|h| h.video_size)
+    let bh = s.behavior_hints.as_ref();
+    bh.and_then(|h| h.vortx.as_ref())
+        .and_then(|v| v.size_bytes)
+        .or_else(|| bh.and_then(|h| h.video_size))
 }
 
 fn label_of(s: &Stream) -> String {
@@ -143,10 +168,7 @@ fn label_of(s: &Stream) -> String {
 }
 
 fn size_gb(s: &Stream) -> Option<f64> {
-    s.behavior_hints
-        .as_ref()
-        .and_then(|h| h.video_size)
-        .map(|bytes| bytes as f64 / 1_073_741_824.0)
+    size_bytes(s).map(|bytes| bytes as f64 / 1_073_741_824.0)
 }
 
 /// Rank `streams` for a profile. `cached[i]` marks stream `i` as debrid-cached (a missing entry is
@@ -174,7 +196,7 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
             continue;
         }
 
-        let parsed = parse(&label);
+        let parsed = parsed_for(s, &label);
 
         if let Some(maxr) = prefs.max_resolution {
             if parsed.resolution.rank() > maxr.rank() {
@@ -386,5 +408,92 @@ mod tests {
         let ranked = rank(&[legit, junk], &prefs, &[false, false]);
         assert_eq!(ranked[0].raw_index, 0); // legit still beats junk
         assert!(ranked[0].score > 0);
+    }
+
+    use vortx_protocol::{StreamBehaviorHints, VortxStreamHints};
+
+    /// A stream whose typed vortx side-channel carries the given resolution token + tags, with a TITLE that
+    /// would parse to something different (so a passing test proves the typed path won).
+    fn typed_stream(misleading_title: &str, resolution: &str, tags: &[&str]) -> Stream {
+        Stream {
+            name: Some(misleading_title.to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some(resolution.to_string()),
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn typed_vortx_inputs_override_a_misleading_title() {
+        // The title says junk 480p cam; the typed object says 2160p remux dv atmos. The engine must rank
+        // from the typed fields, so this is a clean 4k DV remux, not junk.
+        let prefs = RankingPrefs::default();
+        let s = typed_stream("Movie 2024 480p HDCAM", "2160p", &["remux", "dv", "atmos"]);
+        let ranked = rank(&[s], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Uhd);
+        assert!(ranked[0].is_dolby_vision);
+        assert_eq!(ranked[0].audio, Audio::Atmos);
+        assert!(!ranked[0].parsed.junk); // the "hdcam" in the title did NOT make it junk
+        // (60000 tier + 230 remux + 120 dv + 90 atmos) * 1000
+        assert_eq!(ranked[0].score, 60_440_000);
+    }
+
+    #[test]
+    fn a_typed_4k_outranks_a_title_parsed_1080p() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_stream("garbage label", "2160p", &["web-dl"]),
+            stream("Movie 1080p WEB-DL"),
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 0); // the typed 4k
+        assert_eq!(ranked[1].raw_index, 1); // the title-parsed 1080p
+    }
+
+    #[test]
+    fn a_plain_stream_still_ranks_from_its_title() {
+        // No vortx object -> the title parser is authoritative (no regression).
+        let prefs = RankingPrefs::default();
+        let ranked = rank(&[stream("2160p BluRay REMUX")], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Uhd);
+        assert_eq!(ranked[0].parsed.source_class, SourceClass::Remux);
+    }
+
+    #[test]
+    fn an_empty_vortx_object_falls_back_to_the_title() {
+        // A vortx object with no resolution and no tags carries no score inputs -> use the title.
+        let prefs = RankingPrefs::default();
+        let mut s = stream("1080p WEB-DL");
+        s.behavior_hints = Some(StreamBehaviorHints {
+            vortx: Some(VortxStreamHints {
+                cached_services: vec!["realdebrid".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ranked = rank(&[s], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Fhd); // from the title, not Unknown
+    }
+
+    #[test]
+    fn typed_size_bytes_takes_precedence_over_video_size() {
+        // vortx.sizeBytes should drive the size tiebreaker over the generic videoSize.
+        let prefs = RankingPrefs::default();
+        let mut s = typed_stream("x", "1080p", &["web-dl"]);
+        if let Some(bh) = s.behavior_hints.as_mut() {
+            bh.video_size = Some(1); // tiny generic size
+            if let Some(v) = bh.vortx.as_mut() {
+                v.size_bytes = Some(10_737_418_240); // 10 GiB typed
+            }
+        }
+        let ranked = rank(&[s], &prefs, &[false]);
+        // 1080p webdl base = (45000 + 90)*1000 = 45090000; + size_milli(10 GiB) = 1500.
+        assert_eq!(ranked[0].score, 45_091_500);
     }
 }
