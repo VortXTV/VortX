@@ -1,0 +1,33 @@
+{
+  "description": "Cross-language conformance for the hive cached-availability check. A stream's behaviorHints.vortx.cachedServices (debrid wire-strings, byte-frozen to the DebridService enum) is matched case-insensitively against the user's enabled debrid services; a match means the engine treats the stream as instant-cached (facts, not tokens: the user's own debrid re-confirms on play) so the ranker floats it to the top of its tier. Empty on either side, or a plain stream with no vortx object, is never cached. user_services are DebridService wire-strings.",
+  "cases": [
+    {
+      "name": "cached_on_a_user_service",
+      "user_services": ["realdebrid", "torbox"],
+      "streams": [
+        { "cached_services": ["realdebrid"], "expect": true },
+        { "cached_services": ["alldebrid"], "expect": false },
+        { "cached_services": ["RealDebrid"], "expect": true },
+        { "cached_services": [], "expect": false },
+        { "plain": true, "expect": false },
+        { "cached_services": ["premiumize", "torbox"], "expect": true }
+      ]
+    },
+    {
+      "name": "no_user_services_means_never_cached",
+      "user_services": [],
+      "streams": [
+        { "cached_services": ["realdebrid"], "expect": false }
+      ]
+    },
+    {
+      "name": "dmm_public_and_easydebrid_wire_strings",
+      "user_services": ["dmm_public", "easydebrid"],
+      "streams": [
+        { "cached_services": ["dmm_public"], "expect": true },
+        { "cached_services": ["easydebrid"], "expect": true },
+        { "cached_services": ["debridlink"], "expect": false }
+      ]
+    }
+  ]
+}

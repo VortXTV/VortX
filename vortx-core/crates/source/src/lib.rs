@@ -14,6 +14,7 @@
 //! engine phase here). Nothing in the shipping engine is touched.
 
 mod adapters;
+mod cached;
 mod canonical;
 mod customization;
 mod exit;
@@ -31,6 +32,7 @@ mod validate;
 mod verify;
 
 pub use adapters::{NuvioProviderSource, StremioAddonSource};
+pub use cached::{cached_on, cached_vector, stream_is_cached};
 pub use canonical::canonicalize;
 pub use customization::{
     token_keys, AccentDef, AssetRef, BrandingDef, Color, CustomizationCapability, HeroDecl,
