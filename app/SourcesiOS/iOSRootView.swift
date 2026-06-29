@@ -68,6 +68,11 @@ struct iOSRootView: View {
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
     @ObservedObject private var updates = UpdateChecker.shared
+    #if !os(tvOS)
+    /// Offline downloads (#30), observed so the Library tab can carry a live count badge of in-flight
+    /// downloads — the persistent "downloads are running, find them here" signal away from the detail page.
+    @ObservedObject private var downloads = DownloadStore.shared
+    #endif
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
     /// Hide the Live TV tab for users who do not use it (Settings toggle). The Live screen is not mounted
     /// and the tab is dropped from the bar; selection falls back to Home if it was on Live.
@@ -206,6 +211,28 @@ struct iOSRootView: View {
         openURL(url)
     }
 
+    #if !os(tvOS)
+    /// Number of downloads currently in flight (state == .downloading), driving the Library tab badge so
+    /// the user can see work is running and where it lives. Excludes completed/failed/queued/paused.
+    private var activeDownloadCount: Int {
+        downloads.records.reduce(0) { $0 + ($1.state == .downloading ? 1 : 0) }
+    }
+
+    /// A small accent notification badge carrying the active-download count, overlaid on the Library tab.
+    /// Subtle by design: the ember accent circle with onAccent ink, capped at "9+" so a long queue stays
+    /// a compact pill. Offset up-and-out so it reads as a badge on the glyph rather than over it.
+    private func downloadCountBadge(_ count: Int) -> some View {
+        Text(count > 9 ? "9+" : "\(count)")
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(Theme.Palette.onAccent)
+            .padding(.horizontal, 5)
+            .frame(minWidth: 16, minHeight: 16)
+            .background(Theme.Palette.accent, in: Capsule())
+            .offset(x: 6, y: -6)
+            .accessibilityLabel("\(count) active downloads")
+    }
+    #endif
+
     private func tabButton(_ item: Tab) -> some View {
         let selected = tab == item
         let base = Button {
@@ -224,6 +251,15 @@ struct iOSRootView: View {
                             Capsule().fill(Theme.Palette.accent.opacity(0.18))
                         }
                     }
+                    // #30: a small accent count badge on the Library tab while downloads are in flight, so
+                    // the user knows work is running and where to find it. Hidden when zero / on other tabs.
+                    #if !os(tvOS)
+                    .overlay(alignment: .topTrailing) {
+                        if item == .library, activeDownloadCount > 0 {
+                            downloadCountBadge(activeDownloadCount)
+                        }
+                    }
+                    #endif
                 Text(item.title)
                     .font(.system(size: 11, weight: selected ? .semibold : .medium))
                     .lineLimit(1)

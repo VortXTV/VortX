@@ -397,6 +397,44 @@ struct iOSDetailView: View {
         }
     }
 
+    #if !os(tvOS)
+    /// The offline-download state for one video id, derived from `DownloadStore.shared`. Drives the
+    /// download chip's three affordances so a tap gives visible feedback: no record → offer a download,
+    /// an active (queued/downloading/paused) record → an in-progress "Downloading" state, a completed
+    /// record → a "Downloaded" check. Reuses the same store lookups that already prevent double-queueing.
+    private enum DownloadChipState { case none, inProgress, done }
+
+    private func downloadChipState(videoId: String) -> DownloadChipState {
+        guard let record = downloads.records.first(where: { $0.videoId == videoId && $0.state != .failed }) else { return .none }
+        return record.state == .completed ? .done : .inProgress
+    }
+
+    /// A Download chip with state feedback (#30), shared by the movie action row and the series hero. The
+    /// idle state offers a download (enabled only when `ready`); while a record is active it shows a spinner
+    /// + "Downloading" and is disabled; once complete it shows a "Downloaded" check and is disabled. The
+    /// action runs only from the idle state, so a tap can't re-queue an in-flight or finished download.
+    @ViewBuilder private func downloadChip(videoId: String, ready: Bool, action: @escaping () -> Void) -> some View {
+        let state = downloadChipState(videoId: videoId)
+        Button {
+            if state == .none { action() }
+        } label: {
+            switch state {
+            case .done:
+                Label("Downloaded", systemImage: "checkmark.circle.fill")
+            case .inProgress:
+                HStack(spacing: Theme.Space.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Downloading")
+                }
+            case .none:
+                Label("Download", systemImage: "arrow.down.circle")
+            }
+        }
+        .buttonStyle(ChipButtonStyle())
+        .disabled(state != .none || !ready)
+    }
+    #endif
+
     // MARK: Hero (full-bleed backdrop + scrim + meta), mirrors tvOS DetailView.hero
 
     /// Scroll-anchor id for the source section, so the hero's "Sources" action can jump to it.
@@ -670,6 +708,16 @@ struct iOSDetailView: View {
                     }
                     .fixedSize(horizontal: true, vertical: false)
                 }
+                #if !os(tvOS)
+                // Offline (#30): download the primary episode's auto-picked source — the series twin of the
+                // movie Download chip. Gated on the primary episode resolving (same gate as the Play button);
+                // the chip reflects state (idle / Downloading / Downloaded) keyed on that episode's id.
+                if let primary {
+                    downloadChip(videoId: primary.video.id, ready: true) {
+                        Task { await downloadBestSeries(primary.video) }
+                    }
+                }
+                #endif
                 trailerButton
                 iOSLibraryChip()
                 shareChip
@@ -803,6 +851,13 @@ struct iOSDetailView: View {
 
             qualityMenu(groups)
 
+            #if !os(tvOS)
+            // Offline (#30): download the best source, the offline twin of Watch Now — sat beside Quality so
+            // it reads as the download counterpart of the play controls. The chip reflects state (idle /
+            // Downloading / Downloaded) so a tap gives visible feedback and can't re-queue the same title.
+            downloadChip(videoId: meta?.id ?? id, ready: movieReady) { Task { await downloadBest() } }
+            #endif
+
             Button { scrollToSources() } label: {
                 Label(sourceTotal > 0 ? "Sources · \(sourceTotal)" : "Sources",
                       systemImage: "list.bullet")
@@ -812,21 +867,6 @@ struct iOSDetailView: View {
             trailerButton
             iOSLibraryChip()
             shareChip
-            #if !os(tvOS)
-            // Offline (#30): download the best source, the offline twin of Watch Now. Shows a check once
-            // this title is already downloaded so a user can't queue it twice.
-            Button {
-                Task { await downloadBest() }
-            } label: {
-                if downloads.hasDownload(videoId: meta?.id ?? id) {
-                    Label("Downloaded", systemImage: "checkmark.circle.fill")
-                } else {
-                    Label("Download", systemImage: "arrow.down.circle")
-                }
-            }
-            .buttonStyle(ChipButtonStyle())
-            .disabled(!movieReady || downloads.hasDownload(videoId: meta?.id ?? id))
-            #endif
         }
         // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
         if movieReady, let s = movieBest, let reason = StreamRanking.pickReason(s) {
@@ -1080,6 +1120,38 @@ struct iOSDetailView: View {
     private func downloadBest() async {
         guard let stream = movieBest, let url = stream.playableURL else { return }
         await downloadStream(stream, url: url)
+    }
+
+    /// Download-best for a SERIES: queue the primary episode's auto-picked source — the offline twin of the
+    /// series hero's Resume/Play, which targets the SAME episode (`seriesPrimaryEpisode`) and the SAME
+    /// `StreamRanking.best` path. A series detail loads meta only, so this loads + settles that episode's
+    /// streams (mirroring `iOSResolveEpisodeStream`), ranks them, resolves a cached-debrid direct link when
+    /// possible, then hands the episode's series-typed `PlaybackMeta` to `DownloadManager`. No-op if nothing
+    /// resolves. Device-local only; writes nothing to the account / libraryItem docs.
+    private func downloadBestSeries(_ video: CoreVideo) async {
+        guard let m = meta else { return }
+        core.loadMeta(type: "series", id: m.id, streamType: "series", streamId: video.id)
+        var groups: [CoreStreamSourceGroup] = []
+        var firstPlayableAt: Date? = nil
+        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+            groups = displayGroups(core.streamGroups(forStreamId: video.id))
+            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
+            let progress = core.streamLoadProgress(forStreamId: video.id)
+            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, pin: sourcePin,
+                                            debridCachedHashes: debridCache.cachedHashes),
+              let url = best.playableURL else { return }
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
+        let pm = PlaybackMeta(libraryId: m.id, videoId: video.id, type: "series",
+                              name: m.name, poster: video.thumbnail ?? m.poster,
+                              season: video.season, episode: video.episode)
+        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: resolved ?? url,
+                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
     }
     #endif
 
