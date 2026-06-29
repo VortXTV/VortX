@@ -32,6 +32,9 @@ struct SettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
+    // Streaming/seek cache budget, raw byte count (0 = Off, -1 = Unlimited). Int-typed @AppStorage; Int
+    // is 64-bit on Apple TV, so the byte budgets are exact.
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
@@ -258,6 +261,12 @@ struct SettingsView: View {
             choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Streaming cache"),
+                      DiskCacheSetting.pickerOptions.map { (String($0.id), $0.label) },
+                      selection: Binding(get: { String(diskCacheBytes) },
+                                         set: { diskCacheBytes = Int($0) ?? Int(DiskCacheSetting.defaultBytes) }))
+            Text(diskCacheFooter)
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -279,6 +288,16 @@ struct SettingsView: View {
     /// Built-in plus every curated external player; picking one auto-hands eligible streams to it.
     private var externalPlayerChoices: [(String, String)] {
         [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
+    }
+
+    /// Explains the streaming cache and shows live on-disk usage when on. On the Apple TV HD the cache
+    /// is additionally capped tight; Unlimited is always bounded to half of free storage and cleared
+    /// when a title finishes, so it never fills the device.
+    private var diskCacheFooter: String {
+        let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
+        guard diskCacheBytes != 0 else { return base }
+        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
+        return base + " " + String(localized: "Current cache: \(usage).")
     }
 
     private var effectiveDirectLinksOnly: Bool {

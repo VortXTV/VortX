@@ -618,21 +618,25 @@ struct PlayerScreen: View {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
                 // auto-advancing. The episode is already marked watched above, so Continue Watching
                 // rolls to the next episode on its own without yanking the viewer out of the credits.
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if canNextEpisode, let i = episodeIndex {
-                goToEpisode(episodes[i + 1].id, autoAdvance: true)   // in-place advance to the next episode
+                // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
+                goToEpisode(episodes[i + 1].id, autoAdvance: true)
             } else if hasNext {
-                onNext()                                  // legacy non-episode caller
+                onNext()                                  // legacy non-episode caller (in-place)
             } else {
                 // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
                 // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
                 // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
                 if let m = curMeta { core.finishedWatching(libraryId: m.libraryId) }
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             }
         default: break
@@ -2065,6 +2069,11 @@ struct PlayerScreen: View {
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
             if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
         }
+        // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
+        // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
+        // guardrail). No-op when the disk cache is off or empty. Genuine-exit path only; additive,
+        // does not touch player teardown.
+        DiskCacheSetting.clearCache()
         onClose()
     }
 

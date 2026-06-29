@@ -48,6 +48,9 @@ struct iOSSettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
+    // Streaming/seek cache budget, stored as a raw byte count (0 = Off, -1 = Unlimited). @AppStorage is
+    // Int-typed; Int is 64-bit on every Apple device this runs on, so the byte budgets are exact.
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
@@ -391,6 +394,9 @@ struct iOSSettingsView: View {
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            Picker("Streaming cache", selection: $diskCacheBytes) {
+                ForEach(DiskCacheSetting.pickerOptions, id: \.id) { Text($0.label).tag(Int($0.id)) }
+            }
             #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
                 ForEach(PlayerEngineRouter.Override.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
@@ -434,6 +440,7 @@ struct iOSSettingsView: View {
                      : String(localized: "Hide torrent and magnet sources. Only direct and debrid links will play."))
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
+                Text(diskCacheFooter)
                 if !installedExternalPlayers.isEmpty {
                     Text("Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.")
                 }
@@ -462,6 +469,15 @@ struct iOSSettingsView: View {
     private var installedExternalPlayers: [ExternalPlayer.Target] { ExternalPlayer.installed }
 
     private var effectiveDirectLinksOnly: Bool { PlaybackSettings.directLinksOnly }
+
+    /// Explains the streaming cache and, when on, shows the live on-disk usage. Unlimited is always
+    /// capped at half of free disk and cleared when a title finishes, so it can never fill the device.
+    private var diskCacheFooter: String {
+        let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
+        guard diskCacheBytes != 0 else { return base }
+        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
+        return base + "\n" + String(localized: "Current cache: \(usage).")
+    }
 
     /// Direct Links Only writes the flat key; turning it OFF cold-starts the embedded server so
     /// torrents work again without a relaunch (guarded out of the Lite build that ships no server).

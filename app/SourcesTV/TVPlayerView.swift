@@ -2148,6 +2148,12 @@ struct TVPlayerView: View {
         // is a harmless no-op, and this runs ONLY on a genuine exit (Back, close, terminal auto-advance), never
         // on an in-place source/episode switch or an onDisappear rebuild, so normal playback is untouched.
         coordinator.player?.stop()
+        // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
+        // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
+        // guardrail). No-op when the disk cache is off or empty. This runs ONLY on a genuine exit
+        // (Back / close / terminal auto-advance), never on an in-place source/episode switch, and is
+        // additive: it does not touch the stop() teardown above.
+        DiskCacheSetting.clearCache()
         onClose()
     }
 

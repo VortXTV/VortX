@@ -412,6 +412,22 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
+        // Configurable ON-DISK streaming/seek cache (Settings → "Streaming cache"). When enabled, the
+        // big forward buffer is backed by a Caches subdirectory instead of RAM, so a viewer can pick a
+        // large cache (seek minutes ahead with no re-buffer, pre-cache) WITHOUT spending the jetsam-bound
+        // in-process RAM budget. The actual byte budget is the clamped `demuxer-max-bytes` applied per
+        // file in loadFile (DiskCacheSetting.resolvedMaxBytes — always bounded by free disk, never
+        // unlimited). The hero-preview (#44) is a tiny silent loop, so it stays on the in-memory cache.
+        //
+        // `cache-on-disk` is a stable libmpv option (mpv 0.30+, present in MPVKit 0.41); if a future
+        // build ever drops it, these lines no-op and mpv falls back to the in-memory cache that the same
+        // clamped `demuxer-max-bytes` already bounds — so the safety guarantee holds either way.
+        if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
+            checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
+            checkError(mpv_set_option_string(mpv, "cache-dir", cacheDir))
+            mpvLog.log("disk cache armed at \(cacheDir, privacy: .public), budget \(DiskCacheSetting.resolvedMaxBytes(), privacy: .public) bytes")
+        }
+
         // HLS: pick the HIGHEST-bandwidth variant of an adaptive master playlist. mpv's documented
         // default is already `max`, but add-ons that serve a single adaptive master (e.g. KhmerHub's
         // OK.ru streams) were starting at the lowest rendition — the "144p instead of 720p" report —
@@ -756,7 +772,18 @@ final class MPVMetalViewController: PlatformViewController {
             readAhead = isLocalStream ? "96MiB" : "128MiB"
             #endif
         }
-        mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
+        // With the on-disk cache armed (Settings → Streaming cache), the forward buffer is backed by the
+        // Caches dir, not RAM, so grow `demuxer-max-bytes` to the viewer's chosen budget — but only for a
+        // REMOTE (debrid/direct CDN) VOD stream, which is where a big seek-ahead buffer actually helps. A
+        // LOCAL torrent already buffers into the embedded server's own disk cache, and live must stay
+        // small (configureLiveMode owns its tight buffers), so those keep the RAM-safe read-ahead above.
+        // resolvedMaxBytes is always clamped to a fraction of FREE disk (and to a hard ceiling on the
+        // constrained Apple TV HD), so this can never fill the device even on "Unlimited".
+        if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
+            mpv_set_property_string(mpv, "demuxer-max-bytes", String(DiskCacheSetting.resolvedMaxBytes()))
+        } else {
+            mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
+        }
 
         if !options.isEmpty {
             args.append(options.joined(separator: ","))
