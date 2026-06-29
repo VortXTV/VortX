@@ -55,8 +55,12 @@ export async function loadInstalledAddons(): Promise<Addon[]> {
 // When signed in, add/remove pushes the new installed list UP to the account (the doc.addons web sibling)
 // so add-ons added on the web reach the user's other devices. The pusher is INJECTED by account.ts (which
 // owns the session + the encrypted write) to avoid a store -> account import cycle; null when signed out.
-let addonsSyncPusher: (() => void) | null = null;
-export function registerAddonsSyncPusher(fn: (() => void) | null): void {
+// The pusher carries an explicit add/remove signal so the account write can maintain the removal
+// tombstone (doc.removedAddons) precisely - never inferred by diffing the merged set (which would
+// false-tombstone app-installed add-ons the webapp simply doesn't hold locally).
+export interface AddonSyncHint { added?: string; removed?: string }
+let addonsSyncPusher: ((hint?: AddonSyncHint) => void) | null = null;
+export function registerAddonsSyncPusher(fn: ((hint?: AddonSyncHint) => void) | null): void {
   addonsSyncPusher = fn;
 }
 
@@ -65,7 +69,7 @@ export function registerAddonsSyncPusher(fn: (() => void) | null): void {
 export async function addAddon(transportUrl: string): Promise<Addon> {
   const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
   persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
-  addonsSyncPusher?.(); // fire-and-forget push to the account (no-op signed out)
+  addonsSyncPusher?.({ added: addon.transportUrl }); // push + clear any prior removal tombstone for it
   return addon;
 }
 
@@ -73,7 +77,7 @@ export async function addAddon(transportUrl: string): Promise<Addon> {
 export function removeAddon(transportUrl: string): void {
   if (transportUrl === CINEMETA_URL) return;
   persist(installedUrls().filter((u) => u !== transportUrl));
-  addonsSyncPusher?.();
+  addonsSyncPusher?.({ removed: transportUrl }); // push + write the removal tombstone so apps uninstall it
 }
 
 // --- Library (saved titles) ---------------------------------------------------------------------

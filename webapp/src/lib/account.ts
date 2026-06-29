@@ -317,7 +317,11 @@ async function pushSettings(session: Session, s: Settings): Promise<void> {
 /** Push the webapp's installed add-ons up to the account (the doc.addons web sibling), so add-ons added
  *  on the web reach the user's other devices. Cinemeta is excluded (a universal built-in, not a user
  *  add-on). Fail-soft. */
-async function pushAddons(session: Session, urls: string[]): Promise<void> {
+async function pushAddons(
+  session: Session,
+  urls: string[],
+  hint?: { added?: string; removed?: string },
+): Promise<void> {
   try {
     // Resolve each add-on's FULL manifest so the synced entry is the descriptor the native app needs:
     // {transportUrl, name, manifest}. The app DROPS doc.addons entries that lack a manifest (it installs
@@ -339,6 +343,17 @@ async function pushAddons(session: Session, urls: string[]): Promise<void> {
     );
     await mutateSyncDoc(session, (doc) => {
       doc.addons = descriptors;
+      // Maintain the removal tombstone (doc.removedAddons: { [transportUrl]: removedAtEpochMs }) from the
+      // EXPLICIT add/remove signal - never inferred by diffing the merged set, which would false-tombstone
+      // app-installed add-ons the webapp doesn't hold locally. A removal records "now"; the app uninstalls
+      // tombstoned URLs (gated on a good pull). Re-adding the same URL clears its tombstone (add wins LWW).
+      const tomb: Record<string, number> =
+        doc.removedAddons && typeof doc.removedAddons === "object"
+          ? (doc.removedAddons as Record<string, number>)
+          : {};
+      if (hint?.removed) tomb[hint.removed] = Date.now();
+      if (hint?.added) delete tomb[hint.added];
+      doc.removedAddons = tomb;
     });
   } catch {
     // fail-soft: the add-on is already installed locally; a later change re-pushes.
@@ -348,9 +363,9 @@ async function pushAddons(session: Session, urls: string[]): Promise<void> {
 // Wire the write-up triggers once at module load:
 //  - add/remove on the web pushes the installed list up (store.ts calls this injected pusher).
 //  - any USER settings change (suppressUp gates out hydration) debounce-pushes the main profile's settings.
-registerAddonsSyncPusher(() => {
+registerAddonsSyncPusher((hint) => {
   const s = currentSession();
-  if (s) void pushAddons(s, installedUrls());
+  if (s) void pushAddons(s, installedUrls(), hint);
 });
 onSettingsChange((next) => {
   if (suppressUp) return; // hydration applied this, not the user; don't echo it back up
