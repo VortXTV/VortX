@@ -477,14 +477,16 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "ao", "avfoundation,audiounit"))
         #endif
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
-        // Passthrough mode bitstreams Dolby/DTS to a capable AV receiver instead of decoding to PCM;
-        // mpv degrades spdif -> PCM on a route that can't take it, so this never forces silence.
-        // EXCEPT a stereo-only route (TV built-in speakers / AirPlay): there, passthrough does not
-        // degrade cleanly and instead WEDGES the AO open (#78 "Passthrough freezes"), so never arm
-        // spdif on those routes regardless of the chosen mode.
+        // Passthrough mode bitstreams Dolby/DTS to a capable AV receiver instead of decoding to PCM. On tvOS
+        // raw spdif WEDGES the AO open and freezes the WHOLE player (#78/#101 "passthrough freezes the video"),
+        // even on a real receiver - and with the avfoundation AO now decoding while the system negotiates the
+        // HDMI/eARC format (incl Atmos) to the receiver, app-side bitstream is both unnecessary and unsafe. So
+        // never arm spdif on tvOS. iOS keeps it, gated off stereo-only / AirPods routes that can't take it.
+        #if !os(tvOS)
         if !routeIsStereoOnly, !routeIsAirPods, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
         }
+        #endif
         // AO-open failure handling, route-aware. On a stereo-only route (TV built-in / AirPlay) the
         // failure mode is the user being stranded silent or the file freezing, so allow the null AO:
         // playback keeps running (video continues) instead of wedging, the graceful fallback for #78.
@@ -1160,7 +1162,11 @@ final class MPVMetalViewController: PlatformViewController {
         // Never arm spdif on a stereo-only route (TV built-in / AirPlay): passthrough there freezes
         // the AO (#78). channelPolicy already forces a stereo downmix for those routes; keep spdif off
         // so a runtime switch to Passthrough on the built-in speakers degrades to decoded stereo PCM.
-        #if canImport(UIKit)
+        #if os(tvOS)
+        // tvOS: never arm raw spdif - it wedges the AO and freezes the player (#78/#101). Decode to PCM; the
+        // avfoundation AO + the audio session let the system pass Atmos/multichannel through to the receiver.
+        let spdif: String? = nil
+        #elseif canImport(UIKit)
         let spdif = routeIsStereoOnly ? nil : mode.spdifCodecs
         #else
         let spdif = mode.spdifCodecs
@@ -1168,22 +1174,42 @@ final class MPVMetalViewController: PlatformViewController {
         setString("audio-spdif", spdif ?? "")
     }
 
-    /// Live numbers for the player's "Playback info" overlay.
+    /// Live numbers for the player's "Playback info" overlay. Deliberately verbose: this panel is the field
+    /// diagnostic for the audio (#78/#101) and HDR/DV (#76) reports, so it surfaces the player, the active
+    /// audio output (AO) + what it actually opened, the route, and passthrough state - not just the source.
     func playbackStats() -> [(String, String)] {
         guard mpv != nil else { return [] }
         var rows: [(String, String)] = []
+        rows.append(("Player", "libmpv"))   // this overlay is the libmpv path; the AVPlayer path (HLS/DV) has its own
+        // --- Video ---
         let w = getInt("video-params/w"), h = getInt("video-params/h")
         if w > 0 { rows.append(("Video", "\(w)×\(h)  \(getString("video-codec-name") ?? "")")) }
         let gamma = getString("video-params/gamma") ?? ""
-        rows.append(("Range", gamma == "pq" ? "HDR (PQ)" : gamma == "hlg" ? "HLG" : "SDR"))
+        let primaries = getString("video-params/primaries") ?? ""
+        let range = gamma == "pq" ? "HDR (PQ)" : gamma == "hlg" ? "HLG" : "SDR"
+        rows.append(("Range", primaries.isEmpty ? range : "\(range)  \(primaries)"))   // #76: primaries shows BT.2020 vs 709
         rows.append(("Decode", getString("hwdec-current") ?? "software"))
         let fps = getDouble("container-fps")
         if fps > 0 { rows.append(("FPS", String(format: "%.3f", fps))) }
         rows.append(("Dropped", "\(getInt("frame-drop-count"))"))
+        // --- Audio (the soundbar / Atmos / passthrough diagnosis) ---
         if let audio = getString("audio-codec-name") {
-            let channels = getInt("audio-params/channel-count")
-            rows.append(("Audio", channels > 0 ? "\(audio)  \(channels)ch" : audio))
+            let ch = getInt("audio-params/channel-count"), sr = getInt("audio-params/samplerate")
+            var s = audio
+            if ch > 0 { s += "  \(ch)ch" }
+            if sr > 0 { s += "  \(sr / 1000)kHz" }
+            rows.append(("Audio in", s))
         }
+        // The active AO is THE discriminator for #78/#101: "avfoundation" = the route opened via Apple's path
+        // (the fix), "audiounit" = the old path that goes silent on continuous-audio HDMI / "null" = no sound.
+        if let ao = getString("current-ao") { rows.append(("Audio out (AO)", ao)) }
+        let oc = getInt("audio-out-params/channel-count"), osr = getInt("audio-out-params/samplerate")
+        if oc > 0 { rows.append(("AO opened", osr > 0 ? "\(oc)ch  \(osr / 1000)kHz" : "\(oc)ch")) }
+        #if canImport(UIKit)
+        if let port = outputPortType?.rawValue { rows.append(("Route", port)) }
+        #endif
+        let spdif = getString("audio-spdif") ?? ""
+        rows.append(("Passthrough", spdif.isEmpty ? "off (decoding to PCM)" : "on"))
         let cache = getDouble("demuxer-cache-duration")
         if cache > 0 { rows.append(("Buffer", String(format: "%.0fs ahead", cache))) }
         let speed = getDouble("speed")
