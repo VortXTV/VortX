@@ -20,6 +20,7 @@ struct DetailView: View {
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
     @State private var financials: TMDBClient.Financials?
+    @State private var releaseDates: TMDBClient.ReleaseDates?   // theatrical + digital, TMDB-fetched (movies only)
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true   // budget + box office on movie detail (movies only, needs a TMDB key)
 
     var body: some View {
@@ -64,7 +65,7 @@ struct DetailView: View {
                 core.loadMeta(type: type, id: id)
             }
             captureHero()
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
         }
         .onDisappear {
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
@@ -75,7 +76,7 @@ struct DetailView: View {
         .onChange(of: core.metaDetails?.meta?.id) {
             captureHero()
             if type != "series" { loadMovieStreamsIfNeeded() }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials() }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
         }
     }
 
@@ -102,6 +103,15 @@ struct DetailView: View {
         Task {
             let f = await TMDBClient.details(imdbID: imdb, type: type)
             await MainActor.run { financials = f }
+        }
+    }
+
+    /// Fetch theatrical + digital release dates (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadReleaseDates() {
+        guard type != "series", let imdb = ratingsImdbID, releaseDates == nil else { return }
+        Task {
+            let d = await TMDBClient.releaseDates(imdbID: imdb, type: type)
+            await MainActor.run { releaseDates = d }
         }
     }
 
@@ -250,6 +260,7 @@ struct DetailView: View {
                             metaRow(m)
                             ratingsRow()
                             financialsRow()
+                            releaseDatesRow()
                             if let d = m.description, !d.isEmpty {
                                 Text(d)
                                     .font(Theme.Typography.body)
@@ -434,6 +445,7 @@ struct DetailView: View {
                 metaRow(m)
                 ratingsRow()
                 financialsRow()
+                releaseDatesRow()
                 if let d = m.description, !d.isEmpty {
                     Text(d)
                         .font(Theme.Typography.body)
@@ -581,6 +593,23 @@ struct DetailView: View {
         if let b = TMDBClient.shortMoney(f.budget) { parts.append("Budget \(b)") }
         if let r = TMDBClient.shortMoney(f.revenue) { parts.append("Box Office \(r)") }
         if f.budget > 0, f.revenue > 0 { parts.append(String(format: "Profit %.1fx", Double(f.revenue) / Double(f.budget))) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    /// "In theaters Mar 1, 2024  ·  Digital May 21, 2024" - both dates, each shown only when TMDB has it. Movies only.
+    @ViewBuilder private func releaseDatesRow() -> some View {
+        if type != "series", let d = releaseDates {
+            let text = Self.releaseDatesText(d)
+            if !text.isEmpty {
+                Text(text).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
+        }
+    }
+
+    private static func releaseDatesText(_ d: TMDBClient.ReleaseDates) -> String {
+        var parts: [String] = []
+        if let t = d.theatrical { parts.append("In theaters \(t)") }
+        if let g = d.digital { parts.append("Digital \(g)") }
         return parts.joined(separator: "  ·  ")
     }
 

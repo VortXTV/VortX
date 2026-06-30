@@ -526,6 +526,54 @@ enum TMDBClient {
         return "$\(value)"
     }
 
+    // MARK: - Movie release dates (theatrical + digital)
+
+    struct ReleaseDates: Hashable { let theatrical: String?; let digital: String? }
+
+    /// Theatrical (TMDB release type 3) + digital (type 4) dates from /movie/{id}/release_dates, resolved
+    /// from an IMDb id. Movies only (TMDB carries no TV release dates). Region-aware: the device region
+    /// first, then a US fallback per field. nil with no key / a series / neither date found. Dates come back
+    /// pretty-printed ("Mar 1, 2024") so the views render them verbatim.
+    static func releaseDates(imdbID: String, type: String) async -> ReleaseDates? {
+        guard type != "series", imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found["movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int,
+              let payload = await get("/movie/\(tmdbID)/release_dates?api_key=\(key)"),
+              let results = payload["results"] as? [[String: Any]] else { return nil }
+
+        func date(ofType t: Int, in entries: [[String: Any]]) -> String? {
+            entries.first { ($0["type"] as? Int) == t }?["release_date"] as? String
+        }
+        func entries(forRegion code: String) -> [[String: Any]]? {
+            results.first { ($0["iso_3166_1"] as? String) == code }?["release_dates"] as? [[String: Any]]
+        }
+
+        var theatrical: String?, digital: String?
+        if let local = entries(forRegion: deviceRegion) {
+            theatrical = date(ofType: 3, in: local); digital = date(ofType: 4, in: local)
+        }
+        if theatrical == nil || digital == nil, let us = entries(forRegion: "US") {
+            theatrical = theatrical ?? date(ofType: 3, in: us)
+            digital = digital ?? date(ofType: 4, in: us)
+        }
+        guard theatrical != nil || digital != nil else { return nil }
+        return ReleaseDates(theatrical: prettyDate(theatrical), digital: prettyDate(digital))
+    }
+
+    /// TMDB sends "2024-03-01T00:00:00.000Z" (or "2024-03-01"); render the date part as "Mar 1, 2024".
+    private static func prettyDate(_ iso: String?) -> String? {
+        guard let iso, iso.count >= 10 else { return nil }
+        let inFmt = DateFormatter()
+        inFmt.locale = Locale(identifier: "en_US_POSIX")
+        inFmt.dateFormat = "yyyy-MM-dd"
+        guard let date = inFmt.date(from: String(iso.prefix(10))) else { return nil }
+        let out = DateFormatter()
+        out.dateStyle = .medium; out.timeStyle = .none
+        return out.string(from: date)
+    }
+
     /// VortX's keyless catalog edge: a cached, app-gated TMDB proxy that injects OUR key server-side, so
     /// users with no TMDB key still get the hub. Path here mirrors TMDB's /3 namespace.
     private static let edgeBase = "https://catalogs.vortx.tv/3"

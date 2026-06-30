@@ -193,6 +193,7 @@ struct iOSDetailView: View {
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
     @State private var financials: TMDBClient.Financials?
+    @State private var releaseDates: TMDBClient.ReleaseDates?   // theatrical + digital, TMDB-fetched (movies only)
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true   // budget + box office on movie detail (movies only, needs a TMDB key)
     /// #37: a trailer id fetched from Cinemeta when the engine's detail meta carries none. Some catalog
     /// add-ons (e.g. a TMDB catalog) return a meta WITHOUT trailerStreams, so the in-hero trailer never
@@ -308,7 +309,7 @@ struct iOSDetailView: View {
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); resolveTrailerIfNeeded(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m) }
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
@@ -323,7 +324,7 @@ struct iOSDetailView: View {
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
             resolvedTrailerID = nil   // new title: drop the previous fallback before re-resolving
-            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); resolveTrailerIfNeeded(m) }
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m) }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -464,6 +465,7 @@ struct iOSDetailView: View {
                     metaRow
                     ratingsRow
                     financialsRow
+                    releaseDatesRow
                 }
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
@@ -1027,6 +1029,15 @@ struct iOSDetailView: View {
         }
     }
 
+    /// Fetch theatrical + digital release dates (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadReleaseDates() {
+        guard type != "series", let imdb = ratingsImdbID, releaseDates == nil else { return }
+        Task {
+            let d = await TMDBClient.releaseDates(imdbID: imdb, type: type)
+            await MainActor.run { releaseDates = d }
+        }
+    }
+
     /// Movie budget + box office (+ profit multiple), a fact line under the ratings. Opt-out via the
     /// "Show budget & box office" setting; movies-only, hidden when TMDB has no figures.
     @ViewBuilder private var financialsRow: some View {
@@ -1048,6 +1059,27 @@ struct iOSDetailView: View {
         if let b = TMDBClient.shortMoney(f.budget) { parts.append("Budget \(b)") }
         if let r = TMDBClient.shortMoney(f.revenue) { parts.append("Box Office \(r)") }
         if f.budget > 0, f.revenue > 0 { parts.append(String(format: "Profit %.1fx", Double(f.revenue) / Double(f.budget))) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    /// "In theaters Mar 1, 2024  ·  Digital May 21, 2024" - both dates, each shown only when TMDB has it. Movies only.
+    @ViewBuilder private var releaseDatesRow: some View {
+        if type != "series", let d = releaseDates {
+            let text = Self.releaseDatesText(d)
+            if !text.isEmpty {
+                Text(text)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private static func releaseDatesText(_ d: TMDBClient.ReleaseDates) -> String {
+        var parts: [String] = []
+        if let t = d.theatrical { parts.append("In theaters \(t)") }
+        if let g = d.digital { parts.append("Digital \(g)") }
         return parts.joined(separator: "  ·  ")
     }
 
