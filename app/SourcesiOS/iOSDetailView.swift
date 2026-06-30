@@ -169,6 +169,17 @@ struct iOSDetailView: View {
     /// The pin context for this title - a movie pin or a show pin, both keyed by the meta id. The
     /// resolved pin feeds `StreamRanking` (auto-pick + list order) and the per-row pin menu/badge.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: id, isSeries: type == "series") }
+
+    /// True for series AND for a COLLECTION/franchise meta: a non-series meta that carries MULTIPLE entries
+    /// as videos[] (e.g. TVDB collections via AIOmetadata). >1 video distinguishes it from a normal movie
+    /// (which has 0-1). Render those as an episodic list so the entries show, instead of trying to stream the
+    /// collection id itself (which has no sources -> the "one entry, can't find sources" report, #102).
+    /// Live/EPG schedules are excluded (they use videos[] as a now/next schedule, not a playable list).
+    private var isEpisodic: Bool {
+        if type == "series" { return true }
+        if let vids = meta?.videos, vids.count > 1, meta?.behaviorHints?.hasScheduledVideos != true { return true }
+        return false
+    }
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // blur unwatched episode thumbnails to avoid spoilers
@@ -278,7 +289,7 @@ struct iOSDetailView: View {
                             // source-heavy content to a readable column and center it (long lines hurt
                             // readability). iPhone (and any narrow width) stays full-width as before.
                             Group {
-                                if type == "series" {
+                                if isEpisodic {
                                     episodeList
                                 } else {
                                     sourceSection.id(Self.sourcesAnchor)

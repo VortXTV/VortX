@@ -33,7 +33,11 @@ struct DetailView: View {
                 // so the player's live-tuned path engages (see TVPlayerView.initialLiveMode).
                 if LiveTypes.contains(type) {
                     livePage(meta)
-                } else if type == "series", let videos = meta.videos, !videos.isEmpty {
+                // A series OR a COLLECTION/franchise meta (a non-series carrying >1 entries as videos[], e.g.
+                // TVDB collections via AIOmetadata) renders the episodic list; a normal movie (0-1 video) falls
+                // through to moviePage. Without the collection case it showed as one un-streamable entry (#102).
+                } else if let videos = meta.videos, !videos.isEmpty,
+                          (type == "series" || (videos.count > 1 && meta.behaviorHints?.hasScheduledVideos != true)) {
                     seriesPage(meta, videos: videos)
                 } else {
                     moviePage(meta)

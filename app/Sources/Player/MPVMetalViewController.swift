@@ -468,6 +468,14 @@ final class MPVMetalViewController: PlatformViewController {
         // macOS mpv uses the coreaudio AO, which negotiates rate, channels, and routing natively
         // like desktop mpv, so we leave audio at mpv's defaults.
         #if canImport(UIKit)
+        #if os(tvOS)
+        // #78/#101: prefer the avfoundation AO (AVSampleBufferAudioRenderer) over audiounit on tvOS. The
+        // low-level audiounit AO cannot OPEN an Apple TV HDMI route that "continuous audio playback" (a 2nd-gen+
+        // feature) expands to many channels -> dead silence; avfoundation negotiates that route the way AVPlayer
+        // does, and falls back to audiounit if unavailable. Requires MPVKit >= 0.41.0-n8.1.2 (PR #73 builds the
+        // avfoundation AO for tvOS). THIS is the actual fix; the rate/channel tweaks below are belt-and-suspenders.
+        checkError(mpv_set_option_string(mpv, "ao", "avfoundation,audiounit"))
+        #endif
         checkError(mpv_set_option_string(mpv, "audio-channels", channelPolicy))
         // Passthrough mode bitstreams Dolby/DTS to a capable AV receiver instead of decoding to PCM;
         // mpv degrades spdif -> PCM on a route that can't take it, so this never forces silence.

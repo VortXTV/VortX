@@ -32,6 +32,10 @@ struct FeaturedHeroView: View {
     /// WKWebView IFrame cover (`TrailerEmbedCover`), the reliable YouTube path now that tokenless extraction
     /// is dead. Drives a cover.
     @State private var trailerEmbed: TrailerEmbedLaunch?
+    /// The trailer presented full-screen IN-APP via the NATIVE libmpv player (the /clip mp4, same source as the
+    /// ambient hero clip + the detail page). Preferred over the IFrame so nothing in the hero can show a
+    /// YouTube error card or hand off to a browser (#103).
+    @State private var trailerPlay: TrailerNativeLaunch?
 
 
     /// Hero band height. iOS is 380: a bit bigger than the 0.3.0 320 (the user wanted a larger billboard),
@@ -77,6 +81,14 @@ struct FeaturedHeroView: View {
         // (the reliable YouTube path now that tokenless extraction is dead), filling the window on macOS too.
         .platformFullScreenPlayerCover(item: $trailerEmbed) { launch in
             TrailerEmbedCover(youTubeID: launch.youTubeID, title: launch.title, onClose: { trailerEmbed = nil })
+                .ignoresSafeArea()
+        }
+        // #103: the Trailer chip plays the native /clip mp4 in libmpv (NEVER the YouTube IFrame), so the hero
+        // can never show a YouTube error card. The IFrame cover above is the last-resort path only when no
+        // clipURL resolves.
+        .platformFullScreenPlayerCover(item: $trailerPlay) { launch in
+            PlayerScreen(url: launch.url, title: launch.title, headers: nil, resumeSeconds: 0,
+                         recordMeta: nil, isTrailer: true, onClose: { trailerPlay = nil })
                 .ignoresSafeArea()
         }
     }
@@ -256,11 +268,17 @@ struct FeaturedHeroView: View {
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
     /// Tapping it opens an explicit full-screen IN-APP player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
-        if let yt = hero.trailerYouTubeID, !yt.isEmpty {
+        let yt = hero.trailerYouTubeID
+        if hero.clipURL != nil || (yt.map { !$0.isEmpty } ?? false) {
             Button {
-                // Play the trailer in-app via the keyless WKWebView IFrame cover (the reliable YouTube path
-                // now that tokenless /yt extraction is dead), with a silent hand-off if a video blocks embedding.
-                trailerEmbed = TrailerEmbedLaunch(youTubeID: yt, title: "\(hero.name) — Trailer")
+                // NATIVE first: play the /clip mp4 in libmpv (same source as the ambient clip + the detail
+                // page), so the hero never shows a YouTube error card or hands off to a browser (#103). The
+                // IFrame is the last resort only when no clipURL resolves.
+                if let clip = hero.clipURL {
+                    trailerPlay = TrailerNativeLaunch(url: clip, title: "\(hero.name) Trailer")
+                } else if let yt, !yt.isEmpty {
+                    trailerEmbed = TrailerEmbedLaunch(youTubeID: yt, title: "\(hero.name) Trailer")
+                }
             } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }
@@ -293,5 +311,12 @@ private struct KenBurnsArt<Content: View>: View {
 private struct TrailerEmbedLaunch: Identifiable {
     let id = UUID()
     let youTubeID: String
+    let title: String
+}
+
+/// Identifiable launch box for the hero Trailer chip's NATIVE libmpv player cover (#103, the /clip mp4 path).
+private struct TrailerNativeLaunch: Identifiable {
+    let id = UUID()
+    let url: URL
     let title: String
 }
