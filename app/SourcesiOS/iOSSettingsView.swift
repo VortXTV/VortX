@@ -127,7 +127,11 @@ struct iOSSettingsView: View {
             // this instead of the system blue/grey, matching how tvOS SettingsView colors its
             // controls. Per-control `.tint` overrides below stay (destructive red, etc.).
             .tint(Theme.Palette.accent)
+            // navigationTitle bridges into the single shared window toolbar on macOS where every mounted
+            // tab stamps its own title, crashing NSToolbar on duplicate inserts. So it is iOS-only.
+            #if os(iOS)
             .navigationTitle("Settings")
+            #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in

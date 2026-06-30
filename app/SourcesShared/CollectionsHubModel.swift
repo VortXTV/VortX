@@ -54,6 +54,16 @@ enum DiscoverList: String, CaseIterable, Hashable {
         case .upcoming: return 0.42
         }
     }
+    /// The primary TMDB movie list path used to resolve this card's representative backdrop. Mirrors the
+    /// first (movie) sub-catalog in `discoverSubs` so the card art matches what it opens.
+    var backdropListPath: String {
+        switch self {
+        case .trending: return "/trending/movie/week"
+        case .popular:  return "/movie/popular"
+        case .latest:   return "/movie/now_playing"
+        case .upcoming: return "/movie/upcoming"
+        }
+    }
 }
 
 // MARK: - Genres
@@ -250,6 +260,9 @@ final class CollectionsHubModel: ObservableObject {
     /// Genre title -> representative backdrop URL, resolved + cached on the same cadence as the providers.
     /// Empty until resolved; the genre tiles fall back to their tint gradient for any title not yet present.
     @Published private(set) var genreBackdrops: [String: String] = [:]
+    /// Discover card -> representative backdrop URL, resolved + cached on the same cadence as the genre tiles.
+    /// Empty until resolved; the Discover cards fall back to their gradient for any card not yet present.
+    @Published private(set) var discoverBackdrops: [DiscoverList: String] = [:]
 
     let discover = DiscoverList.allCases
     let genres = CollectionsHubModel.genreList
@@ -257,6 +270,7 @@ final class CollectionsHubModel: ObservableObject {
     private var loadedRegion: String?
     private var loadTask: Task<Void, Never>?
     private var genreTask: Task<Void, Never>?
+    private var discoverTask: Task<Void, Never>?
 
     /// Always available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres)
     /// even with no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
@@ -266,8 +280,9 @@ final class CollectionsHubModel: ObservableObject {
     /// exists it is shown immediately and no network call is made; otherwise it fetches and re-caches.
     /// Idempotent for a region per app run.
     func load(region: String = TMDBClient.deviceRegion) {
-        guard Self.isAvailable else { providers = []; genreBackdrops = [:]; loadedRegion = nil; return }
-        loadGenreBackdrops(region: region)   // independent cadence-cached resolve (runs even when providers are cache-fresh)
+        guard Self.isAvailable else { providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil; return }
+        loadGenreBackdrops(region: region)      // independent cadence-cached resolve (runs even when providers are cache-fresh)
+        loadDiscoverBackdrops(region: region)   // same independent cadence-cached resolve for the Discover cards
         guard loadTask == nil else { return }   // never run two fetches at once
         // Already loaded for this region AND the cache is still fresh -> nothing to do. (A stale cache for the
         // same region falls through so the cadence refresh actually fires; the old `loadedRegion != region`
@@ -292,7 +307,8 @@ final class CollectionsHubModel: ObservableObject {
     func clear() {
         loadTask?.cancel(); loadTask = nil
         genreTask?.cancel(); genreTask = nil
-        providers = []; genreBackdrops = [:]; loadedRegion = nil
+        discoverTask?.cancel(); discoverTask = nil
+        providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil
     }
 
     // MARK: genre backdrops (cadence-cached representative artwork per genre)
@@ -343,6 +359,58 @@ final class CollectionsHubModel: ObservableObject {
     }
     private static func genreCacheIsFresh(region: String) -> Bool {
         let at = UserDefaults.standard.double(forKey: genreCacheAtKey(region))
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
+    }
+
+    // MARK: discover-card backdrops (cadence-cached representative artwork per Discover card)
+
+    /// Resolve a representative backdrop for each Discover card. Paints instantly from the region cache, then
+    /// (if stale) refetches all four cards in one 429-safe batch and re-caches. Independent of the provider /
+    /// genre loads so a fresh cache for those never blocks the Discover artwork refresh. Direct mirror of
+    /// `loadGenreBackdrops`.
+    private func loadDiscoverBackdrops(region: String) {
+        if let cached = Self.cachedDiscoverBackdrops(region: region) { discoverBackdrops = cached }
+        if Self.discoverCacheIsFresh(region: region) { return }
+        guard discoverTask == nil else { return }
+        discoverTask = Task { [weak self] in
+            var out: [DiscoverList: String] = [:]
+            // Only four cards, so a single gentle task group is enough (no batching needed); kept 429-safe.
+            await withTaskGroup(of: (DiscoverList, String?).self) { group in
+                for card in DiscoverList.allCases {
+                    group.addTask {
+                        (card, await TMDBClient.listBackdrop(path: card.backdropListPath, region: region))
+                    }
+                }
+                for await (card, url) in group { if let url { out[card] = url } }
+            }
+            guard let self, !Task.isCancelled, !out.isEmpty else { self?.discoverTask = nil; return }
+            self.discoverBackdrops = out       // keep the prior cache on an all-empty fetch (don't blank the tiles)
+            self.discoverTask = nil
+            Self.cacheDiscoverBackdrops(out, region: region)
+        }
+    }
+
+    private static func discoverCacheKey(_ region: String) -> String { "vortx.collections.discoverBackdrops.\(region)" }
+    private static func discoverCacheAtKey(_ region: String) -> String { "vortx.collections.discoverBackdropsAt.\(region)" }
+
+    private static func cacheDiscoverBackdrops(_ map: [DiscoverList: String], region: String) {
+        // Persist with the raw-value string keys (UserDefaults can't hold enum keys).
+        let raw = Dictionary(uniqueKeysWithValues: map.map { ($0.key.rawValue, $0.value) })
+        UserDefaults.standard.set(raw, forKey: discoverCacheKey(region))
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: discoverCacheAtKey(region))
+    }
+    private static func cachedDiscoverBackdrops(region: String) -> [DiscoverList: String]? {
+        guard let raw = UserDefaults.standard.dictionary(forKey: discoverCacheKey(region)) as? [String: String],
+              !raw.isEmpty else { return nil }
+        let map = Dictionary(uniqueKeysWithValues: raw.compactMap { key, value -> (DiscoverList, String)? in
+            guard let card = DiscoverList(rawValue: key) else { return nil }
+            return (card, value)
+        })
+        return map.isEmpty ? nil : map
+    }
+    private static func discoverCacheIsFresh(region: String) -> Bool {
+        let at = UserDefaults.standard.double(forKey: discoverCacheAtKey(region))
         guard at > 0 else { return false }
         return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
     }

@@ -17,7 +17,7 @@ struct TVCollectionsHub: View {
         VStack(alignment: .leading, spacing: Theme.Space.xl) {
             section(title: "Discover", eyebrow: "Browse") {
                 ForEach(model.discover, id: \.self) { list in
-                    NavigationLink { TVCategoryBrowse(target: .discover(list)) } label: { DiscoverCardTile(list: list) }
+                    NavigationLink { TVCategoryBrowse(target: .discover(list)) } label: { DiscoverCardTile(list: list, backdrop: model.discoverBackdrops[list]) }
                         .buttonStyle(CardFocusStyle())
                 }
             }
@@ -61,9 +61,15 @@ private let kHubTileWidth: CGFloat = 240
 /// A cinematic Discover card (Trending / Popular / Latest / Upcoming): gradient + glyph + title + subtitle.
 struct DiscoverCardTile: View {
     let list: DiscoverList
+    /// Representative movie backdrop (resolved + daily-cached by CollectionsHubModel). The gradient is the
+    /// base fallback, so a missing/slow backdrop still reads as a finished tile.
+    var backdrop: String? = nil
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: list.gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
+            if backdrop != nil { RemoteCover(url: backdrop) }
+            // Bottom-up scrim like TVGenreTile so the title/subtitle stay legible over real artwork.
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.25), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             Image(systemName: list.symbol)
                 .font(.system(size: 40, weight: .bold))
                 .foregroundStyle(Theme.Palette.accent.opacity(list.accentOpacity))
@@ -73,6 +79,7 @@ struct DiscoverCardTile: View {
                 Text(list.title).font(.system(size: 26, weight: .bold)).foregroundStyle(.white)
                 Text(list.subtitle).font(.system(size: 16, weight: .medium)).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
             }
+            .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
             .padding(Theme.Space.lg)
         }
         .frame(width: kHubCardWidth, height: kHubCardWidth * 0.52)

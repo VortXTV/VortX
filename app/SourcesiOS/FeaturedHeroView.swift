@@ -71,6 +71,21 @@ struct FeaturedHeroView: View {
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
+        #if os(macOS)
+        // With .windowStyle(.hiddenTitleBar) the top safe-area inset collapses; let just the first band
+        // bleed into that region so its top isn't clipped. Only .top/.container, so the rails below keep
+        // normal insets. The dual scrim (below) keeps the window controls legible over the art.
+        .ignoresSafeArea(.container, edges: .top)
+        // Mac branding lives in content (the window toolbar is removed to kill the NSToolbar crash). The
+        // hero is the first element on Home / Discover / Library, so the wordmark reads on every primary
+        // Mac screen. Pure SwiftUI overlay, never a ToolbarItem.
+        .overlay(alignment: .topLeading) {
+            VortXWordmark(fontSize: 22)
+                .padding(.leading, Theme.Space.lg)
+                .padding(.top, Theme.Space.lg)
+                .allowsHitTesting(false)
+        }
+        #endif
         // The LazyVStack host has no horizontal padding (each rail insets itself), so the band is
         // already edge-to-edge — a fixed-height ambient scroll-header.
         // Animate the swap on the hero id — the model already wraps content changes in the matching

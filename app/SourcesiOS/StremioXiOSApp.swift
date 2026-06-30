@@ -141,6 +141,10 @@ struct StremioXiOSApp: App {
                 // iPadOS ignore this — their windows are managed by the system, not content size.)
                 #if os(macOS)
                 .frame(minWidth: 900, minHeight: 600)
+                // Resolve the single shared NSToolbar as hidden so updateLocations has nothing to
+                // insert into. Combined with .windowStyle(.hiddenTitleBar) below this removes the
+                // toolbar OBJECT the NSToolbar-insert crash requires, not just each item source.
+                .toolbar(.hidden, for: .windowToolbar)
                 #endif
         }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
@@ -149,6 +153,9 @@ struct StremioXiOSApp: App {
         #if os(macOS)
         .defaultSize(width: 1280, height: 820)
         .windowResizability(.contentMinSize)
+        // AppKit never stands up a titlebar/toolbar at window creation, so the shared NSToolbar
+        // the crash inserts into is never created. (macOS 14 target, so .hiddenTitleBar is available.)
+        .windowStyle(.hiddenTitleBar)
         .commands {
             // Single-window media app: the document-style File ▸ New does nothing here, so drop it.
             CommandGroup(replacing: .newItem) { }

@@ -11,12 +11,20 @@ import SwiftUI
 
 struct iOSCollectionsHub: View {
     @ObservedObject var model: CollectionsHubModel
+    @ObservedObject private var downloads = DownloadStore.shared   // surface a Downloads tile only when there are any
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
+            // Downloads tile: shown ONLY when there is at least one download, so Home stays clean by default.
+            // A second entry point alongside the inline Library downloads section (no new bottom-bar tab).
+            if !downloads.records.isEmpty {
+                hubSection(title: "Downloads") {
+                    NavigationLink { iOSDownloadsScreen() } label: { iOSDownloadsTile(count: downloads.records.count) }.buttonStyle(.plain)
+                }
+            }
             hubSection(title: "Discover") {
                 ForEach(model.discover, id: \.self) { list in
-                    NavigationLink(value: HubTarget.discover(list)) { iOSDiscoverCard(list: list) }.buttonStyle(.plain)
+                    NavigationLink(value: HubTarget.discover(list)) { iOSDiscoverCard(list: list, backdrop: model.discoverBackdrops[list]) }.buttonStyle(.plain)
                 }
             }
             if !model.providers.isEmpty {
@@ -53,9 +61,17 @@ private let kiOSCardWidth: CGFloat = 224
 
 struct iOSDiscoverCard: View {
     let list: DiscoverList
+    /// Representative movie backdrop for this card (resolved + daily-cached by CollectionsHubModel). The
+    /// gradient is the base fallback, so a missing/slow backdrop still reads as a finished tile.
+    var backdrop: String? = nil
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: list.gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
+            if let backdrop, let url = URL(string: backdrop) {
+                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
+            }
+            // Bottom-up scrim like iOSGenreTile so the title/subtitle stay legible over real artwork.
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.25), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             Image(systemName: list.symbol)
                 .font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.Palette.accent.opacity(list.accentOpacity))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(Theme.Space.md)
@@ -63,6 +79,7 @@ struct iOSDiscoverCard: View {
                 Text(list.title).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
                 Text(list.subtitle).font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
             }
+            .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
             .padding(Theme.Space.md)
         }
         .frame(width: kiOSCardWidth, height: kiOSCardWidth * 0.5)
@@ -79,11 +96,38 @@ struct iOSServiceTile: View {
             Theme.Palette.surface2
             if let logo = provider.logoURL, let url = URL(string: logo) {
                 AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fit) } placeholder: { Color.clear }
-                    .padding(.horizontal, 28).padding(.vertical, 22)
+                    // Fill the pill: the logo expands to the tile bounds with only a small breathing
+                    // margin, so a square mark reads as a branded tile instead of a tiny centered icon
+                    // stranded in grey. Keep .fit (not .fill) so wordmark logos aren't cropped.
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.horizontal, 18).padding(.vertical, 10)
+                    .clipped()
             } else {
                 Text(provider.name).font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
                     .multilineTextAlignment(.center).padding(10)
             }
+        }
+        .frame(width: kiOSCardWidth, height: kiOSCardWidth * 0.5)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+}
+
+/// The Downloads hub tile: a gradient card with the offline glyph and a count, matching the Discover-card
+/// size. Pushes the standalone `iOSDownloadsScreen`.
+struct iOSDownloadsTile: View {
+    let count: Int
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(colors: [Theme.Palette.surface2, Theme.Palette.surface1], startPoint: .topLeading, endPoint: .bottomTrailing)
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.Palette.accent)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(Theme.Space.md)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Downloads").font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                Text(count == 1 ? "1 item saved offline" : "\(count) items saved offline")
+                    .font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
+            }
+            .padding(Theme.Space.md)
         }
         .frame(width: kiOSCardWidth, height: kiOSCardWidth * 0.5)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))

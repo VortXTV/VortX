@@ -486,6 +486,18 @@ enum TMDBClient {
         return bd.map { "https://image.tmdb.org/t/p/w780\($0)" }
     }
 
+    /// A representative 16:9 backdrop for a Discover card, from the most popular title in its primary movie
+    /// list (a TMDB list path like `/trending/movie/week` or `/movie/popular`), as a w780 URL. One list call,
+    /// fail-soft to nil. The direct mirror of `genreBackdrop` for the Discover tiles. The scrim in the tile
+    /// keeps the label legible.
+    static func listBackdrop(path: String, region: String = deviceRegion) async -> String? {
+        let key = ApiKeys.effectiveTMDBKey()
+        let full = "\(path)?api_key=\(key)&language=en-US&page=1&region=\(region)"
+        guard let obj = await get(full), let results = obj["results"] as? [[String: Any]] else { return nil }
+        let bd = results.compactMap { $0["backdrop_path"] as? String }.first
+        return bd.map { "https://image.tmdb.org/t/p/w780\($0)" }
+    }
+
     /// ISO `yyyy-MM-dd` for `daysAgo` days before now (0 = today). Bounds the Top-This-Week/Month/Year and
     /// "new"/"upcoming" date windows for the sub-catalog discover queries.
     static func isoDate(daysAgo: Int) -> String {

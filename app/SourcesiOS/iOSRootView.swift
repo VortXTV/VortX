@@ -436,8 +436,11 @@ struct iOSHomeView: View {
             // Its bottom fades cleanly into canvas with a small gap before the first rail (#52) — the
             // old negative-overlap tuck made the hero bleed into Continue Watching.
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    FeaturedHeroView(model: hero, onOpen: { path.append($0) })
+                // Sticky hero (like tvOS): the band is a pinned section HEADER, so it stays a first-class,
+                // hit-tested, in-flow subview that pins to the top as the rails scroll under it. NOT a
+                // ZStack-behind-the-scroll (that ate the hero's Play/Trailer/poster taps before).
+                LazyVStack(alignment: .leading, spacing: Theme.Space.lg, pinnedViews: [.sectionHeaders]) {
+                    Section {
                     if !continueWatchingItems.isEmpty {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
@@ -525,6 +528,9 @@ struct iOSHomeView: View {
                     // empty, and one with none still shows the empty state honestly.
                     if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
                         emptyState
+                    }
+                    } header: {
+                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     }
                 }
                 .padding(.bottom, Theme.Space.md)
@@ -769,13 +775,18 @@ struct iOSLibraryView: View {
                     // plain VStack adopt the chips' wider-than-screen content width and shift the whole
                     // column left/clipped (the beta7 "weird viewport"). Greedy-width LazyVStack pins it
                     // to the viewport, matching Home. See the iOSDiscoverView note for the full rationale.
-                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
-                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
+                    // Sticky hero (like tvOS): pinned section HEADER so it stays in-flow + hit-tested and
+                    // pins to the top while the grid scrolls under it. Not a behind-scroll ZStack (taps).
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg, pinnedViews: [.sectionHeaders]) {
+                        Section {
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
                             if profiles.activeUsesEngineHistory, let lib = core.library {
                                 filterChips(lib.selectable)
                             }
                             PosterGrid(items: libraryItems, onTap: handleTap, menu: .library)
+                        }
+                        } header: {
+                            FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -906,9 +917,20 @@ struct DownloadsView: View {
             default:         return "arrow.down.circle"
             }
         }()
-        Image(systemName: symbol)
+        let glyph = Image(systemName: symbol)
             .font(.system(size: 26))
             .foregroundStyle(record.state == .failed ? Theme.Palette.textTertiary : Theme.Palette.accent)
+            .frame(width: 34, height: 34)
+            .contentShape(Rectangle())
+        // For a finished download the leading glyph is a real Play affordance (it read as the obvious
+        // tap target but did nothing before); other states keep it decorative.
+        if record.state == .completed {
+            Button { play(record) } label: { glyph }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Play")
+        } else {
+            glyph
+        }
     }
 
     @ViewBuilder private func subtitle(_ record: DownloadRecord) -> some View {
@@ -980,6 +1002,29 @@ struct DownloadsView: View {
         onPlay(launch)
     }
 }
+
+/// A standalone Downloads screen: the same `DownloadsView` list, plus its own player cover, so it can be
+/// pushed from the Home / Discover Collections hub's Downloads tile (a second entry point besides the
+/// inline Library section). Pulls account/core from the environment to host the local-file player.
+struct iOSDownloadsScreen: View {
+    @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var core: CoreBridge
+    @State private var downloadPlayer: iOSPlayerLaunch?
+
+    var body: some View {
+        ScrollView {
+            DownloadsView(onPlay: { launch in downloadPlayer = launch })
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.vertical, Theme.Space.lg)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle("Downloads")
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .iOSPlayerCover($downloadPlayer, account: account, core: core)
+    }
+}
 #endif
 
 /// Search across every installed add-on, on the engine (debounced). Mirrors the tvOS `SearchView`:
@@ -1047,18 +1092,17 @@ struct iOSSearchView: View {
                     Text(title).searchCompletion(title)
                 }
             }
-            #endif
+            // `.onSubmit(of: .search)` registers search-submit plumbing into the single shared window
+            // toolbar on macOS (the same NSToolbar-insert crash class as the wordmark/.searchable). It is
+            // only meaningful paired with `.searchable` (iOS). The macOS inline TextField above carries its
+            // own `.onSubmit { ... }`, so search-submit stays covered. So this is iOS-only.
             .onSubmit(of: .search) {
                 searchTask?.cancel()
                 searchDebouncePending = false
                 core.suggestSearch(query)
                 core.search(query)
-                // On macOS the search bar is visible in the toolbar on every tab (all tabs stay
-                // mounted). Switch to the Search tab so results are actually visible.
-                #if os(macOS)
-                if !isActive { MacCommands.go(.search) }
-                #endif
             }
+            #endif
             .onAppear {
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
@@ -1220,12 +1264,12 @@ struct iOSDiscoverView: View {
                 // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
                 // on the cross axis — it always takes the full viewport width — so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
-                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
-                    // Hero leads UNCONDITIONALLY (like Home) so Discover ALWAYS has its persistent cinematic
-                    // header, even before the catalog loads — the regression where it was gated behind
-                    // `if let discover` meant Discover showed NO hero until a catalog arrived. The model
-                    // tolerates an empty pool and re-seeds on addons/revision (onChange handlers below).
-                    FeaturedHeroView(model: hero, onOpen: { path.append($0) })
+                LazyVStack(alignment: .leading, spacing: Theme.Space.md, pinnedViews: [.sectionHeaders]) {
+                    // Sticky hero (like tvOS): the band is a pinned section HEADER so it leads
+                    // UNCONDITIONALLY (the model tolerates an empty pool and re-seeds on addons/revision)
+                    // and pins to the top while the chips/grid scroll under it. Kept as an in-flow,
+                    // hit-tested header (never a behind-scroll ZStack, which ate the hero's taps).
+                    Section {
                     if showCollectionsHub, CollectionsHubModel.isAvailable {
                         iOSCollectionsHub(model: collectionsHub)
                     }
@@ -1260,6 +1304,9 @@ struct iOSDiscoverView: View {
                     } else {
                         ContentUnavailableViewCompat(title: "Discover", systemImage: "safari",
                             message: "Sign in to browse your add-ons' catalogs.").frame(minHeight: 420)
+                    }
+                    } header: {
+                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     }
                 }
                 .padding(.top, core.discover != nil ? 0 : Theme.Space.md)
@@ -1934,7 +1981,15 @@ struct PosterGrid: View {
     // Center the adaptive tracks so the cards distribute evenly across the available width. Min track
     // matches the card width: 168pt landscape pills (TMDB key required), else 116pt portrait.
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: catalogPrefs.landscapeCards && apiKeys.hasTMDB ? 168 : 116), spacing: Theme.Space.sm, alignment: .center)]
+        // Match PosterCardiOS.macScale so the adaptive track derives fewer, bigger columns on the wide
+        // Mac window instead of cramming iPhone-sized cards across it.
+        #if os(macOS)
+        let scale: CGFloat = 1.5
+        #else
+        let scale: CGFloat = 1.0
+        #endif
+        let minTrack = (catalogPrefs.landscapeCards && apiKeys.hasTMDB ? 168 : 116) * scale
+        return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
@@ -2294,8 +2349,15 @@ private struct PosterCardiOS: View {
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
     private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
-    private var cardW: CGFloat { landscape ? 168 : 120 }
-    private var cardH: CGFloat { landscape ? 95 : 180 }   // 168 * 9/16 ≈ 95
+    // The Mac reuses these iOS cards on a wide desktop window, where the iPhone-sized constants render
+    // far too small. Scale them up on macOS only; iPhone/iPad keep the original sizes.
+    #if os(macOS)
+    private static let macScale: CGFloat = 1.5
+    #else
+    private static let macScale: CGFloat = 1.0
+    #endif
+    private var cardW: CGFloat { (landscape ? 168 : 120) * Self.macScale }
+    private var cardH: CGFloat { (landscape ? 95 : 180) * Self.macScale }   // 168 * 9/16 ≈ 95
 
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu, onDetails: onDetails))
@@ -2450,19 +2512,18 @@ extension View {
     /// this gate every browse screen stamps its own wordmark and they tile ("StremioX"×4). The
     /// conditional lives *inside* `@ToolbarContentBuilder` — branching the whole view instead would
     /// change the NavigationStack's structural identity and reset its scroll/path on every tab switch.
+    @ViewBuilder
     func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {
+        // navigationTitle itself bridges into the single shared window toolbar on macOS, and with all
+        // seven tab screens mounted at once (opacity-switched to preserve state) every browse screen
+        // stamps its own title, so NSToolbar crashes inserting duplicate items (EXC_BREAKPOINT in
+        // _insertNewItemWithItemIdentifier, the Beta 7 Mac crash). So the WHOLE title+toolbar path is
+        // compile-gated to iOS. A compile-time gate (not a runtime branch) leaves the NavigationStack's
+        // structural identity unchanged, so there is no scroll/path reset. On macOS the wordmark moves
+        // into content (see FeaturedHeroView's macOS overlay); the title is dropped entirely here.
+        #if os(iOS)
         navigationTitle(pageTitle)
             .navigationBarTitleDisplayModeInlineCompat()
-            // The brand wordmark in the navigation bar's PRINCIPAL slot is iOS-only. On macOS a
-            // `.principal` item is hoisted into the single shared window titlebar, and all seven tab
-            // screens stay mounted at once (opacity-switched to preserve state), so every browse screen
-            // would stamp its own wordmark into the one principal slot and NSToolbar crashes inserting a
-            // duplicate principal item (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, the Beta 7 Mac
-            // crash; the old `isActive` content-toggle did not stop the four ITEMS coexisting). Compile-
-            // gating the whole toolbar out on macOS removes the collision; the Mac keeps the native
-            // `navigationTitle(pageTitle)` in its titlebar. A compile-time gate (not a runtime branch)
-            // leaves the NavigationStack's structural identity unchanged, so there is no scroll/path reset.
-            #if os(iOS)
             .toolbar {
                 ToolbarItem(placement: .principal) {
                     if isActive {
@@ -2479,17 +2540,28 @@ extension View {
             // blurred chrome rather than a flat opaque strip.
             .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
-            #endif
+        #else
+        self
+        #endif
     }
 
     /// A scroll/drag on a browse screen quiets the ambient hero rotation; the model resumes it after a
     /// spell of inactivity (#53). Implemented as a non-blocking `simultaneousGesture` so it observes
     /// the drag without intercepting the ScrollView's own scrolling.
+    @ViewBuilder
     func scrollDismissesHeroRotation(model: FeaturedHeroModel) -> some View {
+        // Arm the drag-observer only on iOS. On AppKit a ScrollView-level simultaneousGesture wins click
+        // arbitration over the small .plain Buttons in the subtree (download play/icon buttons, hub /
+        // streaming / Discover cards) and swallows their clicks. The hero is already quieted on macOS by
+        // focus/move interaction, so dropping the gesture there costs nothing and restores card clicks.
+        #if os(macOS)
+        self
+        #else
         simultaneousGesture(
             DragGesture(minimumDistance: 8)
                 .onChanged { _ in model.noteInteraction() }
         )
+        #endif
     }
 
     /// `.navigationBarTitleDisplayMode(.inline)` is unavailable on macOS; no-op there.
