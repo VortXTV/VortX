@@ -8,7 +8,7 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.8 Beta 16 - 2026-06-30 (pre-release)
 
-The first public build since Beta 13, folding in Beta 14 and Beta 15 and a final fix pass (build 138). The Mac crash is fully closed, brand-new releases show their sources, scrub previews capture on every kind of stream, downloads survive an app relaunch, and a batch of Apple TV playback fixes are in. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV playback notes on real hardware.
+A fix-focused build over Beta 15 (build 138). The Mac crash is fully closed, brand-new releases show their sources from the hub, scrub previews capture on every kind of stream, downloads survive an app relaunch, and a batch of Apple TV playback fixes are in. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV playback notes on real hardware.
 
 ### Fixed
 
