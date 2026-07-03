@@ -9,6 +9,7 @@ import com.stremiox.android.model.MetaItem
 import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
 import com.stremiox.android.model.StreamSource
+import android.util.Log
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -51,13 +52,21 @@ class EngineStremioRepository(
 
     /// Initialize the engine once. Idempotent; safe to call from multiple repositories (the native
     /// side is also idempotent). Storage goes to the durable filesDir, the HTTP cache to cacheDir.
+    ///
+    /// Fail-soft: if the native library failed to load or init throws (e.g. a missing/incompatible
+    /// `libstremiox_core.so`), we log and leave [started] false. Every dispatch/getState below is then
+    /// a no-op that yields the engine's `"null"` sentinel, so the parsers return empty state and the UI
+    /// renders an empty (not crashed) screen. The boundary must never take down the whole app.
     @Synchronized
     private fun start() {
         if (started) return
         val storageDir = appContext.filesDir.absolutePath
         val cacheDir = appContext.cacheDir.absolutePath
-        started = StremioXCore.init(storageDir, cacheDir) { json ->
-            onEngineEvent(json)
+        started = runCatching {
+            StremioXCore.init(storageDir, cacheDir) { json -> onEngineEvent(json) }
+        }.getOrElse { error ->
+            Log.e(TAG, "stremio-core init failed; UI will render empty until the engine is available", error)
+            false
         }
     }
 
@@ -158,5 +167,6 @@ class EngineStremioRepository(
         // Match CoreBridge's initial board fetch and search range so behavior tracks the reference app.
         const val DEFAULT_BOARD_ROWS = 12
         const val DEFAULT_SEARCH_ROWS = 30
+        const val TAG = "StremioXEngine"
     }
 }
