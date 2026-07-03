@@ -2,6 +2,11 @@ import Foundation
 import Libavformat
 import Libavcodec
 import Libavutil
+// Libdovi (libdovi's C API, vendored inside MPVKit-GPL alongside FFmpeg) is used to convert a Dolby Vision
+// Profile 7 RPU to Profile 8.1 in-flight so AVPlayer/VideoToolbox can decode it as TRUE DV. It is linked into
+// every native Apple target (and the legacy web-host target) transitively via MPVKit-GPL, the same package that
+// provides Libavcodec/format/util above, so the import resolves wherever this file compiles.
+import Libdovi
 
 /// DV-for-MKV STREAMING remux (Phase 1). Opens an MKV from a debrid HTTP(S) URL and stream-copies it into a
 /// fragmented MP4, writing the muxed bytes to an in-memory `VortXRemuxBuffer` via a CUSTOM AVIO write callback
@@ -11,9 +16,14 @@ import Libavutil
 /// config box survive; only the container changes.
 ///
 /// What the output CARRIES is constrained by what AVPlayer can actually play:
-///   - Video: only single-layer DV Profile 5 / 8.x. Profile 7 (BL+EL) has no VideoToolbox decode, and a
-///     stream whose DV label lied (no DOVI config) gains nothing here: both FAIL FAST (before any video
-///     mounts) so the chrome demotes to libmpv's HDR10 tone-map instead of dead-ending on an AVPlayer error.
+///   - Video: single-layer DV Profile 5 / 8.x plays as a pure stream-copy. Dual-layer Profile 7 (BL+EL, i.e.
+///     ~every UHD-BluRay DV rip) is CONVERTED on the fly to Profile 8.1: AVPlayer/VideoToolbox cannot decode
+///     Profile 7's enhancement layer, but it CAN decode the Profile 8.1 base layer as true DV. We drop the EL
+///     (whether a separate MKV track or an in-band UNSPEC63 sublayer NAL) and convert the DV RPU NAL to
+///     Profile 8.1 via libdovi, then advertise dv_profile=8 / bl_compat=1 on the output so the mov muxer emits
+///     a Profile-8 `dvvC` box and AVPlayer engages true DV. A stream whose DV label lied (no DOVI config) still
+///     FAILS FAST (before any video mounts) so the chrome demotes to libmpv's HDR10 tone-map; a Profile-7
+///     conversion that errors at runtime also fails soft to that same demotion, never a crash or a hang.
 ///   - Audio: only AVPlayer-decodable codecs (AAC/AC3/EAC3/ALAC/MP3/FLAC) are mapped. TrueHD and DTS are
 ///     DROPPED, AVPlayer cannot decode them, and muxed in they either kill the muxer or play silent. A
 ///     source whose ONLY audio is TrueHD/DTS fails fast for the same libmpv demotion (mpv decodes them all).
@@ -173,17 +183,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var mappable = Set<Int>()
         var audioSeen: [String] = []
         var hasDecodableAudio = false
+        // The base-layer (primary) video track. For DUAL-TRACK Profile 7 (separate BL + EL video streams), the
+        // FIRST video stream is the base layer we keep; any later video stream is the enhancement layer, which
+        // AVPlayer can't decode and which we DROP (never mapped). Single-track sources have exactly one video
+        // stream, so this is a no-op for them. `baseVideoIn` also tells the mux loop which packets to convert.
+        var baseVideoIn = -1
         for i in 0..<nb {
             guard let inStream = inCtx.pointee.streams[i], let par = inStream.pointee.codecpar else { continue }
             switch par.pointee.codec_type {
             case AVMEDIA_TYPE_VIDEO:
-                if info.dvProfile < 0 {
+                if baseVideoIn < 0 {
+                    baseVideoIn = i
                     info.width = Int(par.pointee.width)
                     info.height = Int(par.pointee.height)
                     info.videoCodec = Self.codecName(par.pointee.codec_id)
                     Self.readDoVi(par, into: &info)
+                    mappable.insert(i)   // map ONLY the base-layer video track
                 }
-                mappable.insert(i)
+                // Additional video streams (a dual-track P7 enhancement layer) are intentionally NOT mapped.
             case AVMEDIA_TYPE_AUDIO:
                 audioSeen.append(Self.codecName(par.pointee.codec_id))
                 if Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
@@ -194,12 +211,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 break   // subtitles/data/attachments are never mapped (see the header note)
             }
         }
-        // TRUE DV via AVPlayer needs single-layer Profile 5 / 8.x. Profile 7 (BL+EL) has no VideoToolbox
-        // decode, and a stream with no DOVI config (the filename label lied) gains nothing from AVPlayer.
-        guard info.dvProfile == 5 || info.dvProfile == 8 else {
+        // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
+        // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
+        // RPU to Profile 8.1 and drop the EL (see the mux loop). A stream with no DOVI config (the filename
+        // label lied) still gains nothing from AVPlayer and fails fast to the libmpv tone-map.
+        let convertP7 = (info.dvProfile == 7)
+        guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
             buffer.fail(info.dvProfile < 0
                 ? "source has no Dolby Vision configuration (label mismatch)"
                 : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
+            return
+        }
+        // Reject an obviously-malformed base video track up front so the conversion path has a valid stream to
+        // work on and a bad source still fails soft to the libmpv demotion rather than mid-loop.
+        if convertP7, baseVideoIn < 0 {
+            buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
             return
         }
         // AVPlayer cannot decode TrueHD/DTS. With no decodable track the session would mount then fail (or
@@ -210,6 +236,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         var streamMap = [Int](repeating: -1, count: nb)
         var outIndex: Int32 = 0
+        var baseVideoOut = -1        // output index of the base-layer video track (packets to convert)
         for i in 0..<nb where mappable.contains(i) {
             guard let inStream = inCtx.pointee.streams[i] else { continue }
             let par = inStream.pointee.codecpar
@@ -217,11 +244,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)
             if cp < 0 { buffer.fail("avcodec_parameters_copy failed (\(cp))"); return }
             outStream.pointee.codecpar.pointee.codec_tag = 0
+            if i == baseVideoIn {
+                baseVideoOut = Int(outIndex)
+                // For a Profile 7 conversion, re-label the OUTPUT DOVI configuration record as Profile 8.1 so
+                // FFmpeg's mov muxer writes a Profile-8 `dvvC` box (dv_profile>7 selects dvvC) and AVPlayer
+                // engages true DV. The RPU itself is converted per-packet in the mux loop; this makes the
+                // container box agree with the converted bitstream. Also clears the EL-present flag (the EL is
+                // dropped). Best-effort: if the source somehow carried no DOVI side data to rewrite, the
+                // per-packet RPU conversion still runs and the muxer will derive a box from the bitstream.
+                if convertP7 {
+                    Self.relabelOutputDoViProfile81(outStream.pointee.codecpar)
+                }
+            }
             streamMap[i] = Int(outIndex)
             outIndex += 1
             info.mappedStreams += 1
         }
         if info.mappedStreams == 0 { buffer.fail("no playable streams in source"); return }
+        if convertP7, baseVideoOut < 0 { buffer.fail("Dolby Vision profile 7 base-layer video was not mapped"); return }
+
+        // The HEVC NAL length prefix size (1/2/4 bytes) lives in the base track's hvcC extradata; read it once
+        // so the per-packet RPU converter can walk the length-prefixed access units. Defaults to 4 (the near
+        // universal value) if extradata is missing or malformed.
+        let nalLengthSize: Int = convertP7
+            ? Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
+            : 4
 
         // Fragmented MP4 so playback starts before the whole file is muxed, and so it can stream. `faststart`
         // is a no-op for custom-IO (it needs a seekable sink) but harmless; the frag flags are what matter.
@@ -238,8 +285,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
 
-        NSLog("[dv-remux-stream] start: %@ %dx%d dvProfile=%d blCompat=%d streams=%d",
-              info.videoCodec, info.width, info.height, info.dvProfile, info.dvBLCompatId, info.mappedStreams)
+        NSLog("[dv-remux-stream] start: %@ %dx%d dvProfile=%d blCompat=%d streams=%d convertP7=%d nalLen=%d",
+              info.videoCodec, info.width, info.height, info.dvProfile, info.dvBLCompatId,
+              info.mappedStreams, convertP7 ? 1 : 0, nalLengthSize)
 
         while !isCancelled, av_read_frame(inCtx, pkt) >= 0 {
             let inIdx = Int(pkt.pointee.stream_index)
@@ -248,7 +296,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                   let outStream = outCtx.pointee.streams[streamMap[inIdx]] else {
                 av_packet_unref(pkt); continue
             }
-            pkt.pointee.stream_index = Int32(streamMap[inIdx])
+            let outIdx = streamMap[inIdx]
+            // Profile 7 -> 8.1: rewrite the DV RPU NAL (and drop any in-band EL sublayer NAL) in the base-layer
+            // video packets before muxing. Only the base video track is touched; audio and every other packet
+            // pass through byte-for-byte. Conversion is fail-SOFT: on any error the packet's bytes are left
+            // exactly as read, so a quirk in one access unit degrades to a possibly-imperfect frame rather than
+            // aborting the whole session (the AVPlayer -> libmpv demotion remains the hard backstop).
+            if convertP7, outIdx == baseVideoOut {
+                Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize)
+            }
+            pkt.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(pkt, inStream.pointee.time_base, outStream.pointee.time_base)
             pkt.pointee.pos = -1
             let wf = av_interleaved_write_frame(outCtx, pkt)
@@ -311,6 +368,162 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if let c = avcodec_get_name(id) { return String(cString: c) }
         return "?"
     }
+
+    // MARK: - Dolby Vision Profile 7 -> 8.1 conversion (libdovi)
+
+    /// HEVC NAL unit types we care about for DV. The RPU (Dolby's mapping metadata) rides in an UNSPEC62 NAL;
+    /// the enhancement-layer sublayer (in a SINGLE-TRACK Profile 7 stream) rides in UNSPEC63. Type is bits 6..1
+    /// of the first NAL header byte: `(byte0 >> 1) & 0x3F`.
+    private static let hevcNalTypeDoViRPU: UInt8 = 62   // UNSPEC62: Dolby Vision RPU
+    private static let hevcNalTypeDoViEL: UInt8 = 63    // UNSPEC63: Dolby Vision enhancement-layer sublayer
+
+    /// libdovi conversion mode 2: "Converts the RPU to be profile 8.1 compatible ... handles source profiles
+    /// 5, 7 and 8" (both luma and chroma mapping curves set to no-op). This is the mode that makes a Profile 7
+    /// RPU decodable by AVPlayer/VideoToolbox as single-layer 8.1.
+    private static let dolbyConvertModeProfile81: UInt8 = 2
+
+    /// Read the HEVC NAL length-prefix size (1, 2, or 4 bytes) from the base track's hvcC extradata. In an
+    /// hvcC record byte 21 holds `lengthSizeMinusOne` in its low two bits. Falls back to 4 (the near-universal
+    /// value FFmpeg's matroska demuxer emits) when extradata is absent, too short, or not an hvcC record.
+    private static func hevcNalLengthSize(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> Int {
+        guard let par, let ex = par.pointee.extradata else { return 4 }
+        let n = Int(par.pointee.extradata_size)
+        // hvcC starts with configurationVersion (1) and needs at least 23 bytes to reach the length-size byte.
+        guard n >= 23, ex[0] == 1 else { return 4 }
+        let size = Int(ex[21] & 0x03) + 1
+        return (size == 1 || size == 2 || size == 4) ? size : 4
+    }
+
+    /// Rewrite the OUTPUT stream's DOVI configuration side-data record to advertise Profile 8.1 (BL-compatible)
+    /// so FFmpeg's mov muxer emits a Profile-8 `dvvC` box and AVPlayer engages true DV for the converted
+    /// bitstream. Mutates the existing `AV_PKT_DATA_DOVI_CONF` record that `avcodec_parameters_copy` already
+    /// duplicated onto the output codecpar (the buffer is output-owned, so an in-place edit is safe). No-op if
+    /// the source carried no DOVI side data (the per-packet RPU conversion still runs and the muxer derives a
+    /// box from the converted bitstream).
+    private static func relabelOutputDoViProfile81(_ par: UnsafeMutablePointer<AVCodecParameters>?) {
+        guard let par else { return }
+        let n = Int(par.pointee.nb_coded_side_data)
+        guard n > 0, let arr = par.pointee.coded_side_data else { return }
+        for i in 0..<n where arr[i].type == AV_PKT_DATA_DOVI_CONF {
+            guard let data = arr[i].data,
+                  Int(arr[i].size) >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size else { return }
+            data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { rec in
+                rec.pointee.dv_profile = 8
+                rec.pointee.dv_bl_signal_compatibility_id = 1   // BL-compatible (HDR10 base)
+                rec.pointee.el_present_flag = 0                 // the enhancement layer is dropped
+                rec.pointee.rpu_present_flag = 1
+                rec.pointee.bl_present_flag = 1
+                rec.pointee.dv_md_compression = UInt8(AV_DOVI_COMPRESSION_NONE.rawValue)
+            }
+            return
+        }
+    }
+
+    /// Convert the Dolby Vision RPU inside one base-layer HEVC packet from Profile 7 to Profile 8.1, in place,
+    /// and drop any in-band enhancement-layer (UNSPEC63) NAL. Walks the length-prefixed access unit, and for
+    /// each NAL either passes it through, converts it (the UNSPEC62 RPU), or drops it (the UNSPEC63 EL). The
+    /// packet's data buffer is replaced with the rebuilt access unit via `av_packet_from_data`.
+    ///
+    /// FAIL-SOFT by design: on ANY problem (unparseable prefixing, a libdovi parse/convert/write error, an
+    /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
+    /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
+    /// genuinely can't convert.
+    private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int) {
+        guard let src = pkt.pointee.data else { return }
+        let total = Int(pkt.pointee.size)
+        guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return }
+
+        var out = [UInt8]()
+        out.reserveCapacity(total)
+        var changed = false
+        var pos = 0
+        while pos + nalLengthSize <= total {
+            // Read the big-endian NAL length prefix.
+            var nalLen = 0
+            for k in 0..<nalLengthSize { nalLen = (nalLen << 8) | Int(src[pos + k]) }
+            let nalStart = pos + nalLengthSize
+            // A corrupt/misaligned length means we no longer understand the bitstream: abandon the edit and
+            // leave the ORIGINAL packet untouched rather than emit a truncated access unit.
+            guard nalLen > 0, nalStart + nalLen <= total else { return }
+            let nalType = (src[nalStart] >> 1) & 0x3F
+
+            if nalType == hevcNalTypeDoViEL {
+                // Drop the in-band enhancement-layer sublayer NAL (single-track Profile 7); the base layer plus
+                // the converted RPU is what AVPlayer decodes.
+                changed = true
+            } else if nalType == hevcNalTypeDoViRPU {
+                // Convert the RPU NAL (its 2-byte header 0x7C 0x01 is exactly the escaped UNSPEC62 prefix
+                // libdovi expects) to Profile 8.1 and re-emit it length-prefixed. On any libdovi error, keep
+                // the ORIGINAL RPU NAL (still valid DV metadata) so the frame is not left without an RPU.
+                let converted: [UInt8]? = src.withMemoryRebound(to: UInt8.self, capacity: total) { base -> [UInt8]? in
+                    guard let rpu = dovi_parse_unspec62_nalu(base + nalStart, nalLen) else { return nil }
+                    defer { dovi_rpu_free(rpu) }
+                    guard dovi_convert_rpu_with_mode(rpu, dolbyConvertModeProfile81) == 0 else { return nil }
+                    guard let written = dovi_write_unspec62_nalu(rpu) else { return nil }
+                    defer { dovi_data_free(written) }
+                    guard let wdata = written.pointee.data, written.pointee.len > 0 else { return nil }
+                    return Array(UnsafeBufferPointer(start: wdata, count: Int(written.pointee.len)))
+                }
+                if let newNal = converted {
+                    appendLengthPrefixed(&out, newNal, nalLengthSize: nalLengthSize)
+                    changed = true
+                } else {
+                    appendLengthPrefixed(&out, src, from: nalStart, count: nalLen, nalLengthSize: nalLengthSize)
+                }
+            } else {
+                // Every other NAL (VPS/SPS/PPS/slices/SEI) passes through unchanged.
+                appendLengthPrefixed(&out, src, from: nalStart, count: nalLen, nalLengthSize: nalLengthSize)
+            }
+            pos = nalStart + nalLen
+        }
+        // Trailing bytes we could not parse as a complete NAL: bail to the untouched original for safety.
+        guard pos == total else { return }
+        guard changed else { return }   // nothing to rewrite; keep the original buffer
+
+        // Replace the packet payload. av_packet_from_data takes ownership of an av_malloc'd buffer padded with
+        // AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes (libav readers over-read the tail); allocate + copy into one.
+        let newSize = out.count
+        guard let dst = av_malloc(newSize + AV_INPUT_BUFFER_PADDING_SIZE_CONST)?
+            .assumingMemoryBound(to: UInt8.self) else { return }
+        out.withUnsafeBufferPointer { buf in
+            if let b = buf.baseAddress { memcpy(dst, b, newSize) }
+        }
+        memset(dst + newSize, 0, AV_INPUT_BUFFER_PADDING_SIZE_CONST)
+        // av_packet_from_data overwrites pkt->buf/data/size but does NOT unref the old buffer, so release the
+        // demuxer's buffer ref first (this leaves pts/dts/flags/side_data intact, which is what we want). If the
+        // wrap fails, free our buffer and leave the now-empty packet: a zero-size video packet the muxer skips,
+        // preferable to a use-after-free. The AVPlayer -> libmpv demotion still backstops a truly broken stream.
+        if let b = pkt.pointee.buf {
+            var bref: UnsafeMutablePointer<AVBufferRef>? = b
+            av_buffer_unref(&bref)
+            pkt.pointee.buf = nil
+        }
+        pkt.pointee.data = nil
+        pkt.pointee.size = 0
+        if av_packet_from_data(pkt, dst, Int32(newSize)) < 0 {
+            av_free(dst)
+        }
+    }
+
+    /// Append a NAL slice from a source pointer to `out`, writing the big-endian length prefix first.
+    private static func appendLengthPrefixed(_ out: inout [UInt8],
+                                             _ src: UnsafePointer<UInt8>, from: Int, count: Int,
+                                             nalLengthSize: Int) {
+        writeLengthPrefix(&out, count, nalLengthSize: nalLengthSize)
+        out.append(contentsOf: UnsafeBufferPointer(start: src + from, count: count))
+    }
+
+    /// Append a NAL held in a Swift array to `out`, writing the big-endian length prefix first.
+    private static func appendLengthPrefixed(_ out: inout [UInt8], _ nal: [UInt8], nalLengthSize: Int) {
+        writeLengthPrefix(&out, nal.count, nalLengthSize: nalLengthSize)
+        out.append(contentsOf: nal)
+    }
+
+    private static func writeLengthPrefix(_ out: inout [UInt8], _ len: Int, nalLengthSize: Int) {
+        for k in stride(from: nalLengthSize - 1, through: 0, by: -1) {
+            out.append(UInt8((len >> (8 * k)) & 0xFF))
+        }
+    }
 }
 
 // MARK: - Small helpers not exposed cleanly through the Swift libav shims
@@ -321,6 +534,11 @@ private let AVERROR_EXIT_CONST: Int32 = -1414092869   // AVERROR_EXIT
 
 /// AVFMT_FLAG_CUSTOM_IO is a plain #define (0x0080) not always surfaced as a Swift constant.
 private let AVFMT_FLAG_CUSTOM_IO_CONST: Int32 = 0x0080
+
+/// AV_INPUT_BUFFER_PADDING_SIZE is a plain #define (64) the Swift importer does not always surface. libav
+/// bitstream readers over-read past the end of a packet buffer by up to this many bytes, so an av_malloc'd
+/// packet buffer handed to av_packet_from_data must be over-allocated + zero-padded by this amount.
+private let AV_INPUT_BUFFER_PADDING_SIZE_CONST: Int = 64
 
 /// A tiny lock-free-ish boolean flag (an `os_unfair_lock`-free atomic via a serial-safe class). We only need
 /// set-once + read-many across threads; a plain `NSLock`-guarded Bool is more than fast enough here and avoids
