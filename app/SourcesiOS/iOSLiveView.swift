@@ -31,9 +31,14 @@ struct iOSLiveView: View {
                 }
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            // navigationTitle bridges into the single shared window toolbar on macOS where every mounted
+            // tab stamps its own title, crashing NSToolbar on duplicate inserts. So it is iOS-only.
+            #if os(iOS)
             .navigationTitle("Live TV")
+            #endif
             .navigationDestination(for: FeaturedHeroItem.self) { item in
-                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                iOSDetailView(id: item.id, type: item.type, title: item.name,
+                              seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             // Live catalogs are usually ordered after an add-on's movie/series catalogs, so they fall
             // outside the Home board's default window. Widen the board so they hydrate here; re-run when

@@ -42,9 +42,25 @@ const SUB_SIZES: Array<{ label: string; scale: number }> = [
 ];
 const HIDE_AFTER_MS = 3000;
 
+/** An intro / outro segment (seconds). While playback sits inside one, the chrome shows a Skip button that
+ *  jumps to `end`. `kind` only drives the button label ("Skip Intro" vs "Skip Outro"). */
+export interface SkipSegment {
+  kind: "intro" | "outro";
+  start: number;
+  end: number;
+}
+
 export interface PlayerControlsCtx {
   title: string;
   skipStep: number;
+  /** Intro / outro segments for a Skip button (empty when none are known). */
+  skipSegments?: SkipSegment[];
+  /** Show a Next Episode affordance (series with a following episode). */
+  hasNextEpisode?: boolean;
+  /** Play the next episode. */
+  onNextEpisode?: () => void;
+  /** Manually advance to the next fallback source (present only when a fallback exists). */
+  onTryNextSource?: () => void;
 }
 
 export interface PlayerController {
@@ -52,6 +68,12 @@ export interface PlayerController {
   setHls(hls: Hls | null): void;
   /** Rebuild the Subtitles menu from the video's current text tracks (call after tracks are added). */
   refreshSubtitles(): void;
+  /** Flag that the player auto-muted for autoplay (shows the tap-to-unmute pill). */
+  setAutoMuted(on: boolean): void;
+  /** Read-and-clear the auto-muted flag: true only if WE auto-muted (so a user gesture may restore sound). */
+  consumeAutoMuted(): boolean;
+  /** Show a transient toast (e.g. an honest "switched source" message). */
+  toast(msg: string): void;
   /** Remove listeners + timers. */
   dispose(): void;
 }
@@ -82,6 +104,8 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   let openMenu: "settings" | "subs" | null = null;
   let sleepTimer = 0;
   let sleepMins = 0;
+  let autoMuted = false; // set when the player muted itself for autoplay (drives the tap-to-unmute pill)
+  const skipSegments = ctx.skipSegments ?? [];
 
   const remotePlayback = (video as unknown as { remote?: { state?: string } }).remote;
   const canCast = typeof remotePlayback === "object" && remotePlayback !== null && "watchAvailability" in (remotePlayback as object);
@@ -97,6 +121,13 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
       <div class="pl-top">
         <button class="pl-icon pl-back" data-action="close-player" aria-label="Back">${icon("chevron-left") || "‹"}<span>Back</span></button>
         <div class="pl-title">${escapeHtml(ctx.title)}</div>
+      </div>
+
+      <button class="pl-unmute" id="pl-unmute" hidden aria-label="Tap to unmute">${icon("volume-x") || "🔇"}<span>Tap to unmute</span></button>
+
+      <div class="pl-corner">
+        <button class="pl-skipseg" id="pl-skipseg" hidden></button>
+        ${ctx.hasNextEpisode ? `<button class="pl-next" id="pl-next" aria-label="Next episode">${icon("fast-forward") || "⟳"}<span>Next Episode</span></button>` : ""}
       </div>
 
       <div class="pl-center">
@@ -252,6 +283,44 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   });
   $("pl-cast")?.addEventListener("click", () => {
     (video as unknown as { remote?: { prompt?: () => Promise<void> } }).remote?.prompt?.().catch(() => undefined);
+  });
+
+  // ---- next episode ----
+  $("pl-next")?.addEventListener("click", () => ctx.onNextEpisode?.());
+
+  // ---- skip intro / outro ----
+  // The button is shown only while playback is inside a known segment; clicking it jumps past the segment.
+  const skipBtn = $("pl-skipseg");
+  let activeSeg: SkipSegment | null = null;
+  const renderSkip = () => {
+    if (!skipBtn) return;
+    const t = video.currentTime;
+    const seg = skipSegments.find((s) => t >= s.start && t < s.end - 0.5) ?? null;
+    if (seg === activeSeg) return;
+    activeSeg = seg;
+    if (seg) {
+      skipBtn.textContent = seg.kind === "outro" ? "Skip Outro" : "Skip Intro";
+      skipBtn.hidden = false;
+    } else {
+      skipBtn.hidden = true;
+    }
+  };
+  skipBtn?.addEventListener("click", () => {
+    if (activeSeg) video.currentTime = activeSeg.end;
+    renderSkip();
+  });
+
+  // ---- tap-to-unmute pill (D6 autoplay) ----
+  const unmuteBtn = $("pl-unmute");
+  const hideUnmute = () => {
+    autoMuted = false;
+    if (unmuteBtn) unmuteBtn.hidden = true;
+  };
+  unmuteBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    video.muted = false;
+    if (video.volume === 0) video.volume = 1;
+    hideUnmute();
   });
 
   // ---- menus ----
@@ -418,17 +487,45 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     }
   });
 
-  // ---- click stage to toggle, double-click fullscreen ----
+  // ---- stage tap / double-tap gestures ----
+  // Desktop (fine pointer): click on the bare backdrop toggles play, double-click toggles fullscreen -
+  // the familiar web-player behavior. Touch (coarse pointer): a single tap toggles the chrome, and a
+  // double-tap on the left / right half seeks back / forward by the skip step (yt/twitch mobile idiom).
+  const isTouch = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+  let lastTap = 0;
+  let tapTimer = 0;
+  const seekBy = (delta: number) => {
+    video.currentTime = Math.min(video.duration || Infinity, Math.max(0, video.currentTime + delta));
+    flash(delta < 0 ? `« ${Math.abs(delta)}s` : `${delta}s »`);
+  };
   stage.addEventListener("click", (e) => {
     if (e.target !== stage) return; // only the bare backdrop, not a control
     if (openMenu) {
       closeMenus(); // first backdrop click dismisses an open menu
       return;
     }
-    togglePlay();
+    if (!isTouch) {
+      togglePlay();
+      return;
+    }
+    // Touch: distinguish single tap (toggle chrome) from double tap (directional seek).
+    const now = Date.now();
+    if (now - lastTap < 300) {
+      window.clearTimeout(tapTimer);
+      lastTap = 0;
+      const r = stage.getBoundingClientRect();
+      seekBy((e as MouseEvent).clientX - r.left < r.width / 2 ? -ctx.skipStep : ctx.skipStep);
+      return;
+    }
+    lastTap = now;
+    tapTimer = window.setTimeout(() => {
+      // Single tap: toggle chrome visibility.
+      if (stage.classList.contains("pl-hidden")) show();
+      else stage.classList.add("pl-hidden");
+    }, 300);
   });
   stage.addEventListener("dblclick", (e) => {
-    if (e.target !== stage) return;
+    if (e.target !== stage || isTouch) return; // touch double-taps are handled on click above
     $("pl-fs")!.click();
   });
 
@@ -451,6 +548,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
   const onTime = () => {
     if (!scrubbing) renderProgress();
     renderTime();
+    renderSkip();
   };
   video.addEventListener("timeupdate", onTime);
   video.addEventListener("progress", renderProgress);
@@ -466,7 +564,11 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     renderPlay();
     show();
   });
-  video.addEventListener("volumechange", renderVolume);
+  video.addEventListener("volumechange", () => {
+    renderVolume();
+    // A manual unmute (or the media becoming audible again) retires the tap-to-unmute pill.
+    if (!video.muted) hideUnmute();
+  });
   video.addEventListener("ratechange", () => openMenu === "settings" && buildSettingsMenu());
   video.addEventListener("waiting", onWaiting);
   video.addEventListener("playing", onPlaying);
@@ -486,9 +588,23 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     refreshSubtitles() {
       if (openMenu === "subs") buildSubsMenu();
     },
+    setAutoMuted(on: boolean) {
+      autoMuted = on;
+      if (unmuteBtn) unmuteBtn.hidden = !on;
+      if (on) show(); // reveal the chrome so the pill is visible for the user's first tap
+    },
+    consumeAutoMuted() {
+      const was = autoMuted;
+      hideUnmute();
+      return was;
+    },
+    toast(msg: string) {
+      flash(msg);
+    },
     dispose() {
       window.clearTimeout(hideTimer);
       window.clearTimeout(sleepTimer);
+      window.clearTimeout(tapTimer);
       document.removeEventListener("keydown", onDocKeydown, true);
     },
   };

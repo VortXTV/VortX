@@ -366,6 +366,15 @@ enum StreamRanking {
         }
     }
 
+    /// PUBLIC reuse point for the language-index client: the ISO codes `text` plausibly advertises, using the
+    /// SAME `langTokens` map + boundary matching the ranker uses (single source of truth, no duplication). Case
+    /// insensitive; returns the sorted, de-duplicated set of matched codes. Empty when none match. No user data
+    /// is involved -- only language codes derived from the passed strings.
+    static func languageCodesAdvertised(in text: String) -> [String] {
+        let lowered = text.lowercased()
+        return langTokens.keys.filter { claimsLanguage(lowered, $0) }.sorted()
+    }
+
     /// True when a release advertises more than one audio language, so demoting it for "not being
     /// in your language" would be wrong. Catches the explicit markers (multi, multilang,
     /// multi-audio, dual, dual audio), any release tagging two or more distinct languages, and any
@@ -873,7 +882,11 @@ enum StreamRanking {
     /// NOT included: libmpv's gpu-next renders HDR10 correctly, so only DV needs the AVPlayer path.
     static func isDolbyVision(_ text: String) -> Bool {
         let t = text.lowercased()
-        return t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi") || matches(t, #"\bdv\b"#)
+        // Widened token set so DV actually FIRES: many DV releases never write "dolby vision"/"dovi" - they
+        // only label the profile (DV.P8, Profile 8, 8.1/8.4, DoViHDR, DVHDR, BL+RPU). The \b / \bp guards keep
+        // "2160p" from reading as profile 5. A false positive is harmless here: it only routes to AVPlayer
+        // (which plays the file regardless) and the AVPlayer -> libmpv fallback backstops any mis-route.
+        return matches(t, #"(dolby[ ._-]?vision|dolbyvision|\bdovi\b|dovihdr|\bdv\b|\bdvhdr\b|bl\+?rpu|\bp(?:rofile[ ._-]?)?[578](?:\.[0-9])?\b|\bdv[ ._-]?p?[578]\b)"#)
     }
 
     private static func qualityText(_ s: CoreStream) -> String {
@@ -890,6 +903,12 @@ enum StreamRanking {
         var text = [s.name, s.description, s.behaviorHints?.filename]
             .compactMap { $0 }.joined(separator: " ").lowercased()
             .replacingOccurrences(of: "\u{FE0F}", with: "")
+        // Strip add-on TEMPLATE BLOBS first (H6): a failed add-on template can leak a raw expression like
+        // "{cannot_apply_modifier_to_null(replace('2160p','4k'))}" into the stream text. Its literal "2160p"/
+        // "4k" then POISONS resolution classification (a 720p file mislabelled 4K and auto-picked). Any
+        // "{ ... }" run is a template artifact, never real release-name text, so remove every one BEFORE any
+        // resolution / quality / source token is parsed. Non-greedy so adjacent blobs are each removed.
+        text = stripTemplateBlobs(text)
         if let re = regex(#"\.(ts|m2ts|mkv|mp4|avi|webm|mov)(?![a-z0-9])"#) {
             text = re.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
                                                withTemplate: "")
@@ -899,6 +918,28 @@ enum StreamRanking {
         textCache[key] = text
         cacheLock.unlock()
         return text
+    }
+
+    /// Remove add-on template blobs — any `{ ... }` run — from stream text before it is classified (H6). A
+    /// broken add-on template (AIOStreams stream-expressions and similar) can emit a raw, unevaluated
+    /// expression such as `{cannot_apply_modifier_to_null(replace('2160p','4k'))}`; left in place its literal
+    /// resolution tokens poison `resolution` / `qualityLabel`. Non-greedy per-blob removal, up to a small cap
+    /// of blobs so a pathological string can never loop; a single unmatched `{` (no closing brace) is left as
+    /// harmless text. Nested braces are rare in these artifacts; the innermost-first non-greedy pass clears
+    /// the common single-level case.
+    static func stripTemplateBlobs(_ text: String) -> String {
+        guard text.contains("{"), let re = regex(#"\{[^{}]*\}"#) else { return text }
+        var out = text
+        // A blob can itself contain a nested blob; a few passes flattens realistic nesting depth. Bounded so
+        // a degenerate input can't spin.
+        for _ in 0..<4 {
+            guard out.contains("{") else { break }
+            let replaced = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out),
+                                                       withTemplate: " ")
+            if replaced == out { break }
+            out = replaced
+        }
+        return out
     }
 
     private static func resolution(_ t: String) -> Int {

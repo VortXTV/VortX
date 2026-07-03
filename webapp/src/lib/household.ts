@@ -29,7 +29,7 @@ import {
 } from "./vault";
 import { currentSession } from "./account";
 import { addAddon } from "./store";
-import { updateSettings, getSettings, type Settings } from "./settings";
+import { updateSettings, getSettings } from "./settings";
 
 const FAM_API = "https://api.vortx.tv";
 const te = new TextEncoder();

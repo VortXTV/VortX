@@ -101,6 +101,7 @@ struct AddonsView: View {
     @State private var installFailed = false
     @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
     @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
+    @State private var showPairing = false         // the Install-by-QR "pair once, add many" sheet
 
     var body: some View {
         NavigationStack {
@@ -153,6 +154,7 @@ struct AddonsView: View {
                 case .editURL(let a): EditAddonURLView(addon: a)
                 }
             }
+            .sheet(isPresented: $showPairing) { AddonPairingView() }
             .confirmationDialog("Add-on already installed", isPresented: $showUpdateConfirm, titleVisibility: .visible) {
                 Button("Update") { runInstall(replacingExisting: true) }
                 Button("Cancel", role: .cancel) {}
@@ -181,6 +183,13 @@ struct AddonsView: View {
                     .font(Theme.Typography.label)
                     .foregroundStyle(installFailed ? Theme.Palette.danger : Theme.Palette.textSecondary)
             }
+            // Install by QR: pair a phone once, then paste as many add-on URLs there as you like and
+            // install each here. Handy on Apple TV (no keyboard) but offered on every platform.
+            Button { showPairing = true } label: {
+                Label("Install by QR", systemImage: "qrcode")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .fixedSize()
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -224,7 +233,7 @@ struct AddonsView: View {
             if let error {
                 installMessage = error
             } else {
-                installMessage = replacingExisting ? "Updated." : "Installed."
+                installMessage = replacingExisting ? String(localized: "Updated.") : String(localized: "Installed.")
                 newAddonURL = ""
             }
         }
@@ -254,49 +263,68 @@ struct AddonsView: View {
 
     private func addonRow(_ addon: CoreDescriptor) -> some View {
         let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
-        return HStack(alignment: .top, spacing: Theme.Space.md) {
-            addonIcon(addon, isOff: isOff)
-            VStack(alignment: .leading, spacing: 8) {
-                Text(addon.manifest.name).font(Theme.Typography.cardTitle)
-                    .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
-                Text(isOff ? "Off for this profile" : addon.capabilities)
-                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                Text(addon.host).font(.system(size: 16, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
-                    .lineLimit(1).truncationMode(.middle)
-                let h = health.status[addon.transportUrl] ?? .unknown
-                HStack(spacing: 6) {
-                    Circle().fill(h.color).frame(width: 8, height: 8)
-                    Text(h.label).font(Theme.Typography.label).foregroundStyle(h.color)
+        // Layout regression fix: previously icon + text + up-to-4 action chips all shared ONE HStack, so on a
+        // narrow phone the fixed-width chips squeezed the text column toward zero width, forcing the name /
+        // detail to wrap one glyph per line and clipping at the edges. Split into a top INFO row (icon + text
+        // that always claims the full width) and a separate action row below that flows horizontally.
+        return VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack(alignment: .top, spacing: Theme.Space.md) {
+                addonIcon(addon, isOff: isOff)
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    Text(addon.manifest.name).font(Theme.Typography.cardTitle)
+                        .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)   // wrap by word, never by glyph
+                    Text(isOff ? "Off for this profile" : addon.capabilities)
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(addon.host).font(.system(size: 16, design: .monospaced)).foregroundStyle(Theme.Palette.textTertiary)
+                        .lineLimit(1).truncationMode(.middle)
+                    let h = health.status[addon.transportUrl] ?? .unknown
+                    HStack(spacing: 6) {
+                        Circle().fill(h.color).frame(width: 8, height: 8)
+                        Text(h.label).font(Theme.Typography.label).foregroundStyle(h.color)
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)   // the text column owns the row width
             }
-            Spacer(minLength: Theme.Space.sm)
-            // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
-            // regardless of protected state; protected defaults are not configurable anyway.
-            if addon.isConfigurable {
-                Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
-                    .buttonStyle(ChipButtonStyle(selected: false))
-                    .fixedSize()
-            }
-            if !addon.isProtected {
-                // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
-                // URL first, then removes the old, so a bad URL never leaves you with neither.
-                Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
-                    .buttonStyle(ChipButtonStyle(selected: false))
-                    .fixedSize()
-                // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
-                Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
-                    Image(systemName: isOff ? "eye.slash" : "eye")
-                }
-                .buttonStyle(ChipButtonStyle(selected: !isOff))
-                .fixedSize()
-                Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
-                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
-                    .fixedSize()   // keep the Remove chip at its intrinsic width so a narrow phone row can't squeeze the label to one glyph per line
-            }
+            addonActions(addon, isOff: isOff)
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+
+    /// The add-on's action chips, laid out in their own horizontally-scrolling row beneath the info so they
+    /// never steal width from the name / detail column. Scrolls rather than wrapping so a phone with several
+    /// chips stays one clean line.
+    @ViewBuilder private func addonActions(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.sm) {
+                // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
+                // regardless of protected state; protected defaults are not configurable anyway.
+                if addon.isConfigurable {
+                    Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                        .fixedSize()
+                }
+                if !addon.isProtected {
+                    // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
+                    // URL first, then removes the old, so a bad URL never leaves you with neither.
+                    Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                        .fixedSize()
+                    // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
+                    Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
+                        Image(systemName: isOff ? "eye.slash" : "eye")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: !isOff))
+                    .fixedSize()
+                    Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
+                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                        .fixedSize()
+                }
+            }
+        }
     }
 
     private func hint(_ text: String) -> some View {

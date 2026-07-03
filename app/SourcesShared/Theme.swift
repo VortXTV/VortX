@@ -44,6 +44,28 @@ enum Theme {
         // that also render on iPhone — 60pt eats ~120pt of a 390pt phone and clips content off the
         // edges (the beta7 server-config / add-ons clipping). Use `screenInset` instead.
         static let screenEdge: CGFloat = 60
+        // Readable prose column cap for hero synopsis / credits / language chips on the shared iOS/Mac
+        // detail + home surfaces. A phone-narrow 760 looked cramped and left the wide Mac window mostly
+        // empty to the right (item-1 "stretched phone layout" report), so the Mac gets a wider measure
+        // that still keeps line length readable. iPhone/iPad keep 760. One token = every prose block
+        // stays in lockstep.
+        #if os(macOS)
+        static let readableColumn: CGFloat = 980
+        #else
+        static let readableColumn: CGFloat = 760
+        #endif
+        // The full source-heavy content column (sources list, episode list) on a wide iPad/Mac window.
+        // The Mac window is far wider than an iPad, so it earns a wider column than the shared 900; the
+        // hero stays full-bleed above it.
+        #if os(macOS)
+        static let contentColumn: CGFloat = 1120
+        #else
+        static let contentColumn: CGFloat = 900
+        #endif
+        // Width above which the detail body caps its source / episode column at `contentColumn` (centered)
+        // instead of filling the full width — the iPad/Mac regular-width cutover. One token keeps the body
+        // and the pushed episode-streams view agreeing on when they widen.
+        static let wideLayoutMinWidth: CGFloat = 700
         // Platform-aware screen inset: the tvOS 10-foot value on TV, an arm's-length value on
         // phone / iPad / Mac. Shared screens (ServerConfig, Add-ons, Profiles) use this so one token
         // keeps tvOS spacious without clipping the phone.
@@ -58,6 +80,20 @@ enum Theme {
         static let card: CGFloat = 16
         static let chip: CGFloat = 12
         static let control: CGFloat = 14
+        /// The big, soft radius for the full-width hero Play button and continue-watching cards — the
+        /// cinematic media-app look (a pronounced pill, not a subtle control corner).
+        static let hero: CGFloat = 30
+    }
+
+    // MARK: Circular action button sizing (the hero's translucent round icon buttons)
+
+    enum Control {
+        /// Diameter of a circular translucent hero action button (mark-watched, download, bookmark, …).
+        static let circleButton: CGFloat = 50
+        /// Diameter of the small circular chrome buttons overlaid on the hero (back chevron, overflow).
+        /// 44pt so the tappable disc meets the HIG minimum touch target; these are the primary detail-page
+        /// nav/actions now that the system nav bar is hidden on the pushed hero.
+        static let circleChrome: CGFloat = 44
     }
 
     // MARK: Motion
@@ -246,5 +282,137 @@ private struct RowFocusContent: View {
         #else
         return label
         #endif
+    }
+}
+
+// MARK: - Premium hero components (shared by iOS/Mac detail + home)
+
+/// A circular translucent icon button, the cinematic-media-app chrome affordance: a frosted disc with a
+/// centered SF Symbol that scales + brightens on press (and on Mac pointer hover). Used for the hero back
+/// chevron / overflow control and the row of secondary actions (mark-watched, download, bookmark, rate,
+/// remove). Fail-soft: purely presentational, no state of its own.
+struct CircleIconButton: View {
+    let systemName: String
+    var diameter: CGFloat = Theme.Control.circleButton
+    var tint: Color = Theme.Palette.textPrimary
+    var label: String? = nil                 // optional caption under the disc (secondary actions)
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: Theme.Space.xs) {
+                CircleIconDisc(systemName: systemName, diameter: diameter, tint: tint)
+                if let label {
+                    Text(label)
+                        .font(Theme.Typography.eyebrow)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .buttonStyle(CircleIconButtonStyle())
+    }
+}
+
+/// The frosted disc itself, split out so the button style can animate the whole label. Also reused
+/// directly as a `Menu` label where a `ButtonStyle` can't apply (e.g. the detail hero overflow disc).
+struct CircleIconDisc: View {
+    let systemName: String
+    let diameter: CGFloat
+    let tint: Color
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: diameter * 0.42, weight: .semibold))
+            .foregroundStyle(tint)
+            .frame(width: diameter, height: diameter)
+            .background(
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .overlay(Circle().fill(Theme.Palette.canvas.opacity(0.28)))
+            )
+            .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.10), lineWidth: 1))
+            .contentShape(Circle())
+    }
+}
+
+/// Press / hover feedback for a circular icon button: subtle scale + a soft accent glow. Animates only
+/// transform + shadow (compositor-friendly), never layout.
+struct CircleIconButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { Content(configuration: configuration) }
+    private struct Content: View {
+        let configuration: ButtonStyleConfiguration
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        #if os(macOS)
+        @State private var isHovered = false
+        #endif
+        var body: some View {
+            #if os(macOS)
+            let active = isHovered
+            #else
+            let active = false
+            #endif
+            let label = configuration.label
+                .scaleEffect(configuration.isPressed ? 0.92 : (active && !reduceMotion ? 1.06 : 1))
+                .shadow(color: Theme.Palette.accent.opacity(active ? 0.35 : 0), radius: 14, y: 0)
+                .animation(reduceMotion ? nil : Theme.Motion.state, value: configuration.isPressed)
+            #if os(macOS)
+            return label.onHover { isHovered = $0 }
+            #else
+            return label
+            #endif
+        }
+    }
+}
+
+/// A full-width, big-radius primary Play button: high-contrast ember fill, bold label, press + hover
+/// feedback. The cinematic-media-app hero CTA. Animates transform/opacity/shadow only.
+struct HeroPlayButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { Content(configuration: configuration) }
+    private struct Content: View {
+        let configuration: ButtonStyleConfiguration
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @EnvironmentObject private var theme: ThemeManager
+        #if os(macOS)
+        @State private var isHovered = false
+        #endif
+        var body: some View {
+            #if os(macOS)
+            let active = isHovered
+            #else
+            let active = false
+            #endif
+            let label = configuration.label
+                .font(Theme.Typography.cardTitle.weight(.bold))
+                .foregroundStyle(Theme.Palette.onAccent)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, Theme.Space.md)
+                .background(active ? Theme.Palette.accentBright : Theme.Palette.accent,
+                            in: RoundedRectangle(cornerRadius: Theme.Radius.hero, style: .continuous))
+                .scaleEffect(configuration.isPressed ? 0.98 : 1)
+                .shadow(color: Theme.Palette.accent.opacity(active ? 0.55 : 0.30), radius: 22, y: 10)
+                .animation(reduceMotion ? nil : Theme.Motion.state, value: configuration.isPressed)
+            #if os(macOS)
+            return label.onHover { isHovered = $0 }
+            #else
+            return label
+            #endif
+        }
+    }
+}
+
+/// A small rounded metadata box (age rating, quality tag): a hairline-bordered rounded rect with compact
+/// bold text. Reads as an intentional badge rather than plain inline text. Fail-soft on empty input.
+struct MetaBadge: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(Theme.Typography.eyebrow)
+            .foregroundStyle(Theme.Palette.textSecondary)
+            .padding(.horizontal, Theme.Space.xs)
+            .padding(.vertical, 3)
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(Theme.Palette.textTertiary.opacity(0.6), lineWidth: 1)
+            )
     }
 }

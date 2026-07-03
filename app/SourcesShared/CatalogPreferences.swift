@@ -4,13 +4,149 @@ import SwiftUI
 /// what order. Keyed by the same `base|type|id` string CoreBridge.catalogKey builds. The read helpers
 /// are plain static UserDefaults reads so `buildBoardRows` can call them off the main actor; the
 /// ObservableObject drives the editor UI and asks CoreBridge to rebuild the board on a change.
+/// Poster-card WIDTH presets for the iOS/iPad/Mac catalog grids. Each maps to a point width; `.balanced`
+/// is the shipping default so nothing changes unless the user opts in. Wider presets show larger, fewer
+/// cards; narrower presets pack more per row. The grid recomputes its adaptive column count from the same
+/// width, so the responsive layout stays correct at every size class.
+enum PosterWidthPreset: String, CaseIterable, Identifiable {
+    case compact, dense, standard, balanced, comfort, large
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .compact:  return "Compact"
+        case .dense:    return "Dense"
+        case .standard: return "Standard"
+        case .balanced: return "Balanced"
+        case .comfort:  return "Comfort"
+        case .large:    return "Large"
+        }
+    }
+
+    /// The card/track width in points on a REGULAR width class (iPad / Mac), tuned so `.balanced` equals
+    /// today's `iOSPillMetrics.cardWidth` (224) — the shipping look. The compact-iPhone widths are derived
+    /// separately (`compactWidth`) so a phone still fits ~3 across at the default.
+    var regularWidth: CGFloat {
+        switch self {
+        case .compact:  return 150
+        case .dense:    return 180
+        case .standard: return 204
+        case .balanced: return 224
+        case .comfort:  return 260
+        case .large:    return 320
+        }
+    }
+
+    /// The card/track width in points on a COMPACT width class (iPhone portrait). `.balanced` equals today's
+    /// `iOSPillMetrics.gridPosterWidthCompact` (116) so the default phone grid is byte-for-byte unchanged.
+    var compactWidth: CGFloat {
+        switch self {
+        case .compact:  return 92
+        case .dense:    return 104
+        case .standard: return 110
+        case .balanced: return 116
+        case .comfort:  return 140
+        case .large:    return 168
+        }
+    }
+}
+
+/// Poster-card CORNER RADIUS presets. `.rounded` is the shipping default (matches `Theme.Radius.card`, 16pt)
+/// so nothing changes unless the user opts in. Applied to the poster image clip in `PosterCardiOS`.
+enum PosterRadiusPreset: String, CaseIterable, Identifiable {
+    case sharp, subtle, classic, rounded, pill
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .sharp:   return "Sharp"
+        case .subtle:  return "Subtle"
+        case .classic: return "Classic"
+        case .rounded: return "Rounded"
+        case .pill:    return "Pill"
+        }
+    }
+
+    /// The corner radius in points. `.rounded` (16) equals `Theme.Radius.card`, the shipping value. `.pill`
+    /// uses a large radius that reads as a fully rounded end on the poster's short edge.
+    var radius: CGFloat {
+        switch self {
+        case .sharp:   return 0
+        case .subtle:  return 6
+        case .classic: return 10
+        case .rounded: return 16
+        case .pill:    return 28
+        }
+    }
+}
+
+/// A Discover HUB category the user can permanently hide (Discover cards, streaming services as a group, or
+/// a single genre). Distinct from `CatalogPrefsStore.hidden`, which hides an ADD-ON catalog row on Home. The
+/// hub filters these out when it lays out its tiles, and the region-ordering leaves the rest untouched.
+/// Persisted as an opaque string key per tile so the set survives a genre-list change without stale ids.
+enum HubCategoryKey {
+    /// One of the four Discover cards, e.g. `discover:trending`.
+    static func discover(_ list: DiscoverList) -> String { "discover:\(list.rawValue)" }
+    /// A single genre tile, keyed by its stable title, e.g. `genre:Anime`.
+    static func genre(_ g: GenreSpec) -> String { "genre:\(g.title)" }
+    /// The whole Streaming-Services section (one switch to hide every service tile).
+    static let streamingSection = "section:streaming"
+    /// The whole Discover-cards section.
+    static let discoverSection = "section:discover"
+    /// The whole Genres section.
+    static let genresSection = "section:genres"
+}
+
 enum CatalogPrefsStore {
     static let hiddenKey = "stremiox.catalog.hidden"
     static let orderKey = "stremiox.catalog.order"
     static let landscapeKey = "stremiox.catalog.landscapeCards"
+    static let widthKey = "stremiox.catalog.posterWidthPreset"
+    static let radiusKey = "stremiox.catalog.posterRadiusPreset"
+    static let hideLabelsKey = "stremiox.catalog.hidePosterLabels"
+    static let hiddenCategoriesKey = "vortx.discover.hiddenCategories"
+    static let regionKey = "vortx.discover.regionPreference"   // "" / absent = follow the device region
 
     static func hidden() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? []) }
     static func order() -> [String] { UserDefaults.standard.stringArray(forKey: orderKey) ?? [] }
+
+    /// Discover-hub categories the user has permanently hidden (see `HubCategoryKey`). Read as a plain static
+    /// so the hub can filter off the main actor. Empty by default => every tile shows (today's behavior).
+    static func hiddenCategories() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenCategoriesKey) ?? []) }
+    static func isCategoryHidden(_ key: String) -> Bool { hiddenCategories().contains(key) }
+    static func setCategoryHidden(_ key: String, _ value: Bool) {
+        var h = hiddenCategories()
+        if value { h.insert(key) } else { h.remove(key) }
+        UserDefaults.standard.set(Array(h), forKey: hiddenCategoriesKey)
+    }
+
+    /// The user's explicit region override (ISO 3166-1 alpha-2, e.g. "GB"), or nil to follow the device
+    /// region. Uppercased on read so a stored lowercase value still matches TMDB's region form.
+    static func regionOverride() -> String? {
+        let v = (UserDefaults.standard.string(forKey: regionKey) ?? "").trimmingCharacters(in: .whitespaces)
+        return v.isEmpty ? nil : v.uppercased()
+    }
+    static func setRegionOverride(_ code: String?) {
+        if let code, !code.isEmpty { UserDefaults.standard.set(code.uppercased(), forKey: regionKey) }
+        else { UserDefaults.standard.removeObject(forKey: regionKey) }
+    }
+
+    /// Poster width preset (default `.balanced` = today's look). Read as a plain static so card/grid views
+    /// can size off the main actor.
+    static func widthPreset() -> PosterWidthPreset {
+        (UserDefaults.standard.string(forKey: widthKey)).flatMap(PosterWidthPreset.init(rawValue:)) ?? .balanced
+    }
+    static func setWidthPreset(_ p: PosterWidthPreset) { UserDefaults.standard.set(p.rawValue, forKey: widthKey) }
+
+    /// Poster corner-radius preset (default `.rounded` = today's look).
+    static func radiusPreset() -> PosterRadiusPreset {
+        (UserDefaults.standard.string(forKey: radiusKey)).flatMap(PosterRadiusPreset.init(rawValue:)) ?? .rounded
+    }
+    static func setRadiusPreset(_ p: PosterRadiusPreset) { UserDefaults.standard.set(p.rawValue, forKey: radiusKey) }
+
+    /// Hide the title label under each poster (default false = labels shown, today's look).
+    static func hideLabels() -> Bool { UserDefaults.standard.bool(forKey: hideLabelsKey) }
+    static func setHideLabels(_ value: Bool) { UserDefaults.standard.set(value, forKey: hideLabelsKey) }
     /// Cinematic landscape (16:9) catalog cards vs the legacy portrait (2:3) posters. Defaults to ON
     /// (the key unset reads true), so a fresh install gets the cinematic look; the Appearance toggle
     /// lets anyone fall back to portrait. Read as a plain static so card views can size off-main.
@@ -40,9 +176,46 @@ final class CatalogPreferences: ObservableObject {
     @Published var landscapeCards: Bool = CatalogPrefsStore.landscapeCards() {
         didSet { CatalogPrefsStore.setLandscapeCards(landscapeCards) }
     }
+    /// Poster-card width preset for the iOS/iPad/Mac catalog grids + rails. Default `.balanced` = today's
+    /// look. Two-way bound by the Poster Style settings; the grid + cards read it so a change re-lays out live.
+    @Published var posterWidth: PosterWidthPreset = CatalogPrefsStore.widthPreset() {
+        didSet { CatalogPrefsStore.setWidthPreset(posterWidth) }
+    }
+    /// Poster-card corner-radius preset. Default `.rounded` = today's look (Theme.Radius.card).
+    @Published var posterRadius: PosterRadiusPreset = CatalogPrefsStore.radiusPreset() {
+        didSet { CatalogPrefsStore.setRadiusPreset(posterRadius) }
+    }
+    /// Hide the title label under each poster. Default false = labels shown (today's look).
+    @Published var hidePosterLabels: Bool = CatalogPrefsStore.hideLabels() {
+        didSet { CatalogPrefsStore.setHideLabels(hidePosterLabels) }
+    }
+    /// Discover-hub categories the user has permanently hidden (see `HubCategoryKey`). The hub filters these
+    /// off its tiles. Not `didSet`-persisted; mutated through `setCategoryHidden` so the write + republish + a
+    /// hub refresh stay together. Empty by default => every tile shows.
+    @Published private(set) var hiddenCategories: Set<String> = CatalogPrefsStore.hiddenCategories()
+    /// The user's Discover region override (ISO 3166-1 alpha-2), or nil to follow the device region. Drives
+    /// `TMDBClient.deviceRegion` so every hub content path (services, sub-catalogs, region ordering) follows
+    /// it. Persisted + republished so the hub re-loads for the new region on change.
+    @Published var regionOverride: String? = CatalogPrefsStore.regionOverride() {
+        didSet {
+            guard oldValue != regionOverride else { return }
+            CatalogPrefsStore.setRegionOverride(regionOverride)
+            // Region changed: reload the hub (providers/backdrops are region-keyed) so tiles reflect it.
+            CollectionsHubModel.shared.load()
+        }
+    }
     private init() {}
 
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
+
+    /// Whether a Discover-hub category (a card, a genre, or a whole section) is hidden.
+    func isCategoryHidden(_ key: String) -> Bool { hiddenCategories.contains(key) }
+
+    /// Show/hide a Discover-hub category and republish so the live hub re-lays out immediately.
+    func setCategoryHidden(_ key: String, _ value: Bool) {
+        CatalogPrefsStore.setCategoryHidden(key, value)
+        hiddenCategories = CatalogPrefsStore.hiddenCategories()
+    }
 
     func setHidden(_ key: String, _ value: Bool) {
         CatalogPrefsStore.setHidden(key, value)
@@ -230,4 +403,29 @@ struct CatalogManagerView: View {
     private static func base(of key: String) -> String {
         key.components(separatedBy: "|").first ?? key
     }
+}
+
+/// A small curated set of common regions for the Discover region picker (ISO 3166-1 alpha-2 + a display
+/// label). Not exhaustive: the device-region default already covers everyone; this is a convenience for the
+/// most common overrides. The label is localized by the OS region name where possible, else the fixed name.
+/// Shared (SourcesShared) so both the iOS and tvOS Discover settings screens use the same list.
+enum DiscoverRegions {
+    struct Region: Hashable { let code: String; let label: String }
+
+    static let common: [Region] = codes.map { code, fallback in
+        Region(code: code, label: Locale.current.localizedString(forRegionCode: code) ?? fallback)
+    }
+
+    private static let codes: [(String, String)] = [
+        ("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"), ("AU", "Australia"),
+        ("IE", "Ireland"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"), ("ES", "Spain"),
+        ("IT", "Italy"), ("PT", "Portugal"), ("BR", "Brazil"), ("MX", "Mexico"), ("AR", "Argentina"),
+        ("NL", "Netherlands"), ("BE", "Belgium"), ("SE", "Sweden"), ("NO", "Norway"), ("DK", "Denmark"),
+        ("FI", "Finland"), ("PL", "Poland"), ("RU", "Russia"), ("UA", "Ukraine"), ("TR", "Turkey"),
+        ("JP", "Japan"), ("KR", "South Korea"), ("CN", "China"), ("TW", "Taiwan"), ("HK", "Hong Kong"),
+        ("ID", "Indonesia"), ("PH", "Philippines"), ("TH", "Thailand"), ("VN", "Vietnam"), ("MY", "Malaysia"),
+        ("SA", "Saudi Arabia"), ("AE", "United Arab Emirates"), ("EG", "Egypt"), ("ZA", "South Africa"),
+        ("NG", "Nigeria"), ("KE", "Kenya"), ("IL", "Israel"), ("GR", "Greece"), ("CZ", "Czechia"),
+        ("RO", "Romania"), ("HU", "Hungary"), ("CH", "Switzerland"), ("AT", "Austria"), ("NZ", "New Zealand"),
+    ]
 }

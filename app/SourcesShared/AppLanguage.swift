@@ -27,6 +27,17 @@ enum AppLanguage {
         ("uk", "Українська"), ("ur", "اردو"), ("vi", "Tiếng Việt"), ("zh-Hans", "简体中文"), ("zh-Hant", "繁體中文"),
         ("sw", "Kiswahili"), ("kk", "Қазақ"), ("hy", "Հայերեն"), ("ka", "ქართული"),
         ("pa", "ਪੰਜਾਬੀ"), ("ne", "नेपाली"), ("km", "ខ្មែរ"), ("am", "አማርኛ"),
+        // Extended world-language roster (0.3.9): pushes coverage past 100.
+        ("be", "Беларуская"), ("bs", "Bosanski"), ("cy", "Cymraeg"), ("ga", "Gaeilge"), ("gd", "Gàidhlig"),
+        ("lb", "Lëtzebuergesch"), ("mt", "Malti"), ("uz", "Oʻzbek"), ("ky", "Кыргызча"), ("tg", "Тоҷикӣ"),
+        ("mn", "Монгол"), ("lo", "ລາວ"), ("my", "မြန်မာ"), ("si", "සිංහල"), ("or", "ଓଡ଼ିଆ"),
+        ("as", "অসমীয়া"), ("sd", "سنڌي"), ("ps", "پښتو"), ("ha", "Hausa"), ("yo", "Yorùbá"),
+        ("ig", "Igbo"), ("zu", "isiZulu"), ("xh", "isiXhosa"), ("st", "Sesotho"), ("sn", "chiShona"),
+        ("so", "Soomaali"), ("rw", "Kinyarwanda"), ("mg", "Malagasy"), ("ny", "Chichewa"), ("tt", "Татарча"),
+        ("ug", "ئۇيغۇرچە"), ("ku", "Kurdî"), ("oc", "Occitan"), ("jv", "Basa Jawa"), ("su", "Basa Sunda"),
+        ("ht", "Kreyòl Ayisyen"), ("sm", "Gagana Samoa"), ("mi", "Māori"), ("br", "Brezhoneg"), ("fy", "Frysk"),
+        ("ceb", "Cebuano"), ("fo", "Føroyskt"),
+    
     ]
 
     private static let appleLanguagesKey = "AppleLanguages"

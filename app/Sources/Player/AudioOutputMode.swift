@@ -49,7 +49,7 @@ enum AudioOutputMode: String, CaseIterable {
         case .auto: return "Matches your TV or receiver. Best for most setups."
         case .stereo: return "Forces a stereo downmix. Choose this if a soundbar or receiver plays no sound."
         case .surround: return "Decodes Dolby/DTS to multichannel PCM and forces it on. Pick this if a soundbar that doesn't support DTS drops to stereo."
-        case .passthrough: return "Sends Dolby/DTS untouched to an AV receiver that decodes them. Best on Mac or a real receiver; falls back to decoding if unsupported."
+        case .passthrough: return "Hands Dolby/DTS to the system audio path for your receiver. On Apple TV it decodes and lets the OS route it (app-side bitstream froze playback, so it's off there); use Auto for most setups."
         }
     }
 }

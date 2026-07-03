@@ -7,6 +7,7 @@ import {
   hasOnlyUnplayable,
   isTorrent,
   pickPreferred,
+  playbackFallbacks,
   rankedGroups,
   sourceTagList,
   tiers,
@@ -14,13 +15,15 @@ import {
   watchLabel,
   type RankedGroup,
 } from "../lib/streamRanking";
-import { defaultSeason, episodesForSeason, isSeries, seasonsOf } from "../lib/series";
+import { fetchSkipSegments } from "../lib/skip";
+import { defaultSeason, episodesForSeason, isSeries, seasonsOf, sortedVideos } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { icon } from "../lib/icons";
 import { play } from "../lib/player";
 import { cwPosition, cwProgress, cwResumeId, inLibrary, toggleLibrary } from "../lib/store";
 import { getSettings } from "../lib/settings";
 import { fetchRatings, ratingsText, type Ratings } from "../lib/mdblist";
+import { resolveBackendTrailer, userTrailerLang } from "../lib/trailer";
 
 // The Detail page: a full-bleed backdrop with a gradient scrim, a logo/title hero, a meta row
 // (rating, year, runtime, genres), a primary Watch button that plays the best ranked source, a
@@ -45,7 +48,11 @@ interface DetailState {
   openEpisode: Video | null;
   ratings: Ratings | null; // MDBList IMDb/RT/TMDB, fetched async when an MDBList key is set
   similar: MetaItem[]; // "More Like This" - keyless Cinemeta genre catalog, fetched async
+  trailerUrl: string | null; // resolved backend full-trailer mp4 url (trailer.vortx.tv), null until/if resolved
 }
+
+// Aborts the in-flight backend-trailer probe when the user navigates to another title.
+let trailerAbort: AbortController | null = null;
 
 let state: DetailState | null = null;
 let addons: Addon[] = [];
@@ -74,6 +81,7 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
     openEpisode: null,
     ratings: null,
     similar: [],
+    trailerUrl: null,
   };
   host.innerHTML = `<div class="detail"><div class="detail-loading">Loading…</div></div>`;
 
@@ -91,6 +99,25 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
   }
   void loadRatings(meta); // IMDb/RT/TMDB, only when an MDBList key is set; repaints when it lands
   void loadSimilar(meta); // "More Like This" rail; keyless, repaints when it lands
+  void loadTrailer(meta); // full trailer via trailer.vortx.tv; repaints when it resolves (fail-soft)
+  render();
+}
+
+/** Resolve the FULL trailer for this title from the VortX trailer backend (the same /yt resolver the native
+ *  apps use). On success the Trailer button plays the progressive mp4 in the web player; on 404/error the
+ *  backend url stays null and the button falls back to the YouTube iframe embed (or hides if neither works).
+ *  Fail-soft, aborted on navigation, repaints on arrival. */
+async function loadTrailer(meta: MetaItem): Promise<void> {
+  trailerAbort?.abort();
+  trailerAbort = new AbortController();
+  const lang = userTrailerLang(getSettings().audioLang);
+  const url = await resolveBackendTrailer(meta.id, meta.type, lang, trailerAbort.signal);
+  // Staleness is title identity only: the trailer is tied to the title, not to a stream fetch, so it must
+  // NOT be gated on streamReqToken (a same-title stream refetch - e.g. opening an episode - bumps that and
+  // would wrongly drop a valid trailer). Navigating away is covered by the meta.id check plus trailerAbort.
+  if (!state || state.meta?.id !== meta.id) return; // navigated away
+  if (!url) return; // no backend trailer - keep whatever the iframe fallback offers
+  state.trailerUrl = url;
   render();
 }
 
@@ -148,6 +175,8 @@ async function loadStreams(type: string, id: string): Promise<void> {
 
 /** Tear down the Detail surface (called by the router when leaving the route). */
 export function closeDetail(): void {
+  trailerAbort?.abort();
+  trailerAbort = null;
   state = null;
   addons = [];
   hostEl = null;
@@ -228,8 +257,7 @@ function renderMovie(host: HTMLElement, meta: MetaItem): void {
   const groups = rankedFiltered();
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
   const logo = httpUrl(meta.logo);
-  const trailer = trailerYouTubeID(meta);
-  const extra = `${trailer ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
+  const extra = `${hasTrailer(meta) ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
   host.innerHTML = detailShell(
     bg,
     "",
@@ -252,7 +280,6 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
   }
   const open = state.openEpisode;
   const logo = httpUrl(meta.logo);
-  const trailer = trailerYouTubeID(meta);
 
   if (open) {
     const bg = httpUrl(open.thumbnail) || httpUrl(meta.background) || httpUrl(meta.poster);
@@ -270,7 +297,7 @@ function renderSeries(host: HTMLElement, meta: MetaItem): void {
     return;
   }
   const bg = httpUrl(meta.background) || httpUrl(meta.poster);
-  const extra = `${trailer ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
+  const extra = `${hasTrailer(meta) ? trailerButton() : ""}${libraryButton(meta)}${shareButton()}`;
   host.innerHTML = detailShell(
     bg,
     "",
@@ -653,6 +680,12 @@ function youTubeID(value: string): string | undefined {
   return /^[A-Za-z0-9_-]{11}$/.test(trimmed) ? trimmed : undefined;
 }
 
+/** Whether a Trailer affordance should show at all: a resolved backend full trailer, or a YouTube id we can
+ *  embed as the fallback. When neither exists the button is hidden (fail-soft - never a broken player). */
+function hasTrailer(meta: MetaItem): boolean {
+  return !!state?.trailerUrl || !!trailerYouTubeID(meta);
+}
+
 function trailerButton(): string {
   return `<button class="chip trailer-chip" data-action="play-trailer">${icon("trailer")}<span>Trailer</span></button>`;
 }
@@ -720,28 +753,77 @@ function closeTrailer(): void {
 
 // ---- Playback wiring ---------------------------------------------------------------------------
 
-/** Play a stream: direct/debrid urls go straight to the player. Torrents are not playable on web. */
+/** Play a stream: direct/debrid urls go straight to the player. Torrents are not playable on web. `stream`
+ *  is the user's chosen source; the rest of the ranked pool becomes the ordered fallback chain the player
+ *  auto-advances through on a decode / silent-audio failure (D6), with browser-decodable audio preferred. */
 async function playStream(stream: Stream): Promise<void> {
   if (!stream.url || !/^https?:\/\//i.test(stream.url)) return;
-  const title = state?.openEpisode
-    ? `${state.meta?.name ?? ""} · S${state.openEpisode.season ?? 0}E${state.openEpisode.episode ?? 0}`
+  const episode = state?.openEpisode ?? undefined;
+  const title = episode
+    ? `${state?.meta?.name ?? ""} · S${episode.season ?? 0}E${episode.episode ?? 0}`
     : state?.meta?.name ?? "VortX";
-  await play(
-    stream.url,
-    title,
-    state?.meta
+
+  // Fallback chain: the chosen url first, then the decodable-audio-preferred pool (deduped). So an
+  // undecodable-audio pick still starts where the user asked but can auto-advance to a source with sound.
+  const pool = playbackFallbacks(rankedFiltered())
+    .map((s) => s.url)
+    .filter((u): u is string => !!u && /^https?:\/\//i.test(u));
+  const fallbacks = [stream.url, ...pool.filter((u) => u !== stream.url)];
+
+  // Skip segments + next-episode are series playback niceties; fetched fail-soft so playback never waits.
+  const skipSegments = state?.meta
+    ? await fetchSkipSegments(state.meta.id, episode?.season, episode?.episode).catch(() => [])
+    : [];
+  const next = episode ? nextEpisode(episode) : null;
+
+  await play(stream.url, title, {
+    item: state?.meta
       ? {
           id: state.meta.id,
           type: state.meta.type,
           name: state.meta.name,
           poster: state.meta.poster,
-          resumeId: state.openEpisode?.id ?? state.meta.id,
+          resumeId: episode?.id ?? state.meta.id,
         }
       : undefined,
-    state?.meta
-      ? fetchSubtitles(addons, state.meta.type, state.openEpisode?.id ?? state.meta.id)
+    subtitles: state?.meta
+      ? fetchSubtitles(addons, state.meta.type, episode?.id ?? state.meta.id)
       : undefined,
-  );
+    fallbacks,
+    skipSegments,
+    onNextEpisode: next ? () => void playEpisodeById(next.id) : undefined,
+  });
+}
+
+/** The episode that follows `current` in play order (next episode this season, else first of the next
+ *  season), or null when it's the last one. Drives the player's Next Episode button + binge auto-advance. */
+function nextEpisode(current: Video): Video | null {
+  const videos = state?.meta?.videos ?? [];
+  const eps = videos.filter((v) => v.episode !== undefined || v.season !== undefined);
+  // Drop season-0 specials from the binge chain so it never routes a special ahead of the real premiere
+  // (season 0 would otherwise sort first), matching the "skip specials" order used elsewhere. Keep them
+  // only when the currently-open item is itself a special, so Next still works from within the specials run.
+  const isSpecial = (current.season ?? 0) <= 0;
+  const ordered = sortedVideos(isSpecial ? eps : eps.filter((v) => (v.season ?? 0) > 0));
+  const i = ordered.findIndex((v) => v.id === current.id);
+  return i >= 0 && i < ordered.length - 1 ? ordered[i + 1] : null;
+}
+
+/** Open an episode by id and immediately play its best source (used by the player's Next Episode action).
+ *  Mirrors openEpisode's state setup, then auto-picks like the Watch button so playback is continuous. */
+async function playEpisodeById(videoId: string): Promise<void> {
+  if (!state?.meta) return;
+  const episode = state.meta.videos?.find((v) => v.id === videoId);
+  if (!episode) return;
+  state.openEpisode = episode;
+  state.showAllSources = false;
+  state.sourceFilter = null;
+  state.pickerOpen = false;
+  state.pickerTier = null;
+  render();
+  await loadStreams(state.type, episode.id);
+  const top = pickPreferred(rankedFiltered(), getSettings().preferredQuality);
+  if (top) await playStream(top);
 }
 
 async function playBest(): Promise<boolean> {
@@ -777,6 +859,15 @@ async function playStreamRow(node: HTMLElement): Promise<boolean> {
 
 async function playTrailer(): Promise<boolean> {
   if (!state?.meta) return true;
+  // PRIMARY: the backend full trailer (progressive mp4 via trailer.vortx.tv), played in the web player -
+  // the same /yt resolver path the native apps use, so web stays consistent. It is NOT HLS, so play() hands
+  // it straight to the <video> element (no hls.js). No CW item / subtitles: a trailer must not record
+  // Continue Watching progress or pull subtitle tracks.
+  if (state.trailerUrl) {
+    await play(state.trailerUrl, `${state.meta.name} · Trailer`);
+    return true;
+  }
+  // FALLBACK: the YouTube iframe embed, when the backend has no trailer but the meta carries a YouTube id.
   const id = trailerYouTubeID(state.meta);
   if (id) openTrailer(id);
   return true;

@@ -29,6 +29,12 @@ struct PlaybackRequest: Identifiable {
     /// trailer fails to load, the player must NOT fall back to the engine's content streams (that would
     /// substitute the actual/random movie for the dead trailer); it shows the error overlay and stops.
     var isTrailer: Bool = false
+    /// When this request plays a NATIVELY-resolved debrid link, its provenance so the play-record can store
+    /// enough to reresolve a fresh link on a later Continue-Watching resume. nil for torrent/direct/trailer.
+    var debridRef: DebridPlaybackRef? = nil
+    /// yt-direct adaptive pair (trailers / pasted YouTube links): the separate AUDIO stream mpv mounts
+    /// alongside the video-only `url` (`--audio-files`). Forces the libmpv engine in TVPlayerView.
+    var audioSidecarURL: URL? = nil
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -78,6 +84,7 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
+                             audioSidecarURL: req.audioSidecarURL,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }
@@ -142,8 +149,39 @@ struct RootTabView: View {
     /// Hide the Live TV tab for users who do not use it (Settings toggle).
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
 
+    /// The tvOS scroll-to-top key for a tab tag, matching the `TabScrollKeys` the screens observe.
+    /// tvOS `TabView` selection uses integer tags; only Home / Discover / Library carry a scrollable
+    /// hero screen wired for scroll-to-top. Search / Add-ons / Settings are lists or their own
+    /// containers, and Live (tag 6) is an EPG grid, so they are intentionally omitted here (returning
+    /// nil means a re-select is a plain no-op, not a bump nobody observes).
+    private func scrollKey(for tag: Int) -> String? {
+        switch tag {
+        case 0: return TabScrollKeys.home
+        case 1: return TabScrollKeys.discover
+        case 2: return TabScrollKeys.library
+        default: return nil
+        }
+    }
+
+    /// Selection binding that turns a re-select of the ALREADY-active tab into a scroll-to-top signal.
+    /// tvOS `TabView` calls this setter when the user activates a tab item; when the new value equals the
+    /// current selection (re-tapping the active tab) we bump that tab's token instead of a no-op set, so
+    /// the mounted screen scrolls to its top. A genuine tab switch sets `selection` as before.
+    private var selectionBinding: Binding<Int> {
+        Binding(
+            get: { selection },
+            set: { newValue in
+                if newValue == selection, let key = scrollKey(for: newValue) {
+                    TabScrollToTop.shared.bump(key)
+                } else {
+                    selection = newValue
+                }
+            }
+        )
+    }
+
     var body: some View {
-        TabView(selection: $selection) {
+        TabView(selection: selectionBinding) {
             HomeView().id(resetTokens[0])
                 .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
             DiscoverView().id(resetTokens[1])

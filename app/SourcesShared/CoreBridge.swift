@@ -57,6 +57,11 @@ final class CoreBridge: ObservableObject {
             }
         }
         if !ok { NSLog("[CoreBridge] stremiox_core_init failed"); return }
+        // Bring up RemoteConfig once, on the single shared launch path every Apple target runs (VortXTV,
+        // VortXTVLite, VortXiOSNative, VortXMac, VortX). Synchronously loads last-good cached JSON into the
+        // lock-free snapshot (else all-baked, behaviorally identical to shipping), then kicks a background
+        // refresh. Fail-soft: any error keeps baked defaults, so this never blocks or bricks launch.
+        Task { await RemoteConfig.shared.bootstrap() }
         bootstrapAuth()
         seedInitialState()
         scheduleSessionRepair()   // runs on EVERY launch path: covers the force-close add-on-loss desync
@@ -133,10 +138,15 @@ final class CoreBridge: ObservableObject {
         }
         let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
         if alreadyInstalled, !replacingExisting { return "That add-on is already installed." }
-        do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                  let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        // SSRF guard: fetch through AddonURLGuard, which validates the host + every RESOLVED address (and each
+        // redirect hop) against the private/loopback/link-local/CGNAT/ULA ranges and refuses a private target.
+        // A pasted or QR-relayed URL can never point the install fetch at 127.0.0.1 / a LAN service / a cloud
+        // metadata endpoint. Fail-closed for private targets; normal public manifests are unaffected.
+        switch await AddonURLGuard.fetch(url) {
+        case .failure(let rejection):
+            return rejection.message
+        case .success(let (data, _)):
+            guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   manifest["id"] != nil, manifest["name"] != nil else {
                 return "That URL did not return a valid add-on manifest."
             }
@@ -154,9 +164,34 @@ final class CoreBridge: ObservableObject {
             ]
             dispatchCtx(["action": "InstallAddon", "args": descriptor])
             return nil
-        } catch {
-            return "Could not reach that add-on. Check the URL and your connection."
         }
+    }
+
+    /// Result of validating a pasted / QR-relayed manifest URL WITHOUT installing it. Used by the
+    /// Install-by-QR pairing view to show "Install <name>?" and to know whether a URL is already
+    /// installed, using the SAME fetch + validation `installAddon` performs (same normalization, same
+    /// 200 + `id`/`name` manifest check). This never mutates engine state; `installAddon` stays the
+    /// one and only installer, so its validation is not bypassed or weakened.
+    struct AddonManifestPreview: Equatable {
+        let normalizedURL: String
+        let name: String
+        let alreadyInstalled: Bool
+    }
+
+    /// Fetch + validate a manifest URL the way `installAddon` does, returning its name (for a confirm
+    /// prompt) without installing. Returns nil when the URL is invalid or the manifest fails validation.
+    /// The actual install still goes through `installAddon`, which re-fetches and re-validates.
+    @MainActor
+    func previewAddonManifest(urlString: String) async -> AddonManifestPreview? {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else { return nil }
+        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
+        // SSRF guard: same private-address gate `installAddon` uses (the QR confirm resolves the name here),
+        // so a manifest URL pointing at a private/loopback/LAN address never even previews. Fail-soft to nil.
+        guard case let .success((data, _)) = await AddonURLGuard.fetch(url),
+              let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              manifest["id"] != nil,
+              let name = manifest["name"] as? String, !name.isEmpty else { return nil }
+        return AddonManifestPreview(normalizedURL: normalized, name: name, alreadyInstalled: alreadyInstalled)
     }
 
     /// True when the engine has NO stream-capable add-on installed (every title would report "no
@@ -1007,15 +1042,21 @@ final class CoreBridge: ObservableObject {
     /// add-to-library targets the OWNER profile (whose library is the account itself, not a per-profile
     /// overlay), regardless of which profile is active locally. Resolves the full meta (the engine wants
     /// the full object, like addDetailToLibrary) and dispatches it. The id must be a real catalog id.
+    ///
+    /// Returns `true` only when the meta resolved and the AddToLibrary dispatch was made, so a caller that
+    /// records "already added" state (e.g. `LibraryAutoAdd`) can gate on a confirmed add and retry a failed one
+    /// on the next play. `@discardableResult` keeps fire-and-forget callers unchanged.
     @MainActor
-    func addCatalogItemToAccount(id: String, type: String) async {
+    @discardableResult
+    func addCatalogItemToAccount(id: String, type: String) async -> Bool {
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return }
+              let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return false }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
+        return true
     }
 
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`

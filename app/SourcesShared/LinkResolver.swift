@@ -10,8 +10,9 @@ import os
 enum StreamLinkKind: Equatable {
     /// A live Twitch channel (`twitch.tv/<channel>`). Resolves to an HLS `.m3u8` via `resolveTwitch`.
     case twitch(channel: String)
-    /// A YouTube watch / live / channel URL. NOT resolved in Phase 1 (Phase 3 = Worker + Data API).
-    case youtube
+    /// A YouTube watch / live / short URL, carrying the extracted 11-char video id. Played through the
+    /// remote resolver (`trailer.vortx.tv/yt/{id}`), the same path the Trailer button uses.
+    case youtube(videoID: String)
     /// A plain http(s) media URL the existing direct-link path already handles.
     case direct(URL)
     /// Not something we can play directly. `note` is a short, user-facing reason (e.g. a Twitch
@@ -56,11 +57,28 @@ enum LinkResolver {
             return .unsupported(note: "Twitch clips aren't supported yet, only live channels.")
         }
         if bareHost == "youtube.com" || bareHost == "m.youtube.com" || bareHost == "youtu.be" {
-            return .youtube
+            if let id = youTubeVideoID(from: comps, bareHost: bareHost) { return .youtube(videoID: id) }
+            return .unsupported(note: "That YouTube link has no playable video id.")
         }
         // A plain http(s) URL the existing direct-link path already plays.
         if let url = comps.url { return .direct(url) }
         return .unsupported()
+    }
+
+    /// Extract the 11-char YouTube video id from any common URL shape: `youtu.be/<id>`,
+    /// `watch?v=<id>`, or `/embed|live|shorts|v/<id>`. Returns nil for a channel/playlist/other link.
+    private static func youTubeVideoID(from comps: URLComponents, bareHost: String) -> String? {
+        func valid(_ s: String?) -> String? {
+            guard let s, s.range(of: "^[A-Za-z0-9_-]{11}$", options: .regularExpression) != nil else { return nil }
+            return s
+        }
+        let segments = comps.path.split(separator: "/").map(String.init)
+        if bareHost == "youtu.be" { return valid(segments.first) }
+        if let v = comps.queryItems?.first(where: { $0.name == "v" })?.value, let id = valid(v) { return id }
+        if segments.count >= 2, ["embed", "live", "shorts", "v"].contains(segments[0].lowercased()) {
+            return valid(segments[1])
+        }
+        return nil
     }
 
     /// A `twitch.tv` URL is a live channel only when the path is a single segment that is a valid

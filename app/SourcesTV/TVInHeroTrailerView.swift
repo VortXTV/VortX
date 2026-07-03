@@ -2,26 +2,27 @@ import SwiftUI
 
 /// In-hero auto-play trailer for the **tvOS** detail page (#44), the parity twin of the iOS / iPad / Mac
 /// `InHeroTrailerView`. tvOS has no WKWebView, so the YouTube IFrame embed the touch surfaces use cannot
-/// run here; this plays whatever DIRECT URL it is handed through **libmpv**. NOTE: tokenless YouTube
-/// extraction is dead, so `TrailerRequest.playableURL` now yields only a direct (non-YouTube) stream here
-/// (the dead `/yt` route was removed); a YouTube-only trailer has no URL and the layer simply never mounts
-/// (still backdrop stays) until the `trailer.vortx.tv` resolver lands. See TrailerRequest.swift.
+/// run here; this plays whatever DIRECT URL it is handed through **libmpv**. `TrailerRequest.playableURL`
+/// yields either a direct (non-YouTube) stream or the native `{serverBase}/yt/{id}` full-trailer resolver
+/// URL (the SAME path the Trailer button plays; the retired R2 `trailer.vortx.tv/clip` snippet is gone,
+/// owner directive); a resolve miss 404s into the `endFileError` -> still-backdrop fallback below. See
+/// TrailerRequest.swift.
 ///
 /// A muted, looping, chromeless libmpv layer fades in OVER the still backdrop a short beat after the hero
 /// appears, the same ambient treatment iOS gives. The still art underneath is the permanent fallback, so a
 /// missing / slow / blocked clip never leaves the band black.
 ///
-/// Two loop modes (the owner's clip-scope answer): pass `window` for a short SILENT WINDOW (the DETAIL hero
-/// shows a ~8s snippet, the parity of the iOS detail's `.clip(start:window:)`), or leave it nil for the whole
-/// muted trailer on a built-in `loop-file=inf` loop (the HOME featured hero). The same view serves both so
-/// the home + detail heroes share one decorative libmpv layer.
+/// Loop mode: both the HOME and DETAIL heroes now leave `window` nil and loop the WHOLE muted trailer via a
+/// built-in `loop-file=inf` loop (owner directive: the ambient background loop IS the full `/yt` trailer,
+/// muted, not a short snippet). The `window` short-silent-window mode is retained for any caller that wants a
+/// brief looped beat, but is no longer used by the shipping heroes.
 ///
 /// Gating + fallback (mirrors iOS exactly):
 ///   • The caller gates on the `stremiox.autoplayTrailers` setting + `accessibilityReduceMotion`, and only
 ///     mounts this view when a trailer exists, so reduced-motion / setting-off never starts a clip.
-///   • The clip plays only when the embedded server is reachable (checked async on appear). On the Lite
-///     build (`STREMIOX_NO_EMBEDDED_SERVER`) there is no `/yt` route, so `TrailerRequest.playableURL` is
-///     nil and the caller never builds this view — it cleanly no-ops to the still backdrop.
+///   • Only LOOPBACK urls (the embedded node server) wait on an async server-reachability probe; remote
+///     urls (the `/clip` resolver, a direct CDN stream) mount immediately, so the Lite build
+///     (`STREMIOX_NO_EMBEDDED_SERVER`) plays remote clips like any other target.
 ///   • If libmpv reports a load failure (`endFileError`, e.g. ytdl extraction failed), the clip hides and
 ///     the still backdrop stays.
 ///
@@ -34,8 +35,8 @@ import SwiftUI
 /// never leaks a player or holds the streaming server busy. Keyed on the trailer URL so navigating A -> B
 /// rebuilds the layer for B rather than painting A's clip over B's backdrop.
 struct TVInHeroTrailerView: View {
-    /// The resolved trailer playable URL ({serverBase}/yt/{id} or a direct stream). The caller guarantees
-    /// it is non-nil (so the Lite build, where it is nil, never reaches here).
+    /// The resolved trailer playable URL (the `/clip` resolver mp4 or a direct stream). The caller
+    /// guarantees it is non-nil.
     let url: URL
 
     /// When set, play a short SILENT WINDOW instead of the whole trailer: seek to `start` on reveal and
@@ -92,6 +93,7 @@ struct TVInHeroTrailerView: View {
                     // hand mpv `loop-file=inf` (that would replay the whole trailer). Full mode keeps
                     // mpv's built-in inf loop. Muted either way: a silent ambient clip.
                     .muted(true, loop: window == nil)
+                    .videoFill(true)   // fill the WHOLE hero band, never a small letterboxed box (owner ask)
                     .onPropertyChange { engine, name, data in handleProperty(engine, name, data) }
                     .allowsHitTesting(false)   // ambient: never in the focus / hit path
                     .opacity(showClip ? 1 : 0)
@@ -117,8 +119,16 @@ struct TVInHeroTrailerView: View {
             // an offline streaming server. Mount remote URLs straight away and let libmpv's own fetch (and
             // its `endFileError` -> backdrop fallback) be the only gate; only loopback URLs wait on the
             // embedded server. (On the Lite build a YouTube resolver URL is remote, so Lite GAINS trailers.)
+            // H13 diagnostic: the owner reports tvOS hero clips DIM then stay on the still (the layer mounts
+            // + reveal attempts but no first frame decodes). Log the exact URL + how it will be gated so a
+            // terminal run of the app shows whether /clip 404s (never warmed), the /yt resolver is dead, or
+            // libmpv rejects the container. Paired with the [tvtrailer] first-frame / endFileError logs in
+            // handleProperty, this pins the failure to URL vs decode. Cheap NSLog, no behavior change.
+            NSLog("[tvtrailer] mount url=%@ loopback=%@ windowed=%@", url.absoluteString,
+                  Self.isLoopback(url) ? "yes" : "no", window == nil ? "no" : "yes")
             if Self.isLoopback(url) {
                 if await StremioServer.isOnline() { serverReady = true }
+                else { NSLog("[tvtrailer] loopback server OFFLINE, clip suppressed url=%@", url.absoluteString) }
             } else {
                 serverReady = true
             }
@@ -153,6 +163,7 @@ struct TVInHeroTrailerView: View {
             // arm the reveal beat exactly once.
             if !didStart {
                 didStart = true
+                NSLog("[tvtrailer] FIRST FRAME decoded url=%@", url.absoluteString)   // H13: proves decode reached the band
                 if let window { engine.seek(to: window.start) }
                 armReveal()
             }
@@ -163,6 +174,8 @@ struct TVInHeroTrailerView: View {
             }
         case MPVProperty.endFileError:
             // ytdl extraction failed / dead link: hide the clip so the still backdrop shows.
+            let reason = (data as? String) ?? "(no detail)"   // H13: the exact mpv end-file reason (404, unknown-format, ...)
+            NSLog("[tvtrailer] endFileError url=%@ reason=%@", url.absoluteString, reason)
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) { failed = true }
         default:
             break

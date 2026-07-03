@@ -60,6 +60,10 @@ struct SeekBarTrack: View {
     let progress: Double
     var accent: Color
     var track: Color = Color.white.opacity(0.22)
+    /// YouTube-style buffered-ahead fraction (0...1): how far the demuxer/AVPlayer has loaded past the
+    /// playhead. Rendered as a faint grey band from the playhead to the buffered edge, above the track and
+    /// below the knob. Defaults to 0 (fail-soft: no buffered info → nothing extra draws, the bar is unchanged).
+    var buffered: Double = 0
     /// When false (e.g. playback paused), motion freezes; the bar still shows the played fraction.
     var animated: Bool = true
 
@@ -68,7 +72,8 @@ struct SeekBarTrack: View {
             let t = timeline.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
                 SeekBarRenderer.draw(style, ctx, size, t,
-                                     CGFloat(min(1, max(0, progress))), accent, track)
+                                     CGFloat(min(1, max(0, progress))), accent, track,
+                                     CGFloat(min(1, max(0, buffered))))
             }
         }
     }
@@ -82,7 +87,7 @@ struct SeekBarTrack: View {
 /// = track (faint/short), so the playhead boundary always reads as progress.
 private enum SeekBarRenderer {
     static func draw(_ style: SeekBarStyle, _ ctx: GraphicsContext, _ size: CGSize,
-                     _ t: Double, _ p: CGFloat, _ accent: Color, _ track: Color) {
+                     _ t: Double, _ p: CGFloat, _ accent: Color, _ track: Color, _ buffered: CGFloat = 0) {
         switch style {
         case .classic:   capsule(ctx, size, p, accent, track, thicknessScale: 1.0, glow: 0)
         case .minimal:   capsule(ctx, size, p, accent, track, thicknessScale: 0.4, glow: 0)
@@ -99,6 +104,26 @@ private enum SeekBarRenderer {
         case .segments:  runner(ctx, size, t, p, accent, track)
         case .ladder:    spectrum(ctx, size, t, p, accent, track)
         }
+        // YouTube-style buffered-ahead band: a faint grey capsule from the playhead to the buffered edge.
+        // Drawn LAST so it reads over every style's own track, and only the segment AHEAD of the playhead
+        // (never over the played fill or knob). Fail-soft: buffered <= p (or 0) draws nothing.
+        bufferedBand(ctx, size, p, buffered, track)
+    }
+
+    /// The grey loaded-but-not-yet-played hint. A thin capsule spanning (playhead → buffered edge), lighter
+    /// than the unplayed track so it reads as "ready ahead" without competing with the accent played fill.
+    private static func bufferedBand(_ ctx: GraphicsContext, _ size: CGSize, _ p: CGFloat,
+                                     _ buffered: CGFloat, _ track: Color) {
+        guard buffered > p else { return }
+        let w = size.width, h = size.height
+        let th = max(3, h * 0.30)
+        let y = (h - th) / 2
+        let startX = w * p
+        let endX = w * min(1, buffered)
+        let bw = max(0, endX - startX)
+        guard bw > 0.5 else { return }
+        ctx.fill(Path(roundedRect: CGRect(x: startX, y: y, width: bw, height: th), cornerRadius: th / 2),
+                 with: .color(.white.opacity(0.42)))
     }
 
     // MARK: shared bits

@@ -12,6 +12,8 @@ import {
   mergeInstalledAddons,
   applyAddonOrder,
   registerAddonsSyncPusher,
+  registerCwSyncPusher,
+  webProgressEntries,
   installedUrls,
   mergeLibrary,
   mergeContinueWatching,
@@ -19,7 +21,7 @@ import {
   mergeContinueWatchingForScope,
   type CWEntry,
 } from "./store";
-import { mergeSyncedProfiles, type SyncedProfile } from "./profiles";
+import { mergeSyncedProfiles, activeProfileId, isOwnerProfile, type SyncedProfile } from "./profiles";
 import { updateSettings, onSettingsChange, type Settings } from "./settings";
 import { settingsPatchFromDoc, mergeWebappSettingsIntoProfile, effectiveMainSettings, mainProfileId } from "./syncSettings";
 import { CINEMETA_URL, loadAddon } from "./addon";
@@ -213,7 +215,7 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
 
   // Continue Watching for the OWNER: derive from the synced library items' t/d progress, plus any explicit
   // vortx.continueWatching the app emits. cwEntriesFrom is shared with the per-profile hydration below.
-  const cwChanged = mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)]);
+  let cwChanged = mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)]);
 
   // Profiles roster + per-profile (byProfile) library/CW. Without this the webapp only ever showed the
   // local "You" profile and never the user's real synced roster, and secondary profiles had empty
@@ -230,6 +232,22 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
       if (mergeLibraryForScope(pid, asObjArr(rec.library) as unknown as MetaItem[])) byProfileChanged = true;
       const cwSrc = Array.isArray(rec.continueWatching) ? rec.continueWatching : rec.library;
       if (mergeContinueWatchingForScope(pid, cwEntriesFrom(cwSrc))) byProfileChanged = true;
+    }
+  }
+
+  // Web-written watch progress (the bilateral doc.webProgress field this client also WRITES). Shape:
+  // { editedAt, owner: [entry], byProfile: { <overlayId>: [entry] } }, entry = {id,type,v,t,d,lastWatched}.
+  // Mirrors the app's "owner top-level, overlays under byProfile" convention so the owner's web progress
+  // merges into the base scope (not a phantom scope keyed by the owner's profile id). Merging it back means
+  // what you watched on one browser shows on another even before the apps round-trip it into vortx.library.
+  const webProg = doc.webProgress && typeof doc.webProgress === "object" ? (doc.webProgress as Record<string, unknown>) : null;
+  if (webProg) {
+    if (Array.isArray(webProg.owner) && mergeContinueWatching(cwEntriesFrom(webProg.owner))) cwChanged = true;
+    const wpBy = webProg.byProfile && typeof webProg.byProfile === "object" ? (webProg.byProfile as Record<string, unknown>) : null;
+    if (wpBy) {
+      for (const pid of Object.keys(wpBy)) {
+        if (mergeContinueWatchingForScope(pid, cwEntriesFrom(wpBy[pid]))) byProfileChanged = true;
+      }
     }
   }
 
@@ -317,7 +335,11 @@ async function pushSettings(session: Session, s: Settings): Promise<void> {
 /** Push the webapp's installed add-ons up to the account (the doc.addons web sibling), so add-ons added
  *  on the web reach the user's other devices. Cinemeta is excluded (a universal built-in, not a user
  *  add-on). Fail-soft. */
-async function pushAddons(session: Session, urls: string[]): Promise<void> {
+async function pushAddons(
+  session: Session,
+  urls: string[],
+  hint?: { added?: string; removed?: string },
+): Promise<void> {
   try {
     // Resolve each add-on's FULL manifest so the synced entry is the descriptor the native app needs:
     // {transportUrl, name, manifest}. The app DROPS doc.addons entries that lack a manifest (it installs
@@ -339,6 +361,17 @@ async function pushAddons(session: Session, urls: string[]): Promise<void> {
     );
     await mutateSyncDoc(session, (doc) => {
       doc.addons = descriptors;
+      // Maintain the removal tombstone (doc.removedAddons: { [transportUrl]: removedAtEpochMs }) from the
+      // EXPLICIT add/remove signal - never inferred by diffing the merged set, which would false-tombstone
+      // app-installed add-ons the webapp doesn't hold locally. A removal records "now"; the app uninstalls
+      // tombstoned URLs (gated on a good pull). Re-adding the same URL clears its tombstone (add wins LWW).
+      const tomb: Record<string, number> =
+        doc.removedAddons && typeof doc.removedAddons === "object"
+          ? (doc.removedAddons as Record<string, number>)
+          : {};
+      if (hint?.removed) tomb[hint.removed] = Date.now();
+      if (hint?.added) delete tomb[hint.added];
+      doc.removedAddons = tomb;
     });
   } catch {
     // fail-soft: the add-on is already installed locally; a later change re-pushes.
@@ -348,10 +381,102 @@ async function pushAddons(session: Session, urls: string[]): Promise<void> {
 // Wire the write-up triggers once at module load:
 //  - add/remove on the web pushes the installed list up (store.ts calls this injected pusher).
 //  - any USER settings change (suppressUp gates out hydration) debounce-pushes the main profile's settings.
-registerAddonsSyncPusher(() => {
+registerAddonsSyncPusher((hint) => {
   const s = currentSession();
-  if (s) void pushAddons(s, installedUrls());
+  if (s) void pushAddons(s, installedUrls(), hint);
 });
+
+// Push the ACTIVE profile's web watch-progress up to the bilateral doc.webProgress field. Owner progress
+// goes top-level (doc.webProgress.owner) to match the app's convention; overlay progress under
+// .byProfile[profileId]. The app merges this into watch history (LWW by lastWatched), NEVER into
+// libraryItem. Fail-soft. (Read-down lives in applySyncDoc.)
+async function pushWebProgress(session: Session): Promise<void> {
+  try {
+    const entries = webProgressEntries(); // the active scope's CW, already in the bilateral shape
+    const owner = isOwnerProfile(activeProfileId());
+    const pid = activeProfileId();
+    await mutateSyncDoc(session, (doc) => {
+      const wp: Record<string, unknown> =
+        doc.webProgress && typeof doc.webProgress === "object" ? (doc.webProgress as Record<string, unknown>) : {};
+      const prior = owner
+        ? wp.owner
+        : wp.byProfile && typeof wp.byProfile === "object"
+          ? (wp.byProfile as Record<string, unknown>)[pid]
+          : undefined;
+      const merged = mergeWebProgress(prior, entries);
+      if (owner) {
+        wp.owner = merged;
+      } else {
+        const by: Record<string, unknown> =
+          wp.byProfile && typeof wp.byProfile === "object" ? (wp.byProfile as Record<string, unknown>) : {};
+        by[pid] = merged;
+        wp.byProfile = by;
+      }
+      wp.editedAt = Date.now();
+      doc.webProgress = wp;
+    });
+  } catch {
+    // fail-soft: progress is already saved locally; the next CW change re-pushes.
+  }
+}
+
+// Union the doc's existing web-progress entries with this device's, keyed by id+played-id, keeping the
+// fresher lastWatched. Without this, a full-array overwrite would let two browsers clobber each other's
+// progress (LWW on the array instead of per title). Pure - returns a new array, never mutates inputs.
+function mergeWebProgress(prior: unknown, mine: ReturnType<typeof webProgressEntries>): ReturnType<typeof webProgressEntries> {
+  const byKey = new Map<string, (typeof mine)[number]>();
+  const take = (e: unknown): void => {
+    if (!e || typeof e !== "object") return;
+    const r = e as Record<string, unknown>;
+    if (typeof r.id !== "string" || typeof r.v !== "string") return;
+    const key = `${r.id}|${r.v}`;
+    const lastWatched = typeof r.lastWatched === "number" ? r.lastWatched : 0;
+    const existing = byKey.get(key);
+    if (!existing || lastWatched >= existing.lastWatched) {
+      byKey.set(key, {
+        id: r.id,
+        type: typeof r.type === "string" ? r.type : "",
+        v: r.v,
+        t: typeof r.t === "number" ? r.t : 0,
+        d: typeof r.d === "number" ? r.d : 0,
+        lastWatched,
+        name: typeof r.name === "string" ? r.name : undefined,
+        poster: typeof r.poster === "string" ? r.poster : undefined,
+      });
+    }
+  };
+  if (Array.isArray(prior)) prior.forEach(take);
+  mine.forEach(take);
+  return Array.from(byKey.values())
+    .sort((a, b) => b.lastWatched - a.lastWatched)
+    .slice(0, 100); // cap the synced array; locally we still keep the 40 most-recent per the CW store
+}
+
+// recordProgress fires ~every 5s during playback, so coalesce: the first change opens a window and the
+// push fires once at its end (at most ~1 account write per WEBPROGRESS_PUSH_DELAY of continuous play),
+// then flushes on pagehide so a closed tab still syncs the last position.
+let webProgressTimer: ReturnType<typeof setTimeout> | null = null;
+const WEBPROGRESS_PUSH_DELAY = 25_000;
+registerCwSyncPusher(() => {
+  if (suppressUp) return; // hydration merges CW too; don't echo synced progress back up
+  if (!currentSession()) return; // signed out: progress stays local
+  if (webProgressTimer) return; // a push is already scheduled within this window
+  webProgressTimer = setTimeout(() => {
+    webProgressTimer = null;
+    const s = currentSession();
+    if (s) void pushWebProgress(s);
+  }, WEBPROGRESS_PUSH_DELAY);
+});
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => {
+    if (webProgressTimer) {
+      clearTimeout(webProgressTimer);
+      webProgressTimer = null;
+    }
+    const s = currentSession();
+    if (s) void pushWebProgress(s); // best-effort final flush (browsers allow a last fetch on pagehide)
+  });
+}
 onSettingsChange((next) => {
   if (suppressUp) return; // hydration applied this, not the user; don't echo it back up
   if (!settingsSyncArmed) return; // account has no settings mirror yet: keep web changes local (see flag)

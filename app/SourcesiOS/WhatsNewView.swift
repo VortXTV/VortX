@@ -1,33 +1,47 @@
 import SwiftUI
 
-/// "What's new" sheet shown once after an app update (see `WhatsNew`). A short, branded highlights list with
-/// a single dismiss action. iOS/Mac only (SourcesiOS); tvOS has its own surfaces.
+/// The full release changelog, reached from Settings > What's New (it is no longer shown automatically on
+/// launch). Renders the bundled CHANGELOG.md as styled sections via the shared ChangelogParser; falls back
+/// to the curated WhatsNew.highlights for the current version if the changelog resource is missing.
+/// iOS/Mac only (SourcesiOS); the Apple TV twin is SourcesTV/TVWhatsNewView.
 struct WhatsNewView: View {
-    let onDone: () -> Void
+    private let blocks: [ChangelogParser.Block] = ChangelogParser.loadBlocks()
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                    Text("What's new")
-                        .font(.largeTitle.weight(.bold))
-                        .foregroundStyle(Theme.Palette.textPrimary)
-                    Text("VortX \(WhatsNew.version)")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Theme.Palette.accent)
-                }
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                Text("What's New")
+                    .font(.largeTitle.weight(.bold))
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .padding(.bottom, Theme.Space.xs)
 
-                VStack(alignment: .leading, spacing: Theme.Space.md) {
-                    ForEach(WhatsNew.highlights, id: \.self) { line in
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    switch block.kind {
+                    case .version:
+                        Text(block.text)
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(Theme.Palette.accent)
+                            .padding(.top, Theme.Space.lg)
+                    case .subhead:
+                        Text(block.text)
+                            .font(.headline)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .padding(.top, Theme.Space.xs)
+                    case .bullet:
                         HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
                             Image(systemName: "sparkle")
-                                .font(.footnote)
+                                .font(.caption2)
                                 .foregroundStyle(Theme.Palette.accent)
-                            Text(line)
+                            Text(ChangelogParser.inlineMarkdown(block.text))
                                 .font(.body)
                                 .foregroundStyle(Theme.Palette.textPrimary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
+                    case .paragraph:
+                        Text(ChangelogParser.inlineMarkdown(block.text))
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -36,18 +50,9 @@ struct WhatsNewView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.Palette.canvas)
-        // Pin the dismiss button so it is always visible regardless of scroll position,
-        // and let the safe area inset keep it clear of the home indicator.
-        .safeAreaInset(edge: .bottom) {
-            Button { onDone() } label: {
-                Text("Got it").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(PrimaryActionStyle())
-            .padding(.horizontal, Theme.Space.xl)
-            .padding(.top, Theme.Space.sm)
-            .padding(.bottom, Theme.Space.md)
-            .background(Theme.Palette.canvas)
-        }
-        .presentationDetents([.large])
+        #if os(iOS)
+        .navigationTitle("What's New")
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
     }
 }

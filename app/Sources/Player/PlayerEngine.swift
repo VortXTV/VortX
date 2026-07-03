@@ -20,6 +20,11 @@ import Foundation
 protocol PlayerEngine: AnyObject {
     // Loading + transport
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool)
+    /// yt-direct adaptive pair: load `url` (a video-only adaptive stream) with an EXTERNAL AUDIO SIDECAR
+    /// merged in at load (mpv `--audio-files`). nil = no sidecar (identical to the 3-arg form). The libmpv
+    /// engine mounts it; the AVPlayer engine takes the extension default below, which DROPS the sidecar
+    /// (AVFoundation can't merge a second remote file), so AVPlayer callers must hand it a muxed URL.
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?)
     func play()
     func pause()
     func togglePause()
@@ -42,6 +47,13 @@ protocol PlayerEngine: AnyObject {
     func setAudioDelay(_ seconds: Double)
     func applySubtitleStyle()
 
+    // Community-subtitle fingerprint + learned-offset inputs (P3/P4). Read off the engine's own state; the
+    // libmpv engine implements these against mpv properties, the AVPlayer engine takes the 0 defaults below
+    // (its path can't apply sub-delay or extract embedded text, so a 0/absent value is correct there).
+    func containerFrameRate() -> Double
+    func mediaDurationSeconds() -> Double
+    func currentSubDelaySeconds() -> Double
+
     // Chapters + media info
     func chapters() -> [MPVChapter]
     func mediaSummary() -> (width: Int, height: Int, audioCodec: String)
@@ -55,6 +67,17 @@ protocol PlayerEngine: AnyObject {
     // Trickplay + HDR availability
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void)
     var hdrAvailable: Bool { get }
+
+    /// The LIVE playback position in seconds, read straight off the engine (mpv `time-pos` / AVPlayer
+    /// currentTime). Used by the wall-clock trickplay capture driver so it can grab a frame at the true
+    /// position even when the engine's timePos event stream is sparse/coalesced. 0 before playback.
+    var playbackPositionSeconds: Double { get }
+
+    /// Live audio volume, 0...100 (mpv `volume` scale; the AVPlayer engine maps 0...1 <-> 0...100). Set-only
+    /// via setVolume; the getter reflects the last applied value so the chrome slider stays in sync.
+    func setVolume(_ volume0to100: Double)
+    /// Mute / unmute the live audio output without losing the volume level.
+    func setMuted(_ muted: Bool)
 
     #if os(iOS)
     /// iOS-only: force the player into landscape (or back). tvOS is always landscape; macOS has no rotation.
@@ -76,6 +99,30 @@ extension PlayerEngine {
     func addExternalSubtitle(url: String, title: String, lang: String, completion: ((Bool) -> Void)?) {
         addExternalSubtitle(url: url, title: title, lang: lang, timeout: 20, completion: completion)
     }
+
+    // The two loadFile requirements default into each other so each engine only implements ONE concrete
+    // form: MPVMetalViewController implements the 4-arg (its defaulted `audioSidecar:` parameter matches
+    // the full signature) and gets the 3-arg here; AVPlayerEngineController implements the 3-arg and gets
+    // the sidecar-DROPPING 4-arg here (AVFoundation cannot merge a second remote file; trailers on the
+    // AVPlayer lane must be handed a muxed URL instead). NOTE: a new engine must implement at least one
+    // of the two or these defaults recurse.
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool) {
+        loadFile(url, headers: headers, live: live, audioSidecar: nil)
+    }
+
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?) {
+        loadFile(url, headers: headers, live: live)
+    }
+
+    // Default no-op fingerprint/offset inputs for engines that don't surface them (the AVPlayer engine).
+    // `MPVMetalViewController`'s concrete implementations override these.
+    func containerFrameRate() -> Double { 0 }
+    func mediaDurationSeconds() -> Double { 0 }
+    func currentSubDelaySeconds() -> Double { 0 }
+
+    /// Default 0 for any engine that doesn't override (the wall-clock capture driver falls back to the
+    /// chrome's own `currentTime` when this is 0). Both concrete engines override with the real position.
+    var playbackPositionSeconds: Double { 0 }
 }
 
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance

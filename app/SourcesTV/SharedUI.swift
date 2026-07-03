@@ -538,20 +538,36 @@ struct PosterCard: View {
     let type: String
     let id: String
     var progress: Double? = nil
+    /// The saved resume position in seconds, shown as a small "1:03" timecode badge on the poster
+    /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
+    /// every non-CW card, so their tiles are unchanged.
+    var resumeSeconds: Double? = nil
     var width: CGFloat = kPosterWidth
+    /// Explicit LANDSCAPE card width, for callers that lay cards into FIXED grid cells (TVCategoryBrowse's
+    /// 4-across grid). Landscape mode ignores `width` (all rails share one cinematic width), so without
+    /// this a fixed-cell grid rendered full-size landscape cards inside narrower cells and neighbouring
+    /// tiles overlapped (#28). Nil = the rail-standard kLandscapeCardWidth.
+    var landscapeWidth: CGFloat? = nil
     var menu: PosterMenu = .none
     var onFocus: (() -> Void)? = nil   // browse pages report focus to drive the hero backdrop
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
     var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
+    @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
+
+    /// The title to show: the pooled localized title in the user's language when available, else the caller's.
+    private var displayTitle: String { l10n.title(for: id) ?? title }
+    /// The poster to show: the pooled localized (language-matched) poster when available, else the caller's.
+    private var displayPoster: String? { l10n.poster(for: id) ?? poster }
 
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
     /// users keep the clean portrait grid until they add a key (Settings > API keys).
     private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
-    /// Landscape cards use one cinematic width; portrait cards honor the caller's `width`.
-    private var cardWidth: CGFloat { landscape ? kLandscapeCardWidth : width }
+    /// Landscape cards use one cinematic width (or the caller's explicit grid-cell width); portrait
+    /// cards honor the caller's `width`.
+    private var cardWidth: CGFloat { landscape ? (landscapeWidth ?? kLandscapeCardWidth) : width }
 
     var body: some View {
         if menu == .none {
@@ -580,9 +596,9 @@ struct PosterCard: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Group {
                     if landscape {
-                        LandscapeArt(id: id, type: type, title: title, poster: PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
+                        LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth)
                     } else {
-                        PosterArt(PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
+                        PosterArt(PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth)
                     }
                 }
                     .overlay(alignment: .bottom) {
@@ -590,13 +606,27 @@ struct PosterCard: View {
                             ProgressStripe(value: progress).padding(Theme.Space.xs)
                         }
                     }
-                Text(title)
+                    .overlay(alignment: .bottomTrailing) {
+                        if let resumeSeconds, let timecode = resumeTimecode(resumeSeconds) {
+                            Text(timecode)
+                                .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                .background(.black.opacity(0.6), in: Capsule())
+                                .padding(Theme.Space.sm)
+                                .accessibilityLabel("Resumes at \(timecode)")
+                        }
+                    }
+                Text(displayTitle)
                     .font(.system(size: 18, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .frame(width: cardWidth, alignment: .leading)
             }
+            // Read the card as one element so VoiceOver says the title and the resume
+            // timecode together, not a stray "1:03" after the title.
+            .accessibilityElement(children: .combine)
             .background { if let onFocus { FocusReporter(onFocus: onFocus) } }
             // Pin the focus/long-press interaction region to the card's RESTING rect. Without this,
             // tvOS builds the context-menu preview from the focused card's scaled-up, shadow-offset

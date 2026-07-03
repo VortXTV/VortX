@@ -20,29 +20,53 @@ struct TrailerRequest: Identifiable, Equatable {
     /// callers that lack a year/type (e.g. a home board-row hero) still build a title-only /clip request.
     var year: String? = nil
     var mediaType: String = "movie"
+    /// IMDb id (`tt...`) when known: the `/clip` worker keys on it (KinoCheck) to fetch the exact
+    /// trailer/clip, preferred over title+year matching. nil for tmdb:/kitsu: catalog ids.
+    var imdbID: String? = nil
 
-    /// The libmpv-playable URL: a direct (non-YouTube) trailer stream when the meta carried one, else the
-    /// public `trailer.vortx.tv/yt/{id}` resolver URL for a YouTube id. The resolver 302-redirects to a
-    /// playable MP4 (libmpv follows the redirect); it is FAIL-SOFT: a 404 / timeout / undeployed resolver
-    /// surfaces to the player as `endFileError`, and every consumer view falls back to the still backdrop on
-    /// that. A direct stream is always preferred over the resolver. This URL is only consumed on tvOS
-    /// (`TVInHeroTrailerView` via the detail `heroTrailerLayer` + `HomeHeroTrailerModel`), which has no web
-    /// view; iOS/Mac ignore this and play YouTube ids through the WKWebView IFrame (`YouTubeEmbedView`) using
-    /// `youTubeID` directly, reading `directURL` (not this) for their own libmpv path.
+    /// The libmpv-playable URL for the muted, looping AMBIENT in-hero clip: a direct (non-YouTube) trailer
+    /// stream when the meta carried one, else the `/yt/{id}` native resolver URL for the meta's YouTube id
+    /// (`StremioServer.trailerResolverBase` + `/yt/{id}`, the SAME path the full Trailer button and our
+    /// YouTube URL playback use). The R2 `trailer.vortx.tv/clip` ambient snippet has been RETIRED (owner
+    /// directive): now that `/yt` plays the real trailer directly, the ambient background loop is that same
+    /// full trailer, just played muted + looping. This is a thin ambient alias of `nativeFullTrailerURL()`.
+    ///
+    /// FAIL-SOFT: no direct stream and no YouTube id -> nil, and every consumer keeps its still backdrop (no
+    /// error is surfaced). A 404 / timeout / undeployed resolver likewise surfaces to the player as
+    /// `endFileError` -> still backdrop. A direct stream is always preferred over the resolver. Consumed by
+    /// tvOS (`TVInHeroTrailerView` via the detail `heroTrailerLayer` + `HomeHeroTrailerModel`) and the iOS
+    /// detail hero's last-resort ambient branch; the WKWebView IFrame (`InHeroYouTubeTrailerView`) using
+    /// `youTubeID` is the no-server / Lite fallback where the `/yt` route is unavailable.
     var playableURL: URL? {
-        if let directURL { return directURL }
-        var c = URLComponents(string: "https://trailer.vortx.tv/clip")
-        c?.queryItems = [
-            URLQueryItem(name: "title", value: title),
-            URLQueryItem(name: "year", value: year),
-            URLQueryItem(name: "type", value: mediaType),
-        ].filter { ($0.value?.isEmpty == false) }
-        return c?.url
+        nativeFullTrailerURL()
     }
 
     /// The public YouTube watch link, for surfaces that open trailers externally.
     var watchURL: URL? {
         youTubeID.flatMap { URL(string: "https://www.youtube.com/watch?v=\($0)") }
+    }
+
+    /// The FULL-trailer NATIVE playback URL (owner FINAL architecture, HARD): a direct (non-YouTube) trailer
+    /// stream when the meta carried one, else the embedded/remote server's `/yt/{id}` resolver (server.js:
+    /// InnerTube ANDROID client -> a direct media URL that libmpv/AVPlayer plays natively). This is the SAME
+    /// path our YouTube/Twitch URL playback already uses - NOT the trailer.vortx.tv/clip route (that is only
+    /// the 10s ambient billboard snippet) and NOT any full-trailer R2 route (the owner rejected R2 full-trailer
+    /// storage). Server-gated: on the Lite build (no embedded server) a YouTube-only trailer returns nil, so
+    /// the caller falls back to the 10s ambient clip / hides the button - no error screen.
+    ///
+    /// `preferredYouTubeID` lets a caller pass a language-selected id (D11) that overrides the meta's default
+    /// `youTubeID`; the `?lang=` hint carries the resolved base language so the resolver's own fallback chain
+    /// (user-lang -> en -> original/any) matches the client pick. The shape MATCHES tvOS `resolveFullTrailerURL`
+    /// exactly so a warmed resolve is shared across platforms.
+    func nativeFullTrailerURL(preferredYouTubeID: String? = nil, languageCode: String? = nil) -> URL? {
+        if let directURL { return directURL }
+        let yt = (preferredYouTubeID?.isEmpty == false ? preferredYouTubeID : youTubeID)
+        // The remote resolver (trailer.vortx.tv) works on EVERY scheme incl Lite, so no embedded-server gate.
+        guard let yt, !yt.isEmpty else { return nil }
+        var c = URLComponents(string: "\(StremioServer.trailerResolverBase)/yt/\(yt)")
+        let lang = (languageCode?.isEmpty == false) ? languageCode : nil
+        if let lang { c?.queryItems = [URLQueryItem(name: "lang", value: lang)] }
+        return c?.url
     }
 
     /// Build from a resolved meta: prefer a direct (non-YouTube) trailer stream url, else fall
@@ -58,7 +82,8 @@ struct TrailerRequest: Identifiable, Equatable {
         // film/series; nil if not parseable. type is movie/series.
         let yr = (meta.releaseInfo?.prefix(4)).map(String.init)
         let year = (yr?.count == 4 && yr?.allSatisfy(\.isNumber) == true) ? yr : nil
+        let imdbID = meta.id.hasPrefix("tt") ? meta.id : nil
         return TrailerRequest(title: meta.name, youTubeID: yt, directURL: direct,
-                              year: year, mediaType: meta.type)
+                              year: year, mediaType: meta.type, imdbID: imdbID)
     }
 }

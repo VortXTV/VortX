@@ -17,6 +17,8 @@ struct TVPlayerView: View {
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var forceMPV: Bool = false                 // last-resort escape hatch: skip AVPlayer routing, mount libmpv directly
     var isTrailer: Bool = false                // FIX I: a trailer clip, not a content stream → never fail over to engine streams
+    var audioSidecarURL: URL? = nil            // yt-direct adaptive pair: external audio mpv mounts with the video-only url (forces libmpv)
+    var debridRef: DebridPlaybackRef? = nil    // native-debrid provenance of the launching link, for CW reresolve of an expired link
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -32,11 +34,14 @@ struct TVPlayerView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @State private var markedWatched = false   // mark the engine watched once, near end of playback
+    @State private var autoAddedThisPlayback = false   // D8/D9: the ~60s auto-add + watch-ping fires once per playback
+    @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true   // "Auto-add watched to Library" (default ON)
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
     @State private var buffering = true
     @State private var isPaused = false
     @State private var currentTime = 0.0
     @State private var duration = 0.0
+    @State private var bufferedTime = 0.0       // buffered-ahead edge (seconds) for the YouTube-style grey scrubber band
     @State private var videoWidth = 0           // metadata line: encoded width (resolution is by WIDTH, so 2.40:1 4K is not mislabeled 1440p)
     @State private var videoHeight = 0          // metadata line: encoded height
     @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
@@ -57,6 +62,16 @@ struct TVPlayerView: View {
     @State private var addedSubURLs: Set<String> = []
     @State private var subtitleLoadingURL: String?     // an add-on subtitle is downloading (shows Loading… in its row)
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
+
+    // Community-subtitle system (pooled subs P2, sync offset P3, embedded upload P4). All fail-soft + gated.
+    @State private var pooledSubs: [SubtitlePoolClient.PooledSubtitle] = []
+    @State private var pooledSubsKey = ""
+    @State private var addedPooledIDs: Set<Int> = []
+    @State private var pooledSeededOffset = false
+    @State private var embeddedUploadDone = false
+    @State private var offsetCaptureTask: Task<Void, Never>?
+    @State private var subFingerprint: String?
+    @State private var subFingerprintKey = ""
     @State private var showOptions = false             // options panel (audio / subtitles / aspect / episodes)
     @State private var panelKind: PanelKind = .audio   // which list the options panel shows
     @State private var subDelay: Double = 0            // manual subtitle sync, seconds
@@ -67,6 +82,21 @@ struct TVPlayerView: View {
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @State private var optionRow = 0                   // highlighted row in the options panel
+    // Skip-segment editor (tvOS): the inline iOS/Mac editor bar is unavailable here, so the editor
+    // lives in its own focus-driven options panel. State is tvOS-local; submission reuses SkipDBClient
+    // (keyless to skip.vortx.tv, plus skipdb.tv / custom when keyed), exactly like the iOS path. The
+    // editor is offered for any tt####### title (the same gate the iOS control-bar button uses).
+    @State private var skipEditType: SkipDBSubmitView.SegmentType = .intro
+    @State private var skipEditStart: Double = 0       // segment start, seconds; Left/Right adjust, Select = playhead
+    @State private var skipEditEnd: Double = 30        // segment end, seconds
+    @State private var skipEditSubmitting = false
+    @State private var skipEditDone = false            // true once the current segment posted (shows the success row)
+    @State private var skipEditError: String?          // last submit failure message, shown inline
+    @State private var skipEditSubmittedKeys: Set<String> = []   // imdb:S:E:type already submitted this session
+    // Time-row adjust acceleration, mirroring the scrubber's press-repeat ramp (10s → 75s on a hold).
+    @State private var skipEditStep = 10.0
+    @State private var skipEditLastAdjustAt = 0.0
+    @State private var skipEditLastDir = 0   // last adjust direction; a reversal resets the ramp so it does not overshoot
     // Cached so the player body does not rebuild a string and rescan skip spans on
     // every playhead tick (audit #1): updated only when their inputs change.
     @State private var metadataLine = ""
@@ -92,6 +122,10 @@ struct TVPlayerView: View {
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
+    // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
+    // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
+    @State private var engineNote: String?
+    @State private var engineNoteTask: Task<Void, Never>?
     // AVPlayer-only START watchdog: AVPlayer can mount, show the chrome, and silently never produce a
     // playable frame (no item error, no timePos tick). The real fix is in AVPlayerEngineController
     // (automaticallyWaitsToMinimizeStalling = false + explicit play() + the [.initial,.new] status race fix),
@@ -161,10 +195,14 @@ struct TVPlayerView: View {
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
+    /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos tick). See startTrickplayCaptureTimer.
+    @State private var trickplayCaptureTimer: Task<Void, Never>?
+    /// Capture cadence in seconds; matches the local cache tile interval + community upload interval.
+    private static let trickplayCaptureIntervalSecs: Double = 10
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -215,6 +253,20 @@ struct TVPlayerView: View {
             if showStreamQR, let link = shareLink {
                 StreamLinkQRView(title: isTorrentPlayback ? "Magnet link" : "Stream link", link: link)
             }
+            if let note = engineNote {
+                Text(note)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.vertical, Theme.Space.md)
+                    .frame(maxWidth: 900)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, Theme.Space.xl)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
         }
         .onAppear {
             if curURL == nil {   // seed from initial request
@@ -223,6 +275,8 @@ struct TVPlayerView: View {
                 maybeRouteToDefaultExternalPlayer()
             }
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            configureCommunityTrickplayProvisional()
+            startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
@@ -258,7 +312,7 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
             // which captures nothing). Independent of the engine-teardown rules below.
@@ -290,9 +344,15 @@ struct TVPlayerView: View {
     /// this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text (`sourceHint`).
     private var useAVPlayerEngine: Bool {
         if forceMPV || avEngineFailed { return false }   // escape hatch / an AVPlayer load failure fell back to libmpv
+        // A yt-direct adaptive pair NEEDS libmpv (the audio sidecar rides mpv --audio-files; AVPlayer
+        // would play the video-only stream silent), so it bypasses AVPlayer routing entirely.
+        if audioSidecarURL != nil { return false }
         let loopback = url.host == "127.0.0.1" || url.host == "localhost"
         let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
-        return PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV) == .avfoundation
+        // tvOS: DVDisplaySupport.isCapable is constant true (the Apple TV negotiates DV over HDMI), so the DV
+        // mandate's remux lane engages for DV MKVs here too. Stable across renders (no engine flip mid-play).
+        return PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
+                                         dvDisplayCapable: DVDisplaySupport.isCapable) == .avfoundation
     }
 
     /// The video surface: the AVFoundation engine when routed there, otherwise libmpv. Both bind to the same
@@ -307,7 +367,7 @@ struct TVPlayerView: View {
                 .ignoresSafeArea()
         } else {
             MPVMetalPlayerView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers)
+                .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL)
                 .live(initialLiveMode)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
                 .ignoresSafeArea()
@@ -338,16 +398,33 @@ struct TVPlayerView: View {
                     // Live has no resumable position, so don't seed Continue-Watching direct-resume
                     // for it (mirrors PlayerScreen.recordLastStream's live guard).
                     if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
+                        // Attach the native-debrid provenance only when the ORIGINAL launched link is what's
+                        // playing (a source hop before first frame would make it stale); it lets a later CW
+                        // resume mint a fresh link without the slow full add-on re-resolve.
+                        let ref = (u == url) ? debridRef : nil
                         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
                             videoId: m.videoId, url: u.absoluteString, title: curTitle,
                             season: m.season, episode: m.episode, name: m.name,
                             poster: m.poster, type: m.type, qualityText: curHint,
-                            torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
+                            torrent: curIsTorrent, savedAt: Date(), headers: curHeaders,
+                            debridService: ref?.service.rawValue, infoHash: ref?.infoHash,
+                            debridFileId: ref?.fileId, debridTorrentId: ref?.torrentId, fileIdx: ref?.fileIdx,
+                            linkSavedAt: ref != nil ? Date() : nil),
                             profileID: ProfileStore.shared.activeID)
                     }
+                    fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
+                    uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
+                    // Add-on subtitles were fetched only from the `duration` event, which a debrid direct-HTTP
+                    // MKV frequently never delivers, so the panel's "From add-ons" section stayed empty for
+                    // exactly that content. Fetch at playback start too (key-latched, so at most one real
+                    // fetch runs); the duration-event call remains for streams that deliver it first.
+                    fetchAddonSubtitles()
                 }
                 currentTime = d
                 updateCurrentSkip(at: d)
+                // Ensure the community key is provisioned off meta.runtime the moment the behind-playback
+                // meta lands (idempotent; no-op once keyed), so capture starts even without a duration event.
+                configureCommunityTrickplayProvisional()
                 maybeCaptureLocalTrickplay(at: d)
                 // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
                 // to the engine — a live stream has no meaningful watch position.
@@ -360,6 +437,14 @@ struct TVPlayerView: View {
                     markedWatched = true            // ~90% in → flip the watched marker live
                     core.markPlaybackWatched(m)
                 }
+                // ~60s in → the user is really watching this: auto-add to the Library (D8) + send the anon
+                // fleet watch ping (D9), once per playback. Idempotent + gated (D8 setting + per-profile dedup;
+                // D9 MoatConsent + per-title/day dedup); skipped for live and ad-hoc plays.
+                if !autoAddedThisPlayback, !isCurrentLiveStream, d >= 60, let m = curMeta {
+                    autoAddedThisPlayback = true
+                    LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary)
+                    WatchSignalClient.ping(contentId: m.libraryId, type: m.type)
+                }
                 if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
                 if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
             }
@@ -368,12 +453,21 @@ struct TVPlayerView: View {
         case MPVProperty.duration:
             if let d = data as? Double {
                 duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
-                // Community trickplay: fetch any shared sprite-sheet for this exact cut once the duration is
-                // known (fail-soft -> the existing local capture). Acts once per title.
+                // Community trickplay: re-key on the REAL playback duration (this is the authoritative bucket)
+                // and unblock uploads. Capture already started from onAppear's provisional runtime key, so a
+                // debrid MKV that never delivers this event still captures + can upload via the provisional key.
                 if d > 0, let m = curMeta {
-                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode, duration: d)
+                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                                       duration: d, isRealDuration: true)
                 }
+                // The real duration sharpens the release fingerprint: rebuild it and re-fetch the pool so the
+                // rip-matched community sync offset seeds this exact encode (P3). Fail-soft + gated inside.
+                if d > 0 { refreshSubFingerprint(force: true); fetchPooledSubtitles() }
             }
+        case MPVProperty.demuxerCacheTime:
+            // Buffered-ahead edge (absolute seconds) for the YouTube-style grey scrubber band. Fail-soft:
+            // ignore non-finite / behind-playhead values so the band never jumps backward or breaks.
+            if let d = data as? Double, d.isFinite, d >= currentTime { bufferedTime = d }
         case MPVProperty.trackList:
             refreshTracks()
             let s = coordinator.player?.mediaSummary()
@@ -433,6 +527,10 @@ struct TVPlayerView: View {
             case .upArrow: moveOption(-1)
             case .downArrow: moveOption(1)
             case .select: activateOption()
+            // Left/Right adjust a focused Start/End row in the skip editor (the only panel that uses
+            // horizontal input); every other panel ignores it, so the default no-op is unchanged.
+            case .leftArrow:  if let f = focusedSkipField { adjustSkipTime(f, -1) }
+            case .rightArrow: if let f = focusedSkipField { adjustSkipTime(f, 1) }
             default: break
             }
             return
@@ -480,6 +578,14 @@ struct TVPlayerView: View {
         }
     }
 
+    /// True for an IMDb tt####### title, the same gate the iOS control-bar uses to offer the skip
+    /// editor. Live streams and non-tt ids (e.g. add-on/Kitsu ids) are excluded: the SkipDB worker keys
+    /// off imdb:S:E, so a non-tt id has nothing to submit against.
+    private var canEditSkip: Bool {
+        guard !isCurrentLiveStream, let m = curMeta else { return false }
+        return m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil
+    }
+
     /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
     /// bar) are separate rows above this one; up/down moves between the three.
     private var buttonRow: [Control] {
@@ -498,6 +604,7 @@ struct TVPlayerView: View {
         c.append(.fwd)
         if !audioTracks.isEmpty { c.append(.audio) }
         c.append(.subs)
+        if canEditSkip { c.append(.skipEdit) }
         if allEpisodes.count > 1 { c.append(.episodes) }
         if hasChapters { c.append(.chapters) }
         return c
@@ -562,7 +669,22 @@ struct TVPlayerView: View {
         case .sources:  openPanel(.sources)
         case .quality:  openPanel(.quality)
         case .settings: openPanel(.playerSettings)
+        case .skipEdit: openSkipEditor()
         }
+    }
+
+    /// Seed the skip editor from the current playhead and open its panel. Reset on every open so a fresh
+    /// segment never inherits stale times / type / result from a prior submission, matching the iOS bar.
+    private func openSkipEditor() {
+        let snapped = (currentTime * 2).rounded() / 2
+        skipEditStart = max(0, snapped)
+        skipEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
+        skipEditType = .intro
+        skipEditDone = false
+        skipEditError = nil
+        skipEditSubmitting = false
+        skipEditStep = 10
+        openPanel(.skipEditor)
     }
 
     /// The loaded source currently on screen (its playable URL matches what mpv is playing), used to
@@ -698,6 +820,7 @@ struct TVPlayerView: View {
                     HStack(spacing: Theme.Space.md) {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
+                        if canEditSkip { ctrlButton(.skipEdit, "checkmark.bubble") }
                         if allEpisodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                         if hasChapters { ctrlButton(.chapters, "list.bullet.below.rectangle") }
                     }
@@ -726,7 +849,8 @@ struct TVPlayerView: View {
                 // Only the visual swaps; the knob, chapter ticks, and scrub logic below are unchanged.
                 SeekBarTrack(style: SeekBarStyle.current, progress: frac,
                              accent: Theme.Palette.accent,
-                             track: Theme.Palette.textPrimary.opacity(0.22))
+                             track: Theme.Palette.textPrimary.opacity(0.22),
+                             buffered: duration > 0 ? min(1, max(0, bufferedTime / duration)) : 0)
                     .frame(width: w, height: focused ? 24 : 16)
                 // Chapter boundary ticks along the bar (decorative; the knob still reads over them).
                 ForEach(chapterFractions, id: \.self) { f in
@@ -794,14 +918,31 @@ struct TVPlayerView: View {
 
     // MARK: - Options panel (audio / subtitles / episodes), driven by optionRow
 
+    /// Tags a skip-editor row so the remote handler knows a focused Start/End row takes Left/Right to
+    /// adjust the time (every other panel ignores Left/Right). nil for all non-editor rows.
+    private enum SkipField { case start, end }
+
     private struct OptionRow: Identifiable {
         let id = UUID()
         let label: String
         var detail: String = ""        // right-aligned secondary text (e.g. current value)
         var isSelected: Bool = false
         var isHeader: Bool = false     // section header, not focusable, skipped in navigation
+        var skipField: SkipField? = nil   // non-nil only on the skip editor's Start/End rows
         var action: () -> Void = {}
     }
+
+    // Subtitle-sync nudge steps. Primary is 0.5s so a multi-second offset takes a few taps (5s = 10 taps, not
+    // 50 at the old 0.1s); a fine 0.1s trim stays for exact alignment. Hardcoded for now (RemoteConfig later).
+    private static let subSyncStep = 0.5
+    private static let subSyncFine = 0.1
+    private static let subSyncStepLabel = "0.5s"
+    private static let subSyncFineLabel = "0.1s"
+
+    /// Localize a display label whose English text is only known at runtime (e.g. a `SubtitleStyle` preset
+    /// name). The English string doubles as the catalog key, so it resolves through `Localizable.xcstrings`
+    /// and falls back to itself when no translation exists.
+    private static func l10n(_ key: String) -> String { String(localized: LocalizedStringResource(stringLiteral: key)) }
 
     /// Rows for the currently-open panel only, never mixed. Tracks are grouped by language; a "Settings"
     /// row drills into a dedicated sub-panel (sync / size / colour for subtitles, sync for audio).
@@ -809,30 +950,30 @@ struct TVPlayerView: View {
         switch panelKind {
         case .audio:
             var rows = groupedTrackRows(audioTracks) { coordinator.player?.setAudioTrack($0); refreshTracksSoon() }
-            rows.append(OptionRow(label: "Audio Settings", detail: "›") { openPanel(.audioSettings) })
+            rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rows
         case .audioSettings:
             let now = String(format: "%+.1fs", audioDelay)
-            var rows = [OptionRow(label: "Sync", isHeader: true),
-                        OptionRow(label: "Earlier  −0.1s", detail: now) { adjustAudioDelay(-0.1) },
-                        OptionRow(label: "Later  +0.1s", detail: now) { adjustAudioDelay(0.1) }]
-            if audioDelay != 0 { rows.append(OptionRow(label: "Reset") { adjustAudioDelay(-audioDelay) }) }
+            var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true),
+                        OptionRow(label: String(localized: "Earlier  −0.1s"), detail: now) { adjustAudioDelay(-0.1) },
+                        OptionRow(label: String(localized: "Later  +0.1s"), detail: now) { adjustAudioDelay(0.1) }]
+            if audioDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustAudioDelay(-audioDelay) }) }
             return rows
         case .subtitles:
-            var rows = [OptionRow(label: "Off", isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
+            var rows = [OptionRow(label: String(localized: "Off"), isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
             }]
             rows += groupedTrackRows(subtitleTracks) { coordinator.player?.setSubtitleTrack($0); refreshTracksSoon() }
-            // External subtitles from the account's subtitle add-ons. Picking one sub-adds it
-            // into mpv and it joins the embedded list above; its add-on row disappears. Hidden on the
-            // AVPlayer engine, which cannot splice a remote WebVTT in (the row would do nothing).
-            let available = isAVPlayerActive ? [] : addonSubs.filter { !addedSubURLs.contains($0.url) }
+            // External subtitles from the account's subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
+            // the downloaded file (it joins the embedded list above); AVPlayer parses it and renders the cues
+            // over the video itself.
+            let available = addonSubs.filter { !addedSubURLs.contains($0.url) }
             if !available.isEmpty {
-                rows.append(OptionRow(label: "From add-ons", isHeader: true))
+                rows.append(OptionRow(label: String(localized: "From add-ons"), isHeader: true))
                 for sub in available.prefix(30) {
                     let loading = subtitleLoadingURL == sub.url
                     rows.append(OptionRow(label: langName(sub.lang),
-                                          detail: loading ? "Loading…" : sub.addonName) {
+                                          detail: loading ? String(localized: "Loading…") : sub.addonName) {
                         // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
                         // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
                         // until the track arrives (then it moves into the embedded list above).
@@ -847,25 +988,44 @@ struct TVPlayerView: View {
                     })
                 }
             }
-            rows.append(OptionRow(label: "Subtitle Settings", detail: "›") { openPanel(.subtitleSettings) })
+            // Community-pooled subtitles (P2): other users' extracted subs for this title, in the SAME list.
+            // No add-on wording — labeled by language with a subtle "Community" provenance. Work on BOTH engines
+            // now (AVPlayer renders the downloaded file over the video, same as the add-on rows above).
+            let pooled = pooledSubs.filter { !addedPooledIDs.contains($0.id) }
+            if !pooled.isEmpty {
+                rows.append(OptionRow(label: String(localized: "Community"), isHeader: true))
+                for sub in pooled.prefix(30) {
+                    let loading = subtitleLoadingURL == sub.url.absoluteString
+                    rows.append(OptionRow(label: pooledLabel(sub),
+                                          detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
+                        selectPooledSubtitle(sub)
+                    })
+                }
+            }
+            rows.append(OptionRow(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) })
             return rows
         case .subtitleSettings:
             let now = String(format: "%+.1fs", subDelay)
-            var rows = [OptionRow(label: "Sync", isHeader: true),
-                        OptionRow(label: "Earlier  −0.1s", detail: now) { adjustSubDelay(-0.1) },
-                        OptionRow(label: "Later  +0.1s", detail: now) { adjustSubDelay(0.1) }]
-            if subDelay != 0 { rows.append(OptionRow(label: "Reset") { adjustSubDelay(-subDelay) }) }
-            rows.append(OptionRow(label: "Font", isHeader: true))
-            for f in SubtitleStyle.fonts { rows.append(OptionRow(label: f.label, isSelected: subFont == f.id) { setSubtitleFont(f.id) }) }
-            rows.append(OptionRow(label: "Size", isHeader: true))
-            for s in SubtitleStyle.sizes { rows.append(OptionRow(label: s.label, isSelected: subSize == s.id) { setSubtitleSize(s.id) }) }
+            var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true)]
+            // Sync works on BOTH engines: libmpv maps it to `sub-delay`; AVPlayer applies it as the offset on the
+            // external-subtitle overlay it renders itself (external srt/vtt only — native/embedded AVPlayer subs
+            // have no time-shift API). Later = subtitles appear later on both.
+            rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(-Self.subSyncStep) })
+            rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncStepLabel)"), detail: now) { adjustSubDelay(Self.subSyncStep) })
+            rows.append(OptionRow(label: String(localized: "Earlier  −\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(-Self.subSyncFine) })
+            rows.append(OptionRow(label: String(localized: "Later  +\(Self.subSyncFineLabel)"), detail: now) { adjustSubDelay(Self.subSyncFine) })
+            if subDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustSubDelay(-subDelay) }) }
+            rows.append(OptionRow(label: String(localized: "Font"), isHeader: true))
+            for f in SubtitleStyle.fonts { rows.append(OptionRow(label: Self.l10n(f.label), isSelected: subFont == f.id) { setSubtitleFont(f.id) }) }
+            rows.append(OptionRow(label: String(localized: "Size"), isHeader: true))
+            for s in SubtitleStyle.sizes { rows.append(OptionRow(label: Self.l10n(s.label), isSelected: subSize == s.id) { setSubtitleSize(s.id) }) }
             let scalePct = "\(Int((subSizeScale * 100).rounded()))%"
-            rows.append(OptionRow(label: "Smaller  −", detail: scalePct) { adjustSubScale(-1) })
-            rows.append(OptionRow(label: "Bigger  +", detail: scalePct) { adjustSubScale(1) })
-            rows.append(OptionRow(label: "Colour", isHeader: true))
-            for c in SubtitleStyle.colors { rows.append(OptionRow(label: c.label, isSelected: subColor == c.id) { setSubtitleColor(c.id) }) }
-            rows.append(OptionRow(label: "Background", isHeader: true))
-            for b in SubtitleStyle.backgrounds { rows.append(OptionRow(label: b.label, isSelected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
+            rows.append(OptionRow(label: String(localized: "Smaller  −"), detail: scalePct) { adjustSubScale(-1) })
+            rows.append(OptionRow(label: String(localized: "Bigger  +"), detail: scalePct) { adjustSubScale(1) })
+            rows.append(OptionRow(label: String(localized: "Colour"), isHeader: true))
+            for c in SubtitleStyle.colors { rows.append(OptionRow(label: Self.l10n(c.label), isSelected: subColor == c.id) { setSubtitleColor(c.id) }) }
+            rows.append(OptionRow(label: String(localized: "Background"), isHeader: true))
+            for b in SubtitleStyle.backgrounds { rows.append(OptionRow(label: Self.l10n(b.label), isSelected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
             return rows
         case .aspect:
             let mode = coordinator.player?.videoSizeMode ?? "original"
@@ -886,6 +1046,8 @@ struct TVPlayerView: View {
             return rows
         case .playerSettings:
             return playerSettingsRows()
+        case .skipEditor:
+            return skipEditorRows()
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
@@ -943,6 +1105,123 @@ struct TVPlayerView: View {
         let c = code.lowercased()
         if c.isEmpty || c == "und" { return "Unknown" }
         return Locale.current.localizedString(forLanguageCode: c)?.capitalized ?? code.uppercased()
+    }
+
+    // MARK: - Skip-segment editor panel (tvOS)
+
+    /// The skip editor's rows. Type section (intro / recap / outro / preview), Start + End time rows
+    /// (Left/Right adjust, Select snaps to the playhead), then a Submit row that reflects in-flight /
+    /// success / error / already-submitted state. A previously-submitted type shows a check in its row.
+    private func skipEditorRows() -> [OptionRow] {
+        guard let m = curMeta else { return [OptionRow(label: "Unavailable for this title", isHeader: true)] }
+        let key = skipSubmitKey(m, type: skipEditType)
+        let already = skipEditSubmittedKeys.contains(key)
+        let segLen = max(0, skipEditEnd - skipEditStart)
+
+        var rows: [OptionRow] = [OptionRow(label: "Type", isHeader: true)]
+        for t in SkipDBSubmitView.SegmentType.allCases {
+            let tKey = skipSubmitKey(m, type: t)
+            rows.append(OptionRow(label: t.label, detail: skipEditSubmittedKeys.contains(tKey) ? "submitted" : "",
+                                  isSelected: skipEditType == t) {
+                guard skipEditType != t else { return }
+                skipEditType = t
+                skipEditDone = false
+                skipEditError = nil
+            })
+        }
+
+        rows.append(OptionRow(label: "Times", isHeader: true))
+        rows.append(OptionRow(label: "Start", detail: timeString(skipEditStart),
+                              skipField: .start) { skipEditStart = max(0, (currentTime * 2).rounded() / 2) })
+        rows.append(OptionRow(label: "End", detail: timeString(skipEditEnd),
+                              skipField: .end) { skipEditEnd = max((currentTime * 2).rounded() / 2, skipEditStart + 0.5) })
+        rows.append(OptionRow(label: "Length", detail: String(format: "%.1fs", segLen), isHeader: true))
+
+        rows.append(OptionRow(label: "Submit", isHeader: true))
+        if skipEditSubmitting {
+            rows.append(OptionRow(label: "Submitting…"))
+        } else if skipEditDone {
+            rows.append(OptionRow(label: "Submitted. Thank you", isSelected: true))
+        } else if already {
+            rows.append(OptionRow(label: "Resubmit this \(skipEditType.label.lowercased())") { submitSkipEditor(meta: m) })
+        } else {
+            rows.append(OptionRow(label: "Submit \(skipEditType.label.lowercased())") { submitSkipEditor(meta: m) })
+        }
+        if let err = skipEditError {
+            rows.append(OptionRow(label: err, isHeader: true))
+        }
+        return rows
+    }
+
+    /// imdb:S:E:type key for the "already submitted" check, matching the iOS editor's key shape.
+    private func skipSubmitKey(_ m: PlaybackMeta, type: SkipDBSubmitView.SegmentType) -> String {
+        "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0):\(type.rawValue)"
+    }
+
+    /// Adjust the focused Start/End row by one accelerating step, reusing the scrubber's press-repeat ramp
+    /// (fine 10s taps, growing to 75s on a hold) so crossing a long film takes a few presses, not dozens.
+    /// Clamped so Start stays >= 0 and End stays > Start; both within the file duration when it is known.
+    private func adjustSkipTime(_ field: SkipField, _ dir: Int) {
+        let now = Date().timeIntervalSinceReferenceDate
+        if now - skipEditLastAdjustAt < 0.4, dir == skipEditLastDir {
+            skipEditStep = min(skipEditStep + 6, 75)
+        } else {
+            skipEditStep = 10   // a pause, or a direction reversal, resets to fine steps so it does not overshoot
+        }
+        skipEditLastAdjustAt = now
+        skipEditLastDir = dir
+        let upper = duration > 0 ? duration : .greatestFiniteMagnitude
+        let delta = Double(dir) * skipEditStep
+        switch field {
+        case .start:
+            skipEditStart = min(max(0, skipEditStart + delta), max(0, min(upper, skipEditEnd) - 0.5))
+        case .end:
+            skipEditEnd = min(max(skipEditStart + 0.5, skipEditEnd + delta), upper)
+        }
+        skipEditDone = false
+        skipEditError = nil
+        // Preview the new boundary under the playhead so the user sees where it lands, like the scrubber.
+        let target = field == .start ? skipEditStart : skipEditEnd
+        coordinator.player?.seek(to: target)
+        currentTime = target
+        if showOptions { panelRows = optionRows }   // refresh the time readout in place
+        scheduleHide()
+    }
+
+    /// Submit the edited segment. Reuses SkipDBClient.submit (keyless skip.vortx.tv, plus skipdb.tv /
+    /// custom provider when keyed) exactly like the iOS editor; on success it invalidates the cache and
+    /// re-fetches so the new span shows on the scrubber. The panel stays open to show the result.
+    private func submitSkipEditor(meta: PlaybackMeta) {
+        guard !skipEditSubmitting else { return }
+        skipEditSubmitting = true
+        skipEditError = nil
+        skipEditDone = false
+        if showOptions { panelRows = optionRows }
+        let req = SkipDBClient.SubmitRequest(
+            imdb_id: meta.libraryId,
+            season: meta.season,
+            episode: meta.episode,
+            segment_type: skipEditType.rawValue,
+            start_ms: Int(skipEditStart * 1000),
+            end_ms: Int(skipEditEnd * 1000),
+            duration_ms: duration > 0 ? Int(duration * 1000) : nil
+        )
+        let key = skipSubmitKey(meta, type: skipEditType)
+        Task { @MainActor in
+            do {
+                try await SkipDBClient.submit(req)
+                await SkipDBClient.invalidateCache(imdbId: meta.libraryId, season: meta.season,
+                                                   episode: meta.episode, durationSeconds: duration)
+                skipEditSubmittedKeys.insert(key)
+                skipEditDone = true
+                skipFetchKey = ""        // force a re-fetch so the submitted span resolves onto the bar
+                fetchSkipTimestamps()
+            } catch {
+                skipEditError = error.localizedDescription
+            }
+            skipEditSubmitting = false
+            if showOptions { panelRows = optionRows }
+        }
     }
 
     // MARK: - Source switching (swap to another loaded source without leaving the player)
@@ -1078,10 +1357,13 @@ struct TVPlayerView: View {
     /// server applies the headers and rewrites the HLS playlist, so mpv fetches plain loopback
     /// and needs no headers of its own; everything else loads directly with mpv-applied headers.
     private func loadIntoPlayer(_ url: URL, headers: [String: String]?, live: Bool) {
+        // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
+        // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
+        let sidecar = (url == self.url) ? audioSidecarURL : nil
         if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
-            coordinator.player?.loadFile(proxied, headers: nil, live: live)
+            coordinator.player?.loadFile(proxied, headers: nil, live: live, audioSidecar: sidecar)
         } else {
-            coordinator.player?.loadFile(url, headers: headers, live: live)
+            coordinator.player?.loadFile(url, headers: headers, live: live, audioSidecar: sidecar)
         }
     }
 
@@ -1108,14 +1390,23 @@ struct TVPlayerView: View {
         curBinge = stream.behaviorHints?.bingeGroup
         curHeaders = stream.requestHeaders
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+        // Reset the local-capture throttle on a stream switch: otherwise the new stream's capture is gated
+        // by the PREVIOUS stream's lastLocalTrickplayCapture (a high value), so episodes 2..N of a session
+        // captured nothing until playback passed that old timestamp.
+        lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         prepareTorrent(stream)   // mid-playback switches never announced the torrent before
         resumeSeconds = currentTime
         appliedResume = false
+        bufferedTime = 0   // new stream: clear the buffered-ahead band until the new demuxer reports
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
+        // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
+        // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
+        subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
+        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
         loadIntoPlayer(newURL, headers: curHeaders, live: curIsLive)
         startLoadTimeout()
     }
@@ -1169,6 +1460,7 @@ struct TVPlayerView: View {
     private func adjustSubDelay(_ delta: Double) {
         subDelay = ((subDelay + delta) * 10).rounded() / 10
         coordinator.player?.setSubDelay(subDelay)
+        captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
     }
     private func adjustAudioDelay(_ delta: Double) {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
@@ -1209,6 +1501,7 @@ struct TVPlayerView: View {
         case .sources:          return "Sources"
         case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
+        case .skipEditor:       return "Edit Skip Segment"
         }
     }
 
@@ -1294,10 +1587,22 @@ struct TVPlayerView: View {
         if showOptions { panelRows = optionRows }
     }
 
+    /// The skip-editor Start/End field under the cursor, or nil when the highlighted row is not a time
+    /// row (or the panel is not the editor). Drives whether Left/Right adjusts a time vs. does nothing.
+    private var focusedSkipField: SkipField? {
+        guard panelKind == .skipEditor else { return nil }
+        let rows = panelRows
+        guard optionRow >= 0, optionRow < rows.count else { return nil }
+        return rows[optionRow].skipField
+    }
+
     private func openPanel(_ kind: PanelKind) {
         panelKind = kind
         refreshTracks()
         scheduleHide()   // loop won't hide while showOptions; this just keeps the deadline fresh
+        // Late add-on subtitle recovery: if the start-of-playback fetch raced an empty add-on collection,
+        // retry now. Key-latched inside (no-op once a real fetch ran); the async result refreshes the rows.
+        if kind == .subtitles { fetchAddonSubtitles() }
         panelRows = optionRows
         // Single-choice panels open on the current selection; the mixed settings panel opens
         // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
@@ -1425,8 +1730,104 @@ struct TVPlayerView: View {
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         coordinator.player?.stop()
+        // AVPlayer can't demux this container (commonly DV-in-MKV, or Profile 7 dual-layer): surface why,
+        // so the demote stops being silent and the user knows to pick an MP4 source for true Dolby Vision.
+        showEngineNote("AVPlayer can't play this file (likely Dolby Vision in MKV). Using the built-in player, which tone-maps to HDR10/SDR. For true Dolby Vision, pick an MP4 source.")
         avEngineFailed = true
         return true
+    }
+
+    /// Show a brief player toast and auto-clear it. Used to surface the AVPlayer->libmpv fallback reason.
+    private func showEngineNote(_ text: String) {
+        engineNote = text
+        engineNoteTask?.cancel()
+        engineNoteTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            engineNote = nil
+        }
+    }
+
+    /// Key community trickplay EARLY off a PROVISIONAL duration from the title's `meta.runtime`, so capture
+    /// begins at the first positive timePos even when mpv never emits its `duration` event (a debrid
+    /// direct-HTTP MKV frequently doesn't). Fail-soft + idempotent: no-op without a tt id or a parseable
+    /// runtime; the real mpv duration later re-keys the exact bucket and unblocks uploads. Mirrors the
+    /// duration-event call's identity (libraryId + season/episode).
+    private func configureCommunityTrickplayProvisional() {
+        guard let m = curMeta else { return }
+        // The loaded meta carries the human runtime; use it only when it is THIS title's meta.
+        if let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
+           let secs = loaded.runtimeSeconds, secs > 0 {
+            // A tmdb-keyed hub play often carries its imdb id in the loaded meta for free
+            // (behaviorHints.defaultVideoId = "tt…" / "tt…:s:e"); prefer it so the store skips its
+            // network resolve. The store resolves any remaining tmdb id itself.
+            let freeTT = m.libraryId.hasPrefix("tt") ? nil : CommunityTrickplay.ttPrefix(loaded.behaviorHints?.defaultVideoId)
+            scrubThumbnails.configureCommunity(imdbId: freeTT ?? m.libraryId, season: m.season, episode: m.episode,
+                                               duration: secs, isRealDuration: false)
+            return
+        }
+        // The engine's metaDetails can be nil or holding ANOTHER title at play time (a hub detail ->
+        // add-on detail -> play replaces it, or the load raced), which silently killed the provisional
+        // key on tvOS too: whole sessions captured frames that never became eligible to upload. Port the
+        // iOS self-heal: log the miss, then one-shot the runtime (movie then series) and key
+        // provisionally. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks imdb), and the
+        // resolver caches the mapping for the store's own keying. mpv's real `duration` still re-keys.
+        NSLog("[trickplay] provisional key MISS (tvOS): playing=%@ metaDetails=%@ (fetching runtime)",
+              m.libraryId, core.metaDetails?.meta?.id ?? "nil")
+        Task {
+            var ttId = m.libraryId
+            if !ttId.hasPrefix("tt") {
+                guard ttId.lowercased().hasPrefix("tmdb"),
+                      let tt = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil) else {
+                    NSLog("[trickplay] provisional key MISS stays (tvOS): unresolvable id %@", m.libraryId)
+                    return
+                }
+                ttId = tt
+            }
+            var secs = await Self.cinemetaRuntimeSeconds(kind: "movie", id: ttId)
+            if secs <= 0 { secs = await Self.cinemetaRuntimeSeconds(kind: "series", id: ttId) }
+            guard secs > 0 else {
+                NSLog("[trickplay] provisional key MISS stays (tvOS): no cinemeta runtime for %@", ttId)
+                return
+            }
+            await MainActor.run {
+                guard curMeta?.libraryId == m.libraryId else { return }   // still the same title
+                scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
+                                                   duration: secs, isRealDuration: false)
+            }
+        }
+    }
+
+    /// One-shot Cinemeta runtime for the provisional trickplay key when the engine meta is unavailable or
+    /// mismatched at play time (tvOS twin of PlayerScreen.cinemetaRuntimeSeconds). Returns 0 on any miss.
+    private static func cinemetaRuntimeSeconds(kind: String, id: String) async -> Double {
+        guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(kind)/\(id).json"),
+              let (data, _) = try? await URLSession.shared.data(from: url),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let meta = obj["meta"] as? [String: Any] else { return 0 }
+        return parseRuntimeSeconds(meta["runtime"] as? String)
+    }
+
+    /// Minimal twin of CoreMeta.runtimeSeconds for a raw Cinemeta runtime string ("92 min", "1h 32m",
+    /// "2:05:00"), used by the provisional-key self-heal above.
+    private static func parseRuntimeSeconds(_ raw: String?) -> Double {
+        guard let r = raw?.lowercased().trimmingCharacters(in: .whitespaces), !r.isEmpty else { return 0 }
+        if r.contains(":") {
+            let p = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if p.count == 3 { return Double(p[0] * 3600 + p[1] * 60 + p[2]) }
+            if p.count == 2 { return Double(p[0] * 60 + p[1]) }
+        }
+        if let hRange = r.range(of: #"\d+\s*h"#, options: .regularExpression) {
+            let h = Int(r[hRange].filter(\.isNumber)) ?? 0
+            var mins = 0
+            if let mRange = r.range(of: #"\d+\s*m"#, options: .regularExpression,
+                                    range: hRange.upperBound..<r.endIndex) {
+                mins = Int(r[mRange].filter(\.isNumber)) ?? 0
+            }
+            return Double(h * 3600 + mins * 60)
+        }
+        let minutes = Int(r.prefix { $0.isNumber }) ?? 0
+        return Double(minutes * 60)
     }
 
     /// AVPlayer-only START watchdog. AVPlayer can mount and present its chrome yet never produce a playable
@@ -1612,6 +2013,7 @@ struct TVPlayerView: View {
         if resetAutoRetries { autoRetryCount = 0; reconnecting = false }
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
+        bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; loadErrorMsg = ""
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
         startLoadTimeout()
@@ -1645,15 +2047,136 @@ struct TVPlayerView: View {
         guard let m = curMeta else { return }
         let key = "\(m.type):\(m.videoId)"
         guard key != addonSubsKey else { return }
+        let addons = account.addons
+        // The account's add-on collection loads async at app start; latching an empty list here would hide
+        // add-on subtitles for the whole session. Leave the key unlatched so a later call (playback start /
+        // panel open) fetches once the add-ons have arrived.
+        guard !addons.isEmpty else { return }
         addonSubsKey = key
         addonSubs = []
         addedSubURLs = []
-        let addons = account.addons
         Task { @MainActor in
             let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: m.videoId)
             guard addonSubsKey == key else { return }   // episode changed mid-fetch
             addonSubs = subs
             if showOptions, panelKind == .subtitles { panelRows = optionRows }
+        }
+    }
+
+    // MARK: - Community subtitles (pool + sync + embedded upload)
+
+    /// The pool `content_key` for what is playing: the imdb library id, plus season/episode for an episode.
+    /// Live streams and titles with no imdb id return nil, no-oping the whole community-subtitle path.
+    private var communityContentKey: String? {
+        guard let m = curMeta, !isCurrentLiveStream else { return nil }
+        return SubtitleReleaseFingerprint.contentKey(imdbId: m.libraryId, season: m.season, episode: m.episode)
+    }
+
+    /// The release name for the fingerprint: the playing stream's display name / release text.
+    private var communityReleaseName: String? {
+        if let s = currentStream { return sourceLabel(s) }
+        return curTitle.isEmpty ? nil : curTitle
+    }
+
+    /// Build (or rebuild) the one release fingerprint for this playback session, keyed on the active URL so a
+    /// source switch recomputes it. `force` rebuilds even when the key is unchanged (e.g. once the real
+    /// duration/fps land). Kept consistent so fetch/upload/offset all agree.
+    private func refreshSubFingerprint(force: Bool = false) {
+        let key = (curURL ?? url).absoluteString
+        if !force, key == subFingerprintKey, subFingerprint != nil { return }
+        subFingerprintKey = key
+        let fps = coordinator.player?.containerFrameRate() ?? 0
+        let dur = coordinator.player?.mediaDurationSeconds() ?? duration
+        subFingerprint = SubtitleReleaseFingerprint.releaseFingerprint(
+            frameRate: fps > 0 ? fps : nil,
+            durationSecs: dur > 0 ? dur : nil,
+            releaseName: communityReleaseName)
+    }
+
+    /// P2/P3: fetch pooled community subtitles + the learned sync offset for this title, then (P3) seed the
+    /// offset onto the player once. Gated + fail-soft inside the client. De-duped per content key + fingerprint.
+    private func fetchPooledSubtitles() {
+        guard let contentKey = communityContentKey else { return }
+        refreshSubFingerprint()
+        let fp = subFingerprint
+        let key = "\(contentKey)#\(fp ?? "")"
+        guard key != pooledSubsKey else { return }
+        pooledSubsKey = key
+        Task { @MainActor in
+            let result = await SubtitlePoolClient.fetchPooled(contentKey: contentKey, lang: nil, fingerprint: fp)
+            guard communityContentKey == contentKey else { return }   // title changed mid-fetch
+            pooledSubs = result.subs
+            // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
+            // maps it to `sub-delay`; the AVPlayer engine applies it as the offset on the external-subtitle
+            // overlay it renders itself (a no-op until an external cue set is loaded, then it lands correctly).
+            // Never override a delay the user already dialed in.
+            if !pooledSeededOffset, subDelay == 0, let offsetMs = result.offsetMs, offsetMs != 0 {
+                pooledSeededOffset = true
+                let seconds = (Double(offsetMs) / 1000.0 * 10).rounded() / 10
+                subDelay = seconds
+                coordinator.player?.setSubDelay(seconds)
+            }
+            if showOptions, panelKind == .subtitles { panelRows = optionRows }
+        }
+    }
+
+    /// P2: load a pooled subtitle into the player, reusing the exact external-subtitle path (download to a
+    /// local file, then mpv `sub-add`). Shows the shared Loading… row state. Fail-soft.
+    private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+        guard subtitleLoadingURL == nil else { return }
+        subtitleLoadingURL = sub.url.absoluteString
+        if showOptions, panelKind == .subtitles { panelRows = optionRows }
+        Task { @MainActor in
+            guard let localURL = await SubtitlePoolClient.download(sub) else {
+                subtitleLoadingURL = nil
+                if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                return
+            }
+            let title = pooledLabel(sub)
+            coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
+                subtitleLoadingURL = nil
+                if ok { addedPooledIDs.insert(sub.id) }
+                if showOptions, panelKind == .subtitles { panelRows = optionRows }
+            }
+        }
+    }
+
+    /// The label for a pooled subtitle row: the language name. NO add-on wording (framing rule) — pooled subs
+    /// are just "subtitles" with a subtle community provenance shown in the row detail.
+    private func pooledLabel(_ sub: SubtitlePoolClient.PooledSubtitle) -> String { langName(sub.lang) }
+
+    /// P3 capture: debounce a manual sync change, then submit the learned offset to the pool. Works on BOTH
+    /// engines now: on libmpv it is the `sub-delay`, on AVPlayer it is the offset applied to VortX's own
+    /// external-subtitle overlay (add-on/pooled srt/vtt) - the same signed cue offset for this fingerprint.
+    /// Gated + fail-soft inside the client.
+    private func captureSubOffset() {
+        guard let contentKey = communityContentKey else { return }
+        offsetCaptureTask?.cancel()
+        let delaySeconds = subDelay
+        let fp = subFingerprint
+        offsetCaptureTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1500))
+            guard !Task.isCancelled, communityContentKey == contentKey else { return }
+            let offsetMs = Int((delaySeconds * 1000).rounded())
+            await SubtitlePoolClient.postOffset(contentKey: contentKey, lang: "",
+                                                fingerprint: fp, offsetMs: offsetMs)
+        }
+    }
+
+    /// P4: extract the file's own embedded TEXT subtitle tracks off-main and upload each to the pool so users
+    /// on a different rip benefit. Best-effort, once per session, never blocks playback; ignores failures.
+    private func uploadEmbeddedSubtitlesIfNeeded() {
+        guard !embeddedUploadDone, let contentKey = communityContentKey else { return }
+        embeddedUploadDone = true
+        refreshSubFingerprint()
+        let fp = subFingerprint
+        let inputStr = (curURL ?? url).absoluteString
+        Task.detached(priority: .utility) {
+            let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
+            for track in tracks where track.cueCount > 0 {
+                await SubtitlePoolClient.upload(contentKey: contentKey, lang: track.lang, fingerprint: fp,
+                                                origin: "embedded", format: track.format, text: track.srt)
+            }
         }
     }
 
@@ -1943,12 +2466,17 @@ struct TVPlayerView: View {
         let leavingHash = currentTorrentHash
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
-        loadFailed = false; currentTime = 0; duration = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        // New episode: reset the community-subtitle session (new content key + fingerprint) so pooled subs,
+        // the seeded offset, and the embedded upload all re-run against the new episode (P2/P3/P4).
+        subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
+        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
         // Re-arm the watched marker for the NEW episode. Without this, the first episode of a binge sets
         // markedWatched=true at ~90% and every in-place auto-advanced episode after it is blocked by the
         // `!markedWatched` guard, so only the session's first episode ever marks watched (the "watched
         // episodes don't tick" regression; iOS PlayerScreen.goToEpisode already resets it).
         markedWatched = false
+        autoAddedThisPlayback = false   // re-arm the 60s auto-add/watch-ping for the new episode (idempotent per show)
         upNextSuppressed = false; upNextWantsCredits = false   // re-arm the Up Next band for the new episode
         sourceHops = 0; exhaustedURLs = []   // fresh episode, fresh failover budget
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
@@ -1978,6 +2506,8 @@ struct TVPlayerView: View {
             prepareTorrent(pre.stream)
             curURL = u
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            // Reset the local-capture throttle on the in-place episode switch (same reason as switchStream).
+            lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
             // @MainActor: the synchronous CoreBridge calls below (loadMeta / streamGroups ->
             // addonNamesByBase, which lazily mutates addonNamesCache) are main-actor-only. A bare
             // Task runs its pre-await body on a background thread, racing the dictionary against
@@ -2032,6 +2562,8 @@ struct TVPlayerView: View {
                     curURL = u
                     curIsLive = isLiveMeta(newMeta) && !s.isTorrent
                     scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+                    // Reset the local-capture throttle on this in-place episode switch (same reason as switchStream).
+                    lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
                     resumeSeconds = await account.resumeOffset(for: newMeta)
                     loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                     startLoadTimeout()
@@ -2304,16 +2836,56 @@ struct TVPlayerView: View {
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
-        guard !isAVPlayerActive else { return }   // AVPlayer has no frame-capture; the scrub bubble stays hidden
-        guard !scrubbing, !buffering, !isPaused else { return }
+        guard !scrubbing, !buffering, !isPaused else { return }   // AVPlayer now captures too (AVPlayerItemVideoOutput)
+        guard time - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { return }
+        captureTrickplayFrame(at: time)
+    }
+
+    /// The one place a trickplay frame is grabbed (from the timePos tick OR the wall-clock timer). Engine-
+    /// agnostic + logged so a silent pool can be traced from a terminal run (which stage refused / nil frame).
+    private func captureTrickplayFrame(at time: Double) {
         guard !localTrickplayCaptureInFlight else { return }
-        guard time - lastLocalTrickplayCapture >= 10 else { return }
+        guard let player = coordinator.player else { NSLog("[tp-cap] no player mounted at %.0fs (tvOS)", time); return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureInFlight = true
-        coordinator.player?.captureFrameJPEGData(maxWidth: 480) { data in
+        let engine = (player is AVPlayerEngineController) ? "avplayer" : "libmpv"
+        // In-flight watchdog: the libmpv capture is serviced on mpv's VO thread inside nextDrawable(); if that
+        // thread is momentarily idle the handler may never fire, so release the guard after 3s to avoid a
+        // permanent wedge that would silently skip every later capture.
+        let watchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled, self.localTrickplayCaptureInFlight else { return }
             self.localTrickplayCaptureInFlight = false
-            guard let data else { return }
+            NSLog("[tp-cap] %@ capture at %.0fs never serviced (VO idle, tvOS) - releasing guard", engine, time)
+        }
+        player.captureFrameJPEGData(maxWidth: 480) { data in
+            watchdog.cancel()
+            self.localTrickplayCaptureInFlight = false
+            guard let data else {
+                NSLog("[tp-cap] %@ captureFrameJPEGData returned NIL at %.0fs (tvOS)", engine, time)
+                return
+            }
+            NSLog("[tp-cap] %@ captured %d bytes at %.0fs (tvOS)", engine, data.count, time)
             self.scrubThumbnails.recordCapturedFrameData(data, at: time)
+        }
+    }
+
+    /// Wall-clock capture driver (tvOS twin of PlayerScreen.startTrickplayCaptureTimer): a repeating ~10s
+    /// timer gated on active playback, capturing off the LIVE engine position so trickplay is generated even
+    /// when the engine's timePos event stream is sparse/coalesced on a 4K/HDR/DV stream.
+    private func startTrickplayCaptureTimer() {
+        trickplayCaptureTimer?.cancel()
+        trickplayCaptureTimer = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.trickplayCaptureIntervalSecs))
+                guard !Task.isCancelled else { return }
+                guard hasStartedPlaying, !scrubbing, !buffering, !isPaused else { continue }
+                guard let player = coordinator.player else { continue }
+                let now = player.playbackPositionSeconds
+                let t = now > 0 ? now : currentTime
+                guard t > 0, t - lastLocalTrickplayCapture >= Self.trickplayCaptureIntervalSecs else { continue }
+                captureTrickplayFrame(at: t)
+            }
         }
     }
 

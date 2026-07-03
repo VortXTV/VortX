@@ -15,8 +15,12 @@ struct LoginView: View {
     // future unconditional `isSignedIn = true` could otherwise re-enter this sink in a loop (the bug
     // that froze the iOS sign-in). Parity with iOSSignInView's latch — defensive, costs nothing.
     @State private var didHandleSignIn = false
+    /// H22: an explicit first-responder identity for each credential field, so the tvOS system keyboard
+    /// (and the iPhone Continuity Keyboard) binds to a concrete field the same way Search's field does.
+    @FocusState private var focusedField: Field?
 
     private enum Mode { case link, password }
+    private enum Field { case email, password }
 
     var body: some View {
         ZStack {
@@ -61,27 +65,49 @@ struct LoginView: View {
 
     private var passwordLogin: some View {
         VStack(spacing: Theme.Space.md) {
+            // H22 CONTINUITY KEYBOARD: the iPhone Continuity Keyboard detected the Apple TV but never
+            // connected on these fields (it works in the Search tab, which uses the system .searchable
+            // field). Continuity attaches to the standard tvOS credential-entry path, which the OS
+            // recognizes when the identifier + secret are declared as a `.username`/`.password` CREDENTIAL
+            // PAIR (not a bare `.emailAddress`), and each field carries an explicit `keyboardType` +
+            // `submitLabel` so the system keyboard (and thus Continuity) presents its full entry sheet.
+            // The `focused($focusedField)` binding gives each field a real first-responder identity so the
+            // Continuity session binds to a concrete field the way the search controller does. This makes
+            // the fields use the same standard tvOS text-entry path Search uses.
             field { TextField("Email or username", text: $email)
-                .textContentType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled() }
-            field { SecureField("Password", text: $password).textContentType(.password) }
+                .textContentType(.username)
+                .keyboardType(.emailAddress)
+                .submitLabel(.next)
+                .focused($focusedField, equals: .email)
+                .textInputAutocapitalization(.never).autocorrectionDisabled()
+                .onSubmit { focusedField = .password } }
+            field { SecureField("Password", text: $password)
+                .textContentType(.password)
+                .submitLabel(.go)
+                .focused($focusedField, equals: .password)
+                .onSubmit { if !email.isEmpty && !password.isEmpty { submitSignIn() } } }
 
             if let err = account.signInError {
                 Text(err).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
             }
 
-            Button {
-                passwordBusy = true
-                Task {
-                    await account.signIn(email: email, password: password)
-                    await MainActor.run { passwordBusy = false }
-                }
-            } label: {
+            Button { submitSignIn() } label: {
                 Text(passwordBusy ? "Signing in…" : "Sign In").frame(width: 280)
             }
             .buttonStyle(PrimaryActionStyle())
             .disabled(passwordBusy || email.isEmpty || password.isEmpty)
         }
         .frame(width: 700)
+    }
+
+    /// Kick off the password sign-in (shared by the Sign In button and the password field's Return key).
+    private func submitSignIn() {
+        guard !passwordBusy, !email.isEmpty, !password.isEmpty else { return }
+        passwordBusy = true
+        Task {
+            await account.signIn(email: email, password: password)
+            await MainActor.run { passwordBusy = false }
+        }
     }
 
     private func switchMode() {

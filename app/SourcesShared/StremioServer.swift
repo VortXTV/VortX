@@ -24,6 +24,17 @@ enum StremioServer {
         #endif
     }
 
+    /// The PUBLIC remote YouTube-trailer resolver (`trailer.vortx.tv/yt/{id}` -> a directly-playable MP4,
+    /// streamed through the worker). It needs NO embedded server, so it is the full-trailer path on EVERY
+    /// scheme including Lite.
+    static let remoteTrailerResolver = "https://trailer.vortx.tv"
+
+    /// The base to hand a YouTube trailer id to. ALWAYS the public remote resolver (`trailer.vortx.tv`), on
+    /// every build: the embedded `server.js` `/yt` route proved unreliable (it 403s once YouTube rotates), and
+    /// the remote worker is server-fixable (a YouTube change is a worker redeploy, not an app resubmit) and
+    /// works uniformly on the Lite build too. Callers append `/yt/{id}` + an optional `?lang=` hint.
+    static var trailerResolverBase: String { remoteTrailerResolver }
+
     /// Route a header-gated HTTP(S) stream through the embedded server's `/proxy/` endpoint, the
     /// same path official Stremio uses for `notWebReady` add-on streams. The server fetches each
     /// request (and every HLS variant / segment, which it rewrites to come back through the proxy)

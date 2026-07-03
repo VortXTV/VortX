@@ -29,13 +29,20 @@ import UIKit
 /// Privacy: uploads ONLY the generated sprite + vtt + the content key/metadata (imdb / season / episode /
 /// duration-bucket). NEVER an account token, user id, or any PII — none is referenced here.
 enum CommunityTrickplay {
-    static let baseURL = "https://trickplay.vortx.tv"
+    /// The trickplay edge base. Sourced from the RemoteConfig `endpoints.trickplay` dial (validated https +
+    /// *.vortx.tv host, else the baked default), so the owner can repoint it with no app update. Baked default
+    /// `https://trickplay.vortx.tv` == the shipping value; a null/invalid remote endpoint keeps that default.
+    static var baseURL: String { RemoteConfig.snapshot.trickplayEndpoint.absoluteString }
 
     /// The setting gate (default on, like a normal feature). Mirrors the `stremiox.*` @AppStorage namespace
     /// the player already uses; the 0.4 rename seam (`stremiox.` -> `vortx.`) maps it via SettingsBackup.
     static let settingKey = "stremiox.communityTrickplay"
 
     static var isEnabled: Bool {
+        // RemoteConfig fleet kill-switch `features.communityTrickplay`: a remote `false` force-disables the
+        // community layer fleet-wide (fetch AND upload) if the worker is degraded. Baked default true =>
+        // absent/null remote is identical to shipping; the user's own setting still governs.
+        guard RemoteConfig.snapshot.isFeatureOn("communityTrickplay", default: true) else { return false }
         // Absent default = true. UserDefaults returns false for an unset bool, so check object presence.
         if UserDefaults.standard.object(forKey: settingKey) == nil { return true }
         return UserDefaults.standard.bool(forKey: settingKey)
@@ -56,6 +63,72 @@ enum CommunityTrickplay {
         let raw = "\(imdbId):\(season ?? 0):\(episode ?? 0):\(bucket)"
         let digest = Insecure.SHA1.hash(data: Data(raw.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    // MARK: - TMDB-keyed plays -> IMDb identity
+
+    /// The leading `tt…` id inside a raw id string ("tt15239678", "tt14452776:1:2"), or nil. Lets a meta's
+    /// `behaviorHints.defaultVideoId` (often "tt…:s:e" on series) seed the shareable identity for free.
+    static func ttPrefix(_ raw: String?) -> String? {
+        guard let raw, let r = raw.range(of: #"^tt\d{6,}"#, options: .regularExpression) else { return nil }
+        return String(raw[r])
+    }
+
+    /// tmdb->imdb map, persisted so each title resolves over the network at most ONCE per install.
+    private static let tmdb2ttDefaultsKey = "stremiox.trickplay.tmdb2tt"
+    private static var tmdb2ttCache: [String: String] = {
+        (UserDefaults.standard.dictionary(forKey: tmdb2ttDefaultsKey) as? [String: String]) ?? [:]
+    }()
+
+    /// Synchronous cache lookup: the tt id previously resolved for a raw `tmdb:…` library id, or nil.
+    static func cachedIMDbID(for rawId: String) -> String? { tmdb2ttCache[rawId.lowercased()] }
+
+    /// Resolve a `tmdb:…` library id (the identity our hub/TMDB catalogs key plays with) to its `tt…` IMDb id,
+    /// so those plays contribute + fetch community trickplay exactly like Cinemeta (`tt…`) plays. THE bug this
+    /// kills: every play launched from the TMDB-backed catalogs was dropped by `contentKey`'s tt-guard, so an
+    /// account browsing our own hub never fed the pool no matter the device.
+    ///
+    /// Resolution is our own keyless TMDB edge (`catalogs.vortx.tv/3/{movie|tv}/{id}/external_ids`, edge-signed,
+    /// key injected server-side) with a direct-TMDB fallback when the user has a key. Tries the hinted media
+    /// type first, then the other (a bare "tmdb:NNN" does not say movie-vs-tv). Cached persistently; fail-soft
+    /// nil on an unparseable id / both lookups missing.
+    static func resolveIMDbID(rawId: String, seriesHint: Bool) async -> String? {
+        let cacheKey = rawId.lowercased()
+        if let hit = tmdb2ttCache[cacheKey] { return hit }
+        // "tmdb:693134" (canonical), tolerating "tmdb:movie:693134" / "tmdb:tv:693134".
+        let parts = cacheKey.split(separator: ":").map(String.init)
+        guard parts.first == "tmdb", let numeric = parts.dropFirst().first(where: { Int($0) != nil }) else { return nil }
+        let explicit = parts.contains("tv") ? "tv" : (parts.contains("movie") ? "movie" : nil)
+        let order = explicit.map { [$0] } ?? (seriesHint ? ["tv", "movie"] : ["movie", "tv"])
+        for media in order {
+            if let tt = await fetchExternalIMDbID(media: media, tmdbID: numeric) {
+                tmdb2ttCache[cacheKey] = tt
+                UserDefaults.standard.set(tmdb2ttCache, forKey: tmdb2ttDefaultsKey)
+                NSLog("[trickplay] resolved %@ -> %@ (%@)", rawId, tt, media)
+                return tt
+            }
+        }
+        return nil
+    }
+
+    /// One `external_ids` lookup: our keyless edge first (signed; worker holds the key), then TMDB direct with
+    /// the user's own key when present. nil on any miss.
+    private static func fetchExternalIMDbID(media: String, tmdbID: String) async -> String? {
+        func read(_ url: URL?, sign: Bool) async -> String? {
+            guard let url else { return nil }
+            var req = URLRequest(url: url, timeoutInterval: 10)
+            if sign { VortXEdgeAuth.sign(&req) }
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+            return ttPrefix(obj["imdb_id"] as? String)
+        }
+        let edge = RemoteConfig.snapshot.catalogsEndpoint.absoluteString
+        if let tt = await read(URL(string: "\(edge)/\(media)/\(tmdbID)/external_ids"), sign: true) { return tt }
+        if let key = ApiKeys.tmdbKey() {
+            return await read(URL(string: "https://api.themoviedb.org/3/\(media)/\(tmdbID)/external_ids?api_key=\(key)"), sign: false)
+        }
+        return nil
     }
 
     // MARK: - Fetch-first (L1 community layer)
@@ -152,7 +225,12 @@ enum CommunityTrickplay {
     ) async -> Bool {
         guard isEnabled else { return false }
         let sorted = frames.sorted { $0.time < $1.time }
-        guard sorted.count >= 2, sorted.count <= 600 else { return false }
+        // Store even a tiny capture (>=1 frame); the owner asked that even ~5s of coverage be kept + served.
+        // Frame bounds come from the RemoteConfig `trickplay.minFrames`/`maxFrames` dials (clamped min 1..10,
+        // max 30..600). Baked defaults (min 1, max 600) == the shipping literals, so a null/out-of-range
+        // remote value is behaviorally identical to today.
+        let frameBounds = RemoteConfig.snapshot.trickplayFrameBounds
+        guard sorted.count >= frameBounds.min, sorted.count <= frameBounds.max else { return false }
 
         // Tile size: 16:9 at 480 wide is the local capture's native shape (480px, aspect-preserved).
         let tileW = 480, tileH = 270

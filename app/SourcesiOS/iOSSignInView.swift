@@ -29,6 +29,17 @@ struct iOSSignInView: View {
                     // LazyVStack: greedy on width so the QR card / password field can't push the
                     // column past the viewport and clip (systemic fix S1).
                     LazyVStack(spacing: Theme.Space.lg) {
+                        // macOS has no toolbar cancellation item (the shared-window NSToolbar bridge is the
+                        // Beta 7 crash, so the toolbar below is iOS-only). Carry an in-content Cancel so the
+                        // sign-in sheet stays dismissable on Mac.
+                        #if os(macOS)
+                        HStack {
+                            Button("Cancel") { dismiss() }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                            Spacer()
+                        }
+                        #endif
                         wordmark
                         intro
                         if mode == .link {
@@ -43,9 +54,14 @@ struct iOSSignInView: View {
                     .padding(Theme.Space.lg)
                 }
             }
+            // navigationTitle + the cancellation ToolbarItem both bridge into the single shared window
+            // NSToolbar on macOS and crash in _insertNewItemWithItemIdentifier (the Beta 7 Mac crash).
+            // iOS-only here; macOS gets the in-content Cancel above.
+            #if os(iOS)
             .navigationTitle("")          // the wordmark IS the title
             .inlineNavigationTitle()
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            #endif
         }
         // One place handles success for BOTH paths (password + QR/link): seed the engine with the
         // freshly written authKey, then dismiss. CoreBridge booted signed-out at launch, so without

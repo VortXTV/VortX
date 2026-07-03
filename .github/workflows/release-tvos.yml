@@ -164,8 +164,13 @@ jobs:
 
       - name: Build macOS
         run: |
+          # ARCHS=arm64 (not just destination arch): a macOS Release build otherwise compiles the universal
+          # ARCHS_STANDARD (arm64 + x86_64), and the StremioXCore.xcframework macOS slice is arm64-only, so the
+          # x86_64 leg fails to link ("Undefined symbols for architecture x86_64"). Force arm64 to match the
+          # Apple Silicon runner and the local build recipe.
           xcodebuild -project app/VortX.xcodeproj -scheme VortXMac \
             -configuration Release -destination 'platform=macOS,arch=arm64' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO build
 
       - name: Package the IPAs
