@@ -10,6 +10,7 @@
 import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, mutateSyncDoc, type Session } from "./vault";
 import {
   mergeInstalledAddons,
+  pruneInstalledAddons,
   applyAddonOrder,
   registerAddonsSyncPusher,
   registerCwSyncPusher,
@@ -205,8 +206,26 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     const u = addonUrl(a);
     if (u) urls.push(u);
   }
-  const addonsChanged = mergeInstalledAddons(urls);
-  const orderChanged = applyAddonOrder(urls);
+  // Removal set: a URL deleted on ANY surface. mergeInstalledAddons only ever UNIONs, so without subtracting
+  // this a deleted add-on still in vortx.addons (app channel), a Stremio re-import, or one removed on an
+  // Apple device would be added straight back - THAT is the "I removed YouTube/Watch Hub but it keeps coming
+  // back" bug. Three sources, all folded (matching the app's own union): doc.removedAddons keys (this web
+  // stack's tombstones) + doc.webAddonRemovals (the flat mirror) + doc.vortx.deletedAddons (removals done in
+  // the Apple app). Normalize (trim+lowercase) BOTH sides so casing differences can't cause a miss - the app
+  // keys its tombstones the same way. Re-adding a URL clears the web tombstone (add wins LWW).
+  const removedNorm = new Set<string>();
+  if (doc.removedAddons && typeof doc.removedAddons === "object")
+    for (const k of Object.keys(doc.removedAddons)) removedNorm.add(normalizeAddonUrl(k));
+  if (Array.isArray(doc.webAddonRemovals))
+    for (const k of doc.webAddonRemovals) if (typeof k === "string") removedNorm.add(normalizeAddonUrl(k));
+  if (Array.isArray(vortx.deletedAddons))
+    for (const k of vortx.deletedAddons) if (typeof k === "string") removedNorm.add(normalizeAddonUrl(k));
+  const liveUrls = removedNorm.size ? urls.filter((u) => !removedNorm.has(normalizeAddonUrl(u))) : urls;
+  const addedChanged = mergeInstalledAddons(liveUrls);
+  const toPrune = removedNorm.size ? installedUrls().filter((u) => removedNorm.has(normalizeAddonUrl(u))) : [];
+  const prunedChanged = toPrune.length ? pruneInstalledAddons(toPrune) : false;
+  const addonsChanged = addedChanged || prunedChanged;
+  const orderChanged = applyAddonOrder(liveUrls);
 
   // Owner library (vortx.library: [{id,name,type,poster,t,d,lastWatched,v,...}]). The app emits t/d in
   // seconds (the dashboard + now the web app derive Continue Watching from each item's progress).
@@ -332,58 +351,110 @@ async function pushSettings(session: Session, s: Settings): Promise<void> {
   }
 }
 
+/** Tombstone-identity normalization: trim + lowercase, byte-for-byte matching the app's
+ *  AddonTombstones.normalize, so a URL the web writes into doc.webAddonRemovals matches what the app
+ *  compares its installed add-ons against. */
+function normalizeAddonUrl(u: string): string {
+  return u.trim().toLowerCase();
+}
+
 /** Push the webapp's installed add-ons up to the account (the doc.addons web sibling), so add-ons added
- *  on the web reach the user's other devices. Cinemeta is excluded (a universal built-in, not a user
- *  add-on). Fail-soft. */
+ *  on the web reach the user's other devices AND the native apps. Cinemeta is excluded (a universal
+ *  built-in). Serialized + coalesced by the caller. Fail-soft. */
 async function pushAddons(
   session: Session,
   urls: string[],
-  hint?: { added?: string; removed?: string },
+  hint?: { added?: string[]; removed?: string[] },
 ): Promise<void> {
   try {
-    // Resolve each add-on's FULL manifest so the synced entry is the descriptor the native app needs:
-    // {transportUrl, name, manifest}. The app DROPS doc.addons entries that lack a manifest (it installs
-    // them into the engine network-free, see VortXSyncManager.ownedAddons), so a URL-only entry would
-    // never reach the apps - that was the "add-ons added on web don't sync to the apps" bug. Cinemeta is a
-    // universal built-in and is excluded. Resolve in parallel; on a manifest-fetch failure fall back to a
-    // URL-only entry so at least web clients still record the membership.
-    const descriptors = await Promise.all(
+    // Pre-resolve each URL's FULL manifest (async, outside the mutate): the app installs from doc.addons
+    // network-free and DROPS any entry without a manifest, so a URL-only entry would never reach the apps.
+    const resolved = new Map<string, { transportUrl: string; name: string; manifest: unknown }>();
+    await Promise.all(
       urls
         .filter((u) => u !== CINEMETA_URL)
         .map(async (u) => {
           try {
             const a = await loadAddon(u);
-            return { transportUrl: a.transportUrl, name: a.manifest.name, manifest: a.manifest };
+            resolved.set(u, { transportUrl: a.transportUrl, name: a.manifest.name, manifest: a.manifest });
           } catch {
-            return { transportUrl: u };
+            /* leave unresolved; handled inside the mutate (preserve prior descriptor or skip) */
           }
         }),
     );
     await mutateSyncDoc(session, (doc) => {
+      // doc.addons is the WEB-ONLY sibling channel. Exclude app-owned URLs (doc.vortx.addons): the webapp's
+      // installedUrls includes app add-ons it hydrated in, and copying them here makes the dashboard's
+      // diff-based setAddons false-tombstone an untouched app add-on. (audit: web-pollutes-doc.addons)
+      const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
+      const appUrls = new Set(
+        (Array.isArray(vortx.addons) ? vortx.addons : []).map((a) => addonUrl(a)).filter(Boolean) as string[],
+      );
+      const priorByUrl = new Map<string, { transportUrl: string; name?: string; manifest?: unknown }>();
+      for (const a of Array.isArray(doc.addons) ? doc.addons : []) {
+        const u = addonUrl(a);
+        if (u) priorByUrl.set(u, a as { transportUrl: string; name?: string; manifest?: unknown });
+      }
+      const descriptors: Array<{ transportUrl: string; name?: string; manifest?: unknown }> = [];
+      for (const u of urls) {
+        if (u === CINEMETA_URL || appUrls.has(u)) continue; // Cinemeta built-in; app add-ons stay in their channel
+        const r = resolved.get(u);
+        if (r) descriptors.push(r); // freshly-resolved manifest
+        else if (priorByUrl.get(u)?.manifest) descriptors.push(priorByUrl.get(u)!); // preserve the last good descriptor
+        // else: no manifest available this round - SKIP rather than write a URL-only entry the app drops.
+      }
       doc.addons = descriptors;
-      // Maintain the removal tombstone (doc.removedAddons: { [transportUrl]: removedAtEpochMs }) from the
-      // EXPLICIT add/remove signal - never inferred by diffing the merged set, which would false-tombstone
-      // app-installed add-ons the webapp doesn't hold locally. A removal records "now"; the app uninstalls
-      // tombstoned URLs (gated on a good pull). Re-adding the same URL clears its tombstone (add wins LWW).
+
+      // Removal tombstones, from the EXPLICIT add/remove hints (never inferred by diffing, which would
+      // false-tombstone app add-ons). doc.removedAddons {url: epochMs} is the web-internal record (carries
+      // timestamps so a re-add can clear it). doc.webAddonRemovals is the flat string[] the APP reads and
+      // folds into its uninstall set (VortXSyncManager: "web agent owns this write; we only READ it").
       const tomb: Record<string, number> =
         doc.removedAddons && typeof doc.removedAddons === "object"
           ? (doc.removedAddons as Record<string, number>)
           : {};
-      if (hint?.removed) tomb[hint.removed] = Date.now();
-      if (hint?.added) delete tomb[hint.added];
+      for (const u of hint?.removed ?? []) tomb[u] = Date.now();
+      for (const u of hint?.added ?? []) delete tomb[u];
       doc.removedAddons = tomb;
+      doc.webAddonRemovals = Object.keys(tomb).map(normalizeAddonUrl); // the app-facing mirror
     });
   } catch {
     // fail-soft: the add-on is already installed locally; a later change re-pushes.
   }
 }
 
-// Wire the write-up triggers once at module load:
-//  - add/remove on the web pushes the installed list up (store.ts calls this injected pusher).
-//  - any USER settings change (suppressUp gates out hydration) debounce-pushes the main profile's settings.
-registerAddonsSyncPusher((hint) => {
+// Wire the add-on write-up once at module load. recordProgress-style hazards apply: add/remove fire in
+// bursts, and each pushAddons does a FULL doc.addons overwrite, so an unserialized fire-and-forget push
+// could write a stale snapshot and drop an entry. Coalesce: accumulate add/remove hints, debounce briefly,
+// run ONE push that reads installedUrls() fresh at fire time, and never overlap two pushes.
+const pendingAdded = new Set<string>();
+const pendingRemoved = new Set<string>();
+let addonPushTimer: ReturnType<typeof setTimeout> | null = null;
+let addonPushInFlight = false;
+function scheduleAddonPush(): void {
+  if (addonPushTimer) return;
+  addonPushTimer = setTimeout(runAddonPush, 350);
+}
+async function runAddonPush(): Promise<void> {
+  addonPushTimer = null;
+  if (addonPushInFlight) { scheduleAddonPush(); return; } // one already running; try again after it
   const s = currentSession();
-  if (s) void pushAddons(s, installedUrls(), hint);
+  if (!s) { pendingAdded.clear(); pendingRemoved.clear(); return; }
+  const hint = { added: [...pendingAdded], removed: [...pendingRemoved] };
+  pendingAdded.clear();
+  pendingRemoved.clear();
+  addonPushInFlight = true;
+  try {
+    await pushAddons(s, installedUrls(), hint);
+  } finally {
+    addonPushInFlight = false;
+    if (pendingAdded.size || pendingRemoved.size) scheduleAddonPush(); // hints arrived mid-flight
+  }
+}
+registerAddonsSyncPusher((hint) => {
+  if (hint?.added) { pendingAdded.add(hint.added); pendingRemoved.delete(hint.added); }
+  if (hint?.removed) { pendingRemoved.add(hint.removed); pendingAdded.delete(hint.removed); }
+  scheduleAddonPush();
 });
 
 // Push the ACTIVE profile's web watch-progress up to the bilateral doc.webProgress field. Owner progress

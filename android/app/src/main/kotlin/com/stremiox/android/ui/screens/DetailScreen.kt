@@ -11,7 +11,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -37,6 +40,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.stremiox.android.model.Episode
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
@@ -64,6 +68,7 @@ fun DetailScreen(
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
+    val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
@@ -109,6 +114,15 @@ fun DetailScreen(
                         watchEnabled = viewModel.bestSource() != null && !resolving,
                         onWatch = { viewModel.bestSource()?.let(viewModel::play) },
                     )
+                }
+                if (m.data.videos.isNotEmpty()) {
+                    item {
+                        EpisodesSection(
+                            episodes = m.data.videos,
+                            selectedId = selectedEpisodeId,
+                            onSelect = viewModel::selectEpisode,
+                        )
+                    }
                 }
                 item {
                     SourcesSection(
@@ -212,6 +226,77 @@ private fun MetaText(text: String) {
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+/// The episodes rail (series only): a horizontal strip of episode cards. Tapping one reloads the
+/// sources list scoped to that episode through the engine (mirrors tvOS, where choosing an episode
+/// re-drives `meta_details.streams` for that video id). The selected card carries the ember accent.
+@Composable
+private fun EpisodesSection(
+    episodes: List<Episode>,
+    selectedId: String?,
+    onSelect: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            text = "Episodes",
+            style = MaterialTheme.typography.titleLarge,
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.padding(horizontal = 20.dp),
+        )
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp),
+        ) {
+            items(episodes, key = { it.id }) { episode ->
+                EpisodeCard(
+                    episode = episode,
+                    selected = episode.id == selectedId,
+                    onClick = { onSelect(episode.id) },
+                )
+            }
+        }
+    }
+}
+
+/// One episode card: the season/episode label, the title, and the overview. Selected cards get the
+/// primary-tinted surface + border so the current episode's sources context is obvious.
+@Composable
+private fun EpisodeCard(episode: Episode, selected: Boolean, onClick: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .width(220.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surface,
+            )
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Badge(
+            if (episode.season > 0) "S${episode.season} · E${episode.episode}"
+            else "Episode ${episode.episode}",
+        )
+        Text(
+            text = episode.title,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 2,
+        )
+        episode.overview?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 3,
+            )
+        }
+    }
 }
 
 /// The sources section: the per-add-on, multi-quality source list the engine fans out. Mirrors the

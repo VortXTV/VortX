@@ -70,7 +70,7 @@ final class CoreBridge: ObservableObject {
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
     private func seedInitialState() {
-        let items = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+        let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
         let rows = buildBoardRows()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -951,6 +951,20 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
     }
 
+    /// Drop finished titles from the Continue Watching list the engine hands us, BEFORE we publish it.
+    ///
+    /// The engine's `is_in_continue_watching()` is purely `time_offset > 0` with no completion check, so a
+    /// title watched to the end, marked watched, or finished on another device and synced down keeps a
+    /// non-zero offset and sits in the rail forever. `finishedWatching` (the runtime rewind) only fires from
+    /// a local play-to-EOF, so it never catches the marked-watched or watched-elsewhere cases. Filtering
+    /// here at the data layer is the single backstop that covers all of them for every surface (tvOS Home
+    /// and iOS/Mac both render `continueWatching` directly), so no view needs to change. `CoreCWItem.isFinished`
+    /// defines "finished" per type (movies: watched-flag or >= 0.9 progress; series: current episode >= 0.9,
+    /// so a mid-series roll-forward with a fresh low-progress episode is preserved).
+    static func pruneFinished(_ items: [CoreCWItem]) -> [CoreCWItem] {
+        items.filter { !$0.isFinished }
+    }
+
     /// Drop a finished title (a movie, or the last episode of a series) out of Continue Watching by
     /// rewinding its saved position to zero. `is_in_continue_watching()` is just `time_offset > 0`, so a
     /// title finished at its end position would otherwise linger forever. Rewind keeps the library entry
@@ -1260,7 +1274,7 @@ final class CoreBridge: ObservableObject {
 
         // Decode the changed screens off the main thread, then publish on main.
         if fields.contains("continue_watching_preview") {
-            let items = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+            let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
             DispatchQueue.main.async { [weak self] in self?.continueWatching = items }
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change.

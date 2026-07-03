@@ -14,6 +14,10 @@ import UniformTypeIdentifiers
 /// everything that follows a viewer (languages, subtitle style, source order, text size) does.
 struct iOSSettingsView: View {
     @EnvironmentObject private var account: StremioAccount
+    // VortX-sync account (api.vortx.tv): the identity that mints the moat token which un-gates the Singularity
+    // SERVE read. The Singularity toggle gates on THIS, not the Stremio `account` -- a Stremio-only sign-in
+    // mints no token, so the toggle must require the VortX sign-in that the helper text already names.
+    @EnvironmentObject private var vortxSync: VortXSyncManager
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
@@ -721,8 +725,8 @@ struct iOSSettingsView: View {
             if moatContribute {
                 Toggle("Singularity sources", isOn: $singularityServe)
                     .tint(Theme.Palette.accent)
-                    .disabled(!account.isSignedIn)
-                if account.isSignedIn {
+                    .disabled(!vortxSync.isSignedIn)
+                if vortxSync.isSignedIn {
                     Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {

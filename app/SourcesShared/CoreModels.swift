@@ -47,14 +47,64 @@ struct CoreCWItem: Decodable, Identifiable {
     /// The saved resume position in whole seconds (`timeOffset` is ms), so a card can show where
     /// playback will pick up ("Resume 1:03"). 0 when nothing has been played into this title.
     var resumeSeconds: Double { max(0, state.timeOffset / 1000) }
+
+    /// Whether this title is effectively FINISHED and should drop out of Continue Watching.
+    ///
+    /// The engine's `is_in_continue_watching()` is just `time_offset > 0` with no completion check, so a
+    /// title watched to the end (or marked watched, or finished on another device and synced down) keeps a
+    /// non-zero offset and lingers in the rail forever. The runtime rewind (`finishedWatching`) only fires
+    /// from a local play-to-EOF, so nothing catches the marked-watched or watched-elsewhere cases. This is
+    /// the data-layer backstop CoreBridge applies before publishing the rail.
+    ///
+    /// - Movie: finished when the engine flagged it watched (`flaggedWatched`/`timesWatched > 0`) OR when
+    ///   progress is at/past the engine's own 0.9 credits threshold.
+    /// - Series: `timesWatched` counts WATCHED EPISODES, so a mid-series item has it high while still
+    ///   actively resumable, meaning it must NOT gate the rail. The only safe finished signal for a series
+    ///   is the CURRENT episode being at/past 0.9 (the finale, or the last episode, watched to the credits).
+    ///   A finished episode with a next one rolls `time_offset` back to a low value for the new episode, so
+    ///   its progress is low and it correctly stays.
+    var isFinished: Bool {
+        let watchedToEnd = progress >= 0.9
+        if type == "series" { return watchedToEnd }
+        return watchedToEnd || state.flaggedWatched > 0 || state.timesWatched > 0
+    }
 }
 
 struct CoreLibState: Decodable {
     let timeOffset: Double
     let duration: Double
     let videoId: String?
+    /// Engine watched-bookkeeping. `flaggedWatched` (movies) flips to 1 when a movie is marked/played
+    /// to the end; `timesWatched` counts finished plays (movies) or watched episodes (series). Both are
+    /// camelCase in the engine's serialization and default to 0 for older/sparser entries that omit them.
+    let flaggedWatched: Int
+    let timesWatched: Int
 
-    enum CodingKeys: String, CodingKey { case timeOffset, duration, videoId = "video_id" }
+    enum CodingKeys: String, CodingKey {
+        case timeOffset, duration, videoId = "video_id", flaggedWatched, timesWatched
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timeOffset = try c.decode(Double.self, forKey: .timeOffset)
+        duration = try c.decode(Double.self, forKey: .duration)
+        videoId = try c.decodeIfPresent(String.self, forKey: .videoId)
+        flaggedWatched = (try c.decodeIfPresent(Int.self, forKey: .flaggedWatched)) ?? 0
+        timesWatched = (try c.decodeIfPresent(Int.self, forKey: .timesWatched)) ?? 0
+    }
+
+    /// Explicit memberwise init: declaring `init(from:)` above suppresses the synthesized one, and the
+    /// overlay-profile builders in Profiles.swift construct states by hand. The two watched-count fields
+    /// default to 0 (the overlay rail does its own finished-movie pruning), so those call sites are
+    /// unchanged. `nil` videoId keeps the movie case working.
+    init(timeOffset: Double, duration: Double, videoId: String?,
+         flaggedWatched: Int = 0, timesWatched: Int = 0) {
+        self.timeOffset = timeOffset
+        self.duration = duration
+        self.videoId = videoId
+        self.flaggedWatched = flaggedWatched
+        self.timesWatched = timesWatched
+    }
 }
 
 // MARK: board (catalogs_with_extra)

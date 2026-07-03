@@ -1390,7 +1390,9 @@ struct CoreStreamList: View {
     // on + signed in) + HOARD (fire-and-forget descriptor contribution). Fully gated + fail-soft inside
     // `SourceIndexClient`; keyed on this title's content id (imdb, plus :S:E for an episode's PlaybackMeta).
     @StateObject private var sourceIndex = SourceIndexServeSource()
-    @EnvironmentObject private var account: StremioAccount   // sign-in gate for the source-index SERVE read
+    // Stremio account (api.strem.io). NOTE: the source-index SERVE read is gated on the VORTX-SYNC account
+    // (VortXSyncManager, the moat-token identity), NOT this one -- see refreshSourceIndex().
+    @EnvironmentObject private var account: StremioAccount
     // Offline-download state (#30, tvOS): the device-local index drives the Download chip's three
     // affordances (Download / Downloading / Downloaded) the same way iOS does. Device-local only; nothing
     // here syncs or touches the account library.
@@ -1696,9 +1698,15 @@ struct CoreStreamList: View {
     /// Community source index (tvOS): SERVE refresh + HOARD contribution for this title/episode. Fully gated
     /// + fail-soft inside `SourceIndexClient` (consent / fleet flag / Singularity toggle / login). De-duped
     /// per content id; safe to call as sources stream in.
+    ///
+    /// SIGN-IN IDENTITY: the SERVE read is gated on the VORTX-SYNC account, not the Stremio account. The moat
+    /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
+    /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
+    /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex() {
         guard let contentID = sourceContentID else { return }
-        sourceIndex.refresh(contentID: contentID, isSignedIn: account.isSignedIn)
+        let vortxSignedIn = VortXSyncManager.shared.isSignedIn
+        sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
         let groups = torboxSearch.merged(into: core.streamGroups())
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }

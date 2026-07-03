@@ -41,6 +41,15 @@ final class VortXSyncManager: ObservableObject {
         get { UserDefaults.standard.double(forKey: Self.kEditsAtKey) }
         set { UserDefaults.standard.set(newValue, forKey: Self.kEditsAtKey) }
     }
+    /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
+    /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
+    /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
+    /// the converged order. Empty means "no shared order yet" (fall back to the descriptor spine).
+    private static let kAddonOrderKey = "vortx.sync.appliedAddonOrder"
+    static var appliedAddonOrder: [String] {
+        get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: kAddonOrderKey) }
+    }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
     /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
     /// tombstones region) and while ProfileStore is doing touch:false launch housekeeping. The global
@@ -261,17 +270,74 @@ final class VortXSyncManager: ObservableObject {
         return (obj, version)
     }
 
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
+    /// Push a doc at an explicit version. Returns the worker's optimistic-concurrency verdict so the
+    /// caller can react to a lost race, NOT a bare Bool that conflates "stored" with "rejected". The
+    /// worker replies `{ accepted:true }` when it stored a strictly-newer version, or `{ accepted:false,
+    /// version:<current stored> }` when a concurrent write already won. lastSyncedVersion advances ONLY on
+    /// accepted==true: advancing it on a rejected write (the old bug) suppressed the recovery pull, so a
+    /// write that LOST the race was silently dropped and the device stayed diverged.
+    private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
+    private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
-              let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return false }
-        let version = Int(Date().timeIntervalSince1970 * 1000)
-        let (code, _) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
-        if code == 200 {
+              let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return .error }
+        let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
+        guard code == 200 else { return .error }
+        // accepted defaults to true so an older worker without the field (which stored the write) still
+        // advances the version, matching the website's `accepted !== false` read.
+        let accepted = (json?["accepted"] as? Bool) ?? true
+        if accepted {
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
+            return .accepted(version: version)
         }
-        return code == 200
+        // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
+        // deterministically at stored+1 instead of racing epoch-ms again. Do NOT advance lastSyncedVersion.
+        let stored = (json?["version"] as? Int) ?? (json?["version"] as? Double).map(Int.init)
+        return .rejected(storedVersion: stored)
+    }
+
+    /// Blind single-shot push at an epoch-ms version. Used by callers that push a fully-formed doc they do
+    /// not re-derive (they hold no local pending changes to re-merge). Fixed so a rejected write no longer
+    /// advances lastSyncedVersion: it returns false so the caller / the next natural pull reconciles.
+    @discardableResult
+    func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
+        let version = Int(Date().timeIntervalSince1970 * 1000)
+        if case .accepted = await pushSyncDocAt(obj, version: version) { return true }
+        return false
+    }
+
+    /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
+    /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
+    /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
+    /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
+    /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
+    private func pushDerivedDoc(_ initial: [String: Any], rebuild: () async -> [String: Any]?) async -> Bool {
+        let maxRetries = 3
+        var doc = initial
+        var version = Int(Date().timeIntervalSince1970 * 1000)
+        for attempt in 0..<maxRetries {
+            switch await pushSyncDocAt(doc, version: version) {
+            case .accepted:
+                return true
+            case .error:
+                return false   // network / server / encode failure: do not advance, next pull reconciles
+            case .rejected(let storedVersion):
+                // A concurrent write won. Re-pull, re-merge the local pending changes onto it (same merge as
+                // the first attempt), and retry strictly above the winner's version. If the rebuild can no
+                // longer produce a doc (e.g. the account pull now fails), abort WITHOUT advancing so the next
+                // pull reconciles rather than clobbering the winner.
+                guard attempt < maxRetries - 1, let rebuilt = await rebuild() else { return false }
+                doc = rebuilt
+                // storedVersion+1 beats the winner deterministically; fall back to a fresh epoch-ms if the
+                // worker did not echo a version (the row-vanished race), still strictly increasing.
+                if let stored = storedVersion {
+                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
+                } else {
+                    version = Int(Date().timeIntervalSince1970 * 1000)
+                }
+            }
+        }
+        return false   // exhausted retries: leave lastSyncedVersion unadvanced, next pull reconciles
     }
 
     /// A small JSON view of local state the website dashboard can read (the binary-plist `settings`
@@ -465,12 +531,25 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncUp() async -> Bool {
         guard isSignedIn else { return false }
-        // Data-loss guard: a FAILED pull (network error or undecryptable doc) must NEVER overwrite the
-        // account's existing document, or it wipes keys other surfaces wrote (the website's Stremio-imported
-        // library + add-ons). Only start from an empty doc when the account POSITIVELY has no backup yet.
+        // Build the merged doc from the current account base, then push with optimistic-concurrency
+        // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
+        // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
+        // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
+        guard let initial = await mergeLocalIntoDoc(base: nil) else { return false }
+        return await pushDerivedDoc(initial, rebuild: { await self.mergeLocalIntoDoc(base: nil) })
+    }
+
+    /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
+    /// freshly pulled account base (preserving keys other surfaces wrote). Extracted from syncUp so the
+    /// optimistic-concurrency retry can re-run the EXACT same merge onto the winner's doc after a lost
+    /// race, with identical LWW / union / never-clobber-libraryItem semantics on every attempt. `base` is
+    /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
+    /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
+    /// the account's existing document, or it wipes keys other surfaces wrote.
+    private func mergeLocalIntoDoc(base: [String: Any]?) async -> [String: Any]? {
         var doc: [String: Any]
         switch await pullSyncDocResult() {
-        case .failed: return false
+        case .failed: return nil
         case .empty: doc = [:]
         case .doc(let existing): doc = existing
         }
@@ -481,12 +560,18 @@ final class VortXSyncManager: ObservableObject {
         if let cloudRoster = Self.decodeRoster(fromSettingsBlob: doc["settings"]) {
             ProfileStore.shared.mergeInRoster(cloudRoster)
         }
-        guard let data = try? SettingsBackup.makeBackup() else { return false }
+        guard let data = try? SettingsBackup.makeBackup() else { return nil }
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
         // Pass the PULLED vortx block so vortxSummary can union the account-owned add-on set (never
         // shrink it from a degraded engine) and preserve addonsOwnedAt.
         doc["vortx"] = vortxSummary(existingVortx: doc["vortx"] as? [String: Any])
+        // Shared cross-surface add-on ORDER (Bug B). A sibling top-level key (like profileEdits) the app
+        // WRITES from the current engine order and the web dashboard also reads/writes, so a reorder on
+        // any surface converges. Emit the normalized transportUrls in the engine's true priority order.
+        // Omitted when there is nothing to order so a fresh account never writes an empty key.
+        let order = Self.currentAddonOrder()
+        if order.isEmpty { doc.removeValue(forKey: "addonOrder") } else { doc["addonOrder"] = order }
         // READ-MERGE, never wholesale-rebuild. Start from the PULLED apiKeys and only SET the keys this
         // device actually holds; never DELETE a key this device did not author. A device without a TMDB
         // key (or with no keys at all) used to drop the whole object on push, and because pushes version
@@ -516,7 +601,24 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return await pushSyncDoc(doc)
+        return doc
+    }
+
+    /// The current add-on order this device holds, as normalized transportUrls in the engine's true
+    /// priority order (the same `rawAddonDescriptorsOrdered` spine `vortxSummary` uses). Removed add-ons
+    /// (tombstoned) are excluded so the shared order never re-lists a removed add-on. Normalized on the
+    /// same trim+lowercase as the tombstone + doc.addonOrder read side so cross-surface comparison holds.
+    static func currentAddonOrder() -> [String] {
+        let removed = AddonTombstones.all()
+        var seen = Set<String>()
+        var order: [String] = []
+        for raw in CoreBridge.shared.rawAddonDescriptorsOrdered() {
+            guard let url = raw["transportUrl"] as? String, !url.isEmpty else { continue }
+            let normalized = AddonTombstones.normalize(url)
+            guard !removed.contains(normalized), seen.insert(normalized).inserted else { continue }
+            order.append(normalized)
+        }
+        return order
     }
 
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
@@ -620,6 +722,19 @@ final class VortXSyncManager: ObservableObject {
             incomingAddonRemovals += webRemoved
         }
         if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
+        // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
+        // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
+        // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
+        // ONLY inside this suppression region after a STRICTLY-NEWER, SUCCESSFUL pull, so a stale/partial
+        // sync can never scramble the order. Reordering the ALREADY-hydrated live engine Vec needs a
+        // CoreBridge action (out of scope here); the persisted order takes effect on the next hydrate.
+        if let addonOrder = doc["addonOrder"] as? [String] {
+            let normalized = addonOrder.map { AddonTombstones.normalize($0) }
+            if normalized != Self.appliedAddonOrder {
+                Self.appliedAddonOrder = normalized
+                restored = true
+            }
+        }
         let removedAddonSet = AddonTombstones.all()
         if !removedAddonSet.isEmpty {
             Task { @MainActor in
@@ -722,6 +837,25 @@ final class VortXSyncManager: ObservableObject {
         }
         if let webAddons = doc["addons"] as? [[String: Any]] {
             for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
+        }
+        // Apply the shared cross-surface add-on ORDER (Bug B) as the ordering spine when the doc carries
+        // one: a reorder made on any surface (app or web dashboard) converges here so a fresh/cold device
+        // hydrates add-ons in the user's chosen priority. Compared on the same normalized transportUrl the
+        // order is stored under. Any owned add-on NOT named in the order (newly installed elsewhere,
+        // pre-order docs) keeps its existing relative slot AFTER the ordered ones, so nothing is dropped.
+        let addonOrder = (doc["addonOrder"] as? [String]).flatMap { $0.isEmpty ? nil : $0 } ?? appliedAddonOrder
+        if !addonOrder.isEmpty {
+            var normalizedToUrl: [String: String] = [:]
+            for url in order { normalizedToUrl[AddonTombstones.normalize(url)] = url }
+            var ordered: [String] = []
+            var placed = Set<String>()
+            for normalized in addonOrder {
+                guard let url = normalizedToUrl[normalized], byUrl[url] != nil, placed.insert(url).inserted
+                else { continue }
+                ordered.append(url)
+            }
+            for url in order where !placed.contains(url) { ordered.append(url) }
+            return ordered.compactMap { byUrl[$0] }
         }
         return order.compactMap { byUrl[$0] }
     }

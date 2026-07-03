@@ -50,6 +50,88 @@ internal object EngineState {
         return rows
     }
 
+    /// Parse the `discover` field (a `CatalogWithFilters`) into UI [Catalog] rows. Unlike `board` (a
+    /// `CatalogsWithExtra` whose `catalogs` is nested `[[page]]`), Discover is a SINGLE selectable rail:
+    /// the engine serializes the currently selected catalog's pages as a FLAT `catalog: [page]` array
+    /// (each `{ request, content: Loadable<[meta]> }`, mirroring Apple `CoreDiscover.catalog`), plus a
+    /// `selectable` block of the type/catalog/extra options the UI can pivot on.
+    ///
+    /// We flatten the selected catalog's pages into one [Catalog] row, titled from the selected catalog
+    /// option's name when present (else the request path, matching the board titling). The row id is the
+    /// selected catalog's stable id so the UI can key it. Fail-soft: a missing/`Loading`/empty catalog
+    /// yields no row (empty list), never a throw, so Discover degrades to empty rather than crashing.
+    fun parseCatalogWithFilters(json: String): List<Catalog> {
+        val root = json.toJsonObjectOrNull() ?: return emptyList()
+        val pages = root.optJSONArray("catalog") ?: return emptyList()
+        val selected = selectedCatalog(root.optJSONObject("selectable"))
+        val items = mutableListOf<MetaItem>()
+        var title: String? = selected?.first
+        var rowId: String? = selected?.second
+        for (pageIdx in 0 until pages.length()) {
+            val page = pages.optJSONObject(pageIdx) ?: continue
+            if (title == null) {
+                val request = page.optJSONObject("request")
+                rowId = rowId ?: catalogRowId(request, pageIdx)
+                title = catalogTitle(request)
+            }
+            val content = page.readyArray("content") ?: continue
+            for (metaIdx in 0 until content.length()) {
+                content.optJSONObject(metaIdx)?.let { items += parseMetaPreview(it) }
+            }
+        }
+        if (items.isEmpty()) return emptyList()
+        return listOf(Catalog(id = rowId ?: "discover", title = title ?: "Discover", items = items))
+    }
+
+    /// The selected entry of `selectable.catalogs` (the engine marks exactly one `selected: true`),
+    /// returned as `(label, id)` for the Discover row. Each catalog option mirrors Apple
+    /// `CoreSelectableCatalog`: `{ catalog, selected, request }`. Null when no option is selected (e.g. a
+    /// still-loading selectable), so the caller falls back to the page's own request for the title.
+    private fun selectedCatalog(selectable: JSONObject?): Pair<String, String>? {
+        val catalogs = selectable?.optJSONArray("catalogs") ?: return null
+        for (i in 0 until catalogs.length()) {
+            val entry = catalogs.optJSONObject(i) ?: continue
+            if (!entry.optBoolean("selected", false)) continue
+            val label = entry.optStringOrNull("catalog") ?: catalogTitle(entry.optJSONObject("request"))
+            val id = selectableCatalogId(entry)
+            return label to id
+        }
+        return null
+    }
+
+    /// Stable id for a selectable catalog, matching Apple `CoreSelectableCatalog.id`
+    /// (`"catalog|path.id|path.type"`), so the Discover row keys consistently across selections.
+    private fun selectableCatalogId(entry: JSONObject): String {
+        val path = entry.optJSONObject("request")?.optJSONObject("path")
+        return listOf(
+            entry.optString("catalog"),
+            path?.optString("id").orEmpty(),
+            path?.optString("type").orEmpty(),
+        ).filter { it.isNotBlank() }.joinToString("|").ifBlank { "discover" }
+    }
+
+    /// Parse the `continue_watching_preview` field (`{ items: [CoreCWItem] }`) into UI [MetaItem]s for
+    /// the leading Home rail. Each item mirrors Apple `CoreCWItem`: `_id`, `type`, `name`, `poster`,
+    /// a `state` progress block, and `removed`/`temp` library-bookkeeping flags. We drop `removed`
+    /// entries (they linger in the bucket but are not "in Continue Watching"), matching the reference
+    /// apps, and keep engine order (already sorted most-recent-first by the core).
+    fun parseContinueWatching(json: String): List<MetaItem> {
+        val root = json.toJsonObjectOrNull() ?: return emptyList()
+        val items = root.optJSONArray("items") ?: return emptyList()
+        val out = mutableListOf<MetaItem>()
+        for (i in 0 until items.length()) {
+            val obj = items.optJSONObject(i) ?: continue
+            if (obj.optBoolean("removed", false)) continue
+            out += MetaItem(
+                id = obj.optString("_id").ifEmpty { obj.optString("id") },
+                type = MediaType.fromId(obj.optString("type", "movie")),
+                name = obj.optString("name"),
+                poster = obj.optStringOrNull("poster"),
+            )
+        }
+        return out
+    }
+
     /// Parse a `LibraryWithFilters` (`catalog: [libraryItem]`) into UI [MetaItem]s.
     fun parseLibrary(json: String): List<MetaItem> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()

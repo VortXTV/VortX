@@ -36,6 +36,12 @@ class DetailViewModel(
     private val _playback = MutableStateFlow<Playback>(Playback.Idle)
     val playback: StateFlow<Playback> = _playback.asStateFlow()
 
+    /// The episode whose sources are currently shown (series only). null = title-level sources (a movie,
+    /// or a series before an episode is chosen). The screen highlights the selected episode and passes
+    /// its id back through [selectEpisode].
+    private val _selectedEpisodeId = MutableStateFlow<String?>(null)
+    val selectedEpisodeId: StateFlow<String?> = _selectedEpisodeId.asStateFlow()
+
     init {
         viewModelScope.launch {
             // Fan out both add-on calls together; the hero appears the moment meta lands.
@@ -43,6 +49,18 @@ class DetailViewModel(
             val streamsJob = async { repo.streams(type, id) }
             _meta.value = metaJob.await().toUiState()
             _streams.value = streamsJob.await().toUiState()
+        }
+    }
+
+    /// Reload sources scoped to a series [episodeId] (the engine `CoreVideo.id`). Re-drives the sources
+    /// list into Loading then its result, so the section shows progress while the chosen episode's
+    /// stream add-ons fan out. A no-op if the same episode is re-selected. Movies never call this.
+    fun selectEpisode(episodeId: String) {
+        if (_selectedEpisodeId.value == episodeId) return
+        _selectedEpisodeId.value = episodeId
+        _streams.value = UiState.Loading
+        viewModelScope.launch {
+            _streams.value = repo.streams(type, id, episodeId).toUiState()
         }
     }
 

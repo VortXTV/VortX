@@ -4,6 +4,22 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.10 - build 151
+
+A hotfix over 0.3.9 that makes trailers actually play, clears finished titles out of Continue Watching, restores the community source list, sharpens the Streaming Services logos, and hardens account sync. In-place update, nothing resets.
+
+### Fixed
+
+- **Trailers play reliably again.** Many trailers used to show "this source didn't load" because modern YouTube now serves a trailer as separate video and audio streams with no single combined file, and the resolver only accepted the old combined format. Trailers now resolve straight from your own device at up to 1080p and play the separate video and audio together, so the ones that used to fail now work. The muted ambient trailer behind the hero uses the same path.
+- **Continue Watching clears finished titles.** A movie you watched to the end, marked as watched, or finished on another device no longer lingers in the row. A series you are partway through still shows so you can pick up the next episode.
+- **Streaming Services logos are legible.** Every brand mark now sits on a clean light plate, so marks like Apple TV+ and Paramount+ no longer blend into their tile instead of showing as a dark or transparent shape.
+- **Singularity sources show up.** The toggle used to check the wrong sign-in, so community-corroborated sources never loaded. Sign in to VortX, turn on Singularity sources in Settings, and they now appear in the source list alongside your own, on iPhone, iPad, Mac, and Apple TV.
+- **Account sync no longer drops a simultaneous change.** When two devices saved at the same moment one change could be silently lost; the app now detects the conflict, re-merges onto the latest version, and retries. Your add-on order also stays consistent across your devices and the web dashboard.
+
+### Changed
+
+- **Trailer clips use no server storage.** Trailers and the ambient hero clip resolve on demand from your own device, so nothing is pre-cut or stored on VortX's side.
+
 ## 0.3.9 - build 150
 
 Build 149 adds offline HLS downloads on iPhone and iPad (adaptive .m3u8 sources now download properly as a system-managed bundle and play back offline, instead of failing), a fleet of reliability fixes from an adversarial code-review sweep of the 147 changes (a catalog category that could get stuck on an endless spinner when you switched between pills; a hub tile that could open twice on a slow connection; a hub detail whose action buttons could disagree with its body), and a hardened Discover edge cache that no longer freezes a missing rating from a transient upstream hiccup and no longer stampedes the shared key when a popular row goes stale.

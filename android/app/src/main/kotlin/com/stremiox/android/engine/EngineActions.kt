@@ -86,6 +86,13 @@ object EngineActions {
     /// Unload meta details (clears the engine's MetaDetails model when leaving the detail screen).
     fun unloadMeta(): String = envelope(FIELD_META_DETAILS, action("Unload", null))
 
+    /// The state field-selector for `continue_watching_preview`, ready for [StremioXCore.getState].
+    /// Continue Watching is DERIVED state the engine populates from the hydrated library/ctx at
+    /// construction; it emits no `NewState` of its own (mirrors Apple `CoreBridge.seedInitialState`,
+    /// which reads the field directly rather than dispatching a load). So there is no "load CW" action:
+    /// the repository reads this field straight, after the board load has already pumped the event loop.
+    fun continueWatchingPreviewField(): String = "\"$FIELD_CONTINUE_WATCHING_PREVIEW\""
+
     // ---- low-level builders ----
 
     /// `{ "action": <tag>, "args": <args> }`. `args == null` omits the key (for arg-less actions).

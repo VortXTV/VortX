@@ -104,4 +104,24 @@ data class Playable(
     val viaStreamingServer: Boolean = false,
     /// Resume position in milliseconds from per-profile watch history, or 0 to start from the top.
     val startPositionMs: Long = 0L,
+    /// True when [url] is a loopback URL served by the in-process streaming server (a resolved torrent).
+    /// The [PlayerEngineRouter] keeps torrents on libmpv (ExoPlayer cannot replay the torrent warm-up),
+    /// and the mpv engine sizes its read-ahead down for a local stream, mirroring the Apple engine.
+    val isTorrent: Boolean = false,
+    /// Dolby Vision, flagged by stream ranking at selection time (a heuristic text parse, the only DV
+    /// signal available pre-play). Routes to the ExoPlayer engine so its [DefaultRenderersFactory] can
+    /// do the DV -> HEVC/AVC/AV1 codec fallback the panel actually supports (libmpv/gpu-next only
+    /// tone-maps DV to SDR on Android). See [PlayerEngineRouter].
+    val isDolbyVision: Boolean = false,
+    /// Dolby Atmos / bitstream-passthrough audio, flagged at selection time. Routes to the ExoPlayer
+    /// engine, whose [DefaultAudioSink] negotiates E-AC3-JOC/TrueHD passthrough against the device's
+    /// [AudioCapabilities]; mpv's Android AO decodes to PCM instead. See [PlayerEngineRouter].
+    val isAtmos: Boolean = false,
+    /// Per-stream HTTP request headers (Stremio `behaviorHints.proxyHeaders`): some add-ons front CDNs
+    /// that require a specific Referer or browser User-Agent. Applied by whichever engine plays the
+    /// stream (mpv via `http-header-fields`, ExoPlayer via the data-source factory).
+    val headers: Map<String, String> = emptyMap(),
+    /// External sidecar subtitle URLs to mount alongside the video (add-on resolved subtitles). mpv
+    /// mounts them via `sub-add`; the ExoPlayer path can attach them as side-loaded text tracks.
+    val externalSubtitles: List<String> = emptyList(),
 )

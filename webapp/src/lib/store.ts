@@ -129,6 +129,21 @@ export function mergeInstalledAddons(urls: string[]): boolean {
   return true;
 }
 
+/** Prune tombstoned add-ons from the local installed list (read-down of doc.removedAddons). This is what
+ *  makes a removal STICK across a sync: mergeInstalledAddons only ever unions, so an add-on the user
+ *  deleted that still lives in another channel (the app's vortx.addons, a Stremio re-import) would be
+ *  re-added and reappear as installed. Cinemeta is never pruned (it backs Home + meta). Returns true only
+ *  when something was actually removed, so it can gate a re-render. */
+export function pruneInstalledAddons(removedUrls: string[]): boolean {
+  const remove = new Set(removedUrls.filter((u) => typeof u === "string" && u !== CINEMETA_URL));
+  if (!remove.size) return false;
+  const current = installedUrls();
+  const next = current.filter((u) => !remove.has(u));
+  if (next.length === current.length) return false; // nothing tombstoned was actually installed
+  persist(next);
+  return true;
+}
+
 /** Apply a synced add-on ORDER to the local list (read-down): take the synced order as canonical for the
  *  URLs we have installed, then append any local-only URLs in their current order (never drops a local
  *  add-on). Cinemeta stays pinned first so Home + meta always work. Persists + returns true only when the

@@ -7,10 +7,14 @@ import Foundation
 /// format whose `url` is present directly. On a residential IP the IOS/ANDROID clients return the full
 /// streamingData: muxed itag 22/18 AND adaptive 1080p+.
 ///
-/// Above 720p YouTube is adaptive-only (separate video+audio); libmpv plays that natively when the audio
-/// stream is handed over as an `--audio-file` sidecar, which is why `Resolved` carries an optional `audioURL`.
-/// Ambient/AVPlayer contexts that cannot take a sidecar pass `wantMuxedOnly: true` and get the best muxed
-/// <=720 instead.
+/// Modern trailers are ADAPTIVE-ONLY at EVERY height on the residential IOS client: the `/player` answer is
+/// playable OK with ZERO muxed formats (no itag 18/22) and a split video-only + audio-only set up to 1080p
+/// (verified live). libmpv plays that natively when the audio-only stream is handed over as an `--audio-file`
+/// sidecar, which is why `Resolved` carries an optional `audioURL`. So the resolver prefers a muxed format
+/// only WHEN the client actually exposes one, and otherwise returns the adaptive pair at whatever height is
+/// offered (it does NOT require the pair to be > 720). A pure-AVPlayer context that cannot take a sidecar can
+/// still pass `wantMuxedOnly: true` to get muxed-or-nil, but no shipping trailer/ambient caller does: they all
+/// play through mpv (the button mounts the audio sidecar, the muted ambient just renders the video-only leg).
 ///
 /// FAIL-SOFT: any network / decode / playability error is a miss for that client and the ladder moves on;
 /// a fully-missed ladder returns nil. Never throws.
@@ -31,9 +35,11 @@ enum YouTubeDirectResolver {
         let isMuxed: Bool
     }
 
-    /// Resolve `videoID` by walking the InnerTube client ladder (IOS -> ANDROID -> TVHTML5 embedded).
-    /// `maxHeight` caps the adaptive pick (default 1080). `wantMuxedOnly`: ambient/AVPlayer contexts that
-    /// cannot take a sidecar; the resolver then returns the best muxed <=720 (nil when no muxed url exists).
+    /// Resolve `videoID` by walking the InnerTube client ladder (IOS -> ANDROID -> TVHTML5 embedded), returning
+    /// on the first client that yields a usable format. `maxHeight` caps the adaptive pick (default 1080).
+    /// `wantMuxedOnly`: a pure-AVPlayer context that cannot take an audio sidecar; the resolver then returns a
+    /// muxed format only (nil when the client exposed none). Default (false) returns muxed-when-present, else
+    /// the adaptive video+audio pair at any height.
     static func resolve(videoID: String, maxHeight: Int = 1080, wantMuxedOnly: Bool = false) async -> Resolved? {
         // Hero + trailer button double-resolve the same id within seconds; serve the second from cache.
         let cacheKey = "\(videoID)|\(maxHeight)|\(wantMuxedOnly ? 1 : 0)"
@@ -207,20 +213,34 @@ enum YouTubeDirectResolver {
         return url
     }
 
-    /// Apply the resolution policy to one client's streamingData:
-    ///   * !wantMuxedOnly and an adaptive avc1 pair exists with height > 720 -> the pair (isMuxed false).
-    ///   * otherwise the best muxed (itag 22 then 18).
-    ///   * wantMuxedOnly -> muxed only (nil when none).
+    /// Apply the resolution policy to one client's streamingData. Prefer a MUXED format when the client
+    /// exposed one (a single self-contained url is simpler and needs no sidecar), otherwise fall back to the
+    /// adaptive video+audio pair at ANY resolvable height.
+    ///
+    ///   * wantMuxedOnly -> best muxed only (nil when none). A caller that literally cannot take a sidecar
+    ///     (a pure AVPlayer context) sets this; NO shipping trailer/ambient caller does, they all play
+    ///     through mpv, which mounts the audio leg as `--audio-file`.
+    ///   * otherwise -> best muxed (itag 22 then 18) if one exists, ELSE the adaptive pair.
+    ///
+    /// The earlier policy took the adaptive pair only when its height was > 720 and otherwise demanded a
+    /// muxed format. That silently returned nil for the (now common) modern trailer that a residential IOS
+    /// InnerTube client answers with ZERO muxed formats and a best adaptive avc1 stream at <= 720 (verified
+    /// live: a real trailer returns playable OK, muxed 0, adaptive avc1 topping out at 720 with audio/mp4
+    /// present, yet the old gate discarded that perfectly playable pair). Muxed formats are no longer the
+    /// >720 discriminator, so the pair is accepted at whatever height the client offers.
     private static func pick(from streaming: PlayerResponse.StreamingData,
                              maxHeight: Int,
                              wantMuxedOnly: Bool) -> Resolved? {
-        if !wantMuxedOnly,
-           let pair = pickAdaptivePair(streaming.adaptiveFormats ?? [], maxHeight: maxHeight),
-           pair.height > 720 {
-            return Resolved(videoURL: pair.video, audioURL: pair.audio, height: pair.height, isMuxed: false)
-        }
+        // A muxed progressive stream (itag 22/18) is a single self-contained url: prefer it whenever the
+        // client exposed one, for both the muxed-only and the default case.
         if let muxed = pickMuxed(streaming.formats ?? []) {
             return Resolved(videoURL: muxed.url, audioURL: nil, height: muxed.height, isMuxed: true)
+        }
+        // No muxed format (the modern-trailer norm on the IOS client): take the adaptive video+audio pair at
+        // ANY height, unless the caller explicitly cannot take an audio sidecar (wantMuxedOnly).
+        if !wantMuxedOnly,
+           let pair = pickAdaptivePair(streaming.adaptiveFormats ?? [], maxHeight: maxHeight) {
+            return Resolved(videoURL: pair.video, audioURL: pair.audio, height: pair.height, isMuxed: false)
         }
         return nil
     }

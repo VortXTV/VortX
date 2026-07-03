@@ -36,7 +36,12 @@ interface CatalogRepository {
 
     /// Every playable source for a title, grouped by the add-on that returned it, best first. This is
     /// where the real engine fans out to every installed stream add-on; the preview returns a stub.
-    suspend fun streams(type: MediaType, id: String): Result<List<StreamGroup>>
+    ///
+    /// For a series, pass the chosen [episodeId] (the engine `CoreVideo.id`, e.g. `tt123:1:2`) so the
+    /// engine fetches THAT episode's streams; for a movie (or a series' auto-picked first episode) leave
+    /// it null and the engine guesses the best stream for the title. The default keeps every existing
+    /// caller (movies, the hero Watch button) source-compatible.
+    suspend fun streams(type: MediaType, id: String, episodeId: String? = null): Result<List<StreamGroup>>
 
     /// Resolve a chosen [StreamSource] into a directly-playable [Playable] for the player. The engine
     /// does whatever the source requires: hand a magnet to the in-process streaming server and return
@@ -136,10 +141,12 @@ class PreviewCatalogRepository(
         )
     }
 
-    override suspend fun streams(type: MediaType, id: String): Result<List<StreamGroup>> {
+    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> {
         delay(latencyMs)
         // A representative stub of the per-add-on, multi-quality source list the engine returns. The
-        // real impl fans out to every installed stream add-on; the UI hierarchy is identical.
+        // real impl fans out to every installed stream add-on; the UI hierarchy is identical. The
+        // preview ignores [episodeId] (its stub sources are title-level), but accepts it to stay
+        // signature-compatible with the engine impl.
         return Result.success(
             listOf(
                 StreamGroup(

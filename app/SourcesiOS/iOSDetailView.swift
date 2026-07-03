@@ -1633,9 +1633,14 @@ struct iOSDetailView: View {
     /// fire-and-forgets the assembled source descriptors so the pool learns from this resolve. Both are
     /// fully gated + fail-soft in `SourceIndexClient` (consent / fleet flag / toggle / login), so this is a
     /// hard no-op when the feature is off. De-duped per title; safe to call as sources stream in.
+    ///
+    /// SIGN-IN IDENTITY: the SERVE read is gated on the VORTX-SYNC account, not the Stremio account. The moat
+    /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
+    /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
+    /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex() {
         guard let contentID = SourceIndexClient.contentID(imdbId: ratingsImdbID) else { return }
-        sourceIndex.refresh(contentID: contentID, isSignedIn: account.isSignedIn)
+        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         let groups = torboxSearch.merged(into: core.streamGroups())
@@ -2772,9 +2777,14 @@ struct iOSEpisodeStreams: View {
     /// Community source index (episode): SERVE refresh + HOARD contribution for THIS episode. Fully gated +
     /// fail-soft inside `SourceIndexClient` (consent / fleet flag / Singularity toggle / login). De-duped per
     /// content id; safe to call as the episode's sources stream in.
+    ///
+    /// SIGN-IN IDENTITY: the SERVE read is gated on the VORTX-SYNC account, not the Stremio account. The moat
+    /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
+    /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
+    /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex() {
         guard let contentID = episodeContentID else { return }
-        sourceIndex.refresh(contentID: contentID, isSignedIn: account.isSignedIn)
+        sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
         let groups = torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
