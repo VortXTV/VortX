@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 /// Settings: who you're signed in as, the embedded streaming-server status, subtitles, and app info.
 /// Mirrors the official tvOS app's Settings sections, on the StremioX design system.
@@ -60,6 +61,24 @@ struct SettingsView: View {
     @AppStorage(MirrorSettings.libraryKey) private var mirrorLibrary = false
     @AppStorage(MirrorSettings.continueWatchingKey) private var mirrorCW = false
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
+    @ObservedObject private var pinStore = SourcePinStore.shared
+    // Autoplay trailers (the "hero" master switch): the muted autoplay trailer in the featured hero /
+    // detail hero. Default ON. SAME key the iOS/Mac view binds. Read by the hero + trailer paths.
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    // Auto-add watched to Library (D8): a title is added to the Library once ~60s of it has played.
+    // Default ON. SAME key iOS/Mac binds; read at the 60s progress tick in the player.
+    @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true
+    // Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
+    // writes this same key, so the last level persists; this picker sets it explicitly. SAME key as iOS/Mac.
+    @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
+    // New-episode alerts (F5): a local notification at each upcoming episode's air time. Default ON. SAME key
+    // the iOS view's NewEpisodeNotifications.enabledKey resolves to ("stremiox.notifyNewEpisodes"); that type
+    // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
+    // authorization through UNUserNotificationCenter directly (see setNotifyNewEpisodes below).
+    @AppStorage("stremiox.notifyNewEpisodes") private var notifyNewEpisodes = true
+    // Show the built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.), Cinemeta-backed and
+    // shown even with no add-ons installed. Default ON. SAME key iOS/Mac binds.
+    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
     /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
     private enum AccountFocus: Hashable { case vortx, logOut, importStremio }
@@ -74,6 +93,7 @@ struct SettingsView: View {
                     accountSection
                     stremioMirrorSection
                     playbackSection
+                    notificationsSection
                     streamsSection
                     communitySection
                     serverSection
@@ -298,6 +318,12 @@ struct SettingsView: View {
                 Label("Skip database key", systemImage: "checkmark.bubble")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
+            // Autoplay trailers: the master switch for the muted autoplay trailer in the featured hero /
+            // detail hero (the "hero" setting). Default ON. SAME key iOS/Mac binds.
+            choiceRow(String(localized: "Autoplay trailers"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { autoplayTrailers ? "1" : "0" }, set: { autoplayTrailers = ($0 == "1") }))
+            Text("Play a muted trailer automatically in the featured hero and on a title's detail page.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             // Trailer language (D11): the language the trailer picker prefers when choosing the YouTube id.
             // "App language" (the empty tag, the default) follows the app UI language; a set value becomes the
             // highest-priority trailer language in TMDBClient.preferredTrailerLanguages. Mirrors iOS/Mac.
@@ -313,6 +339,60 @@ struct SettingsView: View {
                       selection: Binding(get: { communityTrickplay ? "1" : "0" }, set: { communityTrickplay = ($0 == "1") }))
             Text("Share and reuse scrub-preview thumbnails across the community, so previews appear instantly without each device regenerating them. Only the generated thumbnails are shared, never any account data.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // Default player volume (D5): the level a new playback starts at. The in-player volume slider
+            // writes the same key, so this also reflects the last level used. Coarse 0/25/50/75/100 steps,
+            // plus the exact current level as its own chip when the in-player slider left it off-step (e.g.
+            // 60%), so the picker never snap-misreports the real starting level. SAME key as iOS/Mac.
+            choiceRow(String(localized: "Default volume"), playerVolumeOptions,
+                      selection: Binding(get: { String(Int(playerVolume.rounded())) },
+                                         set: { playerVolume = Double(Int($0) ?? 100) }))
+            // Auto-add a title to the Library once ~60s of it has played (D8). Default ON. The engine adds it
+            // through the account library on the main profile; overlay profiles are skipped. SAME key as iOS/Mac.
+            choiceRow(String(localized: "Auto-add watched to Library"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { autoAddLibrary ? "1" : "0" }, set: { autoAddLibrary = ($0 == "1") }))
+            Text("Adds a title to your Library once about a minute of it has played, so it is easy to find again.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
+    /// Coarse 0/25/50/75/100 volume steps, plus the exact current level as its own chip when the in-player
+    /// fine slider left `stremiox.playerVolume` off-step (e.g. 60), so the picker shows the real value
+    /// instead of snapping it to a wrong neighbour. Mirrors the iOS `playerVolumeSteps`.
+    private var playerVolumeOptions: [(id: String, label: String)] {
+        let steps = [0, 25, 50, 75, 100]
+        let current = Int(playerVolume.rounded())
+        let all = steps.contains(current) ? steps : (steps + [current]).sorted()
+        return all.map { (id: String($0), label: $0 == 100 ? String(localized: "Max (100%)") : "\($0)%") }
+    }
+
+    // MARK: Notifications
+
+    /// New-episode alerts (F5). Same key + behavior as the iOS view: enabling requests notification
+    /// authorization and settles the stored flag to the real grant; disabling clears pending alerts.
+    private var notificationsSection: some View {
+        section(String(localized: "Notifications")) {
+            choiceRow(String(localized: "New episode alerts"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { notifyNewEpisodes ? "1" : "0" },
+                                         set: { setNotifyNewEpisodes($0 == "1") }))
+            Text("Get a notification when a new episode of a series you open is about to air. Scheduled on-device for upcoming episodes, so no background tracking is needed.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
+    /// Turn new-episode alerts on/off. Enabling asks the system for permission and stores the real grant (a
+    /// denial settles the flag back off); disabling clears the flag and every pending alert. This mirrors
+    /// `NewEpisodeNotifications.setEnabled`, inlined here because that type lives in a SourcesiOS file the
+    /// tvOS target does not compile. The SAME `stremiox.notifyNewEpisodes` key is written either way.
+    private func setNotifyNewEpisodes(_ on: Bool) {
+        guard on else {
+            notifyNewEpisodes = false
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+            return
+        }
+        Task { @MainActor in
+            let granted = (try? await UNUserNotificationCenter.current()
+                .requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+            notifyNewEpisodes = granted
         }
     }
 
@@ -514,9 +594,27 @@ struct SettingsView: View {
             Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
+            // Editorial Home rails (Critically Acclaimed, Hidden Gems, etc.), Cinemeta-backed and shown even
+            // with no add-ons installed; this hides them. SAME key iOS/Mac binds.
+            choiceRow(String(localized: "Show editorial Home rows"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showCuratedRails ? "1" : "0" }, set: { showCuratedRails = ($0 == "1") }))
+            Text("Show the built-in editorial rows (Critically Acclaimed, Hidden Gems, and more) on Home, even with no add-ons installed.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
             choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],
                       selection: Binding(get: { catalogPrefs.landscapeCards ? "1" : "0" }, set: { catalogPrefs.landscapeCards = ($0 == "1") }))
             Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Standalone hide-labels toggle (SAME key as the Poster Style screen's toggle), surfaced here so
+            // it is discoverable without opening Poster style. Applies across every poster rail.
+            choiceRow(String(localized: "Hide poster labels"), [("1", "Hide"), ("0", "Show")],
+                      selection: Binding(get: { catalogPrefs.hidePosterLabels ? "1" : "0" }, set: { catalogPrefs.hidePosterLabels = ($0 == "1") }))
+            NavigationLink { TVPosterStyleView() } label: {
+                Label("Poster style", systemImage: "rectangle.portrait.on.rectangle.portrait")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("Tune poster width, corner radius, landscape 16:9 art, and labels, with a live preview.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
@@ -662,6 +760,31 @@ struct SettingsView: View {
                       selection: $sourcePrefs.maxFileSizeGB)
             Text("Hides sources larger than the cap (e.g. 1080p but not a 20 GB file). Sources with no stated size are kept.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Instant / dead-torrent / HDR / AV1 / max-quality filters (SAME SourcePreferences properties the
+            // iOS/Mac view binds), ported to the focus-driven choiceRow style.
+            choiceRow(String(localized: "Instant sources only"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.instantOnly ? "1" : "0" }, set: { sourcePrefs.instantOnly = ($0 == "1") }))
+            choiceRow(String(localized: "Hide dead torrents"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.hideDeadTorrents ? "1" : "0" }, set: { sourcePrefs.hideDeadTorrents = ($0 == "1") }))
+            choiceRow(String(localized: "HDR sources only"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.hdrOnly ? "1" : "0" }, set: { sourcePrefs.hdrOnly = ($0 == "1") }))
+            choiceRow(String(localized: "Hide AV1 sources"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.excludeAV1 ? "1" : "0" }, set: { sourcePrefs.excludeAV1 = ($0 == "1") }))
+            choiceRow(String(localized: "Max quality"),
+                      [("0", String(localized: "Unlimited")), ("4000", "4K"), ("1080", "1080p"), ("720", "720p")],
+                      selection: Binding(get: { String(sourcePrefs.maxResolution) }, set: { sourcePrefs.maxResolution = Int($0) ?? 0 }))
+            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown. Hide dead torrents drops sources with no seeders.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Pinned sources: long-press a source on any title to pin it; this clears them all. Shown only
+            // when there is something to clear (SAME SourcePinStore the iOS/Mac view uses).
+            if pinStore.pinnedCount > 0 {
+                Button { pinStore.clearAll() } label: {
+                    Label("Clear pinned sources (\(pinStore.pinnedCount))", systemImage: "pin.slash")
+                }
+                .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+            }
         }
     }
 
