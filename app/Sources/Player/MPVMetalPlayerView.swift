@@ -24,8 +24,10 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.playUrl = coordinator.playUrl
         mpv.playHeaders = coordinator.playHeaders
         mpv.playUrlLive = coordinator.playLive
+        mpv.playAudioSidecarURL = coordinator.playAudioSidecar
         mpv.startMuted = coordinator.muted
         mpv.loopPlayback = coordinator.loops
+        mpv.forceFillVideo = coordinator.forceFill
         let coord = context.coordinator
         mpv.onSingleTap = { [weak coord] in coord?.onTap?() }
         context.coordinator.player = mpv
@@ -50,9 +52,10 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         coordinator
     }
 
-    func play(_ url: URL, headers: [String: String]? = nil) -> Self {
+    func play(_ url: URL, headers: [String: String]? = nil, audioSidecar: URL? = nil) -> Self {
         coordinator.playUrl = url
         coordinator.playHeaders = headers
+        coordinator.playAudioSidecar = audioSidecar
         return self
     }
 
@@ -66,6 +69,13 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
     func muted(_ muted: Bool, loop: Bool = false) -> Self {
         coordinator.muted = muted
         coordinator.loops = loop
+        return self
+    }
+
+    /// Hero-preview only (#44): crop-to-fill so the ambient clip fills the whole hero band instead of a small
+    /// letterboxed box. Never called by the main player, so real playback aspect is unchanged.
+    func videoFill(_ fill: Bool) -> Self {
+        coordinator.forceFill = fill
         return self
     }
 
@@ -88,9 +98,13 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         var playUrl : URL?
         var playHeaders: [String: String]?
         var playLive = false
+        /// yt-direct adaptive pair: external audio stream mounted with the (video-only) playUrl at load.
+        var playAudioSidecar: URL?
         /// Hero-preview only (#44): start the libmpv instance muted / looping for an ambient background clip.
         var muted = false
         var loops = false
+        /// Ambient hero clip only (#44): crop-to-fill so the clip fills the whole hero band, never letterboxed.
+        var forceFill = false
         var onPropertyChange: ((any PlayerEngine, String, Any?) -> Void)?
         var onTap: (() -> Void)?
 

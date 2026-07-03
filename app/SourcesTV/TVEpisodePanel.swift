@@ -47,7 +47,7 @@ struct TVPlayerEpisodePanel: View {
                     Rectangle().fill(.white.opacity(0.08))
                 }
                 .frame(width: 214, height: 120)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 10) {

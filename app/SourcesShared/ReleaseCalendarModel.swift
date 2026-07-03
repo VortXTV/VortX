@@ -22,6 +22,39 @@ enum SeriesMetaFetcher {
     }
 }
 
+/// One MOVIE's release date (+ name/poster), fetched the same add-on way as `SeriesMetaFetcher`, decoding only
+/// the fields the Upcoming-Movies rail needs (CoreMetaItem does not surface a movie's top-level `released` /
+/// `releaseInfo`). Returns the title only when it is genuinely upcoming inside the window: a full ISO `released`
+/// timestamp or a `yyyy-MM-dd` `releaseInfo`. A bare year is ignored so far-future films never falsely enter the
+/// 45-day horizon. nil on no meta / no parseable date / not-upcoming. Fresh formatters per call (DateFormatter +
+/// ISO8601DateFormatter are not thread-safe and this runs off the main actor).
+enum MovieMetaFetcher {
+    static func upcoming(id: String, bases: [String], now: Date, horizon: Date) async -> (name: String, poster: String?, date: Date)? {
+        struct MovieMeta: Decodable { let name: String?; let poster: String?; let released: String?; let releaseInfo: String? }
+        struct Wrap: Decodable { let meta: MovieMeta? }
+        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        for base in bases {
+            guard let url = URL(string: "\(base)/meta/movie/\(escaped).json") else { continue }
+            var req = URLRequest(url: url); req.timeoutInterval = 12
+            guard let (data, _) = try? await URLSession.shared.data(for: req),
+                  let wrap = try? JSONDecoder().decode(Wrap.self, from: data), let m = wrap.meta else { continue }
+            guard let date = isoDate(m.released) ?? dayDate(m.releaseInfo), date > now, date < horizon else { return nil }
+            return (m.name ?? "", m.poster, date)
+        }
+        return nil
+    }
+    private static func isoDate(_ s: String?) -> Date? {
+        guard let s, !s.isEmpty else { return nil }
+        return ISO8601DateFormatter().date(from: s)
+    }
+    private static func dayDate(_ s: String?) -> Date? {
+        guard let s, s.count >= 10 else { return nil }   // need yyyy-MM-dd; a bare year (4 chars) is ignored
+        let f = DateFormatter(); f.calendar = Calendar(identifier: .iso8601)
+        f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        return f.date(from: String(s.prefix(10)))
+    }
+}
+
 /// "Upcoming Episodes": a Home rail of the next-airing episode of each SERIES in the user's library that
 /// drops within the next 45 days, soonest first. It reuses the SAME meta fetch the new-episode
 /// notification sweep runs (`SeriesMetaFetcher.fetch`), so a show you follow surfaces its next episode
@@ -65,7 +98,7 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Cancel any in-flight sweep when the owning Home view is torn down, so a slow fetch can't keep the
     /// model (and its captured state) alive for up to the per-series timeout after the view disappears.
-    deinit { loadTask?.cancel() }
+    deinit { loadTask?.cancel(); movieLoadTask?.cancel() }
 
     /// Build the rail from the series library + installed meta add-on bases, derived by the caller the SAME
     /// way `NewEpisodeNotifications.sweepLibrary`'s caller does (series-typed library ids + names, and the
@@ -102,9 +135,9 @@ final class ReleaseCalendarModel: ObservableObject {
 
     /// Clear when the library empties or the meta add-ons go away.
     func clear() {
-        loadTask?.cancel()
-        upcoming = []
-        lastSignature = nil
+        loadTask?.cancel(); movieLoadTask?.cancel()
+        upcoming = []; upcomingMovies = []
+        lastSignature = nil; lastMovieSignature = nil
     }
 
     /// Walk each series' meta off the main thread (reusing the shared `SeriesMetaFetcher` that also backs
@@ -146,5 +179,53 @@ final class ReleaseCalendarModel: ObservableObject {
         let f = DateFormatter()
         f.setLocalizedDateFormatFromTemplate("MMMd")
         return f.string(from: date)
+    }
+
+    // MARK: - Upcoming movies (library movies with a future release date inside the same 45-day window)
+
+    /// The upcoming library movies to render, soonest first. Empty hides the rail.
+    @Published private(set) var upcomingMovies: [UpcomingMovie] = []
+
+    /// One soon-to-release library MOVIE, ready for a `PosterCard` that routes to the movie `DetailView`.
+    struct UpcomingMovie: Identifiable {
+        let id: String
+        let name: String
+        let poster: String?
+        let releaseDate: Date
+        let releaseDateLabel: String
+    }
+
+    private var lastMovieSignature: String?
+    private var movieLoadTask: Task<Void, Never>?
+
+    /// Build the Upcoming-Movies rail from the library's MOVIE ids (+ names/posters as fallbacks) and the same
+    /// meta add-on bases. Mirrors `refresh(...)`: its OWN signature + task, so a routine re-emit never refetches
+    /// and tearing down one rail never cancels the other. Empty inputs clear the movie rail; fail-soft like the
+    /// episode rail (a flaky empty fetch keeps a populated rail, an honest empty publishes empty so it disappears).
+    func refreshMovies(movieIDs: [String], movieNames: [String: String] = [:], moviePosters: [String: String] = [:], metaBases: [String], reference: Date = Date()) {
+        guard !movieIDs.isEmpty, !metaBases.isEmpty else { upcomingMovies = []; lastMovieSignature = nil; return }
+        let dayBucket = Int(reference.timeIntervalSinceReferenceDate / 86_400)
+        let ids = Array(movieIDs.prefix(Self.seriesPrefix))
+        let signature = "\(dayBucket)|" + ids.joined(separator: ",")
+        if signature == lastMovieSignature, !upcomingMovies.isEmpty { return }
+        movieLoadTask?.cancel()
+        movieLoadTask = Task {
+            let built = await Self.buildMovies(movieIDs: ids, movieNames: movieNames, moviePosters: moviePosters, metaBases: metaBases, reference: reference)
+            if Task.isCancelled { return }
+            if built.isEmpty, !upcomingMovies.isEmpty { lastMovieSignature = nil }
+            else { upcomingMovies = built; lastMovieSignature = signature }
+        }
+    }
+
+    private static func buildMovies(movieIDs: [String], movieNames: [String: String], moviePosters: [String: String], metaBases: [String], reference: Date) async -> [UpcomingMovie] {
+        let horizon = reference.addingTimeInterval(Self.horizonDays * 86_400)
+        var out: [UpcomingMovie] = []
+        for id in movieIDs {
+            guard let found = await MovieMetaFetcher.upcoming(id: id, bases: metaBases, now: reference, horizon: horizon) else { continue }
+            let name = found.name.isEmpty ? (movieNames[id] ?? "") : found.name
+            out.append(UpcomingMovie(id: id, name: name, poster: found.poster ?? moviePosters[id],
+                                     releaseDate: found.date, releaseDateLabel: Self.dateLabel(for: found.date)))
+        }
+        return out.sorted { $0.releaseDate < $1.releaseDate }
     }
 }

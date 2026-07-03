@@ -11,6 +11,15 @@ import type { Settings } from "./settings";
 // (infoHash, no url) stream is NOT playable here. `isPlayable` accepts only direct/debrid HTTP(S)
 // urls. Torrent-only sources are still surfaced (see playableState) but greyed out with an
 // explanation, per the README's "direct/debrid/HLS-first" contract.
+//
+// MIN-SAFARI CONSTRAINT (conscious): the codec/quality-marker regexes below use lookbehind assertions
+// ((?<![a-z0-9]) word-boundary guards on codec/container/CAM/AV1 tokens). Regex literals are parsed at
+// script-parse time and the build target is es2021, so esbuild leaves lookbehind untouched (it cannot
+// lower regex assertions). That means this module's minimum runtime is iOS Safari >= 16.4 (RegExp
+// lookbehind support). This is the same baseline the CAM/FAKE/AV1 filters already required, so it is
+// the effective web floor, not a new constraint. If the support matrix must reach older Safari, these
+// guards have to be rewritten to a capture-group boundary-set form ((?:^|[^a-z0-9])(token)(?:[^a-z0-9]|$))
+// rather than left as lookbehind.
 
 export interface RankedGroup {
   base: string; // addon transport URL - the grouping key + stable id
@@ -164,11 +173,83 @@ export function rankedGroups(groups: StreamGroup[], keepAddonOrder = false): Ran
   return ranked;
 }
 
-/** The single best playable stream across all groups, for the one-press "Watch". */
+/** Mobile browsers (iOS Safari / Android Chrome) can't demux MKV and lack AC3/EAC3/DTS/TrueHD decoders, so
+ *  an MKV / HEVC / lossless-audio source plays as a black <video>. Detect a mobile browser so the auto-pick
+ *  prefers (and the player can gate on) a mobile-playable MP4/H.264/AAC source. */
+export function isMobileBrowser(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  const touchMac = /Macintosh/.test(ua) && ((navigator as { maxTouchPoints?: number }).maxTouchPoints ?? 0) > 1; // iPadOS masquerades as Mac
+  return /iP(ad|hone|od)/.test(ua) || /Android/.test(ua) || touchMac;
+}
+
+/** True if a direct stream is likely to PLAY in a mobile browser: not flagged notWebReady, and not an MKV
+ *  container / HEVC video / lossless-or-undecodable audio codec that mobile Safari/Chrome can't handle. A
+ *  SOFT heuristic on the quality text + url; never a hard block (callers fall back to the best source). */
+export function isMobileFriendly(s: Stream): boolean {
+  if (s.behaviorHints?.notWebReady) return false;
+  const t = (qualityText(s) + " " + (s.url ?? "")).toLowerCase();
+  if (/(?<![a-z0-9])(mkv|matroska)(?![a-z0-9])|x-matroska/.test(t)) return false;
+  if (/(?<![a-z0-9])(hevc|h\.?265|x265)(?![a-z0-9])/.test(t)) return false;                 // mobile HEVC-in-mp4 is spotty; prefer H.264
+  if (/(?<![a-z0-9])(ac3|eac3|e-ac-3|dts|dts-hd|truehd|atmos)(?![a-z0-9])/.test(t)) return false; // no mobile decoder
+  return true;
+}
+
+/** Prefer mobile-playable sources when the browser is mobile; fall back to the whole pool when none are. */
+function mobilePool(pool: Stream[]): Stream[] {
+  if (!isMobileBrowser()) return pool;
+  const friendly = pool.filter(isMobileFriendly);
+  return friendly.length ? friendly : pool;
+}
+
+/** Audio codecs NO browser can decode in an HTML5 <video> (AC3/E-AC3/DTS/TrueHD are the common culprits in
+ *  debrid remuxes). When a source's label declares one of these, the video plays but the audio is silent -
+ *  the D6 "mobile no audio" bug. Distinct from isMobileFriendly (which also gates MKV/HEVC on mobile only):
+ *  this is a codec-only signal that holds on desktop too, used to prefer decodable audio and to explain an
+ *  auto-advance honestly. A SOFT heuristic on the label text; never a hard block. */
+export function hasUndecodableAudio(s: Stream): boolean {
+  const t = (qualityText(s) + " " + (s.url ?? "")).toLowerCase();
+  return /(?<![a-z0-9])(ac3|eac3|e-ac-3|e-ac3|dts|dts-hd|dts-ma|truehd|true-hd|atmos)(?![a-z0-9])/.test(t);
+}
+
+/** Whether a source is LIKELY to have browser-decodable audio: it either declares a browser-friendly codec
+ *  (AAC/Opus/MP3/FLAC/Vorbis), or it declares no undecodable codec at all (unknown -> optimistically allow,
+ *  since most web-dl/mp4 encodes carry AAC). Used to rank/auto-advance toward a source that will actually
+ *  produce sound in the browser. */
+export function hasDecodableAudio(s: Stream): boolean {
+  return !hasUndecodableAudio(s);
+}
+
+/** An ordered fallback chain of playable sources for one title/episode, best-first, with sources whose audio
+ *  the browser can decode preferred ahead of the rest. The player walks this list: it starts on the best
+ *  source, and on a decode error or detected silent-audio it advances to the next entry. Sources are still
+ *  ranked by quality WITHIN each audio-decodability bucket, so we never drop from a decodable 4K to a
+ *  decodable 480p unnecessarily, and undecodable-audio sources stay as a last resort rather than vanishing
+ *  (some browsers/OSes DO carry the codec, so they can still work). On mobile the mobile-friendly filter is
+ *  applied to the decodable bucket first as well. */
+export function playbackFallbacks(groups: RankedGroup[]): Stream[] {
+  const all = groups.flatMap((g) => g.streams).filter(isPlayable);
+  if (!all.length) return [];
+  const byScore = (a: Stream, b: Stream): number => score(b) - score(a);
+  const decodable = all.filter(hasDecodableAudio).sort(byScore);
+  const undecodable = all.filter((s) => !hasDecodableAudio(s)).sort(byScore);
+  // On mobile, float the mobile-friendly decodable sources to the very front (they also avoid MKV/HEVC),
+  // but keep the rest of the decodable sources next so a fallback is always available.
+  if (isMobileBrowser()) {
+    const friendly = decodable.filter(isMobileFriendly);
+    const rest = decodable.filter((s) => !isMobileFriendly(s));
+    return [...friendly, ...rest, ...undecodable];
+  }
+  return [...decodable, ...undecodable];
+}
+
+/** The single best playable stream across all groups, for the one-press "Watch". On mobile, prefers a
+ *  mobile-playable source so Watch doesn't auto-pick an MKV/HEVC that renders a black <video>. */
 export function best(groups: RankedGroup[]): Stream | undefined {
   const all = groups.flatMap((g) => g.streams).filter(isPlayable);
   if (!all.length) return undefined;
-  return all.reduce((b, s) => (score(s) > score(b) ? s : b));
+  const pool = mobilePool(all);
+  return pool.reduce((b, s) => (score(s) > score(b) ? s : b));
 }
 
 /** A stream's resolution as a number (2160 / 1080 / ...), or null when the source doesn't declare one. */
@@ -190,7 +271,7 @@ export function pickPreferred(groups: RankedGroup[], maxRes: number): Stream | u
     const r = resolutionOf(s);
     return r === null || r <= maxRes;
   });
-  const pool = eligible.length ? eligible : all;
+  const pool = mobilePool(eligible.length ? eligible : all);
   return pool.reduce((b, s) => (score(s) > score(b) ? s : b));
 }
 

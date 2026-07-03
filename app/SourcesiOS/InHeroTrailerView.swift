@@ -1,10 +1,13 @@
 import SwiftUI
 
 /// In-hero auto-play trailer for the iOS / iPad / Mac detail page and Home billboard (#44). It plays a
-/// DIRECT (non-YouTube) trailer stream through **libmpv**. NOTE: YouTube trailers on iOS/Mac now play via
-/// the WKWebView IFrame (`YouTubeEmbedView`), NOT this view - tokenless `/yt` extraction is dead, so this
-/// view is used only when a real direct `trailerStreams` URL exists. (The tvOS twin `TVInHeroTrailerView`
-/// is the only libmpv hero-clip path on its platform, since tvOS has no web view.)
+/// libmpv-playable trailer URL: a DIRECT (non-YouTube) trailer stream, or the server's `/yt/{id}` resolver
+/// URL (owner FINAL architecture: the FULL trailer resolved on demand through the app's own server route and
+/// played NATIVELY, the same path our YouTube URL playback uses). The muted ambient loop is now that same
+/// full `/yt` trailer; the retired R2 `/clip` billboard snippet is gone (owner directive).
+/// This is the PRIMARY iOS/Mac hero-trailer path on every server-capable build; the WKWebView IFrame twin
+/// (`InHeroYouTubeTrailerView`) is only the Lite/no-server fallback. (The tvOS twin `TVInHeroTrailerView` is
+/// the only libmpv hero-clip path on its platform, since tvOS has no web view.)
 ///
 /// A muted, looping, chromeless libmpv layer fades in OVER the still backdrop a short beat after the hero
 /// settles. The still art underneath is the permanent fallback, so a missing / slow / blocked clip never
@@ -61,12 +64,19 @@ struct InHeroTrailerView: View {
     /// Gate so the start-delay beat is armed exactly once per mounted URL.
     @State private var startedDelay = false
 
-    /// Seconds the still backdrop holds before the muted clip dissolves in. The owner asked for a ~3s
-    /// settle on iOS (no focus engine, so the hero's displayed item plus this delay stands in for the
-    /// tvOS focus-settle), keeping the page calm and giving slow networks a moment.
-    private static let startDelay: Duration = .seconds(3)
+    /// How long the still backdrop holds before the muted clip dissolves in. Kept short (owner: the clip must
+    /// start within ~1s); the reveal is still gated on the clip actually decoding a frame, so a slow/failed
+    /// clip never flashes. (Was 3s, which - stacked on the old server probe - felt sluggish.)
+    private static let startDelay: Duration = .milliseconds(400)
     /// Cross-fade duration for the clip reveal.
     private static let fadeDuration: Double = 0.6
+
+    /// A loopback URL (the in-process `/yt` resolver) needs the embedded server up; a remote URL (the public
+    /// `trailer.vortx.tv/yt` resolver or a direct stream) does not, so it can mount immediately.
+    private var isLoopbackURL: Bool {
+        let host = (url.host ?? "").lowercased()
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
 
     var body: some View {
         ZStack {
@@ -80,6 +90,7 @@ struct InHeroTrailerView: View {
                     // hand mpv `loop-file=inf` (that would replay the whole trailer). Full mode keeps
                     // mpv's built-in inf loop. Muted either way: a silent ambient clip.
                     .muted(true, loop: window == nil)
+                    .videoFill(true)   // fill the WHOLE hero band, never a small letterboxed box (owner ask)
                     .onPropertyChange { engine, name, data in handleProperty(engine, name, data) }
                     .allowsHitTesting(false)   // ambient: never in the tap path
                     .opacity(showClip ? 1 : 0)
@@ -94,14 +105,19 @@ struct InHeroTrailerView: View {
         // never lingers over B's backdrop.
         .id(url)
         .task(id: url) {
-            // Reset state for the (possibly new) URL, then confirm the server is reachable before mounting.
-            // On a custom/offline server or a slow boot this stays false and the still backdrop holds.
+            // Reset state for the (possibly new) URL.
             serverReady = false
             showClip = false
             didStart = false
             failed = false
             startedDelay = false
-            if await StremioServer.isOnline() {
+            // A REMOTE url (the public trailer.vortx.tv/yt resolver or a direct CDN stream) does NOT need the
+            // embedded server, so mount it IMMEDIATELY. Only a loopback /yt URL (resolved by the in-process
+            // server) waits on the reachability probe. iOS previously gated even remote clips on the localhost probe, adding 0-4s of
+            // start latency; tvOS already scopes this to loopback - this ports that fix (owner: start < 1s).
+            if isLoopbackURL {
+                if await StremioServer.isOnline() { serverReady = true }
+            } else {
                 serverReady = true
             }
         }

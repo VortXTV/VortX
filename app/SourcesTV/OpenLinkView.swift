@@ -111,8 +111,8 @@ struct OpenLinkView: View {
         case .twitch(let channel):
             playTwitch(channel: channel)
             return
-        case .youtube:
-            status = "YouTube links are coming soon. Twitch and direct video links work today."
+        case .youtube(let videoID):
+            playYouTube(videoID: videoID)
             return
         case .unsupported(let note):
             if let note { status = note; return }
@@ -133,6 +133,31 @@ struct OpenLinkView: View {
         let title = url.lastPathComponent.isEmpty ? (url.host ?? "Stream") : url.lastPathComponent
         dismiss()
         presenter.request = PlaybackRequest(url: url, title: title)
+    }
+
+    /// Play a pasted YouTube link. DEVICE-DIRECT FIRST (yt-direct: InnerTube resolved on the user's own IP,
+    /// full streamingData on a residential IP; an adaptive 1080p+ pair rides mpv's audio-file sidecar), then
+    /// the remote resolver (trailer.vortx.tv/yt) EXACTLY as before when the direct resolve misses.
+    private func playYouTube(videoID: String) {
+        working = true
+        status = "Resolving YouTube video…"
+        resolveTask = Task { @MainActor in
+            defer { working = false }
+            let resolved = await YouTubeDirectResolver.resolve(videoID: videoID, maxHeight: 1080)
+            guard !Task.isCancelled else { return }   // sheet closed mid-resolve → don't present the player
+            if let resolved {
+                NSLog("[yt-direct] tvOS paste-link: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+                dismiss()
+                presenter.request = PlaybackRequest(url: resolved.videoURL, title: "YouTube",
+                                                    audioSidecarURL: resolved.audioURL)
+            } else if let url = URL(string: "\(StremioServer.trailerResolverBase)/yt/\(videoID)") {
+                NSLog("[yt-direct] tvOS paste-link: fallback-worker")
+                dismiss()
+                presenter.request = PlaybackRequest(url: url, title: "YouTube")
+            } else {
+                status = "Couldn't open that YouTube link."
+            }
+        }
     }
 
     /// Resolve a live Twitch channel to its HLS master playlist (best-effort, off-main) and present the

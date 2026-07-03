@@ -42,6 +42,7 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         view.engine = engine
         view.playerLayer.player = engine.player
         engine.attachLayer(view.playerLayer)   // binds video gravity + PiP to this exact layer
+        engine.attachSubtitleOverlay(view.subtitleOverlay)   // draw external srt/vtt subs above the video
         if let url = coordinator.playUrl {
             engine.loadFile(url, headers: coordinator.playHeaders, live: coordinator.playLive)
         }
@@ -59,6 +60,7 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
     /// created + resized manually), holding a STRONG reference to the engine because `Coordinator.player` is weak.
     final class AVPlayerLayerHostView: NSView {
         let playerLayer = AVPlayerLayer()
+        let subtitleOverlay = SubtitleOverlayView()   // external srt/vtt subs, drawn above the video
         var engine: AVPlayerEngineController?
         override init(frame frameRect: NSRect) {
             super.init(frame: frameRect)
@@ -69,9 +71,25 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
             playerLayer.frame = bounds
             playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             base.addSublayer(playerLayer)
+            // The overlay is a subview ABOVE the AVPlayerLayer sublayer, pinned to fill the host.
+            subtitleOverlay.frame = bounds
+            subtitleOverlay.autoresizingMask = [.width, .height]
+            addSubview(subtitleOverlay)
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
-        override func layout() { super.layout(); playerLayer.frame = bounds }
+        override func layout() {
+            super.layout()
+            playerLayer.frame = bounds
+            syncSubtitleInset()
+        }
+        /// Push the bottom letterbox bar height (host-bottom to picture-bottom, for the current videoGravity)
+        /// into the subtitle overlay so external cues ride over the picture rather than the black bar.
+        private func syncSubtitleInset() {
+            let video = playerLayer.videoRect              // picture rect in the layer's coordinate space
+            guard video.height > 0, playerLayer.bounds.height > 0 else { return }
+            let bottomBar = max(0, playerLayer.bounds.maxY - video.maxY)
+            subtitleOverlay.setVideoBottomInset(bottomBar)
+        }
     }
     #else
     func makeUIView(context: Context) -> AVPlayerLayerHostView {
@@ -89,7 +107,25 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
     final class AVPlayerLayerHostView: UIView {
         override static var layerClass: AnyClass { AVPlayerLayer.self }
         var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+        let subtitleOverlay = SubtitleOverlayView()   // external srt/vtt subs, drawn above the video
         var engine: AVPlayerEngineController?
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            // The backing layer IS the AVPlayerLayer; the overlay is a subview, so it renders above the video.
+            subtitleOverlay.frame = bounds
+            subtitleOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            addSubview(subtitleOverlay)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            // Push the bottom letterbox bar height (host-bottom to picture-bottom, for the current videoGravity)
+            // into the subtitle overlay so external cues ride over the picture rather than the black bar.
+            let video = playerLayer.videoRect            // picture rect in the layer's coordinate space
+            guard video.height > 0, playerLayer.bounds.height > 0 else { return }
+            let bottomBar = max(0, playerLayer.bounds.maxY - video.maxY)
+            subtitleOverlay.setVideoBottomInset(bottomBar)
+        }
     }
     #endif
 }

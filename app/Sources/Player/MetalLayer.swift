@@ -50,17 +50,39 @@ class MetalLayer: CAMetalLayer {
         let handler = _captureHandler
         _captureHandler = nil
         let queue = captureCommandQueue
-        let dst = captureTexture
+        let initialDst = captureTexture   // read under the lock (class contract: all fields captureLock-guarded)
         captureLock.unlock()
 
         if let handler {
             var committed = false
-            if let queue, let dst,
-               let cmd = queue.makeCommandBuffer(),
+            if let queue, let cmd = queue.makeCommandBuffer(),
                let blit = cmd.makeBlitCommandEncoder() {
                 let src = d.texture
-                if src.width == dst.width, src.height == dst.height,
-                   src.pixelFormat == dst.pixelFormat {
+                // The capture texture is pre-allocated to an SDR/HD descriptor, but a 4K/HDR/DV drawable
+                // arrives with a different size AND pixelFormat (e.g. bgr10a2 / rgba16Float). The old code
+                // required an exact match and otherwise dropped the frame (handler(nil)) -> EVERY 4K/HDR/DV
+                // frame was silently lost, so those titles never captured trickplay. Instead, reallocate the
+                // capture texture to match the source drawable's descriptor on a mismatch, then blit into it.
+                var dst = initialDst
+                if dst == nil || dst!.width != src.width || dst!.height != src.height || dst!.pixelFormat != src.pixelFormat {
+                    let desc = MTLTextureDescriptor.texture2DDescriptor(
+                        pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
+                    desc.usage = [.shaderRead]
+                    // .shared on EVERY platform (the Mac target is Apple-Silicon-only = unified memory). A
+                    // .managed texture keeps a separate CPU mirror that is NOT valid after a GPU blit until an
+                    // explicit blit.synchronize(resource:) - which this capture path never issues - so on macOS
+                    // the completion's CIImage(mtlTexture:) read a stale/empty mirror and the JPEG encode
+                    // silently returned nil, capturing ZERO community-trickplay frames for 4K/HDR/DV titles (the
+                    // reallocation branch ALWAYS fires for those, since the pre-allocated SDR/HD texture never
+                    // matches a 4K bgr10a2/rgba16F drawable). .shared has no CPU-sync gap and matches the sibling
+                    // allocator in MPVMetalViewController.updateCapturePipeline(), so both sites now agree.
+                    desc.storageMode = .shared
+                    if let realloc = device?.makeTexture(descriptor: desc) {
+                        dst = realloc
+                        captureLock.lock(); captureTexture = realloc; captureLock.unlock()
+                    }
+                }
+                if let dst {
                     blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
                               sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
                               sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),

@@ -55,8 +55,12 @@ export async function loadInstalledAddons(): Promise<Addon[]> {
 // When signed in, add/remove pushes the new installed list UP to the account (the doc.addons web sibling)
 // so add-ons added on the web reach the user's other devices. The pusher is INJECTED by account.ts (which
 // owns the session + the encrypted write) to avoid a store -> account import cycle; null when signed out.
-let addonsSyncPusher: (() => void) | null = null;
-export function registerAddonsSyncPusher(fn: (() => void) | null): void {
+// The pusher carries an explicit add/remove signal so the account write can maintain the removal
+// tombstone (doc.removedAddons) precisely - never inferred by diffing the merged set (which would
+// false-tombstone app-installed add-ons the webapp simply doesn't hold locally).
+export interface AddonSyncHint { added?: string; removed?: string }
+let addonsSyncPusher: ((hint?: AddonSyncHint) => void) | null = null;
+export function registerAddonsSyncPusher(fn: ((hint?: AddonSyncHint) => void) | null): void {
   addonsSyncPusher = fn;
 }
 
@@ -65,7 +69,7 @@ export function registerAddonsSyncPusher(fn: (() => void) | null): void {
 export async function addAddon(transportUrl: string): Promise<Addon> {
   const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
   persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
-  addonsSyncPusher?.(); // fire-and-forget push to the account (no-op signed out)
+  addonsSyncPusher?.({ added: addon.transportUrl }); // push + clear any prior removal tombstone for it
   return addon;
 }
 
@@ -73,7 +77,7 @@ export async function addAddon(transportUrl: string): Promise<Addon> {
 export function removeAddon(transportUrl: string): void {
   if (transportUrl === CINEMETA_URL) return;
   persist(installedUrls().filter((u) => u !== transportUrl));
-  addonsSyncPusher?.();
+  addonsSyncPusher?.({ removed: transportUrl }); // push + write the removal tombstone so apps uninstall it
 }
 
 // --- Library (saved titles) ---------------------------------------------------------------------
@@ -282,6 +286,43 @@ export function cwResumeId(titleId: string): string | null {
   return continueWatching().find((e) => e.id === titleId)?.resumeId ?? null;
 }
 
+// Write-up trigger: fires after any local CW change so the account can push the active profile's web
+// watch-progress up to the bilateral doc.webProgress field (debounced in account.ts), making what you
+// watch on the web reach your apps and other browsers. No-op signed out.
+let cwSyncPusher: (() => void) | null = null;
+export function registerCwSyncPusher(fn: (() => void) | null): void {
+  cwSyncPusher = fn;
+}
+
+/** One bilateral web-progress entry, the shape both the app and other web clients read out of
+ *  doc.webProgress: id = display id, v = played id (episode), t/d = seconds, lastWatched = epoch ms. */
+export interface WebProgressEntry {
+  id: string;
+  type: string;
+  v: string;
+  t: number;
+  d: number;
+  lastWatched: number;
+  name?: string;
+  poster?: string;
+}
+
+/** The ACTIVE profile's local Continue Watching mapped into the bilateral webProgress entry shape. The
+ *  account pusher reads this for the current scope and writes it under doc.webProgress.owner (owner) or
+ *  .byProfile[profileId] (overlay). cwEntriesFrom on the read side consumes the same shape verbatim. */
+export function webProgressEntries(): WebProgressEntry[] {
+  return rawCW().map((e) => ({
+    id: e.id,
+    type: e.type,
+    v: e.resumeId,
+    t: e.position,
+    d: e.duration,
+    lastWatched: e.updatedAt,
+    name: e.name,
+    poster: e.poster,
+  }));
+}
+
 /** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
  *  drops that played id once past 95% (finished). */
 export function recordProgress(
@@ -294,6 +335,7 @@ export function recordProgress(
   const others = rawCW().filter((e) => e.resumeId !== resumeId);
   if (position / duration > 0.95) {
     persistCW(others);
+    cwSyncPusher?.(); // finishing a title is a CW change too - push the dropped state up
     return;
   }
   const entry: CWEntry = {
@@ -307,11 +349,13 @@ export function recordProgress(
     updatedAt: Date.now(),
   };
   persistCW([entry, ...others].slice(0, 40));
+  cwSyncPusher?.(); // debounced account write-up of the active profile's web progress
 }
 
 /** Remove a title from Continue Watching (every played-id entry that shares this display id). */
 export function clearProgress(id: string): void {
   persistCW(rawCW().filter((e) => e.id !== id));
+  cwSyncPusher?.(); // propagate the removal up (apps/other browsers drop it on next pull)
 }
 
 function persistCW(entries: CWEntry[]): void {

@@ -2469,3 +2469,57 @@ video::cue {
   font-size: 0.85rem;
   box-shadow: 0 8px 28px rgba(0,0,0,0.45);
 }
+
+/* Skip Intro/Outro + Next Episode corner cluster (bottom-right, above the control bar) */
+.pl-corner {
+  position: absolute;
+  right: clamp(0.75rem, 3vw, 2rem);
+  bottom: 5.2rem;
+  z-index: 3;
+  display: flex;
+  gap: 0.6rem;
+  transition: opacity var(--duration-normal, 300ms) ease;
+}
+.pl-stage.pl-hidden .pl-corner { opacity: 0; pointer-events: none; }
+.pl-skipseg, .pl-next {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.55rem 1.1rem;
+  border: 1px solid rgba(255,255,255,0.28);
+  border-radius: 999px;
+  background: rgba(20, 18, 16, 0.82);
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background var(--duration-fast, 150ms) ease, transform var(--duration-fast, 150ms) ease;
+}
+.pl-skipseg:hover, .pl-next:hover { background: var(--accent, #f59e0b); color: var(--on-accent, #0f0d0a); border-color: transparent; }
+.pl-skipseg:active, .pl-next:active { transform: scale(0.96); }
+.pl-skipseg[hidden], .pl-next[hidden] { display: none; }
+.pl-next .ico { width: 1.2rem; height: 1.2rem; }
+
+/* Tap-to-unmute pill (mobile autoplay muted -> one tap restores sound) */
+.pl-unmute {
+  position: absolute;
+  top: 4.2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 1.2rem;
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 999px;
+  background: var(--accent, #f59e0b);
+  color: var(--on-accent, #0f0d0a);
+  font-size: 0.9rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+}
+.pl-unmute .ico { width: 1.3rem; height: 1.3rem; }
+.pl-unmute[hidden] { display: none; }

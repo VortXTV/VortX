@@ -61,21 +61,39 @@ struct SkipDBSubmitView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // macOS has no title/cancel toolbar items (the shared-window NSToolbar bridge is the
+                // Beta 7 crash, so both are compiled out below); carry an in-content header so the
+                // sheet stays labeled and dismissable on Mac.
+                #if os(macOS)
+                Section {
+                    HStack {
+                        Text("Submit skip segment").font(.headline)
+                        Spacer()
+                        Button("Cancel") { dismiss() }
+                    }
+                }
+                #endif
                 episodeSection
                 if !existingSegments.isEmpty { existingSection }
                 inputSection
                 submitSection
             }
             .formStyle(.grouped)
+            // navigationTitle + the cancellation ToolbarItem bridge into the single shared window
+            // NSToolbar on macOS and crash in _insertNewItemWithItemIdentifier; iOS/tvOS only.
+            #if !os(macOS)
             .navigationTitle("Submit skip segment")
+            #endif
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
             #endif
+            #if !os(macOS)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
             }
+            #endif
         }
     }
 

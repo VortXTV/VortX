@@ -37,6 +37,7 @@ enum SettingsBackup {
     static let deviceLocalKeys: Set<String> = [
         "stremiox.diskCacheBytes",   // Settings -> Streaming cache (sized to the device's own storage)
         "stremiox.serverURL",        // custom streaming server URL (per-device)
+        "stremiox.videoUpscaling",   // Settings -> Video upscaling (per-device: standard on Apple TV, scaled on Mac)
     ]
 
     /// An app preference that is ALSO safe to sync/transfer (i.e. not a per-device-local key).

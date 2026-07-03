@@ -5,10 +5,124 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+  # Full localization roster shipped by the single Resources/Localizable.xcstrings String Catalog.
+  # The catalog compiler emits an .lproj for every localization in the catalog regardless of this list,
+  # but declaring knownRegions keeps Xcode's project state, the AppleLanguages override (AppLanguage.set),
+  # and Foundation's bundle localization resolution is aware of every code so each pinned language resolves
+  # to its real .lproj at runtime. 0.3.9 expanded this from 64 to 106 languages (+ Base) past 100.
+  knownRegions:
+    - Base
+    - en
+    - af
+    - am
+    - ar
+    - as
+    - az
+    - be
+    - bg
+    - bn
+    - br
+    - bs
+    - ca
+    - ceb
+    - cs
+    - cy
+    - da
+    - de
+    - el
+    - es
+    - et
+    - eu
+    - fa
+    - fi
+    - fil
+    - fo
+    - fr
+    - fy
+    - ga
+    - gd
+    - gl
+    - gu
+    - ha
+    - he
+    - hi
+    - hr
+    - ht
+    - hu
+    - hy
+    - id
+    - ig
+    - is
+    - it
+    - ja
+    - jv
+    - ka
+    - kk
+    - km
+    - kn
+    - ko
+    - ku
+    - ky
+    - lb
+    - lo
+    - lt
+    - lv
+    - mg
+    - mi
+    - mk
+    - ml
+    - mn
+    - mr
+    - ms
+    - mt
+    - my
+    - nb
+    - ne
+    - nl
+    - ny
+    - oc
+    - or
+    - pa
+    - pl
+    - ps
+    - pt-BR
+    - pt-PT
+    - ro
+    - ru
+    - rw
+    - sd
+    - si
+    - sk
+    - sl
+    - sm
+    - sn
+    - so
+    - sq
+    - sr
+    - st
+    - su
+    - sv
+    - sw
+    - ta
+    - te
+    - tg
+    - th
+    - tr
+    - tt
+    - ug
+    - uk
+    - ur
+    - uz
+    - vi
+    - xh
+    - yo
+    - zh-Hans
+    - zh-Hant
+    - zu
 packages:
   MPVKit:
     url: https://github.com/mpvkit/MPVKit
-    exactVersion: "0.41.0"
+    exactVersion: "0.41.0-n8.1.2"   # n8.1.2 includes MPVKit PR #73 (avfoundation AO built for tvOS) - the #78/#101 Atmos/eARC fix
 # Project-wide defaults. VORTX_EDGE_SECRET is the build-time HMAC key for the hardened VortX edge
 # workers; it is EMPTY here so the build never fails when the gitignored Config/VortXEdge.xcconfig
 # is absent (e.g. a fresh clone, or CI before the secret is injected). When that xcconfig is present
@@ -50,8 +164,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
-        MARKETING_VERSION: "0.3.8"
-        CURRENT_PROJECT_VERSION: "128"
+        MARKETING_VERSION: "0.3.9"
+        CURRENT_PROJECT_VERSION: "150"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
@@ -112,6 +226,17 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -125,8 +250,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        MARKETING_VERSION: "0.3.8"
-        CURRENT_PROJECT_VERSION: "128"
+        MARKETING_VERSION: "0.3.9"
+        CURRENT_PROJECT_VERSION: "150"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -173,6 +298,17 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL # macos-arm64_x86_64 slice
@@ -189,8 +325,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        MARKETING_VERSION: "0.3.8"
-        CURRENT_PROJECT_VERSION: "128"
+        MARKETING_VERSION: "0.3.9"
+        CURRENT_PROJECT_VERSION: "150"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -234,6 +370,17 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -253,8 +400,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        MARKETING_VERSION: "0.3.8"
-        CURRENT_PROJECT_VERSION: "128"
+        MARKETING_VERSION: "0.3.9"
+        CURRENT_PROJECT_VERSION: "150"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -292,6 +439,17 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Bundled real streaming-brand logos (transparent PNGs), rendered by the Streaming Services tiles
+      # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
+      # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
+      - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # The full release changelog, bundled so Settings > What's New renders the whole history from the
+      # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
+      - path: ../CHANGELOG.md
+        buildPhase: resources
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
@@ -304,8 +462,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
-        MARKETING_VERSION: "0.3.8"
-        CURRENT_PROJECT_VERSION: "128"
+        MARKETING_VERSION: "0.3.9"
+        CURRENT_PROJECT_VERSION: "150"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -327,6 +485,14 @@ schemes:
     build:
       targets:
         VortXiOSNative: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  VortXMac:
+    build:
+      targets:
+        VortXMac: all
     run:
       config: Debug
     archive:

@@ -25,19 +25,51 @@ final class DownloadStore: ObservableObject {
 
     // MARK: Locations
 
-    /// `Application Support/Downloads`, created on demand and excluded from backup.
-    private var directory: URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// `Application Support/Downloads`, created on demand and excluded from backup. `nonisolated static`
+    /// so the background URLSession's off-main `didFinishDownloadingTo` delegate can resolve the same
+    /// directory WITHOUT hopping to the main actor (pure FileManager path math, no shared mutable state).
+    /// The instance `directory` below delegates to it so there is a single source of truth.
+    nonisolated static var downloadsDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Downloads", isDirectory: true)
-        return base
     }
+
+    private var directory: URL { Self.downloadsDirectory }
 
     private var indexURL: URL { directory.appendingPathComponent("index.json") }
 
     /// Absolute file URL for a record's media, rebuilt from the CURRENT container path so a relocated
     /// app container never strands a stored absolute path.
     func fileURL(for record: DownloadRecord) -> URL {
-        directory.appendingPathComponent(record.localFilename)
+        // A completed HLS offline download lives in a system-managed .movpkg whose path we persist RELATIVE
+        // to the home dir (the container UUID can change between launches); rebuild it against the CURRENT
+        // home dir. Progressive/torrent downloads live flat in the Downloads dir by filename.
+        if let rel = record.hlsRelativePath {
+            return URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(rel)
+        }
+        return directory.appendingPathComponent(record.localFilename)
+    }
+
+    /// Off-main destination resolver for a known media filename (`<id>.<ext>`). Lets the background
+    /// URLSession delegate recover a download's destination after an app relaunch wiped the in-memory
+    /// task->destination map. Pure path math, so it is `nonisolated`.
+    nonisolated static func fileURL(forFilename filename: String) -> URL {
+        downloadsDirectory.appendingPathComponent(filename)
+    }
+
+    /// Ensure the CURRENT-container Downloads directory exists, then mark it excluded from backup. THROWS on a
+    /// real create failure (unlike the private instance `ensureDirectory()`, which logs + swallows) so the
+    /// background URLSession delegate can surface a directory-creation fault at the move step instead of a
+    /// later opaque -3000 "cannot create file". `nonisolated static` so the off-main delegate can call it with
+    /// no main-actor hop. Downloads save FLAT into this root (see `fileURL(forFilename:)`), so creating the
+    /// root is the correct target. H20-FIX contributed by a VortX subreddit user (credited in the changelog).
+    nonisolated static func ensureDownloadsDirectoryExists() throws {
+        let dir = downloadsDirectory
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var mutable = dir
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? mutable.setResourceValues(values)
     }
 
     /// True when the media file for a completed record actually exists on disk (guards play-from-local
@@ -48,7 +80,12 @@ final class DownloadStore: ObservableObject {
 
     private func ensureDirectory() {
         let dir = directory
-        try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Do NOT swallow this: on iOS the Application Support dir is NOT auto-created, and a silent failure
+        // here was the opaque "cannot create file" the owner hit (the directory simply never existed when
+        // the background delegate moved the temp file in). Log it so a real permission/path fault is
+        // diagnosable instead of vanishing.
+        do { try fileManager.createDirectory(at: dir, withIntermediateDirectories: true) }
+        catch { NSLog("[downloads] could not create Downloads dir at \(dir.path): \(error.localizedDescription)") }
         excludeFromBackup(dir)
     }
 
@@ -95,12 +132,15 @@ final class DownloadStore: ObservableObject {
 
     /// Mutate a record in place (progress / state transitions) and persist. No-op if the id is gone
     /// (e.g. the user deleted the row while a late delegate callback arrived).
-    func update(id: UUID, _ mutate: (inout DownloadRecord) -> Void) {
+    /// `persistIndex: false` is for high-frequency PROGRESS ticks (#24): they only need the published
+    /// records for the UI, and re-encoding + atomically rewriting the JSON index on every tick was a
+    /// main-thread disk write several times per second. State transitions keep the default and persist.
+    func update(id: UUID, persistIndex: Bool = true, _ mutate: (inout DownloadRecord) -> Void) {
         guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
         var copy = records[idx]
         mutate(&copy)
         records[idx] = copy
-        persist()
+        if persistIndex { persist() }
     }
 
     /// Remove a record AND its on-disk file. The caller (DownloadManager) is responsible for cancelling

@@ -1,0 +1,64 @@
+name: MPVKit update watch
+
+# Opens a GitHub issue when MPVKit publishes a release NEWER than the one pinned in app/project.yml, so player,
+# audio (AO / passthrough / Atmos), and YouTube-extraction fixes - which all land in MPVKit - never go unnoticed
+# again (the avfoundation tvOS audio fix sat in a pre-release for ~2 weeks before we caught it).
+#
+# Notification ONLY. The bump stays manual + device-tested: a player-dependency change must never ship
+# unverified, and MPVKit pre-releases can regress playback. The issue tells you HOW to bump safely.
+#
+# Runs daily; the dedupe (one open issue per version) means it only pings when a genuinely new version appears.
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # daily 09:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare pinned MPVKit vs latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PINNED=$(grep -E 'exactVersion:' app/project.yml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          # Newest published release OR pre-release (the avfoundation tvOS fix shipped as a pre-release, so we
+          # must watch pre-releases too). Releases come back newest-first; drop drafts; take the first tag.
+          LATEST=$(gh api repos/mpvkit/MPVKit/releases --jq 'map(select(.draft | not)) | .[0].tag_name')
+          echo "pinned=$PINNED  latest=$LATEST"
+          if [ -z "$LATEST" ] || [ "$LATEST" = "$PINNED" ]; then
+            echo "MPVKit is up to date."; exit 0
+          fi
+          # Defence-in-depth: the release tag is the only externally-sourced value here. Only proceed if it is a
+          # plain version token, so a malformed or hostile tag can never inject into the commands below.
+          if ! printf '%s' "$LATEST" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "Unexpected MPVKit tag format: $LATEST - skipping."; exit 0
+          fi
+          TITLE="MPVKit update available: $LATEST (pinned $PINNED)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number --jq 'length')
+          if [ "$EXISTING" != "0" ]; then echo "Already filed for $LATEST."; exit 0; fi
+          # Build the issue body in a temp file so every line stays at this block's indentation. A flush-left
+          # heredoc inside a YAML "run: |" block scalar terminates the scalar early and makes the workflow
+          # unparseable (startup_failure on every push), so we never do that.
+          BODY_FILE="$(mktemp)"
+          printf '%s\n' \
+            "MPVKit \`$LATEST\` is out; we pin \`$PINNED\` in \`app/project.yml\`." \
+            "" \
+            "Player, audio (AO / passthrough / Atmos / eARC), and YouTube-extraction fixes land in MPVKit, so review and consider bumping." \
+            "" \
+            "Release notes: https://github.com/mpvkit/MPVKit/releases/tag/$LATEST" \
+            "" \
+            "How to bump SAFELY (never auto-merge a player-dependency change):" \
+            "1. Set \`exactVersion: \"$LATEST\"\` in \`app/project.yml\`." \
+            "2. \`cd app && xcodegen generate\`, then re-resolve SPM (delete Package.resolved + \`xcodebuild -resolvePackageDependencies\`)." \
+            "3. Rebuild all schemes and DEVICE-TEST playback, especially audio: Atmos/eARC, passthrough, and a DTS/EAC3 stream on Apple TV." \
+            "4. Only ship after it plays clean on a real device." \
+            > "$BODY_FILE"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"

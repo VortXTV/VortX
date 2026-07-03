@@ -25,12 +25,13 @@ The native streaming client for Apple devices, **formerly StremioX**. Fully nati
 
 ## New in the 0.3.8 line
 
-The 0.3.8 betas (current: **Beta 5**) added a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext, plus a wave of per-profile and power-user control:
+The 0.3.8 betas (current: **Beta 15**) added a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext, plus a wave of discovery, playback, and power-user features:
 
-- **40 languages**, following your device automatically, with right-to-left layout for Arabic, Hebrew, Persian, and Urdu.
-- **True Dolby Vision on iPhone and iPad**: a Dolby Vision MP4, MOV, or HLS stream now plays through Apple's AVPlayer for real DV passthrough on a capable display, with an automatic fallback to the built-in libmpv player. Apple TV and Mac follow in a later release. (#76)
-- **Per-profile add-ons** with live **health checks**, **Kids Mode**, **in-app debrid keys** (Real-Debrid, AllDebrid, Premiumize, TorBox), one-tap **quality presets**, **regex source filters**, profile **library export and import**, **Import from Stremio**, **Where to Watch**, **anime skip**, an in-player **frame grab**, **poster rating overlays**, and **eight seek-bar styles**.
-- **In-app updates** with an AltStore / SideStore source, and full **profile management on the web dashboard**.
+- **A Collections hub** on Home and Discover: Discover cards (Trending, Popular, Latest, Upcoming), Streaming Services shown with their logos, and Genres, each tapping into a browse grid. Reorderable, and toggleable per screen.
+- **Native debrid playback**: a cached torrent on your Real-Debrid, TorBox, AllDebrid, or Premiumize account plays instantly straight from the cache, with more than one service checked at once.
+- **True Dolby Vision across all four Apple targets** (Apple TV, iPhone, iPad, Mac) through Apple's AVPlayer, with an automatic fallback to the built-in libmpv player. (#76)
+- **Offline downloads** with a queue, **budget and box office** on movies, **spoiler-blurred** unwatched episodes, **in-player AirPlay**, an in-player **skip-segment editor**, **community scrub previews**, and **upcoming-movie release dates**.
+- **Per-profile add-ons** with live **health checks**, **Kids Mode**, **in-app debrid keys**, one-tap **quality presets**, **regex source filters**, library **export and import**, **Import from Stremio**, **anime skip**, **40+ languages** with right-to-left layout, **in-app updates** via an AltStore / SideStore source, and full **profile management on the web dashboard**.
 
 Full detail is in [CHANGELOG.md](CHANGELOG.md).
 

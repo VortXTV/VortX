@@ -153,7 +153,13 @@ enum DiskCacheSetting {
     }
 
     /// Whether the on-disk cache should be armed at all. OFF keeps mpv on its in-memory buffer.
-    static var diskCacheEnabled: Bool { !isOff }
+    /// Also gated by the RemoteConfig fleet kill-switch `features.diskCache`: a remote `false` FORCES the
+    /// cache off fleet-wide (an escape hatch if the disk cache regresses on some devices). Baked default is
+    /// true, so an absent / null remote field is behaviorally identical to shipping; the user's own Off/On
+    /// selection still governs — this only ANDs in the fleet gate.
+    static var diskCacheEnabled: Bool {
+        !isOff && RemoteConfig.snapshot.isFeatureOn("diskCache", default: true)
+    }
 
     // MARK: Auto-clear
 

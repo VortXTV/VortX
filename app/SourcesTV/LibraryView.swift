@@ -10,6 +10,7 @@ struct LibraryView: View {
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
+    @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
     /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
@@ -25,7 +26,15 @@ struct LibraryView: View {
                 BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
+                        Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Library tab -> scroll here
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                        // Offline downloads (#30): a section ABOVE the saved-titles grid, shown only when at
+                        // least one download exists. Plays from the local file with pause/resume/delete +
+                        // total storage used, and carries the storage-eviction caption. Device-local only.
+                        if !downloads.records.isEmpty {
+                            TVDownloadsView()
+                                .padding(.bottom, Theme.Space.lg)
+                        }
                         if profiles.activeUsesEngineHistory {
                             // Owner profile: the account library (engine), with its type/sort filters.
                             if let library = core.library {
@@ -56,6 +65,8 @@ struct LibraryView: View {
                     .padding(.bottom, Theme.Space.xl)
                 }
                 .heroBottomStrip()
+                // Re-selecting the active Library tab scrolls back to the top.
+                .scrollToTopOnBump(TabScrollKeys.library)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }

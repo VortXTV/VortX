@@ -18,7 +18,11 @@ struct SettingsView: View {
     @State private var langSelection: String = AppLanguage.current ?? "system"
     @State private var showLangRestart = false
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
+    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
+    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
+    @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -34,11 +38,20 @@ struct SettingsView: View {
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     // Streaming/seek cache budget, raw byte count (0 = Off, -1 = Unlimited). Int-typed @AppStorage; Int
     // is 64-bit on Apple TV, so the byte budgets are exact.
-    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
+    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
+    // Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id. Empty
+    // = follow the app UI language (the default). Read by TMDBClient.preferredTrailerLanguages / trailerLanguageBaseCode.
+    @AppStorage("stremiox.trailerLanguage") private var trailerLanguage = ""
     @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true  // share/fetch scrub previews
+    // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
+    // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
+    @AppStorage(MoatConsent.key) private var moatContribute = true
+    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
@@ -62,6 +75,7 @@ struct SettingsView: View {
                     stremioMirrorSection
                     playbackSection
                     streamsSection
+                    communitySection
                     serverSection
                     appearanceSection
                     audioSubtitleSection
@@ -202,7 +216,7 @@ struct SettingsView: View {
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .focused($accountFocus, equals: .importStremio)
                 NavigationLink { MetadataKeysView() } label: {
-                    Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
+                    Label("Metadata (TMDB, MDBList, fanart)", systemImage: "sparkles")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { DebridKeysView() } label: {
@@ -271,11 +285,23 @@ struct SettingsView: View {
             choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Dolby Vision for MKV (Beta)"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { dvRemux ? "1" : "0" }, set: { dvRemux = ($0 == "1") }))
+            Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
             choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
             choiceRow(String(localized: "Skip timestamps source"), [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
                       selection: $skipProvider)
+            NavigationLink { SkipKeysView() } label: {
+                Label("Skip database key", systemImage: "checkmark.bubble")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            // Trailer language (D11): the language the trailer picker prefers when choosing the YouTube id.
+            // "App language" (the empty tag, the default) follows the app UI language; a set value becomes the
+            // highest-priority trailer language in TMDBClient.preferredTrailerLanguages. Mirrors iOS/Mac.
+            choiceRow(String(localized: "Trailer language"), trailerLanguageOptions, selection: $trailerLanguage)
             choiceRow(String(localized: "Play in"), externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -290,6 +316,30 @@ struct SettingsView: View {
         }
     }
 
+    /// Give-to-get master switch + the opt-in "Singularity" community source index. The master toggle
+    /// governs whether this device both contributes anonymized metadata AND consumes every pooled feature;
+    /// off = out of the whole pool. Singularity SERVE is a further per-device opt-in that also needs sign-in.
+    private var communitySection: some View {
+        section(String(localized: "Community")) {
+            choiceRow(String(localized: "Contribute anonymized data to improve results"),
+                      [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { moatContribute ? "1" : "0" }, set: { moatContribute = ($0 == "1") }))
+            Text(MoatConsent.disclosure)
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            if moatContribute {
+                if account.isSignedIn {
+                    choiceRow(String(localized: "Singularity sources"), [("0", "Off"), ("1", "On")],
+                              selection: Binding(get: { singularityServe ? "1" : "0" }, set: { singularityServe = ($0 == "1") }))
+                    Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                } else {
+                    Text("Sign in to VortX to turn on Singularity sources.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
+            }
+        }
+    }
+
     /// Built-in plus every curated external player; picking one auto-hands eligible streams to it.
     private var externalPlayerChoices: [(String, String)] {
         [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
@@ -301,8 +351,12 @@ struct SettingsView: View {
     private var diskCacheFooter: String {
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
         guard diskCacheBytes != 0 else { return base }
-        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
-        return base + " " + String(localized: "Current cache: \(usage).")
+        // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the
+        // buffer is RAM-resident, not offloaded to disk), so it always read "0 KB" and looked broken. Show
+        // the real RAM-bounded budget the player will actually use instead (floored at 64 MiB, clamped to
+        // the device-safe ceiling), which is an honest non-zero number visible in Settings.
+        let budget = DiskCacheSetting.humanReadable(DiskCacheSetting.resolvedMaxBytes())
+        return base + " " + String(localized: "Cache budget: \(budget).")
     }
 
     private var effectiveDirectLinksOnly: Bool {
@@ -426,6 +480,13 @@ struct SettingsView: View {
 
     // MARK: Appearance (accent + chrome)
 
+    /// "App language" (the empty tag = follow the app UI language) + every shipped language, for the Trailer
+    /// language picker (D11). Distinct from `appLanguageOptions`: the empty tag matches the `stremiox.trailerLanguage`
+    /// unset convention (`TMDBClient.trailerLanguageOverride` treats empty as unset), mirroring iOS/Mac.
+    private var trailerLanguageOptions: [(id: String, label: String)] {
+        [(id: "", label: String(localized: "App language"))] + AppLanguage.supported.map { (id: $0.code, label: $0.name) }
+    }
+
     /// "System Default" + every shipped language, for the App Language picker on tvOS.
     private var appLanguageOptions: [(id: String, label: String)] {
         [(id: "system", label: "System Default")] + AppLanguage.supported.map { (id: $0.code, label: $0.name) }
@@ -458,9 +519,31 @@ struct SettingsView: View {
             Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow(String(localized: "Streaming-service rows"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { showStreamingRails ? "1" : "0" }, set: { showStreamingRails = ($0 == "1") }))
-            Text("Show 'what's on Netflix / Disney+ / ...' rows on Home, from TMDB watch providers. Needs a TMDB key.")
+            choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showHubHome ? "1" : "0" }, set: { showHubHome = ($0 == "1") }))
+            choiceRow(String(localized: "Collections on Discover"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showHubDiscover ? "1" : "0" }, set: { showHubDiscover = ($0 == "1") }))
+            choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
+                      selection: $hubCadence)
+            NavigationLink { TVReorderServicesView() } label: {
+                Label("Reorder streaming services", systemImage: "arrow.up.arrow.down")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            NavigationLink { TVDiscoverSettingsView() } label: {
+                Label("Discover & region", systemImage: "globe")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Text("Discover cards, Streaming-service tiles, and Genre tiles high on Home and Discover; tap a tile to browse its catalogs (Movies, Shows, New, Top week/month/year, Trending). Needs a TMDB key.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Budget & box office"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showFinancials ? "1" : "0" }, set: { showFinancials = ($0 == "1") }))
+            Text("Show a movie's budget, box office, and profit on its detail page. Movies only; needs a TMDB key.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Blur unwatched episodes"), [("1", "Blur"), ("0", "Show")],
+                      selection: Binding(get: { spoilerBlur ? "1" : "0" }, set: { spoilerBlur = ($0 == "1") }))
+            Text("Blur episode thumbnails you have not watched yet, to avoid spoilers.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
@@ -723,6 +806,10 @@ struct SettingsView: View {
             infoRow(String(localized: "Version"), appVersion)
             infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
             infoRow(String(localized: "Server"), String(localized: "Stremio streaming server (nodejs-mobile)"))
+            NavigationLink { TVWhatsNewView() } label: {
+                Label("What's New", systemImage: "sparkles")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
         }
         .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
     }

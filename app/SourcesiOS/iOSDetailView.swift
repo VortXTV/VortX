@@ -157,20 +157,55 @@ struct iOSDetailView: View {
     let id: String
     let type: String
     let title: String
+    /// Seed art carried from the hub card that pushed this detail, so the hero never blanks while
+    /// (or if) Cinemeta meta is nil. A brand-new/unreleased title (`tt` at TMDB but not yet in Cinemeta)
+    /// loads with meta=nil, which used to leave the hero empty; threading the card's already-resolved
+    /// backdrop/logo (catalog background, else metahub-by-tt, else poster) keeps it populated. Defaults
+    /// to nil so the existing non-hub call sites (search / live / similar) keep compiling unchanged.
+    var seedBackdrop: String? = nil
+    var seedLogo: String? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile watched set + episode progress
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + badges/menu (#15)
+    @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
     // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
     // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // Circular in-hero back chevron dismisses this pushed detail (the cinematic-media chrome, in place of
+    // the plain system nav-bar back on iOS). On Mac the existing .macBackAffordance() still supplies Esc / Cmd-[.
+    @Environment(\.dismiss) private var dismiss
 
     /// The pin context for this title - a movie pin or a show pin, both keyed by the meta id. The
     /// resolved pin feeds `StreamRanking` (auto-pick + list order) and the per-row pin menu/badge.
-    private var pinContext: SourcePinContext { SourcePinContext(metaId: id, isSeries: type == "series") }
+    /// The AUTHORITATIVE type for the STREAM request + the series/movie render branch: the loaded meta's type
+    /// once resident, else the incoming `type`. The Collections/Trending HUB passes a TMDB /movie-vs-/tv GUESS
+    /// as `type` (TMDBClient), which for TV-movies / mini-series / anime disagrees with the type stream add-ons
+    /// index the title under - so a type-scoped stream request matched no add-on ("No sources found" from the
+    /// hub, while the same title worked from an add-on catalog whose card carries the engine's authoritative
+    /// type). Keying off meta.type fixes both directions; the fallback to `type` keeps behavior unchanged until
+    /// meta loads (verified cause: 3-agent settle 2026-07-01).
+    private var effectiveType: String {
+        if core.metaDetails?.meta?.id == id, let t = core.metaDetails?.meta?.type, !t.isEmpty { return t }
+        return type
+    }
+
+    private var pinContext: SourcePinContext { SourcePinContext(metaId: id, isSeries: effectiveType == "series") }
+
+    /// True for series AND for a COLLECTION/franchise meta: a non-series meta that carries MULTIPLE entries
+    /// as videos[] (e.g. TVDB collections via AIOmetadata). >1 video distinguishes it from a normal movie
+    /// (which has 0-1). Render those as an episodic list so the entries show, instead of trying to stream the
+    /// collection id itself (which has no sources -> the "one entry, can't find sources" report, #102).
+    /// Live/EPG schedules are excluded (they use videos[] as a now/next schedule, not a playable list).
+    private var isEpisodic: Bool {
+        if effectiveType == "series" { return true }
+        if let vids = meta?.videos, vids.count > 1, meta?.behaviorHints?.hasScheduledVideos != true { return true }
+        return false
+    }
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // blur unwatched episode thumbnails to avoid spoilers
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
     // `platformFullScreenPlayerCover(item:)` calls become a `.sheet(item:)`, and two sheets attached to
@@ -184,27 +219,74 @@ struct iOSDetailView: View {
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
     // has cached, so they badge + rank up. Empty (zero badges, ranking unchanged) with no debrid key.
     @StateObject private var debridCache = DebridCacheAwareness()
+    // TorBox search-as-a-source (gated on a TorBox key): extra usenet + torrent sources from the public
+    // TorBox search index, merged into the list. Empty (list unchanged) with no TorBox key.
+    @StateObject private var torboxSearch = TorBoxSearchSource()
+    // Community source index ("Singularity"): the SERVE half. Merges corroborated pooled sources when the
+    // per-profile Singularity toggle is ON and the user is signed in (empty otherwise). The HOARD half is a
+    // fire-and-forget contribution keyed off the same assembled groups; both are gated + fail-soft inside
+    // `SourceIndexClient`, so the source list is unchanged unless the user opted in.
+    @StateObject private var sourceIndex = SourceIndexServeSource()
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
     #endif
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
+    /// Cast & Crew disclosure: the full cast rail shows by default (#10, owner wants who-played-who with
+    /// photos visible); the "Cast & Crew" button can still fold it away to declutter, animating
+    /// transform/opacity only.
+    @State private var castExpanded = true
     @State private var mdbRatings: MDBListRatings?
+    /// Full cast with who-played-who + headshots (TMDB credits via the keyless edge), rendered as the
+    /// horizontally scrollable cast rail. The meta's plain name list is the fallback so the rail never
+    /// blanks without TMDB. `creditsKey` de-dupes the fetch per imdb id.
+    @State private var castMembers: [TMDBClient.CastMember] = []
+    @State private var creditsKey: String?
+    /// TMDB's overview for this title, used when the engine meta carries no description (a hub-seeded
+    /// tt id not yet in Cinemeta loads meta=nil, which used to leave the synopsis empty).
+    @State private var fallbackOverview: String?
     @State private var watchAvail: TMDBClient.WatchAvailability?
+    @State private var financials: TMDBClient.Financials?
+    @State private var releaseDates: TMDBClient.ReleaseDates?   // theatrical + digital, TMDB-fetched (movies only)
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true   // budget + box office on movie detail (movies only, needs a TMDB key)
     /// #37: a trailer id fetched from Cinemeta when the engine's detail meta carries none. Some catalog
     /// add-ons (e.g. a TMDB catalog) return a meta WITHOUT trailerStreams, so the in-hero trailer never
     /// mounted on the detail page even though the Home hero (which enriches via Cinemeta) had one. This
     /// is the detail page's own fallback, used only when `meta.trailerYouTubeID` is nil.
     @State private var resolvedTrailerID: String?
+    /// The user-language-PREFERRED YouTube trailer id from TMDB /videos, when one resolves. Used for the
+    /// WITH-SOUND "watch trailer" action so a viewer whose preferred language is e.g. Portuguese gets the
+    /// Portuguese trailer instead of the default (usually English) one. Resolved fail-soft and only when a
+    /// TMDB key / edge is reachable; nil keeps today's default trailer, so there is never a regression.
+    /// tvOS does not read this (no web view) but the seam is populated the same way there for a later VPS
+    /// resolve; see `resolvePreferredTrailerIfNeeded`.
+    @State private var resolvedPreferredTrailerID: String?
+    /// A6: transient "trailer is preparing" notice for the rare both-paths-out case (no full YouTube trailer
+    /// AND no /clip): a small auto-dismissing capsule over the hero, never the full source-error screen.
+    @State private var trailerNotice = false
+    @State private var trailerNoticeTask: Task<Void, Never>?
+    /// yt-direct: the detail hero's ambient clip ATTEMPTED device-direct resolve, keyed by the YouTube id it
+    /// resolved so a language-pick upgrade re-resolves. `url == nil` = attempted, no direct stream (mount the
+    /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
+    @State private var detailAmbientDirect: (ytID: String, url: URL?)?
+
+    /// "Also available in" language chips (P1, community-subtitle system): the union of the languages
+    /// PARSED from this title's loaded stream names and the crowd-sourced language index, so a user can
+    /// tell at a glance whether e.g. a K-drama is available in English before opening a source. Codes only;
+    /// gated on `features.languageIndex` and rendered only when non-empty. `langChipsKey` de-dupes the
+    /// compute per title/episode set.
+    @State private var langChips: [(code: String, label: String)] = []
+    @State private var langChipsKey = ""
 
     /// The one thing presented full-screen at a time: a resolved player stream or the trailer. Both play
     /// IN-APP through the native libmpv player; there is no longer a YouTube web-embed presentation.
     private enum Presentation: Identifiable {
         case player(PlayerLaunch)
         /// The trailer, played in the SAME native mpv player as a stream (`isTrailer: true`). The url is a
-        /// direct (non-YouTube) trailer stream OR the embedded server's `/yt/{id}` route (the same path
-        /// tvOS uses). recordMeta is nil for these so a trailer never lands in Continue Watching.
-        case trailerPlayer(url: URL, title: String)
+        /// direct (non-YouTube) trailer stream, a DEVICE-DIRECT yt stream (yt-direct; `audioSidecar` set
+        /// when it is a video-only adaptive pick whose audio rides mpv's --audio-file sidecar), OR the
+        /// server's `/yt/{id}` route. recordMeta is nil for these so a trailer never lands in Continue Watching.
+        case trailerPlayer(url: URL, title: String, audioSidecar: URL?)
         /// A YouTube trailer played via the keyless IFrame embed (`TrailerEmbedCover`) - the reliable,
         /// official-Stremio-style path, and the one that needs no streaming server (works on Lite too).
         /// iOS/iPad/Mac only (WKWebView); tvOS keeps `/yt` via its own DetailView.
@@ -212,7 +294,7 @@ struct iOSDetailView: View {
         var id: String {
             switch self {
             case .player(let l): "player-\(l.id)"
-            case .trailerPlayer(_, let t): "trailer-\(t)"
+            case .trailerPlayer(_, let t, _): "trailer-\(t)"
             case .trailerEmbed(let yt, _): "trailerEmbed-\(yt)"
             }
         }
@@ -233,18 +315,41 @@ struct iOSDetailView: View {
         /// prev/next keeps the same release across episodes (binge continuity).
         var bingeGroup: String? = nil
         var isTorrent: Bool = false
+        /// When this launch resolved a NATIVE debrid link, the provenance to reresolve a fresh link on a
+        /// later Continue-Watching resume (recorded into LastStreamStore on play). nil for torrent/direct.
+        var debridRef: DebridPlaybackRef? = nil
     }
 
-    /// The hero artwork height scales with the platform: phones get a shorter band, the Mac a taller one.
-    /// The Mac band is generous so a wide window doesn't squash the 16:9 backdrop into a thin over-cropped
-    /// strip (the "same cut issue on the detail page" report) — kept a fixed (not aspect-ratio) band here
-    /// because the detail hero overlays an unbounded synopsis, which an aspectRatio would fight on narrow
-    /// windows; the pure billboard FeaturedHeroView (clamped synopsis) can safely be aspect-driven.
+    /// The LIVE page's fixed artwork band (the VOD hero scales with the viewport via `heroBandHeight`).
     private var backdropHeight: CGFloat {
         #if os(macOS)
         return 560
         #else
         return 320
+        #endif
+    }
+
+    /// The cinematic VOD hero band: ~60% of the viewport on iPhone/iPad (a fixed 320 band read as a
+    /// ~20% strip on a modern phone) and ~58% of the Mac window, clamped so a short window still shows
+    /// the action row without scrolling. Kept a fixed-per-layout (not aspect-ratio) band because the
+    /// hero overlays a text block that an aspectRatio would fight on narrow windows.
+    private func heroBandHeight(viewport: CGFloat) -> CGFloat {
+        #if os(macOS)
+        guard viewport > 0 else { return 560 }
+        return min(760, max(560, viewport * 0.58))
+        #else
+        guard viewport > 0 else { return 420 }
+        return max(360, viewport * 0.60)
+        #endif
+    }
+
+    /// Hero primary-CTA width cap: iPhone stays edge-to-edge (minus margins), iPad caps at 760; the Mac
+    /// caps near a comfortable button width so the primary Play doesn't span the whole window (#6).
+    private var heroCtaMaxWidth: CGFloat {
+        #if os(macOS)
+        return 400
+        #else
+        return 760
         #endif
     }
 
@@ -269,18 +374,18 @@ struct iOSDetailView: View {
                             livePage
                         } else {
                             // The Sources action in the hero row scrolls to this anchor.
-                            hero(width: geo.size.width) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
+                            hero(width: geo.size.width, height: geo.size.height) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
                             // #9: on a wide iPad/Mac window keep the hero full-bleed but cap the
                             // source-heavy content to a readable column and center it (long lines hurt
                             // readability). iPhone (and any narrow width) stays full-width as before.
                             Group {
-                                if type == "series" {
+                                if isEpisodic {
                                     episodeList
                                 } else {
                                     sourceSection.id(Self.sourcesAnchor)
                                 }
                             }
-                            .frame(maxWidth: geo.size.width > 700 ? 900 : .infinity)
+                            .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
                             .frame(maxWidth: .infinity)
                             whereToWatchSection
                             moreLikeThisSection
@@ -292,35 +397,81 @@ struct iOSDetailView: View {
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // A6: the rare "no trailer available right now" notice (no full YouTube trailer AND no /clip). A small
+        // capsule, auto-dismissed by `showTrailerNotice`, so the Trailer button never opens the source-error screen.
+        .overlay(alignment: .top) {
+            if trailerNotice {
+                Text("Trailer is preparing, try again shortly")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.sm)
+                    .background(.black.opacity(0.72), in: Capsule())
+                    .padding(.top, Theme.Space.xl)
+                    .transition(reduceMotion ? .identity : .opacity)
+                    .allowsHitTesting(false)
+            }
+        }
+        // navigationTitle on a PUSHED view bridges into the single shared window NSToolbar on macOS and
+        // crashes in _insertNewItemWithItemIdentifier (the Beta 7 Mac crash). iOS-only; on macOS the title
+        // already reads from the in-content hero.
+        #if os(iOS)
+        // Hide the system nav bar so the full-bleed hero runs edge-to-edge under the status bar; the
+        // in-hero circular back chevron (heroChrome) is the back affordance. The swipe-from-edge
+        // interactive pop still works with a hidden bar.
         .navigationTitle(meta?.name ?? title)
         .inlineNavigationTitle()
+        .toolbar(.hidden, for: .navigationBar)
+        #endif
+        // macOS has no toolbar back button (toolbar removed), so supply an in-content Back + Esc / Cmd-[.
+        .macBackAffordance()
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
         .onAppear {
-            if type == "series" {
+            if effectiveType == "series" {
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
-                if core.metaDetails?.meta?.id != id { core.loadMeta(type: type, id: id) }
+                if core.metaDetails?.meta?.id != id { core.loadMeta(type: effectiveType, id: id) }
             } else if core.metaDetails?.meta?.id == id {
                 loadMovieStreamsIfNeeded()        // meta already resident → dispatch streams now
             } else {
-                core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
+                core.loadMeta(type: effectiveType, id: id) // load meta FIRST; onChange dispatches streams on arrival
+                // For an imdb tt id whose Cinemeta meta may never arrive (new/unreleased title), don't wait
+                // on the onChange(meta?.id) that would never fire: fire the tt-keyed streams now so the
+                // sources list populates regardless of the meta race. No-op'd by hasStreams once they land.
+                loadMovieStreamsIfNeeded()
             }
-            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
+            if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m); resolvePreferredTrailerIfNeeded(m) }
+            // These resolve from the tt id alone, so a hub-seeded title whose Cinemeta meta never
+            // arrives still gets its cast, synopsis fallback, and a More-Like-This rail (#7/#29).
+            loadCredits()
+            loadSimilarFallback()
+            refreshLanguageChips()
         }
         // A movie/live title is a SINGLE video, but its stream request must carry the IMDB id, not the raw
         // catalog id: a TMDB/Kitsu catalog gives the meta a tmdb:/kitsu: id, and imdb-keyed stream add-ons
         // (idPrefixes ["tt"]) are silently dropped from the plan for a non-imdb id (so only AIOStreams-style
         // broad add-ons answer). The imdb id lives in the meta's behaviorHints.defaultVideoId, known only
         // AFTER the meta loads — so dispatch the streams here, once the meta arrives. (movieStreamId).
+        // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
+        // hub's TMDB guess was wrong, meta.type now corrects it and the stream request re-fires under the type
+        // the add-ons actually index the title under. The hasStreams guard keys on the effective streamId, so
+        // this cannot loop.
+        .onChange(of: core.metaDetails?.meta?.type) { _ in
+            if effectiveType != "series" { loadMovieStreamsIfNeeded() }
+        }
         .onChange(of: core.metaDetails?.meta?.id) { _ in
-            if type != "series" { loadMovieStreamsIfNeeded() }
+            if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             else if let m = meta, let videos = m.videos {
                 // F5: opening a series schedules its next-episode alert (asks permission in context the
                 // first time; on by default). Keyed by series id, so revisiting refreshes rather than dupes.
                 Task { await NewEpisodeNotifications.scheduleUpcomingAuthorized(seriesId: m.id, seriesName: m.name, videos: videos) }
             }
             resolvedTrailerID = nil   // new title: drop the previous fallback before re-resolving
-            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); resolveTrailerIfNeeded(m) }
+            resolvedPreferredTrailerID = nil   // new title: drop the previous language-preferred pick too
+            langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
+            if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m); resolvePreferredTrailerIfNeeded(m) }
+            loadCredits()   // meta may have surfaced the imdb defaultVideoId for a tmdb:/kitsu: catalog id
+            refreshLanguageChips()
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
@@ -339,8 +490,23 @@ struct iOSDetailView: View {
         // when the torrents actually change; with no debrid key it returns an empty set and nothing renders.
         // Series load streams per-episode (iOSEpisodeStreams owns its own awareness); movie + live read here.
         .onChange(of: core.streamLoadProgress().loaded) { _ in
-            if type != "series" { debridCache.refresh(from: displayGroups(core.streamGroups())) }
+            // Cache awareness reads the UNFILTERED groups PLUS the TorBox search sources (usenet + torrent):
+            // the Direct-links-only filter drops raw torrents, but a raw torrent / usenet nzb is exactly what
+            // the native cache-check needs, so filtering here would starve the check. Cache awareness is
+            // orthogonal to the playback filter.
+            if effectiveType != "series" {
+                debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups()))
+                refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
+            }
+            refreshLanguageChips()   // recompute the "Also available in" chips as more sources answer
         }
+        // TorBox search-as-a-source: fetch the extra usenet/torrent sources once the meta's imdb id is
+        // known (gated on a TorBox key inside `refresh`; de-duped by imdb id). Series episodes fetch in
+        // their own episode view.
+        .onChange(of: core.metaDetails?.meta?.id) { _ in
+            if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); refreshSourceIndex() }
+        }
+        .onAppear { if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); refreshSourceIndex() } }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
@@ -348,6 +514,7 @@ struct iOSDetailView: View {
                     url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
                     recordMeta: launch.meta, recordQualityText: launch.qualityText,
                     recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
+                    recordDebridRef: launch.debridRef,
                     // reportProgress feeds the engine Player (TimeChanged) so Continue Watching updates live and
                     // watched time is tracked; saveProgress keeps the signed-in remote/overlay sync. iOS was only
                     // doing the latter, so nothing reached the engine and CW never updated (tvOS does both).
@@ -356,9 +523,10 @@ struct iOSDetailView: View {
                     onClose: { presentation = nil }
                 )
                 .ignoresSafeArea()
-            case .trailerPlayer(let url, let title):
+            case .trailerPlayer(let url, let title, let audioSidecar):
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
-                             recordMeta: nil, isTrailer: true, onClose: { presentation = nil })
+                             recordMeta: nil, isTrailer: true, audioSidecarURL: audioSidecar,
+                             onClose: { presentation = nil })
                     .ignoresSafeArea()
             case .trailerEmbed(let youTubeID, let title):
                 TrailerEmbedCover(youTubeID: youTubeID, title: title, onClose: { presentation = nil })
@@ -367,21 +535,75 @@ struct iOSDetailView: View {
         }
     }
 
-    /// Present the meta's trailer IN-APP. A direct (non-YouTube) trailer stream plays in the native libmpv
-    /// `PlayerScreen`; a YouTube trailer plays in the keyless WKWebView IFrame cover (`TrailerEmbedCover`),
-    /// which loads from a real youtube.com-origin document so it survives YouTube's embed-Referer
-    /// enforcement, with a silent hand-off to the YouTube app/browser if a specific video blocks embedding.
+    /// Present the meta's FULL trailer IN-APP (A6 - the explicit Trailer button, NOT the ambient hero /clip).
+    /// OWNER FINAL ARCHITECTURE (HARD): the FULL trailer plays ON DEMAND through the app's own server route
+    /// (server.js `/yt/:id`, InnerTube ANDROID client -> a direct stream URL) NATIVELY in libmpv/AVPlayer - the
+    /// SAME path our YouTube/Twitch URL playback already uses. There is NO trailer.vortx.tv full-trailer route
+    /// and NO R2 full-trailer storage; the `/clip` mp4 is ONLY the 10s ambient hero snippet.
+    ///
+    /// Fallback order (A6 / D4 / D11):
+    ///   1) /yt resolver -> native player (primary, every platform with an embedded server, tvOS-full included):
+    ///      built from the language-preferred YouTube id (D11) when a genuine localized hit exists, else the
+    ///      meta's own / Cinemeta-TMDB-fallback default id; a real DIRECT (non-YouTube) trailer stream is also a
+    ///      full trailer and plays natively with no server;
+    ///   2) iOS/Mac ONLY: the keyless WKWebView IFrame embed (`TrailerEmbedCover`) if the resolver path is
+    ///      unavailable (Lite build / no server) but a YouTube id exists;
+    ///   3) the ambient /clip mp4 (SHORT snippet) as a last resort so the button still plays something;
+    ///   4) a transient "preparing" notice - never the full source-error screen.
     private func playTrailer() {
         guard let m = meta else { return }
         let title = "\(m.name) Trailer"
         let req = TrailerRequest.from(meta: m)
-        // Direct stream plays in libmpv; a YouTube id plays in the IFrame cover (tokenless /yt extraction is
-        // dead). The id comes from the engine meta or the Cinemeta/TMDB fallback (resolvedTrailerID).
-        if let direct = req?.directURL {
-            presentation = .trailerPlayer(url: direct, title: title)
-        } else if let yt = req?.youTubeID ?? resolvedTrailerID, !yt.isEmpty {
-            presentation = .trailerEmbed(youTubeID: yt, title: title)
+        // D11: resolve the language-preferred id first (async, fail-soft). preferredYouTubeID may already be
+        // populated by resolvePreferredTrailerIfNeeded; if not, resolve inline so a manual tap still honors the
+        // picker. The whole selection is fail-soft: any nil falls through to the default id / direct / clip.
+        Task { @MainActor in
+            let preferred = await resolvedOrFreshPreferredTrailerID(m)
+            let defaultYT = (req?.youTubeID ?? resolvedTrailerID).flatMap { $0.isEmpty ? nil : $0 }
+            let lang = TMDBClient.trailerLanguageBaseCode
+            // 0) DEVICE-DIRECT FIRST (yt-direct): resolve the YouTube stream on the user's own IP (InnerTube
+            //    from the app; a residential IP gets adaptive 1080p+, whose separate audio rides mpv's
+            //    --audio-file sidecar). A direct (non-YouTube) trailer stream still wins below (it needs no
+            //    resolver at all); any miss falls through to the /yt worker exactly as before.
+            if req?.directURL == nil, let yt = preferred ?? defaultYT,
+               let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
+                NSLog("[yt-direct] detail trailer button: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+                presentation = .trailerPlayer(url: resolved.videoURL, title: title, audioSidecar: resolved.audioURL)
+                return
+            }
+            // 1) NATIVE /yt (or a direct stream) is the PRIMARY full-trailer path on every server-capable build.
+            if let native = req?.nativeFullTrailerURL(preferredYouTubeID: preferred ?? defaultYT, languageCode: lang)
+                ?? TrailerRequest(title: m.name, youTubeID: preferred ?? defaultYT, directURL: nil)
+                    .nativeFullTrailerURL(languageCode: lang) {
+                NSLog("[yt-direct] detail trailer button: fallback-worker")
+                presentation = .trailerPlayer(url: native, title: title, audioSidecar: nil)
+                return
+            }
+            // 2) iOS/Mac only: no server (Lite) but a YouTube id exists -> the keyless IFrame embed cover.
+            if let yt = preferred ?? defaultYT {
+                presentation = .trailerEmbed(youTubeID: yt, title: title)
+                return
+            }
+            // 3) No full trailer resolved: the short /clip mp4 so the button still plays something.
+            if let clip = req?.playableURL {
+                presentation = .trailerPlayer(url: clip, title: title, audioSidecar: nil)
+                return
+            }
+            // 4) Nothing at all: a small transient notice, never the source-error screen.
+            showTrailerNotice()
         }
+    }
+
+    /// The language-preferred trailer id (D11) for a manual Trailer tap: return the already-resolved id if
+    /// `resolvePreferredTrailerIfNeeded` populated it, else resolve inline (a genuine preferred-language hit
+    /// only, else nil so the default id plays). Fail-soft throughout: no TMDB key / no localized trailer -> nil.
+    private func resolvedOrFreshPreferredTrailerID(_ m: CoreMetaItem) async -> String? {
+        if let id = resolvedPreferredTrailerID, !id.isEmpty { return id }
+        let languages = TMDBClient.preferredTrailerLanguages.filter { $0 != "en" }
+        guard !languages.isEmpty else { return nil }
+        let pick = await TMDBClient.preferredTrailerPick(metaID: m.id, type: m.type, preferredLanguages: languages)
+        guard pick.matchedPreferred, let yt = pick.key, !yt.isEmpty else { return nil }
+        return yt
     }
 
     /// A standalone Trailer chip, shown whenever the meta carries a trailer (direct stream or a YouTube
@@ -397,6 +619,62 @@ struct iOSDetailView: View {
         }
     }
 
+    /// A6: surface the "no trailer right now" case (no full YouTube trailer AND no /clip) as a small
+    /// self-dismissing notice over the hero band instead of the full source-error screen. Rare - it only
+    /// fires when neither a YouTube id nor the /clip resolver produced a source.
+    private func showTrailerNotice() {
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { trailerNotice = true }
+        // The capsule is visual-only (allowsHitTesting false, no focus); speak it so a VoiceOver user who
+        // tapped Trailer gets the same feedback instead of the tap appearing to do nothing.
+        #if canImport(UIKit)
+        UIAccessibility.post(notification: .announcement, argument: "Trailer is preparing, try again shortly")
+        #endif
+        trailerNoticeTask?.cancel()
+        trailerNoticeTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.3)) { trailerNotice = false }
+        }
+    }
+
+    #if !os(tvOS)
+    /// The offline-download state for one video id, derived from `DownloadStore.shared`. Drives the
+    /// download chip's three affordances so a tap gives visible feedback: no record → offer a download,
+    /// an active (queued/downloading/paused) record → an in-progress "Downloading" state, a completed
+    /// record → a "Downloaded" check. Reuses the same store lookups that already prevent double-queueing.
+    private enum DownloadChipState { case none, inProgress, done }
+
+    private func downloadChipState(videoId: String) -> DownloadChipState {
+        guard let record = downloads.records.first(where: { $0.videoId == videoId && $0.state != .failed }) else { return .none }
+        return record.state == .completed ? .done : .inProgress
+    }
+
+    /// A Download chip with state feedback (#30), shared by the movie action row and the series hero. The
+    /// idle state offers a download (enabled only when `ready`); while a record is active it shows a spinner
+    /// + "Downloading" and is disabled; once complete it shows a "Downloaded" check and is disabled. The
+    /// action runs only from the idle state, so a tap can't re-queue an in-flight or finished download.
+    @ViewBuilder private func downloadChip(videoId: String, ready: Bool, action: @escaping () -> Void) -> some View {
+        let state = downloadChipState(videoId: videoId)
+        Button {
+            if state == .none { action() }
+        } label: {
+            switch state {
+            case .done:
+                Label("Downloaded", systemImage: "checkmark.circle.fill")
+            case .inProgress:
+                HStack(spacing: Theme.Space.sm) {
+                    ProgressView().controlSize(.small)
+                    Text("Downloading")
+                }
+            case .none:
+                Label("Download", systemImage: "arrow.down.circle")
+            }
+        }
+        .buttonStyle(ChipButtonStyle())
+        .disabled(state != .none || !ready)
+    }
+    #endif
+
     // MARK: Hero (full-bleed backdrop + scrim + meta), mirrors tvOS DetailView.hero
 
     /// Scroll-anchor id for the source section, so the hero's "Sources" action can jump to it.
@@ -404,46 +682,74 @@ struct iOSDetailView: View {
 
     /// Hero: full-bleed backdrop + scrim + title / meta / action row / synopsis. `scrollToSources`
     /// is wired into the movie action row's "Sources" button (the tvOS 3-action twin).
-    private func hero(width: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
+    private func hero(width: CGFloat, height: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
         // Two stacked blocks, NOT one bottom-aligned ZStack over the backdrop. The backdrop is a
-        // fixed-height banner with ONLY the title + meta overlaid at its bottom; the action buttons and the
-        // (long) synopsis flow BELOW it on the canvas. Putting the whole column inside a bottom-aligned
-        // ZStack made a tall column (long synopsis + wrapped buttons) push the fixed-height backdrop down
-        // until it sat behind the buttons with the title stranded on black above — the "backdrop is so far
-        // down / layout is messy" report. A fixed banner keeps the art pinned to the top at any content height.
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+        // fixed-height banner with the title + meta + a clamped synopsis overlaid at its bottom; the action
+        // buttons and the (long) full synopsis flow BELOW it on the canvas. Putting the whole column inside
+        // a bottom-aligned ZStack made a tall column (long synopsis + wrapped buttons) push the fixed-height
+        // backdrop down until it sat behind the buttons with the title stranded on black above, the
+        // "backdrop is so far down / layout is messy" report. A fixed banner keeps the art pinned to the top.
+        let band = heroBandHeight(viewport: height)
+        return VStack(alignment: .leading, spacing: Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
-                backdrop
+                backdrop(height: band)
                     // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
                     // shows. Mounted ONLY for VOD with a resolved YouTube id and when motion is allowed; the
                     // still backdrop underneath is the permanent fallback. Live channels never get a trailer.
-                    .overlay { heroTrailerClip }
+                    .overlay { heroTrailerClip(height: band) }
+                    // Edge-to-edge cinematic hero: the art bleeds UP under the status bar / notch so there is no
+                    // canvas-colored strip above it on a notched iPhone. Only the backdrop art (and its trailer
+                    // overlay) ignores the top safe area; heroChrome stays an overlay on the ZStack below, which
+                    // still respects the inset, so the back / overflow discs clear the notch.
+                    .ignoresSafeArea(edges: .top)
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     titleOrLogo
                     metaRow
                     ratingsRow
+                    financialsRow
+                    releaseDatesRow
+                    // #9: a clamped synopsis reads WITH the ratings block on the hero art; the full
+                    // description still flows below the action row for anyone who wants all of it.
+                    if let synopsis = heroOverview {
+                        Text(synopsis)
+                            .font(Theme.Typography.body)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .lineLimit(3).truncationMode(.tail)
+                            .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+                            .padding(.top, 2)
+                    }
                 }
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
                 .frame(width: width, alignment: .leading)
             }
+            // Circular translucent chrome: back chevron top-left, overflow top-right. Overlaid on the ZStack
+            // (NOT the backdrop) so it keeps the safe-area inset the backdrop now ignores; its own top padding
+            // then insets the discs below the status bar / notch, so the hero reads like a cinematic media app.
+            .overlay(alignment: .topLeading) { heroChrome }
             .frame(width: width, alignment: .leading)
 
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                if type == "movie" {
+                // Branch on the SAME authoritative signal the body uses (episodeList vs sourceSection), not the
+                // raw hub-guess `type`: a hub tile the hub mis-typed as "movie" that resolves to a series/
+                // collection meta would otherwise show movie Play actions contradicting an episodic body (#102).
+                if !isEpisodic {
                     watchNow(scrollToSources: scrollToSources)
                 } else {
                     seriesHeroActions
                 }
-                if let overview = meta?.description, !overview.isEmpty {
+                // H2: only show the full description below when it is meaningfully longer than the hero's
+                // 3-line excerpt, so a short synopsis is not printed twice on the same screen.
+                if showsFullDescriptionBelow, let overview = heroOverview {
                     Text(overview)
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textSecondary)
                         .lineSpacing(2)
                         .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: 760, alignment: .leading)
+                        .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
                 }
                 creditsRows
+                languageChips
             }
             .padding(.horizontal, Theme.Space.md)
             .frame(width: width, alignment: .leading)
@@ -451,64 +757,222 @@ struct iOSDetailView: View {
         .frame(width: width, alignment: .leading)
     }
 
+    /// The synopsis to render: the engine meta's description, else TMDB's overview (a hub-seeded tt id
+    /// not yet in Cinemeta loads meta=nil, which used to leave both synopsis blocks empty).
+    private var heroOverview: String? {
+        if let d = meta?.description, !d.isEmpty { return d }
+        return fallbackOverview
+    }
+
+    /// H2: the hero band already shows a 3-line synopsis excerpt, so only repeat the FULL description in the
+    /// section below the action row when it is MEANINGFULLY longer than that excerpt (~3 lines at the readable
+    /// column width) - otherwise the two blocks are identical and the description reads as doubled. Chars,
+    /// not rendered lines, is a good-enough proxy here.
+    private static let heroSynopsisExcerptChars = 200
+    private var showsFullDescriptionBelow: Bool {
+        guard let o = heroOverview else { return false }
+        return o.count > Self.heroSynopsisExcerptChars
+    }
+
+    /// Circular translucent chrome overlaid on the hero art: a back chevron (top-left) that pops this
+    /// pushed detail, and an overflow control (top-right) with Share. Kept fail-soft: the overflow only
+    /// carries actions that are always safe. Inset from the top so it clears the status bar / notch.
+    @ViewBuilder private var heroChrome: some View {
+        HStack {
+            CircleIconButton(systemName: "chevron.left", diameter: Theme.Control.circleChrome) { dismiss() }
+                .accessibilityLabel("Back")
+            Spacer()
+            Menu {
+                if let m = core.metaDetails?.meta {
+                    if m.id.hasPrefix("tt"), let url = URL(string: "https://www.imdb.com/title/\(m.id)/") {
+                        ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
+                    } else {
+                        ShareLink(item: m.name) { Label("Share", systemImage: "square.and.arrow.up") }
+                    }
+                }
+            } label: {
+                // Reuse the disc look for the menu label (Menu can't take a ButtonStyle directly), so
+                // the overflow disc stays in lockstep with the back chevron's CircleIconButton.
+                CircleIconDisc(systemName: "ellipsis", diameter: Theme.Control.circleChrome, tint: Theme.Palette.textPrimary)
+            }
+            .menuStyle(.borderlessButton)
+            .accessibilityLabel("More")
+        }
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.top, Theme.Space.md)
+    }
+
+    /// "Also available in" chips row (P1). Rendered only when the language merge produced something and the
+    /// languageIndex feature is on. Full localized language NAMES (English · Français …, via the chip's
+    /// Locale-resolved label, #8), in ONE horizontally scrollable row so a long list fits any width. No
+    /// add-on wording: these are just the languages this title is available in.
+    @ViewBuilder private var languageChips: some View {
+        if !langChips.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                Text("Also available in")
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.xs) {
+                        ForEach(langChips, id: \.code) { chip in
+                            Text(chip.label)
+                                .font(Theme.Typography.label.weight(.semibold))
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(1)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(Theme.Palette.surface2, in: Capsule())
+                                .accessibilityLabel(chip.label)
+                        }
+                    }
+                }
+            }
+            .padding(.top, Theme.Space.xs)
+            .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+        }
+    }
+
+    /// Full-bleed artwork at the LIVE page's fixed band height (the VOD hero passes its own scaled band).
+    private var backdrop: some View { backdrop(height: backdropHeight) }
+
     /// Full-bleed artwork with the same two scrims tvOS uses: a vertical canvas fade so the lower text
     /// block stays readable, and a leading canvas fade for the title column.
-    private var backdrop: some View {
-        AsyncImage(url: URL(string: meta?.background ?? meta?.poster ?? "")) { phase in
+    private func backdrop(height: CGFloat) -> some View {
+        // Fall back through: meta background -> meta poster -> the hub card's seed backdrop ->
+        // metahub-by-tt (so a meta=nil unreleased title still paints art) -> the seed logo's poster.
+        // Without this the hero blanked to surface1 whenever Cinemeta meta was nil (Cocktail 2,
+        // Evil Dead Burn: tt exists at TMDB, not yet in Cinemeta).
+        let bg = meta?.background ?? meta?.poster
+            ?? seedBackdrop
+            ?? FeaturedHeroItem.metahubBackground(forId: id)
+        return AsyncImage(url: URL(string: bg ?? "")) { phase in
             switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+            // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
+            // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
+            // it to black bars (the "shows all have cut off hero image" report), so series fit instead.
+            case .success(let img): img.resizable().aspectRatio(contentMode: (type == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill)
             default: Theme.Palette.surface1
             }
         }
-        .frame(height: backdropHeight)
+        .frame(height: height)
         // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
         // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
         // this, the oversized serif hero title made the ZStack wider than the screen and `.bottomLeading`
         // pushed the whole block to a negative x — clipping the title / Watch / synopsis off the left.
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
+        // A smoother multi-stop vertical fade: the art stays crisp up top and dissolves cleanly into the
+        // dark canvas so the title/meta block reads without a hard seam (the cinematic reference look).
         .overlay(
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas.opacity(0.15), location: 0.45),
+                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.72),
+                .init(color: Theme.Palette.canvas.opacity(0.88), location: 0.90),
                 .init(color: Theme.Palette.canvas, location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
         )
+        // A gentle top scrim so the translucent chrome buttons stay legible over bright artwork.
         .overlay(
-            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
+        )
+        // A soft leading fade anchors the title column.
+        .overlay(
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
     }
 
-    /// #44: the muted, looping in-hero trailer (`InHeroTrailerView`) painted over the still backdrop, now
-    /// played through libmpv via the embedded server's `/yt` route (mirroring tvOS), NOT a YouTube web
-    /// embed. Mounted only when ALL hold: motion is allowed, this is a VOD title (live channels carry no
-    /// trailers and run a stripped page), and the trailer resolved a PLAYABLE url (a direct stream from the
-    /// meta, else the `/yt/{id}` route; nil on the Lite build, so it no-ops to the still backdrop there).
-    /// The clip itself fades in a beat after the backdrop shows; the still art underneath is the permanent
-    /// fallback, so a missing / slow / blocked clip never blanks the band, and no error is ever surfaced.
-    @ViewBuilder private var heroTrailerClip: some View {
+    /// H3 / #44: the muted, looping in-hero trailer painted over the still backdrop. The owner wants the WHOLE
+    /// trailer muted here (not a 10s snippet), through the SAME native /yt path as the explicit Trailer button
+    /// (A6, owner FINAL architecture). Mounted only when ALL hold: motion is allowed, this is a VOD title (live
+    /// channels carry no trailers and run a stripped page), and a trailer resolved. Priority mirrors A6:
+    ///   1) the NATIVE full trailer (a direct stream, else the `/yt` resolver URL) muted + looping in libmpv -
+    ///      the primary path on every server-capable build (the same route the Trailer button plays),
+    ///   2) iOS/Mac ONLY: the keyless IFrame embed (`InHeroYouTubeTrailerView`) when no native URL is available
+    ///      (Lite / no server) but a YouTube id exists,
+    ///   3) a last-resort native `/yt` trailer built straight from the raw meta trailer (via `playableURL`),
+    ///      muted + looping, for the rare case branch 1's language-preferred resolution has not populated yet.
+    /// The clip fades in a beat after the backdrop shows; the still art underneath is the permanent fallback, so
+    /// a missing / slow / blocked trailer never blanks the band, and no error is ever surfaced.
+    @ViewBuilder private func heroTrailerClip(height: CGFloat) -> some View {
         if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type) {
-            if let direct = detailTrailerDirectURL {
-                // Direct (non-YouTube) stream: a short SILENT WINDOW in libmpv (parity with tvOS: start 10, length 8).
-                InHeroTrailerView(url: direct, height: backdropHeight, window: (start: 10, length: 8))
+            if let native = detailNativeTrailerURL {
+                // FULL trailer (direct stream OR the /yt resolver) muted + looping in libmpv (window nil = whole
+                // trailer, looped). This is the owner's FINAL detail-hero path - same native route as the button.
+                // yt-direct: try the DEVICE-DIRECT stream first (resolved on the user's own IP; the clip is
+                // muted, so a video-only adaptive pick needs no audio sidecar). The clip mounts only after the
+                // attempt lands so a late resolve never remounts it; a miss mounts the /yt worker URL. A meta
+                // with a real direct (non-YouTube) trailer stream has no ambientYouTubeID and mounts at once.
+                Group {
+                    if let yt = detailAmbientYouTubeID {
+                        if let attempt = detailAmbientDirect, attempt.ytID == yt {
+                            InHeroTrailerView(url: attempt.url ?? native, height: height, window: nil)
+                        }
+                    } else {
+                        InHeroTrailerView(url: native, height: height, window: nil)
+                    }
+                }
+                .task(id: detailAmbientYouTubeID) { await resolveDetailAmbientDirect() }
             } else if let yt = detailTrailerYouTubeID {
-                // YouTube clip: a muted, windowed WKWebView IFrame (tokenless /yt extraction is dead). Non-
-                // interactive so it reads as ambient backdrop; the still art underneath stays as the fallback.
-                YouTubeEmbedView(youTubeID: yt, mode: .clip(startSeconds: 10, windowSeconds: 8))
-                    .frame(height: backdropHeight).clipped().allowsHitTesting(false)
+                // Fallback (iOS/Mac only, no server): the FULL YouTube trailer muted + looping via the keyless
+                // IFrame embed. The native /yt path above is preferred; this only fires on the Lite build.
+                InHeroYouTubeTrailerView(youTubeID: yt, height: height)
+            } else if let clip = detailTrailerClipURL {
+                // Last resort: the meta's own trailer via the native /yt resolver (owner directive: the retired
+                // R2 /clip snippet is gone), muted + looping the whole trailer, when branch 1 has not resolved.
+                InHeroTrailerView(url: clip, height: height, window: nil)
             }
         }
     }
 
-    /// A direct (non-YouTube) trailer stream from the meta, if any - plays natively in libmpv on every platform.
-    private var detailTrailerDirectURL: URL? {
+    /// The NATIVE full-trailer URL for the detail hero (owner FINAL architecture): a direct (non-YouTube)
+    /// trailer stream from the meta, else the embedded/remote server's `/yt/{id}` resolver URL built from the
+    /// language-preferred id (D11) when one resolved, else the meta's own / Cinemeta-TMDB-fallback default id.
+    /// Server-gated: nil on the Lite build (no embedded server) for a YouTube-only trailer, so the IFrame-embed
+    /// fallback (iOS/Mac) or the /clip ambient takes over. `?lang=` carries the resolved base language so the
+    /// resolver's fallback chain matches the client pick.
+    private var detailNativeTrailerURL: URL? {
         guard let m = meta else { return nil }
-        return TrailerRequest.from(meta: m)?.directURL
+        let req = TrailerRequest.from(meta: m)
+        if let direct = req?.directURL { return direct }
+        let yt = (resolvedPreferredTrailerID?.isEmpty == false ? resolvedPreferredTrailerID : nil)
+            ?? detailTrailerYouTubeID
+        guard let yt, !yt.isEmpty else { return nil }
+        return TrailerRequest(title: m.name, youTubeID: yt, directURL: nil)
+            .nativeFullTrailerURL(languageCode: TMDBClient.trailerLanguageBaseCode)
     }
 
-    /// The YouTube trailer id (engine meta's, else the Cinemeta/TMDB fallback) for the WKWebView IFrame clip.
+    /// The YouTube id the ambient detail-hero clip resolves (yt-direct): the same D11 language-preferred /
+    /// default id `detailNativeTrailerURL` builds its `/yt` URL from, and nil when the meta carries a real
+    /// direct (non-YouTube) trailer stream (that plays as-is, no resolver of any kind).
+    private var detailAmbientYouTubeID: String? {
+        guard let m = meta, TrailerRequest.from(meta: m)?.directURL == nil else { return nil }
+        return (resolvedPreferredTrailerID?.isEmpty == false ? resolvedPreferredTrailerID : nil)
+            ?? detailTrailerYouTubeID
+    }
+
+    /// yt-direct: one attempt per ambient YouTube id at resolving the detail-hero clip on the user's own IP.
+    /// Fail-soft: any miss records `url = nil`, which mounts the existing /yt worker URL unchanged.
+    private func resolveDetailAmbientDirect() async {
+        guard let yt = detailAmbientYouTubeID, detailAmbientDirect?.ytID != yt else { return }
+        let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080)
+        NSLog("[yt-direct] detail ambient: %@",
+              resolved.map { $0.isMuxed ? "direct-muxed" : "direct-pair" } ?? "fallback-worker")
+        detailAmbientDirect = (yt, resolved?.videoURL)
+    }
+
+    /// The detail hero's last-resort ambient trailer URL. `playableURL` now yields the meta's own trailer via
+    /// the native `/yt` resolver (or a direct stream), NOT the retired R2 `/clip` snippet (owner directive), so
+    /// this is a raw-meta `/yt` fallback used only when `detailNativeTrailerURL` (which layers the D11
+    /// language-preferred id on top) has not resolved. Fail-soft: nil -> the still backdrop + Ken Burns stay.
+    private var detailTrailerClipURL: URL? {
+        guard let m = meta else { return nil }
+        return TrailerRequest.from(meta: m)?.playableURL
+    }
+
+    /// The YouTube trailer id (engine meta's, else the Cinemeta/TMDB fallback) for the WKWebView IFrame clip
+    /// fallback (iOS/Mac, no server).
     private var detailTrailerYouTubeID: String? {
         if let m = meta, let yt = TrailerRequest.from(meta: m)?.youTubeID, !yt.isEmpty { return yt }
         if let yt = resolvedTrailerID, !yt.isEmpty { return yt }
@@ -541,12 +1005,43 @@ struct iOSDetailView: View {
         }
     }
 
+    /// Resolve the user-LANGUAGE-preferred trailer id from TMDB /videos for the WITH-SOUND "watch trailer"
+    /// action, independently of `resolveTrailerIfNeeded` (which only fires when the meta carries NO trailer).
+    /// This runs even when the meta already has a default trailer, because the point is to prefer a trailer in
+    /// the viewer's language over that (usually English) default. TMDB tags videos by `iso_639_1`, so the pick
+    /// is language > original-language > English > first. Fail-soft: no TMDB data / no localized trailer leaves
+    /// `resolvedPreferredTrailerID` nil and `playTrailer` uses today's default, so there is no regression.
+    ///
+    /// tvOS SEAM: this same id is what a future tvOS build would hand to a VPS resolve endpoint (tvOS has no
+    /// web view to play a YouTube id, so it keeps playing the default warmed /clip today). The resolver lives
+    /// in SourcesShared (`TMDBClient`), so tvOS can populate the same seam without new plumbing; the VPS side
+    /// is intentionally NOT built here.
+    private func resolvePreferredTrailerIfNeeded(_ m: CoreMetaItem) {
+        guard resolvedPreferredTrailerID == nil else { return }
+        // Only NON-English preferred languages are worth overriding the default (/clip) trailer for: the
+        // default trailer is already the English one, so an English-preferred viewer keeps today's reliable
+        // /clip path (no regression), while a viewer who prefers e.g. Portuguese gets the Portuguese trailer.
+        let languages = TMDBClient.preferredTrailerLanguages.filter { $0 != "en" }
+        guard !languages.isEmpty else { return }
+        Task {
+            // Require a GENUINE preferred-language hit (matchedPreferred): a fallback to original/English/first
+            // is what the default path already plays, so overriding for that would needlessly swap the reliable
+            // /clip mp4 for a YouTube embed. Fail-soft: no localized trailer leaves the id nil and the default plays.
+            let pick = await TMDBClient.preferredTrailerPick(metaID: m.id, type: m.type, preferredLanguages: languages)
+            guard pick.matchedPreferred, let yt = pick.key, !yt.isEmpty else { return }
+            await MainActor.run { if core.metaDetails?.meta?.id == m.id { resolvedPreferredTrailerID = yt } }
+        }
+    }
+
     /// The title block: the addon-provided logo when present (the editorial signature on the tvOS hero),
     /// otherwise the serif hero type.
     @ViewBuilder private var titleOrLogo: some View {
         // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
-        ResolvedTitleLogo(id: meta?.id, type: meta?.type ?? "movie", fallbackLogo: meta?.logo,
-                          maxWidth: 320, maxHeight: 110, accessibilityName: meta?.name ?? "") {
+        // When meta is nil (unreleased/new title not yet in Cinemeta) fall through to the detail id and the
+        // hub card's seed logo (metahub-by-tt), so the hero shows the show LOGO instead of blanking.
+        ResolvedTitleLogo(id: meta?.behaviorHints?.defaultVideoId ?? meta?.id ?? id, type: meta?.type ?? type,
+                          fallbackLogo: l10n.logo(for: id) ?? meta?.logo ?? seedLogo ?? FeaturedHeroItem.metahubLogo(forId: id),
+                          maxWidth: 320, maxHeight: 110, accessibilityName: l10n.title(for: id) ?? meta?.name ?? title) {
             heroTitle
         }
     }
@@ -558,7 +1053,7 @@ struct iOSDetailView: View {
         // `maxWidth: .infinity, alignment: .leading` lets the title WRAP/scale within the available
         // width instead — so the title can never make the ZStack exceed the screen. Mirrors tvOS,
         // whose hero title wraps inside a width-bounded VStack with no horizontal fixedSize.
-        Text(meta?.name ?? title)
+        Text(l10n.title(for: id) ?? meta?.name ?? title)
             .font(Theme.Typography.hero).tracking(-1)
             .foregroundStyle(Theme.Palette.textPrimary)
             .lineLimit(3).minimumScaleFactor(0.6)
@@ -592,23 +1087,106 @@ struct iOSDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Cast / Director / Writer lines under the synopsis, each shown only when the meta carries it.
-    /// Top names are capped so a long IMDb cast list doesn't push the action row off-screen; the
-    /// label column is fixed-width so the three rows align like a small credits block.
+    /// Cast & Crew under the synopsis: a horizontally scrollable rail of EVERY cast member with photo +
+    /// who-played-who (TMDB credits, keyless edge; the meta's plain name list is the no-TMDB fallback),
+    /// then Director / Writer lines (#10). Visible by default; the header button folds it away.
     @ViewBuilder private var creditsRows: some View {
         let m = meta
-        let cast = m?.cast ?? []
         let directors = m?.directors ?? []
         let writers = m?.writers ?? []
-        if !cast.isEmpty || !directors.isEmpty || !writers.isEmpty {
-            VStack(alignment: .leading, spacing: 2) {
-                creditLine("Cast", cast.prefix(5))
-                creditLine("Director", directors.prefix(3))
-                creditLine("Writer", writers.prefix(3))
+        if !railCastMembers.isEmpty || !directors.isEmpty || !writers.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.25)) { castExpanded.toggle() }
+                } label: {
+                    HStack(spacing: Theme.Space.xs) {
+                        Text("Cast & Crew")
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .rotationEffect(.degrees(castExpanded ? 180 : 0))
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Cast and crew")
+                .accessibilityHint(castExpanded ? "Collapse" : "Expand")
+                if castExpanded {
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        castRail
+                        VStack(alignment: .leading, spacing: 2) {
+                            creditLine("Director", directors.prefix(3))
+                            creditLine("Writer", writers.prefix(3))
+                        }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
-            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.top, Theme.Space.xs)
         }
+    }
+
+    /// The rail's member list: TMDB credits (full cast, characters, headshots) when they resolved, else
+    /// the meta's plain cast names (no photos/roles) so the rail never blanks without TMDB. Negative
+    /// synthetic ids keep the fallback Identifiable without colliding with TMDB person ids.
+    private var railCastMembers: [TMDBClient.CastMember] {
+        if !castMembers.isEmpty { return castMembers }
+        return (meta?.cast ?? []).enumerated().map {
+            TMDBClient.CastMember(id: -1 - $0.offset, name: $0.element, character: nil, profileURL: nil)
+        }
+    }
+
+    /// Horizontally scrollable full-cast rail: photo circle, actor name, character name beneath: ALL
+    /// entries, not a 3-name line. LazyHStack so a 60-member ensemble builds on demand.
+    @ViewBuilder private var castRail: some View {
+        if !railCastMembers.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.md) {
+                    ForEach(railCastMembers) { member in
+                        VStack(spacing: Theme.Space.xs) {
+                            castPhoto(member)
+                            Text(member.name)
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                            if let role = member.character, !role.isEmpty {
+                                Text(role)
+                                    .font(Theme.Typography.eyebrow)
+                                    .foregroundStyle(Theme.Palette.textTertiary)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                        .frame(width: 92)
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    /// One cast headshot: the TMDB profile photo in a circle, else an initials disc so the rail keeps
+    /// its rhythm when a member has no photo (or TMDB never resolved).
+    private func castPhoto(_ member: TMDBClient.CastMember) -> some View {
+        AsyncImage(url: URL(string: member.profileURL ?? "")) { phase in
+            switch phase {
+            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+            default:
+                ZStack {
+                    Theme.Palette.surface2
+                    Text(member.name.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined())
+                        .font(Theme.Typography.label.weight(.semibold))
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+            }
+        }
+        .frame(width: 72, height: 72)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.08), lineWidth: 1))
     }
 
     @ViewBuilder private func creditLine(_ label: String, _ names: ArraySlice<String>) -> some View {
@@ -645,28 +1223,40 @@ struct iOSDetailView: View {
     @ViewBuilder private var seriesHeroActions: some View {
         let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
         let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
-        VStack(alignment: .leading, spacing: Theme.Space.xs) {
-            // FlowLayout, not HStack: the hero is hard-capped to the screen width, so an HStack squeezed
-            // the Trailer / In Library chips until their labels wrapped vertically ("Tr / ail / er").
-            // FlowLayout keeps each chip at its natural width and drops overflow onto the next line.
-            FlowLayout(spacing: Theme.Space.sm) {
-                if let m = meta, let primary {
-                    VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                        NavigationLink {
-                            iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
-                                  seasonEpisodes: sortedEpisodes(m.videos ?? []))
-                        } label: {
-                            Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume),
-                                  systemImage: "play.fill")
-                        }
-                        .buttonStyle(PrimaryActionStyle())
-                        if primary.isResume, primaryProgress > 0.01 {
-                            iOSProgressStripe(value: primaryProgress)
-                                .frame(width: 160)
-                        }
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // Full-width primary episode CTA on its own line (matches the movie Play button), with the
+            // resume stripe just beneath it.
+            if let m = meta, let primary {
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    NavigationLink {
+                        iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
+                              seasonEpisodes: sortedEpisodes(m.videos ?? []))
+                    } label: {
+                        Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
+                                                  resumeSeconds: primary.isResume ? primaryEpisodeResumeSeconds : nil),
+                              systemImage: "play.fill")
                     }
-                    .fixedSize(horizontal: true, vertical: false)
+                    .buttonStyle(HeroPlayButtonStyle())
+                    if primary.isResume, primaryProgress > 0.01 {
+                        iOSProgressStripe(value: primaryProgress)
+                            .frame(maxWidth: heroCtaMaxWidth)
+                    }
                 }
+                // Same per-platform CTA cap as the movie Play button (#6): comfortable on Mac, wide on touch.
+                .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
+            }
+            // Secondary actions wrap beneath. FlowLayout keeps each chip at its natural width and drops
+            // overflow onto the next line under the hero's hard width cap (prevents "Tr / ail / er" slivers).
+            FlowLayout(spacing: Theme.Space.sm) {
+                #if !os(tvOS)
+                // Offline (#30): download the primary episode's auto-picked source — the series twin of the
+                // movie Download chip. Gated on the primary episode resolving; the chip reflects state.
+                if let primary {
+                    downloadChip(videoId: primary.video.id, ready: true) {
+                        Task { await downloadBestSeries(primary.video) }
+                    }
+                }
+                #endif
                 trailerButton
                 iOSLibraryChip()
                 shareChip
@@ -703,10 +1293,32 @@ struct iOSDetailView: View {
         return sorted.first.map { ($0, false) }
     }
 
-    private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool) -> String {
-        let prefix = isResume ? "Resume" : "Play"
-        guard let season = video.season else { return "\(prefix) Episode \(video.episodeNumber)" }
-        return "\(prefix) S\(season) E\(video.episodeNumber)"
+    private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool, resumeSeconds: Double? = nil) -> String {
+        let prefix = isResume ? String(localized: "Resume") : String(localized: "Play")
+        let base: String = {
+            guard let season = video.season else { return "\(prefix) \(String(localized: "Episode")) \(video.episodeNumber)" }
+            return "\(prefix) S\(season) E\(video.episodeNumber)"
+        }()
+        // On a resume, append where playback picks up ("Resume S1 E3 · 1:03"); mirrors the movie button.
+        if let timecode = resumeSeconds.flatMap(resumeTimecode) { return "\(base)  ·  \(timecode)" }
+        return base
+    }
+
+    /// The saved resume position (seconds) for the series' primary episode, respecting the per-profile
+    /// invariant: engine-history profiles read the engine library item's `timeOffset`; overlay profiles
+    /// read their own entry. Read-only. Nil when the parked episode isn't the primary or there is none.
+    private var primaryEpisodeResumeSeconds: Double? {
+        guard let m = meta else { return nil }
+        let saved: (videoId: String?, timeOffsetMs: Double) = {
+            guard profiles.activeUsesEngineHistory else {
+                let entry = profiles.watch[m.id]
+                return (entry?.videoId, Double(entry?.timeOffsetMs ?? 0))
+            }
+            let state = core.metaDetails?.libraryItem?.state
+            return (state?.videoId, state?.timeOffset ?? 0)
+        }()
+        guard saved.timeOffsetMs > 0 else { return nil }
+        return saved.timeOffsetMs / 1000
     }
 
     private func sortedEpisodes(_ videos: [CoreVideo]) -> [CoreVideo] {
@@ -781,8 +1393,10 @@ struct iOSDetailView: View {
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
-        VStack(alignment: .leading, spacing: Theme.Space.xs) {
-        FlowLayout(spacing: Theme.Space.sm) {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // The primary CTA is a big, high-contrast rounded Play button on its own line, the
+            // cinematic-media-app hero action, no longer one small chip lost in a wrapping row.
+            // Width-capped per platform (heroCtaMaxWidth) so it doesn't span the whole Mac window (#6).
             Button {
                 Task { await playMovie() }
             } label: {
@@ -791,46 +1405,63 @@ struct iOSDetailView: View {
                     // "Finding best… X/Y" state reads as busy, matching the source-list control bar.
                     if preparing || movieLoadingSources { ProgressView().tint(Theme.Palette.onAccent) }
                     else { Image(systemName: "play.fill") }
-                    Text(movieLabel)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(movieLabel)
+                        // #11: the selected source's spec line rides inside the CTA (resolution ·
+                        // DV/HDR · flavor · size), so one glance says WHAT Play will play.
+                        if movieReady, let s = movieBest, let detail = primarySourceDetail(s) {
+                            Text(detail)
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.onAccent.opacity(0.82))
+                                .lineLimit(1).truncationMode(.tail)
+                        }
+                    }
                 }
             }
-            .buttonStyle(PrimaryActionStyle())
+            .buttonStyle(HeroPlayButtonStyle())
             .disabled(!movieReady || preparing)
             .opacity(movieReady || preparing ? 1 : 0.55)
+            .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
 
-            qualityMenu(groups)
-
-            Button { scrollToSources() } label: {
-                Label(sourceTotal > 0 ? "Sources · \(sourceTotal)" : "Sources",
-                      systemImage: "list.bullet")
-            }
-            .buttonStyle(ChipButtonStyle())
-
-            trailerButton
-            iOSLibraryChip()
-            shareChip
-            #if !os(tvOS)
-            // Offline (#30): download the best source, the offline twin of Watch Now. Shows a check once
-            // this title is already downloaded so a user can't queue it twice.
-            Button {
-                Task { await downloadBest() }
-            } label: {
-                if downloads.hasDownload(videoId: meta?.id ?? id) {
-                    Label("Downloaded", systemImage: "checkmark.circle.fill")
-                } else {
-                    Label("Download", systemImage: "arrow.down.circle")
+            // D10: a secondary "Play from start" beside the primary "Resume · 1:03", shown only when a saved
+            // resume position exists. Plays the SAME best stream from 0:00 without clearing the stored resume
+            // point (the primary Resume still seeks to the saved position). Hidden for a fresh title (nothing
+            // to restart) and while sources are still resolving.
+            if movieReady, movieResumeSeconds != nil {
+                Button { Task { await playMovie(fromStart: true) } } label: {
+                    Label("Play from start", systemImage: "arrow.counterclockwise")
                 }
+                .buttonStyle(ChipButtonStyle())
+                .disabled(preparing)
             }
-            .buttonStyle(ChipButtonStyle())
-            .disabled(!movieReady || downloads.hasDownload(videoId: meta?.id ?? id))
-            #endif
-        }
-        // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
-        if movieReady, let s = movieBest, let reason = StreamRanking.pickReason(s) {
-            Text("Picked for \(reason)")
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textTertiary)
-        }
+
+            // Secondary actions wrap beneath the CTA. FlowLayout keeps each chip at its natural width and
+            // drops overflow onto the next line under the hero's hard width cap.
+            FlowLayout(spacing: Theme.Space.sm) {
+                qualityMenu(groups)
+
+                #if !os(tvOS)
+                // Offline (#30): download the best source, the offline twin of Watch Now. The chip reflects
+                // state (idle / Downloading / Downloaded) so a tap gives visible feedback.
+                downloadChip(videoId: meta?.id ?? id, ready: movieReady) { Task { await downloadBest() } }
+                #endif
+
+                Button { scrollToSources() } label: {
+                    Label(sourceTotal > 0 ? "Sources · \(sourceTotal)" : "Sources",
+                          systemImage: "list.bullet")
+                }
+                .buttonStyle(ChipButtonStyle())
+
+                trailerButton
+                iOSLibraryChip()
+                shareChip
+            }
+            // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
+            if movieReady, let s = movieBest, let reason = StreamRanking.pickReason(s) {
+                Text("Picked for \(reason)")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
         }
         .padding(.top, Theme.Space.xs)
     }
@@ -875,6 +1506,7 @@ struct iOSDetailView: View {
             continuity: rememberedQuality,
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs,
             // Hero already shows Watch + Quality + the "Sources" scroll button, so suppress this list's
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
@@ -908,11 +1540,24 @@ struct iOSDetailView: View {
     /// the imdb defaultVideoId). The hasStreams guard keys on the EFFECTIVE id, so a re-dispatch loop can't
     /// form once the imdb-keyed streams arrive.
     private func loadMovieStreamsIfNeeded() {
-        guard type != "series", core.metaDetails?.meta?.id == id else { return }
+        guard effectiveType != "series" else { return }
+        // Relaxed guard (build 137): the old `meta?.id == id` gate blocked streams whenever Cinemeta meta
+        // was nil (a brand-new/unreleased title: tt at TMDB, not yet in Cinemeta -> "No sources found"
+        // even though imdb-keyed add-ons would answer the tt). Fire streams either when this title's meta
+        // is resident (the normal imdb-defaultVideoId path) OR, when meta is still absent, directly on the
+        // catalog id IF it is itself an imdb tt id (the hub-card case). Non-imdb ids without meta still wait
+        // (their stream id only resolves from the meta's defaultVideoId). The hasStreams guard keys on the
+        // effective id, so this can't form a re-dispatch loop once the streams arrive.
+        let metaResident = core.metaDetails?.meta?.id == id
+        guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
-        core.loadMeta(type: type, id: id, streamType: type, streamId: streamId)
+        // Dispatch under the AUTHORITATIVE type (meta.type when resident), NOT the hub's TMDB movie/tv guess,
+        // so a TV-movie / mini-series / anime the hub mis-typed still matches the add-on that indexes it. Log
+        // a correction so a device/sim test can spot any residual (e.g. meta that never resolved under the guess).
+        if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
+        core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)
     }
 
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
@@ -920,6 +1565,82 @@ struct iOSDetailView: View {
     private var ratingsImdbID: String? {
         if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
         return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// The pool `content_key` for this title (P1). Movies key on the imdb id; a series detail keys on the
+    /// show id (no season/episode here, since the detail page lists all sources across episodes). nil when
+    /// no imdb id is known — the whole language-chip feature then no-ops.
+    private var languageContentKey: String? {
+        SubtitleReleaseFingerprint.contentKey(imdbId: ratingsImdbID)
+    }
+
+    /// P1: compute the "Also available in" chips from (a) the languages PARSED from the loaded stream names
+    /// and (b) the crowd-sourced language index, then fire-and-forget a name-provenance contribution. Gated
+    /// on `features.languageIndex` inside the clients; de-duped per title + loaded-stream-count so it re-runs
+    /// as sources arrive. Fail-soft: any miss leaves the row hidden.
+    private func refreshLanguageChips() {
+        // Gate the whole compute (incl. the TMDB spoken_languages verify fetch) on the master feature flag, so
+        // it is a hard no-op when off rather than relying only on the per-client internal no-ops.
+        guard LanguageIndexClient.isEnabled, let contentKey = languageContentKey else { return }
+        // AGGREGATE across EVERY loaded source for this title (all add-ons), scanning BOTH the stream `name`
+        // AND its `description`: add-ons commonly split the release name into `name` and the audio/sub language
+        // tags into `description` (or vice-versa), so `name ?? description` under-labelled a lazy add-on. Taking
+        // both widens the union of language tokens (MULTI, DUAL, KOR+ENG, audio/sub tags) we can see.
+        let names: [String] = displayGroups(core.streamGroups())
+            .flatMap { $0.streams }
+            .flatMap { [$0.name, $0.description] }
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+        // Re-run only when the title or the set of observed names changes (sources stream in over time).
+        let key = "\(contentKey)#\(names.count)"
+        guard key != langChipsKey else { return }
+        langChipsKey = key
+
+        // Split into AUDIO vs SUBTITLE claims per stream context: a bare release-name language word is an audio
+        // claim (verified below); a code from a subtitle-marked string (vostfr, "ESubs", ...) is a subtitle
+        // claim (kept). This split is what lets the verify drop a FALSE audio claim without dropping real subs.
+        let observed = LanguageIndexClient.audioSubCodes(fromNames: names)
+        let imdb = ratingsImdbID
+        Task { @MainActor in
+            // Fetch the community index AND TMDB's real spoken_languages in PARALLEL: the two verification
+            // sources for a name-parsed audio claim. Both fail soft to nil (no signal), never falsely contradict.
+            async let availabilityTask = LanguageIndexClient.fetch(contentKey: contentKey)
+            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: type)
+            let availability = await availabilityTask
+            let tmdbSpoken = await spokenTask
+            // Guard against a title switch mid-fetch.
+            guard languageContentKey == contentKey else { return }
+            // VERIFY: drop a name-only AUDIO language that BOTH TMDB (not in spoken_languages) and the community
+            // (no/low count) contradict -- the false-claim fix. Subtitle + community + TMDB codes are kept.
+            // The chip row is horizontally scrollable now (#8), so a wider cap fits without clutter.
+            langChips = LanguageIndexClient.verifiedAvailabilityChips(observedAudio: observed.audio,
+                                                                      observedSub: observed.sub,
+                                                                      availability: availability,
+                                                                      tmdbSpoken: tmdbSpoken,
+                                                                      limit: 24)
+        }
+        // Fire-and-forget: contribute the name-parsed codes so the index learns from real users.
+        Task.detached {
+            await LanguageIndexClient.contribute(contentKey: contentKey,
+                                                 audioLangs: observed.audio,
+                                                 subLangs: observed.sub,
+                                                 provenance: "name")
+        }
+    }
+
+    /// Community source index (movie/live): the SERVE + HOARD driver. SERVE refreshes the pooled community
+    /// sources for the title (gated on the Singularity toggle + sign-in inside the client), and HOARD
+    /// fire-and-forgets the assembled source descriptors so the pool learns from this resolve. Both are
+    /// fully gated + fail-soft in `SourceIndexClient` (consent / fleet flag / toggle / login), so this is a
+    /// hard no-op when the feature is off. De-duped per title; safe to call as sources stream in.
+    private func refreshSourceIndex() {
+        guard let contentID = SourceIndexClient.contentID(imdbId: ratingsImdbID) else { return }
+        sourceIndex.refresh(contentID: contentID, isSignedIn: account.isSignedIn)
+        // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
+        // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
+        let groups = torboxSearch.merged(into: core.streamGroups())
+        guard !groups.isEmpty else { return }
+        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
     }
 
     /// Fetch cross-provider ratings for this title. Prefers the VortX ratings service (no user key
@@ -965,6 +1686,86 @@ struct iOSDetailView: View {
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
 
+    /// Fetch the movie budget + box office (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadFinancials() {
+        guard showFinancials, type != "series", let imdb = ratingsImdbID, financials == nil else { return }
+        Task {
+            let f = await TMDBClient.details(imdbID: imdb, type: type)
+            await MainActor.run { financials = f }
+        }
+    }
+
+    /// Fetch the full cast (who-played-who + headshots) and TMDB's overview fallback from the keyless
+    /// credits edge path (#10). Keyed per imdb id so meta arriving after the tt-only first load doesn't
+    /// refetch; works with meta=nil (hub-seeded tt not yet in Cinemeta). Fail-soft: a miss leaves the
+    /// meta-cast fallback rail + empty overview.
+    private func loadCredits() {
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID, creditsKey != imdb else { return }
+        creditsKey = imdb
+        Task {
+            guard let result = await TMDBClient.credits(imdbID: imdb, type: effectiveType) else { return }
+            await MainActor.run {
+                guard creditsKey == imdb else { return }   // title switched mid-fetch
+                if !result.cast.isEmpty { castMembers = result.cast }
+                if fallbackOverview == nil { fallbackOverview = result.overview }
+            }
+        }
+    }
+
+    /// Fetch theatrical + digital release dates (no-op for series / no key / no imdb id). Fail-soft; the row hides on a miss.
+    private func loadReleaseDates() {
+        guard type != "series", let imdb = ratingsImdbID, releaseDates == nil else { return }
+        Task {
+            let d = await TMDBClient.releaseDates(imdbID: imdb, type: type)
+            await MainActor.run { releaseDates = d }
+        }
+    }
+
+    /// Movie budget + box office (+ profit multiple), a fact line under the ratings. Opt-out via the
+    /// "Show budget & box office" setting; movies-only, hidden when TMDB has no figures.
+    @ViewBuilder private var financialsRow: some View {
+        if showFinancials, type != "series", let f = financials {
+            let text = Self.financialsText(f)
+            if !text.isEmpty {
+                Text(text)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// "Budget $200M  ·  Box Office $1.4B  ·  Profit 7.0x" - both values (Arvio shows budget only) plus a profit multiple.
+    private static func financialsText(_ f: TMDBClient.Financials) -> String {
+        var parts: [String] = []
+        if let b = TMDBClient.shortMoney(f.budget) { parts.append("Budget \(b)") }
+        if let r = TMDBClient.shortMoney(f.revenue) { parts.append("Box Office \(r)") }
+        if f.budget > 0, f.revenue > 0 { parts.append(String(format: "Profit %.1fx", Double(f.revenue) / Double(f.budget))) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    /// "In theaters Mar 1, 2024  ·  Digital May 21, 2024" - both dates, each shown only when TMDB has it. Movies only.
+    @ViewBuilder private var releaseDatesRow: some View {
+        if type != "series", let d = releaseDates {
+            let text = Self.releaseDatesText(d)
+            if !text.isEmpty {
+                Text(text)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1).truncationMode(.tail)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    private static func releaseDatesText(_ d: TMDBClient.ReleaseDates) -> String {
+        var parts: [String] = []
+        if let t = d.theatrical { parts.append("In theaters \(t)") }
+        if let g = d.digital { parts.append("Digital \(g)") }
+        return parts.joined(separator: "  ·  ")
+    }
+
     /// One-decimal IMDb formatter (8.5, not 8.50). `static let` to avoid per-row allocation.
     private static let mdbImdbFmt: NumberFormatter = {
         let f = NumberFormatter()
@@ -976,8 +1777,13 @@ struct iOSDetailView: View {
     /// Apply the Direct-links-only filter (drop every torrent source) so a user with the setting on
     /// never sees or auto-plays a torrent — the exact `displayGroups` the tvOS `CoreStreamList` uses.
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard PlaybackSettings.directLinksOnly else { return groups }
-        return groups.compactMap { group in
+        // Merge the TorBox search sources FIRST (no-op with no TorBox key / no results), then the community
+        // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
+        // Direct-links-only filter so a search/community torrent source is filtered on the same rule as an
+        // add-on's — keeps the filter contract intact.
+        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        guard PlaybackSettings.directLinksOnly else { return withSearch }
+        return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
             guard !streams.isEmpty else { return nil }
             return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
@@ -1006,55 +1812,122 @@ struct iOSDetailView: View {
         return p.total == 0 || p.loaded < p.total
     }
 
-    /// Watch-Now arms only once EVERY stream add-on has answered (or the settle timeout fired), so one
-    /// press plays the best of ALL sources, not the best of whoever replied first — matching tvOS. The
-    /// Quality picker stays live throughout, so a user who wants a specific source can pick it immediately.
-    private var movieReady: Bool { meta != nil && movieBest != nil && !movieLoadingSources }
+    /// Watch-Now arms once a best stream has resolved and sources have settled. A4b: this is NO LONGER gated
+    /// on `meta != nil` — a hub-opened title whose Cinemeta meta is nil/mismatched (a tt at TMDB not yet in
+    /// Cinemeta) still assembles its `streamGroups` (the sources LIST renders from them unconditionally), so
+    /// Play must arm off the SAME groups the list shows, not a meta-gated path, or the button would sit
+    /// disabled forever while the sources below are fully playable. Playback identity falls back to the seed
+    /// id/title (`moviePlaybackMeta`) when meta is nil.
+    private var movieReady: Bool { movieBest != nil && !movieLoadingSources }
 
-    private var movieLabel: String {
-        if preparing { return "Finding the best source…" }
-        if movieReady, let s = movieBest { return "Watch  ·  \(StreamRanking.qualityLabel(s))" }
-        if movieLoadingSources {
-            let p = core.streamLoadProgress()
-            return p.total > 0 ? "Finding best…  \(p.loaded)/\(p.total)" : "Loading sources…"
-        }
-        return "No sources found"
+    /// The movie's playback identity, resolved from the loaded meta when present, else the seed id/title/type
+    /// carried from the hub card (A4b: a hub-opened title with nil/mismatched Cinemeta meta still plays and
+    /// records CW off its seed identity, mirroring `downloadStream`'s meta-or-seed fallback).
+    private var moviePlaybackMeta: PlaybackMeta {
+        let m = meta
+        return PlaybackMeta(libraryId: m?.id ?? id, videoId: m?.id ?? id, type: "movie",
+                            name: m?.name ?? title, poster: m?.poster ?? seedBackdrop, season: nil, episode: nil)
     }
 
-    private func playMovie() async {
-        guard !preparing, let m = meta, let stream = movieBest else { return }
+    /// The movie's saved resume position in seconds, or nil when there is none. Reads the SAME
+    /// per-profile source `playMovie`'s `resume(_:)` uses (the engine library item for engine-history
+    /// profiles via `engineResumeSeconds`, the overlay's own entry otherwise via `ProfileStore.resumeOffset`),
+    /// so the button label and the seek it triggers always agree. Read-only; writes nothing. A4b: keys off the
+    /// meta-or-seed identity so a hub-opened title with nil meta still surfaces its resume point.
+    private var movieResumeSeconds: Double? {
+        let pm = moviePlaybackMeta
+        let secs = core.engineResumeSeconds(for: pm) ?? profiles.resumeOffset(for: pm)
+        return secs >= 1 ? secs : nil
+    }
+
+    /// #11: the selected source's spec line for the primary CTA ("4K · DV · Remux · Atmos · 24.5 GB"),
+    /// from the SAME parse the source rows use, so the button never promises what a row wouldn't show.
+    private func primarySourceDetail(_ s: CoreStream) -> String? {
+        let d = StreamRanking.sourceDetail(s)
+        let joined = [d.tags, d.size].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+        return joined.isEmpty ? nil : joined
+    }
+
+    private var movieLabel: String {
+        if preparing { return String(localized: "Finding the best source…") }
+        if movieReady, movieBest != nil {
+            // A saved resume position turns the primary into "Resume · 1:03" (playback already seeks there);
+            // a fresh title keeps "Watch". The source spec now rides on the CTA's detail line (#11).
+            return movieResumeSeconds.flatMap(resumeTimecode).map { "\(String(localized: "Resume"))  ·  \($0)" } ?? String(localized: "Watch")
+        }
+        if movieLoadingSources {
+            let p = core.streamLoadProgress()
+            return p.total > 0 ? String(localized: "Finding best…  \(p.loaded)/\(p.total)") : String(localized: "Loading sources…")
+        }
+        return String(localized: "No sources found")
+    }
+
+    /// D10: `fromStart` plays the SAME best stream from 0:00, ignoring the saved resume position WITHOUT
+    /// clearing it (the stored resume point is untouched; playback just starts at 0). Default false keeps the
+    /// primary Play/Resume behaviour (seek to the saved position).
+    private func playMovie(fromStart: Bool = false) async {
+        // A4b: no longer gated on `meta != nil` — a hub-opened title with nil/mismatched Cinemeta meta still
+        // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
+        guard !preparing, let stream = movieBest else { return }
         preparing = true; defer { preparing = false }
         // CACHED DEBRID: a raw torrent the user's debrid serves plays as a direct link (fail-soft; no-key is
         // a zero-await nil → today's path). On a debrid hit we play a remote direct URL with isTorrent:false
         // and DON'T run primePlayback (no `/create`); otherwise `prime` stays true and the path is exactly
         // today's (primePlayback → engine + torrent prime), so the no-key path is byte-identical.
-        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
-        guard let url = resolved ?? stream.playableURL else { return }
-        let prime = resolved == nil
+        //
+        // AUTO-PICK PARALLELISM: this is the top-cached "Watch" path, so race the top few CACHED candidates
+        // (StreamRanking order preserved) concurrently and play the FIRST that resolves — the user reaches a
+        // genuinely-cached source in ~2-4s instead of committing to `movieBest` alone when it is a
+        // false-cached row. Fail-soft: a nil race result falls straight through to the single-resolve on
+        // `movieBest` below, so the no-key / no-cache path is byte-identical. (A manual source-row tap uses
+        // `playStream`, which stays single-resolve on the exact chosen row.)
+        let candidates = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                                    debridCachedHashes: debridCache.cachedHashes).flatMap(\.streams)
+        if let win = await DebridCoordinator.shared.resolveFirstPlayable(
+            candidates: candidates, cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            core.loadEnginePlayer(for: win.stream)
+            let pm = moviePlaybackMeta
+            let resumeSeconds = fromStart ? 0 : await resume(pm)
+            presentation = .player(PlayerLaunch(url: win.ref.url, title: pm.name, headers: win.stream.requestHeaders,
+                                                resume: resumeSeconds, meta: pm,
+                                                qualityText: StreamRanking.signature(win.stream),
+                                                bingeGroup: win.stream.behaviorHints?.bingeGroup,
+                                                isTorrent: false, debridRef: win.ref))
+            return
+        }
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
+        guard let url = ref?.url ?? stream.playableURL else { return }
+        let prime = ref == nil
         if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
-        let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
-                              name: m.name, poster: m.poster, season: nil, episode: nil)
-        presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
-                                            resume: await resume(pm), meta: pm,
+        let pm = moviePlaybackMeta
+        // fromStart: hand the player resume 0 so it starts at the beginning. The stored resume point is NOT
+        // cleared here - it stays until normal playback progress overwrites it (D10: play-from-start, not reset).
+        let resumeSeconds = fromStart ? 0 : await resume(pm)
+        presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: stream.requestHeaders,
+                                            resume: resumeSeconds, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: !prime && stream.isTorrent))
+                                            bingeGroup: stream.behaviorHints?.bingeGroup,
+                                            isTorrent: !prime && stream.isTorrent, debridRef: ref))
     }
 
     /// Play an arbitrary chosen movie source (a tapped source-list row). `url` is the source's
     /// `playableURL`; a cached-debrid raw torrent overrides it with the direct link (fail-soft, no-key
     /// byte-identical — see `DebridCoordinator.resolvedPlaybackURL`).
     private func playStream(_ stream: CoreStream, url: URL) async {
-        guard !preparing, let m = meta else { return }
+        // A4b: no longer gated on `meta != nil` — a hub-opened title with nil meta still plays a tapped source
+        // row off its seed identity (the source list itself renders without meta, so its rows must be playable).
+        guard !preparing else { return }
         preparing = true; defer { preparing = false }
-        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
-        let prime = resolved == nil
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
+        let prime = ref == nil
         if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
-        let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
-                              name: m.name, poster: m.poster, season: nil, episode: nil)
-        presentation = .player(PlayerLaunch(url: resolved ?? url, title: m.name, headers: stream.requestHeaders,
+        let pm = moviePlaybackMeta
+        presentation = .player(PlayerLaunch(url: ref?.url ?? url, title: pm.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: !prime && stream.isTorrent))
+                                            bingeGroup: stream.behaviorHints?.bingeGroup,
+                                            isTorrent: !prime && stream.isTorrent, debridRef: ref))
     }
 
     #if !os(tvOS)
@@ -1065,10 +1938,19 @@ struct iOSDetailView: View {
     /// `PlaybackMeta`, and hands both to `DownloadManager`. Device-local only; writes nothing to the
     /// account / libraryItem docs.
     private func downloadStream(_ stream: CoreStream, url: URL) async {
-        guard let m = meta else { return }
         let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
-        let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
-                              name: m.name, poster: m.poster, season: nil, episode: nil)
+        // A raw torrent downloads through the loopback server, which must be told to /create the torrent
+        // first. The play path primes it (primePlayback) but the download path never did, so a torrent
+        // row's download hit a server with no such torrent and failed instantly (#21).
+        if resolved == nil, stream.isTorrent {
+            torrentPrime?.cancel()
+            torrentPrime = prepareTorrentStream(stream)
+        }
+        // meta can be nil for a hub-seeded tt not yet in Cinemeta (its sources still list); the seed
+        // id/title keep the download record usable instead of silently dropping the tap.
+        let m = meta
+        let pm = PlaybackMeta(libraryId: m?.id ?? id, videoId: m?.id ?? id, type: "movie",
+                              name: m?.name ?? title, poster: m?.poster ?? seedBackdrop, season: nil, episode: nil)
         DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolved ?? url,
                                         sourceName: stream.name, qualityText: StreamRanking.signature(stream))
     }
@@ -1077,6 +1959,43 @@ struct iOSDetailView: View {
     private func downloadBest() async {
         guard let stream = movieBest, let url = stream.playableURL else { return }
         await downloadStream(stream, url: url)
+    }
+
+    /// Download-best for a SERIES: queue the primary episode's auto-picked source — the offline twin of the
+    /// series hero's Resume/Play, which targets the SAME episode (`seriesPrimaryEpisode`) and the SAME
+    /// `StreamRanking.best` path. A series detail loads meta only, so this loads + settles that episode's
+    /// streams (mirroring `iOSResolveEpisodeStream`), ranks them, resolves a cached-debrid direct link when
+    /// possible, then hands the episode's series-typed `PlaybackMeta` to `DownloadManager`. No-op if nothing
+    /// resolves. Device-local only; writes nothing to the account / libraryItem docs.
+    private func downloadBestSeries(_ video: CoreVideo) async {
+        guard let m = meta else { return }
+        core.loadMeta(type: "series", id: m.id, streamType: "series", streamId: video.id)
+        var groups: [CoreStreamSourceGroup] = []
+        var firstPlayableAt: Date? = nil
+        for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
+            groups = displayGroups(core.streamGroups(forStreamId: video.id))
+            if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
+            let progress = core.streamLoadProgress(forStreamId: video.id)
+            let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
+            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+                                            secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, pin: sourcePin,
+                                            debridCachedHashes: debridCache.cachedHashes),
+              let url = best.playableURL else { return }
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
+        // Same loopback-torrent prime as the per-row download (#21): the server must /create it first.
+        if resolved == nil, best.isTorrent {
+            torrentPrime?.cancel()
+            torrentPrime = prepareTorrentStream(best)
+        }
+        let pm = PlaybackMeta(libraryId: m.id, videoId: video.id, type: "series",
+                              name: m.name, poster: video.thumbnail ?? m.poster,
+                              season: video.season, episode: video.episode)
+        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: resolved ?? url,
+                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
     }
     #endif
 
@@ -1192,6 +2111,7 @@ struct iOSDetailView: View {
             settleTimedOut: settleTimedOut,
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } }
         )
         .padding(.horizontal, Theme.Space.md)
@@ -1327,7 +2247,12 @@ struct iOSDetailView: View {
     }
 
     private func episodeThumbnail(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
-        AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
+        // Effective spoiler-blur: the user's explicit setting wins; else the RemoteConfig fleet default
+        // (`features.spoilerBlur`); else baked true. `_ = spoilerBlur` keeps the view observing the
+        // @AppStorage so a Settings toggle triggers a redraw.
+        _ = spoilerBlur
+        let blurArt = SpoilerBlurSetting.isEnabled && !isWatched   // hide future-episode imagery until you have watched it
+        return AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
             switch phase {
             case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
             default:
@@ -1336,7 +2261,14 @@ struct iOSDetailView: View {
             }
         }
         .frame(width: 132, height: 74)
+        .blur(radius: blurArt ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+        .overlay {
+            if blurArt {
+                Image(systemName: "eye.slash.fill").font(.footnote)
+                    .foregroundStyle(.white.opacity(0.85)).shadow(radius: 2).accessibilityHidden(true)
+            }
+        }
         .overlay(alignment: .topTrailing) {
             if isWatched {
                 Image(systemName: "checkmark.circle.fill")
@@ -1379,7 +2311,11 @@ struct iOSDetailView: View {
                             NavigationLink {
                                 iOSDetailView(id: item.id, type: item.type, title: item.name)
                             } label: {
-                                moreLikeThisCard(item)
+                                // Reuse the shared catalog card so the related rail honors the same poster
+                                // orientation (landscape/portrait) and hide-labels settings as every other
+                                // rail, instead of a hardcoded portrait tile (Bug: related rail stayed portrait).
+                                PosterCardiOS(id: item.id, type: item.type, name: item.name,
+                                              poster: item.poster, progress: 0)
                             }
                             .buttonStyle(.plain)
                         }
@@ -1390,32 +2326,30 @@ struct iOSDetailView: View {
         }
     }
 
-    private func moreLikeThisCard(_ item: MetaPreview) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            CachedPosterImage(url: PosterArtwork.poster(id: item.id, fallback: item.poster))
-                .frame(width: 100, height: 150)
-                .clipped()
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-            Text(item.name)
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .lineLimit(1)
-                .frame(width: 100, alignment: .leading)
-        }
-    }
-
     private func loadSimilar(_ meta: CoreMetaItem) {
         guard !LiveTypes.contains(type), !meta.genres.isEmpty else { return }
         Task {
             let items = await AddonClient.similar(type: type, excludingId: id, genres: meta.genres, title: meta.name)
             var merged = items
-            // When a TMDB key is set, prepend TMDB recommendations (deduped) for richer "more like this".
-            if ApiKeys.tmdbKey() != nil, id.hasPrefix("tt") {
+            // Prepend TMDB recommendations (deduped) for richer "more like this". No key gate: the
+            // recommendations call routes through the keyless catalogs edge when the user has no key.
+            if id.hasPrefix("tt") {
                 let existing = Set(items.map(\.id))
                 let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id && !existing.contains($0.id) }
                 merged = recs + items
             }
             await MainActor.run { similarItems = merged }
+        }
+    }
+
+    /// More-Like-This when Cinemeta meta is (still) nil: a hub-seeded tt not yet in Cinemeta has no
+    /// genres for the add-on path, but TMDB recommendations resolve from the tt id alone (keyless edge),
+    /// so the rail still populates (#29). The full `loadSimilar` overwrites this once meta arrives.
+    private func loadSimilarFallback() {
+        guard similarItems.isEmpty, meta == nil, id.hasPrefix("tt"), !LiveTypes.contains(type) else { return }
+        Task {
+            let recs = await AddonClient.tmdbSimilar(type: type, imdbID: id).filter { $0.id != id }
+            await MainActor.run { if similarItems.isEmpty { similarItems = recs } }
         }
     }
 
@@ -1513,10 +2447,23 @@ struct iOSEpisodeStreams: View {
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source for this show (#15)
     // Debrid cache awareness for THIS episode's source list. Empty (no badges, ranking unchanged) with no key.
     @StateObject private var debridCache = DebridCacheAwareness()
+    // TorBox search-as-a-source for this episode: extra usenet + torrent sources for the SHOW (gated on a
+    // TorBox key). Empty (list unchanged) with no key.
+    @StateObject private var torboxSearch = TorBoxSearchSource()
+    // Community source index ("Singularity") for this episode: SERVE (merges corroborated pooled sources
+    // when the toggle is on + signed in) + HOARD (fire-and-forget descriptor contribution). Fully gated +
+    // fail-soft inside `SourceIndexClient`; keyed on the episode content id (show:S:E).
+    @StateObject private var sourceIndex = SourceIndexServeSource()
 
     /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
+
+    /// The show's imdb id for the TorBox search index (defaultVideoId when the meta id is tmdb:/kitsu:).
+    private var showImdbID: String? {
+        if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        return meta.id.hasPrefix("tt") ? meta.id : nil
+    }
 
     private var backdropHeight: CGFloat {
         #if os(macOS)
@@ -1542,12 +2489,14 @@ struct iOSEpisodeStreams: View {
                     continuity: rememberedQuality,
                     pinContext: pinContext,
                     cachedHashes: debridCache.cachedHashes,
+                    cachedUsenetURLs: debridCache.cachedUsenetURLs,
                     play: { stream, url in Task { await play(stream, url: url) } },
+                    playBest: { candidates in Task { await playBest(candidates) } },
                     download: episodeDownloadHandler
                 )
                 .padding(.horizontal, Theme.Space.md)
                 // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
-                .frame(maxWidth: geo.size.width > 700 ? 900 : .infinity)
+                .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
                 .frame(maxWidth: .infinity)
             }
             .padding(.bottom, Theme.Space.xl)
@@ -1555,8 +2504,12 @@ struct iOSEpisodeStreams: View {
         }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // iOS-only: a macOS navigationTitle on this pushed episode-streams view crashes the shared NSToolbar.
+        #if os(iOS)
         .navigationTitle(video.episodeTitle)
         .inlineNavigationTitle()
+        #endif
+        .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {
@@ -1575,11 +2528,16 @@ struct iOSEpisodeStreams: View {
             try? await Task.sleep(for: .seconds(20))
             settleTimedOut = true
         }
-        // Debrid cache awareness for this episode's torrents: re-check as add-ons answer (de-duped by hash
-        // set in refresh). Empty / no-op with no debrid key.
+        // Debrid cache awareness for this episode's torrents + usenet: re-check as add-ons answer (de-duped
+        // by hash set in refresh). Includes the TorBox search sources so those rows badge too. No-op with
+        // no debrid key.
         .onChange(of: core.streamLoadProgress(forStreamId: video.id).loaded) { _ in
-            debridCache.refresh(from: displayGroups(core.streamGroups(forStreamId: video.id)))
+            // Unfiltered: cache awareness needs the raw torrents the Direct-links-only filter would drop.
+            debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id)))
+            refreshSourceIndex()   // SERVE + HOARD the community source index as this episode's sources answer
         }
+        // TorBox search-as-a-source for the show (gated on a TorBox key; de-duped by imdb id inside refresh).
+        .onAppear { torboxSearch.refresh(imdbId: showImdbID); refreshSourceIndex() }
         .platformFullScreenPlayerCover(item: $player) { launch in
             PlayerScreen(
                 url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
@@ -1628,7 +2586,7 @@ struct iOSEpisodeStreams: View {
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .lineSpacing(2)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: 760, alignment: .leading)
+                    .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
                     .padding(.horizontal, Theme.Space.md)
             }
         }
@@ -1694,8 +2652,8 @@ struct iOSEpisodeStreams: View {
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
-        let (resolved, isTorrent) = await playbackURL(for: stream, episode: ep)
-        let playURL = resolved ?? url
+        let (ref, isTorrent) = await playbackRef(for: stream, episode: ep)
+        let playURL = ref?.url ?? url
         core.loadEnginePlayer(for: stream)
         lastBinge = stream.behaviorHints?.bingeGroup   // seed the sticky release-group from the user's pick (#3)
         // Cancel any prior torrent prime before storing the new one, so a re-pick can't leave a stale
@@ -1708,7 +2666,44 @@ struct iOSEpisodeStreams: View {
                               season: video.season, episode: video.episode)
         player = iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: isTorrent)
+                                            qualityText: StreamRanking.signature(stream),
+                                            isTorrent: isTorrent, debridRef: ref)
+    }
+
+    /// AUTO-PICK play for the episode "Watch in <quality>" button: race the top few CACHED candidates
+    /// (ranking order preserved) in parallel and play the FIRST that resolves, so the user reaches a
+    /// genuinely-cached source fast instead of committing to the single ranked best when it is a
+    /// false-cached row. FAIL-SOFT: a nil race result falls back to today's single-resolve on the ranked
+    /// best (`play`), so the no-key / no-cache path is byte-identical. A MANUAL row tap / Quality pick still
+    /// goes through `play(_:url:)` on the exact chosen row.
+    private func playBest(_ candidates: [CoreStream]) async {
+        guard !preparing else { return }
+        // Hold `preparing` for the whole race so a second Watch tap can't launch a duplicate resolve. It is
+        // RELEASED before the single-resolve fallback below, which sets its own guard (`play` early-returns
+        // while `preparing`), so the fallback path is unchanged.
+        preparing = true
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        if let win = await DebridCoordinator.shared.resolveFirstPlayable(
+            candidates: candidates, episode: ep, cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            defer { preparing = false }
+            core.loadEnginePlayer(for: win.stream)
+            lastBinge = win.stream.behaviorHints?.bingeGroup
+            torrentPrime?.cancel(); torrentPrime = nil   // debrid direct link: no torrent prime
+            let name = "\(meta.name)  ·  S\(video.season ?? season)E\(video.episodeNumber)"
+            let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                  name: meta.name, poster: video.thumbnail ?? meta.poster,
+                                  season: video.season, episode: video.episode)
+            player = iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
+                                                resume: await resume(pm), meta: pm,
+                                                qualityText: StreamRanking.signature(win.stream),
+                                                isTorrent: false, debridRef: win.ref)
+            return
+        }
+        preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
+        // No parallel-cached winner: today's single-resolve on the ranked best (first playable candidate).
+        guard let best = candidates.first(where: { $0.playableURL != nil }), let url = best.playableURL else { return }
+        await play(best, url: url)
     }
 
     #if !os(tvOS)
@@ -1723,11 +2718,17 @@ struct iOSEpisodeStreams: View {
     /// `PlaybackMeta`, so play-from-local records progress against the right episode. Device-local only.
     private func downloadStream(_ stream: CoreStream, url: URL) async {
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
-        let (resolved, _) = await playbackURL(for: stream, episode: ep)
+        let (ref, isTorrent) = await playbackRef(for: stream, episode: ep)
+        // A raw torrent downloads through the loopback server, which must be told to /create the torrent
+        // first; the play path primes it, the download path didn't, so the row's download died (#21).
+        if isTorrent {
+            torrentPrime?.cancel()
+            torrentPrime = prepareTorrentStream(stream)
+        }
         let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                               name: meta.name, poster: video.thumbnail ?? meta.poster,
                               season: video.season, episode: video.episode)
-        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolved ?? url,
+        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: ref?.url ?? url,
                                         sourceName: stream.name, qualityText: StreamRanking.signature(stream))
     }
     #else
@@ -1735,13 +2736,14 @@ struct iOSEpisodeStreams: View {
     #endif
 
     /// Resolve the URL to play for `stream` on this episode view, preferring a cached-debrid DIRECT link
-    /// for a raw torrent. Mirrors the movie view's helper; returns `(direct, false)` when debrid served it,
-    /// else `(stream.playableURL, stream.isTorrent)`. Fail-soft and no-key byte-identical.
-    private func playbackURL(for stream: CoreStream, episode: DebridEpisode?) async -> (url: URL?, isTorrent: Bool) {
-        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream, episode: episode) {
-            return (direct, false)
+    /// for a raw torrent. Mirrors the movie view's helper; returns `(ref, false)` when debrid served it
+    /// (the ref carries the URL + reresolve provenance), else `(nil, stream.isTorrent)` so the caller uses
+    /// `stream.playableURL`. Fail-soft and no-key byte-identical.
+    private func playbackRef(for stream: CoreStream, episode: DebridEpisode?) async -> (ref: DebridPlaybackRef?, isTorrent: Bool) {
+        if let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode) {
+            return (ref, false)
         }
-        return (stream.playableURL, stream.isTorrent)
+        return (nil, stream.isTorrent)
     }
 
     private func resume(_ pm: PlaybackMeta) async -> Double {
@@ -1750,14 +2752,32 @@ struct iOSEpisodeStreams: View {
     }
 
     /// Direct-links-only: drop every torrent source so a user with the setting on never sees or
-    /// auto-plays one — the same `displayGroups` filter the tvOS `CoreStreamList` applies.
+    /// auto-plays one — the same `displayGroups` filter the tvOS `CoreStreamList` applies. Merges the
+    /// TorBox search sources first (no-op with no TorBox key / no results).
     private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard PlaybackSettings.directLinksOnly else { return groups }
-        return groups.compactMap { group in
+        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
+        guard PlaybackSettings.directLinksOnly else { return withSearch }
+        return withSearch.compactMap { group in
             let streams = group.streams.filter { !$0.isTorrent }
             guard !streams.isEmpty else { return nil }
             return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
         }
+    }
+
+    /// The episode's pool `content_id` (show imdb id + `:S:E`), or nil when the show has no imdb id.
+    private var episodeContentID: String? {
+        SourceIndexClient.contentID(imdbId: showImdbID, season: video.season ?? season, episode: video.episodeNumber)
+    }
+
+    /// Community source index (episode): SERVE refresh + HOARD contribution for THIS episode. Fully gated +
+    /// fail-soft inside `SourceIndexClient` (consent / fleet flag / Singularity toggle / login). De-duped per
+    /// content id; safe to call as the episode's sources stream in.
+    private func refreshSourceIndex() {
+        guard let contentID = episodeContentID else { return }
+        sourceIndex.refresh(contentID: contentID, isSignedIn: account.isSignedIn)
+        let groups = torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))
+        guard !groups.isEmpty else { return }
+        Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
     }
 
     /// The quality this series last played in (per profile), so the episode's Watch-in pick keeps the
@@ -1886,12 +2906,22 @@ struct iOSSourceList: View {
     /// Raw-torrent infoHashes the user's debrid account has cached, lowercased, for the per-row "Cached"
     /// chip. Empty by default (no key / not yet checked) → no badges, identical to today.
     var cachedHashes: Set<String> = []
+    /// nzb links whose TorBox usenet download is confirmed cached, for the per-row ⚡ on USENET rows. Empty
+    /// by default (no TorBox key / not yet checked) → no usenet badges, identical to today.
+    var cachedUsenetURLs: Set<String> = []
     /// When false, the primary Watch / Quality / All-sources control bar is hidden and the grouped list is
     /// shown directly. The MOVIE detail page passes false because its hero already shows Watch + Quality +
     /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
     /// keep the default true — there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
+    /// AUTO-PICK play for the primary "Watch in <quality>" button ONLY: hands the caller the ranked
+    /// candidate list (best first) so it can race the top few CACHED sources in parallel and play the first
+    /// that resolves, reaching a genuinely-cached link fast instead of committing to `best` alone. Optional:
+    /// when nil, the Watch button falls back to the single-resolve `play(best, url)` (byte-identical to
+    /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
+    /// resolves exactly that row through `play`.
+    var playBest: (([CoreStream]) -> Void)? = nil
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
@@ -1899,6 +2929,9 @@ struct iOSSourceList: View {
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
+    /// Rows whose per-row download was tapped this session (keyed by playable URL), so the icon flips to
+    /// a check and disables; the tap used to give ZERO feedback, reading as "does nothing" (#21).
+    @State private var queuedDownloads: Set<String> = []
     @State private var collapsed: Set<String> = []      // per-add-on sections the user folded away
     @State private var qualityTier: String? = nil       // second-level quality sheet (a resolution tier)
     @State private var sortMode: SourceSort = .best     // how the rows within each add-on are ordered
@@ -2058,7 +3091,9 @@ struct iOSSourceList: View {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
-                    Button { play(best, url) } label: {
+                    // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
+                    // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
+                    Button { if let playBest { playBest(groups.flatMap(\.streams)) } else { play(best, url) } } label: {
                         if loading {
                             HStack(spacing: Theme.Space.sm) {
                                 ProgressView().tint(Theme.Palette.onAccent)
@@ -2157,14 +3192,16 @@ struct iOSSourceList: View {
     private var groupedList: some View {
         LazyVStack(spacing: Theme.Space.sm) {
             ForEach(visibleGroups) { group in
-                Section {
-                    if !collapsed.contains(group.addon) {
-                        ForEach(Array(sortedStreams(group).enumerated()), id: \.offset) { _, stream in
-                            streamRow(group.addon, stream)
-                        }
+                // Header + rows as flat SIBLINGS, NOT wrapped in `Section {} header: {}`. On macOS the
+                // LazyVStack + Section(header:) combo mis-measures section geometry during lazy realization -
+                // a not-yet-built section reserves a near-viewport-height blank, which is the reported
+                // "sources vanish / big blank gaps on scroll". Emitting them flat removes that reservation
+                // while KEEPING the LazyVStack, so a title with thousands of sources still won't OOM on tvOS.
+                sectionHeader(group)
+                if !collapsed.contains(group.addon) {
+                    ForEach(Array(sortedStreams(group).enumerated()), id: \.offset) { _, stream in
+                        streamRow(group.addon, stream)
                     }
-                } header: {
-                    sectionHeader(group)
                 }
             }
         }
@@ -2221,13 +3258,22 @@ struct iOSSourceList: View {
                 // A visible per-row Download affordance (the context menu carries the same action for
                 // discoverability). `#if !os(tvOS)`-gated implicitly by the optional closure being nil there.
                 if let download {
-                    Button { download(stream, url) } label: {
-                        Image(systemName: "arrow.down.circle")
+                    let key = url.absoluteString
+                    Button {
+                        download(stream, url)
+                        queuedDownloads.insert(key)
+                    } label: {
+                        Image(systemName: queuedDownloads.contains(key) ? "checkmark.circle.fill" : "arrow.down.circle")
                             .font(.system(size: 22))
                             .foregroundStyle(Theme.Palette.accent)
+                            // A full-size tap target: the bare 22pt glyph's hit area was near-untappable
+                            // next to the big play row, which is why the icon read as dead (#21).
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Download this source")
+                    .disabled(queuedDownloads.contains(key))
+                    .accessibilityLabel(queuedDownloads.contains(key) ? "Download queued" : "Download this source")
                     .padding(.trailing, Theme.Space.xs)
                 }
             }
@@ -2239,9 +3285,13 @@ struct iOSSourceList: View {
         }
     }
 
-    /// True when this raw torrent's infoHash is in the debrid-confirmed cached set (drives the row chip).
-    /// False for every stream when the set is empty (no key / not yet checked), so no chips render.
+    /// True when this row is confirmed cached in the user's debrid account (drives the row ⚡). A raw
+    /// torrent matches by infoHash; a USENET row matches its nzb link against the usenet-cached set. False
+    /// for every stream when both sets are empty (no key / not yet checked), so no chips render.
     private func isDebridCached(_ stream: CoreStream) -> Bool {
+        if let nzb = stream.nzbUrl, !nzb.isEmpty {
+            return !cachedUsenetURLs.isEmpty && cachedUsenetURLs.contains(nzb)
+        }
         guard !cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
         return cachedHashes.contains(h)
     }
@@ -2293,13 +3343,22 @@ private struct iOSStreamLabel: View {
     let stream: CoreStream
     let enabled: Bool
     var pinned: Bool = false
-    /// This raw torrent is cached in the user's debrid account (coordinator-confirmed). Adds a small
-    /// "Cached" chip; false by default so the row is unchanged when no key is configured.
+    /// This raw torrent is cached in the user's debrid account (coordinator-confirmed). The row ALSO lights
+    /// the "⚡ CACHED" badge when the add-on's own text marks the source cached, so this only needs to be the
+    /// native-hash signal; false by default so a coordinator with no key still defers to the text markers.
     var debridCached: Bool = false
 
     var body: some View {
         let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
-        let flavors = StreamRanking.flavorTags(stream)           // flavour only — quality is the badge below
+        // A row is cached when EITHER the native coordinator confirmed this raw torrent's hash
+        // (`debridCached`) OR the add-on's own text carries a cache marker (⚡ / [RD+] / "cached" / …).
+        // Owner's streams are pre-resolved debrid-ADDON links, so the native hash check collects nothing;
+        // the text-marker path is what actually lights the badge for him. `signature` is the public
+        // wrapper over the private `qualityText`, so it's the same text `isCached` parses internally.
+        let cached = debridCached || StreamRanking.isCached(stream, StreamRanking.signature(stream))
+        // Drop the plain "Cached" flavour chip when the row already shows the prominent "⚡ CACHED" badge,
+        // so a cached row reads as one bolt badge, not a doubled bolt-plus-plain-"Cached".
+        let flavors = StreamRanking.flavorTags(stream).filter { !($0 == "Cached" && cached) }
         let size = StreamRanking.sizeText(stream)
         return HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
@@ -2319,9 +3378,10 @@ private struct iOSStreamLabel: View {
                     // one above (the reported double tag). Real add-on names still show.
                     if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
                     if stream.isTorrent { badge("TORRENT") }
-                    // Debrid cache chip: this raw torrent is instant from the user's debrid account. Reuses
-                    // the prominent (accent) badge style with a bolt glyph; only shows when confirmed cached.
-                    if debridCached { badge("⚡ CACHED", prominent: true) }
+                    // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
+                    // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
+                    // badge style with a bolt glyph; only shows when cached.
+                    if cached { badge("⚡ CACHED", prominent: true) }
                 }
                 // Parsed flavour tags + size — the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".

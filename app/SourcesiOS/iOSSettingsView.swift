@@ -50,17 +50,38 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     // Streaming/seek cache budget, stored as a raw byte count (0 = Off, -1 = Unlimited). @AppStorage is
     // Int-typed; Int is 64-bit on every Apple device this runs on, so the byte budgets are exact.
-    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
+    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
+    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
+    @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
+    @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
+    @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
+    @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
     @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true   // share/fetch scrub previews
+    // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
+    // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
+    @AppStorage(MoatConsent.key) private var moatContribute = true
+    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    /// Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id.
+    /// Empty = follow the app UI language (the default; `TMDBClient.trailerLanguageOverride` treats empty as
+    /// unset). Read by TMDBClient.preferredTrailerLanguages / trailerLanguageBaseCode.
+    @AppStorage("stremiox.trailerLanguage") private var trailerLanguage = ""
+    /// Auto-add watched to Library (D8): when playback of a title crosses ~60s it is added to the Library.
+    /// Default ON. Read at the 60s progress tick in PlayerScreen / TVPlayerView via LibraryAutoAdd.
+    @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true
+    /// Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
+    /// writes this same key, so the last level persists; this picker sets it explicitly. Read by PlayerScreen.
+    @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
@@ -103,6 +124,7 @@ struct iOSSettingsView: View {
                 playbackSection.listRowBackground(Theme.Palette.surface1)
                 notificationsSection.listRowBackground(Theme.Palette.surface1)
                 streamsSection.listRowBackground(Theme.Palette.surface1)
+                communitySection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
@@ -123,7 +145,11 @@ struct iOSSettingsView: View {
             // this instead of the system blue/grey, matching how tvOS SettingsView colors its
             // controls. Per-control `.tint` overrides below stay (destructive red, etc.).
             .tint(Theme.Palette.accent)
+            // navigationTitle bridges into the single shared window toolbar on macOS where every mounted
+            // tab stamps its own title, crashing NSToolbar on duplicate inserts. So it is iOS-only.
+            #if os(iOS)
             .navigationTitle("Settings")
+            #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in
@@ -349,7 +375,7 @@ struct iOSSettingsView: View {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
             NavigationLink("Import from Stremio") { StremioImportView() }
-            NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
+            NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
         }
@@ -404,6 +430,10 @@ struct iOSSettingsView: View {
             }
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(.caption).foregroundStyle(.secondary)
+            Toggle("Dolby Vision for MKV (Beta)", isOn: $dvRemux)
+                .tint(Theme.Palette.accent)
+            Text("Plays Dolby Vision .mkv from debrid via an in-app remux. Experimental; falls back automatically if it fails.")
+                .font(.caption).foregroundStyle(.secondary)
             #endif
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
@@ -415,12 +445,36 @@ struct iOSSettingsView: View {
                 Text("SkipDB").tag("skipdb")
                 Text("Both").tag("both")
             }
+            NavigationLink("Skip database key") { SkipKeysView() }
             NavigationLink("Seek bar style") { SeekBarStylePicker() }
             Toggle("Community scrub previews", isOn: $communityTrickplay)
                 .tint(Theme.Palette.accent)
             Text("Share and reuse scrub-preview thumbnails across the community, so previews appear instantly without each device regenerating them. Only the generated thumbnails are shared, never any account data.")
                 .font(.caption).foregroundStyle(.secondary)
             Toggle("Autoplay trailers", isOn: $autoplayTrailers)
+                .tint(Theme.Palette.accent)
+            // Trailer language (D11): the language the trailer picker prefers when choosing the YouTube id.
+            // "App language" (the default) leaves the key empty so it follows the app UI language; a set
+            // value becomes the highest-priority trailer language in TMDBClient.preferredTrailerLanguages.
+            Picker("Trailer language", selection: $trailerLanguage) {
+                Text("App language").tag("")
+                ForEach(AppLanguage.supported, id: \.code) { lang in
+                    Text(lang.name).tag(lang.code)
+                }
+            }
+            // Default player volume (D5): the level a new playback starts at. The in-player volume slider
+            // writes the same key, so this also reflects the last level used. Coarse 0/25/50/75/100 steps,
+            // plus the exact current level as its own row when the in-player slider left it off-step (e.g.
+            // 60%), so the picker never snap-misreports the real starting level.
+            Picker("Default volume", selection: playerVolumeSelection) {
+                ForEach(playerVolumeSteps, id: \.self) { pct in
+                    Text(pct == 100 ? "Max (100%)" : "\(pct)%").tag(pct)
+                }
+            }
+            // Auto-add a title to the Library once ~60s of it has played (D8). Default ON. The engine adds it
+            // through the account library on the main profile; overlay profiles are skipped (never touch the
+            // account library). A manual removal is remembered so a title is not force-re-added on replay.
+            Toggle("Auto-add watched to Library", isOn: $autoAddLibrary)
                 .tint(Theme.Palette.accent)
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
@@ -480,14 +534,36 @@ struct iOSSettingsView: View {
     private var diskCacheFooter: String {
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
         guard diskCacheBytes != 0 else { return base }
-        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
-        return base + "\n" + String(localized: "Current cache: \(usage).")
+        // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the
+        // buffer is RAM-resident), so it always read "0 KB". Show the real RAM-bounded budget instead.
+        let budget = DiskCacheSetting.humanReadable(DiskCacheSetting.resolvedMaxBytes())
+        return base + "\n" + String(localized: "Cache budget: \(budget).")
     }
 
     /// Direct Links Only writes the flat key; turning it OFF cold-starts the embedded server so
     /// torrents work again without a relaunch (guarded out of the Lite build that ships no server).
     /// Toggling new-episode alerts: enabling asks the system for permission, and `setEnabled` writes the
     /// stored key (which this @AppStorage mirrors), so the switch settles to the real authorization state.
+    /// Picker rows for default volume: the coarse 0/25/50/75/100 steps, plus the exact current level when the
+    /// in-player fine slider left `stremiox.playerVolume` off-step (e.g. 60), so the picker can show the real
+    /// value instead of snapping it to a wrong neighbour.
+    private var playerVolumeSteps: [Int] {
+        let steps = [0, 25, 50, 75, 100]
+        let current = Int(playerVolume.rounded())
+        return steps.contains(current) ? steps : (steps + [current]).sorted()
+    }
+
+    /// Maps the continuous `stremiox.playerVolume` (0-100 Double, shared with the in-player slider) onto the
+    /// `playerVolumeSteps` picker. The getter returns the exact current level (which `playerVolumeSteps`
+    /// always includes) so the shown selection matches the real starting level; the setter writes the chosen
+    /// percentage so the player launches at that level.
+    private var playerVolumeSelection: Binding<Int> {
+        Binding(
+            get: { Int(playerVolume.rounded()) },
+            set: { playerVolume = Double($0) }
+        )
+    }
+
     private var notifyNewEpisodesBinding: Binding<Bool> {
         Binding(
             get: { notifyNewEpisodes },
@@ -628,6 +704,34 @@ struct iOSSettingsView: View {
                 }
                 Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
             }
+        }
+    }
+
+    // MARK: Community & privacy
+
+    /// The give-to-get master switch + the opt-in "Singularity" community source index. The master toggle
+    /// governs whether this device both contributes anonymized metadata AND consumes every pooled feature;
+    /// off = out of the whole pool. Singularity SERVE is a further per-device opt-in that also needs sign-in.
+    @ViewBuilder private var communitySection: some View {
+        Section {
+            Toggle("Contribute anonymized data to improve results", isOn: $moatContribute)
+                .tint(Theme.Palette.accent)
+            Text(MoatConsent.disclosure)
+                .font(.caption).foregroundStyle(.secondary)
+            if moatContribute {
+                Toggle("Singularity sources", isOn: $singularityServe)
+                    .tint(Theme.Palette.accent)
+                    .disabled(!account.isSignedIn)
+                if account.isSignedIn {
+                    Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Sign in to VortX to turn on Singularity sources.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Community")
         }
     }
 
@@ -797,10 +901,28 @@ struct iOSSettingsView: View {
             // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
             // cannot remove from Home" report).
             Toggle("Show editorial Home rows", isOn: $showCuratedRails)
-            // Browse-by-streaming-service rails (Netflix, Disney+, ...), from TMDB watch providers; needs a TMDB key.
-            Toggle("Show streaming-service rows", isOn: $showStreamingRails)
-            // Cinematic 16:9 landscape catalog cards (clean TMDB backdrops) vs the legacy portrait posters.
-            Toggle("Cinematic landscape cards", isOn: $catalogPrefs.landscapeCards)
+            // Collections hub (Discover cards + Streaming-service tiles + Genre tiles) on Home / Discover; needs a TMDB key.
+            Toggle("Collections on Home", isOn: $showHubHome)
+            Toggle("Collections on Discover", isOn: $showHubDiscover)
+            Picker("Refresh collections", selection: $hubCadence) {
+                Text("Daily").tag("daily")
+                Text("Twice daily").tag("twiceDaily")
+                Text("4x daily").tag("fourTimesDaily")
+            }
+            NavigationLink("Reorder streaming services") { iOSReorderServicesView() }
+            NavigationLink("Discover & region") { iOSDiscoverSettingsView() }
+            // Fold Search into Discover (one combined surface with a search field above the browse) so the
+            // tab bar is less cluttered on mobile. Default OFF, fully reversible — Search returns as its own tab.
+            Toggle("Combine Discover & Search", isOn: $mergeDiscoverSearch)
+            Toggle("Budget & box office", isOn: $showFinancials)
+            Toggle("Blur unwatched episode thumbnails", isOn: $spoilerBlur)
+            // Poster appearance (width / corner radius / landscape art / labels) lives on its own screen
+            // with a live preview. The old inline "Cinematic landscape cards" toggle moved there.
+            NavigationLink("Poster style") { iOSPosterStyleView() }
+            // Surface the hide-labels toggle here too so it is discoverable without opening Poster style.
+            // It applies across every poster rail (Discover, Home, Continue Watching, More Like This) since
+            // they all render through the shared PosterCardiOS which reads this same preference.
+            Toggle("Hide poster labels", isOn: $catalogPrefs.hidePosterLabels)
 
             // ThemeAccentPicker / ThemeBackgroundPicker are tvOS-only (declared in SourcesTV); on
             // iOS we bind native Pickers to the SAME ThemeManager state (accentID, oled).
@@ -1001,6 +1123,11 @@ struct iOSSettingsView: View {
             }
             LabeledContent("Version", value: appVersion)
             LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
+            NavigationLink {
+                WhatsNewView()
+            } label: {
+                Label("What's New", systemImage: "sparkles")
+            }
         }
     }
 

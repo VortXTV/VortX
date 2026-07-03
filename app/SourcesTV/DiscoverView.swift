@@ -10,6 +10,8 @@ struct DiscoverView: View {
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
+    @ObservedObject private var collectionsHub = CollectionsHubModel.shared
+    @AppStorage("vortx.discover.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Discover (needs a TMDB key)
     /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
@@ -25,7 +27,11 @@ struct DiscoverView: View {
                 BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
+                        Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Discover tab -> scroll here
                         Text("Discover").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                        if showCollectionsHub, CollectionsHubModel.isAvailable {
+                            TVCollectionsHub(model: collectionsHub)
+                        }
                         if let discover = core.discover {
                             typeChips(discover.selectable.types)
                             catalogChips(discover.selectable.catalogs)
@@ -42,11 +48,14 @@ struct DiscoverView: View {
                     .padding(.bottom, Theme.Space.xl)
                 }
                 .heroBottomStrip()
+                // Re-selecting the active Discover tab scrolls back to the top.
+                .scrollToTopOnBump(TabScrollKeys.discover)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { if core.discover == nil { core.loadDiscover() }; seed() }
+        .onAppear { if core.discover == nil { core.loadDiscover() }; seed(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: core.discover?.items.first?.id) { seed() }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
     }
 
     private func seed() {

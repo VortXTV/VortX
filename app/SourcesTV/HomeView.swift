@@ -10,10 +10,8 @@ struct HomeView: View {
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
-    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
-    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails (needs a TMDB key)
-    @StateObject private var groups = HomeGroupsModel()   // nested collections: grouped Streaming / Genres / Top New / New rails
-    @AppStorage("vortx.home.showCollectionGroups") private var showCollectionGroups = true   // toggle the whole nested-collection section (mostly TMDB-backed)
+    @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
+    @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -44,7 +42,12 @@ struct HomeView: View {
                     // the resolved URL so a focus change (which clears it) tears the libmpv layer down.
                     // Non-focusable + no hit-testing inside the view, so the focus engine is untouched.
                     .overlay {
-                        if autoplayTrailers, !reduceMotion, let url = heroTrailer.url {
+                        // Also gated by the RemoteConfig fleet kill-switch `features.trailers`: a remote
+                        // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
+                        // is degraded). Baked default true => absent/null remote is identical to shipping; the
+                        // user's "Auto-play trailers" setting still governs.
+                        if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
+                           !reduceMotion, let url = heroTrailer.url {
                             TVInHeroTrailerView(url: url)
                                 .ignoresSafeArea()
                                 .allowsHitTesting(false)
@@ -54,11 +57,18 @@ struct HomeView: View {
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Home tab -> scroll here
                         if !continueWatching.isEmpty {
                             // The long-press menu is safe on every profile now: Details is pure
                             // navigation, and the dismiss routes into the overlay profile's own
                             // history inside CoreBridge.removeFromLibrary.
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
+                        }
+                        // Collections hub (Discover cards, Streaming-service tiles, Genre tiles), right after
+                        // Continue Watching per the owner's row order. Each tile opens a sub-catalog browse grid.
+                        // Needs a TMDB key; hidden without one. Replaces the old flat streaming rails + nested groups.
+                        if showCollectionsHub, CollectionsHubModel.isAvailable {
+                            TVCollectionsHub(model: collectionsHub)
                         }
                         // Local recommendations seeded from this profile's recent watch history (#0.3.9).
                         // Hidden when there's no TMDB key, no history to seed from, or no results.
@@ -71,27 +81,26 @@ struct HomeView: View {
                         if !releaseCalendar.upcoming.isEmpty {
                             UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
                         }
+                        // "Upcoming Movies": library movies with a future release date in the next 45 days,
+                        // soonest first; hidden when nothing is upcoming. Each card routes to the movie DetailView.
+                        if !releaseCalendar.upcomingMovies.isEmpty {
+                            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                                RailHeader(eyebrow: "Coming soon", title: "Upcoming Movies")
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                                        ForEach(releaseCalendar.upcomingMovies) { m in
+                                            PosterCard(title: m.name, poster: m.poster, type: "movie", id: m.id, menu: .catalog,
+                                                       onFocus: { focusModel.focus(FocusedHero(id: m.id, type: "movie", title: m.name,
+                                                                                               backdrop: m.poster, metaLine: m.releaseDateLabel,
+                                                                                               overview: nil, genreLine: nil)) })
+                                        }
+                                    }
+                                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
+                                }
+                            }
+                        }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
-                        }
-                        // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service
-                        // in-region, from TMDB watch providers. Discovery only; cards play through the engine
-                        // like any catalog card. Hidden with no TMDB key; each rail drops when empty in-region.
-                        // Suppressed when the nested-collection section is on, since its "Streaming" GROUP
-                        // (group 1) reproduces these exact rails — showing both would duplicate the rows.
-                        if showStreamingRails && !showCollectionGroups {
-                            ForEach(streaming.collections) { collection in
-                                StreamingRow(title: collection.title, items: collection.items, focusModel: focusModel)
-                            }
-                        }
-                        // Nested collections (grouped rails): big group headers (Streaming / Genres / Top New /
-                        // New) each over their child rails, BELOW every flat rail above. Additive + empty-state
-                        // safe — a group with no rails is never built, and the whole section needs (mostly) a
-                        // TMDB key, so with no key + no network this renders nothing and the Home is unchanged.
-                        if showCollectionGroups {
-                            ForEach(groups.groups) { group in
-                                CollectionGroupSection(group: group, focusModel: focusModel)
-                            }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
@@ -101,6 +110,8 @@ struct HomeView: View {
                     .padding(.bottom, Theme.Space.xl)
                 }
                 .heroBottomStrip()
+                // Re-selecting the active Home tab scrolls the rail strip back to the top.
+                .scrollToTopOnBump(TabScrollKeys.home)
             }
             .overlay(alignment: .topLeading) {
                 header
@@ -110,9 +121,8 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showStreamingRails { streaming.load() }; if showCollectionGroups { groups.load() } }
-        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
-        .onChange(of: showCollectionGroups) { show in if show { groups.load() } else { groups.clear() } }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
@@ -137,11 +147,15 @@ struct HomeView: View {
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
-        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
-        guard !series.isEmpty else { releaseCalendar.clear(); return }
-        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let catalog = core.library?.catalog ?? []
         let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshMovies(movieIDs: movies.map(\.id), movieNames: movieNames, moviePosters: moviePosters, metaBases: bases)
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
@@ -176,8 +190,10 @@ struct HomeView: View {
 /// instant focus moves (the URL clears, which unmounts `TVInHeroTrailerView`), so the embedded server is
 /// hit at most once per settled item, never on every rotation.
 ///
-/// On the Lite build (no embedded server) a YouTube-only trailer has no `playableURL`, so this resolves nil
-/// and the still hero art stays — the no-op the owner asked for.
+/// YouTube trailers resolve to the native `{serverBase}/yt/{id}` full-trailer resolver (the SAME path the
+/// Trailer button plays; `StremioServer.trailerResolverBase` picks the in-process route on full builds and
+/// the public `trailer.vortx.tv/yt` resolver on Lite, so Lite plays hero trailers too). The retired R2
+/// `/clip` snippet is gone (owner directive). A resolve miss 404s into the player's still-backdrop fallback.
 @MainActor final class HomeHeroTrailerModel: ObservableObject {
     /// The settled item's resolved trailer URL, or nil while debouncing / when no trailer exists. Mounting
     /// `TVInHeroTrailerView` on this means clearing it tears the libmpv layer down at once.
@@ -220,8 +236,19 @@ struct HomeView: View {
     /// this item, so a late network reply for a since-abandoned item never paints.
     private func resolveTrailer(for hero: FocusedHero) async {
         guard let request = await fetchTrailer(for: hero), let playable = request.playableURL else { return }
+        // yt-direct: try the DEVICE-DIRECT stream first (resolved on the user's own IP). The hero clip is
+        // MUTED, so a video-only adaptive pick needs no audio sidecar; a miss keeps the /yt worker URL.
+        // A direct (non-YouTube) trailer stream already IS `playable`, so only YouTube ids resolve here.
+        var chosen = playable
+        if request.directURL == nil, let yt = request.youTubeID, !yt.isEmpty,
+           let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
+            chosen = resolved.videoURL
+            NSLog("[yt-direct] tvOS home ambient: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+        } else if request.directURL == nil {
+            NSLog("[yt-direct] tvOS home ambient: fallback-worker")
+        }
         guard currentItemID == hero.id, !Task.isCancelled else { return }
-        url = playable
+        url = chosen
     }
 
     /// Walk Cinemeta (for tt ids) + every installed meta add-on for this item's meta, building a
@@ -231,6 +258,7 @@ struct HomeView: View {
         var bases = metaSourceBases
         if hero.id.hasPrefix("tt") { bases.insert("https://v3-cinemeta.strem.io/", at: 0) }
         let candidates = bases.compactMap { URL(string: "\($0)meta/\(hero.type)/\(hero.id).json") }
+        let imdbID = hero.id.hasPrefix("tt") ? hero.id : nil
         for url in candidates {
             var request = URLRequest(url: url)
             request.timeoutInterval = 6
@@ -239,8 +267,21 @@ struct HomeView: View {
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let decoded = try? JSONDecoder().decode(TrailerMetaResponse.self, from: data),
                   let meta = decoded.meta else { continue }
-            if let trailer = meta.trailerRequest(title: hero.title) { return trailer }
+            if var trailer = meta.trailerRequest(title: hero.title) {
+                // Attach the hero's id / type / year for any downstream keying; the ambient in-hero clip now
+                // plays the meta's own YouTube trailer through the `/yt` native resolver (via `playableURL` ->
+                // `nativeFullTrailerURL`), the SAME path the full Trailer button uses. The retired R2 `/clip`
+                // pool no longer factors in, so a trailer with no direct stream and no YouTube id resolves to
+                // nil and the still backdrop stays (fail-soft).
+                trailer.imdbID = imdbID
+                trailer.mediaType = hero.type
+                trailer.year = meta.year
+                return trailer
+            }
         }
+        // No add-on-listed trailer (or no meta at all, e.g. a hub title Cinemeta doesn't know): with the R2
+        // `/clip` pool retired there is no id-only ambient source, so `playableURL` would resolve to nil and
+        // the hero keeps its still backdrop + Ken Burns. Return nil rather than a trailer-less request.
         return nil
     }
 }
@@ -253,6 +294,14 @@ private struct TrailerMetaResponse: Decodable {
     struct Meta: Decodable {
         let trailerStreams: [Stream]?
         let links: [Link]?
+        let releaseInfo: String?
+
+        /// 4-digit release year from releaseInfo ("2024", "2024-2025", "2024-"): the /clip resolver's
+        /// title+year disambiguator for heroes without an imdb id. Nil when not parseable.
+        var year: String? {
+            let yr = (releaseInfo?.prefix(4)).map(String.init)
+            return (yr?.count == 4 && yr?.allSatisfy(\.isNumber) == true) ? yr : nil
+        }
 
         /// Build a `TrailerRequest`: prefer a direct (non-YouTube) trailer stream, else a YouTube id from
         /// `trailerStreams` or a "Trailer" link. Nil when neither exists (so the still art stays).
@@ -347,6 +396,7 @@ struct CoreContinueWatchingRow: View {
                     ForEach(items) { item in
                         PosterCard(title: item.name, poster: item.poster,
                                    type: item.type, id: item.id, progress: item.progress,
+                                   resumeSeconds: item.resumeSeconds,
                                    menu: menu,
                                    onFocus: focusModel.map { model in
                                        { model.focus(item.focusedHero) }
