@@ -7,6 +7,7 @@ import Foundation
 enum WhatsNew {
     static let version = "0.3.10"
     static let highlights: [String] = [
+        "Posters are bigger by default. Catalog and rail cards now open at a larger, more cinematic size out of the box on iPhone, iPad, and Mac, and you can still tune the size in Settings, Appearance, Poster Style.",
         "Continue Watching now clears titles you have finished. A movie you watched to the end, marked as watched, or finished on another device no longer lingers in the row, and a series you are partway through still shows so you can pick up the next episode.",
         "The Streaming Services logos are now clearly legible. Every brand mark sits on a clean light plate, so marks like Apple TV+ and Paramount+ no longer blend into their tile.",
         "Account sync no longer silently drops a change when two devices save at the same moment, and your add-on order now stays consistent across your devices and the web dashboard.",

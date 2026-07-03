@@ -134,7 +134,7 @@ enum CatalogPrefsStore {
     /// Poster width preset (default `.balanced` = today's look). Read as a plain static so card/grid views
     /// can size off the main actor.
     static func widthPreset() -> PosterWidthPreset {
-        (UserDefaults.standard.string(forKey: widthKey)).flatMap(PosterWidthPreset.init(rawValue:)) ?? .balanced
+        (UserDefaults.standard.string(forKey: widthKey)).flatMap(PosterWidthPreset.init(rawValue:)) ?? .large
     }
     static func setWidthPreset(_ p: PosterWidthPreset) { UserDefaults.standard.set(p.rawValue, forKey: widthKey) }
 
