@@ -110,7 +110,7 @@ dependencies {
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
     // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
-    "fullImplementation"("dev.jdtech.mpv:libmpv:1.0.0")
+    "fullImplementation"("dev.jdtech.mpv:libmpv:0.5.1")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
