@@ -49,6 +49,13 @@ struct InHeroTrailerView: View {
     /// the view, never shared with the main player's coordinator.
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
 
+    /// "A fullscreen player is up" signal. This hero view stays MOUNTED under a presented player (the
+    /// browse UI is not torn down by fullScreenCover / the Mac host), so without this gate the clip's
+    /// libmpv instance kept decoding + re-fetching its looping 1080p trailer beneath the whole movie:
+    /// micro stutter and audio crackle on every stream. The clip unmounts while a player is active and
+    /// remounts (with a fresh reveal fade) when playback closes.
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
+
     /// Flips true once the clip has actually started decoding AND the start-delay beat has passed, which
     /// cross-fades it in over the still backdrop. Gating the reveal on real playback means a clip that never
     /// loads (offline server, resolver miss) simply never appears, leaving the still art.
@@ -80,7 +87,7 @@ struct InHeroTrailerView: View {
 
     var body: some View {
         ZStack {
-            if serverReady, !failed {
+            if serverReady, !failed, !playbackGate.playerActive {
                 // The muted, looping libmpv surface. Opacity-gated (not conditionally mounted) so the
                 // player keeps decoding behind the scrim while we wait for the start-delay beat; revealing
                 // it is a pure cross-fade with no reload.
@@ -120,6 +127,12 @@ struct InHeroTrailerView: View {
             } else {
                 serverReady = true
             }
+        }
+        // A fullscreen player presented over this hero just unmounted the clip (libmpv torn down). Reset
+        // the reveal beat so the clip re-runs its decode-gated fade-in when it remounts after playback
+        // closes, instead of flashing a black not-yet-decoding surface at full opacity.
+        .onChange(of: playbackGate.playerActive) {
+            if playbackGate.playerActive { showClip = false; didStart = false; startedDelay = false }
         }
         // Decorative ambient layer; the hero title / actions carry the accessible content.
         .accessibilityHidden(true)

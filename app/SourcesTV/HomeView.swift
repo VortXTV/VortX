@@ -7,6 +7,7 @@ struct HomeView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
@@ -46,8 +47,15 @@ struct HomeView: View {
                         // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
                         // is degraded). Baked default true => absent/null remote is identical to shipping; the
                         // user's "Auto-play trailers" setting still governs.
+                        //
+                        // `presenter.request == nil`: the player presents OVER the shell, which is only
+                        // opacity-hidden + disabled, NOT unmounted - so without this gate the hero clip's
+                        // libmpv instance kept decoding its looping 1080p trailer (and re-fetching it from
+                        // the CDN) underneath the whole movie: micro stutter and audio crackle on EVERY
+                        // stream, on every playback started while a hero clip was up. Unmounting here tears
+                        // the clip down the moment the player presents; it remounts fresh on close.
                         if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-                           !reduceMotion, let url = heroTrailer.url {
+                           !reduceMotion, presenter.request == nil, let url = heroTrailer.url {
                             TVInHeroTrailerView(url: url)
                                 .ignoresSafeArea()
                                 .allowsHitTesting(false)

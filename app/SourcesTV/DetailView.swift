@@ -761,7 +761,12 @@ struct DetailView: View {
     /// only reveals once it actually starts decoding and the server is confirmed online (see
     /// `TVInHeroTrailerView`), so a missing / slow / blocked trailer never blanks the band.
     @ViewBuilder private func heroTrailerLayer(_ m: CoreMetaItem) -> some View {
-        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
+        // `presenter.request == nil`: the player presents OVER this page, which stays mounted (only
+        // opacity-hidden + disabled) - so without this gate the hero clip's libmpv instance kept decoding
+        // its looping 1080p trailer underneath the whole movie: micro stutter and audio crackle on every
+        // stream started from this page. Unmounting tears the clip down the moment the player presents;
+        // it remounts fresh when playback closes.
+        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type), presenter.request == nil,
            let url = TrailerRequest.from(meta: m)?.playableURL {
             // Owner directive: play the WHOLE trailer muted + looping (window nil), the same full `/yt` trailer
             // as the Trailer button, not a 10s snippet (that only suited the retired short `/clip` mp4). For a

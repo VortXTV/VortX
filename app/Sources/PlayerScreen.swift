@@ -398,24 +398,32 @@ struct PlayerScreen: View {
     @State private var infoRows: [(String, String)] = []
 
     var body: some View {
-        #if os(iOS)
-        // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
-        // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
-        // server can transcode HLS); tvOS routes HLS in TVPlayerView.
-        if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url) {
-            HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
-                          onProgress: onProgress, onClose: onClose)
-                .ignoresSafeArea()
-                .statusBarHidden(true)
-        } else {
+        Group {
+            #if os(iOS)
+            // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
+            // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
+            // server can transcode HLS); tvOS routes HLS in TVPlayerView.
+            if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url) {
+                HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
+                              onProgress: onProgress, onClose: onClose)
+                    .ignoresSafeArea()
+                    .statusBarHidden(true)
+            } else {
+                mpvBody
+            }
+            #else
+            // macOS (#46): the AVPlayer engine now sits behind the SAME full chrome (playerSurface mounts
+            // AVPlayerEngineView for Dolby Vision / the "Prefer AVPlayer" override, else libmpv), so the Mac no
+            // longer drops to a bare AVKit player without the episode list / quality / sources panels.
             mpvBody
+            #endif
         }
-        #else
-        // macOS (#46): the AVPlayer engine now sits behind the SAME full chrome (playerSurface mounts
-        // AVPlayerEngineView for Dolby Vision / the "Prefer AVPlayer" override, else libmpv), so the Mac no
-        // longer drops to a bare AVKit player without the episode list / quality / sources panels.
-        mpvBody
-        #endif
+        // Ambient-hero gate: the browse UI (and any mounted in-hero trailer clip) stays alive UNDER this
+        // fullscreen player, so signal "a player is up" for as long as this screen is mounted - the hero
+        // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
+        // whole movie (micro stutter + audio crackle on every stream).
+        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear() }
+        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear() }
     }
 
     #if os(iOS) || os(macOS)
