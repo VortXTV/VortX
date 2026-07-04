@@ -16,9 +16,27 @@ import Libavutil
 /// (PGS/HDMV, DVD/VobSub, DVB) are SKIPPED: they are bitmaps, not text, and OCR is out of scope.
 ///
 /// FAIL-SOFT: returns `[]` on ANY error (open failure, no text tracks, decode failure). Never throws. Must be
-/// called OFF the main thread (it does blocking libav I/O). Accepts a local file path OR a direct/debrid
-/// HTTP(S) URL that libav can open (same inputs `MKVRemuxSession.remux` accepts).
+/// called OFF the main thread (it does blocking libav I/O).
+///
+/// LOCAL FILES ONLY: the packet loop below (`av_read_frame`) walks the ENTIRE container sequentially - text
+/// cues are interleaved through the whole file, so there is no cheap way to collect them. On a local file
+/// (a finished download) that is a quick disk read; on a network input it makes libav RE-DOWNLOAD the whole
+/// file at full rate alongside the player. That second stream was the 0.3.9/0.3.10 Apple TV regression:
+/// a streamed 1080p remux (20+ GB, and remuxes are exactly the files that carry embedded text tracks)
+/// accumulated frame drops and distorted audio minutes in, stacking a further never-cancelled full-file
+/// read on every restart and episode switch, and only running smooth again once a read finished during a
+/// long pause. So `extractTextSubtitles` hard-refuses any non-file input; callers can pre-check with
+/// `isLocalFileInput` to avoid spawning work at all. The 127.0.0.1 torrent loopback counts as REMOTE - its
+/// bytes still have to be downloaded by the torrent engine before they can be read.
 enum SubtitleEmbeddedExtractor {
+
+    /// True only for an input that is already fully on this device: an absolute file path or a file:// URL.
+    /// Everything else (http/https debrid or CDN links, and the 127.0.0.1 torrent loopback) is remote.
+    static func isLocalFileInput(_ input: String) -> Bool {
+        if input.hasPrefix("/") { return true }
+        if let url = URL(string: input), url.isFileURL { return true }
+        return false
+    }
 
     /// One extracted text subtitle track.
     struct ExtractedTrack: Sendable {
@@ -31,6 +49,7 @@ enum SubtitleEmbeddedExtractor {
     /// Extract every TEXT subtitle track from `input`. `preferVTT` picks the WebVTT container for the output
     /// text (default false = SRT). Blocking; call off the main thread. Returns `[]` on any error.
     static func extractTextSubtitles(input: String, preferVTT: Bool = false) -> [ExtractedTrack] {
+        guard isLocalFileInput(input) else { return [] }   // see the type doc: never demux a network input
         var ifmt: UnsafeMutablePointer<AVFormatContext>? = nil
         guard avformat_open_input(&ifmt, input, nil, nil) == 0, let inCtx = ifmt else { return [] }
         defer { var p: UnsafeMutablePointer<AVFormatContext>? = inCtx; avformat_close_input(&p) }

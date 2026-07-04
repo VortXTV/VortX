@@ -2892,14 +2892,18 @@ struct PlayerScreen: View {
 
     /// P4: extract the file's own embedded TEXT subtitle tracks off-main and upload each to the pool so users
     /// on a different rip benefit. Best-effort, once per session, never blocks playback; ignores failures.
+    /// LOCAL FILES (finished downloads) ONLY: extraction demuxes the whole container, so on a streamed play it
+    /// re-downloaded the entire file next to the player - the Apple TV "remux builds up frame drops and
+    /// distorted audio" regression (same code path here on iPhone/iPad/Mac), stacking a further never-cancelled
+    /// full-file read on every restart and episode switch. The extractor hard-refuses remote inputs too;
+    /// checking here skips spawning the task.
     private func uploadEmbeddedSubtitlesIfNeeded() {
         guard !embeddedUploadDone, let contentKey = communityContentKey else { return }
         embeddedUploadDone = true
+        let inputStr = (curURL ?? url).absoluteString
+        guard SubtitleEmbeddedExtractor.isLocalFileInput(inputStr) else { return }
         refreshSubFingerprint()
         let fp = subFingerprint
-        // libav opens the SAME input the player plays (a local file, a direct/debrid HTTP URL). Torrents play
-        // through the loopback streaming server URL, which libav can also open.
-        let inputStr = (curURL ?? url).absoluteString
         Task.detached(priority: .utility) {
             let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
             for track in tracks where track.cueCount > 0 {

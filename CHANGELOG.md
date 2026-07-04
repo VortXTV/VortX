@@ -4,6 +4,12 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased
+
+### Fixed
+
+- **Streamed remuxes no longer build up frame drops and distorted audio minutes into playback.** Since 0.3.9, starting any stream whose file carries embedded text subtitles (remuxes, mostly) kicked off a background job that re-downloaded and demuxed the entire file alongside the player to share those subtitles with the community pool - on a 20+ GB remux that second full-rate stream starved playback, restarting the video or switching episodes stacked another copy of it (it was never cancelled), and playback only ran smooth again once a copy finished during a long pause. Embedded subtitles are now shared from downloaded files only, where reading them is a quick local pass; streamed plays skip the job entirely, and nothing else about community subtitles changes. Apple TV, iPhone, iPad, and Mac.
+
 ## 0.3.10 - build 151
 
 A hotfix over 0.3.9 that ends the "tried several sources, none worked" flash on a source that was actually still loading, restores instant playback, makes trailers actually play (video and audio, straight from your device), plays dual-layer Dolby Vision as true DV, clears finished titles out of Continue Watching, gives the Streaming Services row full brand-colored tiles, sharpens the community source list, and hardens account sync. In-place update, nothing resets.
