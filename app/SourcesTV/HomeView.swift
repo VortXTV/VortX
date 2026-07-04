@@ -35,24 +35,26 @@ struct HomeView: View {
                 // the rails lands straight on the tab bar.
                 // detailsBottom = strip height (470) + a breathing gap, so the synopsis can never
                 // run into the rail header regardless of tab-bar safe-area shifts.
-                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
+                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520) {
                     // #44: once focus SETTLES on a catalog item for ~3s, its muted FULL trailer fades in
-                    // behind the hero art (over the still backdrop, under the rails + details). Gated on
-                    // the same autoplay-trailers setting + reduce-motion as the detail hero, and keyed on
-                    // the resolved URL so a focus change (which clears it) tears the libmpv layer down.
-                    // Non-focusable + no hit-testing inside the view, so the focus engine is untouched.
-                    .overlay {
-                        // Also gated by the RemoteConfig fleet kill-switch `features.trailers`: a remote
-                        // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
-                        // is degraded). Baked default true => absent/null remote is identical to shipping; the
-                        // user's "Auto-play trailers" setting still governs.
-                        if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-                           !reduceMotion, let url = heroTrailer.url {
-                            TVInHeroTrailerView(url: url)
-                                .ignoresSafeArea()
-                                .allowsHitTesting(false)
-                        }
+                    // over the still backdrop but UNDER the logo / meta / synopsis (and under the rails), so
+                    // the hero details stay visible OVER the clip exactly as they read over the still art.
+                    // (The clip used to be an `.overlay` here, which painted it above the details and blanked
+                    // the hero of all its text while the clip played.) Gated on the same autoplay-trailers
+                    // setting + reduce-motion as the detail hero, and keyed on the resolved URL so a focus
+                    // change (which clears it) tears the libmpv layer down. Non-focusable + no hit-testing
+                    // inside the view, so the focus engine is untouched.
+                    // Also gated by the RemoteConfig fleet kill-switch `features.trailers`: a remote
+                    // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
+                    // is degraded). Baked default true => absent/null remote is identical to shipping; the
+                    // user's "Auto-play trailers" setting still governs.
+                    if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
+                       !reduceMotion, let url = heroTrailer.url {
+                        TVInHeroTrailerView(url: url)
+                            .ignoresSafeArea()
+                            .allowsHitTesting(false)
                     }
+                }
                 // The rails live in a bottom strip. The focus engine centers focused rows inside
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {

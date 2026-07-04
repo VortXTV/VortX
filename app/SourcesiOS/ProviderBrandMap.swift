@@ -60,6 +60,18 @@ enum ProviderBrandMap {
             73:   hex(18, 18, 18),     // Tubi - dark (the magenta wordmark reads on it)
             300:  hex(0, 30, 60),      // Pluto TV - dark blue
             11:   hex(12, 12, 12),     // MUBI - black
+            // Regional services (India-heavy long tail). No bundled mark, so the tile paints this flat brand
+            // color and frames TMDB's remote logo (with the provider FULL NAME as the load/failure fallback,
+            // never a single letter). Colors mirror ProviderBrandLogo.brandStyles; darkened to sit with the
+            // rest of the row. Neutral-dark where the exact brand hue is uncertain, which the name still reads.
+            232:  hex(120, 18, 120),   // ZEE5 - deep purple/magenta
+            237:  hex(14, 14, 20),     // Sony LIV - near-black
+            220:  hex(14, 14, 16),     // JioCinema - near-black
+            121:  hex(48, 20, 96),     // Voot - deep purple
+            515:  hex(18, 18, 22),     // MX Player - dark
+            532:  hex(170, 22, 28),    // Aha - deep red
+            218:  hex(14, 14, 18),     // Eros Now - near-black
+            442:  hex(14, 14, 16),     // Lionsgate Play - near-black
         ]
     }()
 
@@ -88,11 +100,24 @@ enum ProviderBrandMap {
         aliasToCanonical[providerID] ?? providerID
     }
 
-    /// Collapse duplicate brand tiles (Apple TV / Apple TV+, Prime aliases, Max/HBO Max, Discovery+),
-    /// keeping the FIRST occurrence of each canonical brand so the upstream ranking order is preserved.
+    /// A stable brand-identity key for a provider, so two TMDB ids that resolve to the SAME visible brand
+    /// collapse to one tile even when they are not in the hand-maintained `aliasToCanonical` pairs. Priority:
+    /// the bundled logo slug (Prime 9/119 -> "primevideo", Apple 2/350 -> "appletv", Max 1899/384 -> "max",
+    /// Discovery+ 520/524 -> "discoveryplus" all share a slug), then the canonical alias id (covers brands we
+    /// dedupe but do not ship a bundled mark for), then the raw id. Disney+ (337) and Disney+ Hotstar (122)
+    /// stay distinct on purpose: different slugs, genuinely different services in the regions that list both.
+    private static func brandIdentityKey(for providerID: Int) -> String {
+        if let slug = ProviderBrandLogo.bundledLogoName(for: providerID) { return "slug:\(slug)" }
+        return "id:\(canonicalProviderID(for: providerID))"
+    }
+
+    /// Collapse duplicate brand tiles by RESOLVED brand identity (the bundled logo slug, else the canonical
+    /// alias id), so each visible brand appears ONCE: Apple TV / Apple TV+, the Prime, Max/HBO Max and
+    /// Discovery+ alias pairs, and any future split ids that share a bundled mark. Keeps the FIRST occurrence
+    /// of each brand so the upstream (region/user-order) ranking is preserved.
     static func dedupeProviders(_ providers: [TMDBClient.ProviderTile]) -> [TMDBClient.ProviderTile] {
-        var seen = Set<Int>()
-        return providers.filter { seen.insert(canonicalProviderID(for: $0.providerID)).inserted }
+        var seen = Set<String>()
+        return providers.filter { seen.insert(brandIdentityKey(for: $0.providerID)).inserted }
     }
 
     /// The bundled first-party logo slug for a provider (the real brand PNG under Resources/streaming-logos),

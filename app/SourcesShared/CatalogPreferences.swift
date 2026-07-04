@@ -44,16 +44,20 @@ enum PosterWidthPreset: String, CaseIterable, Identifiable {
         (regularWidth * 200.0 / 224.0).rounded()
     }
 
-    /// The card/track width in points on a COMPACT width class (iPhone portrait). `.balanced` equals today's
-    /// `iOSPillMetrics.gridPosterWidthCompact` (116) so the default phone grid is byte-for-byte unchanged.
+    /// The card/track width in points on a COMPACT width class (iPhone portrait). The default `.balanced`
+    /// lands at 168 so the movie/show poster grid shows ~2 across, matching the size of the Streaming Services
+    /// and Discover category tiles (which are viewport-2-up on a phone). The old 3-across default (116) made the
+    /// poster cards read smaller than those tiles; the whole compact ladder is shifted up so `.balanced` is the
+    /// big 2-up default while `.compact`/`.dense`/`.standard` still offer the tighter 3-across look. Regular
+    /// (iPad/Mac `regularWidth`) and tvOS (`tvWidth`) are unchanged, so only the phone default grows.
     var compactWidth: CGFloat {
         switch self {
-        case .compact:  return 92
-        case .dense:    return 104
-        case .standard: return 110
-        case .balanced: return 116
-        case .comfort:  return 140
-        case .large:    return 168
+        case .compact:  return 110
+        case .dense:    return 130
+        case .standard: return 148
+        case .balanced: return 168
+        case .comfort:  return 186
+        case .large:    return 200
         }
     }
 }

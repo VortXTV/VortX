@@ -341,17 +341,36 @@ extension View {
 
 /// The browse pages' background layer: the focused title's artwork at full bleed with a detail
 /// block (title, meta line, synopsis) on the upper-left band. Content scrolls over it.
-struct BrowseHeroBackdrop: View {
+struct BrowseHeroBackdrop<TrailerLayer: View>: View {
     @ObservedObject var model: FocusedItemModel
     var detailsTop: CGFloat = 90   // Home: just under the tab bar; grid pages: below their chips
     /// When set, the block's BOTTOM is pinned this far above the container's bottom edge instead of
     /// using `detailsTop`. The rails strip anchors to the same edge, so the two can never collide
     /// even as the tab bar shows or hides and shifts the top safe area.
     var detailsBottom: CGFloat? = nil
+    /// The ambient muted trailer clip, layered BETWEEN the still backdrop and the details block so the
+    /// logo / title / meta / synopsis stay legible OVER the clip (identical to how they read over the
+    /// still art). Home passes its focus-settled `TVInHeroTrailerView` here; grid pages pass nothing
+    /// (the default `EmptyView`), so their still-art heroes are unchanged. Previously the clip was an
+    /// `.overlay` on this view, which painted it ABOVE the details and blanked the hero of all its text
+    /// while the clip played.
+    var trailer: () -> TrailerLayer
     @EnvironmentObject private var theme: ThemeManager
     /// The focused title's clean TMDB clearlogo (textless PNG), resolved by id like the landscape cards.
     /// nil until it resolves (or when TMDB has none / no key) - the title then falls back to styled text.
     @State private var heroLogo: UIImage?
+
+    init(
+        model: FocusedItemModel,
+        detailsTop: CGFloat = 90,
+        detailsBottom: CGFloat? = nil,
+        @ViewBuilder trailer: @escaping () -> TrailerLayer = { EmptyView() }
+    ) {
+        self.model = model
+        self.detailsTop = detailsTop
+        self.detailsBottom = detailsBottom
+        self.trailer = trailer
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -360,6 +379,10 @@ struct BrowseHeroBackdrop: View {
                 FullBleedBackdrop(url: hero.backdrop)
                     .id(hero.id)
                     .transition(.opacity)
+                // The muted trailer clip sits OVER the still backdrop but UNDER the details, so a
+                // resolved clip becomes the moving background while the logo / meta / synopsis stay on
+                // top (the fallback still art keeps the same z-order, so the hero never blanks).
+                trailer()
                 if model.detailsVisible {
                     positioned(detailsBlock(hero)
                         .frame(maxWidth: 860, alignment: .leading)

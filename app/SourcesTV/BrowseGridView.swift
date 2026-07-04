@@ -37,6 +37,8 @@ struct TVCollectionsHub: View {
             }
             if showStreaming, !model.providers.isEmpty {
                 section(title: "Streaming Services", eyebrow: "Browse by service") {
+                    // TODO(0.3.11): dedup by brand identity (move ProviderBrandMap.dedupeProviders from
+                    // SourcesiOS to SourcesShared so tvOS can call it; SourcesiOS is not in the tvOS target).
                     ForEach(model.providers) { p in
                         NavigationLink { TVCategoryBrowse(target: .service(id: p.providerID, name: p.name)) } label: { TVServiceTile(provider: p) }
                             .buttonStyle(CardFocusStyle())

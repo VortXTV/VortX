@@ -107,9 +107,9 @@ struct iOSCollectionsHub: View {
 enum iOSPillMetrics {
     /// The shared tile/pill column width used across the hub tiles and the poster cards.
     static let cardWidth: CGFloat = 224
-    /// Poster-grid card width on a COMPACT iPhone only (#104): 224 fit just one column on a phone, so the
-    /// vertical poster grid + its cards use this narrower width there to show ~3 across. iPad/Mac stay at 224.
-    static let gridPosterWidthCompact: CGFloat = 116
+    /// Poster-grid card width on a COMPACT iPhone only (#104): the default now shows ~2 across (matching the
+    /// Streaming Services / Discover category tiles) instead of the old smaller 3-across. iPad/Mac stay at 224.
+    static let gridPosterWidthCompact: CGFloat = 168
 
     /// The poster-card / grid-track width for the user's Poster Style preset, size-class aware. The grid and
     /// the cards both call this so they stay in lockstep and the adaptive column count recomputes from the

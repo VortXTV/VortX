@@ -22,6 +22,9 @@ struct SettingsView: View {
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
     @State private var langSelection: String = AppLanguage.current ?? "system"
     @State private var showLangRestart = false
+    // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
+    @State private var showDiagExport = false
+    @State private var diagExport: (url: String, qr: Image)?
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
@@ -111,6 +114,12 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+        }
+        .fullScreenCover(isPresented: $showDiagExport, onDismiss: {
+            VXDiagExport.shared.stop()
+            diagExport = nil
+        }) {
+            diagExportSheet
         }
         // Track-language and subtitle-style edits belong to the ACTIVE profile: fold every
         // flat-key change back into it (the captureTheme pattern, RootTabView does the same for
@@ -830,7 +839,50 @@ struct SettingsView: View {
                                          set: { probeLogging = ($0 == "1"); if probeLogging { VXProbeHeartbeat.start() } }))
             Text("Logs detailed activity for troubleshooting.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // Apple TV has no share sheet, so the diagnostic log is exported over the LAN: this stands up a
+            // tiny local server and shows a QR the owner scans with their phone to download the log file.
+            Button {
+                diagExport = VXDiagExport.shared.start()
+                showDiagExport = true
+            } label: { Text("Export diagnostic log") }
+                .buttonStyle(ChipButtonStyle(selected: false))
         }
+    }
+
+    /// Full-screen QR export overlay: the phone scans the code, downloads vortx-diag.log over the LAN, and
+    /// sends it on. Dismissing stops the local server so the log is not left served.
+    @ViewBuilder private var diagExportSheet: some View {
+        VStack(spacing: Theme.Space.lg) {
+            Text("Export diagnostic log")
+                .font(Theme.Typography.screenTitle).foregroundStyle(Theme.Palette.textPrimary)
+            if let export = diagExport {
+                export.qr
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 420, height: 420)
+                    .background(Color.white)
+                    .padding(Theme.Space.md)
+                Text(export.url)
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Connect this device to Wi-Fi to export the diagnostic log.")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            Button {
+                showDiagExport = false
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            } label: { Text("Done") }
+                .buttonStyle(ChipButtonStyle(selected: true))
+        }
+        .padding(Theme.Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 
     private func choiceRow(_ label: String, _ options: [(id: String, label: String)],

@@ -29,6 +29,10 @@ struct iOSSettingsView: View {
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
     @State private var showSignIn = false
+    // Diagnostic-log export over the LAN: the sheet flag + the started (url, qr) payload. Identical to the
+    // tvOS SettingsView flow (settings parity); the phone scans the QR to download vortx-diag.log.
+    @State private var showDiagExport = false
+    @State private var diagExport: (url: String, qr: Image)?
     #if os(macOS)
     /// Drives the "Share streaming server on this network" toggle (macOS only). Backed by
     /// NodeServer.sharedOnLAN, which persists + restarts the node process when it flips.
@@ -156,6 +160,12 @@ struct iOSSettingsView: View {
             .navigationTitle("Settings")
             #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
+            .sheet(isPresented: $showDiagExport, onDismiss: {
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            }) {
+                diagExportSheet
+            }
             .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in
                 switch result {
@@ -528,11 +538,55 @@ struct iOSSettingsView: View {
                 .onChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
             Text("Logs detailed activity for troubleshooting.")
                 .font(.caption).foregroundStyle(.secondary)
+            // Export the rolling diagnostic log over the LAN: a phone on the same Wi-Fi scans the QR to
+            // download vortx-diag.log. Kept identical to the tvOS flow for settings parity.
+            Button("Export diagnostic log") {
+                diagExport = VXDiagExport.shared.start()
+                showDiagExport = true
+            }
+            .tint(Theme.Palette.accent)
         } header: {
             Text("Advanced (mpv options)")
         } footer: {
             Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
+    }
+
+    /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
+    /// LAN, and sends it on. Dismissing stops the local server so the log is not left served. Kept visually
+    /// identical to the tvOS export overlay for settings parity.
+    @ViewBuilder private var diagExportSheet: some View {
+        VStack(spacing: 24) {
+            Text("Export diagnostic log")
+                .font(.title2.bold()).foregroundStyle(Theme.Palette.textPrimary)
+            if let export = diagExport {
+                export.qr
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 320, maxHeight: 320)
+                    .background(Color.white)
+                    .padding(12)
+                Text(export.url)
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
+                    .font(.subheadline).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Connect this device to Wi-Fi to export the diagnostic log.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            Button("Done") {
+                showDiagExport = false
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            }
+            .tint(Theme.Palette.accent)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 
     /// External players present on this device, the choices the "Play in" picker offers. Evaluated once
