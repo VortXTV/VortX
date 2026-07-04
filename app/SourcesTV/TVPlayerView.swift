@@ -1774,7 +1774,11 @@ struct TVPlayerView: View {
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
-            guard !hasStartedPlaying, !loadFailed else { return }
+            // A cancelled watchdog (superseded by a hop / reload / new load) must NOT fire: Task.sleep throws
+            // CancellationError on cancel and `try?` swallows it, so without this guard the cancelled timer runs
+            // handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every source
+            // in milliseconds ("Tried N sources") over a source that was actually still loading.
+            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             handleStartTimeout()
         }
     }
@@ -1800,7 +1804,7 @@ struct TVPlayerView: View {
             loadTimeout?.cancel()
             loadTimeout = Task { @MainActor in
                 try? await Task.sleep(for: .seconds(20))
-                guard !hasStartedPlaying, !loadFailed else { return }
+                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }   // cancelled re-arm must not fire (see start-watchdog)
                 handleStartTimeout()
             }
             return
