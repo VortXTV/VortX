@@ -102,4 +102,11 @@ enum ProviderBrandMap {
     static func bundledLogoName(for providerID: Int) -> String? {
         ProviderBrandLogo.bundledLogoName(for: providerID)
     }
+
+    /// The full-bleed brand fill for a provider tile (Apple-TV-style: the brand color fills the whole pill),
+    /// or nil for the long tail. Delegates to the cross-platform `ProviderBrandLogo` table so iOS/Mac and
+    /// tvOS render one identical treatment.
+    static func brandStyle(for providerID: Int) -> BrandTileStyle? {
+        ProviderBrandLogo.brandStyle(for: providerID)
+    }
 }

@@ -185,26 +185,43 @@ struct iOSServiceTile: View {
     private var plateInset: CGFloat { plateWidth * BundledLogo.plateInsetFraction }
 
     var body: some View {
-        // Clean, dedicated brand tile (H1): the provider's official TMDB mark, sized medium and centered on
-        // the brand's FLAT color (curated map for the majors, warm-neutral fallback for the long tail), NOT
-        // the old blown-up fill-crop the owner rejected. We ship no brand artwork of our own - only the flat
-        // color lives in ProviderBrandMap; the logo image is always TMDB's official logo_path.
+        // Full-bleed brand tile (the Apple TV look the owner asked for): the brand's OWN color fills the whole
+        // pill edge to edge, with the bundled logo centered on top - Netflix full white + red wordmark, Disney+
+        // full blue + white logo, Apple TV+ full black + white logo, Hulu full black + green logo. No inset
+        // white plate, no letters. The flat color lives in ProviderBrandLogo.brandStyle; the logo image is our
+        // bundled first-party mark (SwiftUI-tinted white on dark fills, natural color on light fills).
         ZStack {
-            ProviderBrandMap.brandColor(for: provider.providerID)
-            // A top-down sheen -> deepening floor gives the flat brand tone real card depth (a soft highlight
-            // at the top, a darker base at the bottom) so every tile reads as a premium, cohesive brand card.
-            LinearGradient(colors: [.white.opacity(0.10), .clear, .black.opacity(0.28)],
-                           startPoint: .top, endPoint: .bottom)
-            if let slug = ProviderBrandMap.bundledLogoName(for: provider.providerID),
-               let bundled = BundledLogo.image(named: slug) {
-                // A mapped major ALWAYS shows its real bundled brand logo instantly - no network, no TMDB
-                // fill-crop, no letters. .fit + generous padding keeps a wordmark or a square icon whole and
-                // centered on the brand color, never edge-to-edge (the owner's "wtf are these logos" fix).
+            if let style = ProviderBrandMap.brandStyle(for: provider.providerID),
+               let slug = ProviderBrandMap.bundledLogoName(for: provider.providerID),
+               let bundled = BundledLogo.rawImage(named: slug) {
+                // The brand fill covers the ENTIRE tile (a top->bottom gradient; top == bottom reads as a flat
+                // solid), so the tile itself is the brand-colored pill.
+                LinearGradient(colors: [style.top, style.bottom], startPoint: .top, endPoint: .bottom)
+                // The bundled mark centered on top, tinted white on dark/saturated fills (a clean single-color
+                // wordmark) or kept its natural color on light fills (Netflix red on white). .fit keeps a
+                // wordmark or a square icon whole and large, filling ~62% of the tile width.
+                bundled
+                    .renderingMode(style.tintWhite ? .template : .original)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: width * 0.62, maxHeight: tileHeight * 0.62)
+            } else if let slug = ProviderBrandMap.bundledLogoName(for: provider.providerID),
+                      let bundled = BundledLogo.image(named: slug) {
+                // No curated brand style but we still bundle the mark: keep the plated look on the flat brand
+                // color so the tile is never a blank box (long-tail bundled marks: Plex, YouTube, SonyLIV, Zee5).
+                ProviderBrandMap.brandColor(for: provider.providerID)
+                LinearGradient(colors: [.white.opacity(0.10), .clear, .black.opacity(0.28)],
+                               startPoint: .top, endPoint: .bottom)
                 bundled
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: markWidth, maxHeight: markHeight)
             } else if let logo = provider.logoURL, let url = URL(string: logo) {
+                // The flat brand color + sheen frames the remote plate below for the unbundled long tail.
+                ProviderBrandMap.brandColor(for: provider.providerID)
+                LinearGradient(colors: [.white.opacity(0.10), .clear, .black.opacity(0.28)],
+                               startPoint: .top, endPoint: .bottom)
                 // Fallback for the long tail we don't bundle: the TMDB mark, on the SAME warm near-white plate
                 // the bundled majors use (#95: the bare mark drawn straight onto the dark brand tile read as
                 // "very dark"; a cropped w300 raster read as "incomplete"). The mark is aspect-fit and centered
@@ -236,6 +253,9 @@ struct iOSServiceTile: View {
                             .stroke(.black.opacity(0.10), lineWidth: 1)
                     )
             } else {
+                // No brand style, no bundled mark, no logoURL: the flat brand color (neutral fallback) with the
+                // provider FULL NAME, never a bare single letter.
+                ProviderBrandMap.brandColor(for: provider.providerID)
                 Text(provider.name)
                     .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
                     .multilineTextAlignment(.center).lineLimit(2).padding(10)

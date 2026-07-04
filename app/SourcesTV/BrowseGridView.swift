@@ -172,18 +172,33 @@ struct TVServiceTile: View {
     let provider: TMDBClient.ProviderTile
     var body: some View {
         ZStack {
-            (ProviderBrand.color(for: provider) ?? Theme.Palette.surface2)
-            if let slug = ProviderBrandLogo.bundledLogoName(for: provider.providerID),
-               let bundled = BundledLogo.image(named: slug) {
-                // A mapped major ALWAYS shows its real bundled brand logo instantly - no network, no TMDB
-                // fill-crop, no letters. The mark now FILLS the tile (owner: "logo should fill the pill"),
-                // .fit so a wordmark or square icon stays whole and centered on the brand color.
+            if let style = ProviderBrandLogo.brandStyle(for: provider.providerID),
+               let slug = ProviderBrandLogo.bundledLogoName(for: provider.providerID),
+               let bundled = BundledLogo.rawImage(named: slug) {
+                // Full-bleed brand tile (the Apple TV look): the brand's OWN color fills the whole pill edge to
+                // edge (a top->bottom gradient; top == bottom reads as a flat solid), with the bundled logo
+                // centered on top - tinted white on dark/saturated fills, natural color on light fills (Netflix
+                // red on white). No inset plate, no letters.
+                LinearGradient(colors: [style.top, style.bottom], startPoint: .top, endPoint: .bottom)
+                bundled
+                    .renderingMode(style.tintWhite ? .template : .original)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .foregroundStyle(.white)
+                    .frame(width: kHubCardWidth * 0.62, height: kHubCardWidth * 0.52 * 0.62)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let slug = ProviderBrandLogo.bundledLogoName(for: provider.providerID),
+                      let bundled = BundledLogo.image(named: slug) {
+                // No curated brand style but we still bundle the mark: keep the plated look on the flat brand
+                // color so a long-tail bundled mark (Plex, YouTube, SonyLIV, Zee5) is never a blank box.
+                (ProviderBrand.color(for: provider) ?? Theme.Palette.surface2)
                 bundled
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: kHubCardWidth * 0.82, height: kHubCardWidth * 0.52 * 0.72)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if provider.logoURL != nil {
+                (ProviderBrand.color(for: provider) ?? Theme.Palette.surface2)
                 // Fallback for the long tail we don't bundle: the TMDB mark, filling the tile too, .fit so a
                 // wordmark logo is never cropped. `brandName` gives RemoteLogo the provider FULL NAME to show
                 // while loading / on failure, so a long-tail tile is never an empty box and never a bare letter.
@@ -191,6 +206,9 @@ struct TVServiceTile: View {
                     .frame(width: kHubCardWidth * 0.86, height: kHubCardWidth * 0.52 * 0.76)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                // No brand style, no bundled mark, no logoURL: the flat brand color (neutral fallback) with the
+                // provider FULL NAME, never a bare single letter.
+                (ProviderBrand.color(for: provider) ?? Theme.Palette.surface2)
                 Text(provider.name).font(.system(size: 24, weight: .bold)).foregroundStyle(.white)
                     .multilineTextAlignment(.center).padding(Theme.Space.md)
             }

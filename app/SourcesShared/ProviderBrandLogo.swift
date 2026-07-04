@@ -62,6 +62,70 @@ enum ProviderBrandLogo {
 
     /// Whether we bundle a first-party logo for this provider (drives the "logo-first" branch in the tiles).
     static func hasBundledLogo(for providerID: Int) -> Bool { idToSlug[providerID] != nil }
+
+    /// Per-provider full-bleed brand fill for the "Streaming Services" tiles (the Apple TV look the owner
+    /// asked for): the brand's own color fills the WHOLE rounded pill edge to edge, with the bundled logo
+    /// centered on top. This replaces the old uniform near-white plate (white for every brand, aspect-fit so
+    /// it never filled the pill). `top`/`bottom` describe a top->bottom LinearGradient (set them equal for a
+    /// flat solid); `tintWhite` says whether the logo should be re-rendered white (dark or saturated brand
+    /// backgrounds) or kept its natural color (light backgrounds like Netflix's white pill, and the few marks
+    /// that read on their own on a dark tile). Returns nil for providers with no curated brand style, so the
+    /// tiles keep their existing logo/full-name fallback path.
+    static func brandStyle(for providerID: Int) -> BrandTileStyle? {
+        brandStyles[providerID]
+    }
+
+    /// sRGB brand color from 0-255 components.
+    private static func srgb(_ r: Double, _ g: Double, _ b: Double) -> Color {
+        Color(.sRGB, red: r / 255, green: g / 255, blue: b / 255, opacity: 1)
+    }
+
+    /// Curated full-bleed brand fills keyed by TMDB/JustWatch provider id. Alias ids (Prime 9/119, Disney
+    /// 337/122, Max 1899/384, Apple 350/2, Discovery+ 520/524) share a style so a not-yet-deduped list still
+    /// looks uniform. Each brand uses its official primary color; a light second stop deepens toward the base
+    /// so the flat tone reads as a real card. `tintWhite` is true for every dark/saturated fill (the logo is
+    /// re-rendered white for a clean single-color mark); it is false only where the mark must keep its natural
+    /// color: Netflix (red wordmark on its white pill), ESPN/light fills, and Hulu (green mark on black).
+    /// Note: a few marks whose art is predominantly BLACK (Peacock, Pluto TV) tint white despite reading as
+    /// "multicolor" brands, because a black wordmark would vanish on their dark tile; a visible logo wins.
+    private static let brandStyles: [Int: BrandTileStyle] = [
+        8:    BrandTileStyle(top: srgb(255, 255, 255), bottom: srgb(255, 255, 255), tintWhite: false), // Netflix
+        9:    BrandTileStyle(top: srgb(19, 153, 255),  bottom: srgb(15, 121, 198),  tintWhite: true),  // Prime Video
+        119:  BrandTileStyle(top: srgb(19, 153, 255),  bottom: srgb(15, 121, 198),  tintWhite: true),  // Prime Video (alias)
+        337:  BrandTileStyle(top: srgb(12, 22, 103),   bottom: srgb(27, 44, 138),   tintWhite: true),  // Disney+
+        122:  BrandTileStyle(top: srgb(12, 22, 103),   bottom: srgb(27, 44, 138),   tintWhite: true),  // Disney+ Hotstar
+        1899: BrandTileStyle(top: srgb(10, 30, 220),   bottom: srgb(59, 10, 160),   tintWhite: true),  // Max
+        384:  BrandTileStyle(top: srgb(10, 30, 220),   bottom: srgb(59, 10, 160),   tintWhite: true),  // HBO Max (alias)
+        350:  BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Apple TV+
+        2:    BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Apple TV (aliased to +)
+        531:  BrandTileStyle(top: srgb(0, 100, 255),   bottom: srgb(0, 71, 179),    tintWhite: true),  // Paramount+
+        15:   BrandTileStyle(top: srgb(11, 12, 15),    bottom: srgb(11, 12, 15),    tintWhite: false), // Hulu (green mark on black)
+        386:  BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Peacock (black wordmark, tint to show)
+        283:  BrandTileStyle(top: srgb(244, 117, 33),  bottom: srgb(224, 100, 15),  tintWhite: true),  // Crunchyroll
+        520:  BrandTileStyle(top: srgb(11, 92, 214),   bottom: srgb(10, 70, 168),   tintWhite: true),  // Discovery+
+        524:  BrandTileStyle(top: srgb(11, 92, 214),   bottom: srgb(10, 70, 168),   tintWhite: true),  // Discovery+ (alias)
+        43:   BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Starz
+        37:   BrandTileStyle(top: srgb(200, 16, 46),   bottom: srgb(142, 11, 32),   tintWhite: true),  // Showtime
+        526:  BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // AMC+
+        73:   BrandTileStyle(top: srgb(122, 8, 250),   bottom: srgb(90, 6, 189),    tintWhite: true),  // Tubi
+        300:  BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Pluto TV (black wordmark, tint to show)
+        38:   BrandTileStyle(top: srgb(255, 78, 152),  bottom: srgb(214, 60, 124),  tintWhite: true),  // BBC iPlayer
+        11:   BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // MUBI
+        344:  BrandTileStyle(top: srgb(18, 179, 227),  bottom: srgb(14, 144, 182),  tintWhite: true),  // Rakuten Viki
+    ]
+}
+
+/// The full-bleed brand fill for one streaming-service tile: a top->bottom gradient (top == bottom for a
+/// solid) that fills the WHOLE rounded pill, plus whether the bundled logo should be re-rendered white on top
+/// of it. Owned by `ProviderBrandLogo.brandStyle(for:)` and consumed by both tile layers (SourcesiOS
+/// `iOSServiceTile`, SourcesTV `TVServiceTile`) so iOS/Mac and tvOS render one identical treatment.
+struct BrandTileStyle {
+    /// Top gradient stop (the brand's primary color).
+    let top: Color
+    /// Bottom gradient stop (a deeper base; equal to `top` for a flat solid).
+    let bottom: Color
+    /// Re-render the logo white (dark/saturated fills) vs. keep its natural color (light fills).
+    let tintWhite: Bool
 }
 
 /// Cross-platform loader for a bundled PNG in the `streaming-logos` subdirectory of the app bundle. Returns a
@@ -90,6 +154,25 @@ enum BundledLogo {
         #elseif canImport(AppKit)
         guard let nsImage = NSImage(contentsOf: url) else { return nil }
         return plated(nsImage)
+        #else
+        return nil
+        #endif
+    }
+
+    /// Load `streaming-logos/<name>.png` as a RAW, un-plated SwiftUI Image (or nil if absent). This is the
+    /// full-bleed twin of `image(named:)`: the bundled marks are transparent single-color art, so a tile can
+    /// paint its own brand fill and lay the raw logo centered on top (tinting it white via `.renderingMode`
+    /// where the fill is dark), instead of the old warm near-white plate that was white for every brand. The
+    /// plated path stays for any caller that still wants the boxed look.
+    static func rawImage(named name: String) -> Image? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "png", subdirectory: "streaming-logos")
+        else { return nil }
+        #if canImport(UIKit)
+        guard let uiImage = UIImage(contentsOfFile: url.path) else { return nil }
+        return Image(uiImage: uiImage)
+        #elseif canImport(AppKit)
+        guard let nsImage = NSImage(contentsOf: url) else { return nil }
+        return Image(nsImage: nsImage)
         #else
         return nil
         #endif

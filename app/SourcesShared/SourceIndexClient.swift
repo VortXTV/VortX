@@ -150,7 +150,9 @@ enum SourceIndexClient {
     /// on AND the user is signed in AND consent is granted AND the fleet flag is on. Fail-soft to `[]` on any
     /// error, on the worker's `login_required` empty read, or when disabled.
     static func fetchPooled(contentID: String, isSignedIn: Bool) async -> [PooledSource] {
-        // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged.
+        // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged. Sign-in
+        // IS required (owner decision 2026-07-04: keep Singularity results a VortX-user-only benefit; the worker
+        // enforces the same login gate and serves an empty list to a tokenless caller). Contribute stays open.
         NSLog("[sing-probe] fetchPooled GATE contentID=%@ isEnabled=%@ serveEnabled=%@ isSignedIn=%@",
               contentID, isEnabled ? "on" : "off", serveEnabled ? "on" : "off", isSignedIn ? "yes" : "no")
         guard isEnabled, serveEnabled, isSignedIn else {
@@ -162,7 +164,13 @@ enum SourceIndexClient {
             NSLog("[sing-probe] fetchPooled URLComponents FAILED contentID=%@ -> []", contentID)
             return []
         }
-        comps.queryItems = [URLQueryItem(name: "content_id", value: contentID)]
+        // Ask for torrents ONLY: those are the cross-user PLAYABLE sources (infohash-keyed). Direct-http
+        // pool entries are stored as sha256(url) for privacy and cannot be replayed, so requesting all kinds
+        // just let unplayable http rows crowd the playable torrents out of the server's MAX_SERVE window.
+        comps.queryItems = [
+            URLQueryItem(name: "content_id", value: contentID),
+            URLQueryItem(name: "kind", value: "torrent"),
+        ]
         guard let url = comps.url else {
             NSLog("[sing-probe] fetchPooled url build FAILED contentID=%@ -> []", contentID)
             return []
@@ -317,8 +325,9 @@ final class SourceIndexServeSource: ObservableObject {
     private var lastContentID: String?
     private var task: Task<Void, Never>?
 
-    /// Fetch pooled sources for `contentID` when SERVE is enabled + the user is signed in. Fail-soft + deduped
-    /// by content id. Safe to call on every meta change / `.task` / `.onAppear`.
+    /// Fetch pooled sources for `contentID` when SERVE is enabled + the user is signed in (owner decision
+    /// 2026-07-04: Singularity results are a VortX-user-only benefit). Fail-soft + deduped by content id. Safe
+    /// to call on every meta change / `.task` / `.onAppear`.
     func refresh(contentID: String?, isSignedIn: Bool) {
         guard SourceIndexClient.serveEnabled, SourceIndexClient.isEnabled, isSignedIn,
               let contentID, contentID != lastContentID else {

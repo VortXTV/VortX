@@ -7,6 +7,7 @@ import Foundation
 enum WhatsNew {
     static let version = "0.3.10"
     static let highlights: [String] = [
+        "The Streaming Services tiles now look like the ones on the Apple TV app. Each tile is filled edge to edge with the service's own brand color, with its logo centered on top: Netflix on a white tile, Disney+ and Prime Video and Paramount+ on blue, Apple TV+ on black, Hulu on black with its green logo, Crunchyroll on orange, and more. No more logo floating on a small white card.",
         "Playback starts right away again. Tapping a source, or Watch Now, now begins in a second or two instead of loading for up to half a minute and flashing \"source failed\" first. When a source cannot open on the native player it falls back to the built-in player on the same source instantly, so you get the source you picked rather than a lower-quality one, and HLS and Dolby Vision still play on the native player.",
         "Posters are bigger by default. Catalog and rail cards now open at a larger, more cinematic size out of the box on iPhone, iPad, and Mac, and you can still tune the size in Settings, Appearance, Poster Style.",
         "Continue Watching now clears titles you have finished. A movie you watched to the end, marked as watched, or finished on another device no longer lingers in the row, and a series you are partway through still shows so you can pick up the next episode.",
