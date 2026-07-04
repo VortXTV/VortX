@@ -131,8 +131,10 @@ struct InHeroTrailerView: View {
         // A fullscreen player presented over this hero just unmounted the clip (libmpv torn down). Reset
         // the reveal beat so the clip re-runs its decode-gated fade-in when it remounts after playback
         // closes, instead of flashing a black not-yet-decoding surface at full opacity.
-        .onChange(of: playbackGate.playerActive) {
-            if playbackGate.playerActive { showClip = false; didStart = false; startedDelay = false }
+        // Single-parameter onChange form: the iOS target deploys to 16.0, where the zero-parameter
+        // iOS 17 overload does not exist (it broke the CI iOS build).
+        .onChange(of: playbackGate.playerActive) { active in
+            if active { showClip = false; didStart = false; startedDelay = false }
         }
         // Decorative ambient layer; the hero title / actions carry the accessible content.
         .accessibilityHidden(true)
