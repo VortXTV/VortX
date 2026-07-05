@@ -12,7 +12,8 @@ import Foundation
 /// regression). The player screens drive this gate from onAppear/onDisappear; the hero views unmount
 /// their clip while `playerActive` and remount when playback closes.
 ///
-/// Main-thread only (SwiftUI appear/disappear callbacks and view bodies), so no locking is needed.
+/// Main-thread only (SwiftUI appear/disappear callbacks and view bodies), so no locking is needed. The
+/// two mutators are `@MainActor` so that isolation is compiler-enforced, matching `CoreBridge.setPlayerActive`.
 final class FullscreenPlaybackGate: ObservableObject {
     static let shared = FullscreenPlaybackGate()
     private init() {}
@@ -25,6 +26,6 @@ final class FullscreenPlaybackGate: ObservableObject {
     /// True while at least one fullscreen player screen is mounted.
     var playerActive: Bool { activePlayers > 0 }
 
-    func playerDidAppear() { activePlayers += 1 }
-    func playerDidDisappear() { activePlayers = max(0, activePlayers - 1) }
+    @MainActor func playerDidAppear() { activePlayers += 1 }
+    @MainActor func playerDidDisappear() { activePlayers = max(0, activePlayers - 1) }
 }

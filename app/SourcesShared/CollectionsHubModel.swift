@@ -271,6 +271,12 @@ final class CollectionsHubModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var genreTask: Task<Void, Never>?
     private var discoverTask: Task<Void, Never>?
+    /// Monotonic generation tags: a Task is a value type and cannot be compared by identity, so each load bumps
+    /// its tag and captures it; a task only clears its stored handle when its captured tag still matches, so a
+    /// task completing after a clear()+restart can tell it is no longer the current handle and leaves it alone.
+    private var loadGen = 0
+    private var genreGen = 0
+    private var discoverGen = 0
 
     /// Available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres) even with
     /// no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
@@ -296,15 +302,19 @@ final class CollectionsHubModel: ObservableObject {
             loadedRegion = region
             if Self.cacheIsFresh(region: region) { return }   // fresh enough; skip the refetch
         }
-        loadTask = Task { [weak self] in
+        loadGen += 1; let myGen = loadGen
+        let thisTask = Task { [weak self] in
             let fetched = await TMDBClient.regionProviders(region: region)
             guard let self, !Task.isCancelled else { return }
-            self.loadTask = nil
+            // Only clear the stored handle if it still points at this task; a load() racing a clear()
+            // (which nils loadTask before starting a fresh one) must not null out the newer load's handle.
+            if self.loadGen == myGen { self.loadTask = nil }
             guard !fetched.isEmpty else { return }   // keep cache/old on an empty fetch
             self.providers = Self.applyOrder(fetched)
             self.loadedRegion = region
             Self.cacheProviders(fetched, region: region)
         }
+        loadTask = thisTask
     }
 
     func clear() {
@@ -323,7 +333,8 @@ final class CollectionsHubModel: ObservableObject {
         if let cached = Self.cachedGenreBackdrops(region: region) { genreBackdrops = cached }
         if Self.genreCacheIsFresh(region: region) { return }
         guard genreTask == nil else { return }
-        genreTask = Task { [weak self] in
+        genreGen += 1; let myGen = genreGen
+        let thisTask = Task { [weak self] in
             var out: [String: String] = [:]
             let genres = CollectionsHubModel.genreList
             let batchSize = 4   // cap concurrency: a once-daily op, kept gentle on TMDB to avoid 429s
@@ -342,11 +353,16 @@ final class CollectionsHubModel: ObservableObject {
                 if Task.isCancelled { break }
                 i += batchSize
             }
-            guard let self, !Task.isCancelled, !out.isEmpty else { self?.genreTask = nil; return }
+            // Only clear the stored handle if it still points at this task (see load()).
+            guard let self, !Task.isCancelled, !out.isEmpty else {
+                if self?.genreGen == myGen { self?.genreTask = nil }
+                return
+            }
+            if self.genreGen == myGen { self.genreTask = nil }
             self.genreBackdrops = out          // keep the prior cache on an all-empty fetch (don't blank the tiles)
-            self.genreTask = nil
             Self.cacheGenreBackdrops(out, region: region)
         }
+        genreTask = thisTask
     }
 
     private static func genreCacheKey(_ region: String) -> String { "vortx.collections.genreBackdrops.\(region)" }
@@ -376,7 +392,8 @@ final class CollectionsHubModel: ObservableObject {
         if let cached = Self.cachedDiscoverBackdrops(region: region) { discoverBackdrops = cached }
         if Self.discoverCacheIsFresh(region: region) { return }
         guard discoverTask == nil else { return }
-        discoverTask = Task { [weak self] in
+        discoverGen += 1; let myGen = discoverGen
+        let thisTask = Task { [weak self] in
             var out: [DiscoverList: String] = [:]
             // Only four cards, so a single gentle task group is enough (no batching needed); kept 429-safe.
             await withTaskGroup(of: (DiscoverList, String?).self) { group in
@@ -387,11 +404,16 @@ final class CollectionsHubModel: ObservableObject {
                 }
                 for await (card, url) in group { if let url { out[card] = url } }
             }
-            guard let self, !Task.isCancelled, !out.isEmpty else { self?.discoverTask = nil; return }
+            // Only clear the stored handle if it still points at this task (see load()).
+            guard let self, !Task.isCancelled, !out.isEmpty else {
+                if self?.discoverGen == myGen { self?.discoverTask = nil }
+                return
+            }
+            if self.discoverGen == myGen { self.discoverTask = nil }
             self.discoverBackdrops = out       // keep the prior cache on an all-empty fetch (don't blank the tiles)
-            self.discoverTask = nil
             Self.cacheDiscoverBackdrops(out, region: region)
         }
+        discoverTask = thisTask
     }
 
     private static func discoverCacheKey(_ region: String) -> String { "vortx.collections.discoverBackdrops.\(region)" }

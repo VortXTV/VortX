@@ -801,6 +801,7 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Loaded streams grouped by their source addon (for the per-addon filter + source labels).
+    @MainActor
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
@@ -836,6 +837,7 @@ final class CoreBridge: ObservableObject {
     /// path id. An in-player episode switch uses this so it never grabs the previous episode's
     /// streams that are still loaded in `metaDetails` during the brief window before the new ones
     /// arrive, and so it can RANK across every add-on instead of taking whoever answered first.
+    @MainActor
     func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
@@ -881,6 +883,7 @@ final class CoreBridge: ObservableObject {
         var id: String { base }
     }
 
+    @MainActor
     func streamAddonStates(forStreamId streamId: String? = nil) -> [StreamAddonState] {
         guard let data = stateData("meta_details"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -930,6 +933,7 @@ final class CoreBridge: ObservableObject {
     /// per render. Built once, reused, and invalidated on the main actor whenever `ctx`
     /// changes (handleEvent). Main-actor only: addonNamesByBase is called from view code.
     private var addonNamesCache: [String: String]?
+    @MainActor
     private func addonNamesByBase() -> [String: String] {
         if let cached = addonNamesCache { return cached }
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [:] }

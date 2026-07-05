@@ -122,6 +122,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             // classify fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties
             // the reason to the observed engine flip, giving one greppable [dv] trail.
             VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
+        } else if PlayerEngineRouter.shouldDVRemux(url: url) {
+            // The router demanded the DV-for-MKV remux lane but VortXRemuxResourceLoader.make returned nil (loader
+            // could not be built). AVFoundation has no Matroska demuxer, so loading the raw MKV here would mount an
+            // item AVPlayer can never produce a frame from. Fail-soft immediately so the chrome demotes to libmpv
+            // HDR10 instead of stalling on an un-demuxable asset. This ties into the [dv] demotion trail below.
+            DiagnosticsLog.log("avplayer", "dv-remux loader build failed host=\(url.host ?? "?") -> demoting to libmpv")
+            VXProbe.log("dv", "remux loader build failed -> endFileError demote host=\(url.host ?? "?")")
+            fatalErrorEmitted = true
+            emit(MPVProperty.endFileError, "DV remux unavailable")
+            return
         } else {
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
             newAsset = AVURLAsset(url: url, options: options)
@@ -613,6 +623,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // stop() is the normal teardown; this is a safety net if the engine is released without it.
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         observations.forEach { $0.invalidate() }
+        NotificationCenter.default.removeObserver(self)   // matches teardownObservers(): drop AVPlayerItem note observers before dealloc
         remuxLoader?.invalidate()
     }
 }

@@ -194,10 +194,19 @@ enum CoreLoadable<T: Decodable>: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        switch try container.decode(String.self, forKey: .type) {
+        let tag = try container.decode(String.self, forKey: .type)
+        switch tag {
         case "Ready": self = .ready(try container.decode(T.self, forKey: .content))
         case "Err": self = .err
-        default: self = .loading
+        case "Loading": self = .loading
+        // Any other tag (an engine "Err"-shape rename, or a genuinely errored group with an
+        // unknown tag) is TERMINAL, not still-loading. Decoding it as .loading would leave
+        // streamLoadProgress stuck at N-1/N and spin the source list forever. Treat it as
+        // terminal (.err, which streamLoadProgress already counts as settled) and log the
+        // surprise so an engine tag rename is visible instead of silent.
+        default:
+            NSLog("[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            self = .err
         }
     }
 

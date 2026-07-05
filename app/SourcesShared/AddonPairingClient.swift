@@ -104,29 +104,32 @@ enum AddonPairingClient {
 
     // MARK: - Session persistence (resume across sheet opens)
 
-    /// The most recent session, persisted so a manifest the phone adds AFTER the pairing sheet closes
+    /// The most recent session, held so a manifest the phone adds AFTER the pairing sheet closes
     /// still arrives: the view resumes this session on the next open instead of minting a fresh one.
     /// The relay keeps a session alive ~10 min from its last activity, and the phone page's own 2s
     /// polling keeps bumping that while it stays open, so the stored expiry is only a lower bound;
-    /// liveness is decided by polling the token, never by the stored timestamp. Only the short-lived
-    /// token + page URL are stored, no account data.
-    private static let persistedSessionKey = "vortx.addonPair.session"
+    /// liveness is decided by polling the token, never by the stored timestamp.
+    ///
+    /// This lives IN MEMORY ONLY (not UserDefaults): the token is a bearer credential for the relay
+    /// session, and plaintext UserDefaults is captured by Finder/iCloud device backups. Resume is only
+    /// needed while the app process is alive (sheet close then reopen), so a static holder is enough,
+    /// and it leaves no on-disk trace to back up. `nil` = no session to resume.
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var storedSession: Session?
 
     static func persist(_ session: Session) {
-        UserDefaults.standard.set(
-            ["token": session.token, "pageUrl": session.pageUrl, "expiresAtMs": session.expiresAtMs],
-            forKey: persistedSessionKey)
+        lock.lock(); defer { lock.unlock() }
+        storedSession = session
     }
 
     static func persistedSession() -> Session? {
-        guard let dict = UserDefaults.standard.dictionary(forKey: persistedSessionKey),
-              let token = dict["token"] as? String, !token.isEmpty,
-              let pageUrl = dict["pageUrl"] as? String, !pageUrl.isEmpty else { return nil }
-        return Session(token: token, pageUrl: pageUrl, expiresAtMs: numeric(dict["expiresAtMs"]) ?? 0)
+        lock.lock(); defer { lock.unlock() }
+        return storedSession
     }
 
     static func clearPersistedSession() {
-        UserDefaults.standard.removeObject(forKey: persistedSessionKey)
+        lock.lock(); defer { lock.unlock() }
+        storedSession = nil
     }
 
     // MARK: - Helpers

@@ -21,6 +21,19 @@ enum DebridProbe {
 /// link, fail soft to the torrent engine) is a separate step. Full API specs: Brain
 /// `wiki/projects/stremiox/vortx-debrid-implementation.md`.
 
+// MARK: - Query encoding
+
+/// Percent-encoding for query-string VALUES. `CharacterSet.urlQueryAllowed` is the wrong set for a value: it
+/// leaves the sub-delimiters `&`, `=`, `+` and `,` intact, so an unescaped value can inject extra params.
+/// `valueAllowed` strips those so a joined hash list stays inside its `hash=` parameter.
+enum DebridQuery {
+    static let valueAllowed: CharacterSet = {
+        var set = CharacterSet.urlQueryAllowed
+        set.remove(charactersIn: "&=+,")
+        return set
+    }()
+}
+
 // MARK: - Value types
 
 /// One file inside a debrid torrent. `id` is the provider's file id used to request the stream link.
@@ -163,6 +176,9 @@ actor TorBoxResolver: DebridResolving {
     private let apiKey: String
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/torrents"
+    /// Percent-encode a query VALUE (drops the sub-delimiters `&`/`=`/`+`/`,` that `.urlQueryAllowed` leaves
+    /// intact) so a joined hash list can never break out of the `hash=` parameter.
+    fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -211,7 +227,8 @@ actor TorBoxResolver: DebridResolving {
         // Up to 100 hashes per call.
         for chunk in hashes.chunked(into: 100) {
             let joined = chunk.joined(separator: ",")
-            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(joined)&format=list&list_files=true") else { continue }
+            let encoded = joined.addingPercentEncoding(withAllowedCharacters: Self.queryValueAllowed) ?? joined
+            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(encoded)&format=list&list_files=true") else { continue }
             let env: Envelope<[Cached]> = try await get(url)
             for c in env.data ?? [] {
                 out[c.hash.lowercased()] = (c.files ?? []).map(file(from:))
@@ -284,7 +301,9 @@ actor TorBoxResolver: DebridResolving {
     /// The `requestdl` leg: mint a direct stream URL for a known torrent_id+file_id. A missing file surfaces
     /// as `.notCached` (a 404/"not found" from TorBox) so the caller can re-add.
     private func requestDL(torrentId: Int, fileId: Int) async throws -> URL {
-        guard let url = URL(string: "\(Self.base)/requestdl?token=\(apiKey)&torrent_id=\(torrentId)&file_id=\(fileId)&redirect=false") else {
+        // Auth rides the Authorization: Bearer header set by `get`; do NOT also put the key in the query string
+        // (it would leak into URL logs/caches). token= is intentionally omitted.
+        guard let url = URL(string: "\(Self.base)/requestdl?torrent_id=\(torrentId)&file_id=\(fileId)&redirect=false") else {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
@@ -383,6 +402,7 @@ actor TorBoxUsenetResolver {
     private let apiKey: String
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/usenet"
+    fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -437,7 +457,8 @@ actor TorBoxUsenetResolver {
         var out: [String: [DebridFile]] = [:]
         for chunk in hashes.chunked(into: 100) {
             let joined = chunk.joined(separator: ",")
-            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(joined)&format=list&list_files=true") else { continue }
+            let encoded = joined.addingPercentEncoding(withAllowedCharacters: Self.queryValueAllowed) ?? joined
+            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(encoded)&format=list&list_files=true") else { continue }
             let env: Envelope<[Cached]> = try await get(url)
             for c in env.data ?? [] {
                 out[c.hash.lowercased()] = (c.files ?? []).map(file(from:))
@@ -493,7 +514,8 @@ actor TorBoxUsenetResolver {
 
     /// The `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id.
     private func requestDL(usenetId: Int, fileId: Int) async throws -> URL {
-        guard let url = URL(string: "\(Self.base)/requestdl?token=\(apiKey)&usenet_id=\(usenetId)&file_id=\(fileId)&redirect=false") else {
+        // Auth rides the Authorization: Bearer header set by `get`; the key is not repeated in the query string.
+        guard let url = URL(string: "\(Self.base)/requestdl?usenet_id=\(usenetId)&file_id=\(fileId)&redirect=false") else {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
@@ -1185,7 +1207,11 @@ extension DebridCoordinator {
         // labeled best instead.
         if racing.count == 1 {
             guard acceptable(racing[0]) else { return nil }
-            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode) else { return nil }
+            // Re-assert the confirmed-cached gate at resolve time: a candidate evicted between the cache check
+            // and this call returns nil with ZERO network instead of starting an add-then-download.
+            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode,
+                                                      confirmedCachedHashes: cachedHashes,
+                                                      confirmedUsenetURLs: cachedUsenetURLs) else { return nil }
             return (ref, racing[0])
         }
 
@@ -1193,7 +1219,11 @@ extension DebridCoordinator {
             for stream in racing {
                 group.addTask {
                     // Each leg carries its own 15s bound + RD fast-fail (it is a full resolvedPlaybackRef).
-                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode)
+                    // Pass the confirmed-cached sets so a candidate evicted between the cache check and this
+                    // leg returns nil with ZERO network rather than kicking off an add-then-download.
+                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode,
+                                                                                       confirmedCachedHashes: cachedHashes,
+                                                                                       confirmedUsenetURLs: cachedUsenetURLs)
                     else { return nil }
                     return (ref, stream)
                 }

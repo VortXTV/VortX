@@ -56,7 +56,22 @@ final class VXTrailerProxy {
     private let upstream = URLSession(configuration: .ephemeral)
 
     private var listener: NWListener?
-    private var port: UInt16 = 0
+
+    /// The bound ephemeral port. Written by the listener state handler (on `listenerQueue`) and read by
+    /// `ensureListening` (on `queue`), so every access goes through `portLock` to keep the two queues from
+    /// racing on it. Use `currentPort` / `setPort`, never the backing store directly.
+    private var _port: UInt16 = 0
+    private let portLock = NSLock()
+
+    private var currentPort: UInt16 {
+        portLock.lock(); defer { portLock.unlock() }
+        return _port
+    }
+
+    private func setPort(_ value: UInt16) {
+        portLock.lock(); defer { portLock.unlock() }
+        _port = value
+    }
 
     private init() {}
 
@@ -88,7 +103,7 @@ final class VXTrailerProxy {
     /// so a double-resolve (hero + trailer button within seconds) cannot race two listeners into existence.
     private func ensureListening() -> UInt16? {
         queue.sync {
-            if listener != nil, port != 0 { return port }
+            if listener != nil, currentPort != 0 { return currentPort }
 
             do {
                 // Bind explicitly to loopback so the socket is never reachable off-device: an OS-assigned
@@ -105,7 +120,11 @@ final class VXTrailerProxy {
                 newListener.stateUpdateHandler = { [weak self] state in
                     switch state {
                     case .ready:
-                        self?.port = newListener.port?.rawValue ?? 0
+                        // The state handler runs on `listenerQueue`; `ensureListening` reads `port` on `queue`
+                        // on the semaphore-timeout path. Guard the write with `portLock` so the two queues do
+                        // not race on `port`. (We cannot hop onto `queue` here: `ensureListening` is blocked
+                        // inside `queue.sync` waiting on `ready`, so a `queue.async` would deadlock.)
+                        self?.setPort(newListener.port?.rawValue ?? 0)
                         ready.signal()
                     case .failed, .cancelled:
                         ready.signal()
@@ -116,13 +135,14 @@ final class VXTrailerProxy {
                 newListener.start(queue: listenerQueue)
                 // Wait briefly for the ready state so the caller gets a usable port synchronously.
                 _ = ready.wait(timeout: .now() + 2)
-                guard newListener.port?.rawValue != nil, self.port != 0 else {
+                let boundPort = currentPort
+                guard newListener.port?.rawValue != nil, boundPort != 0 else {
                     newListener.cancel()
                     return nil
                 }
                 self.listener = newListener
-                NSLog("[yt-proxy] listener started on port %d", self.port)
-                return self.port
+                NSLog("[yt-proxy] listener started on port %d", boundPort)
+                return boundPort
             } catch {
                 NSLog("[yt-proxy] listener start failed: %@", String(describing: error))
                 return nil
@@ -132,18 +152,29 @@ final class VXTrailerProxy {
 
     // MARK: - Per-connection handling
 
+    /// How long a client has to send a complete request header before the connection is force-cancelled. A
+    /// client that connects and then stalls (or dribbles bytes without ever sending CRLFCRLF) would otherwise
+    /// keep the NWConnection and its receive-closure chain alive forever; this bounds that to a hard deadline.
+    private static let headerDeadline: TimeInterval = 15
+
     /// Accept one mpv connection: read its request, then stream the requested byte range from googlevideo.
     private func handle(_ connection: NWConnection) {
         connection.start(queue: queue)
-        readRequest(connection, buffer: Data())
+        // Arm a header-read deadline so a client that connects but never finishes its header does not leak the
+        // connection. Disarmed (`.cancel()`) once the header is parsed and `serve` takes over.
+        let deadline = DispatchWorkItem { connection.cancel() }
+        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadline)
+        readRequest(connection, buffer: Data(), deadline: deadline)
     }
 
     /// Read from the connection until the header terminator (CRLFCRLF), then serve. Bounds the header read so a
-    /// malformed client cannot make us buffer without limit.
-    private func readRequest(_ connection: NWConnection, buffer: Data) {
+    /// malformed client cannot make us buffer without limit. `deadline` force-cancels a client that never
+    /// completes its header; it is cancelled the moment the header is fully parsed.
+    private func readRequest(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] chunk, _, isComplete, error in
             guard let self else { return }
             if error != nil {
+                deadline.cancel()
                 connection.cancel()
                 return
             }
@@ -154,6 +185,7 @@ final class VXTrailerProxy {
 
             let terminator = Data("\r\n\r\n".utf8)
             if let range = accumulated.range(of: terminator) {
+                deadline.cancel()   // header complete: disarm the idle-header deadline before serving
                 let headerData = accumulated.subdata(in: accumulated.startIndex..<range.lowerBound)
                 self.serve(connection, header: headerData)
                 return
@@ -161,10 +193,11 @@ final class VXTrailerProxy {
 
             // Guard against an unbounded / never-terminated header.
             if isComplete || accumulated.count > 64_000 {
+                deadline.cancel()
                 connection.cancel()
                 return
             }
-            self.readRequest(connection, buffer: accumulated)
+            self.readRequest(connection, buffer: accumulated, deadline: deadline)
         }
     }
 
@@ -188,7 +221,10 @@ final class VXTrailerProxy {
         }
         let items = comps.queryItems ?? []
         let encodedU = items.first(where: { $0.name == "u" })?.value ?? ""
-        let mime = items.first(where: { $0.name == "mime" })?.value ?? "video/mp4"
+        // Whitelist the mime before it goes into the `Content-Type:` response header. The value is client
+        // supplied, so an un-checked value (containing CR/LF) would let a local client inject extra response
+        // headers into mpv. Anything not in the known set falls back to video/mp4.
+        let mime = Self.sanitizedMime(items.first(where: { $0.name == "mime" })?.value)
 
         guard let upstreamString = Self.base64urlDecode(encodedU),
               let upstreamURL = URL(string: upstreamString),
@@ -313,6 +349,17 @@ final class VXTrailerProxy {
     }
 
     // MARK: - Helpers
+
+    /// The only mime types this proxy ever serves. Anything else (including a CR/LF-bearing injection attempt)
+    /// falls back to `video/mp4` so the `Content-Type:` response header can never carry attacker-controlled text.
+    private static let allowedMimes: Set<String> = ["video/mp4", "audio/mp4"]
+
+    /// Clamp a client-supplied mime to the known-good set, defaulting to `video/mp4`. This is the response-header
+    /// injection guard: the returned value is always a literal from `allowedMimes`, never client text.
+    private static func sanitizedMime(_ raw: String?) -> String {
+        guard let raw, allowedMimes.contains(raw) else { return "video/mp4" }
+        return raw
+    }
 
     /// Append (or replace) the bounded `&range=start-stop` window on a googlevideo URL.
     private static func appendRange(_ url: URL, start: Int, stop: Int) -> URL? {

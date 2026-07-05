@@ -296,13 +296,34 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push at an epoch-ms version. Used by callers that push a fully-formed doc they do
-    /// not re-derive (they hold no local pending changes to re-merge). Fixed so a rejected write no longer
-    /// advances lastSyncedVersion: it returns false so the caller / the next natural pull reconciles.
+    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
+    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
+    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
+    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
+    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
+    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
+    /// reconciles.
     @discardableResult
     func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
-        let version = Int(Date().timeIntervalSince1970 * 1000)
-        if case .accepted = await pushSyncDocAt(obj, version: version) { return true }
+        var version = Int(Date().timeIntervalSince1970 * 1000)
+        for attempt in 0..<2 {
+            switch await pushSyncDocAt(obj, version: version) {
+            case .accepted:
+                return true
+            case .error:
+                return false
+            case .rejected(let storedVersion):
+                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
+                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
+                // clock still produces a higher version than the stored one, so the device is never locked out.
+                guard attempt < 1 else { return false }
+                if let stored = storedVersion {
+                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
+                } else {
+                    version = Int(Date().timeIntervalSince1970 * 1000)
+                }
+            }
+        }
         return false
     }
 
@@ -643,6 +664,12 @@ final class VortXSyncManager: ObservableObject {
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
         // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
+        // `force` (manual "Sync now" / sign-in reconciliation) intentionally re-applies even a stale/equal doc
+        // for the UNION-SAFE merges (roster, settings, apiKeys): those can only ADD, never resurrect a delete.
+        // But the DESTRUCTIVE folds (delete tombstones, add-on-removal uninstalls, profileEdits) must still be
+        // version-gated even under force: a stale forced pull that predates a delete would otherwise let a
+        // resurrected old edit/delete win over a newer local state. Gate them on a strictly-newer pull only.
+        let pullIsNewer = pulled.version > lastSyncedVersion
         let doc = pulled.doc
         var restored = false
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
@@ -679,8 +706,10 @@ final class VortXSyncManager: ObservableObject {
             if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
             // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
             // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
-            // path explicitly). @MainActor hop because the coordinator is main-actor isolated.
-            Task { @MainActor in DebridCoordinator.shared.reload() }
+            // path explicitly). @MainActor hop because the coordinator is main-actor isolated. This runs
+            // AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the body
+            // in its own suppression to keep reload()'s writes from re-arming a self-echo push.
+            Task { @MainActor in Self.shared.withRemoteApplySuppressed { DebridCoordinator.shared.reload() } }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
@@ -701,7 +730,7 @@ final class VortXSyncManager: ObservableObject {
         // Cross-device delete tombstones: fold any incoming doc.vortx.deletedProfiles into the local set
         // FIRST (before applying the roster below), so a profile another device deleted is dropped here
         // and the union-merge can never bring it back. mergeDeletedTombstones also prunes the live roster.
-        if let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
+        if pullIsNewer, let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
             if ProfileStore.shared.mergeDeletedTombstones(deleted) { restored = true }
         }
         // Cross-device add-on REMOVAL tombstones (the add-on analogue of the deletedProfiles fold above).
@@ -714,11 +743,15 @@ final class VortXSyncManager: ObservableObject {
         // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
         // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
         // reinstalled on the next hydrate even before this uninstall runs.
+        // Fold the DOC's incoming removals only on a strictly-newer pull (see pullIsNewer above): a stale
+        // forced pull that predates a locally-restored add-on must not resurrect its old removal. The uninstall
+        // loop below still reads the durable LOCAL tombstone set, so a removal recorded on THIS device is
+        // always honored regardless of force.
         var incomingAddonRemovals: [String] = []
-        if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
+        if pullIsNewer, let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
             incomingAddonRemovals += removed
         }
-        if let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
+        if pullIsNewer, let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
             incomingAddonRemovals += webRemoved
         }
         if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
@@ -737,11 +770,16 @@ final class VortXSyncManager: ObservableObject {
         }
         let removedAddonSet = AddonTombstones.all()
         if !removedAddonSet.isEmpty {
+            // Runs AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the
+            // uninstall loop in its own suppression: uninstallAddon writes UserDefaults, which would otherwise
+            // fire the observer and re-arm a self-echo push of the just-applied removal.
             Task { @MainActor in
-                for addon in CoreBridge.shared.addons
-                where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
-                    && !addon.isOfficial && !addon.isProtected {
-                    CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                Self.shared.withRemoteApplySuppressed {
+                    for addon in CoreBridge.shared.addons
+                    where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
+                        && !addon.isOfficial && !addon.isProtected {
+                        CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                    }
                 }
             }
         }
@@ -771,7 +809,10 @@ final class VortXSyncManager: ObservableObject {
         // Web-authored profile edits (vortx.tv dashboard writes doc.profileEdits, a SIBLING key the app
         // preserves via syncUp's read-merge-write, unlike doc.vortx which the app overwrites). Apply
         // name/familyEdit/pin + per-profile library adds, LWW by editedAt, once per stamp.
-        if let edits = doc["profileEdits"] as? [String: Any] {
+        // Gated on a strictly-newer pull (pullIsNewer) as well as the per-stamp editedAt guard: a stale forced
+        // pull that predates a local change must not re-apply a resurrected old edit whose editedAt happens to
+        // exceed this device's last-applied stamp.
+        if pullIsNewer, let edits = doc["profileEdits"] as? [String: Any] {
             let editedAt = (edits["editedAt"] as? Double) ?? Double((edits["editedAt"] as? Int) ?? 0)
             if editedAt > lastAppliedProfileEditsAt {
                 ProfileStore.shared.applyProfileEdits(edits)
@@ -870,8 +911,12 @@ final class VortXSyncManager: ObservableObject {
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
         guard !ownedLibrary.isEmpty else { return }
-        // Only recover when the engine's account library is genuinely empty (a fresh / cold device).
-        let engineLibrary = CoreBridge.shared.library?.catalog ?? []
+        // Only recover when the engine's account library is genuinely empty (a fresh / cold device). Require
+        // the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
+        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account
+        // library while the engine is still loading its real one. A nil library defers recovery to a later
+        // call once the engine has emitted its library field.
+        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
         let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
         guard !engineHasLibrary else { return }
         var recovered = 0

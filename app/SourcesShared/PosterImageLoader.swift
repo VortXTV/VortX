@@ -17,8 +17,10 @@ import CoreGraphics
 /// and each decode blocked the main thread while the user scrolled.
 ///
 /// This loader fixes all three:
-///   1. A DEDICATED, generously-sized `URLCache` (`configureSharedCache`, called once at launch) so a whole
-///      catalog page of poster bytes stays cached across scrolls and relaunches instead of evicting.
+///   1. A DEDICATED, generously-sized `URLCache` owned only by this loader's session (built once at launch via
+///      `configureSharedCache`) so a whole catalog page of poster bytes stays cached across scrolls and
+///      relaunches instead of evicting. It never replaces `URLCache.shared`, so unrelated requests (sync,
+///      ratings, l10n, config) keep the small system default and are not pulled into the 512 MB poster store.
 ///   2. A BOUNDED-concurrency gate (`ConcurrencyGate`) so a grid appearing fires a handful of fetches at a
 ///      time, never hundreds at once (which is what starved individual posters into coming back empty).
 ///   3. OFF-MAIN decode + downsample via ImageIO, so the main thread never decodes a poster while scrolling.
@@ -28,34 +30,43 @@ import CoreGraphics
 /// permanently blank card. Callers keep their own frame / crop / clip; this only returns the decoded image.
 enum PosterImageLoader {
 
-    // MARK: shared URLCache (called once at launch, before any image request)
+    // MARK: dedicated poster URLCache (built once, owned by this loader's session only)
 
-    /// Install a dedicated, generously-sized shared `URLCache`. The default iOS shared cache is ~4 MB memory /
-    /// ~20 MB disk, which cannot hold one catalog page of posters, so `.returnCacheDataElseLoad` re-fetched
-    /// nearly every poster on every scroll. Sized here to comfortably hold many pages of poster JPEGs so the
-    /// cache actually serves them. Idempotent: safe to call more than once, but intended once from app init.
-    static func configureSharedCache() {
+    /// The loader's OWN generously-sized `URLCache`, wired only into `PosterImageLoader.session` below. The
+    /// default iOS shared cache is ~4 MB memory / ~20 MB disk, which cannot hold one catalog page of posters,
+    /// so `.returnCacheDataElseLoad` re-fetched nearly every poster on every scroll. Sized here to comfortably
+    /// hold many pages of poster JPEGs so the cache actually serves them. This deliberately does NOT touch
+    /// `URLCache.shared`: replacing the process-wide cache would swallow every unrelated request (sync,
+    /// ratings, l10n, config) into this 512 MB poster store. Kept separate so posters get their big cache and
+    /// everything else keeps the system default.
+    private static let cache: URLCache = {
         // 64 MB memory / 512 MB disk: posters are small JPEGs, so this holds thousands of them and survives
         // relaunch (disk), which is exactly what turns the poster grid from "re-fetch everything" into
         // "serve from cache". Well within the increased-memory entitlement the native targets already carry.
         let memoryCapacity = 64 * 1024 * 1024
         let diskCapacity = 512 * 1024 * 1024
-        let cache = URLCache(memoryCapacity: memoryCapacity, diskCapacity: diskCapacity, diskPath: "vortx-images")
-        URLCache.shared = cache
-        NSLog("[poster-probe] configureSharedCache installed memory=%dMB disk=%dMB diskPath=vortx-images",
-              memoryCapacity / (1024 * 1024), diskCapacity / (1024 * 1024))
+        return URLCache(memoryCapacity: memoryCapacity, diskCapacity: diskCapacity, diskPath: "vortx-images")
+    }()
+
+    /// Retained for call-site compatibility: forces the dedicated cache + session to build once at launch,
+    /// before any image request, so the first poster page is served warm. Idempotent (lazy statics build once).
+    static func configureSharedCache() {
+        _ = session
+        NSLog("[poster-probe] configureSharedCache built dedicated poster cache memory=%dMB disk=%dMB diskPath=vortx-images",
+              64, 512)
     }
 
     // MARK: bounded-concurrency image session
 
     /// A dedicated session for image bytes so poster fetches share a connection pool sized for many small
     /// GETs and do NOT contend with `URLSession.shared` (sync, ratings, trickplay, add-on manifests). Uses the
-    /// shared (now large) URLCache for disk persistence; `.returnCacheDataElseLoad` is set per request.
+    /// loader's OWN large `cache` (not `URLCache.shared`) for disk persistence; `.returnCacheDataElseLoad` is
+    /// set per request.
     private static let session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.httpMaximumConnectionsPerHost = 6
         cfg.timeoutIntervalForRequest = 20
-        cfg.urlCache = URLCache.shared
+        cfg.urlCache = cache
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         return URLSession(configuration: cfg)
     }()

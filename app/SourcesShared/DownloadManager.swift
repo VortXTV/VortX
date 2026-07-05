@@ -399,6 +399,8 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         taskForRecord[id] = nil
         lastProgressPush[id] = nil   // do not leak the throttle entry across a terminal transition
+        cannotCreateFileRetries[id] = nil   // reset the -3000 self-heal count so a later same-id failure heals again
+        // (the self-heal restart path below increments its count AFTER this clearTask, so the one-retry cap holds)
         // The record no longer has a live task; drop the persisted identifier so a later relaunch never
         // tries to reconnect a task that is gone. No-op if the record was already removed (cancel).
         if store.record(id: id) != nil { store.update(id: id) { $0.taskIdentifier = nil } }
@@ -783,10 +785,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
                self.cannotCreateFileRetries[id, default: 0] < 1,
                let record = self.store.record(id: id), !record.isTorrent,
                let url = URL(string: record.remoteURL) {
-                self.cannotCreateFileRetries[id, default: 0] += 1
                 self.resumeData[id] = nil
-                NSLog("[downloads] -3000 self-heal restart id=%@ attempt=%d", id.uuidString, self.cannotCreateFileRetries[id] ?? 1)
+                // clearTask resets cannotCreateFileRetries[id], so bump the count AFTER it or the one-retry
+                // cap never engages (it would loop -3000 forever).
                 self.clearTask(id: id)
+                self.cannotCreateFileRetries[id, default: 0] += 1
+                NSLog("[downloads] -3000 self-heal restart id=%@ attempt=%d", id.uuidString, self.cannotCreateFileRetries[id] ?? 1)
                 self.store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
                 self.startTask(for: record, url: url)
                 return

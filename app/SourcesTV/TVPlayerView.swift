@@ -198,6 +198,7 @@ struct TVPlayerView: View {
     // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
     @State private var preloaded: PreloadedEpisode?
     @State private var preloadingID: String?
+    @State private var switchingEpisode = false        // re-entrancy guard: a rapid double Next / Up-Next-Select must not launch two overlapping episode resolves (mirrors iOS goToEpisode)
     @State private var warmedID: String?               // next episode whose source was pre-warmed
     @State private var curHint: String?                // quality signature of what is playing now
     @State private var curBinge: String?               // bingeGroup of what is playing now (drives sticky auto-next)
@@ -2695,6 +2696,12 @@ struct TVPlayerView: View {
     /// already-ranked best source instantly with no resolution wait.
     private func play(episode v: CoreVideo) {
         guard let m = curMeta else { return }
+        // Re-entrancy guard: a rapid double Next / Up-Next-Select could fire play(episode:) twice
+        // before the first resolve finishes, launching two overlapping engine resolves and double-freeing
+        // the leaving torrent engine. Bail if a switch is already in flight; clear the flag on every exit
+        // (both the preload branch and the async fallback, including the nil/error paths). Mirrors iOS goToEpisode.
+        guard !switchingEpisode else { return }
+        switchingEpisode = true
         saveProgress(at: currentTime)
         // Snapshot the engine we're leaving so a DIFFERENT-hash next source can free it — but only
         // ONCE the real next hash is known, never speculatively here. Destroying a SAME-hash engine
@@ -2778,6 +2785,7 @@ struct TVPlayerView: View {
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }
+            switchingEpisode = false   // preload resolve done: re-arm for the next switch
             return
         }
 
@@ -2818,12 +2826,14 @@ struct TVPlayerView: View {
                     resumeSeconds = await account.resumeOffset(for: newMeta)
                     loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                     startLoadTimeout()
+                    switchingEpisode = false   // fallback resolve landed: re-arm for the next switch
                     return
                 }
                 try? await Task.sleep(for: .milliseconds(100))
             }
             loadErrorMsg = "No playable source found for this episode."
             withAnimation { loadFailed = true }
+            switchingEpisode = false   // fallback resolve gave up: re-arm so the user can retry
         }
     }
 

@@ -155,10 +155,12 @@ final class MPVMetalViewController: PlatformViewController {
 
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
-        checkError(mpv_set_option_string(mpv, "vid", "no"))
+        // Runtime rebuild after a live resize/rotation: `vid` must be set as a PROPERTY. mpv_set_option_string
+        // is a silent no-op after mpv_initialize, so the option-string form never actually rebuilt the VO.
+        checkError(mpv_set_property_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
-            self.checkError(mpv_set_option_string(self.mpv, "vid", "auto"))
+            self.checkError(mpv_set_property_string(self.mpv, "vid", "auto"))
             self.applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         }
     }
@@ -649,7 +651,10 @@ final class MPVMetalViewController: PlatformViewController {
         #else
         pause()
         #endif
-        checkError(mpv_set_option_string(mpv, "vid", "no"))
+        // `vid` is toggled at RUNTIME here, so it must go through the PROPERTY setter: mpv_set_option_string
+        // is a silent no-op after mpv_initialize (see applyChannelPolicy), so the option-string form left the
+        // background "drop video decode" doing nothing.
+        checkError(mpv_set_property_string(mpv, "vid", "no"))
     }
 
     @objc public func enterForeground() {
@@ -659,7 +664,7 @@ final class MPVMetalViewController: PlatformViewController {
             mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
         }
         applyChannelPolicy()
-        checkError(mpv_set_option_string(mpv, "vid", "auto"))
+        checkError(mpv_set_property_string(mpv, "vid", "auto"))   // runtime toggle: property, not option (no-op post-init)
         applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         play()
     }
@@ -729,13 +734,22 @@ final class MPVMetalViewController: PlatformViewController {
 
     deinit {
         // Safety net: if the view controller is torn down without stop() (e.g. an
-        // unexpected dealloc), make sure mpv can't call back into freed memory.
+        // unexpected dealloc), make sure mpv can't call back into freed memory. Mirror stop()'s
+        // SERIALIZED teardown rather than destroying inline: an inline mpv_terminate_destroy here
+        // could race an in-flight readEvents drain on `queue` (double-destroy / use-after-free), so
+        // nil the handle synchronously (one owner) and dispatch the destroy onto the event queue.
         if let handle = mpv {
-            mpv_set_wakeup_callback(handle, nil, nil)
             mpv = nil
-            mpv_terminate_destroy(handle)
+            mpv_set_wakeup_callback(handle, nil, nil)
+            let relay = wakeupRelay
+            wakeupRelay = nil
+            queue.async {
+                mpv_terminate_destroy(handle)
+                relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
+            }
+        } else {
+            wakeupRelay?.release()
         }
-        wakeupRelay?.release()
     }
 
     /// mpv's stock User-Agent, captured once so a stream with custom headers can never leak
@@ -748,6 +762,9 @@ final class MPVMetalViewController: PlatformViewController {
         live: Bool = false,
         audioSidecar: URL? = nil
     ) {
+        // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
+        // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
+        guard mpv != nil else { return }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
         // colorspace — the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
@@ -910,6 +927,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func configureLiveMode(_ live: Bool) {
+        guard mpv != nil else { return }   // raw mpv_set_property_string below: never pass a nil handle post-teardown
         guard configuredLiveMode != live else { return }
         configuredLiveMode = live
         if live {
@@ -1071,14 +1089,14 @@ final class MPVMetalViewController: PlatformViewController {
     
     private func getFlag(_ name: String) -> Bool {
         guard mpv != nil else { return false }   // teardown nils mpv; a late togglePause() must not pass NULL to libmpv
-        var data = Int64()
+        var data = Int32()   // MPV_FORMAT_FLAG is a 4-byte C int, not Int/Int64; an 8-byte read only works by little-endian luck
         mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
         return data > 0
     }
     
     private func setFlag(_ name: String, _ flag: Bool) {
         guard mpv != nil else { return }
-        var data: Int = flag ? 1 : 0
+        var data: Int32 = flag ? 1 : 0   // MPV_FORMAT_FLAG is a 4-byte C int; write exactly 4 bytes, not 8
         mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data)
     }
 

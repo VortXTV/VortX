@@ -1938,7 +1938,7 @@ struct PlayerScreen: View {
                 reconnecting = false; buffering = false
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
                 if autoAdvance { onClose() }            // nothing playable on auto-advance: leave, don't hang on a spinner
-                else { loadErrorMsg = "Couldn't load that episode" }
+                else { loadErrorMsg = "Couldn't load that episode"; withAnimation { loadFailed = true } }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
                 return
             }
             curMetaState = es.meta

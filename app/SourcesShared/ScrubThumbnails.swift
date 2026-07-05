@@ -158,19 +158,41 @@ final class ScrubThumbnailsStore: ObservableObject {
         }
     }
 
+    /// Monotonic token so a slow disk read+decode that resolves after the user has scrubbed on (or after a
+    /// community-sheet / in-memory hit already set a newer frame) is discarded instead of clobbering the
+    /// current preview with a stale one.
+    private var showToken = 0
+
     /// Shows the stored frame nearest to `time`. Call while the user is scrubbing. Community sheet first
     /// (shared), then the per-device local cache.
+    ///
+    /// The synchronous fast paths (community crop + in-memory NSCache hit) assign `image` inline so a warm
+    /// scrub stays instant. A cache MISS used to do a blocking `ioQueue.sync` disk read + JPEG decode ON THE
+    /// MAIN THREAD during scrubbing; that read+decode is now hopped off the main actor and the resolved frame
+    /// is assigned back on the MainActor, gated by `showToken` so a stale late result can't overwrite a newer one.
     func show(time: Double) {
+        showToken &+= 1
         if let sheet = communitySheet, let crop = sheet.crop(at: time) {
             image = crop
             return
         }
-        guard let key = localCacheKey,
-              let local = Self.localFrameCache.image(for: key, time: time) else {
+        guard let key = localCacheKey else {
             image = nil
             return
         }
-        image = local
+        // In-memory hit resolves synchronously so a warm scrub is instant and never touches disk.
+        if let cached = Self.localFrameCache.memoryImage(for: key, time: time) {
+            image = cached
+            return
+        }
+        // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
+        let token = showToken
+        Self.localFrameCache.imageAsync(for: key, time: time) { [weak self] resolved in
+            Task { @MainActor in
+                guard let self, self.showToken == token else { return }   // user scrubbed on; drop the stale frame
+                self.image = resolved
+            }
+        }
     }
 
     func clear() {
@@ -403,19 +425,35 @@ private final class LocalTrickplayFrameCache {
         }
     }
 
-    func image(for key: String, time: Double) -> ScrubImage? {
+    /// Synchronous in-memory-only lookup: returns the nearest already-decoded thumbnail without ever touching
+    /// disk, so a warm scrub can resolve on the main thread with no I/O. Returns nil on a miss; the caller
+    /// then falls back to `imageAsync` for the off-thread read+decode.
+    func memoryImage(for key: String, time: Double) -> ScrubImage? {
         let target = bucketFor(time)
-        return ioQueue.sync {
-            let minBucket = max(0, target - maxLookbackBuckets)
+        let minBucket = max(0, target - maxLookbackBuckets)
+        for bucket in stride(from: target, through: minBucket, by: -1) {
+            if let cached = memory.object(forKey: memKey(key, bucket)) { return cached }
+        }
+        return nil
+    }
+
+    /// Off-main-thread read + JPEG decode of the nearest stored frame. Runs on the private `ioQueue` and calls
+    /// `completion` (also on `ioQueue`) with the decoded image or nil. Kept async so scrubbing never blocks the
+    /// main thread on a disk read + decode; the in-memory fast path is `memoryImage(for:)` above.
+    func imageAsync(for key: String, time: Double, completion: @escaping (ScrubImage?) -> Void) {
+        let target = bucketFor(time)
+        ioQueue.async {
+            let minBucket = max(0, target - self.maxLookbackBuckets)
             for bucket in stride(from: target, through: minBucket, by: -1) {
-                if let cached = memory.object(forKey: memKey(key, bucket)) { return cached }
-                let url = fileURL(for: key, bucket: bucket)
+                if let cached = self.memory.object(forKey: self.memKey(key, bucket)) { completion(cached); return }
+                let url = self.fileURL(for: key, bucket: bucket)
                 guard let data = try? Data(contentsOf: url),
                       let decoded = ScrubImage(data: data) else { continue }
-                memory.setObject(decoded, forKey: memKey(key, bucket))
-                return decoded
+                self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
+                completion(decoded)
+                return
             }
-            return nil
+            completion(nil)
         }
     }
 

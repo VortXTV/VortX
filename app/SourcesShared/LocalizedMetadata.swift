@@ -388,16 +388,27 @@ final class LocalizedMetadataStore: ObservableObject {
         }
     }
 
-    /// Pick a TMDB image PATH from an `/images` array: exact base-language, then textless (iso_639_1 == null),
-    /// then any, highest vote first. Returns "" when there is nothing. Mirrors the worker's `pickImage`.
+    /// Pick a TMDB image PATH from an `/images` array with an explicit fallback order: exact base-language,
+    /// then textless (iso_639_1 missing or JSON null), then English, then any, highest vote first. Returns ""
+    /// when there is nothing. Mirrors the worker's `pickImage`. A present-but-non-null tag that is not a String
+    /// (e.g. an unexpected numeric or object value) is treated as untagged for the "any" tier only, never as
+    /// textless, so a malformed tag can never masquerade as a clean textless plate.
     private static func pickImagePath(_ list: [[String: Any]]?, lang: String) -> String {
         guard let list, !list.isEmpty else { return "" }
         func path(_ x: [String: Any]) -> String? { x["file_path"] as? String }
+        func isTextless(_ x: [String: Any]) -> Bool {
+            let raw = x["iso_639_1"]
+            return raw == nil || raw is NSNull
+        }
         let byLang = list.filter { ($0["iso_639_1"] as? String) == lang && path($0) != nil }
-        let textless = list.filter { $0["iso_639_1"] == nil || ($0["iso_639_1"] as? NSNull) != nil }
-            .filter { path($0) != nil }
+        let textless = list.filter { isTextless($0) && path($0) != nil }
+        let byEnglish = list.filter { ($0["iso_639_1"] as? String) == "en" && path($0) != nil }
         let anyWithPath = list.filter { path($0) != nil }
-        let pool = !byLang.isEmpty ? byLang : (!textless.isEmpty ? textless : anyWithPath)
+        let pool: [[String: Any]]
+        if !byLang.isEmpty { pool = byLang }
+        else if !textless.isEmpty { pool = textless }
+        else if !byEnglish.isEmpty { pool = byEnglish }
+        else { pool = anyWithPath }
         let best = pool.max { (($0["vote_average"] as? Double) ?? 0) < (($1["vote_average"] as? Double) ?? 0) }
         return best.flatMap(path) ?? ""
     }

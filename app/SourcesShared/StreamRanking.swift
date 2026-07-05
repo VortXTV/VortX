@@ -1022,14 +1022,18 @@ enum StreamRanking {
             return true
         }
         // "[RD download]" forms, "⏳" hourglass, "⬇" download arrow, "❌ not ready", "🎟" ticket.
+        // "download" is only a cache signal inside a bracketed service tag ([PM download]); the bare
+        // word appears in ordinary release names ("Download.2005") and must not force uncached.
         if text.contains("⏳") || text.contains("⬇") || text.contains("uncached")
             || text.contains("not ready") || text.contains("🎟")
-            || boundedMatch(text, "download") {
+            || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\s+download\]"#) {
             return false
         }
         // "[RD+]"-style plus tags, "⚡" bolt, "(Instant RD)", plain "cached", "🎫" ticket.
-        if text.contains("⚡") || text.contains("+]") || text.contains("instant")
-            || text.contains("cached") || text.contains("🎫") {
+        // The "+" plus tag only counts bound to a known service code inside brackets; a bare "+]"
+        // substring occurs in ordinary release names and would misclassify them as cached.
+        if text.contains("⚡") || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\+\]"#)
+            || text.contains("instant") || text.contains("cached") || text.contains("🎫") {
             return true
         }
         return s.url != nil && s.infoHash == nil   // plain URL with no contrary marker
