@@ -819,7 +819,11 @@ struct PlayerScreen: View {
                     // file) so auto-advance isn't a cold start. Purely additive: the actual advance
                     // still resolves through loadEpisode, so progress reporting and engine binding are
                     // unchanged — this only pre-heats the slow I/O the next open would otherwise pay for.
-                    if !effectivelyLive, duration > 60, d / duration >= 0.5 { warmNextIfNeeded() }
+                    // Past the halfway mark when the duration is known, or after ~2 min of playback when it
+                    // ISN'T: many debrid MKVs never emit mpv's `duration`, so the duration>60 trigger alone
+                    // never fired for them and the next episode never pre-heated (the "next episode cold-starts"
+                    // case). warmNextIfNeeded is idempotent per episode.
+                    if !effectivelyLive, (duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120) { warmNextIfNeeded() }
                     // ~90% in → flip the engine's watched marker live, so the title leaves Continue
                     // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
                     if !markedWatched, !effectivelyLive, duration > 0, d / duration >= 0.9, let m = curMeta {

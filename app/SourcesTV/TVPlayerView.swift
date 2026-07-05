@@ -488,8 +488,15 @@ struct TVPlayerView: View {
                     // miss) so those plays feed the pool too; a tt id still pings inline. Never blocks.
                     WatchSignalClient.pingResolvingTMDB(contentId: m.libraryId, type: m.type, seriesHint: m.season != nil)
                 }
-                if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
-                if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
+                // Prefetch + rank the next episode once we're clearly committed to this one: past the halfway
+                // mark when the duration is known, or after ~2 min of playback when it ISN'T. Many debrid MKVs
+                // (the 4K remuxes the owner watches) never emit mpv's `duration` event, so the duration>0
+                // triggers alone never fired for them and the next episode never prewarmed - the "next episode
+                // used to prefetch/prewarm, now it cold-starts" regression. preload/warm are idempotent per ep.
+                if (duration > 0 && d / duration >= 0.5) || (duration <= 0 && d >= 120) { preloadNextIfNeeded() }
+                // Wake the provider (ranged read of the preloaded source): near the end when duration is known,
+                // or once we're a few minutes in when it isn't (best-effort for durationless streams).
+                if (duration > 0 && duration - d <= 100) || (duration <= 0 && d >= 300) { warmNextIfReady() }
             }
         case MPVProperty.videoParamsSigPeak:
             if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
