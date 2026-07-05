@@ -23,6 +23,10 @@ struct TVCollectionsHub: View {
         guard !prefs.isCategoryHidden(HubCategoryKey.genresSection) else { return [] }
         return model.genres.filter { !prefs.isCategoryHidden(HubCategoryKey.genre($0)) }
     }
+    private var visibleDecades: [DecadeSpec] {
+        guard !prefs.isCategoryHidden(HubCategoryKey.decadesSection) else { return [] }
+        return model.decades.filter { !prefs.isCategoryHidden(HubCategoryKey.decade($0)) }
+    }
     private var showStreaming: Bool { !prefs.isCategoryHidden(HubCategoryKey.streamingSection) }
 
     var body: some View {
@@ -49,6 +53,14 @@ struct TVCollectionsHub: View {
                 section(title: "Browse by Genre", eyebrow: "Browse by genre") {
                     ForEach(visibleGenres, id: \.self) { g in
                         NavigationLink { TVCategoryBrowse(target: .genre(g)) } label: { TVGenreTile(genre: g, backdrop: model.genreBackdrops[g.title]) }
+                            .buttonStyle(CardFocusStyle())
+                    }
+                }
+            }
+            if !visibleDecades.isEmpty {
+                section(title: "Browse by Decade", eyebrow: "Browse by decade") {
+                    ForEach(visibleDecades, id: \.self) { d in
+                        NavigationLink { TVCategoryBrowse(target: .decade(d)) } label: { TVDecadeTile(decade: d) }
                             .buttonStyle(CardFocusStyle())
                     }
                 }
@@ -233,6 +245,26 @@ struct TVGenreTile: View {
             HStack(spacing: Theme.Space.sm) {
                 Image(systemName: genre.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)
                 Text(LocalizedStringKey(genre.title)).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+            }
+            .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+            .padding(Theme.Space.md)
+        }
+        .frame(width: kHubCardWidth, height: kHubCardWidth * 0.52)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+}
+
+/// A browse-by-decade tile: the same ember-tinted card as TVGenreTile with a calendar glyph and the decade
+/// label. No backdrop first cut (the gradient carries it, matching a genre tile with no art).
+struct TVDecadeTile: View {
+    let decade: DecadeSpec
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: decade.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)
+                Text(decade.title).font(.system(size: 20, weight: .bold)).foregroundStyle(.white).lineLimit(1)
             }
             .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
             .padding(Theme.Space.md)
@@ -507,6 +539,7 @@ struct TVDiscoverSettingsView: View {
                 categoryRow(String(localized: "Discover cards"), key: HubCategoryKey.discoverSection)
                 categoryRow(String(localized: "Streaming services"), key: HubCategoryKey.streamingSection)
                 categoryRow(String(localized: "Genres"), key: HubCategoryKey.genresSection)
+                categoryRow(String(localized: "Decades"), key: HubCategoryKey.decadesSection)
                 Text("Hide a whole section from Home and Discover.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -524,6 +557,14 @@ struct TVDiscoverSettingsView: View {
                         .foregroundStyle(Theme.Palette.textPrimary).padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.md)
                     ForEach(CollectionsHubModel.genreList, id: \.self) { g in
                         categoryRow(g.title, key: HubCategoryKey.genre(g))
+                    }
+                }
+
+                if !prefs.isCategoryHidden(HubCategoryKey.decadesSection) {
+                    Text("Decades").font(Theme.Typography.sectionTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary).padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.md)
+                    ForEach(CollectionsHubModel.decadeList, id: \.self) { d in
+                        categoryRow(d.title, key: HubCategoryKey.decade(d))
                     }
                 }
             }

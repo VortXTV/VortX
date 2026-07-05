@@ -88,6 +88,16 @@ struct GenreSpec: Hashable {
     var tint: Color { Theme.Palette.accent }   // ember accent, not a per-genre rainbow hue (VortX identity)
 }
 
+/// A browse-by-decade tile: a release-year window. Kept a plain value (like GenreSpec) so `HubTarget` stays
+/// trivially Hashable. The sub-catalogs bake the window into every TMDB discover query.
+struct DecadeSpec: Hashable {
+    let title: String
+    let symbol: String
+    let startYear: Int
+    let endYear: Int
+    var tint: Color { Theme.Palette.accent }
+}
+
 // MARK: - Hub target (what a tile points at)
 
 /// What a tapped tile opens. Hashable + self-describing so the iOS `NavigationStack(path:)` can push it and
@@ -96,12 +106,14 @@ enum HubTarget: Hashable {
     case discover(DiscoverList)
     case service(id: Int, name: String)
     case genre(GenreSpec)
+    case decade(DecadeSpec)
 
     var title: String {
         switch self {
         case .discover(let l): return l.title
         case .service(_, let name): return name
         case .genre(let g): return g.title
+        case .decade(let d): return d.title
         }
     }
 }
@@ -125,6 +137,7 @@ enum CollectionsCatalog {
         case .discover(let list): return discoverSubs(list, region: region)
         case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region)
         case .genre(let g):       return scopedSubs(movieScope: genreScope(g, media: "movie"), tvScope: genreScope(g, media: "tv"), region: region)
+        case .decade(let d):      return decadeSubs(d, region: region)
         }
     }
 
@@ -176,6 +189,29 @@ enum CollectionsCatalog {
             top("topyear", "Top This Year", days: 365, minVotes: 10),
             sub("trending", "Trending",
                 movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: { "\($0)&sort_by=popularity.desc" }),
+        ]
+    }
+
+    // MARK: Browse-by-decade sub-catalogs (a release-year window baked into every discover query)
+
+    /// Movies/Shows/New/Trending scoped to a decade's release-year window. Unlike the genre/service set this
+    /// OMITS the Top-This-Week/Month/Year pills (a rolling recent window is meaningless for an old decade), and
+    /// "New" sorts by release date DESCENDING WITHIN the decade (the window's `.lte` is the decade end, never
+    /// today), so "New Movies" in the 1980s means the latest 1980s releases.
+    private static func decadeSubs(_ d: DecadeSpec, region: String) -> [SubCatalog] {
+        let movieWindow = "primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31"
+        let tvWindow = "first_air_date.gte=\(d.startYear)-01-01&first_air_date.lte=\(d.endYear)-12-31"
+        func sub(_ id: String, _ title: String, movie: String?, tv: String?) -> SubCatalog {
+            SubCatalog(id: id, title: title, load: { page in
+                await mergedDiscover(movie: movie, tv: tv, region: region, page: page)
+            })
+        }
+        return [
+            sub("movies", "Movies", movie: "\(movieWindow)&sort_by=popularity.desc", tv: nil),
+            sub("shows", "Shows", movie: nil, tv: "\(tvWindow)&sort_by=popularity.desc"),
+            sub("newmovies", "New Movies", movie: "\(movieWindow)&sort_by=primary_release_date.desc&vote_count.gte=5", tv: nil),
+            sub("newshows", "New Shows", movie: nil, tv: "\(tvWindow)&sort_by=first_air_date.desc&vote_count.gte=5"),
+            sub("trending", "Trending", movie: "\(movieWindow)&sort_by=popularity.desc", tv: "\(tvWindow)&sort_by=popularity.desc"),
         ]
     }
 
@@ -266,6 +302,7 @@ final class CollectionsHubModel: ObservableObject {
 
     let discover = DiscoverList.allCases
     let genres = CollectionsHubModel.genreList
+    let decades = CollectionsHubModel.decadeList
 
     private var loadedRegion: String?
     private var loadTask: Task<Void, Never>?
@@ -490,6 +527,19 @@ final class CollectionsHubModel: ObservableObject {
     }
 
     // MARK: genre tiles (incl. Anime keyword + Documentary)
+
+    /// Browse-by-decade tiles, newest first, back to the 1950s. Fixed windows (the current decade's window runs
+    /// to its natural end; TMDB simply has few entries past today, and popularity.desc surfaces the real ones).
+    static let decadeList: [DecadeSpec] = [
+        DecadeSpec(title: "2020s", symbol: "calendar", startYear: 2020, endYear: 2029),
+        DecadeSpec(title: "2010s", symbol: "calendar", startYear: 2010, endYear: 2019),
+        DecadeSpec(title: "2000s", symbol: "calendar", startYear: 2000, endYear: 2009),
+        DecadeSpec(title: "1990s", symbol: "calendar", startYear: 1990, endYear: 1999),
+        DecadeSpec(title: "1980s", symbol: "calendar", startYear: 1980, endYear: 1989),
+        DecadeSpec(title: "1970s", symbol: "calendar", startYear: 1970, endYear: 1979),
+        DecadeSpec(title: "1960s", symbol: "calendar", startYear: 1960, endYear: 1969),
+        DecadeSpec(title: "1950s", symbol: "calendar", startYear: 1950, endYear: 1959),
+    ]
 
     static let genreList: [GenreSpec] = [
         GenreSpec("Action", "flame.fill", hue: 0.02, movie: 28, tv: 10759),

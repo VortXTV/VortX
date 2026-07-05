@@ -106,6 +106,10 @@ enum HubCategoryKey {
     static let discoverSection = "section:discover"
     /// The whole Genres section.
     static let genresSection = "section:genres"
+    /// A single decade tile, keyed by its start year, e.g. `decade:1990`.
+    static func decade(_ d: DecadeSpec) -> String { "decade:\(d.startYear)" }
+    /// The whole Decades section.
+    static let decadesSection = "section:decades"
 }
 
 enum CatalogPrefsStore {
