@@ -30,6 +30,11 @@ final class VXDiagExport {
     private var listener: NWListener?
     private var port: UInt16 = 0
 
+    /// Set once the LAN server has actually served the log to a phone at least once this session, so `stop()`
+    /// (export screen dismissed) can CLEAR the rolling log then and only then, giving the next export a fresh
+    /// buffer without wiping data that was never downloaded. Owner request: "once exported, clear it."
+    private var didServe = false
+
     private init() {}
 
     // MARK: - Public contract
@@ -60,7 +65,15 @@ final class VXDiagExport {
             listener?.cancel()
             listener = nil
             port = 0
-            NSLog("[diag] export: stopped")
+            // Clear the rolling log ONLY if it was actually downloaded this session, so the next export starts
+            // fresh (owner request) without discarding a log the phone never fetched.
+            if didServe {
+                VXProbe.clearLog()
+                didServe = false
+                NSLog("[diag] export: stopped + cleared log (was served)")
+            } else {
+                NSLog("[diag] export: stopped")
+            }
         }
     }
 
@@ -160,7 +173,10 @@ final class VXDiagExport {
         NSLog("[diag] export: sending log (%d bytes)", body.count)
         var payload = Data(head.utf8)
         payload.append(body)
-        connection.send(content: payload, completion: .contentProcessed { _ in
+        connection.send(content: payload, completion: .contentProcessed { [weak self] _ in
+            // The log has now been handed to the phone: mark it served so `stop()` clears the buffer for a
+            // fresh next export. Serialized on `queue` (same queue the connection + stop() run on).
+            self?.queue.async { self?.didServe = true }
             connection.cancel()
         })
     }
@@ -238,7 +254,10 @@ extension VXDiagExport {
         do {
             try data.write(to: dest, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([dest])
-            NSLog("[diag] export: revealed %@ in Finder", dest.path)
+            // The Downloads copy is an independent file, so it is safe to clear the live rolling log now: the
+            // next export starts fresh (owner request "once exported, clear it").
+            VXProbe.clearLog()
+            NSLog("[diag] export: revealed %@ in Finder + cleared live log", dest.path)
             return dest.path
         } catch {
             // Downloads not writable (unexpected on an unsandboxed Mac): reveal the log in place instead.

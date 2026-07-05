@@ -245,10 +245,31 @@ struct AddonsView: View {
         let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
         let tint = isOff ? Theme.Palette.textTertiary
                          : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
-        if let logo = addon.manifest.logo, let url = URL(string: logo) {
-            AsyncImage(url: url) { phase in
-                if let image = phase.image {
-                    image.resizable().scaledToFit()
+        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff)
+    }
+
+    /// Add-on logo, DOWNSAMPLED via PosterImageLoader (maxPixel 168 = the 56pt @3x on-screen size) instead of
+    /// AsyncImage, which decoded each logo at FULL resolution. With a whole account's worth of add-ons rendered
+    /// at once (a synced account can carry 25+), that burst of full-res bitmaps ballooned resident memory into
+    /// the hundreds of MB / ~1 GB and made the Add-ons screen lag badly (owner-reported "unusable" on Mac).
+    /// Falls back to the capability SF Symbol when there is no logo or it fails to load. Mirrors PosterCardiOS's
+    /// warm-cache + `.task(id:)` pattern so a revisit never flashes blank.
+    private struct AddonLogoIcon: View {
+        let logo: String?
+        let symbol: String
+        let tint: Color
+        let isOff: Bool
+        @State private var image: VXPosterImage?
+
+        private var warmCache: VXPosterImage? {
+            guard let logo, let u = URL(string: logo) else { return nil }
+            return PosterImageLoader.cached(u)
+        }
+
+        var body: some View {
+            Group {
+                if let img = image ?? warmCache {
+                    imageView(img).resizable().scaledToFit()
                         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
                         .opacity(isOff ? 0.5 : 1)
                 } else {
@@ -256,8 +277,19 @@ struct AddonsView: View {
                 }
             }
             .frame(width: 56, height: 56)
-        } else {
-            Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint).frame(width: 56)
+            .task(id: logo) {
+                guard image == nil, let logo, !logo.isEmpty else { return }
+                // 168px = 56pt @3x: only the on-screen size ever sits in memory, never a 1000px+ full-res logo.
+                if let img = await PosterImageLoader.load(logo, maxPixel: 168) { image = img }
+            }
+        }
+
+        private func imageView(_ img: VXPosterImage) -> Image {
+            #if canImport(UIKit)
+            Image(uiImage: img)
+            #else
+            Image(nsImage: img)
+            #endif
         }
     }
 
