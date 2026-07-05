@@ -260,6 +260,35 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
         // RPU to Profile 8.1 and drop the EL (see the mux loop). A stream with no DOVI config (the filename
         // label lied) still gains nothing from AVPlayer and fails fast to the libmpv tone-map.
+        // The matroska demuxer only surfaces a DOVI config from a container dvcC/dvvC BlockAdditionMapping. A
+        // source that labels DV solely via IN-BAND HEVC RPU NALs (UNSPEC62) leaves dvProfile at -1 above, and
+        // real Stremio (mpv, which reads the in-band RPU) still shows DV. When the container gave no profile,
+        // probe the bitstream: read a bounded run of packets into a small buffer (NO av_seek - the debrid HTTP
+        // AVIO is not reliably byte-seekable) and read the profile from the FIRST base-video packet's RPU. Those
+        // packets are DRAINED into the mux loop below (in order) so nothing is re-read and no rewind is needed;
+        // a function-scope defer frees any packet the mux loop never got to (early return / non-DV fall-through).
+        var prebuffered: [UnsafeMutablePointer<AVPacket>] = []
+        defer { for p in prebuffered { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) } }
+        if info.dvProfile < 0, baseVideoIn >= 0 {
+            let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
+            let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
+            var scanned = 0
+            while scanned < maxScan, !isCancelled {
+                guard let p = av_packet_alloc() else { break }
+                if av_read_frame(inCtx, p) < 0 { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp); break }
+                scanned += 1
+                prebuffered.append(p)
+                if Int(p.pointee.stream_index) == baseVideoIn {
+                    let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
+                    if prof >= 0 {
+                        info.dvProfile = prof
+                        VXProbe.log("dv", "in-band RPU detected dvProfile=\(prof) (no container DOVI config)")
+                    }
+                    break   // decided on the first base-video packet either way
+                }
+            }
+        }
+
         let convertP7 = (info.dvProfile == 7)
         guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
             // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
@@ -414,6 +443,33 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // buffer.finish(), so a truncated stream ended playback cleanly with no error and no AVPlayer -> libmpv
         // demotion. A mid-stream error now fails the buffer so the loader errors the request and the chrome
         // can re-open the link on libmpv.
+        // Drain the DV-detection read-ahead packets FIRST, in order, before any live read. Each was
+        // av_packet_alloc'd in the pre-scan; the per-iteration defer frees it however this iteration exits, and
+        // removeFirst drops it from `prebuffered` so the function-scope defer never double-frees it. This is the
+        // seek-free half: the buffered packets are the exact bytes the loop would have read, so muxing them in
+        // order reproduces a full stream. Same streamMap / convertP7 / rescale path as the live loop below.
+        while !prebuffered.isEmpty, !isCancelled {
+            let p = prebuffered.removeFirst()
+            defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
+            let inIdx = Int(p.pointee.stream_index)
+            guard inIdx >= 0, inIdx < nb, streamMap[inIdx] >= 0,
+                  let inStream = inCtx.pointee.streams[inIdx],
+                  let outStream = outCtx.pointee.streams[streamMap[inIdx]] else { continue }
+            let outIdx = streamMap[inIdx]
+            if convertP7, outIdx == baseVideoOut {
+                Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats)
+            }
+            p.pointee.stream_index = Int32(outIdx)
+            av_packet_rescale_ts(p, inStream.pointee.time_base, outStream.pointee.time_base)
+            p.pointee.pos = -1
+            let wf = av_interleaved_write_frame(outCtx, p)
+            if wf < 0 {
+                if isCancelled { break }
+                buffer.fail("av_interleaved_write_frame failed (\(wf)) [prebuffered drain]")
+                return
+            }
+        }
+
         let AVERROR_EOF_CONST: Int32 = -541478725
         var readRetries = 0
         let maxReadRetries = 4
@@ -605,6 +661,37 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
     /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
     /// genuinely can't convert.
+    /// Detect the Dolby Vision profile from an IN-BAND HEVC RPU when the container carried no DOVI config. Walks
+    /// one base-video access unit's length-prefixed NALs; on the FIRST UNSPEC62 (type 62) RPU it parses the RPU
+    /// with libdovi and returns its `guessed_profile` (5/7/8...). Returns -1 when the packet has no parseable RPU.
+    /// SEEK-FREE and side-effect-free: reads the packet bytes only, never advances the demuxer or mutates the
+    /// packet. Mirrors the NAL walk + memory pattern of `convertPacketRPUToProfile81`; uses only libdovi symbols
+    /// already linked (dovi_parse_unspec62_nalu / dovi_rpu_get_header / guessed_profile / free).
+    private static func inBandDoViProfile(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int) -> Int {
+        guard let src = pkt.pointee.data else { return -1 }
+        let total = Int(pkt.pointee.size)
+        guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return -1 }
+        var pos = 0
+        while pos + nalLengthSize <= total {
+            var nalLen = 0
+            for k in 0..<nalLengthSize { nalLen = (nalLen << 8) | Int(src[pos + k]) }
+            let nalStart = pos + nalLengthSize
+            guard nalLen > 0, nalStart + nalLen <= total else { return -1 }
+            let nalType = (src[nalStart] >> 1) & 0x3F
+            if nalType == hevcNalTypeDoViRPU {
+                return src.withMemoryRebound(to: UInt8.self, capacity: total) { base -> Int in
+                    guard let rpu = dovi_parse_unspec62_nalu(base + nalStart, nalLen) else { return -1 }
+                    defer { dovi_rpu_free(rpu) }
+                    guard let hdr = dovi_rpu_get_header(rpu) else { return -1 }
+                    defer { dovi_rpu_free_header(hdr) }
+                    return Int(hdr.pointee.guessed_profile)
+                }
+            }
+            pos = nalStart + nalLen
+        }
+        return -1
+    }
+
     private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
         guard let src = pkt.pointee.data else { return }
         let total = Int(pkt.pointee.size)
