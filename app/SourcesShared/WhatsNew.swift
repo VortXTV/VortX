@@ -5,7 +5,7 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.3.12"
+    static let version = "0.3.11"
     static let highlights: [String] = [
         "The Mac app no longer freezes or force-quits while a title's source list loads. On a popular title with a thousand-plus sources, building and ranking that list ran on the main thread several times a second and could lock the app hard enough that you had to force-quit it. The whole list is now assembled and ranked off the main thread and published once, so the window stays responsive and keyboard navigation keeps working while sources stream in. iPhone, iPad, Mac, and Apple TV.",
         "Play from start replays the source you were watching, never a different one. Starting a movie over from the beginning used to re-run source selection and could jump to another source; it now restarts the exact same source from 0:00. Watch Now and picking a source yourself are unchanged.",

@@ -4,9 +4,9 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.12 - build 154
+## 0.3.11 - build 154 (pre-release)
 
-A stability and playback follow-up to 0.3.11 that ends the Mac source-list freeze that could force you to quit the app, makes Continue Watching and Play from start start on the exact source you expect, lights true Dolby Vision on Apple TV, and fixes iPhone/iPad downloads that failed with a storage or file-creation error. In-place update, nothing resets.
+A stability and playback pre-release over build 153 that ends the Mac source-list freeze that could force you to quit the app, makes Continue Watching and Play from start start on the exact source you expect, lights true Dolby Vision on Apple TV, and fixes iPhone/iPad downloads that failed with a storage or file-creation error. In testing; becomes the 0.3.12 release once verified. In-place update, nothing resets.
 
 ### Fixed
 
