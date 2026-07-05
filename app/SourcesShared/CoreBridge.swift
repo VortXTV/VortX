@@ -222,6 +222,17 @@ final class CoreBridge: ObservableObject {
         // owner-reported "pressing delete doesn't delete." Tombstoning + refreshAddons still suppresses it.
         if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
             AddonTombstones.tombstone(descriptor.transportUrl)
+            // Propagate the removal to your other devices PROMPTLY. The tombstone write arms the
+            // UserDefaults-didChange auto-sync, but that push is DEBOUNCED and reschedules on every write,
+            // so a steady trickle of unrelated UserDefaults writes (health probes, poster caches) can starve
+            // it and delay the delete from syncing for minutes (owner-reported: pressed "Sync now" on the
+            // phone, it did not delete; ~5 minutes later it did). Kick an immediate, non-debounced push so
+            // the tombstone lands in doc.vortx.deletedAddons right away and peers pick it up on their next pull.
+            let removedUrl = descriptor.transportUrl
+            Task {
+                let ok = await VortXSyncManager.shared.pushThisDevice()
+                NSLog("[addon] removal of %@ pushed to sync immediately (ok=%@)", removedUrl, ok ? "yes" : "no")
+            }
         }
         let raw = rawAddonsByUrl[descriptor.transportUrl]
         // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only). When a live Stremio

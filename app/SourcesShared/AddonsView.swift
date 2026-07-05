@@ -338,36 +338,45 @@ struct AddonsView: View {
         .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
     }
 
-    /// The add-on's action chips, laid out in their own horizontally-scrolling row beneath the info so they
-    /// never steal width from the name / detail column. Scrolls rather than wrapping so a phone with several
-    /// chips stays one clean line.
+    /// The add-on's action chips, in their own row beneath the info so they never steal width from the name /
+    /// detail column. On iPhone the four chips of a configurable add-on (Configure + link + eye + Remove)
+    /// overflowed a single horizontal-scroll row and CLIPPED Remove off the right edge (owner-reported "the
+    /// add-on page is cut off from the side" - the clipped chip was the one you most need). So on iOS / Mac
+    /// they now WRAP (FlowLayout): a narrow phone drops Remove to a second line instead of hiding it, while
+    /// iPad / Mac keep them on one line. tvOS is wide and focus-driven, so it keeps the scroll row unchanged.
     @ViewBuilder private func addonActions(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        #if os(tvOS)
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: Theme.Space.sm) {
-                // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
-                // regardless of protected state; protected defaults are not configurable anyway.
-                if addon.isConfigurable {
-                    Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
-                        .buttonStyle(ChipButtonStyle(selected: false))
-                        .fixedSize()
-                }
-                if !addon.isProtected {
-                    // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
-                    // URL first, then removes the old, so a bad URL never leaves you with neither.
-                    Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
-                        .buttonStyle(ChipButtonStyle(selected: false))
-                        .fixedSize()
-                    // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
-                    Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
-                        Image(systemName: isOff ? "eye.slash" : "eye")
-                    }
-                    .buttonStyle(ChipButtonStyle(selected: !isOff))
-                    .fixedSize()
-                    Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
-                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
-                        .fixedSize()
-                }
+            HStack(spacing: Theme.Space.sm) { addonActionChips(addon, isOff: isOff) }
+        }
+        #else
+        FlowLayout(spacing: Theme.Space.sm) { addonActionChips(addon, isOff: isOff) }
+        #endif
+    }
+
+    @ViewBuilder private func addonActionChips(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
+        // regardless of protected state; protected defaults are not configurable anyway.
+        if addon.isConfigurable {
+            Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .fixedSize()
+        }
+        if !addon.isProtected {
+            // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
+            // URL first, then removes the old, so a bad URL never leaves you with neither.
+            Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .fixedSize()
+            // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
+            Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
+                Image(systemName: isOff ? "eye.slash" : "eye")
             }
+            .buttonStyle(ChipButtonStyle(selected: !isOff))
+            .fixedSize()
+            Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
+                .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                .fixedSize()
         }
     }
 
