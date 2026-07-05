@@ -107,7 +107,7 @@ enum StreamRanking {
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                      pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
-        if SourcePreferences.shared.useAddonOrder {
+        if SourcePreferences.reading.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
             // explicit "play THIS" - so an applicable pin still wins, falling back to add-on order.
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
@@ -154,7 +154,7 @@ enum StreamRanking {
         guard let hint = rememberedQuality, !hint.isEmpty else {
             return seconds > 4                                         // fresh play: original snappy window
         }
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         let torrentOK = prefs.useAddonOrder || prefs.typeOrder.first == .torrent
         let qualityReady = groups.contains { group in
             group.streams.contains { s in
@@ -264,7 +264,7 @@ enum StreamRanking {
         // awareness-only slice, so it still plays via the torrent server, not debrid. The +8000 cached
         // bonus above lifts it WITHIN the torrent tier; the .debrid retag waits for the cached-PLAY path.
         let type = sourceType(s, text)
-        score += SourcePreferences.shared.tierWeight(for: type)
+        score += SourcePreferences.reading.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
         // providers without ever crossing a quality or tier boundary.
         score += providerOffset(for: provider(text))
@@ -563,7 +563,7 @@ enum StreamRanking {
     /// Whether a stream survives the user's keyword + safety filters (Settings > Streams). Default
     /// preferences pass everything, so this is a no-op until the user opts in.
     static func passesUserFilters(_ s: CoreStream) -> Bool {
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         let kids = ProfileStore.activeIsKids()
         if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
         let text = qualityText(s)
@@ -634,7 +634,7 @@ enum StreamRanking {
 
     static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         // A Kids profile must run passesUserFilters even with zero manual filters (its content guard
         // lives there), so only take the no-op fast path when not a Kids profile.
         guard !prefs.noFiltersActive || ProfileStore.activeIsKids() else { return groups }
@@ -647,7 +647,7 @@ enum StreamRanking {
     static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                              debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
         let groups = applyUserFilters(groups)
-        guard !SourcePreferences.shared.useAddonOrder else { return groups }
+        guard !SourcePreferences.reading.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {
@@ -662,7 +662,7 @@ enum StreamRanking {
     static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
-        if SourcePreferences.shared.useAddonOrder {
+        if SourcePreferences.reading.useAddonOrder {
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
         }
@@ -925,7 +925,7 @@ enum StreamRanking {
         let t = qualityText(s)
         var why: [String] = []
         if isCached(s, t) { why.append("instant from cache") }
-        if SourcePreferences.shared.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
+        if SourcePreferences.reading.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
         guard !why.isEmpty else { return nil }
         return why.joined(separator: " · ")
     }

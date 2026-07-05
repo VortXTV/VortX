@@ -50,9 +50,32 @@ enum SourcePreset: String, CaseIterable, Identifiable {
     }
 }
 
+/// The read surface `StreamRanking` needs from source preferences at score / filter time. Both the live
+/// singleton and an immutable `Snapshot` conform, so the ranker can run on a captured snapshot instead of
+/// reading (and racing) the mutable singleton across threads. Keep it in lockstep with what the ranker reads.
+protocol SourcePrefsReading {
+    var useAddonOrder: Bool { get }
+    var typeOrder: [SourceType] { get }
+    var noFiltersActive: Bool { get }
+    var keywordsAreRegex: Bool { get }
+    var excludeRegex: NSRegularExpression? { get }
+    var includeRegex: NSRegularExpression? { get }
+    var excludeTerms: [String] { get }
+    var includeTerms: [String] { get }
+    var safetyMode: String { get }
+    var instantOnly: Bool { get }
+    var hideDeadTorrents: Bool { get }
+    var excludeAV1: Bool { get }
+    var hdrOnly: Bool { get }
+    var maxResolution: Int { get }
+    var maxFileSizeGB: Double { get }
+    func tierWeight(for type: SourceType) -> Int
+    func matches(_ regex: NSRegularExpression, _ text: String) -> Bool
+}
+
 /// Persisted source-ranking preferences.
 /// Observed by SettingsView and read by StreamRanking at score time.
-final class SourcePreferences: ObservableObject {
+final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let shared = SourcePreferences()
 
     private static let orderKey      = "stremiox.streaming.sourceTypeOrder"
@@ -71,7 +94,7 @@ final class SourcePreferences: ObservableObject {
 
     // Max possible quality score is ~13,800 (4K + cached + remux + HDR + atmos + file-size cap).
     // A 15,000-point tier gap means the preferred type ALWAYS beats a lower type regardless of quality.
-    private static let tierWeights = [45_000, 30_000, 15_000, 0]
+    fileprivate static let tierWeights = [45_000, 30_000, 15_000, 0]
 
     @Published var typeOrder: [SourceType] {
         didSet {
@@ -297,4 +320,65 @@ final class SourcePreferences: ObservableObject {
             maxResolution = 1080; maxFileSizeGB = 4;  instantOnly = true;  hdrOnly = false; excludeAV1 = true
         }
     }
+}
+
+// MARK: - Off-main snapshot (the race fix for SourceListModel's detached rank)
+
+extension SourcePreferences {
+
+    /// An immutable capture of the ranking-relevant preferences, taken ON THE MAIN ACTOR. `StreamRanking`
+    /// installs one as a task-local (`readingOverride`) around its off-main rank so it never reads the
+    /// mutable singleton's in-memory state across threads. The singleton's `@Published` props and the
+    /// `excludeRegex` / `includeRegex` references are reassigned on the main thread (Settings edits,
+    /// `reload()` on a profile switch); the old main-actor `DetailRankMemo` ran the rank on the main actor,
+    /// so moving it into `Task.detached` made this the first off-main reader. Carrying the compiled regex
+    /// references is safe: `NSRegularExpression` is documented immutable + thread-safe for matching, so only
+    /// the singleton's concurrent REASSIGNMENT was the race, and a snapshot freezes that out.
+    struct Snapshot: SourcePrefsReading, @unchecked Sendable {   // @unchecked: NSRegularExpression is thread-safe for matching but not Sendable-marked
+        let useAddonOrder: Bool
+        let typeOrder: [SourceType]
+        let noFiltersActive: Bool
+        let keywordsAreRegex: Bool
+        let excludeRegex: NSRegularExpression?
+        let includeRegex: NSRegularExpression?
+        let excludeTerms: [String]
+        let includeTerms: [String]
+        let safetyMode: String
+        let instantOnly: Bool
+        let hideDeadTorrents: Bool
+        let excludeAV1: Bool
+        let hdrOnly: Bool
+        let maxResolution: Int
+        let maxFileSizeGB: Double
+
+        /// Same logic as `SourcePreferences.tierWeight`, over the snapshotted `typeOrder`.
+        func tierWeight(for type: SourceType) -> Int {
+            let idx = typeOrder.firstIndex(of: type) ?? (typeOrder.count - 1)
+            return idx < SourcePreferences.tierWeights.count ? SourcePreferences.tierWeights[idx] : 0
+        }
+        /// Same matching as `SourcePreferences.matches` (pure; `NSRegularExpression` matching is thread-safe).
+        func matches(_ regex: NSRegularExpression, _ text: String) -> Bool {
+            regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil
+        }
+    }
+
+    /// Capture the ranking-relevant prefs into an immutable, thread-safe `Snapshot`. MUST be called on the
+    /// main actor (the singleton is only ever mutated there), so every captured value is mutually consistent.
+    func snapshot() -> Snapshot {
+        Snapshot(useAddonOrder: useAddonOrder, typeOrder: typeOrder, noFiltersActive: noFiltersActive,
+                 keywordsAreRegex: keywordsAreRegex, excludeRegex: excludeRegex, includeRegex: includeRegex,
+                 excludeTerms: excludeTerms, includeTerms: includeTerms, safetyMode: safetyMode,
+                 instantOnly: instantOnly, hideDeadTorrents: hideDeadTorrents, excludeAV1: excludeAV1,
+                 hdrOnly: hdrOnly, maxResolution: maxResolution, maxFileSizeGB: maxFileSizeGB)
+    }
+
+    /// The off-main override for the ranker. When installed (by `SourceListModel`'s detached rank via
+    /// `$readingOverride.withValue(...)`), `reading` returns this frozen snapshot instead of the live
+    /// singleton, so the off-main rank cannot race the main-thread mutation. `Task.detached` does NOT
+    /// inherit task-locals, so the `withValue` MUST wrap the rank inside the detached task.
+    @TaskLocal static var readingOverride: Snapshot?
+
+    /// What the ranker reads: the installed off-main snapshot if present, else the live singleton. Main-actor
+    /// callers install nothing, so they read `shared` exactly as before (identical behavior, zero allocation).
+    static var reading: SourcePrefsReading { readingOverride ?? shared }
 }

@@ -164,6 +164,12 @@ final class SourceListModel: ObservableObject {
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
         let torboxStreams = torbox.streams
         let singularityStreams = singularity.streams
+        // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
+        // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
+        // main thread (Settings edits, profile reload()), so reading them from the detached rank below
+        // would race. The snapshot is installed as a task-local INSIDE the detached task (Task.detached
+        // does not inherit task-locals), so the off-main rank reads this frozen copy, never the singleton.
+        let prefsSnapshot = SourcePreferences.shared.snapshot()
 
         Task.detached(priority: .userInitiated) { [weak self] in
             // STEP 3 (delete fix), belt and suspenders: CoreBridge.streamGroups() already subtracts
@@ -184,9 +190,15 @@ final class SourceListModel: ObservableObject {
                     return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
                 }
             }
-            let ranked = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
-            let rankedBest = StreamRanking.best(ranked, continuity: ctx.continuity, pin: ctx.pin,
-                                                debridCachedHashes: cachedHashes)
+            // Run the rank against the frozen prefs snapshot (task-local), so StreamRanking never reads the
+            // mutable SourcePreferences singleton across threads. withValue binds it for this synchronous
+            // scope only; existing main-actor StreamRanking callers install nothing and read the live singleton.
+            let (ranked, rankedBest) = SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
+                let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
+                let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
+                                              debridCachedHashes: cachedHashes)
+                return (groups, best)
+            }
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
 
             await MainActor.run {
