@@ -230,7 +230,14 @@ enum CommunityTrickplay {
         // max 30..600). Baked defaults (min 1, max 600) == the shipping literals, so a null/out-of-range
         // remote value is behaviorally identical to today.
         let frameBounds = RemoteConfig.snapshot.trickplayFrameBounds
-        guard sorted.count >= frameBounds.min, sorted.count <= frameBounds.max else { return false }
+        // The sheet builder below needs >= 2 tiles (`while budget >= 2`). Clamp the effective lower bound to 2 so a
+        // 1-frame set is rejected up front with a clear reason instead of silently falling through the geometry loop
+        // and failing at the floor with a misleading "compose/encode failure" log.
+        let minFrames = max(2, frameBounds.min)
+        guard sorted.count >= minFrames, sorted.count <= frameBounds.max else {
+            VXProbe.log("tp", "buildAndUpload skipped: sorted=\(sorted.count) below buildable floor \(minFrames) (need >=2 tiles)")
+            return false
+        }
 
         // Bound one sheet to a 3 MB-safe tile budget. A long watch produces far more 480x270 tiles than fit
         // under the worker's 3 MB cap, so the full-session sheet blew the cap and the upload was dropped before

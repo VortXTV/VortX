@@ -255,13 +255,18 @@ final class ScrubThumbnailsStore: ObservableObject {
         // (capture is ~every 10s, so effectively every ~10s of new coverage). This replaces the old ~1-minute
         // batch so trickplay contributes live, not only at teardown.
         let minNewFrames = 1
+        // The community sheet builder needs >= 2 tiles: buildAndUpload's `while budget >= 2` loop is skipped for a
+        // single frame, so a 1-frame push is admitted then dropped at the floor (the noisy sorted=1 failure every
+        // session). Never spawn a progressive push until we actually have a buildable (>= 2) frame count.
+        let minBuildableFrames = 2
         // Evaluate each guard clause up front so the probe can report WHY we do or do not upload this tick.
         let enabled = CommunityTrickplay.isEnabled
         let hasKey = communityKey != nil
         let beatsStored = sessionFrames.count > communityExistingFrameCount   // keep-fuller: don't clobber a fuller set
         let hasNewCoverage = sessionFrames.count >= lastUploadedCount + minNewFrames
-        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && communityImdb != nil
-        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) minNew=\(minNewFrames) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
+        let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
+        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && enoughToBuild && communityImdb != nil
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) minNew=\(minNewFrames) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -277,11 +282,12 @@ final class ScrubThumbnailsStore: ObservableObject {
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
         // No hasRealDuration gate (see maybeUploadProgressively) so a debrid MKV that never emitted mpv's
-        // `duration` event still flushes on exit. Store even a tiny capture (>=1 frame) so a short watch or a
-        // quick bug-test is never lost - the owner asked that even ~5s of coverage be stored + served.
+        // `duration` event still flushes on exit. Requires >= 2 kept frames: the sheet builder needs >= 2 tiles
+        // (`while budget >= 2`), so a lone-frame flush can only reproduce the sorted=1 drop. Capture is ~every 10s,
+        // so a ~20s+ watch stores; a shorter single-frame watch is structurally unbuildable, not dropped in error.
         let enabled = CommunityTrickplay.isEnabled
         let hasKey = communityKey != nil
-        let hasFrames = sessionFrames.count >= 1
+        let hasFrames = sessionFrames.count >= 2   // sheet builder floors at 2 tiles; a lone frame is unbuildable
         let grewSinceUpload = sessionFrames.count > lastUploadedCount
         let beatsStored = sessionFrames.count > communityExistingFrameCount
         let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && communityImdb != nil
