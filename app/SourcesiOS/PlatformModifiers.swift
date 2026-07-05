@@ -148,10 +148,14 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
             c.host = host
             c.savedTitleVisibility = host.titleVisibility
             c.savedTitlebarTransparent = host.titlebarAppearsTransparent
-            c.savedToolbarVisible = host.toolbar?.isVisible
             host.titleVisibility = .hidden
             host.titlebarAppearsTransparent = true
-            host.toolbar?.isVisible = false
+            // DO NOT toggle `host.toolbar?.isVisible`. That NSToolbar is OWNED by SwiftUI's ToolbarBridge;
+            // mutating its visibility here corrupts the bridge, so the NEXT SwiftUI-driven toolbar rebuild
+            // (navigating into a Settings sub-screen after the player has been up) crashed in
+            // -[NSToolbar _insertNewItemWithItemIdentifier:...] (EXC_BREAKPOINT). Live-repro'd 2026-07-05:
+            // play -> close -> open "VortX account & sync" crashed; a fresh navigation never did. The
+            // transparent titlebar + hidden title already keep chrome off the full-window player cover.
         }
         return view
     }
@@ -163,7 +167,6 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         guard let host = coordinator.host else { return }
         host.titleVisibility = coordinator.savedTitleVisibility
         host.titlebarAppearsTransparent = coordinator.savedTitlebarTransparent
-        if let v = coordinator.savedToolbarVisible { host.toolbar?.isVisible = v }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
