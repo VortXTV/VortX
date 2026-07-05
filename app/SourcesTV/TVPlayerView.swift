@@ -75,6 +75,7 @@ struct TVPlayerView: View {
     @State private var addedPooledIDs: Set<Int> = []
     @State private var pooledSeededOffset = false
     @State private var embeddedUploadDone = false
+    @State private var langContributeDone = false      // the container language-index contribute ran once this session
     @State private var offsetCaptureTask: Task<Void, Never>?
     @State private var subFingerprint: String?
     @State private var subFingerprintKey = ""
@@ -290,6 +291,10 @@ struct TVPlayerView: View {
         }
         .onAppear {
             VXProbeState.shared.setRoute("player")
+            // Mark the engine player-active so CoreBridge skips the library-branch In-Library re-decode of
+            // the meta_details payload while the player is up (the detail page is not on screen). Cleared in
+            // onDisappear. Depth-counted so a nested mount cannot clear it early.
+            core.setPlayerActive(true)
             if curURL == nil {   // seed from initial request
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
@@ -334,6 +339,7 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
+            core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
@@ -373,8 +379,13 @@ struct TVPlayerView: View {
         let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
         // tvOS: DVDisplaySupport.isCapable is constant true (the Apple TV negotiates DV over HDMI), so the DV
         // mandate's remux lane engages for DV MKVs here too. Stable across renders (no engine flip mid-play).
-        return PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
-                                         dvDisplayCapable: DVDisplaySupport.isCapable) == .avfoundation
+        let chosen = PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
+                                               dvDisplayCapable: DVDisplaySupport.isCapable)
+        // [dv] routing probe: first line of the DV trail (route -> mount -> classify -> fallback -> demote).
+        // Gated, so free in shipping builds. AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv
+        // here means the DV source tone-maps to HDR10.
+        VXProbe.log("dv", "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(PlayerEngineRouter.isDVRemuxCandidate(url)) container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
+        return chosen == .avfoundation
     }
 
     /// The video surface: the AVFoundation engine when routed there, otherwise libmpv. Both bind to the same
@@ -466,7 +477,9 @@ struct TVPlayerView: View {
                 if !autoAddedThisPlayback, !isCurrentLiveStream, d >= 60, let m = curMeta {
                     autoAddedThisPlayback = true
                     LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary)
-                    WatchSignalClient.ping(contentId: m.libraryId, type: m.type)
+                    // Resolve a tmdb:… hub/catalog id to its tt identity first (fire-and-forget on a cache
+                    // miss) so those plays feed the pool too; a tt id still pings inline. Never blocks.
+                    WatchSignalClient.pingResolvingTMDB(contentId: m.libraryId, type: m.type, seriesHint: m.season != nil)
                 }
                 if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
                 if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
@@ -1012,7 +1025,7 @@ struct TVPlayerView: View {
                         refreshTracksSoon()
                         coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                             subtitleLoadingURL = nil
-                            if ok { addedSubURLs.insert(sub.url) }
+                            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                             refreshTracksSoon()
                             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on ok=\(ok))")
                         }
@@ -1441,7 +1454,7 @@ struct TVPlayerView: View {
         // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
         // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
         subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
-        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
+        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false; langContributeDone = false
         loadIntoPlayer(newURL, headers: curHeaders, live: curIsLive)
         startLoadTimeout()
     }
@@ -1694,6 +1707,7 @@ struct TVPlayerView: View {
             let lang = s < 0 ? "off" : (subtitleTracks.first { $0.id == s }.map { langName($0.lang) } ?? "\(s)")
             VXProbe.event("subs", "subs selected \(lang) (auto)")
         }
+        contributeContainerLanguagesIfNeeded()   // pool the file's REAL track langs (provenance "container")
         refreshTracksSoon()
     }
 
@@ -1884,14 +1898,13 @@ struct TVPlayerView: View {
         // iOS self-heal: log the miss, then one-shot the runtime (movie then series) and key
         // provisionally. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks imdb), and the
         // resolver caches the mapping for the store's own keying. mpv's real `duration` still re-keys.
-        NSLog("[trickplay] provisional key MISS (tvOS): playing=%@ metaDetails=%@ (fetching runtime)",
-              m.libraryId, core.metaDetails?.meta?.id ?? "nil")
+        VXProbe.log("tp", "provisional key MISS (tvOS): playing=\(m.libraryId) metaDetails=\(core.metaDetails?.meta?.id ?? "nil") (fetching runtime)")
         Task {
             var ttId = m.libraryId
             if !ttId.hasPrefix("tt") {
                 guard ttId.lowercased().hasPrefix("tmdb"),
                       let tt = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil) else {
-                    NSLog("[trickplay] provisional key MISS stays (tvOS): unresolvable id %@", m.libraryId)
+                    VXProbe.log("tp", "provisional key MISS stays (tvOS): unresolvable id \(m.libraryId)")
                     return
                 }
                 ttId = tt
@@ -1899,7 +1912,7 @@ struct TVPlayerView: View {
             var secs = await Self.cinemetaRuntimeSeconds(kind: "movie", id: ttId)
             if secs <= 0 { secs = await Self.cinemetaRuntimeSeconds(kind: "series", id: ttId) }
             guard secs > 0 else {
-                NSLog("[trickplay] provisional key MISS stays (tvOS): no cinemeta runtime for %@", ttId)
+                VXProbe.log("tp", "provisional key MISS stays (tvOS): no cinemeta runtime for \(ttId)")
                 return
             }
             await MainActor.run {
@@ -2303,7 +2316,19 @@ struct TVPlayerView: View {
         embeddedUploadDone = true
         refreshSubFingerprint()
         let fp = subFingerprint
-        let inputStr = (curURL ?? url).absoluteString
+        // Gate the extract to LOCAL / loopback sources only. `extractTextSubtitles` does an
+        // `avformat_open_input` + a full `av_read_frame` demux to EOF; on a debrid/direct REMOTE URL that
+        // re-opens and streams the whole file a SECOND time just to read subs, competing with playback for the
+        // debrid connection. libav can only reach the file's own text via that re-download (libmpv exposes just
+        // track lang/title, not cue text), so for remote sources we skip the extract entirely. Torrents play
+        // through the loopback server (isTorrentPlayback) and local files re-open locally, both free to extract.
+        let u = curURL ?? url
+        let isLocal = u.isFileURL || isTorrentPlayback || u.host == "127.0.0.1" || u.host == "localhost" || u.host == "::1"
+        guard isLocal else {
+            VXProbe.log("sing", "sub embedded-extract skipped remote host=\(u.host ?? "-")")
+            return
+        }
+        let inputStr = u.absoluteString
         Task.detached(priority: .utility) {
             let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
             for track in tracks where track.cueCount > 0 {
@@ -2311,6 +2336,66 @@ struct TVPlayerView: View {
                                                 origin: "embedded", format: track.format, text: track.srt)
             }
         }
+    }
+
+    /// Hoard a successfully-loaded ADD-ON subtitle into the community pool (origin "addon") so the next user
+    /// gets it without hitting the add-on. Best-effort, off-main, gated + size-capped + fail-soft inside
+    /// `SubtitlePoolClient.upload`; never blocks playback. The sub text is downloaded once from the add-on URL.
+    private func hoardAddonSubtitle(_ sub: AddonSubtitle) {
+        guard let contentKey = communityContentKey, let subURL = URL(string: sub.url) else { return }
+        refreshSubFingerprint()
+        let fp = subFingerprint
+        let lang = sub.lang
+        let ext = subURL.pathExtension.lowercased()
+        let format = ["srt", "vtt", "ass"].contains(ext) ? ext : "srt"
+        Task.detached(priority: .utility) {
+            guard let data = try? await URLSession.shared.data(from: subURL).0,
+                  let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1),
+                  !text.isEmpty else { return }
+            await SubtitlePoolClient.upload(contentKey: contentKey, lang: lang, fingerprint: fp,
+                                            origin: "addon", format: format, text: text)
+        }
+    }
+
+    /// Contribute the file's REAL audio + subtitle track languages to the community language index with
+    /// provenance "container" -- the strongest signal, since these come from libmpv's own track list rather
+    /// than a parsed release name. Fires once per session on every play (incl. Continue-Watching / card
+    /// resumes that never open the detail view). Resolves a `tmdb:` library id to its `tt` id first so
+    /// tmdb-only titles are not dropped. Fail-soft: an unresolvable tmdb id contributes nothing.
+    private func contributeContainerLanguagesIfNeeded() {
+        guard !langContributeDone, LanguageIndexClient.isEnabled else { return }
+        let audio = audioTracks.map { $0.lang }.filter { !$0.isEmpty }
+        let subs = subtitleTracks.map { $0.lang }.filter { !$0.isEmpty }
+        guard !audio.isEmpty || !subs.isEmpty else { return }
+        langContributeDone = true
+
+        // A tmdb-backed play carries a `tmdb:` library id. communityContentKey must NOT be used for it: the
+        // fingerprint's bare-digit fallback turns `tmdb:12345` into a bogus `tt12345`. Resolve tmdb -> tt FIRST
+        // for those, and only fall through to the direct key for real tt / other ids.
+        if let m = curMeta, !isCurrentLiveStream, m.libraryId.lowercased().hasPrefix("tmdb:") {
+            let rawId = m.libraryId
+            let season = m.season, episode = m.episode
+            Task.detached(priority: .utility) {
+                let tt: String?
+                if let cached = CommunityTrickplay.cachedIMDbID(for: rawId) {
+                    tt = cached
+                } else {
+                    tt = await CommunityTrickplay.resolveIMDbID(rawId: rawId, seriesHint: season != nil)
+                }
+                guard let tt, let contentKey = SubtitleReleaseFingerprint.contentKey(imdbId: tt, season: season, episode: episode) else { return }
+                await LanguageIndexClient.contribute(contentKey: contentKey, audioLangs: audio,
+                                                     subLangs: subs, provenance: "container")
+            }
+            return
+        }
+        if let contentKey = communityContentKey {
+            Task.detached(priority: .utility) {
+                await LanguageIndexClient.contribute(contentKey: contentKey, audioLangs: audio,
+                                                     subLangs: subs, provenance: "container")
+            }
+            return
+        }
+        langContributeDone = false   // no resolvable id yet; allow a later retry once tracks/meta firm up
     }
 
     private var isCurrentLiveStream: Bool { curIsLive && !isTorrentPlayback }
@@ -2983,7 +3068,7 @@ struct TVPlayerView: View {
     /// agnostic + logged so a silent pool can be traced from a terminal run (which stage refused / nil frame).
     private func captureTrickplayFrame(at time: Double) {
         guard !localTrickplayCaptureInFlight else { return }
-        guard let player = coordinator.player else { NSLog("[tp-cap] no player mounted at %.0fs (tvOS)", time); return }
+        guard let player = coordinator.player else { VXProbe.log("tp", "no player mounted at \(Int(time))s (tvOS)"); return }
         lastLocalTrickplayCapture = time
         localTrickplayCaptureInFlight = true
         let engine = (player is AVPlayerEngineController) ? "avplayer" : "libmpv"
@@ -2994,7 +3079,7 @@ struct TVPlayerView: View {
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled, self.localTrickplayCaptureInFlight else { return }
             self.localTrickplayCaptureInFlight = false
-            NSLog("[tp-cap] %@ capture at %.0fs never serviced (VO idle, tvOS) - releasing guard", engine, time)
+            VXProbe.log("tp", "\(engine) capture at \(Int(time))s never serviced (VO idle, tvOS) - releasing guard")
         }
         player.captureFrameJPEGData(maxWidth: 480) { data in
             // MAIN-ACTOR HOP (parity with PlayerScreen; the owner-device zero-contribution fix): the libmpv
@@ -3011,11 +3096,11 @@ struct TVPlayerView: View {
                 Task { @MainActor in
                     watchdog.cancel()
                     self.localTrickplayCaptureInFlight = false
-                    NSLog("[tp-cap] %@ captureFrameJPEGData returned NIL at %.0fs (tvOS)", engine, time)
+                    VXProbe.log("tp", "\(engine) captureFrameJPEGData returned NIL at \(Int(time))s (tvOS)")
                 }
                 return
             }
-            NSLog("[tp-cap] %@ captured %d bytes at %.0fs (tvOS)", engine, data.count, time)
+            VXProbe.log("tp", "\(engine) captured \(data.count) bytes at \(Int(time))s (tvOS)")
             let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)   // heavy decode OFF main
             Task { @MainActor in
                 watchdog.cancel()

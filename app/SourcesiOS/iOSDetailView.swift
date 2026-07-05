@@ -1531,8 +1531,12 @@ struct iOSDetailView: View {
     /// per-add-on headers (so a title returning thousands of sources doesn't bury one add-on). The
     /// component owns the filter / collapse state; it plays a chosen source through `playStream`.
     @ViewBuilder private var sourceSection: some View {
+        // While the player/trailer cover is up, skip the expensive rankedGroups(displayGroups(...)) pass and
+        // pass an empty list + isSuspended, so the mounted-but-hidden detail stops rebuilding the source list
+        // behind the video. The list restores unchanged on player close (presentation flips back to nil).
+        let suspended = presentation != nil
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+            groups: suspended ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
                                                debridCachedHashes: debridCache.cachedHashes),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
@@ -1545,7 +1549,8 @@ struct iOSDetailView: View {
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
             play: { stream, url in Task { await playStream(stream, url: url) } },
-            download: movieDownloadHandler
+            download: movieDownloadHandler,
+            isSuspended: suspended
         )
         .padding(.horizontal, Theme.Space.md)
     }
@@ -1950,7 +1955,7 @@ struct iOSDetailView: View {
                                                     debridCachedHashes: debridCache.cachedHashes).flatMap(\.streams)
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
             candidates: candidates, cachedHashes: debridCache.cachedHashes,
-            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: stream) {
             core.loadEnginePlayer(for: win.stream)
             let pm = moviePlaybackMeta
             let resumeSeconds = fromStart ? 0 : await resume(pm)
@@ -2198,8 +2203,11 @@ struct iOSDetailView: View {
     /// `type` so the player tunes for live). Same component as the movie list, minus the
     /// remembered-quality continuity hint (live streams don't carry meaningful quality memory).
     @ViewBuilder private var liveSourceSection: some View {
+        // Suspend the list rebuild while the player cover is up (see sourceSection): skip rankedGroups and
+        // pass an empty list, so the hidden live detail stops re-rendering behind the video.
+        let suspended = presentation != nil
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+            groups: suspended ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
                                                debridCachedHashes: debridCache.cachedHashes),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
@@ -2207,7 +2215,8 @@ struct iOSDetailView: View {
             pinContext: pinContext,
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
-            play: { stream, url in Task { await playLiveStream(stream, url: url) } }
+            play: { stream, url in Task { await playLiveStream(stream, url: url) } },
+            isSuspended: suspended
         )
         .padding(.horizontal, Theme.Space.md)
     }
@@ -2593,8 +2602,10 @@ struct iOSEpisodeStreams: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width)
+                // While the episode's player/trailer cover is up, skip the rankedGroups pass (pass [] +
+                // isSuspended) so this hidden episode list stops re-rendering behind the video. Restores on close.
                 iOSSourceList(
-                    groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin,
+                    groups: presentation != nil ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin,
                                                        debridCachedHashes: debridCache.cachedHashes),
                     progress: core.streamLoadProgress(forStreamId: video.id),
                     states: core.streamAddonStates(forStreamId: video.id),
@@ -2605,8 +2616,9 @@ struct iOSEpisodeStreams: View {
                     cachedUsenetURLs: debridCache.cachedUsenetURLs,
                     play: { stream, url in Task { await play(stream, url: url) } },
                     playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
-                    playBest: { candidates in Task { await playBest(candidates) } },
-                    download: episodeDownloadHandler
+                    playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
+                    download: episodeDownloadHandler,
+                    isSuspended: presentation != nil
                 )
                 .padding(.horizontal, Theme.Space.md)
                 // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
@@ -2823,7 +2835,7 @@ struct iOSEpisodeStreams: View {
     /// false-cached row. FAIL-SOFT: a nil race result falls back to today's single-resolve on the ranked
     /// best (`play`), so the no-key / no-cache path is byte-identical. A MANUAL row tap / Quality pick still
     /// goes through `play(_:url:)` on the exact chosen row.
-    private func playBest(_ candidates: [CoreStream]) async {
+    private func playBest(_ candidates: [CoreStream], labeledBest: CoreStream) async {
         guard !preparing else { return }
         // Hold `preparing` for the whole race so a second Watch tap can't launch a duplicate resolve. It is
         // RELEASED before the single-resolve fallback below, which sets its own guard (`play` early-returns
@@ -2832,7 +2844,7 @@ struct iOSEpisodeStreams: View {
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
             candidates: candidates, episode: ep, cachedHashes: debridCache.cachedHashes,
-            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: labeledBest) {
             defer { preparing = false }
             core.loadEnginePlayer(for: win.stream)
             lastBinge = win.stream.behaviorHints?.bingeGroup
@@ -2848,8 +2860,12 @@ struct iOSEpisodeStreams: View {
             return
         }
         preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
-        // No parallel-cached winner: today's single-resolve on the ranked best (first playable candidate).
-        guard let best = candidates.first(where: { $0.playableURL != nil }), let url = best.playableURL else { return }
+        // No acceptable parallel-cached winner (false-cached best, or every resolved leg a lower resolution
+        // than a confirmed-cached label): single-resolve the LABELED best so the played quality matches the
+        // button, instead of the first playable candidate (which could itself be a lower tier). Fall back to
+        // the first playable only if the labeled best somehow has no URL.
+        let fallback = labeledBest.playableURL != nil ? labeledBest : candidates.first(where: { $0.playableURL != nil })
+        guard let best = fallback, let url = best.playableURL else { return }
         await play(best, url: url, explicit: false)   // auto Watch fallback: may hop normally
     }
 
@@ -3088,11 +3104,21 @@ struct iOSSourceList: View {
     /// when nil, the Watch button falls back to the single-resolve `play(best, url)` (byte-identical to
     /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
     /// resolves exactly that row through `play`.
-    var playBest: (([CoreStream]) -> Void)? = nil
+    var playBest: (([CoreStream], CoreStream) -> Void)? = nil
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
     var download: ((CoreStream, URL) -> Void)? = nil
+    /// Set true by the detail page while a full-screen player (or trailer) cover is up. On macOS the detail
+    /// tree stays MOUNTED behind the player (MacRootPlayerOverlay only sets opacity 0 + disabled, it does not
+    /// unmount), and on tvOS the equivalent shell stays mounted too, so this hidden list keeps re-evaluating
+    /// its body on every CoreBridge @Published bump. Rebuilding a 1000+ stream ranked list behind the video
+    /// saturates the main thread and starves the mpv Metal surface of a layout pass (the "video stuck in a
+    /// small rectangle / 30s stall" symptom). When suspended we render a same-size placeholder and skip the
+    /// grouped list entirely; the view stays mounted so its filter / collapse / sort @State below survives, so
+    /// closing the player restores the list exactly as it was. The caller ALSO passes `groups: []` when
+    /// suspended, which skips the heavy `rankedGroups(displayGroups(...))` argument evaluation at the call site.
+    var isSuspended: Bool = false
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
@@ -3217,6 +3243,17 @@ struct iOSSourceList: View {
     }
 
     var body: some View {
+        // While a player/trailer cover is up, the detail page stays mounted behind it (macOS overlay +
+        // tvOS shell), so this body re-evaluates on every engine bump. Skip the whole grouped list and hold
+        // a placeholder of a similar height so scroll position is roughly preserved. The view stays mounted,
+        // so the @State (filter / collapse / sort / queuedDownloads) survives and the list restores on close.
+        if isSuspended {
+            return AnyView(Color.clear.frame(height: 1))
+        }
+        return AnyView(sourceListBody)
+    }
+
+    @ViewBuilder private var sourceListBody: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             iOSRailHeader(eyebrow: eyebrow, title: "Sources")
 
@@ -3265,7 +3302,7 @@ struct iOSSourceList: View {
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
                     // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
                     // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
-                    Button { if let playBest { playBest(groups.flatMap(\.streams)) } else { (playAuto ?? play)(best, url) } } label: {
+                    Button { if let playBest { playBest(groups.flatMap(\.streams), best) } else { (playAuto ?? play)(best, url) } } label: {
                         if loading {
                             HStack(spacing: Theme.Space.sm) {
                                 ProgressView().tint(Theme.Palette.onAccent)

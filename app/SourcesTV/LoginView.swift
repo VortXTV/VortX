@@ -54,10 +54,13 @@ struct LoginView: View {
             core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
             // Account-owns-everything snapshot-on-import: once the engine has pulled this Stremio
             // account's add-ons, snapshot the full descriptor set into the VortX account doc so the
-            // account OWNS them (they hydrate later with no live Stremio session). Delayed so
-            // PullAddonsFromAPI has landed; no-op (never-zero guarded) if still empty / signed out.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                Task { @MainActor in await VortXSyncManager.shared.snapshotOwnedFromEngine() }
+            // account OWNS them (they hydrate later with no live Stremio session). We AWAIT the engine's
+            // PullAddonsFromAPI settling (awaitAddonsHydrated) rather than a fixed delay: a fixed delay
+            // snapshotted a slow host mid-pull, capturing only SOME add-ons (the partial-import bug).
+            // No-op (never-zero guarded) if still empty / signed out.
+            Task { @MainActor in
+                await core.awaitAddonsHydrated()
+                await VortXSyncManager.shared.snapshotOwnedFromEngine()
             }
             dismiss()
         }

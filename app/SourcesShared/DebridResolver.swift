@@ -1118,8 +1118,18 @@ extension DebridCoordinator {
     /// `stream` it resolved from, so the caller can wire the engine / headers / quality signature off the
     /// exact winning row (`DebridPlaybackRef` itself is a persisted value type and deliberately carries no
     /// `CoreStream`).
+    /// - Parameter labeledBest: the exact stream the "Watch Now" label was composed from (`StreamRanking.best`),
+    ///   so the race can keep its promise. When supplied AND the labeled best is itself confirmed-cached (so it
+    ///   is guaranteed to resolve), the race REFUSES any winner of a lower resolution than the label: a faster
+    ///   lower-quality leg can no longer silently override the promised quality (the device-verified "button
+    ///   says 4K DV, plays 1080p" divergence). Such a race returns `nil`, so the caller single-resolves the
+    ///   labeled best and the played quality matches the button. When the labeled best is NOT confirmed-cached
+    ///   (a false add-on ⚡ this account does not hold, which would time out serially), the completion-order race
+    ///   is kept as-is so the user still reaches a genuinely-cached source fast. `nil` (the default) preserves
+    ///   the pre-cap completion-order behaviour for every non-Watch-Now caller.
     func resolveFirstPlayable(candidates: [CoreStream], episode: DebridEpisode? = nil,
                               cachedHashes: Set<String>, cachedUsenetURLs: Set<String> = [],
+                              labeledBest: CoreStream? = nil,
                               max: Int = 4) async -> (ref: DebridPlaybackRef, stream: CoreStream)? {
         // Zero-await no-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this
         // returns nil before any provider contact, so the caller's fallback runs its unchanged path.
@@ -1142,8 +1152,36 @@ extension DebridCoordinator {
         // of parallel resolves; the losers are cancelled the moment one wins.
         let cap = Swift.min(Swift.max(max, 1), 4)
         let racing = Array(cached.prefix(cap))
-        // A single confirmed-cached candidate is just the existing single resolve (no group overhead).
+
+        // LABEL-AUTHORITATIVE GATE. The Watch-Now label is composed from `labeledBest`; the played source must
+        // not be a LOWER resolution than that promise. We can only hold the promise when the labeled best is
+        // itself guaranteed to resolve, i.e. it is confirmed-cached (a raw torrent whose hash is in
+        // `cachedHashes`, a usenet nzb in `cachedUsenetURLs`, or a url-bearing direct/debrid row). In that case
+        // we REFUSE any race winner whose resolution is below the label and let the caller single-resolve the
+        // labeled best instead. When the labeled best is NOT confirmed-cached (a false add-on ⚡ that would time
+        // out serially), we keep the completion-order race exactly as before so the user still reaches a real
+        // cached source fast. With no `labeledBest` the gate is inert (accept anything).
+        let bestRank = labeledBest.map(StreamRanking.resolutionRank)
+        let bestConfirmedCached: Bool = {
+            guard let best = labeledBest else { return false }
+            if best.url != nil { return true }   // direct / debrid link resolves without an add-then-download
+            if let h = best.infoHash?.lowercased(), !h.isEmpty, cachedHashes.contains(h) { return true }
+            if let nzb = best.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
+            return false
+        }()
+        // A winner is acceptable unless the label is a confirmed-cached HIGHER resolution than it (which we can
+        // and must deliver instead). Equal-or-higher-resolution winners always pass, so a same-tier faster leg
+        // (e.g. two 4K sources) still wins the race.
+        func acceptable(_ s: CoreStream) -> Bool {
+            guard bestConfirmedCached, let br = bestRank else { return true }
+            return StreamRanking.resolutionRank(s) >= br
+        }
+
+        // A single confirmed-cached candidate is just the existing single resolve (no group overhead). Still
+        // honour the gate: a lone winner below a confirmed-cached label is refused so the caller resolves the
+        // labeled best instead.
         if racing.count == 1 {
+            guard acceptable(racing[0]) else { return nil }
             guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode) else { return nil }
             return (ref, racing[0])
         }
@@ -1157,12 +1195,15 @@ extension DebridCoordinator {
                     return (ref, stream)
                 }
             }
-            // First leg to produce a real ref WINS. A leg that fails/fast-fails returns nil; keep draining
-            // until a non-nil ref appears or every leg has reported. Then cancel the remaining (in-flight)
-            // legs so we stop hitting the provider the instant we have a playable link.
+            // First leg to produce a real ref that PASSES the label-authoritative gate wins. A leg that
+            // fails/fast-fails returns nil, and a leg that resolves but is a lower resolution than a
+            // confirmed-cached label is skipped (not accepted as a silent lower-quality substitute); we keep
+            // draining until an acceptable ref appears or every leg has reported. Then cancel the remaining
+            // (in-flight) legs. When every resolved leg is below a confirmed-cached label the winner stays nil
+            // and the caller single-resolves the labeled best, so the played quality matches the button.
             var winner: (ref: DebridPlaybackRef, stream: CoreStream)?
             for await result in group {
-                if let result { winner = result; break }
+                if let result, acceptable(result.stream) { winner = result; break }
             }
             group.cancelAll()
             return winner

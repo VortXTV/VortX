@@ -67,6 +67,27 @@ enum WatchSignalClient {
     /// `type` is the title's kind ("movie" / "series"); it is sent so the worker can group Trending / Popular
     /// by type (its `/popular?type=series` row is empty otherwise, since it defaults a missing type to "movie").
     /// The worker validates + lowercases it, so any non-conforming value is harmless.
+    /// Ping wrapper that first resolves a `tmdb:…` library id (our hub / TMDB-catalog plays) to its `tt…`
+    /// IMDb identity, so those watches feed the pool too instead of being dropped by `ping`'s tt-only guard.
+    /// A tt id pings inline. A tmdb id uses the SAME resolver community trickplay uses: a cached mapping
+    /// pings inline; a cache miss kicks ONE fire-and-forget async resolve and pings when it lands (never
+    /// blocking the playback tick). A non-tt, non-tmdb id (kitsu:/paste-a-link) is left to `ping`'s guard.
+    static func pingResolvingTMDB(contentId: String, type: String, seriesHint: Bool) {
+        if contentId.lowercased().hasPrefix("tmdb") {
+            if let tt = CommunityTrickplay.cachedIMDbID(for: contentId) {
+                ping(contentId: tt, type: type)
+            } else {
+                Task.detached(priority: .background) {
+                    if let tt = await CommunityTrickplay.resolveIMDbID(rawId: contentId, seriesHint: seriesHint) {
+                        ping(contentId: tt, type: type)
+                    }
+                }
+            }
+            return
+        }
+        ping(contentId: contentId, type: type)   // tt id (or a non-tmdb id the guard below rejects)
+    }
+
     static func ping(contentId: String, type: String) {
         // GIVE-TO-GET: no contribution without pool consent (and no consumption of the Trending rows either).
         guard MoatConsent.contributeAndConsume else { return }

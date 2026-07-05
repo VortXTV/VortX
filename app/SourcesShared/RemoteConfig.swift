@@ -47,6 +47,10 @@ enum RemoteConfigDefaults {
     static let captureIntervalSecs = 10      // ScrubThumbnails.captureInterval
     static let trickplayMinFrames = 1        // CommunityTrickplay lower bound (`sorted.count >= 1`)
     static let trickplayMaxFrames = 600      // CommunityTrickplay upper bound (`sorted.count <= 600`)
+    static let trickplayMaxTiles = 80        // CommunityTrickplay per-sheet tile budget (3 MB-safe at 320x180/q0.7:
+                                             // 80 tiles => ~2880x1620 with headroom); a longer watch is decimated
+                                             // across the whole duration, not truncated. Any RemoteConfig override
+                                             // up to the 400 clamp is made byte-safe by buildAndUpload's re-decimation.
 
     // Endpoints.
     static let endpointTrickplay = "https://trickplay.vortx.tv"   // CommunityTrickplay.baseURL
@@ -156,6 +160,7 @@ struct RemoteConfigData: Decodable {
         let captureIntervalSecs: Int?
         let minFrames: Int?
         let maxFrames: Int?
+        let maxTiles: Int?
         let sheetCapBytes: Int?
         let tileW: Int?
         let tileH: Int?
@@ -239,6 +244,7 @@ final class ResolvedConfig: @unchecked Sendable {
     let captureIntervalSecsValue: Int
     let trickplayMinFrames: Int
     let trickplayMaxFrames: Int
+    let trickplayMaxTiles: Int
 
     // Endpoints, validated (https + *.vortx.tv) or baked default.
     let trickplayEndpoint: URL
@@ -272,6 +278,7 @@ final class ResolvedConfig: @unchecked Sendable {
          captureIntervalSecs: Int,
          trickplayMinFrames: Int,
          trickplayMaxFrames: Int,
+         trickplayMaxTiles: Int,
          trickplayEndpoint: URL,
          catalogsEndpoint: URL,
          subtitlesEndpoint: URL,
@@ -296,6 +303,7 @@ final class ResolvedConfig: @unchecked Sendable {
         self.captureIntervalSecsValue = captureIntervalSecs
         self.trickplayMinFrames = trickplayMinFrames
         self.trickplayMaxFrames = trickplayMaxFrames
+        self.trickplayMaxTiles = trickplayMaxTiles
         self.trickplayEndpoint = trickplayEndpoint
         self.catalogsEndpoint = catalogsEndpoint
         self.subtitlesEndpoint = subtitlesEndpoint
@@ -326,6 +334,7 @@ final class ResolvedConfig: @unchecked Sendable {
             captureIntervalSecs: RemoteConfigDefaults.captureIntervalSecs,
             trickplayMinFrames: RemoteConfigDefaults.trickplayMinFrames,
             trickplayMaxFrames: RemoteConfigDefaults.trickplayMaxFrames,
+            trickplayMaxTiles: RemoteConfigDefaults.trickplayMaxTiles,
             trickplayEndpoint: URL(string: RemoteConfigDefaults.endpointTrickplay)!,
             catalogsEndpoint: URL(string: RemoteConfigDefaults.endpointCatalogs)!,
             subtitlesEndpoint: URL(string: RemoteConfigDefaults.endpointSubtitles)!,
@@ -366,6 +375,11 @@ final class ResolvedConfig: @unchecked Sendable {
 
     /// Trickplay frame bounds (baked min 1, max 600).
     var trickplayFrameBounds: (min: Int, max: Int) { (trickplayMinFrames, trickplayMaxFrames) }
+
+    /// Trickplay per-sheet tile budget (baked 80). A watch with more captured frames than this is decimated
+    /// evenly across its whole duration into one sheet, so a long film uploads coarse full-span previews
+    /// instead of failing the 3 MB sheet cap.
+    var trickplayMaxTilesValue: Int { trickplayMaxTiles }
 
     /// A validated endpoint URL by key ("trickplay" / "catalogs"). Returns nil for any unwired key; the two
     /// wired endpoints also have dedicated stored properties, this is the generic form.
@@ -532,6 +546,7 @@ actor RemoteConfig {
         let capture = clamp(data.trickplay?.captureIntervalSecs, RemoteConfigDefaults.captureIntervalSecs, 2, 60)
         let minFrames = clamp(data.trickplay?.minFrames, RemoteConfigDefaults.trickplayMinFrames, 1, 10)
         let maxFrames = clamp(data.trickplay?.maxFrames, RemoteConfigDefaults.trickplayMaxFrames, 30, 600)
+        let maxTiles = clamp(data.trickplay?.maxTiles, RemoteConfigDefaults.trickplayMaxTiles, 30, 400)
 
         // --- Endpoints: https + host ends ".vortx.tv" or baked default. ---
         let trickplayURL = validatedEndpoint(data.endpoints?.trickplay, fallback: RemoteConfigDefaults.endpointTrickplay)
@@ -593,6 +608,7 @@ actor RemoteConfig {
             captureIntervalSecs: capture,
             trickplayMinFrames: minFrames,
             trickplayMaxFrames: maxFrames,
+            trickplayMaxTiles: maxTiles,
             trickplayEndpoint: trickplayURL,
             catalogsEndpoint: catalogsURL,
             subtitlesEndpoint: subtitlesURL,

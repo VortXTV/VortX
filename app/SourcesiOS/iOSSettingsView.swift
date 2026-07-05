@@ -33,6 +33,7 @@ struct iOSSettingsView: View {
     // tvOS SettingsView flow (settings parity); the phone scans the QR to download vortx-diag.log.
     @State private var showDiagExport = false
     @State private var diagExport: (url: String, qr: Image)?
+    @State private var diagMacPath: String?
     #if os(macOS)
     /// Drives the "Share streaming server on this network" toggle (macOS only). Backed by
     /// NodeServer.sharedOnLAN, which persists + restarts the node process when it flips.
@@ -77,8 +78,8 @@ struct iOSSettingsView: View {
     // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
     // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
     @AppStorage(MoatConsent.key) private var moatContribute = true
-    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
-    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
+    // "Singularity" community source index SERVE opt-in (per device). Default ON; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = true
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     /// Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id.
@@ -403,13 +404,13 @@ struct iOSSettingsView: View {
     /// them from VortX. Turn one ON to make VortX track Stremio for that category (adds and removes).
     @ViewBuilder private var stremioMirrorSection: some View {
         Section {
-            Toggle("Mirror add-ons from Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
+            Toggle("Two-way sync add-ons with Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
             Toggle("Mirror library from Stremio", isOn: $mirrorLibrary).tint(Theme.Palette.accent)
             Toggle("Mirror Continue Watching from Stremio", isOn: $mirrorCW).tint(Theme.Palette.accent)
         } header: {
             Text("Stremio mirror")
         } footer: {
-            Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+            Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
         }
     }
 
@@ -538,10 +539,14 @@ struct iOSSettingsView: View {
                 .onChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
             Text("Logs detailed activity for troubleshooting.")
                 .font(.caption).foregroundStyle(.secondary)
-            // Export the rolling diagnostic log over the LAN: a phone on the same Wi-Fi scans the QR to
-            // download vortx-diag.log. Kept identical to the tvOS flow for settings parity.
+            // Export the rolling diagnostic log. On macOS the Mac has a filesystem, so save it to Downloads
+            // and reveal it in Finder; on iOS a phone on the same Wi-Fi scans the QR to download it.
             Button("Export diagnostic log") {
+                #if os(macOS)
+                diagMacPath = VXDiagExport.shared.revealInFinder()
+                #else
                 diagExport = VXDiagExport.shared.start()
+                #endif
                 showDiagExport = true
             }
             .tint(Theme.Palette.accent)
@@ -559,6 +564,25 @@ struct iOSSettingsView: View {
         VStack(spacing: 24) {
             Text("Export diagnostic log")
                 .font(.title2.bold()).foregroundStyle(Theme.Palette.textPrimary)
+            #if os(macOS)
+            if let path = diagMacPath {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 48)).foregroundStyle(Theme.Palette.accent)
+                Text("Saved to Downloads and revealed in Finder.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                Text(path)
+                    .font(.footnote).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
+                Text("Send that vortx-diag.log file over.")
+                    .font(.subheadline).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Could not write the diagnostic log. Turn on Diagnostic logging first, then try again.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            #else
             if let export = diagExport {
                 export.qr
                     .interpolation(.none)
@@ -577,6 +601,7 @@ struct iOSSettingsView: View {
                     .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
                     .multilineTextAlignment(.center)
             }
+            #endif
             Button("Done") {
                 showDiagExport = false
                 VXDiagExport.shared.stop()

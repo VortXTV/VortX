@@ -48,6 +48,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var pendingSeek: Double?
     private var requestedRate: Float = 1
     private var timeObserver: Any?
+    /// Throttle marks for the two EXPENSIVE per-tick side effects, mirroring the libmpv path
+    /// (MPVMetalViewController.swift lastTimePosEmit / lastCacheTimeEmit). The periodic observer still
+    /// fires at 0.25s, but the probe write (NSLock) and the loadedTimeRanges scan are gated behind the same
+    /// PerformanceMode-scaled interval so a constrained device gets the same relief the libmpv path already has.
+    /// Confined to the main actor (only read/written inside the observer's MainActor.assumeIsolated block).
+    private var lastProbeEmit: TimeInterval = 0
+    private var lastCacheEmit: TimeInterval = 0
     private var observations: [NSKeyValueObservation] = []
     private var pipController: AVPictureInPictureController?
     private weak var playerLayer: AVPlayerLayer?
@@ -111,6 +118,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             built.loader.start()
             newAsset = asset
             DiagnosticsLog.log("avplayer", "dv-remux mount host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
+            // [dv] the true-DV remux lane mounted: AVPlayer is now fed a vortxremux:// fMP4 stream. If a
+            // classify fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties
+            // the reason to the observed engine flip, giving one greppable [dv] trail.
+            VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
         } else {
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
             newAsset = AVURLAsset(url: url, options: options)
@@ -465,17 +476,29 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         ) { [weak self] time in
             MainActor.assumeIsolated {
                 guard let self, self.timeObserver != nil else { return }
+                // Cheap, every tick: the play head (scrubber smoothness) and the subtitle overlay clock. These
+                // must stay at the full 0.25s cadence or the progress bar and external subs visibly lag.
                 self.emit(MPVProperty.timePos, time.seconds)
-                // Push the play head (and duration when known) into the probe at the observer's own ~4 Hz.
-                let dur = self.item?.duration.seconds ?? 0
-                VXProbeState.shared.setPlayer(pos: time.seconds.isFinite ? Int(time.seconds) : 0,
-                                              dur: dur.isFinite && dur > 0 ? Int(dur) : nil,
-                                              engine: "avplayer")
                 self.updateSubtitleOverlay(atClock: time.seconds)   // sync external-sub overlay to the clock
+                // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
+                // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
+                // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
+                let clock = ProcessInfo.processInfo.systemUptime
+                let minInterval = PerformanceMode.reduced ? 0.5 : 0.25
+                // Push the play head (and duration when known) into the probe, throttled.
+                if clock - self.lastProbeEmit >= minInterval {
+                    self.lastProbeEmit = clock
+                    let dur = self.item?.duration.seconds ?? 0
+                    VXProbeState.shared.setPlayer(pos: time.seconds.isFinite ? Int(time.seconds) : 0,
+                                                  dur: dur.isFinite && dur > 0 ? Int(dur) : nil,
+                                                  engine: "avplayer")
+                }
                 // YouTube-style buffered-ahead edge: the end of the loaded range that CONTAINS the playhead
                 // (AVPlayer reports one or more loaded ranges). Emitting the same key libmpv uses lets the
-                // scrubber render the grey band identically on both engines. Fail-soft: no matching range → 0.
-                if let item = self.item {
+                // scrubber render the grey band identically on both engines. Fail-soft: no matching range -> 0.
+                // Throttled to match libmpv, which already caps demuxerCacheTime at 0.5s.
+                if clock - self.lastCacheEmit >= minInterval, let item = self.item {
+                    self.lastCacheEmit = clock
                     let now = time.seconds
                     var aheadEdge = 0.0
                     for value in item.loadedTimeRanges {
@@ -525,6 +548,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
             VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
+            // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv HDR10.
+            // For a DV source this is the tail of the [dv] trail (a remux fail-soft usually preceded it), so
+            // grepping [dv] shows route -> mount -> classify/fallback-reason -> this demotion in order.
+            VXProbe.log("dv", "AVPlayer item .failed -> demoting to libmpv HDR10: \(ns?.localizedDescription ?? "?")")
             guard !fatalErrorEmitted else { break }
             fatalErrorEmitted = true
             emit(MPVProperty.endFileError, item.error?.localizedDescription ?? "Playback failed")

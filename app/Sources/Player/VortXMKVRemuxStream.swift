@@ -100,8 +100,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&openOpts, "headers", joined, 0)
         }
-        // Reasonable network timeouts so a dead debrid link fails instead of hanging the thread forever.
-        av_dict_set(&openOpts, "rw_timeout", "15000000", 0)   // 15s in microseconds
+        // Reasonable network timeouts so a dead debrid link fails instead of hanging the thread forever. Kept
+        // at 10s (not longer) so a cold-open timeout PLUS the single warm retry below still lands inside the
+        // start-watchdog window rather than tripping a source hop.
+        av_dict_set(&openOpts, "rw_timeout", "10000000", 0)   // 10s in microseconds
         // Cap how much the probe reads before classifying. rw_timeout bounds each syscall, but without these
         // avformat_find_stream_info can read many seconds of a high-bitrate 4K DV bitstream off a slow debrid
         // CDN before the DV / audio fail-fast guard below runs, leaving AVPlayer on frameless chrome (no bytes,
@@ -109,16 +111,49 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // couple seconds is plenty to read the DOVI config and audio codecs and keeps the pre-start window bounded.
         av_dict_set(&openOpts, "probesize", "5000000", 0)         // ~5 MB
         av_dict_set(&openOpts, "analyzeduration", "2000000", 0)   // 2s in microseconds
-        let openRc = avformat_open_input(&ifmt, input, nil, &openOpts)
+        // Debrid CDNs answer with chunked / redirected slow-start responses that FFmpeg's plain HTTP open gives
+        // up on (rc=-60), where libmpv, which sets exactly these flags, succeeds on the same URL. Reconnect on
+        // transient/network errors and keep the connection persistent across the redirect + range requests so
+        // the remux open matches mpv's resilience. Unknown keys are ignored by older protocol builds, not fatal.
+        Self.applyDebridHTTPResilience(&openOpts)
+        var openRc = avformat_open_input(&ifmt, input, nil, &openOpts)
         av_dict_free(&openOpts)
+        // Cold-debrid warm-up retry. The FIRST open of a debrid link frequently times out (rc=-60 ETIMEDOUT):
+        // the provider is still pulling the file into its CDN cache, so the first request primes it and an
+        // immediate retry connects in a couple seconds. This is exactly why libmpv (which opens the link AFTER
+        // our probe demotes) plays where the probe timed out. Retry ONCE, on timeout only, with a fresh options
+        // dict; a warm retry lands inside the start-watchdog window, a genuinely dead link times out twice and
+        // demotes to libmpv HDR10 as before.
+        if openRc == AVERROR_ETIMEDOUT_CONST {
+            VXProbe.log("dv", "probe open timed out rc=\(openRc); retrying once (cold-debrid warm-up)")
+            var retryOpts: OpaquePointer? = nil
+            if let headers, !headers.isEmpty {
+                let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+                av_dict_set(&retryOpts, "headers", joined, 0)
+            }
+            av_dict_set(&retryOpts, "rw_timeout", "10000000", 0)      // 10s on the warm retry
+            av_dict_set(&retryOpts, "probesize", "5000000", 0)
+            av_dict_set(&retryOpts, "analyzeduration", "2000000", 0)
+            Self.applyDebridHTTPResilience(&retryOpts)
+            openRc = avformat_open_input(&ifmt, input, nil, &retryOpts)
+            av_dict_free(&retryOpts)
+            if openRc == 0 { VXProbe.log("dv", "probe open retry SUCCEEDED (warm debrid)") }
+        }
         guard openRc == 0, let inCtx = ifmt else {
+            // [dv] could not open the source at all (dead debrid link / network / timed out twice) -> libmpv HDR10.
+            VXProbe.log("dv", "HDR10 FALLBACK: probe open failed rc=\(openRc)")
             buffer.fail("avformat_open_input failed (\(openRc))")
             return
         }
         defer { var p: UnsafeMutablePointer<AVFormatContext>? = inCtx; avformat_close_input(&p) }
 
         let si = avformat_find_stream_info(inCtx, nil)
-        if si < 0 { buffer.fail("avformat_find_stream_info failed (\(si))"); return }
+        if si < 0 {
+            // [dv] opened but could not read stream info -> demote to libmpv HDR10.
+            VXProbe.log("dv", "HDR10 FALLBACK: find_stream_info failed rc=\(si)")
+            buffer.fail("avformat_find_stream_info failed (\(si))")
+            return
+        }
 
         // Output context: fragmented MP4, NO file (custom IO).
         var ofmt: UnsafeMutablePointer<AVFormatContext>? = nil
@@ -203,7 +238,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // Additional video streams (a dual-track P7 enhancement layer) are intentionally NOT mapped.
             case AVMEDIA_TYPE_AUDIO:
                 audioSeen.append(Self.codecName(par.pointee.codec_id))
-                if Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
+                // Map ONLY the FIRST AVPlayer-decodable audio track. A UHD remux can carry 10+ AC3 language
+                // dubs; mapping all of them makes the fragmented muxer's delay_moov wait for a first packet from
+                // EVERY audio stream before it can write the moov, but frag_keyframe cuts the first fragment at
+                // the opening video keyframe before the sparse later tracks deliver one, so the moov write fails
+                // ("Cannot write moov before AC3 packets") and the mux aborts. AVPlayer plays one track anyway.
+                if !hasDecodableAudio, Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
                     hasDecodableAudio = true
                     mappable.insert(i)
                 }
@@ -211,12 +251,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 break   // subtitles/data/attachments are never mapped (see the header note)
             }
         }
+        // [dv] classify probe: one greppable line of what the source actually carries (DV profile, dims, and
+        // the audio codecs seen / whether any is AVPlayer-decodable). This is the line that explains WHY a DV
+        // source did or did not stay on the true-DV AVPlayer lane. Gated, so free in shipping builds.
+        VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio)")
+
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
         // RPU to Profile 8.1 and drop the EL (see the mux loop). A stream with no DOVI config (the filename
         // label lied) still gains nothing from AVPlayer and fails fast to the libmpv tone-map.
         let convertP7 = (info.dvProfile == 7)
         guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
+            // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
+            // libmpv HDR10. Logs the exact reason (no DOVI config vs an undecodable profile like 4/9).
+            VXProbe.log("dv", "HDR10 FALLBACK: dvProfile=\(info.dvProfile) not AVPlayer-decodable")
             buffer.fail(info.dvProfile < 0
                 ? "source has no Dolby Vision configuration (label mismatch)"
                 : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
@@ -231,6 +279,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // AVPlayer cannot decode TrueHD/DTS. With no decodable track the session would mount then fail (or
         // play silent); libmpv decodes every codec here, so fail fast and let the chrome demote.
         guard hasDecodableAudio else {
+            // [dv] the DOMINANT real-world reason a premium 4K DV remux tone-maps to HDR10: its only audio is
+            // TrueHD/Atmos or DTS, which AVPlayer cannot decode and this build cannot transcode (the bundled
+            // FFmpeg has no ac3/eac3 encoder). Keeping the safe libmpv HDR10 path here is correct, not a
+            // regression; a true DV-with-lossless fix needs a server-side EAC3 remux or an FFmpeg rebuild.
+            VXProbe.log("dv", "HDR10 FALLBACK: no AVPlayer-decodable audio, source=[\(audioSeen.joined(separator: ","))] (TrueHD/DTS need transcode, unavailable in this build)")
             buffer.fail("no AVPlayer-decodable audio track (source audio: \(audioSeen.joined(separator: ",")))")
             return
         }
@@ -240,28 +293,46 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         for i in 0..<nb where mappable.contains(i) {
             guard let inStream = inCtx.pointee.streams[i] else { continue }
             let par = inStream.pointee.codecpar
-            guard let outStream = avformat_new_stream(outCtx, nil) else { buffer.fail("avformat_new_stream returned nil"); return }
+            guard let outStream = avformat_new_stream(outCtx, nil) else { VXProbe.log("dv", "HDR10 FALLBACK: avformat_new_stream returned nil (inStream=\(i))"); buffer.fail("avformat_new_stream returned nil"); return }
             let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)
-            if cp < 0 { buffer.fail("avcodec_parameters_copy failed (\(cp))"); return }
+            if cp < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avcodec_parameters_copy rc=\(cp) (inStream=\(i))"); buffer.fail("avcodec_parameters_copy failed (\(cp))"); return }
             outStream.pointee.codecpar.pointee.codec_tag = 0
             if i == baseVideoIn {
                 baseVideoOut = Int(outIndex)
+                // DV HEVC in mp4 MUST use the 'hvc1' sample entry (parameter sets out-of-band in hvcC). A Dolby
+                // Vision config box (dvcC/dvvC) on an 'hev1' entry (in-band parameter sets) is rejected by
+                // movenc's mov_init with EINVAL, and the codec_tag=0 above lets the muxer derive 'hev1' for some
+                // Profile 7 rips - which is exactly the write_header rc=-22 we hit only on convertP7. Force
+                // 'hvc1' (MKTAG little-endian) on the base video so the DV config box sits on a valid entry.
+                outStream.pointee.codecpar.pointee.codec_tag =
+                    UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
+                    | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24
                 // For a Profile 7 conversion, re-label the OUTPUT DOVI configuration record as Profile 8.1 so
                 // FFmpeg's mov muxer writes a Profile-8 `dvvC` box (dv_profile>7 selects dvvC) and AVPlayer
                 // engages true DV. The RPU itself is converted per-packet in the mux loop; this makes the
-                // container box agree with the converted bitstream. Also clears the EL-present flag (the EL is
-                // dropped). Best-effort: if the source somehow carried no DOVI side data to rewrite, the
-                // per-packet RPU conversion still runs and the muxer will derive a box from the bitstream.
+                // container box agree with the converted bitstream. The EL-present flag is cleared in the relabel.
                 if convertP7 {
                     Self.relabelOutputDoViProfile81(outStream.pointee.codecpar)
+                }
+            }
+            // fMP4 requires each AUDIO track to carry a frame_size; a matroska stream-copy usually leaves it 0,
+            // and movenc then rejects write_header with EINVAL ("track N: codec frame size is not set"). This,
+            // NOT the DV config box, is the real Profile-7 write_header failure (the source's AC3 tracks all
+            // report frame_size 0). Set the codec's known constant when absent so the mov muxer accepts them.
+            if outStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO,
+               outStream.pointee.codecpar.pointee.frame_size == 0 {
+                switch outStream.pointee.codecpar.pointee.codec_id {
+                case AV_CODEC_ID_AAC: outStream.pointee.codecpar.pointee.frame_size = 1024
+                case AV_CODEC_ID_MP3: outStream.pointee.codecpar.pointee.frame_size = 1152
+                default: outStream.pointee.codecpar.pointee.frame_size = 1536   // AC3/EAC3, and a safe non-zero fallback
                 }
             }
             streamMap[i] = Int(outIndex)
             outIndex += 1
             info.mappedStreams += 1
         }
-        if info.mappedStreams == 0 { buffer.fail("no playable streams in source"); return }
-        if convertP7, baseVideoOut < 0 { buffer.fail("Dolby Vision profile 7 base-layer video was not mapped"); return }
+        if info.mappedStreams == 0 { VXProbe.log("dv", "HDR10 FALLBACK: no playable streams mapped"); buffer.fail("no playable streams in source"); return }
+        if convertP7, baseVideoOut < 0 { VXProbe.log("dv", "HDR10 FALLBACK: P7 base-layer video not mapped (baseVideoIn=\(baseVideoIn))"); buffer.fail("Dolby Vision profile 7 base-layer video was not mapped"); return }
 
         // The HEVC NAL length prefix size (1/2/4 bytes) lives in the base track's hvcC extradata; read it once
         // so the per-packet RPU converter can walk the length-prefixed access units. Defaults to 4 (the near
@@ -273,14 +344,52 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Fragmented MP4 so playback starts before the whole file is muxed, and so it can stream. `faststart`
         // is a no-op for custom-IO (it needs a seekable sink) but harmless; the frag flags are what matter.
         var opts: OpaquePointer? = nil   // AVDictionary*
-        av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0)
+        // delay_moov is REQUIRED here: with empty_moov the muxer would try to write the moov at write_header,
+        // but an AC3 audio track's parameters are only known once the first AC3 packet arrives, so movenc
+        // rejects write_header with EINVAL ("Cannot write moov atom before AC3 packets. Set the delay_moov flag
+        // to fix this."). delay_moov defers the moov to the first fragment, which is exactly what fMP4 wants.
+        // TIME-BASED FRAGMENTATION (NO frag_keyframe) is what finally lets a P7-with-AC3 DV remux PLAY, not just
+        // write_header. frag_keyframe cuts the first fragment at the opening video keyframe, and delay_moov then
+        // serializes the moov there BEFORE the AC3 track has delivered a packet, so movenc's dac3 writer (which
+        // needs a parsed AC3 packet: track->eac3_priv->ec3_done, it never reads extradata) aborts with "Cannot
+        // write moov before AC3 packets". A time-based cut lets av_interleaved_write_frame deliver the AC3
+        // track's first packet (DTS-ordered) into the muxer before the ~1s fragment flush, so the moov gets a
+        // valid dac3 box. frag_duration (the max-fragment-duration TRIGGER) is REQUIRED, not min_frag_duration
+        // (a floor only): movenc re-adds frag_keyframe in mov_write_header when there is no cut trigger, silently
+        // restoring the keyframe cut. Verified against libavformat 62.12.101 (the exact lib this app ships).
+        av_dict_set(&opts, "movflags", "empty_moov+default_base_moof+delay_moov", 0)
+        av_dict_set(&opts, "frag_duration", "1000000", 0)   // 1s fragments in microseconds (the cut TRIGGER)
         // FLAC-in-mp4 is spec'd (and AVPlayer decodes it) but FFmpeg's mov muxer gates it behind strict
         // experimental; without this a FLAC-audio DV MKV would die at avformat_write_header.
         av_dict_set(&opts, "strict", "experimental", 0)
         defer { av_dict_free(&opts) }
 
+        // [dv] one-line dump of exactly what the muxer is about to validate: the base-video sample-entry fourcc
+        // (must be hvc1 for a DV config box, NOT hev1) + the DOVI record fields. Disambiguates a codec_tag
+        // problem from a record-field problem in a single live run, whether write_header then succeeds or fails.
+        if convertP7, baseVideoOut >= 0, let vpar = outCtx.pointee.streams[baseVideoOut]?.pointee.codecpar {
+            let tag = vpar.pointee.codec_tag
+            let fourcc = String(bytes: [UInt8(tag & 0xFF), UInt8((tag >> 8) & 0xFF),
+                                        UInt8((tag >> 16) & 0xFF), UInt8((tag >> 24) & 0xFF)],
+                                encoding: .ascii) ?? "?"
+            var maj = -1, lvl = -1, comp = -1, blc = -1, elp = -1
+            let n = Int(vpar.pointee.nb_coded_side_data)
+            if n > 0, let arr = vpar.pointee.coded_side_data {
+                for i in 0..<n where arr[i].type == AV_PKT_DATA_DOVI_CONF {
+                    if let d = arr[i].data {
+                        d.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { r in
+                            maj = Int(r.pointee.dv_version_major); lvl = Int(r.pointee.dv_level)
+                            comp = Int(r.pointee.dv_md_compression)
+                            blc = Int(r.pointee.dv_bl_signal_compatibility_id); elp = Int(r.pointee.el_present_flag)
+                        }
+                    }
+                }
+            }
+            VXProbe.log("dv", "pre-write_header video tag=\(fourcc) dvMaj=\(maj) dvLevel=\(lvl) blCompat=\(blc) el=\(elp) mdComp=\(comp)")
+        }
+
         let wh = avformat_write_header(outCtx, &opts)
-        if wh < 0 { buffer.fail("avformat_write_header failed (\(wh))"); return }
+        if wh < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avformat_write_header rc=\(wh) (convertP7=\(convertP7); the relabel-8.1 dvvC box or the fMP4 muxer rejected the mapped streams)"); buffer.fail("avformat_write_header failed (\(wh))"); return }
 
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
@@ -288,6 +397,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         NSLog("[dv-remux-stream] start: %@ %dx%d dvProfile=%d blCompat=%d streams=%d convertP7=%d nalLen=%d",
               info.videoCodec, info.width, info.height, info.dvProfile, info.dvBLCompatId,
               info.mappedStreams, convertP7 ? 1 : 0, nalLengthSize)
+
+        // [dv] tally the P7->8.1 RPU conversion outcome across the whole session and emit ONE greppable summary
+        // on every exit (trailer, cancel, or an AVPlayer-rejected write that breaks the loop). This is the line
+        // that distinguishes "libdovi converted fine, AVPlayer still refused it" from "libdovi rejected the RPU".
+        var rpuStats = RPUConvStats()
+        defer {
+            if convertP7 {
+                VXProbe.log("dv", "P7 RPU convert exit: converted=\(rpuStats.rpuConverted) fellBack=\(rpuStats.rpuFellBack) elDropped=\(rpuStats.elDropped) pktBailed=\(rpuStats.pktBailed) bytes=\(buffer.producedCount)")
+            }
+        }
 
         while !isCancelled, av_read_frame(inCtx, pkt) >= 0 {
             let inIdx = Int(pkt.pointee.stream_index)
@@ -303,7 +422,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             // exactly as read, so a quirk in one access unit degrades to a possibly-imperfect frame rather than
             // aborting the whole session (the AVPlayer -> libmpv demotion remains the hard backstop).
             if convertP7, outIdx == baseVideoOut {
-                Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize)
+                Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
             pkt.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(pkt, inStream.pointee.time_base, outStream.pointee.time_base)
@@ -339,6 +458,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         AV_CODEC_ID_ALAC.rawValue, AV_CODEC_ID_MP3.rawValue, AV_CODEC_ID_FLAC.rawValue
     ]
 
+    /// Per-session tally of Profile-7 -> 8.1 RPU conversion outcomes, logged once at mux exit so a DV source
+    /// that mounts but still demotes to mpv reveals WHERE it broke: converted>0 with fellBack==0 means libdovi
+    /// did its job (the failure is downstream in AVPlayer); fellBack>0 means libdovi rejected the RPU (the real
+    /// DV blocker, needs a libdovi/RPU fix); both zero means no RPU NAL was ever walked (an nalLengthSize or
+    /// bitstream-shape problem, cross-check the classify line).
+    struct RPUConvStats {
+        var rpuConverted = 0
+        var rpuFellBack = 0
+        var elDropped = 0
+        var pktBailed = 0
+    }
+
     struct SourceInfo {
         var videoCodec: String = "?"
         var dvProfile: Int = -1
@@ -346,6 +477,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var width: Int = 0
         var height: Int = 0
         var mappedStreams: Int = 0
+    }
+
+    /// Apply the HTTP protocol options libmpv uses so the remux open survives debrid CDN quirks (chunked
+    /// slow-start, mid-stream redirects, transient resets) that make a plain FFmpeg open time out (rc=-60) on a
+    /// URL libmpv plays fine. Set on the same AVDictionary handed to avformat_open_input. Unknown keys on an
+    /// older protocol build are simply left in the dict, never fatal.
+    private static func applyDebridHTTPResilience(_ opts: inout OpaquePointer?) {
+        av_dict_set(&opts, "reconnect", "1", 0)
+        av_dict_set(&opts, "reconnect_streamed", "1", 0)
+        av_dict_set(&opts, "reconnect_on_network_error", "1", 0)
+        av_dict_set(&opts, "reconnect_delay_max", "5", 0)          // seconds
+        av_dict_set(&opts, "multiple_requests", "1", 0)            // persistent connection across redirect+range
     }
 
     private static func readDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?, into info: inout SourceInfo) {
@@ -408,7 +551,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             guard let data = arr[i].data,
                   Int(arr[i].size) >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size else { return }
             data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { rec in
+                // Fully populate the record (not a partial relabel): movenc's DoVi validation wants a complete,
+                // internally-consistent Profile 8.1 config. dv_version_major must be 1 and dv_level must be
+                // non-zero or mov_init can EINVAL; a P7 source's md_compression may be non-zero, invalid for the
+                // fragmented-output DoVi box, so force NONE.
+                rec.pointee.dv_version_major = 1
+                rec.pointee.dv_version_minor = 0
                 rec.pointee.dv_profile = 8
+                rec.pointee.dv_level = max(rec.pointee.dv_level, 1)   // keep the source level, never 0
                 rec.pointee.dv_bl_signal_compatibility_id = 1   // BL-compatible (HDR10 base)
                 rec.pointee.el_present_flag = 0                 // the enhancement layer is dropped
                 rec.pointee.rpu_present_flag = 1
@@ -428,7 +578,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
     /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
     /// genuinely can't convert.
-    private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int) {
+    private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
         guard let src = pkt.pointee.data else { return }
         let total = Int(pkt.pointee.size)
         guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return }
@@ -444,13 +594,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let nalStart = pos + nalLengthSize
             // A corrupt/misaligned length means we no longer understand the bitstream: abandon the edit and
             // leave the ORIGINAL packet untouched rather than emit a truncated access unit.
-            guard nalLen > 0, nalStart + nalLen <= total else { return }
+            guard nalLen > 0, nalStart + nalLen <= total else { stats.pktBailed += 1; return }
             let nalType = (src[nalStart] >> 1) & 0x3F
 
             if nalType == hevcNalTypeDoViEL {
                 // Drop the in-band enhancement-layer sublayer NAL (single-track Profile 7); the base layer plus
                 // the converted RPU is what AVPlayer decodes.
                 changed = true
+                stats.elDropped += 1
             } else if nalType == hevcNalTypeDoViRPU {
                 // Convert the RPU NAL (its 2-byte header 0x7C 0x01 is exactly the escaped UNSPEC62 prefix
                 // libdovi expects) to Profile 8.1 and re-emit it length-prefixed. On any libdovi error, keep
@@ -467,8 +618,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 if let newNal = converted {
                     appendLengthPrefixed(&out, newNal, nalLengthSize: nalLengthSize)
                     changed = true
+                    stats.rpuConverted += 1
                 } else {
                     appendLengthPrefixed(&out, src, from: nalStart, count: nalLen, nalLengthSize: nalLengthSize)
+                    stats.rpuFellBack += 1
                 }
             } else {
                 // Every other NAL (VPS/SPS/PPS/slices/SEI) passes through unchanged.
@@ -477,7 +630,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             pos = nalStart + nalLen
         }
         // Trailing bytes we could not parse as a complete NAL: bail to the untouched original for safety.
-        guard pos == total else { return }
+        guard pos == total else { stats.pktBailed += 1; return }
         guard changed else { return }   // nothing to rewrite; keep the original buffer
 
         // Replace the packet payload. av_packet_from_data takes ownership of an av_malloc'd buffer padded with
@@ -543,6 +696,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 /// AVERROR_EXIT = -('E'|'X'|'I'|'T'<<8...) via AVERROR(...) on FFERRTAG; the Swift import doesn't surface the
 /// macro, so hardcode the standard value. This aborts the muxer's write loop when we cancel mid-remux.
 private let AVERROR_EXIT_CONST: Int32 = -1414092869   // AVERROR_EXIT
+
+/// AVERROR(ETIMEDOUT) = -(ETIMEDOUT) = -60 on Darwin (what rw_timeout expiry returns). The Swift importer does
+/// not surface the AVERROR macro, so hardcode the observed value to gate the cold-debrid open retry.
+private let AVERROR_ETIMEDOUT_CONST: Int32 = -60
 
 /// AVFMT_FLAG_CUSTOM_IO is a plain #define (0x0080) not always surfaced as a Swift constant.
 private let AVFMT_FLAG_CUSTOM_IO_CONST: Int32 = 0x0080

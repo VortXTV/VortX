@@ -73,16 +73,21 @@ struct InHeroYouTubeTrailerView: View {
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the hero backdrop uses, so the title / meta stay legible over the trailer and the
-    /// band reads consistently whether the still art or the trailer is showing (mirrors `InHeroTrailerView`).
+    /// The scrim the moving trailer carries so the title / logo / meta / synopsis stay legible over video
+    /// (mirrors `InHeroTrailerView`): a deep vertical fade tuned to match OR EXCEED the still-backdrop scrim,
+    /// a top scrim for the chrome discs, and a leading fade for the title column. The extra depth keeps the
+    /// logo readable once the bright moving embed dissolves in over the still art (owner report).
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas.opacity(0.30), location: 0.45),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.72),
+                .init(color: Theme.Palette.canvas.opacity(0.90), location: 0.90),
                 .init(color: Theme.Palette.canvas, location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }

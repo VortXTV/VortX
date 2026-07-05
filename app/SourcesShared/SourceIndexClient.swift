@@ -117,23 +117,44 @@ enum SourceIndexClient {
 
     // MARK: - HOARD: POST /sources/contribute (signed, fire-and-forget)
 
-    /// Report the assembled source descriptors for a title. Gated on consent + the fleet feature flag. Batches
-    /// the whole set into ONE POST; result ignored; failures silent. No-op on an empty descriptor set.
+    /// Report the assembled source descriptors for a title. Gated on consent + the fleet feature flag. Popular
+    /// titles routinely resolve far more than one POST can carry (the worker truncates each POST at
+    /// `MAX_SOURCES_PER_CONTRIBUTE` = 100), so a single ONE-POST upload silently dropped every descriptor past
+    /// the first 100 and a real title never fully seeded. Instead we chunk the whole deduped set into
+    /// `batchSize`-descriptor POSTs and send them SEQUENTIALLY, spaced by `interBatchDelayMs` so the run stays
+    /// under the worker's per-IP rate limit. Each POST is independently fire-and-forget: its result is ignored,
+    /// and a 429 or any error silently drops just that one batch (never blocks or crashes playback). No-op on an
+    /// empty set. `descriptors` is expected already-deduped by `descriptors(from:)`.
     static func contribute(contentID: String, descriptors: [Descriptor]) async {
         guard isEnabled, !descriptors.isEmpty else { return }
-        // Cap the batch so a pathological title (thousands of streams) can never send an unbounded body.
-        let capped = Array(descriptors.prefix(maxDescriptorsPerContribute))
+        // Bound the whole title: a pathological title still never sends an unbounded number of batches.
+        let all = Array(descriptors.prefix(maxDescriptorsPerTitle))
+        // batchSize MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE or the tail of every batch is dropped
+        // worker-side. Slice into <= batchSize chunks.
+        let batches = stride(from: 0, to: all.count, by: batchSize).map {
+            Array(all[$0 ..< min($0 + batchSize, all.count)])
+        }
 
         struct Body: Encodable { let content_id: String; let sources: [Descriptor] }
-        guard let data = try? JSONEncoder().encode(Body(content_id: contentID, sources: capped)) else { return }
+        for (i, chunk) in batches.enumerated() {
+            guard let data = try? JSONEncoder().encode(Body(content_id: contentID, sources: chunk)) else { continue }
 
-        var req = URLRequest(url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
-                             timeoutInterval: 8)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.httpBody = data
-        VortXEdgeAuth.sign(&req)   // gated host: stamp X-VX-Ts / X-VX-Sig / X-VX-Kid
-        _ = try? await URLSession.shared.data(for: req)
+            var req = URLRequest(url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
+                                 timeoutInterval: 8)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "content-type")
+            req.httpBody = data
+            VortXEdgeAuth.sign(&req)   // gated host: stamp X-VX-Ts / X-VX-Sig / X-VX-Kid
+            VXProbe.log("sing", "contribute POST content=\(contentID) batch=\(i + 1)/\(batches.count) descriptors=\(chunk.count)")
+            _ = try? await URLSession.shared.data(for: req)   // fire-and-forget; a 429 / error just drops this batch
+
+            // Space the batches so the whole run stays under the worker per-IP limit. Skip the sleep after the
+            // last batch. try? swallows cancellation, which is fine: this whole call is a detached, fail-soft
+            // pool write and is never tied to playback.
+            if i < batches.count - 1 {
+                try? await Task.sleep(nanoseconds: interBatchDelayMs * 1_000_000)
+            }
+        }
     }
 
     /// Convenience: extract descriptors from `groups` and contribute them for `contentID`. The HOARD entry the
@@ -142,6 +163,65 @@ enum SourceIndexClient {
         guard isEnabled else { return }
         let descriptors = descriptors(from: groups)
         await contribute(contentID: contentID, descriptors: descriptors)
+    }
+
+    /// HOARD the SINGLE source a Continue-Watching / card resume actually plays. The resume path re-resolves one
+    /// stored source and plays it WITHOUT assembling the title's full stream groups, so the detail-view `hoard`
+    /// never runs for a card resume and those (very common) playbacks never seeded the pool at all. This seeds
+    /// exactly that one source from the resume's already-stored fields: no new stream-resolve, no network fan-out,
+    /// no hot-path work. Gated identically (contribute re-checks `isEnabled` = consent + fleet flag). Deduped per
+    /// content id per process, so re-resuming the same title does not re-POST. Fire-and-forget + fail-soft.
+    ///
+    /// Only TORRENT sources carry a shareable, corroboratable public id (the infohash). A non-torrent resume
+    /// (plain direct link) has no poolable id here and is a clean no-op, matching the detail-view descriptor
+    /// rules which never send the raw resolved url.
+    static func hoardResumedSource(contentID: String, infoHash: String?, quality: String?,
+                                   sizeBytes: Int64, sourceTag: String, seeders: Int?) async {
+        guard isEnabled else { return }
+        guard let hash = infoHash?.lowercased(), !hash.isEmpty,
+              hash.range(of: #"^[0-9a-fA-F]{20,64}$"#, options: .regularExpression) != nil else { return }
+        // Per-process dedup: a resumed title only needs to seed its one source once per launch.
+        guard await ResumeSeedGuard.shared.shouldSeed(contentID: contentID, id: hash) else { return }
+        let d = Descriptor(kind: Kind.torrent.rawValue, id: hash,
+                           quality: (quality?.isEmpty == false) ? quality! : "Other",
+                           sizeBytes: max(0, sizeBytes), sourceTag: sanitizeTag(sourceTag),
+                           seeders: (seeders ?? -1) >= 0 ? seeders : nil)
+        await contribute(contentID: contentID, descriptors: [d])
+    }
+
+    /// HOARD the FULL assembled source groups a Continue-Watching / card resume produces, once the resume path's
+    /// background `loadMeta` has populated them. A card resume plays one stored source WITHOUT opening the detail
+    /// view, so the detail-view `hoard` never fires for it; the older `hoardResumedSource` only seeded a torrent
+    /// resume's single source and no-op'd for a debrid/direct resume (which is exactly the common case), so those
+    /// playbacks seeded nothing. This bridges the gap: the resume already kicks `loadMeta` (for the auto-hop
+    /// safety net), which asynchronously fills `streamGroups(forStreamId:)`; we poll for that becoming non-empty
+    /// under a short bounded cap, then fire the SAME full-group `hoard` the detail view uses, so debrid/direct
+    /// resumes seed too.
+    ///
+    /// 100% fail-soft + off the hot path: bounded poll (`maxWaitMs`), a hung/empty meta simply times out to a
+    /// no-op, and the eventual `hoard` is itself consent + fleet-flag gated. Deduped per content per process via
+    /// `ResumeSeedGuard` so re-resuming the same title in one launch does not re-POST. `resolveGroups` is called
+    /// on the main actor (it reads `CoreBridge`'s published state); nothing here blocks the resume/playback.
+    static func hoardResumedGroups(contentID: String,
+                                   maxWaitMs: Int = 5000,
+                                   pollIntervalMs: Int = 250,
+                                   resolveGroups: @MainActor @escaping () -> [CoreStreamSourceGroup]) async {
+        guard isEnabled else { return }
+        let deadline = max(1, maxWaitMs / max(1, pollIntervalMs))
+        for _ in 0..<deadline {
+            let groups = await resolveGroups()
+            if !groups.isEmpty {
+                // Per-process dedup, consumed only once we actually have groups to seed (so a timed-out poll does
+                // not burn the slot for a later resume of the same title). A synthetic id keeps this from
+                // colliding with the single-source `hoardResumedSource` dedup entries.
+                guard await ResumeSeedGuard.shared.shouldSeed(contentID: contentID, id: "resume-groups") else { return }
+                await hoard(contentID: contentID, groups: groups)
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(pollIntervalMs) * 1_000_000)
+        }
+        // Timed out with no assembled groups (the resume's stored link played but no meta/streams arrived): a
+        // clean no-op, exactly today's behavior for a resume that never assembles the title.
     }
 
     // MARK: - SERVE: GET /sources?content_id=… (signed, opt-in + login-gated)
@@ -153,15 +233,14 @@ enum SourceIndexClient {
         // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged. Sign-in
         // IS required (owner decision 2026-07-04: keep Singularity results a VortX-user-only benefit; the worker
         // enforces the same login gate and serves an empty list to a tokenless caller). Contribute stays open.
-        NSLog("[sing-probe] fetchPooled GATE contentID=%@ isEnabled=%@ serveEnabled=%@ isSignedIn=%@",
-              contentID, isEnabled ? "on" : "off", serveEnabled ? "on" : "off", isSignedIn ? "yes" : "no")
+        VXProbe.log("sing", "fetchPooled GATE contentID=\(contentID) isEnabled=\(isEnabled ? "on" : "off") serveEnabled=\(serveEnabled ? "on" : "off") isSignedIn=\(isSignedIn ? "yes" : "no")")
         guard isEnabled, serveEnabled, isSignedIn else {
-            NSLog("[sing-probe] fetchPooled GATE CLOSED contentID=%@ -> [] (gate off / not signed in)", contentID)
+            VXProbe.log("sing", "fetchPooled GATE CLOSED contentID=\(contentID) -> [] (gate off / not signed in)")
             return []
         }
         guard var comps = URLComponents(url: baseURL.appendingPathComponent("sources"),
                                         resolvingAgainstBaseURL: false) else {
-            NSLog("[sing-probe] fetchPooled URLComponents FAILED contentID=%@ -> []", contentID)
+            VXProbe.log("sing", "fetchPooled URLComponents FAILED contentID=\(contentID) -> []")
             return []
         }
         // Ask for torrents ONLY: those are the cross-user PLAYABLE sources (infohash-keyed). Direct-http
@@ -172,7 +251,7 @@ enum SourceIndexClient {
             URLQueryItem(name: "kind", value: "torrent"),
         ]
         guard let url = comps.url else {
-            NSLog("[sing-probe] fetchPooled url build FAILED contentID=%@ -> []", contentID)
+            VXProbe.log("sing", "fetchPooled url build FAILED contentID=\(contentID) -> []")
             return []
         }
 
@@ -188,23 +267,21 @@ enum SourceIndexClient {
         if let moat {
             req.setValue(moat, forHTTPHeaderField: MoatToken.header)
         }
-        NSLog("[sing-probe] fetchPooled GET %@ contentID=%@ edgeSigned=%@ moatToken=%@",
-              url.absoluteString, contentID, signed ? "yes" : "no", moat != nil ? "present" : "absent")
+        VXProbe.log("sing", "fetchPooled GET \(url.absoluteString) contentID=\(contentID) edgeSigned=\(signed ? "yes" : "no") moatToken=\(moat != nil ? "present" : "absent")")
 
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                NSLog("[sing-probe] fetchPooled HTTP non-2xx contentID=%@ status=%d -> []", contentID, status)
+                VXProbe.log("sing", "fetchPooled HTTP non-2xx contentID=\(contentID) status=\(status) -> []")
                 return []
             }
             let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data)
             let sources = decoded?.sources ?? []
-            NSLog("[sing-probe] fetchPooled HTTP OK contentID=%@ status=%d corroboratedSources=%d reason=%@",
-                  contentID, http.statusCode, sources.count, decoded?.reason ?? "-")
+            VXProbe.log("sing", "fetchPooled HTTP OK contentID=\(contentID) status=\(http.statusCode) corroboratedSources=\(sources.count) reason=\(decoded?.reason ?? "-")")
             return sources
         } catch {
-            NSLog("[sing-probe] fetchPooled HTTP ERROR contentID=%@ error=%@ -> []", contentID, error.localizedDescription)
+            VXProbe.log("sing", "fetchPooled HTTP ERROR contentID=\(contentID) error=\(error.localizedDescription) -> []")
             return []
         }
     }
@@ -227,8 +304,7 @@ enum SourceIndexClient {
             let desc = "Singularity source\(sizeSuffix)\(seedSuffix)"
             return make(name: name, description: desc, infoHash: hash.lowercased())
         }
-        NSLog("[sing-probe] streams(from:) reconstruct pooled=%d -> playable torrents=%d (usenet/direct/non-torrent dropped)",
-              pooled.count, built.count)
+        VXProbe.log("sing", "streams(from:) reconstruct pooled=\(pooled.count) -> playable torrents=\(built.count) (usenet/direct/non-torrent dropped)")
         return built
     }
 
@@ -241,10 +317,13 @@ enum SourceIndexClient {
             && RemoteConfig.snapshot.isFeatureOn("sourceIndex", default: RemoteConfigDefaults.featureSourceIndex)
     }
 
-    /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default OFF: an unset value reads false,
-    /// which is exactly the intended default, so no object-presence dance is needed here.
+    /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default ON, absent key reads as true
+    /// (give-to-get; still sign-in gated in fetchPooled), mirroring MoatConsent.contributeAndConsume.
     static let serveKey = "vortx.singularity.serve"
-    static var serveEnabled: Bool { UserDefaults.standard.bool(forKey: serveKey) }
+    static var serveEnabled: Bool {
+        if UserDefaults.standard.object(forKey: serveKey) == nil { return true }
+        return UserDefaults.standard.bool(forKey: serveKey)
+    }
 
     // MARK: - Singularity source-group identity (shared by the iOS + tvOS source lists)
 
@@ -271,7 +350,15 @@ enum SourceIndexClient {
 
     // MARK: - Helpers
 
-    private static let maxDescriptorsPerContribute = 400
+    /// The overall per-title cap on descriptors uploaded. Far above real fan-out (a title with more unique
+    /// sources than this drops the tail, which is acceptable). At `batchSize` per POST this is at most 20 POSTs.
+    private static let maxDescriptorsPerTitle = 2000
+    /// Descriptors per POST. MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE (currently 100) or each batch
+    /// tail is truncated worker-side and silently lost.
+    private static let batchSize = 100
+    /// Delay between sequential batch POSTs. Just over one second so 20 batches spread over ~21s stay under the
+    /// worker's per-IP limit (60 contributes per 60s). Fire-and-forget: any dropped batch is silently lost.
+    private static let interBatchDelayMs: UInt64 = 1100
 
     /// The source-index base URL from RemoteConfig, or the baked default.
     private static var baseURL: URL {
@@ -341,11 +428,10 @@ final class SourceIndexServeSource: ObservableObject {
             let pooled = await SourceIndexClient.fetchPooled(contentID: contentID, isSignedIn: isSignedIn)
             let built = SourceIndexClient.streams(from: pooled)
             guard !Task.isCancelled, let self else {
-                NSLog("[sing-probe] refresh publish SKIPPED contentID=%@ (cancelled or self gone) built=%d",
-                      contentID, built.count)
+                VXProbe.log("sing", "refresh publish SKIPPED contentID=\(contentID) (cancelled or self gone) built=\(built.count)")
                 return
             }
-            NSLog("[sing-probe] refresh publish contentID=%@ streams=%d (now merge-ready)", contentID, built.count)
+            VXProbe.log("sing", "refresh publish contentID=\(contentID) streams=\(built.count) (now merge-ready)")
             self.streams = built
         }
     }
@@ -358,7 +444,7 @@ final class SourceIndexServeSource: ObservableObject {
     /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         guard !streams.isEmpty else {
-            NSLog("[sing-probe] merged PASS-THROUGH singularityStreams=0 -> groups unchanged (%d groups)", groups.count)
+            VXProbe.log("sing", "merged PASS-THROUGH singularityStreams=0 -> groups unchanged (\(groups.count) groups)")
             return groups
         }
         var seen: Set<String> = []
@@ -371,12 +457,27 @@ final class SourceIndexServeSource: ObservableObject {
         // deduped against the user's add-on groups, so a release your add-ons already return still appears
         // under the Singularity label.
         guard !own.isEmpty else {
-            NSLog("[sing-probe] merged singularityStreams=%d survivingInternalDedup=0 -> groups unchanged (%d groups)",
-                  streams.count, groups.count)
+            VXProbe.log("sing", "merged singularityStreams=\(streams.count) survivingInternalDedup=0 -> groups unchanged (\(groups.count) groups)")
             return groups
         }
-        NSLog("[sing-probe] merged GROUP produced addon=%@ streamCount=%d (from singularityStreams=%d, internal-dedup only, NOT deduped vs user add-ons) totalGroups=%d",
-              SourceIndexClient.groupAddon, own.count, streams.count, groups.count + 1)
+        VXProbe.log("sing", "merged GROUP produced addon=\(SourceIndexClient.groupAddon) streamCount=\(own.count) (from singularityStreams=\(streams.count), internal-dedup only, NOT deduped vs user add-ons) totalGroups=\(groups.count + 1)")
         return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
+    }
+}
+
+// MARK: - Resume-seed dedup
+
+/// Remembers which (content, source) pairs a resume already seeded this process, so re-resuming the same title
+/// does not re-POST the same one source. Process-lifetime only (never persisted): a fresh launch may re-seed
+/// once, which is harmless (the pool upserts by UNIQUE(content_id, kind, id)).
+actor ResumeSeedGuard {
+    static let shared = ResumeSeedGuard()
+    private var seen: Set<String> = []
+
+    /// True the FIRST time a given (contentID, id) is offered this process; false thereafter. Bounded so a long
+    /// session cannot grow the set without limit; on overflow it resets (worst case a re-seed, still harmless).
+    func shouldSeed(contentID: String, id: String) -> Bool {
+        if seen.count > 4000 { seen.removeAll(keepingCapacity: true) }
+        return seen.insert(contentID + "|" + id).inserted
     }
 }

@@ -213,3 +213,39 @@ final class VXDiagExport {
         return CIContext().createCGImage(scaled, from: scaled.extent)
     }
 }
+
+#if os(macOS)
+import AppKit
+
+extension VXDiagExport {
+
+    /// macOS export path: a Mac has a filesystem and Finder, so the LAN-server + scan-a-QR-with-your-phone
+    /// dance (built for Apple TV, which has neither a share sheet nor a reachable file browser) is the wrong
+    /// mechanism and also trips over the App Sandbox network-server gate on a `0.0.0.0` bind. Instead just
+    /// copy the current rolling `vortx-diag.log` into the user's Downloads folder and reveal it in Finder so
+    /// the owner grabs and sends the file directly. Returns the destination path to show the user, or nil if
+    /// the log could not be materialised anywhere.
+    @MainActor func revealInFinder() -> String? {
+        let src = VXProbe.logFileURL
+        let fm = FileManager.default
+        // Prefer Downloads (user-visible); fall back to the temp dir if it is not resolvable.
+        let destDir = (try? fm.url(for: .downloadsDirectory, in: .userDomainMask, appropriateFor: nil, create: false))
+            ?? fm.temporaryDirectory
+        let dest = destDir.appendingPathComponent("vortx-diag.log")
+        // Copy the current log (overwriting any stale copy). If the source is missing/empty, still write a
+        // placeholder so the reveal is not a dead file.
+        let data = (try? Data(contentsOf: src)) ?? Data("(diagnostic log is empty)\n".utf8)
+        do {
+            try data.write(to: dest, options: .atomic)
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
+            NSLog("[diag] export: revealed %@ in Finder", dest.path)
+            return dest.path
+        } catch {
+            // Downloads not writable (unexpected on an unsandboxed Mac): reveal the log in place instead.
+            NSWorkspace.shared.activateFileViewerSelecting([src])
+            NSLog("[diag] export: copy to Downloads failed (%@), revealed source in place", String(describing: error))
+            return src.path
+        }
+    }
+}
+#endif

@@ -838,6 +838,11 @@ final class MPVMetalViewController: PlatformViewController {
         // direct CDN keeps the full buffer for network resilience. Set per file at runtime.
         let isLocalStream = playURL.host == "127.0.0.1" || playURL.host == "localhost"
             || (playURL.host?.hasSuffix("strem.io") ?? false)
+            // A trailer is a short clip and never needs the big remote read-ahead. A googlevideo trailer is
+            // already proxied to 127.0.0.1 (small), but a worker-fallback trailer (trailer.vortx.tv, a remote
+            // host) otherwise takes the full 256 MiB remote buffer and contributes to the tvOS jetsam that the
+            // owner sees as "the server died". Give the trailer host the small read-ahead too.
+            || (playURL.host?.contains("trailer.vortx.tv") ?? false)
         configureLiveMode(live)
         let readAhead: String
         if live {

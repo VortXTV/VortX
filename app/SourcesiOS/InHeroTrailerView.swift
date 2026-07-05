@@ -125,16 +125,23 @@ struct InHeroTrailerView: View {
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the hero backdrop uses, so the title / meta stay legible over video and the band
-    /// reads consistently whether the still art or the clip is showing.
+    /// The scrim the moving clip carries so the title / logo / meta / synopsis stay legible over video.
+    /// A moving clip has bright motion the still backdrop does not, so this scrim is tuned to match OR
+    /// EXCEED the still-backdrop scrim (see the hero `backdrop` overlays): a deeper vertical fade, a top
+    /// scrim for the chrome discs, and a leading fade for the title column. Without the top scrim and the
+    /// deeper mid stops the logo looked washed out / covered once the clip faded in (owner report), even
+    /// though the details paint ABOVE the clip in the ZStack.
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas.opacity(0.30), location: 0.45),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.72),
+                .init(color: Theme.Palette.canvas.opacity(0.90), location: 0.90),
                 .init(color: Theme.Palette.canvas, location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }

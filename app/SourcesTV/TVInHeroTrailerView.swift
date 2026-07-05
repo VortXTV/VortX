@@ -137,16 +137,20 @@ struct TVInHeroTrailerView: View {
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the tvOS `FullBleedBackdrop` uses, so the title / meta stay legible over video
-    /// and the band reads consistently whether the still art or the clip is showing.
+    /// The scrim the moving clip carries. It is based on the tvOS `FullBleedBackdrop` scrim but tuned
+    /// slightly DEEPER (and with an added top scrim) because a moving clip has bright motion the still art
+    /// does not, so the logo / meta / synopsis (which paint ABOVE this clip) stay legible once it fades in
+    /// (owner report: the clip appeared to cover the details). Still-art legibility is unchanged.
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.18), location: 0.50),
-                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.78),
-                .init(color: Theme.Palette.canvas.opacity(0.88), location: 1.0),
+                .init(color: Theme.Palette.canvas.opacity(0.28), location: 0.50),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.78),
+                .init(color: Theme.Palette.canvas.opacity(0.92), location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.40), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }

@@ -762,7 +762,7 @@ struct iOSHomeView: View {
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -1589,7 +1589,7 @@ struct iOSDiscoverView: View {
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             if showCollectionsHub { collectionsHub.load() }
         }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
         // The grid changes whenever a different type/catalog/genre is selected, which bumps revision —
         // reseed so the hero pool tracks the visible catalog.
         .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
@@ -1857,6 +1857,23 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
     }
     LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
+    // Seed the community pool with the FULL assembled source groups this resume produces. A card resume never
+    // opens the detail view, so the detail-view hoard never runs for it; this resume kicks a background loadMeta
+    // (below, for both movie and series) that fills streamGroups, and this polls for that then fires the same
+    // full-group hoard the detail view uses. The older single-source hoard no-op'd for debrid/direct resumes
+    // (the common case), so those playbacks seeded nothing. Fire-and-forget, deduped per content, gated inside
+    // SourceIndexClient (consent + fleet flag). No-op when the library id is not a real imdb id or no groups
+    // assemble.
+    if let cid = SourceIndexClient.contentID(imdbId: item.id, season: entry.season, episode: entry.episode) {
+        let streamId = entry.videoId
+        Task.detached {
+            // Read groups off the shared bridge (not the captured `core`) so the detached task never captures a
+            // non-Sendable reference; there is one engine bridge, so this is the same state the resume loads.
+            await SourceIndexClient.hoardResumedGroups(contentID: cid) {
+                CoreBridge.shared.streamGroups(forStreamId: streamId)
+            }
+        }
+    }
     // Reresolve the EXACT stored source FIRST (same debrid file, fresh link) so the card tap resumes the source
     // the user chose instead of replaying a stale, expired URL and dead-ending into the cross-source auto-pick
     // ("Tried N sources / this source didn't load"). CWResume mints a fresh link for the SAME file when the

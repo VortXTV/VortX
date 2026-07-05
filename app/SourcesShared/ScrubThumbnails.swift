@@ -100,7 +100,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             // Diagnose an empty server table: log WHY we never key (the remaining culprits are a non-tt,
             // non-tmdb libraryId, e.g. kitsu:/paste-a-link, or a zero duration).
             if enabled, communityKey == nil {
-                NSLog("[trickplay] community NOT keyed (need a tt-imdb id + duration>0): imdb=%@ dur=%.0f", imdbId ?? "nil", duration)
+                VXProbe.log("tp", "community NOT keyed (need a tt-imdb id + duration>0): imdb=\(imdbId ?? "nil") dur=\(Int(duration))")
             }
             return
         }
@@ -111,7 +111,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         if communityKey == key { return }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
         let rekeying = communityKey != nil
-        NSLog("[trickplay] community %@: %@ (imdb=%@ real=%@)", rekeying ? "re-keyed" : "keyed", key, imdbId, isRealDuration ? "yes" : "no")
+        VXProbe.log("tp", "community \(rekeying ? "re-keyed" : "keyed"): \(key) (imdb=\(imdbId) real=\(isRealDuration ? "yes" : "no"))")
         communityKey = key
         communityImdb = imdbId
         communitySeason = season
@@ -149,7 +149,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 guard let tt else {
-                    NSLog("[trickplay] tmdb->imdb resolve FAILED for %@ (session stays local-only)", rawId)
+                    VXProbe.log("tp", "tmdb->imdb resolve FAILED for \(rawId) (session stays local-only)")
                     return
                 }
                 self.configureCommunity(imdbId: tt, season: season, episode: episode,
@@ -185,7 +185,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// failed to decode or the frame is near-black (unrendered) and should be dropped. Fail-soft: logs the drop.
     nonisolated static func decodeCapturedFrame(_ data: Data, at time: Double) -> ScrubImage? {
         guard let decoded = ScrubImage(data: data) else {
-            NSLog("[trickplay] dropping frame at %.0fs: JPEG decode failed", time)
+            VXProbe.log("tp", "dropping frame at \(Int(time))s: JPEG decode failed")
             return nil
         }
         #if canImport(AppKit)
@@ -209,16 +209,15 @@ final class ScrubThumbnailsStore: ObservableObject {
         }
         let bigEnoughToBeReal = data.count >= nonBlackByteFloor
         let kept = bigEnoughToBeReal || !samplerBlack
-        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=%@ kept=%@",
-              time, data.count, samplerBlack ? "true" : "false", kept ? "true" : "false")
+        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=\(samplerBlack ? "true" : "false") kept=\(kept ? "true" : "false")")
         if !kept {
-            NSLog("[trickplay] dropping frame at %.0fs: near-black (unrendered) bytes=%d", time, data.count)
+            VXProbe.log("tp", "dropping frame at \(Int(time))s: near-black (unrendered) bytes=\(data.count)")
             return nil
         }
         #else
         // Non-AppKit platforms have no pixel sampler here, so nothing is dropped as near-black; still emit the probe
         // so the log shows the size verdict for every captured frame on every platform.
-        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=n/a kept=true", time, data.count)
+        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=n/a kept=true")
         #endif
         return decoded
     }
@@ -262,11 +261,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let beatsStored = sessionFrames.count > communityExistingFrameCount   // keep-fuller: don't clobber a fuller set
         let hasNewCoverage = sessionFrames.count >= lastUploadedCount + minNewFrames
         let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && communityImdb != nil
-        NSLog("[tp-probe] upload-gate frames=%d existing=%d lastUploaded=%d minNew=%d enabled=%@ hasKey=%@ imdb=%@ beatsStored=%@ hasNewCoverage=%@ -> %@",
-              sessionFrames.count, communityExistingFrameCount, lastUploadedCount, minNewFrames,
-              enabled ? "true" : "false", hasKey ? "true" : "false", communityImdb ?? "nil",
-              beatsStored ? "true" : "false", hasNewCoverage ? "true" : "false",
-              willUpload ? "UPLOAD" : "skip")
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) minNew=\(minNewFrames) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -290,11 +285,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let grewSinceUpload = sessionFrames.count > lastUploadedCount
         let beatsStored = sessionFrames.count > communityExistingFrameCount
         let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && communityImdb != nil
-        NSLog("[tp-probe] teardown-flush frames=%d existing=%d lastUploaded=%d enabled=%@ hasKey=%@ hasFrames=%@ grewSinceUpload=%@ beatsStored=%@ -> %@",
-              sessionFrames.count, communityExistingFrameCount, lastUploadedCount,
-              enabled ? "true" : "false", hasKey ? "true" : "false", hasFrames ? "true" : "false",
-              grewSinceUpload ? "true" : "false", beatsStored ? "true" : "false",
-              willFlush ? "FLUSH" : "skip")
+        VXProbe.log("tp", "teardown-flush frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") hasFrames=\(hasFrames ? "true" : "false") grewSinceUpload=\(grewSinceUpload ? "true" : "false") beatsStored=\(beatsStored ? "true" : "false") -> \(willFlush ? "FLUSH" : "skip")")
         guard willFlush, let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
     }
@@ -307,13 +298,13 @@ final class ScrubThumbnailsStore: ObservableObject {
         let frames = sessionFrames
         let season = communitySeason, episode = communityEpisode
         let bucket = communityDurationBucket, height = communitySrcHeight
-        NSLog("[tp-probe] pushUpload FIRING key=%@ imdb=%@ frames=%d", key, imdb, frames.count)
+        VXProbe.log("tp", "pushUpload FIRING key=\(key) imdb=\(imdb) frames=\(frames.count)")
         Task.detached(priority: .utility) {
             let ok = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,
                 durationBucket: bucket, srcHeight: height,
                 intervalS: Self.captureInterval, frames: frames)
-            NSLog("[trickplay] upload key=%@ frames=%d -> %@", key, frames.count, ok ? "stored" : "failed")
+            VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(ok ? "stored" : "failed")")
         }
     }
 

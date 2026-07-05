@@ -205,9 +205,19 @@ enum StreamRanking {
         else if boundedMatch(text, #"dvd[ .\-_]?rip"#) { score -= 200 }
         else if text.contains("tvrip") || text.contains("satrip") || boundedMatch(text, #"pdtv"#) { score -= 300 }
         // Video range, fine-grained: DV > HDR10+ > HDR10/HLG > SDR. Checked specific-first so HDR10+
-        // is not swallowed by the generic "hdr" test. Any HDR is effectively strict over SDR; the
-        // gradations between HDR flavours are soft (a size tiebreak can nudge), which is fine.
-        if text.contains("dolby vision") || text.contains("dolbyvision") || text.contains("dovi") { score += 30 }
+        // is not swallowed by the generic "hdr" test. Any HDR is effectively strict over SDR.
+        //
+        // DV uses the SAME wide predicate the engine router trusts (isDolbyVision), not a narrow
+        // "dolby vision"/"dovi" token match. Two reasons: (1) a source labeled only by profile
+        // (DV.P8, Profile 8, BL+RPU, DoViHDR) routes to the true-DV AVPlayer lane at play time but,
+        // under the old narrow match, scored as pure SDR here, so any "hdr" peer (+18) outranked it
+        // and the auto-pick took HDR10 over a real DV source; using isDolbyVision makes ranking and
+        // routing agree. (2) The bonus is raised to +45 so a real DV source beats an equal-resolution
+        // HDR10 source (+18) by MORE than the size tiebreak can swing (cap +12 below), so an equal-res
+        // HDR10 file cannot overtake DV on file size alone. +45 still sits well below the source and
+        // resolution tiers (remux +230, bluray +150, and the resolution ladder), so a 1080p DV source
+        // never leapfrogs a 4K HDR10 remux: DV stays a within-tier preference, not a cross-tier override.
+        if StreamRanking.isDolbyVision(text) { score += 45 }
         else if text.contains("hdr10+") || text.contains("hdr10plus") { score += 24 }
         else if text.contains("hdr") || text.contains("hlg") { score += 18 }
         // File size is now a SMALL final tiebreaker (cap +12), not a primary signal: it only orders

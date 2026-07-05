@@ -1422,6 +1422,16 @@ struct CoreStreamList: View {
     }
 
     var body: some View {
+        // While the player is up the tvOS shell stays MOUNTED behind it (RootView renders the player over an
+        // opacity(0).disabled() RootTabView, it does not unmount the shell), so this body re-evaluates on every
+        // CoreBridge @Published bump. Rebuilding a 1000+ stream ranked list behind the video saturates the main
+        // thread and starves the mpv Metal surface of a layout pass (the "video stuck in a small rectangle /
+        // 30s stall" symptom). Skip the whole rankedGroups(displayGroups(...)) + best + watchReady work and hold
+        // a same-size placeholder; the view stays mounted so its @State (filter / collapse / picker) survives and
+        // the list + focus target restore unchanged when the player closes (presenter.request flips back to nil).
+        if presenter.request != nil {
+            return AnyView(Color.clear.frame(minHeight: 1))
+        }
         let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
                                                 debridCachedHashes: debridCache.cachedHashes)   // best source first within each add-on
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
@@ -1440,13 +1450,11 @@ struct CoreStreamList: View {
         // button hostage: the timeout opens the gate anyway.
         let watchReady = !loadingAddons || settleTimedOut
 
-        return VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // PINNED Singularity: the best few community-corroborated sources floated to the VERY top, above
-            // the Watch/quality controls and the add-on grouping, so at least one Singularity-labeled source
-            // is always visible without scrolling past a popular title's thousands of add-on rows. `groups`
-            // is already ranked + merged, so this slice is best-first. Empty pool → nothing renders. The rest
-            // of the Singularity sources still live under the normal grouping / the All-sources list.
-            singularitySection(groups)
+        return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // Singularity sources are NOT pinned above Play. They render nested inside the "All sources" list
+            // (via `visible` below, which already includes the merged Singularity group), matching iOS/Mac, so
+            // the community rows sit alongside the other add-on sources instead of floating above the Watch
+            // button before the user has even opened the source list.
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
@@ -1608,7 +1616,7 @@ struct CoreStreamList: View {
             Button("Cancel", role: .cancel) { pendingDownload = nil }
         } message: {
             Text("tvOS can reclaim app storage when the device runs low, so a saved download may be removed by the system. Re-download it any time it is gone.")
-        }
+        })
     }
 
     // MARK: Offline download (#30)
@@ -1761,8 +1769,8 @@ struct CoreStreamList: View {
     }
 
     /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in
-    /// parallel so we reach a genuinely-cached link fast instead of committing to `best` alone, which — when
-    /// `best` is a false-cached row (an add-on ⚡ that this account does not actually hold) — serially times
+    /// parallel so we reach a genuinely-cached link fast instead of committing to `best` alone, which, when
+    /// `best` is a false-cached row (an add-on ⚡ that this account does not actually hold), serially times
     /// out before the user reaches a real one. `groups` is already StreamRanking-ordered (continuity / binge /
     /// pin applied), so flattening it preserves that order as the candidate order. FAIL-SOFT: if the parallel
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
@@ -1803,7 +1811,7 @@ struct CoreStreamList: View {
         let candidates = groups.flatMap(\.streams)
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
             candidates: candidates, cachedHashes: debridCache.cachedHashes,
-            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: best) {
             // A parallel-cached winner is a remote direct link: present it exactly as the single-resolve
             // debrid branch does (engine wired for state, torrent:false, no /create, no closeTorrent).
             core.loadEnginePlayer(for: win.stream)
@@ -1856,32 +1864,6 @@ struct CoreStreamList: View {
                 }
             }
             .padding(.vertical, Theme.Space.xs)
-        }
-    }
-
-    /// A pinned, labeled "Singularity" section at the very top of the source list. Shows the best few
-    /// community-corroborated Singularity sources (sliced from the already-ranked `groups`, best-first, capped
-    /// at `pinnedSectionMax`) so at least one Singularity-labeled source is always visible without scrolling.
-    /// Empty pool (SERVE off / signed out / nothing corroborated) → nothing renders (pure pass-through). Rows
-    /// reuse `streamRow`, so they play / pin exactly like any other source and stay clearly labeled.
-    @ViewBuilder private func singularitySection(_ groups: [CoreStreamSourceGroup]) -> some View {
-        let pinned = SourceIndexClient.pinnedStreams(from: groups)
-        if !pinned.isEmpty {
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "sparkles").font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text(SourceIndexClient.groupAddon.uppercased())
-                        .font(Theme.Typography.eyebrow).tracking(1.5)
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text("Community").font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .padding(.horizontal, Theme.Space.md)
-                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
-                    streamRow(SourceIndexClient.groupAddon, stream)
-                }
-            }
         }
     }
 

@@ -33,6 +33,17 @@ final class VXTrailerProxy {
     /// windows no larger than this. 1 MiB is the size proven end to end against ffmpeg in the prototype.
     private static let windowSize = 1_048_576
 
+    /// Per-window upstream retry budget. A single googlevideo window failure (transient network error, a
+    /// non-2xx status, or an empty body) must NOT truncate the track: the fixed-length 206 already promised the
+    /// full byte count, and a trailer streams video + audio as TWO independent proxied connections, so one
+    /// unretried hiccup ends just that track mid-clip (the "audio or video dies halfway, never finishes" bug).
+    /// Each window is re-requested (idempotent `&range=`) up to this many times with backoff before giving up.
+    private static let maxWindowAttempts = 4
+    /// Base backoff between window retries, scaled by attempt number.
+    private static let windowRetryBaseDelay: TimeInterval = 0.3
+    /// Per-window upstream timeout so a stalled window fails fast (and retries) instead of hanging the track.
+    private static let windowTimeout: TimeInterval = 20
+
     private let queue = DispatchQueue(label: "com.stremiox.vxtrailerproxy")
 
     /// A SEPARATE queue for the listener's state/connection callbacks. It must not be `queue`: `ensureListening`
@@ -235,27 +246,49 @@ final class VXTrailerProxy {
     // MARK: - Windowed streaming
 
     /// Fetch `[pos, end]` from googlevideo one <=1 MiB `&range=` window at a time, writing each to the client
-    /// before requesting the next (backpressure keeps memory bounded to a single window). Stops on client
-    /// disconnect or any upstream error.
+    /// before requesting the next (backpressure keeps memory bounded to a single window). Each window is fetched
+    /// with a bounded retry (see `fetchWindow`) so a transient upstream hiccup does not truncate the track.
     private func streamWindows(_ connection: NWConnection, upstream: URL, pos: Int, end: Int) {
         guard pos <= end else {
             connection.cancel()   // done: the 206 body is complete
             return
         }
         let stop = min(pos + Self.windowSize - 1, end)
-        guard let windowURL = Self.appendRange(upstream, start: pos, stop: stop) else {
+        fetchWindow(connection, upstream: upstream, start: pos, stop: stop, end: end, attempt: 1)
+    }
+
+    /// Fetch ONE `[start, stop]` window and, on success, write it to the client and advance to the next window.
+    /// On a transient upstream failure (network error, non-2xx status, or empty body) it re-requests the SAME
+    /// idempotent `&range=` window up to `maxWindowAttempts` with a small backoff BEFORE giving up. This is the
+    /// fix for trailers dying halfway: previously any single window failure did `connection.cancel()`, closing
+    /// the socket after fewer bytes than the fixed Content-Length promised and truncating that one track.
+    private func fetchWindow(_ connection: NWConnection, upstream: URL, start: Int, stop: Int, end: Int, attempt: Int) {
+        guard let windowURL = Self.appendRange(upstream, start: start, stop: stop) else {
             connection.cancel()
             return
         }
 
         var request = URLRequest(url: windowURL)
+        request.timeoutInterval = Self.windowTimeout
         // NO Range header upstream: googlevideo answers the bounded `&range=` query with a plain 200.
         request.setValue(YouTubeDirectResolver.googlevideoUserAgent, forHTTPHeaderField: "User-Agent")
 
-        let task = upstream_session_dataTask(request) { [weak self] data, _, error in
+        let task = upstream_session_dataTask(request) { [weak self] data, response, error in
             guard let self else { return }
-            guard error == nil, let data, !data.isEmpty else {
-                connection.cancel()
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let ok = error == nil && (200...299).contains(status) && (data?.isEmpty == false)
+            guard ok, let data else {
+                // Transient upstream failure: retry the SAME window (idempotent) after a short backoff rather
+                // than cancelling and truncating this track. Only close once the retry budget is exhausted.
+                if attempt < Self.maxWindowAttempts {
+                    self.queue.asyncAfter(deadline: .now() + Self.windowRetryBaseDelay * Double(attempt)) { [weak self] in
+                        self?.fetchWindow(connection, upstream: upstream, start: start, stop: stop, end: end, attempt: attempt + 1)
+                    }
+                } else {
+                    NSLog("[yt-proxy] window %d-%d gave up after %d attempts (status=%d err=%@)",
+                          start, stop, attempt, status, String(describing: error))
+                    connection.cancel()
+                }
                 return
             }
             connection.send(content: data, completion: .contentProcessed { [weak self] sendError in

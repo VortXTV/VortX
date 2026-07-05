@@ -37,6 +37,11 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Resume data captured on pause / recoverable failure, so resume() can continue instead of restart.
     private var resumeData: [UUID: Data] = [:]
 
+    /// Per-record count of NSURLErrorCannotCreateFile (-3000) self-heal restarts, so a transient background
+    /// daemon staging failure is retried once from scratch, but a genuinely unwritable destination still
+    /// surfaces its error on the second hit instead of looping.
+    private var cannotCreateFileRetries: [UUID: Int] = [:]
+
     /// Last progress tick forwarded to the store per record (#24). The OS delivers `didWriteData` many
     /// times per second per active download; unthrottled, each tick was a main-thread `records` publish
     /// PLUS a synchronous JSON re-encode + atomic index write. Ticks are forwarded at most every ~0.5s /
@@ -246,6 +251,7 @@ final class DownloadManager: NSObject, ObservableObject {
         taskForRecord[id]?.cancel()
         clearTask(id: id)
         resumeData[id] = nil
+        cannotCreateFileRetries[id] = nil
         #if os(iOS)
         cancelAssetTask(id: id)
         #endif
@@ -752,6 +758,23 @@ extension DownloadManager: URLSessionDownloadDelegate {
             if (error as NSError).code == NSURLErrorCancelled { return }
             if let resume { self.resumeData[id] = resume }
             let ns = error as NSError
+            // Self-healing retry for NSURLErrorCannotCreateFile (-3000). With ample free space this is not an
+            // out-of-space error: it is the background download daemon failing to create/write its OWN staging
+            // temp file, which is typically transient. Drop any stale resume data and restart the transfer ONCE
+            // from scratch so the daemon re-stages a fresh temp, instead of surfacing an opaque failure. The
+            // one-retry cap means a genuinely unwritable destination still ends in the clear message below.
+            if ns.code == NSURLErrorCannotCreateFile,
+               self.cannotCreateFileRetries[id, default: 0] < 1,
+               let record = self.store.record(id: id), !record.isTorrent,
+               let url = URL(string: record.remoteURL) {
+                self.cannotCreateFileRetries[id, default: 0] += 1
+                self.resumeData[id] = nil
+                NSLog("[downloads] -3000 self-heal restart id=%@ attempt=%d", id.uuidString, self.cannotCreateFileRetries[id] ?? 1)
+                self.clearTask(id: id)
+                self.store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
+                self.startTask(for: record, url: url)
+                return
+            }
             // DIAGNOSTIC: the owner hit NSURLErrorCannotCreateFile (-3000) with ~200 GB free and a ~1 GB file,
             // so this is NOT out of space. Log the FULL error (domain/code/userInfo) so the true cause is
             // visible on-device, and surface the real domain/code instead of a wrong "storage" message.

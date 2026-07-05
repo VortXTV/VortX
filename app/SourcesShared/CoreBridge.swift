@@ -36,11 +36,48 @@ final class CoreBridge: ObservableObject {
     /// updates but only once per burst. Touched only on the main actor.
     private var boardRebuildWork: DispatchWorkItem?
     private static let boardRebuildDebounce: TimeInterval = 0.08
+    /// Coalesces the `meta_details` re-decode+publish. Source search for a high-source title emits a BURST
+    /// of `meta_details` events as stream batches land (GoT: ~11 re-emits of the same 1757-row payload as it
+    /// grows), and each used to run a full off-main decode + a main-thread republish, invalidating every
+    /// view subscribed to CoreBridge (including the presented player). This timer collapses a burst into one
+    /// trailing decode ~90 ms after the last emit, and the decode then DIFFS against the stored value so an
+    /// identical re-emit republishes nothing. An episode switch still lands within one debounce window (well
+    /// inside the in-player 20s / 250ms poll), so next-episode / binge is unaffected. Touched only on main.
+    private var metaDetailsWork: DispatchWorkItem?
+    private static let metaDetailsDebounce: TimeInterval = 0.09
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
     private var switchInFlight = false
     private var switchFromUID: String?
+
+    // MARK: Player-active gating (playback lag fix)
+    //
+    // A high-source title (e.g. GoT S2E1: 1757 streams across 17 groups) makes source search re-emit
+    // `meta_details` a dozen-plus times as batches land, and a single ~20s progress save re-emits both
+    // `library` and `meta_details`. The library branch decoded the whole 1757-stream payload on the
+    // worker thread only to update the In-Library button. During playback the detail page is covered
+    // (Mac leaves it mounted at opacity 0), so that decode is pure waste and starved the main thread,
+    // which is what stalled the mpv Metal surface. `playerActive` (a depth counter so a trailer-over-
+    // detail then a real player, or a teardown straddle, can't clear it early) lets the library branch
+    // skip that In-Library re-decode while a player is up. It does NOT gate the primary meta_details
+    // republish: in-player episode switching / binge auto-advance load a NEW meta and poll
+    // streamGroups(forStreamId:), which reads the stored metaDetails, so that republish must keep
+    // landing. Toggled from PlayerScreen (iOS/Mac) and TVPlayerView (tvOS) on appear/disappear.
+    @Published private(set) var playerActive = false
+    private var playerActiveDepth = 0
+
+    /// Increment/decrement the player-active depth on the MAIN actor and publish `playerActive`.
+    /// Balanced calls from each player host's onAppear (+1) and onDisappear (-1); the depth counter
+    /// keeps it true across a nested trailer→player mount and a teardown straddle.
+    func setPlayerActive(_ on: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.playerActiveDepth = max(0, self.playerActiveDepth + (on ? 1 : -1))
+            let active = self.playerActiveDepth > 0
+            if self.playerActive != active { self.playerActive = active }
+        }
+    }
 
     /// The Keychain slot holding the ACTIVE profile's session key (shared profiles use the primary
     /// slot, own-account profiles their own). Resolved per read so a profile switch re-points it.
@@ -131,7 +168,17 @@ final class CoreBridge: ObservableObject {
             // the syncDown apply loop's @MainActor hop), so we never re-enter the engine synchronously
             // while it is emitting the ctx event we are handling. tombstone:false via a direct dispatch
             // because the URL is already in the set; re-recording would be a redundant no-op.
-            if !toUninstall.isEmpty {
+            //
+            // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only): when a live Stremio
+            // session exists, stremio-core PERSISTS an engine UninstallAddon upstream via api.strem.io
+            // addonCollectionSet, so this loop is the periodic path that would delete a tombstoned add-on
+            // from the user's REAL Stremio account on every ctx cycle (launch / PullAddonsFromAPI). Only
+            // reconcile the engine collection when push is ON, OR when signed out of Stremio (a local-only
+            // engine edit that cannot reach the account). When push is OFF + a session is live we STILL
+            // drop the tombstoned add-on from the published set below (survivingTyped / publishedRaw), so
+            // the user never sees it, but we leave the engine collection (and the Stremio account) intact.
+            let pushDeletionsToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
+            if !toUninstall.isEmpty, pushDeletionsToStremio {
                 Task { @MainActor [weak self] in
                     for rawDescriptor in toUninstall {
                         self?.dispatchCtx(["action": "UninstallAddon", "args": rawDescriptor])
@@ -165,7 +212,28 @@ final class CoreBridge: ObservableObject {
         if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
             AddonTombstones.tombstone(descriptor.transportUrl)
         }
-        dispatchCtx(["action": "UninstallAddon", "args": raw])
+        // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only). When a live Stremio
+        // session exists, stremio-core's ctx reducer PERSISTS an UninstallAddon by calling api.strem.io
+        // addonCollectionSet, i.e. the deletion would propagate to the user's REAL Stremio account. That
+        // is the destructive two-way delete users reported. So only dispatch the engine uninstall when
+        // the "Mirror add-ons from Stremio" two-way toggle is ON, OR when there is no live Stremio session
+        // (deleting from a signed-out engine is local-only and safe). When push is OFF and a session is
+        // live, we keep the tombstone (the VortX-view removal) and rely on refreshAddons to suppress the
+        // add-on from the published set every ctx cycle, never touching the user's Stremio account.
+        // The Change-URL replace path (tombstone:false) always dispatches: swapping a manifest URL is a
+        // local edit, not a real removal, and must not be blocked.
+        let pushDeletionToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
+        if !tombstone || pushDeletionToStremio {
+            dispatchCtx(["action": "UninstallAddon", "args": raw])
+        } else {
+            // Tombstone-only path (push OFF + live Stremio session): we did NOT dispatch an engine
+            // uninstall, so no ctx event will fire and refreshAddons will not re-run on its own. Apply the
+            // same tombstone suppression to the CURRENTLY published set now so the add-on disappears from
+            // the VortX view immediately, while the engine (and the user's Stremio account) keep it. On the
+            // next real ctx event refreshAddons re-derives from the tombstone set identically, so this is a
+            // pure local echo, not a divergent source of truth.
+            refreshAddons()
+        }
     }
 
     /// Install an add-on from its manifest URL. Stremio add-on URLs ARE the manifest.json URL; we fetch
@@ -265,6 +333,24 @@ final class CoreBridge: ObservableObject {
     /// restore triggers off THIS so a logout re-applies the user's owned add-ons instead of staying wiped.
     var hasNoUserStreamAddon: Bool {
         !addons.contains { $0.providesStreams && !($0.isOfficial || $0.isProtected) }
+    }
+
+    /// Await the engine's Stremio add-on pull settling before a caller snapshots the owned set. On sign-in
+    /// the engine fires PullAddonsFromAPI asynchronously; snapshotting after a FIXED delay can capture the
+    /// set MID-PULL (a slow / down add-on host lands late), which is the partial-import users reported. This
+    /// polls until the engine holds at least one USER stream add-on (hasNoUserStreamAddon == false) or a
+    /// bounded timeout elapses, so the snapshot only runs once the pull looks complete. The timeout is a
+    /// safety net, not a happy path: snapshotOwnedFromEngine is itself never-zero guarded, so a genuinely
+    /// empty account after timeout is a no-op rather than a partial write.
+    @MainActor
+    func awaitAddonsHydrated(timeout: TimeInterval = 12) async {
+        let deadlineNanos = UInt64(timeout * 1_000_000_000)
+        let stepNanos: UInt64 = 250_000_000   // 0.25s poll cadence
+        var elapsed: UInt64 = 0
+        while hasNoUserStreamAddon, elapsed < deadlineNanos {
+            try? await Task.sleep(nanoseconds: stepNanos)
+            elapsed += stepNanos
+        }
     }
 
     /// The raw installed add-on descriptors the engine currently holds (the exact `{transportUrl,
@@ -1364,16 +1450,10 @@ final class CoreBridge: ObservableObject {
             refreshAddons()
         }
         if fields.contains("meta_details") {
-            let details = decode(CoreMetaDetails.self, field: "meta_details")
-            if VXProbe.enabled {
-                // Count ready streams across every source group so the log shows when streams actually
-                // ARRIVED (not just that meta_details re-emitted). On a non-zero arrival also stamp the
-                // heartbeat via note("streams N"). Ready-only pass, no per-item logging.
-                let readyStreams = (details?.streams ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.streams.count ?? 0) streams=\(readyStreams)")
-                if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
-            }
-            DispatchQueue.main.async { [weak self] in self?.metaDetails = details }
+            // Coalesce a source-search burst into one trailing decode+diff (see metaDetailsWork). The heavy
+            // 1757-stream decode used to run on this worker thread on every re-emit; now it runs once per
+            // burst, and the diff drops the republish when nothing the UI / streamGroups needs has changed.
+            scheduleMetaDetailsRepublish()
         }
         if fields.contains("discover") {
             let value = decode(CoreDiscover.self, field: "discover")
@@ -1413,6 +1493,15 @@ final class CoreBridge: ObservableObject {
             // republishes only when the library-derived bits actually changed, because `library`
             // also fires on every ~20s progress save and re-ranking a detail page that often
             // was its own performance bug.
+            //
+            // SKIP entirely while a player is up: the In-Library button this feeds is not visible during
+            // playback, and the full 1757-stream decode on every ~20s progress save was the main-thread
+            // saturation that stalled the video. The detail page re-derives In-Library state from the
+            // coalesced meta_details republish when the player closes, so nothing is lost. Reading the
+            // @Published `playerActive` here is safe: it is written only on the main actor and a stale
+            // read at worst defers the In-Library refresh by one library emit, which the diff below
+            // (or the next meta_details republish) then catches.
+            guard !playerActive else { return }
             let details = decode(CoreMetaDetails.self, field: "meta_details")
             DispatchQueue.main.async { [weak self] in
                 guard let self, let current = self.metaDetails else { return }
@@ -1450,6 +1539,87 @@ final class CoreBridge: ObservableObject {
             guard let self else { return }
             self.changedFields = Set(fields)
             self.revision &+= 1
+        }
+    }
+
+    // MARK: meta_details coalesce + diff
+
+    /// Coalesce a burst of `meta_details` emits into ONE trailing decode+diff. Called from the worker
+    /// thread on every emit; it hops to the main actor (where the debounce state lives), cancels any
+    /// pending work, and schedules a single decode ~90 ms after the last emit. The decode runs off-main;
+    /// it republishes `metaDetails` ONLY when something the UI or `streamGroups(forStreamId:)` actually
+    /// needs has changed (the loaded meta id, the ready-stream set, or the library/watched bits), so an
+    /// identical re-emit of the same 1757-row payload during source search republishes nothing. An
+    /// episode switch or a fresh Load changes the meta id / stream set, so its republish always lands
+    /// within one debounce window, keeping in-player next-episode / binge auto-advance intact.
+    private func scheduleMetaDetailsRepublish() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.metaDetailsWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    let details = self.decode(CoreMetaDetails.self, field: "meta_details")
+                    if VXProbe.enabled {
+                        // Count ready streams across every source group so the log shows when streams
+                        // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
+                        // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
+                        let readyStreams = (details?.streams ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
+                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.streams.count ?? 0) streams=\(readyStreams)")
+                        if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
+                    }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        if Self.metaDetailsNeedsRepublish(current: self.metaDetails, next: details) {
+                            self.metaDetails = details
+                        }
+                    }
+                }
+            }
+            self.metaDetailsWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.metaDetailsDebounce, execute: work)
+        }
+    }
+
+    /// True when the newly decoded meta_details differs from the stored one in a way the UI or the
+    /// in-player episode-switch path (which reads `streamGroups(forStreamId:)` off the stored value)
+    /// would observe: the loaded meta id, the per-group ready-stream signature (so a new episode's
+    /// streams or newly landed sources always republish), or the library/watched bits behind the
+    /// In-Library button and watched dots. A pure re-emit of the identical loaded payload returns false,
+    /// which is what drops the ~11 redundant source-search republishes for a high-source title.
+    private static func metaDetailsNeedsRepublish(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
+        // Presence flips always republish (spinner -> loaded, or unload).
+        guard let current, let next else { return (current != nil) != (next != nil) }
+        if current.meta?.id != next.meta?.id { return true }
+        if current.libraryItem?.id != next.libraryItem?.id
+            || current.libraryItem?.removed != next.libraryItem?.removed
+            || current.libraryItem?.temp != next.libraryItem?.temp
+            || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
+            return true
+        }
+        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+    }
+
+    /// A cheap signature of the ready streams per source group: the group's path id plus its ready
+    /// stream count. It changes when new sources land for the current episode, when a group errors in,
+    /// or when a different episode's streams arrive (a new path id), which is exactly when the source
+    /// list / episode-switch poll needs the fresh value. It does NOT change on an identical re-emit.
+    private static func streamSetSignature(_ groups: [CoreStreamGroup]) -> [String] {
+        // Encode the LOADED STATE, not just the ready count. A group in .loading and a group in .err both have
+        // ready==nil, so keying on the count alone made a loading->err transition invisible: when the LAST
+        // unresolved add-on errored, metaDetails was not republished, streamLoadProgress stayed at N-1/N, and
+        // the source-list spinner + the resolveSettled auto-pick waited out the settle timeout. Distinguish
+        // ready(count) vs loading vs err so that transition republishes at once.
+        groups.map { g -> String in
+            let marker: String
+            switch g.content {
+            case .ready(let r)?: marker = "r\(r.count)"
+            case .loading?:      marker = "L"
+            case .err?:          marker = "E"
+            case .none:          marker = "-"
+            }
+            return "\(g.request.path.id)#\(marker)"
         }
     }
 

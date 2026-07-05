@@ -59,8 +59,8 @@ struct SettingsView: View {
     // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
     // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
     @AppStorage(MoatConsent.key) private var moatContribute = true
-    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
-    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
+    // "Singularity" community source index SERVE opt-in (per device). Default ON; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = true
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
@@ -273,13 +273,13 @@ struct SettingsView: View {
     @ViewBuilder private var stremioMirrorSection: some View {
         section(String(localized: "Stremio mirror")) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                choiceRow(String(localized: "Mirror add-ons from Stremio"), [("0", "Off"), ("1", "On")],
+                choiceRow(String(localized: "Two-way sync add-ons with Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorAddons ? "1" : "0" }, set: { mirrorAddons = ($0 == "1") }))
                 choiceRow(String(localized: "Mirror library from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
                 choiceRow(String(localized: "Mirror Continue Watching from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
-                Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+                Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
