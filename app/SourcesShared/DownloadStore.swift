@@ -70,6 +70,16 @@ final class DownloadStore: ObservableObject {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         try? mutable.setResourceValues(values)
+        #if os(iOS)
+        // A background download can COMPLETE while the device is LOCKED (a backgrounded or overnight transfer).
+        // Under the default file-protection class, creating/writing the file while locked fails with
+        // NSURLErrorCannotCreateFile (-3000) even with ample free space, which is one cause of the reported
+        // iPhone/iPad download failure. Downgrade the Downloads dir to CompleteUntilFirstUserAuthentication:
+        // still protected before the first unlock, but writable while locked afterwards, which suits
+        // non-sensitive media and lets a locked-device download land. New files inherit the dir's class.
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: dir.path)
+        #endif
     }
 
     /// True when the media file for a completed record actually exists on disk (guards play-from-local
