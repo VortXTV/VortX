@@ -34,7 +34,7 @@ actor FanartClient {
         let task = Task { await Self.fetch(id: id, type: type) }
         inflight[id] = task
         let result = await task.value
-        cache[id] = result
+        if !result.isEmpty { cache[id] = result }   // don't latch a transient fetch failure into a session-long empty Art
         inflight[id] = nil
         return result
     }

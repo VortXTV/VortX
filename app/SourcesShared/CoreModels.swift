@@ -95,8 +95,8 @@ struct CoreLibState: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        timeOffset = try c.decode(Double.self, forKey: .timeOffset)
-        duration = try c.decode(Double.self, forKey: .duration)
+        timeOffset = (try c.decodeIfPresent(Double.self, forKey: .timeOffset)) ?? 0
+        duration = (try c.decodeIfPresent(Double.self, forKey: .duration)) ?? 0
         videoId = try c.decodeIfPresent(String.self, forKey: .videoId)
         flaggedWatched = (try c.decodeIfPresent(Int.self, forKey: .flaggedWatched)) ?? 0
         timesWatched = (try c.decodeIfPresent(Int.self, forKey: .timesWatched)) ?? 0

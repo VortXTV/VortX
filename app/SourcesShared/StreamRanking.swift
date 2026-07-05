@@ -873,7 +873,7 @@ enum StreamRanking {
     /// and made best() pick that 1080p file over genuine peers.
     private static func explicitResolution(_ t: String) -> Int? {
         for (token, value) in [("2160", 4000), ("1440", 1440), ("1080", 1080),
-                               ("720", 720), ("576", 540), ("540", 540), ("480", 480)] {
+                               ("720", 720), ("576", 576), ("540", 540), ("480", 480)] {
             if boundedMatch(t, "\(token)p?") { return value }
         }
         return nil

@@ -1309,7 +1309,7 @@ final class CoreBridge: ObservableObject {
         // Overlay profiles never feed the engine Player: it would write their progress into the
         // ACCOUNT library bucket and sync it, which is exactly what profile separation prevents.
         guard ProfileStore.shared.activeUsesEngineHistory else { return }
-        guard durationSeconds > 0, timeSeconds >= 0 else { return }
+        guard durationSeconds.isFinite, timeSeconds.isFinite, durationSeconds > 0, timeSeconds >= 0 else { return }
         #if os(tvOS)
         let device = "tvOS"
         #else

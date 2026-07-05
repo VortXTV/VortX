@@ -131,14 +131,17 @@ enum DebridResolve {
     static func pickFile(_ files: [DebridFile], episode: DebridEpisode?, fileIdx: Int?) -> DebridFile? {
         if let idx = fileIdx, files.indices.contains(idx) { return files[idx] }
         let videos = files.filter(\.isVideo)
-        guard let episode else { return videos.max(by: { $0.size < $1.size }) }
-        let scored = videos.compactMap { f -> (DebridFile, Int)? in
+        // Provider omitted filenames (isVideo false for every entry, e.g. AllDebrid on a cached single-file
+        // torrent): fall back to the whole file list so size selection still resolves instead of noMatchingFile.
+        let pool = videos.isEmpty ? files : videos
+        guard let episode else { return pool.max(by: { $0.size < $1.size }) }
+        let scored = pool.compactMap { f -> (DebridFile, Int)? in
             let s = episodeMatchScore(filename: f.shortName.isEmpty ? f.name : f.shortName,
                                       season: episode.season, episode: episode.episode)
             return s > 0 ? (f, s) : nil
         }
         if let best = scored.max(by: { $0.1 < $1.1 })?.0 { return best }
-        return videos.max(by: { $0.size < $1.size })   // pack fallback: biggest video
+        return pool.max(by: { $0.size < $1.size })   // pack fallback: biggest video
     }
 
     /// Score a filename against a SxEy target (SnnEnn, n x nn, "season n ... episode n"). 0 = no match.

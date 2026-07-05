@@ -212,8 +212,12 @@ final class VXTrailerProxy {
         if let rangeLine = lines.first(where: { $0.lowercased().hasPrefix("range:") }) {
             let spec = rangeLine.drop(while: { $0 != "=" }).dropFirst()   // "start-end"
             let bounds = spec.components(separatedBy: "-")
-            if let s = Int(bounds.first ?? ""), s >= 0 { start = s }
-            if bounds.count > 1, let e = Int(bounds[1]), e >= start { end = e }
+            if (bounds.first ?? "").isEmpty, bounds.count > 1, let n = Int(bounds[1]), n > 0 {
+                start = max(0, clen - n); end = clen - 1   // suffix range "bytes=-N": the last N bytes (RFC 7233)
+            } else {
+                if let s = Int(bounds.first ?? ""), s >= 0 { start = s }
+                if bounds.count > 1, let e = Int(bounds[1]), e >= start { end = e }
+            }
         }
         end = min(end, clen - 1)
         guard start <= end else {

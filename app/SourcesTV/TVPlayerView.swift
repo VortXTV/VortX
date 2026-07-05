@@ -1859,7 +1859,12 @@ struct TVPlayerView: View {
         // `sourceHops` and never calls `hopToNextSource`, so this is not a failover attempt and the
         // "Source failed, trying another (N/4)" banner (gated on `sourceHops > 0`) never shows. libmpv just
         // tone-maps a DV link to HDR10, an acceptable fallback, so no toast is surfaced.
+        // Re-arm the load state + start watchdog for the libmpv re-load. Without this the mpv re-open after the
+        // AVPlayer->mpv demote runs with NO start watchdog, so a stalled mpv re-open never fails over or surfaces
+        // an error (mirrors iOS PlayerScreen.demoteAVPlayerToMPV).
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         avEngineFailed = true
+        startLoadTimeout()
         return true
     }
 
@@ -2148,7 +2153,7 @@ struct TVPlayerView: View {
     /// Reload the current stream. Manual retries and fresh loads reset the auto-recovery budget; the
     /// auto-retry path passes `false` so its bounded count keeps counting down toward the overlay.
     private func retryLoad(resetAutoRetries: Bool = true) {
-        if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1 }
+        if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
