@@ -467,7 +467,7 @@ struct DetailView: View {
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
                                              watched: watched,
-                                             initialSeason: primary?.video.season)
+                                             initialSeason: resumeSeasonHint(videos, metaID: meta.id) ?? primary?.video.season)
                             .id("detailContent")
                         castSection
                         whereToWatchSection
@@ -965,6 +965,19 @@ struct DetailView: View {
         return f
     }()
 
+    /// The season of the episode the viewer was LAST on (from the resume videoId), decoupled from the
+    /// watched-gate seriesPrimaryEpisode applies. Opening Details from Continue Watching should land on the
+    /// season you were last in, even if that episode is now marked watched (seriesPrimaryEpisode would jump to
+    /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
+    /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
+    private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
+        let videoId: String? = profiles.activeUsesEngineHistory
+            ? core.metaDetails?.libraryItem?.state.videoId
+            : profiles.watch[metaID]?.videoId
+        guard let videoId else { return nil }
+        return sortedEpisodes(videos).first { $0.id == videoId }?.season
+    }
+
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
         // Resume position: the engine's library entry is account level, so overlay
@@ -1059,6 +1072,7 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
 
     @State private var season: Int = 1
+    @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
     // `videos`; episodes additionally on `season`.
@@ -1121,22 +1135,33 @@ struct CoreSeasonedEpisodes: View {
             }
             .padding(.horizontal, Theme.Space.screenEdge)
         }
-        .onAppear {
-            recomputeSeasons()
-            let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
-            if seasons.contains(preferred) { season = preferred }
-            else if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        .onAppear { applyPreferredSeason() }
+        .onChange(of: season) {
+            // Any season change (a manual tap, OR our own programmatic apply below) locks the auto-pick, so a
+            // later videos-arrived pass never clobbers the season you chose.
+            didApplyInitial = true
             recomputeEpisodes()
         }
-        .onChange(of: season) { recomputeEpisodes() }
         // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
-        // on first appear can be stale or empty. Rebuild them when the videos array grows, keeping the selected
-        // season valid.
-        .onChange(of: videos.count) {
-            recomputeSeasons()
-            if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
-            recomputeEpisodes()
+        // on first appear can be stale or empty, and the initial-season hint (from Continue Watching) may not
+        // resolve until they arrive. Re-run the resolver when the videos array grows so the hint still lands.
+        .onChange(of: videos.count) { applyPreferredSeason() }
+    }
+
+    /// Resolve and apply the preferred season, re-applying the Continue-Watching `initialSeason` hint until it
+    /// actually lands on a season present in `seasons` (guarded by `didApplyInitial` so a manual tap is never
+    /// overridden when late videos arrive). This is what makes "open Details on the season I was last watching"
+    /// survive the common case where a large series' episode list streams in after the panel first appears.
+    private func applyPreferredSeason() {
+        recomputeSeasons()
+        if !didApplyInitial {
+            let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if seasons.contains(preferred) {
+                season = preferred   // triggers onChange(season) -> didApplyInitial = true
+            }
         }
+        if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        recomputeEpisodes()
     }
 
     private var firstUnwatchedSeason: Int? {
