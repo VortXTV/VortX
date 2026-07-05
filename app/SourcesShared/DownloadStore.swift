@@ -92,11 +92,11 @@ final class DownloadStore: ObservableObject {
         let dir = directory
         // Do NOT swallow this: on iOS the Application Support dir is NOT auto-created, and a silent failure
         // here was the opaque "cannot create file" the owner hit (the directory simply never existed when
-        // the background delegate moved the temp file in). Log it so a real permission/path fault is
-        // diagnosable instead of vanishing.
-        do { try fileManager.createDirectory(at: dir, withIntermediateDirectories: true) }
+        // the background delegate moved the temp file in). Route through the shared helper so the
+        // CompleteUntilFirstUserAuthentication protection class is applied from init onward (a locked-device
+        // completion otherwise trips -3000); log a real create fault so it is diagnosable instead of vanishing.
+        do { try Self.ensureDownloadsDirectoryExists() }
         catch { NSLog("[downloads] could not create Downloads dir at \(dir.path): \(error.localizedDescription)") }
-        excludeFromBackup(dir)
     }
 
     /// Mark the directory excluded from iCloud/iTunes backup. Best-effort; a failure here is non-fatal

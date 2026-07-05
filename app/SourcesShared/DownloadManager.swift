@@ -179,8 +179,10 @@ final class DownloadManager: NSObject, ObservableObject {
 
         // Defensive: iOS does NOT auto-create Application Support, so make sure the Downloads dir exists
         // before the background session or the completion move ever needs it. Rules out a missing container
-        // as the "cannot create file (-3000)" cause; the completion move also creates it, this is belt+braces.
-        try? FileManager.default.createDirectory(at: DownloadStore.downloadsDirectory, withIntermediateDirectories: true)
+        // as the "cannot create file (-3000)" cause. Route through ensureDownloadsDirectoryExists() (not a bare
+        // createDirectory) so the CompleteUntilFirstUserAuthentication protection class is applied here too, or
+        // a locked-device completion still trips -3000; the completion move also ensures it, this is belt+braces.
+        try? DownloadStore.ensureDownloadsDirectoryExists()
 
         if canStartNow { startTask(for: record, url: resolvedURL) }
         return record
@@ -275,12 +277,23 @@ final class DownloadManager: NSObject, ObservableObject {
     /// true only on a HARD shortfall; an unknown size (bytesTotal == 0) is allowed through.
     private func storageShortfall(for record: DownloadRecord) -> Bool {
         guard record.bytesTotal > 0 else { return false }
-        // volumeAvailableCapacityKey is available on every Apple platform (the ...ForImportantUsage variant is
-        // unavailable on tvOS, and this file is shared). Raw available bytes are fine for a shortfall guard.
-        let vals = try? DownloadStore.downloadsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-        guard let free = vals?.volumeAvailableCapacity else { return false }
-        // Need the file plus a ~200 MB margin (the background daemon stages a temp copy before the move).
-        return Int64(free) < Int64(record.bytesTotal) + 200 * 1024 * 1024
+        // Only the REMAINING bytes still have to be written. A resumed (or -3000 self-heal restarted) partial
+        // already occupies its downloaded bytes on the volume, so comparing the FULL size double-counted them
+        // and failed a nearly-complete resume as "not enough storage" with ample free space (the reported bug).
+        let remaining = max(0, record.bytesTotal - record.bytesDone)
+        guard remaining > 0 else { return false }
+        #if os(iOS)
+        // ForImportantUsage reports the space the OS will actually free (purgeable caches included) for a
+        // user-initiated write, so the raw key does not UNDER-report free space and false-fail. tvOS lacks it.
+        let free = (try? DownloadStore.downloadsDirectory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage
+        #else
+        let free = (try? DownloadStore.downloadsDirectory.resourceValues(
+            forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity.map(Int64.init)
+        #endif
+        guard let free else { return false }
+        // Need the remaining bytes plus a ~200 MB margin (the background daemon stages a temp copy before the move).
+        return free < remaining + 200 * 1024 * 1024
     }
 
     private func startTask(for record: DownloadRecord, url: URL) {
@@ -299,6 +312,12 @@ final class DownloadManager: NSObject, ObservableObject {
         // relaunch empties the in-memory maps.
         task.taskDescription = record.localFilename
         destinations.set(store.fileURL(for: record), for: Self.taskKey(session, task.taskIdentifier))
+        // Apply the CompleteUntilFirstUserAuthentication protection class to the Downloads dir BEFORE the
+        // background daemon stages its temp file. Without this, a transfer that COMPLETES while the device is
+        // locked (an overnight / backgrounded multi-GB download) cannot create the file and fails with -3000
+        // even with ample free space. The completion-move also ensures this, but that is too late for the
+        // staging write; doing it here also makes the -3000 self-heal restart path productive.
+        try? DownloadStore.ensureDownloadsDirectoryExists()
         beginForegroundAssertionIfNeeded(for: record)
         task.resume()
     }
