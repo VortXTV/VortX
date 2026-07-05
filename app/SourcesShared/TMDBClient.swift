@@ -542,19 +542,34 @@ enum TMDBClient {
         // No user-key guard: the keyless edge serves providers too, so the hub populates for everyone.
         async let movieList = providerPage(media: "movie", region: region)
         async let tvList = providerPage(media: "tv", region: region)
+        // TMDB ships some brands under TWO provider ids (Apple TV+ = 2 and 350, Prime = 9 and 119, Max = 384
+        // and 1899, Discovery+ = 520 and 524). Deduping by the raw providerID left DOUBLE tiles (the "2x Apple
+        // TV+" report) which ALSO pushed legitimate services past the `limit` cap (the "missing services"
+        // report). Collapse aliases to a canonical id and dedupe on that, preferring the entry that already
+        // carries the canonical id (its logo/name are the right ones) and otherwise the smaller display_priority.
         var byID: [Int: (tile: ProviderTile, priority: Int)] = [:]
         for entry in (await movieList) + (await tvList) {
-            // Keep the smaller (more prominent) display_priority when a provider is in both lists.
-            if let existing = byID[entry.tile.providerID], existing.priority <= entry.priority { continue }
-            byID[entry.tile.providerID] = entry
+            let canonical = Self.canonicalProviderID(entry.tile.providerID)
+            if let existing = byID[canonical] {
+                let existingIsCanonical = existing.tile.providerID == canonical
+                let entryIsCanonical = entry.tile.providerID == canonical
+                if existingIsCanonical && !entryIsCanonical { continue }
+                if existingIsCanonical == entryIsCanonical && existing.priority <= entry.priority { continue }
+            }
+            byID[canonical] = entry
         }
         let ranked = byID.values.sorted { a, b in
-            let ra = featuredProviderRank[a.tile.providerID] ?? (1000 + a.priority)
-            let rb = featuredProviderRank[b.tile.providerID] ?? (1000 + b.priority)
+            let ra = featuredProviderRank[Self.canonicalProviderID(a.tile.providerID)] ?? (1000 + a.priority)
+            let rb = featuredProviderRank[Self.canonicalProviderID(b.tile.providerID)] ?? (1000 + b.priority)
             return ra != rb ? ra < rb : a.tile.name < b.tile.name
         }
         return Array(ranked.map(\.tile).prefix(limit))
     }
+
+    /// Some brands appear under two TMDB provider ids; map the alias to the canonical (kept) id so each brand
+    /// tiles once: Apple TV+ (2 -> 350), Prime Video (119 -> 9), Max (384 -> 1899), Discovery+ (524 -> 520).
+    private static let providerAlias: [Int: Int] = [2: 350, 119: 9, 384: 1899, 524: 520]
+    private static func canonicalProviderID(_ id: Int) -> Int { providerAlias[id] ?? id }
 
     private static func providerPage(media: String, region: String) async -> [(tile: ProviderTile, priority: Int)] {
         let key = ApiKeys.effectiveTMDBKey()

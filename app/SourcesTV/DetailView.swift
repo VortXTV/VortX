@@ -1456,10 +1456,12 @@ struct CoreStreamList: View {
         let watchReady = !loadingAddons || settleTimedOut
 
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // Singularity sources are NOT pinned above Play. They render nested inside the "All sources" list
-            // (via `visible` below, which already includes the merged Singularity group), matching iOS/Mac, so
-            // the community rows sit alongside the other add-on sources instead of floating above the Watch
-            // button before the user has even opened the source list.
+            // PINNED Singularity: the best few community-corroborated sources floated to the top, matching iOS
+            // (iOSDetailView pins its singularitySection too). Empty pool -> nothing renders (pure pass-through);
+            // the full Singularity set still lives in the "All sources" list below. NOTE: 0.3.11 briefly removed
+            // this on tvOS ONLY, which buried Singularity at the bottom of the collapsed source list while iOS
+            // kept its pinned section. Restored for true iOS parity.
+            singularitySection(groups)
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
@@ -1869,6 +1871,30 @@ struct CoreStreamList: View {
                 }
             }
             .padding(.vertical, Theme.Space.xs)
+        }
+    }
+
+    /// A pinned, labeled "Singularity" section at the top of the source list (matches iOSDetailView, which pins
+    /// its own). Shows the best few community-corroborated Singularity sources (sliced from the already-ranked
+    /// `groups`, best-first). Empty pool -> nothing renders (pure pass-through). Rows reuse `streamRow`.
+    @ViewBuilder private func singularitySection(_ groups: [CoreStreamSourceGroup]) -> some View {
+        let pinned = SourceIndexClient.pinnedStreams(from: groups)
+        if !pinned.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.sm) {
+                    Image(systemName: "sparkles").font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text(SourceIndexClient.groupAddon.uppercased())
+                        .font(Theme.Typography.eyebrow).tracking(1.5)
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text("Community").font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .padding(.horizontal, Theme.Space.md)
+                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
+                    streamRow(SourceIndexClient.groupAddon, stream)
+                }
+            }
         }
     }
 

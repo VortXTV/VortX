@@ -1600,6 +1600,15 @@ final class CoreBridge: ObservableObject {
         if current.libraryItem?.id != next.libraryItem?.id
             || current.libraryItem?.removed != next.libraryItem?.removed
             || current.libraryItem?.temp != next.libraryItem?.temp
+            // Playback-state progress MUST re-publish: engineResumeSeconds reads libraryItem.state.timeOffset +
+            // videoId at player open, so without these the resume position latched at the open-time value (~10s)
+            // no matter how long you watched, and only a back-to-Home re-entry re-seeded it (0.3.11 regression).
+            // This only re-publishes the already-decoded value (no extra decode); the ~90s engine library push
+            // cadence keeps it cheap, and during source search timeOffset does not change so the search-churn
+            // suppression this predicate exists for is unaffected.
+            || current.libraryItem?.state.timeOffset != next.libraryItem?.state.timeOffset
+            || current.libraryItem?.state.videoId != next.libraryItem?.state.videoId
+            || current.libraryItem?.state.duration != next.libraryItem?.state.duration
             || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
             return true
         }
