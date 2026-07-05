@@ -131,12 +131,24 @@ struct AddonsView: View {
                             .buttonStyle(.plain)
                             hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
                             HStack {
+                                // tvOS: keep the button LEFT-aligned so it sits directly above the first
+                                // add-on row (also left-aligned) and a Down press lands on that row. Right-
+                                // aligned behind a Spacer, it sat off the rows' downward focus beam, so focus
+                                // stalled at "Re-check status" and never entered the list (owner-reported).
+                                // NOT wrapping rows in per-row .focusSection() on purpose: stacked sibling
+                                // focus sections make tvOS skip rows (the Collections-hub region-jump lesson);
+                                // plain VStack rows step geometrically once entry is on-axis.
+                                #if !os(tvOS)
                                 Spacer()
+                                #endif
                                 Button { health.probe(core.addons.map(\.transportUrl), force: true) } label: {
                                     Label("Re-check status", systemImage: "arrow.clockwise")
                                 }
                                 .buttonStyle(ChipButtonStyle(selected: false))
                                 .fixedSize()
+                                #if os(tvOS)
+                                Spacer()
+                                #endif
                             }
                             ForEach(core.addons) { addon in addonRow(addon) }
                         }

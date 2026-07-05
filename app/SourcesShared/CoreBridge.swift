@@ -208,10 +208,15 @@ final class CoreBridge: ObservableObject {
     /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
     /// URL must stay re-addable on every device. The genuine in-app Remove button keeps the default.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
-        guard let raw = rawAddonsByUrl[descriptor.transportUrl] else { return }
+        // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
+        // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
+        // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
+        // `guard let raw ... else { return }` made Remove a SILENT NO-OP in that case, which is exactly the
+        // owner-reported "pressing delete doesn't delete." Tombstoning + refreshAddons still suppresses it.
         if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
             AddonTombstones.tombstone(descriptor.transportUrl)
         }
+        let raw = rawAddonsByUrl[descriptor.transportUrl]
         // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only). When a live Stremio
         // session exists, stremio-core's ctx reducer PERSISTS an UninstallAddon by calling api.strem.io
         // addonCollectionSet, i.e. the deletion would propagate to the user's REAL Stremio account. That
@@ -223,15 +228,15 @@ final class CoreBridge: ObservableObject {
         // The Change-URL replace path (tombstone:false) always dispatches: swapping a manifest URL is a
         // local edit, not a real removal, and must not be blocked.
         let pushDeletionToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
-        if !tombstone || pushDeletionToStremio {
+        if let raw, !tombstone || pushDeletionToStremio {
             dispatchCtx(["action": "UninstallAddon", "args": raw])
         } else {
-            // Tombstone-only path (push OFF + live Stremio session): we did NOT dispatch an engine
-            // uninstall, so no ctx event will fire and refreshAddons will not re-run on its own. Apply the
-            // same tombstone suppression to the CURRENTLY published set now so the add-on disappears from
-            // the VortX view immediately, while the engine (and the user's Stremio account) keep it. On the
-            // next real ctx event refreshAddons re-derives from the tombstone set identically, so this is a
-            // pure local echo, not a divergent source of truth.
+            // Tombstone-only path (push OFF + live Stremio session, OR no raw descriptor to dispatch): we did
+            // NOT dispatch an engine uninstall, so no ctx event will fire and refreshAddons will not re-run
+            // on its own. Apply the same tombstone suppression to the CURRENTLY published set now so the
+            // add-on disappears from the VortX view immediately, while the engine (and the user's Stremio
+            // account) keep it. On the next real ctx event refreshAddons re-derives from the tombstone set
+            // identically, so this is a pure local echo, not a divergent source of truth.
             refreshAddons()
         }
     }
