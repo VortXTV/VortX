@@ -1071,13 +1071,23 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
 
+    @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (#7 return-to-episode)
     @State private var season: Int = 1
     @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
+    @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
     // `videos`; episodes additionally on `season`.
     @State private var seasons: [Int] = []
     @State private var episodes: [CoreVideo] = []
+
+    /// The engine's CURRENT resume episode id for this series (advances as continuous-play moves through
+    /// episodes), read from the same source as resumeSeasonHint: the engine library for the main profile,
+    /// the per-profile overlay otherwise. This is where Back should land after continuous play (#7).
+    private var resumeVideoId: String? {
+        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+    }
+    private var resumeSeason: Int? { resumeVideoId.flatMap { id in videos.first { $0.id == id }?.season } }
 
     private func recomputeSeasons() { seasons = Array(Set(videos.map { $0.season ?? 0 })).sorted() }
     private func recomputeEpisodes() {
@@ -1131,11 +1141,21 @@ struct CoreSeasonedEpisodes: View {
             }
 
             VStack(spacing: Theme.Space.sm) {
-                ForEach(episodes) { v in episodeRow(v) }
+                ForEach(episodes) { v in episodeRow(v).focused($focusedEpisode, equals: v.id) }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
         }
         .onAppear { applyPreferredSeason() }
+        // #7: when the player closes, continuous-play may have advanced to a LATER episode (even a later
+        // season). The detail page stays mounted behind the player, so this panel keeps the season/focus it
+        // launched from. On close, jump to the episode the engine now resumes at: switch season if it moved,
+        // then focus that row (tvOS auto-scrolls focus into view) so Back returns to the CURRENT episode, not
+        // the one originally launched. Async so the row exists after a season switch and the shell is frontmost.
+        .onChange(of: presenter.request == nil) {
+            guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
+            if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
+            DispatchQueue.main.async { focusedEpisode = id }
+        }
         .onChange(of: season) {
             // Any season change (a manual tap, OR our own programmatic apply below) locks the auto-pick, so a
             // later videos-arrived pass never clobbers the season you chose.
