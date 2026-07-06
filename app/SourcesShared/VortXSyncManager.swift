@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import CryptoKit   // Curve25519 for the QR sign-in pairing session (QrJoinSession.ephemeral)
 
 /// Bridges the thread-agnostic `VortXSyncManager.addonOrderChangedNote` to a `@Published` the add-on list
 /// READS in its body, so a reorder re-sorts the live list immediately. A never-read `@State` bumped from
@@ -207,7 +208,7 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - HTTP
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false) async -> (Int, [String: Any]?) {
+    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false, bearer: String? = nil) async -> (Int, [String: Any]?) {
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -215,7 +216,9 @@ final class VortXSyncManager: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
-        if auth, let token { req.setValue("Bearer " + token, forHTTPHeaderField: "authorization") }
+        // `bearer` is a one-off token override (the QR joiner calls /me with the freshly issued session
+        // token BEFORE it is adopted); otherwise `auth` uses the stored session token.
+        if let t = bearer ?? (auth ? token : nil) { req.setValue("Bearer " + t, forHTTPHeaderField: "authorization") }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -1138,6 +1141,79 @@ final class VortXSyncManager: ObservableObject {
         a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
         account = a
         persist()
+    }
+
+    // MARK: - VortX-account QR sign-in (device pairing)
+    //
+    // A device with no keyboard (Apple TV) signs into the VortX account by showing a QR/code. A device
+    // already signed into VortX (a phone, or web.vortx.tv) approves it and hands over the sync data key,
+    // ECDH-wrapped to the TV's ephemeral key. The relay (/v1/qr/*) never sees the key.
+    //
+    // JOINER (TV):    POST /v1/qr/start {devicePublicKey} -> {pairingID, code}; then poll
+    //                 GET /v1/qr/status?id=... -> {pending} | {token, payload} | 404/410 expired.
+    // HOLDER (phone/web, signed in): POST /v1/qr/authorize {code, wrappedPayload} (Bearer).
+    //
+    // The worker mints the session `token` itself; the joiner wraps NOTHING and the holder wraps only the
+    // raw 32-byte `dataKey`. The opaque `payload` string is a JSON envelope so the holder's ephemeral
+    // public key travels with the sealed key: {"claim": <b64url holder pubkey>, "wrapped": <b64url iv‖ct‖tag>}.
+    // Both the app holder (qrApprove) and the web holder (vortx-site vault.ts qrApprove) MUST emit this exact
+    // envelope, and both joiners MUST parse it. Crypto contract: PairingCrypto (salt vortx-pairing-salt-v1,
+    // info vortx-pairing-v1, base64url, iv‖ct‖tag) — identical across app + web.
+
+    /// A live joiner pairing: the id to poll, the human code to show, and our ephemeral key kept in memory
+    /// only (never persisted) until the handoff completes. `devicePublicKey` is embedded in the shown QR.
+    struct QrJoinSession {
+        let pairingID: String
+        let code: String
+        let devicePublicKey: String
+        let ephemeral: Curve25519.KeyAgreement.PrivateKey
+    }
+
+    enum QrJoinResult: Equatable { case pending, expired, failed, signedIn(email: String) }
+
+    /// JOINER (TV): open a pairing. Returns the session to poll, or nil on a transport failure.
+    func qrStart() async -> QrJoinSession? {
+        let eph = PairingCrypto.newEphemeral()
+        let pub = eph.publicKeyBase64URL
+        let (code, json) = await request("POST", "/v1/qr/start", body: ["devicePublicKey": pub])
+        guard code == 200, let id = json?["pairingID"] as? String, let human = json?["code"] as? String else { return nil }
+        return QrJoinSession(pairingID: id, code: human, devicePublicKey: pub, ephemeral: eph.privateKey)
+    }
+
+    /// JOINER (TV): poll once. On approval, unwrap the data key, fetch the account via /me with the freshly
+    /// issued token, and adopt. Security: the token is DISCARDED (never adopted) if the unwrap fails, so a
+    /// session with no decryptable data key can never leave a half-signed-in device.
+    func qrPoll(_ session: QrJoinSession) async -> QrJoinResult {
+        let (code, json) = await request("GET", "/v1/qr/status?id=\(session.pairingID)")
+        if code == 404 || code == 410 { return .expired }
+        guard code == 200 else { return .pending }
+        if json?["pending"] as? Bool == true { return .pending }
+        guard let token = json?["token"] as? String, let payloadStr = json?["payload"] as? String else { return .pending }
+        // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
+        guard let pData = payloadStr.data(using: .utf8),
+              let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
+              let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
+              let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
+        else { return .failed }
+        // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
+        let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
+        guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
+        adopt(token: token, account: acct, dataKey: dk)
+        return .signedIn(email: acct["email"] as? String ?? "")
+    }
+
+    /// HOLDER (a signed-in device, and the shared shape the web holder mirrors): approve a joining device's
+    /// `code`, wrapping our data key to the device's ephemeral public key (from the QR's `k` param). Returns
+    /// false if we are not signed in (no data key), the wrap fails, or the relay rejects it.
+    func qrApprove(code: String, devicePublicKey: String) async -> Bool {
+        guard let dataKey else { return false }
+        guard let (claim, wrapped) = PairingCrypto.wrapDataKey(dataKey, toJoinerPublicKey: devicePublicKey),
+              let envData = try? JSONSerialization.data(withJSONObject: ["claim": claim, "wrapped": wrapped]),
+              let envelope = String(data: envData, encoding: .utf8) else { return false }
+        let (c, _) = await request("POST", "/v1/qr/authorize",
+            body: ["code": code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(), "wrappedPayload": envelope],
+            auth: true)
+        return c == 200
     }
 
     /// Auto-sync: a debounced push, called whenever a setting / profile / key changes. Coalesces a burst

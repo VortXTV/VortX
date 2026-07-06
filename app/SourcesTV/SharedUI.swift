@@ -790,7 +790,7 @@ struct CoreEmptyState: View {
         CoreEmptyState(
             systemImage: "person.crop.circle.badge.questionmark",
             title: "Sign in to get started",
-            message: "Sign in to your Stremio account to load your library, catalogs, and add-ons.",
+            message: "Sign in to load your library, catalogs, and add-ons. Sign in to VortX, or connect a Stremio account.",
             showsSignInButton: true
         )
     }
