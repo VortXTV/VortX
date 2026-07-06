@@ -139,6 +139,10 @@ function bumpSyncFloor(accountId: string, version: number): void {
   if (version > syncFloor(accountId)) localStorage.setItem("vortx.syncVer." + accountId, String(version));
 }
 
+// Exported ONLY for the in-repo crypto test (vault.crypto.test.mjs) so it exercises the REAL functions rather
+// than a re-implementation. Not part of the app's public API; do not import elsewhere.
+export const __syncCryptoTestHooks = { documentAAD, sealDocument, openDocument, DOC_V2_PREFIX, sawV2, markSawV2, syncFloor, bumpSyncFloor };
+
 interface ApiResult {
   status: number;
   // The server replies with assorted JSON shapes per endpoint; callers narrow what they read.
