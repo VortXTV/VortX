@@ -22,7 +22,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Compare pinned MPVKit vs latest release
         env:
           GH_TOKEN: ${{ github.token }}
