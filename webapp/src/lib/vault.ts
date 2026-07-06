@@ -121,6 +121,24 @@ async function openDocument(dataKey: Uint8Array, stored: string, accountId: stri
   }
 }
 
+// H-1 downgrade ratchet + H-2 version high-water floor, per account, in localStorage (mirrors the app).
+// H-1: once this account has been seen as v2, a bare-legacy blob is tamper (a legacy blob authenticates at
+// ANY version, so a downgrade replay would otherwise defeat the version binding). H-2: a pulled doc whose
+// version is below the highest this device has seen for the account is a stale replay and must not become a
+// merge base. Both are keyed by accountId so they follow the signed-in account; dormant until v2 exists.
+function sawV2(accountId: string): boolean {
+  return localStorage.getItem("vortx.sawV2." + accountId) === "1";
+}
+function markSawV2(accountId: string): void {
+  localStorage.setItem("vortx.sawV2." + accountId, "1");
+}
+function syncFloor(accountId: string): number {
+  return Number(localStorage.getItem("vortx.syncVer." + accountId) || "0");
+}
+function bumpSyncFloor(accountId: string, version: number): void {
+  if (version > syncFloor(accountId)) localStorage.setItem("vortx.syncVer." + accountId, String(version));
+}
+
 interface ApiResult {
   status: number;
   // The server replies with assorted JSON shapes per endpoint; callers narrow what they read.
@@ -510,20 +528,28 @@ export async function fetchSync(session: Session): Promise<SyncStatus> {
   if (r.status === 404) return { synced: false };
   if (r.status !== 200) throw new Error("offline");
   const data = r.data as { document: string; version: number };
-  const pt = await openDocument(session.dataKey, data.document, session.account.id, data.version);
+  const acct = session.account.id;
+  const isV2 = data.document.startsWith(DOC_V2_PREFIX);
   let contents: Record<string, unknown> | undefined;
   let decryptFailed = false;
-  // A doc that EXISTS but does not decrypt (wrong key, tamper, a version-bound v2 doc served under a forged
-  // version) or does not parse must NOT masquerade as {}: flag it so getSyncDoc/mutateSyncDoc abort instead
-  // of clobbering the account.
-  if (pt) {
-    try {
-      contents = JSON.parse(td.decode(pt)) as Record<string, unknown>;
-    } catch {
+  // "decryptFailed" means "do not use / do not clobber". It covers: an undecryptable doc (wrong key, tamper,
+  // a v2 doc served under a forged version), a NON-parsing doc, H-2 a stale replay below our per-account
+  // version high-water, and H-1 a bare-legacy doc after this account has been seen as v2 (a downgrade).
+  if (data.version < syncFloor(acct) || (!isV2 && sawV2(acct))) {
+    decryptFailed = true;
+  } else {
+    const pt = await openDocument(session.dataKey, data.document, acct, data.version);
+    if (pt) {
+      try {
+        contents = JSON.parse(td.decode(pt)) as Record<string, unknown>;
+        if (isV2) markSawV2(acct);
+        bumpSyncFloor(acct, data.version);
+      } catch {
+        decryptFailed = true;
+      }
+    } else {
       decryptFailed = true;
     }
-  } else {
-    decryptFailed = true;
   }
   return {
     synced: true,
@@ -551,6 +577,8 @@ export async function putSyncDoc(session: Session, doc: Record<string, unknown>)
     body: { document: ciphertext, version },
   });
   if (r.status !== 200) throw new Error("Could not save to your account.");
+  bumpSyncFloor(session.account.id, version);                          // H-2: never accept below this again
+  if (WRITE_SYNC_DOC_V2) markSawV2(session.account.id);                // H-1: our stored doc is now v2
 }
 
 /** Read-modify-write the sync document with optimistic concurrency. Fetches the current doc + version,
@@ -580,7 +608,11 @@ export async function mutateSyncDoc(
       body: { document: ciphertext, version },
     });
     if (r.status !== 200) throw new Error("Could not save to your account.");
-    if (r.data?.accepted !== false) return; // stored (accepted true, or older worker without the field)
+    if (r.data?.accepted !== false) {
+      bumpSyncFloor(session.account.id, version);                      // H-2: never accept below this again
+      if (WRITE_SYNC_DOC_V2) markSawV2(session.account.id);            // H-1: our stored doc is now v2
+      return; // stored (accepted true, or older worker without the field)
+    }
     // accepted === false: a newer version landed between our read and write; loop to re-fetch and merge.
   }
   throw new Error("Could not save to your account (kept losing to another device).");

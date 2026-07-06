@@ -66,11 +66,19 @@ final class VortXSyncManager: ObservableObject {
     ///      NOT DONE.
     /// Flip this AND WRITE_SYNC_DOC_V2 in vortx-site vault.ts AND webapp/src/lib/vault.ts together.
     static let writeSyncDocV2 = false
-    private static let kVersionKey = "vortx.sync.lastSyncedVersion"
-    private var lastSyncedVersion = UserDefaults.standard.integer(forKey: VortXSyncManager.kVersionKey)
-    private func persistLastSyncedVersion() {
-        UserDefaults.standard.set(lastSyncedVersion, forKey: Self.kVersionKey)
+    private static let kVersionKey = "vortx.sync.lastSyncedVersion"   // legacy GLOBAL key (pre per-account)
+    // H-2: the newest doc version this device has pushed or applied, keyed PER ACCOUNT so the version-wins
+    // guard and the merge-base floor follow the signed-in account. A single global int broke on account-switch
+    // (sign out of A at v1000, into B at v5 -> B's pulls would look stale). A fresh per-account key starts at
+    // 0, so the first pull is treated as newer and applied once, then stamps the key - the same harmless
+    // self-heal the global value had on a cold launch. The computed setter persists immediately.
+    private func versionKey(for accountId: String?) -> String { "vortx.sync.lastSyncedVersion." + (accountId ?? "") }
+    private var lastSyncedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: versionKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: versionKey(for: account?.id)) }
     }
+    private func persistLastSyncedVersion() { /* the computed setter above persists per-account; no-op kept so
+        the advance-then-persist call sites read unchanged */ }
     /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
     /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
     /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
@@ -322,11 +330,34 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - Encrypted sync document
 
-    func pullSyncDoc() async -> [String: Any]? {
+    // H-1 downgrade ratchet (per account): once this account's doc has opened as v2 (or this client wrote v2),
+    // a bare-legacy blob is treated as TAMPER and never opened. A legacy blob authenticates at ANY version, so
+    // without this a backend could replay an archived pre-flip legacy ciphertext under a forged higher version
+    // and defeat the version binding. Dormant until v2 docs exist (post-flip). Keyed by accountId.
+    private static func sawDocV2(_ accountId: String) -> Bool {
+        !accountId.isEmpty && UserDefaults.standard.bool(forKey: "vortx.sync.sawDocV2." + accountId)
+    }
+    private static func markSawDocV2(_ accountId: String) {
+        guard !accountId.isEmpty else { return }
+        UserDefaults.standard.set(true, forKey: "vortx.sync.sawDocV2." + accountId)
+    }
+    /// Open a pulled sync document, enforcing the H-1 ratchet. Returns nil (tamper / undecryptable) rather than
+    /// ever surfacing an empty doc, so a caller never clobbers the account from a refused or failed open.
+    private func openSyncDocument(_ stored: String, version: Int) -> Data? {
         guard let dataKey else { return nil }
+        let acctId = account?.id ?? ""
+        let isV2 = stored.hasPrefix(VortXSyncCrypto.docV2Prefix)
+        if !isV2, Self.sawDocV2(acctId) { return nil }             // legacy after v2 seen -> tamper
+        let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: stored, accountId: acctId, version: version)
+        if pt != nil, isV2 { Self.markSawDocV2(acctId) }           // this account is now on v2
+        return pt
+    }
+
+    func pullSyncDoc() async -> [String: Any]? {
+        guard dataKey != nil else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let doc = json?["document"] as? String,
-              let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: doc, accountId: account?.id ?? "", version: (json?["version"] as? Int) ?? 0) else { return nil }
+              let pt = openSyncDocument(doc, version: (json?["version"] as? Int) ?? 0) else { return nil }
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
     }
 
@@ -335,24 +366,29 @@ final class VortXSyncManager: ObservableObject {
     /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
     private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
     private func pullSyncDocResult() async -> SyncDocPull {
-        guard let dataKey else { return .failed }
+        guard dataKey != nil else { return .failed }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
         guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
-        guard let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: docStr, accountId: account?.id ?? "", version: (json?["version"] as? Int) ?? 0),
-              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable: do not clobber
+        let pulledVersion = (json?["version"] as? Int) ?? 0
+        // H-2: refuse an honest-label replay of a doc OLDER than what this account has already applied. syncUp
+        // uses this as its merge base, so a stale base would drop newer writes made on another surface. A real
+        // server only ever returns a version >= what we last stamped, so this only fires on rollback/replay.
+        if pulledVersion < lastSyncedVersion { return .failed }
+        guard let pt = openSyncDocument(docStr, version: pulledVersion),
+              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable / ratchet-refused: do not clobber
         return .doc(obj)
     }
 
     /// Pull the doc plus its server version, so the foreground pull can apply only changes that are
     /// newer than what this device already has (and not re-apply its own last push).
     private func pullDocVersioned() async -> (doc: [String: Any], version: Int)? {
-        guard let dataKey else { return nil }
+        guard dataKey != nil else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let docStr = json?["document"] as? String,
               let version = json?["version"] as? Int,
-              let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: docStr, accountId: account?.id ?? "", version: version),
+              let pt = openSyncDocument(docStr, version: version),
               let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return nil }
         return (obj, version)
     }
@@ -375,6 +411,7 @@ final class VortXSyncManager: ObservableObject {
         if accepted {
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
+            if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
             return .accepted(version: version)
         }
         // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
