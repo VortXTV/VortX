@@ -45,6 +45,27 @@ final class VortXSyncManager: ObservableObject {
     /// version-wins guard stays consistent across relaunches: an in-memory 0 after a cold launch would treat
     /// the account's current doc as "newer" and re-apply it once on every launch (harmless but wasteful, and
     /// it re-runs the restore). Seeded from UserDefaults at init.
+    /// MIGRATION flip for the version-bound sync-document format (see VortXSyncCrypto.sealDocument). Stays
+    /// FALSE until the dual-read build is broadly adopted: a v2 doc is unreadable by any client that predates
+    /// openDocument, so writing v2 before then breaks sync for a user whose OTHER device/surface is still on
+    /// an older build. openDocument always reads BOTH formats regardless of this flag; only WRITE is gated.
+    ///
+    /// DO NOT flip to true until ALL of the following hold (each is a hard gate; a premature flip either
+    /// breaks or fails to protect real accounts):
+    ///   1. Dual-read shipped + adopted on EVERY sync client: this app, the vortx-site dashboard
+    ///      (vortx.tv), AND the web client (webapp/, web.vortx.tv) - all three, each with WRITE_SYNC_DOC_V2
+    ///      still false. (Dual-read + the decrypt-fail guard is DONE on all three as of this change.)
+    ///   2. H-1, a per-account "seen v2" ratchet: once an account's doc has opened as v2 (or this client
+    ///      wrote v2), REFUSE a bare-legacy doc for that account thereafter - else a backend can serve an
+    ///      archived pre-flip legacy ciphertext under a forged higher version and the legacy read path opens
+    ///      it, so the rollback protection is theatre for every account that ever had a legacy doc. NOT DONE.
+    ///   3. H-2, a per-account version high-water floor: reject a pulled doc whose version is below the last
+    ///      version this device applied FOR THAT ACCOUNT (lastSyncedVersion is currently global, so this
+    ///      needs per-account keying to avoid breaking account-switch), so an honest-label replay of an old
+    ///      (ciphertext, version) pair cannot become a stale merge base that drops other surfaces' writes.
+    ///      NOT DONE.
+    /// Flip this AND WRITE_SYNC_DOC_V2 in vortx-site vault.ts AND webapp/src/lib/vault.ts together.
+    static let writeSyncDocV2 = false
     private static let kVersionKey = "vortx.sync.lastSyncedVersion"
     private var lastSyncedVersion = UserDefaults.standard.integer(forKey: VortXSyncManager.kVersionKey)
     private func persistLastSyncedVersion() {
@@ -305,7 +326,7 @@ final class VortXSyncManager: ObservableObject {
         guard let dataKey else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let doc = json?["document"] as? String,
-              let pt = VortXSyncCrypto.open(key: dataKey, doc) else { return nil }
+              let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: doc, accountId: account?.id ?? "", version: (json?["version"] as? Int) ?? 0) else { return nil }
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
     }
 
@@ -319,7 +340,7 @@ final class VortXSyncManager: ObservableObject {
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
         guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
-        guard let pt = VortXSyncCrypto.open(key: dataKey, docStr),
+        guard let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: docStr, accountId: account?.id ?? "", version: (json?["version"] as? Int) ?? 0),
               let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable: do not clobber
         return .doc(obj)
     }
@@ -331,7 +352,7 @@ final class VortXSyncManager: ObservableObject {
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let docStr = json?["document"] as? String,
               let version = json?["version"] as? Int,
-              let pt = VortXSyncCrypto.open(key: dataKey, docStr),
+              let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: docStr, accountId: account?.id ?? "", version: version),
               let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return nil }
         return (obj, version)
     }
@@ -345,7 +366,7 @@ final class VortXSyncManager: ObservableObject {
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
     private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
-              let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return .error }
+              let ct = VortXSyncCrypto.sealDocument(dataKey: dataKey, plaintext: pt, accountId: account?.id ?? "", version: version, writeV2: Self.writeSyncDocV2) else { return .error }
         let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still

@@ -82,6 +82,45 @@ async function open(key: Uint8Array, ciphertext: string): Promise<Uint8Array | n
   }
 }
 
+// --- Sync-document sealing with version binding (rollback protection). Mirrors the app
+//     (VortXSyncCrypto.sealDocument/openDocument) and vortx-site vault.ts byte-for-byte: the sync `document`
+//     (ONLY, never the wrapped keys) binds (accountId, version) as AES-GCM additionalData, so a storage
+//     backend that lacks the data key still cannot replay an old ciphertext under a fabricated higher version
+//     (silent account rollback). A "v2." prefix marks the new format; legacy (bare base64, no AAD) docs still
+//     open. The Worker stores `document` opaquely and already echoes the authentic version, so it needs no
+//     change. MIGRATION: ship dual-READ on EVERY client first (app, vortx-site dashboard, AND this webapp),
+//     then flip WRITE_SYNC_DOC_V2 to true IN LOCKSTEP across all three plus the app's writeSyncDocV2 once
+//     every client can read v2 - a v2 doc is unreadable by an older client. ---
+const DOC_V2_PREFIX = "v2.";
+const WRITE_SYNC_DOC_V2 = false;
+/** AAD binding a sync document to its account + version. IDENTICAL construction on every surface. */
+function documentAAD(accountId: string, version: number): Uint8Array {
+  return enc(`vortx/sync-doc/v2\n${accountId}\n${version}`);
+}
+/** Seal the sync doc. writeV2 binds (accountId, version) and marks "v2."; otherwise legacy no-AAD format. */
+async function sealDocument(dataKey: Uint8Array, pt: Uint8Array, accountId: string, version: number, writeV2: boolean): Promise<string> {
+  if (!writeV2) return seal(dataKey, pt);
+  const k = await crypto.subtle.importKey("raw", dataKey as BufferSource, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: documentAAD(accountId, version) as BufferSource }, k, pt as BufferSource));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv, 0);
+  out.set(ct, 12);
+  return DOC_V2_PREFIX + b64(out);
+}
+/** Open a sync doc of either format. A "v2." blob MUST authenticate against (accountId, version); a replay
+ *  under a different version or a stripped/forged prefix fails the GCM tag and returns null. */
+async function openDocument(dataKey: Uint8Array, stored: string, accountId: string, version: number): Promise<Uint8Array | null> {
+  if (!stored.startsWith(DOC_V2_PREFIX)) return open(dataKey, stored);
+  try {
+    const comb = unb64(stored.slice(DOC_V2_PREFIX.length));
+    const k = await crypto.subtle.importKey("raw", dataKey as BufferSource, "AES-GCM", false, ["decrypt"]);
+    return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: comb.subarray(0, 12) as BufferSource, additionalData: documentAAD(accountId, version) as BufferSource }, k, comb.subarray(12) as BufferSource));
+  } catch {
+    return null;
+  }
+}
+
 interface ApiResult {
   status: number;
   // The server replies with assorted JSON shapes per endpoint; callers narrow what they read.
@@ -461,6 +500,9 @@ export interface SyncStatus {
   version?: number;
   size?: number;
   contents?: Record<string, unknown>;
+  // A stored doc that EXISTS (200) but did not decrypt/parse. A writer that treats this as an empty {} would
+  // PUT a near-empty doc as a full replacement and WIPE the account (every channel), so callers must abort.
+  decryptFailed?: boolean;
 }
 
 export async function fetchSync(session: Session): Promise<SyncStatus> {
@@ -468,35 +510,45 @@ export async function fetchSync(session: Session): Promise<SyncStatus> {
   if (r.status === 404) return { synced: false };
   if (r.status !== 200) throw new Error("offline");
   const data = r.data as { document: string; version: number };
-  const pt = await open(session.dataKey, data.document);
+  const pt = await openDocument(session.dataKey, data.document, session.account.id, data.version);
   let contents: Record<string, unknown> | undefined;
+  let decryptFailed = false;
+  // A doc that EXISTS but does not decrypt (wrong key, tamper, a version-bound v2 doc served under a forged
+  // version) or does not parse must NOT masquerade as {}: flag it so getSyncDoc/mutateSyncDoc abort instead
+  // of clobbering the account.
   if (pt) {
     try {
       contents = JSON.parse(td.decode(pt)) as Record<string, unknown>;
     } catch {
-      // Binary / non-JSON payload: report status without contents.
+      decryptFailed = true;
     }
+  } else {
+    decryptFailed = true;
   }
   return {
     synced: true,
     version: data.version,
     size: Math.ceil((data.document.length * 3) / 4),
     contents,
+    decryptFailed,
   };
 }
 
 /** Read the decrypted sync document (the data key lives in this tab). */
 export async function getSyncDoc(session: Session): Promise<Record<string, unknown>> {
   const s = await fetchSync(session);
+  // Never present an undecryptable doc as {} - a caller that writes it back would replace the whole account.
+  if (s.synced && s.decryptFailed) throw new Error("Could not read your account right now. Please try again.");
   return (s.contents as Record<string, unknown>) ?? {};
 }
 /** Write the decrypted sync document back, re-encrypted under the data key. */
 export async function putSyncDoc(session: Session, doc: Record<string, unknown>): Promise<void> {
-  const ciphertext = await seal(session.dataKey, enc(JSON.stringify(doc)));
+  const version = Date.now(); // ONE value, bound into the AAD and sent as the row version, so they match
+  const ciphertext = await sealDocument(session.dataKey, enc(JSON.stringify(doc)), session.account.id, version, WRITE_SYNC_DOC_V2);
   const r = await api("/v1/backup", {
     method: "PUT",
     token: session.token,
-    body: { document: ciphertext, version: Date.now() },
+    body: { document: ciphertext, version },
   });
   if (r.status !== 200) throw new Error("Could not save to your account.");
 }
@@ -514,14 +566,18 @@ export async function mutateSyncDoc(
 ): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt++) {
     const status = await fetchSync(session);
+    // Refuse to write onto a doc we could not read: mutating an assumed-empty {} and PUTing it would wipe
+    // the whole account at a winning version. Fail loudly instead (mirrors the app + vortx-site).
+    if (status.synced && status.decryptFailed) throw new Error("Could not read your account right now. Please try again.");
     const base = status.synced ? status.version ?? 0 : 0;
     const doc = (status.contents as Record<string, unknown>) ?? {};
     mutate(doc);
-    const ciphertext = await seal(session.dataKey, enc(JSON.stringify(doc)));
+    const version = base + 1; // ONE value, bound into the AAD and sent as the row version
+    const ciphertext = await sealDocument(session.dataKey, enc(JSON.stringify(doc)), session.account.id, version, WRITE_SYNC_DOC_V2);
     const r = await api("/v1/backup", {
       method: "PUT",
       token: session.token,
-      body: { document: ciphertext, version: base + 1 },
+      body: { document: ciphertext, version },
     });
     if (r.status !== 200) throw new Error("Could not save to your account.");
     if (r.data?.accepted !== false) return; // stored (accepted true, or older worker without the field)
