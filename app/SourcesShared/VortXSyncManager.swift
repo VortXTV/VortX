@@ -63,9 +63,13 @@ final class VortXSyncManager: ObservableObject {
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
     /// the converged order. Empty means "no shared order yet" (fall back to the descriptor spine).
     private static let kAddonOrderKey = "vortx.sync.appliedAddonOrder"
+    /// Upper bound on the persisted order length. A real account has a few dozen add-ons; this only exists so a
+    /// malicious/garbage synced `doc.addonOrder` can't balloon UserDefaults. Applied in the setter, which is the
+    /// single chokepoint for both the in-app reorder and the syncDown apply.
+    private static let maxAddonOrderEntries = 1024
     static var appliedAddonOrder: [String] {
         get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: kAddonOrderKey) }
+        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
     }
     /// Posted (main thread) whenever the shared add-on order changes: an in-app Reorder drag or a remote
     /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
@@ -251,6 +255,8 @@ final class VortXSyncManager: ObservableObject {
         let (_, pre) = await request("POST", "/v1/auth/prelogin", body: ["login": login])
         guard let saltStr = pre?["kdfSalt"] as? String, let salt = Data(base64Encoded: saltStr),
               let iters = pre?["kdfIters"] as? Int else { return .failed("Could not reach VortX. Try again.") }
+        // Reject a downgraded work factor from the UNAUTHENTICATED prelogin response before deriving the key.
+        guard iters >= VortXSyncCrypto.minIters else { return .failed("Could not verify VortX security parameters. Try again.") }
         let masterKey = VortXSyncCrypto.masterKey(password: password, kdfSalt: salt, iters: iters)
         var body: [String: Any] = ["login": login, "authVerifier": VortXSyncCrypto.authVerifier(masterKey: masterKey, password: password)]
         if let totp, !totp.isEmpty { body["totp"] = totp }
@@ -272,6 +278,8 @@ final class VortXSyncManager: ObservableObject {
               let iters = start?["kdfIters"] as? Int, let wrappedRec = start?["wrappedKeyRecovery"] as? String else {
             return .failed("No recovery is set up for that email.")
         }
+        // Same downgrade guard as signIn: recover-start is unauthenticated too.
+        guard iters >= VortXSyncCrypto.minIters else { return .failed("Could not verify VortX security parameters. Try again.") }
         let recoveryKey = VortXSyncCrypto.recoveryKey(recoveryCode: trimmed, kdfSalt: salt, iters: iters)
         guard let dk = VortXSyncCrypto.open(key: recoveryKey, wrappedRec) else { return .failed("That recovery code is not correct.") }
         // Keep the existing kdfSalt (it also derives the recovery key); derive the new master from it.

@@ -64,6 +64,9 @@ actor FanartClient {
     private static func tvdbID(for id: String) async -> String? {
         if id.hasPrefix("tvdb:") { return id.components(separatedBy: ":").last }
         guard let tmdbKey = ApiKeys.tmdbKey(), !tmdbKey.isEmpty else { return nil }
+        // SECURITY: the URLs below (and the fanart.tv fetch) carry the user's TMDB / Fanart key as a query
+        // param. Never log these URLs verbatim (no url.absoluteString into VXProbe or the LAN-exportable diag
+        // log) - the key is a user credential. Same convention as DebridResolver / MoatToken.
         // Resolve the TMDB tv id first (a tt id via /find, a tmdb: id directly), then its external_ids.tvdb_id.
         var tmdbTVID: String?
         if id.hasPrefix("tt") {

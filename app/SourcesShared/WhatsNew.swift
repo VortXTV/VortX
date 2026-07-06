@@ -7,6 +7,7 @@ import Foundation
 enum WhatsNew {
     static let version = "0.3.11"
     static let highlights: [String] = [
+        "Security hardening for your account and add-ons. Sign-in and recovery now reject a weakened password-hardening setting from a spoofed server before it can touch your key, and the add-on status check no longer pings private or home-network addresses (your own on-device local add-on still works). No change to how anything looks or feels; it just closes a couple of doors.",
         "You can now reorder your add-ons right in the app. Open Add-ons, tap Reorder add-ons, and drag any add-on up or down. That order is the priority order, which add-on's catalogs and sources come first, and it syncs to your other devices and the web dashboard, the same order a drag on the dashboard sets. The list re-sorts the moment you finish. iPhone, iPad, and Mac.",
         "On Mac, opening a title while its sources are still loading no longer crashes the app. Assembling a big source list off the main thread (the freeze fix below) could, on macOS 26, trip a system toolbar bug and force-quit the whole app the moment a movie detail refreshed. The app now guards that system path so the crash can't happen, on every kind of title. Mac only.",
         "A back-to-top button on Home and Discover. Once you scroll past the top, a small button appears in the bottom corner; tap it to jump straight back to the top. Re-tapping the tab still does the same. iPhone, iPad, and Mac.",

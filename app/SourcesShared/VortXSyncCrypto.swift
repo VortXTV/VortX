@@ -17,6 +17,12 @@ import CommonCrypto
 ///   document     = base64(AES-256-GCM(syncDocJSON, key=dataKey))
 enum VortXSyncCrypto {
     static let defaultIters = 210_000
+    /// Hard floor for a server-supplied `kdfIters`. `/v1/auth/prelogin` and `/v1/auth/recover-start` are
+    /// UNAUTHENTICATED, so a spoofed/compromised api.vortx.tv (or a MITM) could return `kdfIters: 1` and make
+    /// the client derive a near-unstretched master key, collapsing the offline cost of cracking the account's
+    /// stored wrapped key. Reject anything below this floor before deriving. Well under defaultIters so every
+    /// legitimate account (minted at 210k) passes; far above any downgrade an attacker would want.
+    static let minIters = 100_000
 
     // MARK: PBKDF2-SHA256 (CryptoKit has no PBKDF2; CommonCrypto provides it)
 

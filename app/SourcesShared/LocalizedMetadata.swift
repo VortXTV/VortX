@@ -318,6 +318,7 @@ final class LocalizedMetadataStore: ObservableObject {
             if parts.count == 3, let n = Int(parts[2]) { return (String(parts[1]), String(n)) }
             return nil
         }
+        // SECURITY: this URL carries the user's TMDB key as api_key=. Never log it verbatim (VXProbe / diag log).
         guard id.hasPrefix("tt"),
               let url = URL(string: "https://api.themoviedb.org/3/find/\(id)?external_source=imdb_id&api_key=\(key)"),
               let (data, resp) = try? await session.data(from: url),

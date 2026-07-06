@@ -70,6 +70,13 @@ final class AddonHealthStore: ObservableObject {
 
     nonisolated private static func check(_ transportUrl: String) async -> AddonHealth {
         guard let url = URL(string: transportUrl) else { return .down }
+        // SSRF guard, same policy as installAddon/previewAddonManifest (AddonURLGuard). A transportUrl can
+        // arrive from a synced account doc or the web dashboard, not just a user paste, so never let this
+        // auto-firing reachability probe hit an arbitrary private / LAN / link-local / metadata target and
+        // turn the app into a network scanner. The ONE legitimate private target is the app's own loopback
+        // streaming server (the default 127.0.0.1 local add-on); a discard-response GET to loopback has no
+        // attacker feedback channel, so it is exempt while everything else private is refused.
+        if !isLoopbackHost(url.host), await AddonURLGuard.validate(url) != nil { return .down }
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
         // Some add-on CDNs reject non-browser User-Agents (same lesson as AddonClient + the libmpv fetches).
@@ -84,6 +91,15 @@ final class AddonHealthStore: ObservableObject {
         } catch {
             return .down
         }
+    }
+
+    /// True when `host` is on-device loopback (localhost / 127.0.0.0/8 / ::1). Exempt from the probe's SSRF
+    /// guard so the default 127.0.0.1 local-add-on still reports its real status (see check(_:)).
+    nonisolated private static func isLoopbackHost(_ host: String?) -> Bool {
+        guard var h = host, !h.isEmpty else { return false }
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }  // unbracket IPv6 literals
+        let lower = h.lowercased()
+        return lower == "localhost" || lower == "::1" || lower.hasPrefix("127.")
     }
 }
 

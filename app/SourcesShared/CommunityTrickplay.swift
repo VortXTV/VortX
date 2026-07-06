@@ -126,6 +126,7 @@ enum CommunityTrickplay {
         let edge = RemoteConfig.snapshot.catalogsEndpoint.absoluteString
         if let tt = await read(URL(string: "\(edge)/\(media)/\(tmdbID)/external_ids"), sign: true) { return tt }
         if let key = ApiKeys.tmdbKey() {
+            // SECURITY: this URL carries the user's TMDB key as api_key=. Never log it verbatim (VXProbe / diag).
             return await read(URL(string: "https://api.themoviedb.org/3/\(media)/\(tmdbID)/external_ids?api_key=\(key)"), sign: false)
         }
         return nil
