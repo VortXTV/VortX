@@ -710,9 +710,39 @@ actor AllDebridResolver: DebridResolving {
         self.session = URLSession(configuration: cfg)
     }
 
-    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+    /// `GET /magnet/instant`, `magnets[]` = infohashes. AllDebrid still ships this in 2026 (only Real-Debrid
+    /// removed its cache-check), but it is known to be flaky, so a failed/empty chunk simply yields no
+    /// confirmations for those hashes and the resolve path still works. Batch ~40.
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] {
+        guard !hashes.isEmpty else { return [:] }
+        var out: [String: [DebridFile]] = [:]
+        for chunk in hashes.chunked(into: 40) {
+            let items = chunk.map { URLQueryItem(name: "magnets[]", value: $0) }
+            guard let env: Env<InstantData> = try? await get(authed("/magnet/instant", items)),
+                  env.status == "success", let magnets = env.data?.magnets else { continue }
+            for m in magnets where (m.instant ?? false) {
+                let files = (m.files ?? []).compactMap { f -> DebridFile? in
+                    guard let n = f.n else { return nil }
+                    return DebridFile(id: 0, name: n, shortName: (n as NSString).lastPathComponent, size: f.s ?? 0, mimetype: nil)
+                }
+                // A cached hash MUST map to a non-empty file list to enter the confirmed-cached set; if the
+                // instant tree was omitted, a placeholder keeps the hash confirmed (resolve picks the file).
+                out[m.hash.lowercased()] = files.isEmpty ? [DebridFile(id: 0, name: m.hash, shortName: m.hash, size: 0, mimetype: nil)] : files
+            }
+        }
+        return out
+    }
 
     private struct Env<T: Decodable>: Decodable { let status: String; let data: T? }
+    private struct InstantData: Decodable {
+        let magnets: [InstantMagnet]?
+        struct InstantMagnet: Decodable {
+            let hash: String
+            let instant: Bool?
+            let files: [IFile]?
+            struct IFile: Decodable { let n: String?; let s: Int64? }
+        }
+    }
     private struct UploadData: Decodable { let magnets: [UpMagnet]?; struct UpMagnet: Decodable { let id: Int? } }
     private struct StatusData: Decodable {
         let magnets: StatusMagnet?
@@ -777,7 +807,40 @@ actor PremiumizeResolver: DebridResolving {
         self.session = URLSession(configuration: cfg)
     }
 
-    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+    /// `POST /api/cache/check` with `items[]` = bare infohashes. The response arrays are positionally aligned
+    /// with `items[]`; a `true` in `response` means `transfer/directdl` will succeed instantly for that hash.
+    /// It does not consume fair-use quota. Premiumize still ships this in 2026 (only Real-Debrid removed its
+    /// cache-check). Any failure yields no confirmations for that chunk (resolve still works); batch ~80.
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] {
+        guard !hashes.isEmpty else { return [:] }
+        var out: [String: [DebridFile]] = [:]
+        for chunk in hashes.chunked(into: 80) {
+            guard let r: CacheCheck = try? await formItems("/cache/check", chunk.map { ("items[]", $0) }),
+                  r.status == "success", let flags = r.response else { continue }
+            for (i, hash) in chunk.enumerated() where i < flags.count && flags[i] {
+                let name = (r.filename.flatMap { i < $0.count ? $0[i] : nil } ?? nil) ?? hash
+                let size = r.filesize.flatMap { i < $0.count ? $0[i].value : nil } ?? 0
+                out[hash.lowercased()] = [DebridFile(id: 0, name: name, shortName: (name as NSString).lastPathComponent, size: size, mimetype: nil)]
+            }
+        }
+        return out
+    }
+
+    private struct CacheCheck: Decodable {
+        let status: String
+        let response: [Bool]?
+        let filename: [String?]?
+        let filesize: [PMSize]?
+    }
+    /// Premiumize returns `filesize` as a base-10 STRING on a hit and the integer `0` on a miss; decode both.
+    private struct PMSize: Decodable {
+        let value: Int64
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let s = try? c.decode(String.self) { value = Int64(s) ?? 0 }
+            else { value = (try? c.decode(Int64.self)) ?? 0 }
+        }
+    }
 
     private struct DirectDL: Decodable {
         let status: String
@@ -812,6 +875,20 @@ actor PremiumizeResolver: DebridResolving {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = DebridForm.encode(fields)
+        return try await DebridHTTP.decode(session, req)
+    }
+
+    /// POST with REPEATED form keys (the `[String: String]` `form` above collapses duplicate keys, but
+    /// `/cache/check` needs many `items[]=...`). `apikey` rides the query, matching `form`.
+    private func formItems<T: Decodable>(_ path: String, _ pairs: [(String, String)]) async throws -> T {
+        var c = URLComponents(string: Self.base + path)
+        c?.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        var req = URLRequest(url: c?.url ?? URL(string: Self.base)!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = pairs
+            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
+            .joined(separator: "&").data(using: .utf8)
         return try await DebridHTTP.decode(session, req)
     }
 }
