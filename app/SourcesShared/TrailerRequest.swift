@@ -4,11 +4,11 @@ import Foundation
 /// (SourcesShared is in all of them). A meta's trailer is either a direct (non-YouTube) stream
 /// URL or a YouTube id; this collapses both into one `playableURL` the players can hand to libmpv.
 ///
-/// YouTube trailers are played through the embedded server's `/yt/:id` route (server.js: a 301
-/// redirect to a direct media URL resolved by ytdl-core), so they need `StremioServer.canProxy`.
-/// On the Lite build (no embedded server) a YouTube-only trailer has no `playableURL`, which is
-/// what lets the tvOS Trailer button auto-hide there. `watchURL` is the public youtube.com link
-/// for surfaces that can open a browser/external player instead (e.g. iOS/macOS).
+/// YouTube trailers resolve to a playable URL with NO embedded server. `playableURL` uses the always-remote
+/// `StremioServer.trailerResolverBase` (`trailer.vortx.tv/yt/{id}`); at play time the players additionally try
+/// the on-device `YouTubeDirectResolver` (InnerTube) plus the local `VXTrailerProxy` (127.0.0.1) first. So a
+/// YouTube-only trailer has a `playableURL` on EVERY scheme, Lite included, and the tvOS Trailer button shows
+/// there too. `watchURL` is the public youtube.com link for surfaces that open an external player (iOS/macOS).
 struct TrailerRequest: Identifiable, Equatable {
     let id = UUID()
     let title: String

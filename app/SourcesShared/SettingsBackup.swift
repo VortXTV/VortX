@@ -38,6 +38,9 @@ enum SettingsBackup {
         "stremiox.diskCacheBytes",   // Settings -> Streaming cache (sized to the device's own storage)
         "stremiox.serverURL",        // custom streaming server URL (per-device)
         "stremiox.videoUpscaling",   // Settings -> Video upscaling (per-device: standard on Apple TV, scaled on Mac)
+        "stremiox.dvRemux",          // Settings -> Dolby Vision for MKV (per-device: depends on THIS device's DV
+                                     // display + decode). Was syncing, so a pull kept reverting a freshly-toggled
+                                     // device back to a peer's OFF value, which is why enabling it never "took".
     ]
 
     /// An app preference that is ALSO safe to sync/transfer (i.e. not a per-device-local key).

@@ -75,7 +75,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// backend and known to crash it (double free); the app does the HDR signalling itself in
     /// syncDisplayDynamicRange.
     private var appliedDynamicRange: ContentDynamicRange? = nil
-    
+
+    /// Set by the launch site (via the `PlayerEngine` protocol) from the stream's Dolby Vision flag. When true,
+    /// `syncDisplayDynamicRange` drives the Apple TV into Dolby Vision display mode for DV content this lane
+    /// renders as a tone-mapped PQ base layer, so the TV lights its DV badge exactly as the reference player
+    /// does on a decoded MKV. tvOS-only effect (the display-mode request is tvOS); harmless elsewhere.
+    var contentIsDolbyVision = false
+
     override func viewDidLoad() {
         super.viewDidLoad()
         
@@ -155,10 +161,12 @@ final class MPVMetalViewController: PlatformViewController {
 
     private func reconfigureVideoOutput() {
         guard mpv != nil else { return }
-        checkError(mpv_set_option_string(mpv, "vid", "no"))
+        // Runtime rebuild after a live resize/rotation: `vid` must be set as a PROPERTY. mpv_set_option_string
+        // is a silent no-op after mpv_initialize, so the option-string form never actually rebuilt the VO.
+        checkError(mpv_set_property_string(mpv, "vid", "no"))
         DispatchQueue.main.async { [weak self] in
             guard let self, self.mpv != nil else { return }
-            self.checkError(mpv_set_option_string(self.mpv, "vid", "auto"))
+            self.checkError(mpv_set_property_string(self.mpv, "vid", "auto"))
             self.applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         }
     }
@@ -295,6 +303,14 @@ final class MPVMetalViewController: PlatformViewController {
             if #available(iOS 15.0, tvOS 15.0, *) {
                 try? session.setSupportsMultichannelContent(routeIsMultichannelCapable)
             }
+            // Ask the session to OPEN the route's real channel count. Without this the session can sit at 2
+            // output channels on a >2ch HDMI route and the AO/renderer silently downmixes multichannel PCM to
+            // stereo (the reference players set this; we never did). Gated exactly like
+            // setSupportsMultichannelContent above so the #78 stereo-route protections are untouched.
+            if routeIsMultichannelCapable, intrinsicMaxChannels > 2 {
+                try? session.setPreferredOutputNumberOfChannels(min(intrinsicMaxChannels, 8))
+            }
+            NSLog("[#78 audio] realized outputChannels=\(session.outputNumberOfChannels) (multichannelCapable=\(routeIsMultichannelCapable) intrinsicMax=\(intrinsicMaxChannels))")
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
         } catch {
@@ -649,7 +665,10 @@ final class MPVMetalViewController: PlatformViewController {
         #else
         pause()
         #endif
-        checkError(mpv_set_option_string(mpv, "vid", "no"))
+        // `vid` is toggled at RUNTIME here, so it must go through the PROPERTY setter: mpv_set_option_string
+        // is a silent no-op after mpv_initialize (see applyChannelPolicy), so the option-string form left the
+        // background "drop video decode" doing nothing.
+        checkError(mpv_set_property_string(mpv, "vid", "no"))
     }
 
     @objc public func enterForeground() {
@@ -659,7 +678,7 @@ final class MPVMetalViewController: PlatformViewController {
             mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
         }
         applyChannelPolicy()
-        checkError(mpv_set_option_string(mpv, "vid", "auto"))
+        checkError(mpv_set_property_string(mpv, "vid", "auto"))   // runtime toggle: property, not option (no-op post-init)
         applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
         play()
     }
@@ -729,13 +748,22 @@ final class MPVMetalViewController: PlatformViewController {
 
     deinit {
         // Safety net: if the view controller is torn down without stop() (e.g. an
-        // unexpected dealloc), make sure mpv can't call back into freed memory.
+        // unexpected dealloc), make sure mpv can't call back into freed memory. Mirror stop()'s
+        // SERIALIZED teardown rather than destroying inline: an inline mpv_terminate_destroy here
+        // could race an in-flight readEvents drain on `queue` (double-destroy / use-after-free), so
+        // nil the handle synchronously (one owner) and dispatch the destroy onto the event queue.
         if let handle = mpv {
-            mpv_set_wakeup_callback(handle, nil, nil)
             mpv = nil
-            mpv_terminate_destroy(handle)
+            mpv_set_wakeup_callback(handle, nil, nil)
+            let relay = wakeupRelay
+            wakeupRelay = nil
+            queue.async {
+                mpv_terminate_destroy(handle)
+                relay?.release()   // no callbacks after terminate_destroy; safe to drop the relay
+            }
+        } else {
+            wakeupRelay?.release()
         }
-        wakeupRelay?.release()
     }
 
     /// mpv's stock User-Agent, captured once so a stream with custom headers can never leak
@@ -748,6 +776,9 @@ final class MPVMetalViewController: PlatformViewController {
         live: Bool = false,
         audioSidecar: URL? = nil
     ) {
+        // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
+        // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
+        guard mpv != nil else { return }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
         // colorspace — the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
@@ -838,6 +869,11 @@ final class MPVMetalViewController: PlatformViewController {
         // direct CDN keeps the full buffer for network resilience. Set per file at runtime.
         let isLocalStream = playURL.host == "127.0.0.1" || playURL.host == "localhost"
             || (playURL.host?.hasSuffix("strem.io") ?? false)
+            // A trailer is a short clip and never needs the big remote read-ahead. A googlevideo trailer is
+            // already proxied to 127.0.0.1 (small), but a worker-fallback trailer (trailer.vortx.tv, a remote
+            // host) otherwise takes the full 256 MiB remote buffer and contributes to the tvOS jetsam that the
+            // owner sees as "the server died". Give the trailer host the small read-ahead too.
+            || (playURL.host?.contains("trailer.vortx.tv") ?? false)
         configureLiveMode(live)
         let readAhead: String
         if live {
@@ -854,7 +890,7 @@ final class MPVMetalViewController: PlatformViewController {
             // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
             // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
             // server + swap) keeps the larger buffer for slow-CDN resilience.
-            readAhead = isLocalStream ? "96MiB" : "128MiB"
+            readAhead = isLocalStream ? "96MiB" : "256MiB"   // owner-raised remote base 128 -> 256 (ATV 4K has headroom); Streaming-cache lifts it further
             #endif
         }
         // With the on-disk cache armed (Settings → Streaming cache) we lift `demuxer-max-bytes` for a
@@ -905,6 +941,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     private func configureLiveMode(_ live: Bool) {
+        guard mpv != nil else { return }   // raw mpv_set_property_string below: never pass a nil handle post-teardown
         guard configuredLiveMode != live else { return }
         configuredLiveMode = live
         if live {
@@ -1001,13 +1038,24 @@ final class MPVMetalViewController: PlatformViewController {
                 range = .sdr
             }
         }
+#if os(tvOS)
+        // HONEST OUTPUT: the mpv lane decodes/tone-maps Dolby Vision to PQ pixels, so it requests HDR10 and
+        // NEVER the panel's Dolby Vision mode. An earlier build promoted .hdr10 -> .dolbyVision here when the
+        // stream was DV-flagged; that flips the TV into real DV mode over tone-mapped PQ pixels ("fake Dolby
+        // Vision", the behavior other players are criticized for), and decoded-pixel pipelines deliberately
+        // downgrade DV requests to HDR10 for exactly this reason. The DV badge is earned only by the AVPlayer
+        // remux lane, which carries the genuine bitstream to VideoToolbox. Message-only breadcrumb below.
+        if contentIsDolbyVision, range == .hdr10 {
+            DiagnosticsLog.log("dv", "DV title on the libmpv lane: requesting HDR10 output (tone-mapped PQ; true DV plays only on the AVPlayer remux lane)")
+        }
+#endif
         guard range != appliedDynamicRange else { return }
         appliedDynamicRange = range
 
         // Synchronous breadcrumbs: if any of these statements kills the process
         // (MoltenVK owns the layer's drawables and mid-stream colorspace changes
         // are crash-suspect territory), the last line in diagnostics.log names it.
-        let trc = range == .hdr10 ? "pq" : (range == .hlg ? "hlg" : "auto")
+        let trc = (range == .hdr10 || range == .dolbyVision) ? "pq" : (range == .hlg ? "hlg" : "auto")
         let prim = range == .sdr ? "auto" : "bt.2020"
         DiagnosticsLog.logSync("mpv", "applying target-trc=\(trc)")
         checkError(mpv_set_property_string(handle, "target-trc", trc))
@@ -1018,6 +1066,10 @@ final class MPVMetalViewController: PlatformViewController {
         case .hdr10: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
         case .hlg:   metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
         case .sdr:   metalLayer.colorspace = nil
+        // The libmpv lane tone-maps Dolby Vision through its PQ path and reports .hdr10 for it, so it never
+        // actually produces .dolbyVision here; map it to the PQ colorspace defensively (true DV plays on the
+        // AVPlayer remux lane, which owns the .dolbyVision display-mode request).
+        case .dolbyVision: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
         }
         DiagnosticsLog.logSync("mpv", "layer colorspace tagged")
         mpvLog.log("output range → \(range.rawValue, privacy: .public) (gamma=\(gamma, privacy: .public) sigPeak=\(sigPeak, privacy: .public))")
@@ -1065,14 +1117,15 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     private func getFlag(_ name: String) -> Bool {
-        var data = Int64()
+        guard mpv != nil else { return false }   // teardown nils mpv; a late togglePause() must not pass NULL to libmpv
+        var data = Int32()   // MPV_FORMAT_FLAG is a 4-byte C int, not Int/Int64; an 8-byte read only works by little-endian luck
         mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
         return data > 0
     }
     
     private func setFlag(_ name: String, _ flag: Bool) {
         guard mpv != nil else { return }
-        var data: Int = flag ? 1 : 0
+        var data: Int32 = flag ? 1 : 0   // MPV_FORMAT_FLAG is a 4-byte C int; write exactly 4 bytes, not 8
         mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data)
     }
 
@@ -1100,7 +1153,8 @@ final class MPVMetalViewController: PlatformViewController {
                 type: type,
                 title: getString("track-list/\(i)/title") ?? "",
                 lang: getString("track-list/\(i)/lang") ?? "",
-                selected: getFlag("track-list/\(i)/selected")
+                selected: getFlag("track-list/\(i)/selected"),
+                forced: getFlag("track-list/\(i)/forced")   // AV_DISPOSITION_FORCED, for forced-subtitle auto-select
             ))
         }
         return result
@@ -1610,6 +1664,17 @@ final class MPVMetalViewController: PlatformViewController {
                         ?? self.playUrl?.host ?? "?"
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
+                    // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
+                    // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
+                    // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        guard let self, self.mpv != nil else { return }
+                        let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
+                        let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
+                        let ao = self.getString("current-ao") ?? "?"
+                        NSLog("[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                        VXProbe.log("player", "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                    }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
                     // not value-coalesced like the sig-peak property observer, so it fires reliably on

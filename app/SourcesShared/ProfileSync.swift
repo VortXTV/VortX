@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os
 
 /// One title's watch state inside a profile's private overlay: enough to render Continue Watching,
@@ -61,6 +62,10 @@ enum ProfileSync {
     /// Overwrites each with a valid empty watched string (the documents stay invisible: type
     /// "other" + removed). Returns the payloads found, so watch history can be salvaged.
     private static func repairPoisonedLibrary(authKey: String) async -> [String: String] {
+        // Once a launch scans the whole library and finds nothing poisoned, remember that per account
+        // so we stop pulling the entire libraryItem collection (and rebuilding an unbounded salvage map)
+        // on every subsequent launch. Cleared implicitly if the flag is ever reset.
+        if UserDefaults.standard.bool(forKey: repairDoneKey(authKey)) { return [:] }
         let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "all": true]
         guard let data = try? await post("datastoreGet", body: body),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -81,8 +86,18 @@ enum ProfileSync {
         }
         if repaired > 0 {
             log.info("repair: scrubbed \(repaired) poisoned documents; official apps can sync again")
+        } else {
+            // Nothing to fix this launch: mark the account clean so we skip the full-library scan next time.
+            UserDefaults.standard.set(true, forKey: repairDoneKey(authKey))
         }
         return salvaged
+    }
+
+    /// Per-account "library already scanned clean" flag key. Derived from a SHA-256 of the authKey so
+    /// the raw account token never lands in UserDefaults (it stays Keychain-only).
+    private static func repairDoneKey(_ authKey: String) -> String {
+        let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "stremiox.libraryRepairComplete.\(digest)"
     }
 
     /// A valid, schema-clean, invisible libraryItem (empty watched string parses fine everywhere).

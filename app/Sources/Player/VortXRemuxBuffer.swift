@@ -27,7 +27,9 @@ import Foundation
 final class VortXRemuxBuffer: @unchecked Sendable {
 
     private let condition = NSCondition()
-    /// The retained tail of the produced stream. `storage[0]` corresponds to absolute offset `storageBase`.
+    /// The retained tail of the produced stream. `storage[storage.startIndex]` corresponds to absolute offset
+    /// `storageBase`. The index base is NOT always 0: `evictBelow`'s `Data.removeFirst` advances an internal
+    /// start offset, so reads and eviction must work relative to `storage.startIndex`, never a bare 0.
     private var storage = Data()
     /// Absolute offset of the first byte still held in `storage`. Bytes below this have been delivered and evicted.
     private var storageBase = 0
@@ -139,10 +141,23 @@ final class VortXRemuxBuffer: @unchecked Sendable {
                 return ReadResult(data: Data(), atEnd: true, failure: "range evicted below streaming window")
             }
             if offset < producedCount {
+                // `storage` is indexed relative to its own `startIndex`, NOT 0. `evictBelow`'s
+                // `Data.removeFirst` advances an internal start offset rather than memmoving, so after the
+                // first eviction `storage.startIndex` is non-zero. Map the 0-based logical position onto the
+                // real Data index base before slicing. (Slicing at a bare 0-based `localStart` is exactly what
+                // trapped `subdata(in:)` out of bounds once eviction began.)
+                let base = storage.startIndex
                 let localStart = offset - storageBase
                 let available = storage.count - localStart
                 let take = min(length, available)
-                let slice = storage.subdata(in: localStart..<(localStart + take))
+                let lo = base + localStart
+                let hi = lo + take
+                guard lo >= storage.startIndex, hi <= storage.endIndex, lo <= hi else {
+                    // Unreachable given the window invariant, but fail soft (drives the AVPlayer -> libmpv
+                    // fallback) instead of trapping and taking the whole app down, as the old code did.
+                    return ReadResult(data: Data(), atEnd: true, failure: "remux buffer range out of bounds")
+                }
+                let slice = storage.subdata(in: lo..<hi)
                 // atEnd only if we've handed back everything up to a finished stream's end.
                 let end = isFinished && (offset + take >= producedCount)
                 // The reader has consumed up to (offset + take); drop the delivered tail below the floor.
@@ -166,6 +181,15 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         guard dropCount > 0, dropCount <= storage.count else { return }
         storage.removeFirst(dropCount)
         storageBase += dropCount
+        // `Data.removeFirst` advances an internal start offset instead of memmoving, so the evicted bytes
+        // stay resident in the backing allocation and `storage.startIndex` climbs. Left unbounded that would
+        // defeat the whole sliding window: RAM would grow with playback and jetsam the memory-constrained
+        // Apple TV this class exists to protect. Once the reclaimable prefix reaches the floor, compact:
+        // `subdata` copies the retained window into a fresh 0-based buffer and frees the old backing.
+        // Amortized ~1x (one window-sized copy per window-sized advance) and it keeps `startIndex` bounded.
+        if storage.startIndex >= Self.windowFloorBytes {
+            storage = storage.subdata(in: storage.startIndex..<storage.endIndex)
+        }
         // Resident bytes dropped: wake a producer parked on the high-water mark in `append`.
         condition.signal()
     }

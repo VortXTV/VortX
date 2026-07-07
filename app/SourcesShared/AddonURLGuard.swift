@@ -103,7 +103,14 @@ enum AddonURLGuard {
                     current = next
                     continue
                 }
-                return .success((data, http.url ?? current))
+                // Re-validate the URL URLSession actually connected to (its own resolution, not ours). This
+                // narrows the resolve-then-connect DNS-rebinding window: a host that answered a public address
+                // to our pre-fetch `validate` but now resolves to a private one is refused before we hand the
+                // manifest back. It is not a full close (URLSession still re-resolves and pins no IP; see the
+                // RESIDUAL RISK note above), but it catches the common rebind between validation and response.
+                let finalURL = http.url ?? current
+                if let rejection = await validate(finalURL) { return .failure(rejection) }
+                return .success((data, finalURL))
             } catch {
                 return .failure(.unresolvable)
             }

@@ -25,6 +25,12 @@ protocol PlayerEngine: AnyObject {
     /// engine mounts it; the AVPlayer engine takes the extension default below, which DROPS the sidecar
     /// (AVFoundation can't merge a second remote file), so AVPlayer callers must hand it a muxed URL.
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?)
+    /// The launch site sets this from the stream's Dolby Vision flag BEFORE `loadFile`. The AVPlayer lane
+    /// (true DV) uses it to switch the Apple TV into Dolby Vision mode before the item attaches; the libmpv
+    /// lane renders DV as a tone-mapped PQ base layer, so it requests only HDR10 (a decoded-pixel pipeline
+    /// cannot present true DV; flipping the panel to DV over tone-mapped PQ is the "fake DV" other players
+    /// are criticized for).
+    var contentIsDolbyVision: Bool { get set }
     func play()
     func pause()
     func togglePause()
@@ -123,6 +129,12 @@ extension PlayerEngine {
     /// Default 0 for any engine that doesn't override (the wall-clock capture driver falls back to the
     /// chrome's own `currentTime` when this is 0). Both concrete engines override with the real position.
     var playbackPositionSeconds: Double { 0 }
+
+    /// Default no-op for engines that don't track the flag. BOTH concrete engines override with a stored
+    /// property: `MPVMetalViewController` reads it in `syncDisplayDynamicRange` (requests HDR10 for its
+    /// tone-mapped DV output), and `AVPlayerEngineController` reads it in `loadFile` to switch the Apple TV
+    /// into Dolby Vision mode BEFORE the item is attached (covers native DV MP4/MOV/HLS, not just the remux).
+    var contentIsDolbyVision: Bool { get { false } set { } }
 }
 
 /// `MPVMetalViewController` already implements every `PlayerEngine` member, so this is a pure conformance

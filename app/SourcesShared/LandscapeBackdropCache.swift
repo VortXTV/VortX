@@ -33,7 +33,9 @@ actor LandscapeBackdropCache {
         let task = Task { await TMDBClient.landscapeImages(metaID: id, type: type) }
         inflight[id] = task
         let result = await task.value
-        cache[id] = result
+        // Only cache a POSITIVE result. A transient TMDB failure returns (nil, nil); caching that latched the
+        // card into poster-fallback for the WHOLE session. Leaving a miss uncached lets a later appear retry.
+        if result.backdrop != nil || result.logo != nil { cache[id] = result }
         inflight[id] = nil
         return result
     }

@@ -22,6 +22,9 @@ struct SettingsView: View {
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
     @State private var langSelection: String = AppLanguage.current ?? "system"
     @State private var showLangRestart = false
+    // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
+    @State private var showDiagExport = false
+    @State private var diagExport: (url: String, qr: Image)?
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
@@ -36,6 +39,8 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    // When "1", the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
+    @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(VXProbe.defaultsKey) private var probeLogging = false   // gated diagnostic logging + heartbeat
@@ -56,8 +61,8 @@ struct SettingsView: View {
     // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
     // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
     @AppStorage(MoatConsent.key) private var moatContribute = true
-    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
-    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
+    // "Singularity" community source index SERVE opt-in (per device). Default ON; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = true
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
     // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
@@ -112,12 +117,19 @@ struct SettingsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
+        .fullScreenCover(isPresented: $showDiagExport, onDismiss: {
+            VXDiagExport.shared.stop()
+            diagExport = nil
+        }) {
+            diagExportSheet
+        }
         // Track-language and subtitle-style edits belong to the ACTIVE profile: fold every
         // flat-key change back into it (the captureTheme pattern, RootTabView does the same for
         // the theme). The equality guard inside capturePlayback stops a profile switch's own
         // flat-key writes from echoing back as roster edits.
         .onChange(of: prefAudioLang) { StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
-        .onChange(of: prefSubLang) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: prefSubLang) { if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
+        .onChange(of: matchAudioSubRaw) { if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
         .onChange(of: prefForced) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subFont) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
@@ -264,13 +276,13 @@ struct SettingsView: View {
     @ViewBuilder private var stremioMirrorSection: some View {
         section(String(localized: "Stremio mirror")) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                choiceRow(String(localized: "Mirror add-ons from Stremio"), [("0", "Off"), ("1", "On")],
+                choiceRow(String(localized: "Two-way sync add-ons with Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorAddons ? "1" : "0" }, set: { mirrorAddons = ($0 == "1") }))
                 choiceRow(String(localized: "Mirror library from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
                 choiceRow(String(localized: "Mirror Continue Watching from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
-                Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+                Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -787,12 +799,74 @@ struct SettingsView: View {
 
     private var audioSubtitleSection: some View {
         section("Audio & Subtitles") {
-            choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: $prefAudioLang)
-            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: $prefSubLang)
+            choiceRow(String(localized: "Match audio to subtitle languages"), [("0", "Off"), ("1", "On")], selection: $matchAudioSubRaw)
+            if matchAudioSubRaw != "1" {
+                choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: primaryAudioLang)
+                choiceRow(String(localized: "Fallback audio language"),
+                          [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
+                          selection: fallbackAudioLang)
+            }
+            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: primarySubLang)
+            choiceRow(String(localized: "Fallback subtitle language"),
+                      [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
+                      selection: fallbackSubLang)
             choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
-            Text("The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
+    }
+
+    /// The stored subtitle preference (`TrackPreferences.Key.subtitle`) is a comma-separated PRIORITY LIST
+    /// ("tr,en") that TrackSelector already walks in order; the UI presents it as two pickers via these
+    /// derived bindings. Primary = the first entry; setting it keeps the existing fallback (dropping it only
+    /// when it would duplicate the new primary). The raw `prefSubLang` @AppStorage stays the storage anchor,
+    /// so profile capture (.onChange(of: prefSubLang)) and cross-device sync round-trip the whole list.
+    private var primarySubLang: Binding<String> {
+        Binding(
+            get: { prefSubLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefSubLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    /// Fallback = the second entry of the stored chain ("" = none). Choosing None (or the primary itself)
+    /// stores just the primary.
+    private var fallbackSubLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefSubLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefSubLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
+    }
+
+    /// Audio primary / fallback: the SAME two-picker derivation as the subtitle chain, over the
+    /// `TrackPreferences.Key.audio` list. Shown only when "Match audio to subtitle languages" is off.
+    private var primaryAudioLang: Binding<String> {
+        Binding(
+            get: { prefAudioLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefAudioLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    private var fallbackAudioLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefAudioLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefAudioLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
     }
 
     // MARK: Subtitle style
@@ -830,7 +904,50 @@ struct SettingsView: View {
                                          set: { probeLogging = ($0 == "1"); if probeLogging { VXProbeHeartbeat.start() } }))
             Text("Logs detailed activity for troubleshooting.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // Apple TV has no share sheet, so the diagnostic log is exported over the LAN: this stands up a
+            // tiny local server and shows a QR the owner scans with their phone to download the log file.
+            Button {
+                diagExport = VXDiagExport.shared.start()
+                showDiagExport = true
+            } label: { Text("Export diagnostic log") }
+                .buttonStyle(ChipButtonStyle(selected: false))
         }
+    }
+
+    /// Full-screen QR export overlay: the phone scans the code, downloads vortx-diag.log over the LAN, and
+    /// sends it on. Dismissing stops the local server so the log is not left served.
+    @ViewBuilder private var diagExportSheet: some View {
+        VStack(spacing: Theme.Space.lg) {
+            Text("Export diagnostic log")
+                .font(Theme.Typography.screenTitle).foregroundStyle(Theme.Palette.textPrimary)
+            if let export = diagExport {
+                export.qr
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 420, height: 420)
+                    .background(Color.white)
+                    .padding(Theme.Space.md)
+                Text(export.url)
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Connect this device to Wi-Fi to export the diagnostic log.")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            Button {
+                showDiagExport = false
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            } label: { Text("Done") }
+                .buttonStyle(ChipButtonStyle(selected: true))
+        }
+        .padding(Theme.Space.xl)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 
     private func choiceRow(_ label: String, _ options: [(id: String, label: String)],

@@ -210,7 +210,10 @@ enum TorBoxSearch {
 final class TorBoxSearchSource: ObservableObject {
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always
     /// with no TorBox key). One group so the source list shows a single "TorBox Search" section.
-    @Published private(set) var streams: [CoreStream] = []
+    @Published private(set) var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
+    /// Monotonic epoch bumped whenever `streams` is REPLACED. `SourceListModel` folds this into its
+    /// O(1) rebuild signature (a single Int compare instead of hashing the array).
+    private(set) var epoch = 0
 
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
@@ -273,7 +276,14 @@ final class TorBoxSearchSource: ObservableObject {
     /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns `groups`
     /// unchanged when there is nothing to add — so a no-key / empty-result path is a pure pass-through.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        Self.merge(streams, into: groups)
+    }
+
+    /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
+    /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
+    /// wraps it for the existing main-actor call sites. Value types in, value types out, no state.
+    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        guard !extra.isEmpty else { return groups }
         var seenHashes: Set<String> = []
         var seenNZB: Set<String> = []
         var seenURLs: Set<String> = []
@@ -284,7 +294,7 @@ final class TorBoxSearchSource: ObservableObject {
                 if let u = s.url { seenURLs.insert(u) }
             }
         }
-        let fresh = streams.filter { s in
+        let fresh = extra.filter { s in
             if let h = s.infoHash?.lowercased() { return !seenHashes.contains(h) }
             if let n = s.nzbUrl { return !seenNZB.contains(n) }
             if let u = s.url { return !seenURLs.contains(u) }

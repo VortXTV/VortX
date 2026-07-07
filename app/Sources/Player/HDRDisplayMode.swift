@@ -6,13 +6,15 @@ import UIKit   // all UIKit/UIWindow usage below is inside #if os(tvOS); macOS j
 #endif
 import os
 
-/// The dynamic range mpv reports for the playing file, reduced to the modes the
-/// Apple TV display pipeline can be asked to match. Dolby Vision content renders
-/// through mpv's PQ path, so it requests the HDR10 display mode.
+/// The dynamic range the playing file carries, reduced to the modes the Apple TV display pipeline can be
+/// asked to match. When content plays through the libmpv/PQ lane (which tone-maps Dolby Vision) it requests
+/// the `hdr10` mode; when true Dolby Vision plays through the AVPlayer remux lane, it requests `dolbyVision`
+/// so the TV lights its Dolby Vision mode instead of HDR10.
 enum ContentDynamicRange: String {
     case sdr
     case hdr10
     case hlg
+    case dolbyVision
 }
 
 /// Drives the Apple TV's HDMI display-mode switch so HDR content lights the TV's
@@ -29,6 +31,11 @@ enum ContentDynamicRange: String {
 /// only misbehave on real hardware where the unified log is hard to reach.
 enum HDRDisplayMode {
     private static let log = Logger(subsystem: "com.stremiox.app", category: "hdr")
+
+    /// Posted (once per process) when a display-mode request is refused because the user has
+    /// Match Dynamic Range OFF, so the player chrome can surface an actionable hint instead of the
+    /// request dying silently in the log. `userInfo["message"]` carries the display text.
+    static let userHintNotification = Notification.Name("vortx.hdr.userHint")
 
     private static func note(_ message: String) {
         log.log("\(message, privacy: .public)")
@@ -74,6 +81,15 @@ enum HDRDisplayMode {
         }
         guard manager.isDisplayCriteriaMatchingEnabled else {
             note("display switch skipped: Match Dynamic Range is OFF (tvOS Settings > Video and Audio > Match Content)")
+            // Guardrail: this silent refusal is the #1 real-world reason "DV/HDR never engages" (Match
+            // Dynamic Range is OFF by default on every Apple TV). Surface ONE user-visible hint per process
+            // so the user learns the exact setting; fail-soft, message-only, playback is untouched.
+            if !matchRangeHintPosted {
+                matchRangeHintPosted = true
+                NotificationCenter.default.post(
+                    name: userHintNotification, object: nil,
+                    userInfo: ["message": "Turn on Settings > Video and Audio > Match Content > Match Dynamic Range for Dolby Vision / HDR output"])
+            }
             return
         }
         let rate = Float(fps > 0 ? fps : 60)
@@ -90,18 +106,47 @@ enum HDRDisplayMode {
         }
     }
 
-    /// Build the criteria. The private integer initializer is preferred: it is what
-    /// the field-proven tvOS players ship, while criteria built from synthetic format
-    /// descriptions via the public initializer have been seen being ignored by tvOS.
-    /// Falls back to the public path if the SPI ever disappears.
+    /// Build the criteria. The PUBLIC `AVDisplayCriteria(refreshRate:formatDescription:)` (tvOS 17+) is
+    /// preferred: built with a `kCMVideoCodecType_DolbyVisionHEVC` ('dvh1') format description it is the
+    /// documented, future-proof way to request Dolby Vision mode. Empirical KVC readback of criteria built
+    /// this way on tvOS 26.5 gives videoDynamicRange SDR=1, HLG=2, HDR10=4, DV=5, which proves the old
+    /// SPI integer table this code shipped (2=HDR10, 3=HLG, 4=DV, from tvOS 11-13-era Kodi/MrMC console
+    /// logs) is STALE on current tvOS: sending 4 today requests HDR10, so the previous "DV" request was
+    /// literally asking the panel for HDR10 (and "HDR10"=2 was asking for HLG). The SPI int initializer is
+    /// retained only as a fallback for pre-tvOS-17 / a failed format-description build, using the
+    /// empirically corrected integers.
     @MainActor
     private static func makeCriteria(range: ContentDynamicRange, rate: Float, width: Int, height: Int) -> AVDisplayCriteria? {
-        let sel = NSSelectorFromString("initWithRefreshRate:videoDynamicRange:")
-        if AVDisplayCriteria.instancesRespond(to: sel) {
-            let dynamicRange: Int32 = range == .hlg ? 3 : 2   // 2 = HDR10/PQ, 3 = HLG
-            note("criteria via SPI int initializer, videoDynamicRange=\(dynamicRange)")
-            return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: dynamicRange)
+        if #available(tvOS 17.0, *) {
+            if let format = makeFormatDescription(range: range, width: width, height: height) {
+                note("criteria via public formatDescription initializer, codec=\(range == .dolbyVision ? "dvh1" : "hvc1") range=\(range.rawValue)")
+                return AVDisplayCriteria(refreshRate: rate, formatDescription: format)
+            }
+            note("public formatDescription build failed; falling back to SPI int initializer")
         }
+        // SPI fallback (pre-tvOS-17, or the format-description build failed). Empirically corrected
+        // videoDynamicRange integers for CURRENT tvOS (KVC readback of public-built criteria, tvOS 26.5):
+        // 1 = SDR, 2 = HLG, 4 = HDR10/PQ, 5 = Dolby Vision (dvh1). The old 2/3/4 table requested the
+        // wrong modes on modern tvOS. The +2.5s switch-in-progress log remains the on-device confirmation.
+        let sel = NSSelectorFromString("initWithRefreshRate:videoDynamicRange:")
+        guard AVDisplayCriteria.instancesRespond(to: sel) else {
+            note("criteria failed: SPI initializer unavailable and public path failed")
+            return nil
+        }
+        let dynamicRange: Int32
+        switch range {
+        case .hlg:         dynamicRange = 2
+        case .dolbyVision: dynamicRange = 5
+        default:           dynamicRange = 4   // hdr10 / PQ (sdr never reaches here, it resets above)
+        }
+        note("criteria via SPI int initializer, videoDynamicRange=\(dynamicRange)")
+        return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: dynamicRange)
+    }
+
+    /// A synthetic CMVideoFormatDescription describing the content for the public criteria initializer.
+    /// Dolby Vision uses the 'dvh1' codec type (this is what flips videoDynamicRange to 5, the panel's DV
+    /// mode); HDR10 is HEVC+PQ (=4); HLG is HEVC+HLG (=2). All BT.2020, matching real DV/HDR bitstreams.
+    private static func makeFormatDescription(range: ContentDynamicRange, width: Int, height: Int) -> CMFormatDescription? {
         let transfer: CFString = range == .hlg
             ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
             : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
@@ -110,22 +155,28 @@ enum HDRDisplayMode {
             kCMFormatDescriptionExtension_TransferFunction: transfer,
             kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
         ]
+        let codec: CMVideoCodecType = range == .dolbyVision
+            ? kCMVideoCodecType_DolbyVisionHEVC   // 'dvh1', the DV sample-entry codec type
+            : kCMVideoCodecType_HEVC
         var format: CMFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: kCMVideoCodecType_HEVC,
+            codecType: codec,
             width: Int32(max(width, 1)),
             height: Int32(max(height, 1)),
             extensions: extensions as CFDictionary,
             formatDescriptionOut: &format
         )
         guard status == noErr, let format else {
-            note("criteria fallback failed: CMVideoFormatDescriptionCreate err=\(status)")
+            note("CMVideoFormatDescriptionCreate failed err=\(status) range=\(range.rawValue)")
             return nil
         }
-        note("criteria via public formatDescription initializer (SPI unavailable)")
-        return AVDisplayCriteria(refreshRate: rate, formatDescription: format)
+        return format
     }
+
+    /// One user-visible Match-Dynamic-Range hint per process (see the guard in `request`).
+    @MainActor
+    private static var matchRangeHintPosted = false
 
     /// Return the TV to its default display mode. Safe to call repeatedly.
     @MainActor

@@ -25,6 +25,7 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.playHeaders = coordinator.playHeaders
         mpv.playUrlLive = coordinator.playLive
         mpv.playAudioSidecarURL = coordinator.playAudioSidecar
+        mpv.contentIsDolbyVision = coordinator.contentIsDolbyVision
         mpv.startMuted = coordinator.muted
         mpv.loopPlayback = coordinator.loops
         mpv.forceFillVideo = coordinator.forceFill
@@ -52,10 +53,11 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         coordinator
     }
 
-    func play(_ url: URL, headers: [String: String]? = nil, audioSidecar: URL? = nil) -> Self {
+    func play(_ url: URL, headers: [String: String]? = nil, audioSidecar: URL? = nil, isDolbyVision: Bool = false) -> Self {
         coordinator.playUrl = url
         coordinator.playHeaders = headers
         coordinator.playAudioSidecar = audioSidecar
+        coordinator.contentIsDolbyVision = isDolbyVision
         return self
     }
 
@@ -100,6 +102,9 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         var playLive = false
         /// yt-direct adaptive pair: external audio stream mounted with the (video-only) playUrl at load.
         var playAudioSidecar: URL?
+        /// Dolby Vision flag for the launching stream; copied onto the controller in makeController so the
+        /// libmpv lane requests DV display mode for DV content on the FIRST load, not just source switches.
+        var contentIsDolbyVision = false
         /// Hero-preview only (#44): start the libmpv instance muted / looping for an ambient background clip.
         var muted = false
         var loops = false

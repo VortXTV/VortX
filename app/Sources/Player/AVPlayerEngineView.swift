@@ -16,9 +16,13 @@ import AVFoundation
 struct AVPlayerEngineView: PlatformViewRepresentable {
     @ObservedObject var coordinator: MPVMetalPlayerView.Coordinator
 
-    func play(_ url: URL, headers: [String: String]? = nil) -> Self {
+    /// `isDolbyVision` mirrors MPVMetalPlayerView.play: the launching stream's DV flag, copied onto the
+    /// engine before the initial loadFile so the Apple TV display-mode switch fires for the FIRST mount too
+    /// (source switches go through loadIntoPlayer, which sets `contentIsDolbyVision` on the live engine).
+    func play(_ url: URL, headers: [String: String]? = nil, isDolbyVision: Bool = false) -> Self {
         coordinator.playUrl = url
         coordinator.playHeaders = headers
+        coordinator.contentIsDolbyVision = isDolbyVision
         return self
     }
     func live(_ live: Bool) -> Self { coordinator.playLive = live; return self }
@@ -43,6 +47,7 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         view.playerLayer.player = engine.player
         engine.attachLayer(view.playerLayer)   // binds video gravity + PiP to this exact layer
         engine.attachSubtitleOverlay(view.subtitleOverlay)   // draw external srt/vtt subs above the video
+        engine.contentIsDolbyVision = coordinator.contentIsDolbyVision   // BEFORE loadFile (pre-attach DV switch)
         if let url = coordinator.playUrl {
             engine.loadFile(url, headers: coordinator.playHeaders, live: coordinator.playLive)
         }

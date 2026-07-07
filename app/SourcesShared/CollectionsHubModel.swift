@@ -88,6 +88,16 @@ struct GenreSpec: Hashable {
     var tint: Color { Theme.Palette.accent }   // ember accent, not a per-genre rainbow hue (VortX identity)
 }
 
+/// A browse-by-decade tile: a release-year window. Kept a plain value (like GenreSpec) so `HubTarget` stays
+/// trivially Hashable. The sub-catalogs bake the window into every TMDB discover query.
+struct DecadeSpec: Hashable {
+    let title: String
+    let symbol: String
+    let startYear: Int
+    let endYear: Int
+    var tint: Color { Theme.Palette.accent }
+}
+
 // MARK: - Hub target (what a tile points at)
 
 /// What a tapped tile opens. Hashable + self-describing so the iOS `NavigationStack(path:)` can push it and
@@ -96,12 +106,14 @@ enum HubTarget: Hashable {
     case discover(DiscoverList)
     case service(id: Int, name: String)
     case genre(GenreSpec)
+    case decade(DecadeSpec)
 
     var title: String {
         switch self {
         case .discover(let l): return l.title
         case .service(_, let name): return name
         case .genre(let g): return g.title
+        case .decade(let d): return d.title
         }
     }
 }
@@ -125,6 +137,7 @@ enum CollectionsCatalog {
         case .discover(let list): return discoverSubs(list, region: region)
         case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region)
         case .genre(let g):       return scopedSubs(movieScope: genreScope(g, media: "movie"), tvScope: genreScope(g, media: "tv"), region: region)
+        case .decade(let d):      return decadeSubs(d, region: region)
         }
     }
 
@@ -176,6 +189,29 @@ enum CollectionsCatalog {
             top("topyear", "Top This Year", days: 365, minVotes: 10),
             sub("trending", "Trending",
                 movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: { "\($0)&sort_by=popularity.desc" }),
+        ]
+    }
+
+    // MARK: Browse-by-decade sub-catalogs (a release-year window baked into every discover query)
+
+    /// Movies/Shows/New/Trending scoped to a decade's release-year window. Unlike the genre/service set this
+    /// OMITS the Top-This-Week/Month/Year pills (a rolling recent window is meaningless for an old decade), and
+    /// "New" sorts by release date DESCENDING WITHIN the decade (the window's `.lte` is the decade end, never
+    /// today), so "New Movies" in the 1980s means the latest 1980s releases.
+    private static func decadeSubs(_ d: DecadeSpec, region: String) -> [SubCatalog] {
+        let movieWindow = "primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31"
+        let tvWindow = "first_air_date.gte=\(d.startYear)-01-01&first_air_date.lte=\(d.endYear)-12-31"
+        func sub(_ id: String, _ title: String, movie: String?, tv: String?) -> SubCatalog {
+            SubCatalog(id: id, title: title, load: { page in
+                await mergedDiscover(movie: movie, tv: tv, region: region, page: page)
+            })
+        }
+        return [
+            sub("movies", "Movies", movie: "\(movieWindow)&sort_by=popularity.desc", tv: nil),
+            sub("shows", "Shows", movie: nil, tv: "\(tvWindow)&sort_by=popularity.desc"),
+            sub("newmovies", "New Movies", movie: "\(movieWindow)&sort_by=primary_release_date.desc&vote_count.gte=5", tv: nil),
+            sub("newshows", "New Shows", movie: nil, tv: "\(tvWindow)&sort_by=first_air_date.desc&vote_count.gte=5"),
+            sub("trending", "Trending", movie: "\(movieWindow)&sort_by=popularity.desc", tv: "\(tvWindow)&sort_by=popularity.desc"),
         ]
     }
 
@@ -266,11 +302,18 @@ final class CollectionsHubModel: ObservableObject {
 
     let discover = DiscoverList.allCases
     let genres = CollectionsHubModel.genreList
+    let decades = CollectionsHubModel.decadeList
 
     private var loadedRegion: String?
     private var loadTask: Task<Void, Never>?
     private var genreTask: Task<Void, Never>?
     private var discoverTask: Task<Void, Never>?
+    /// Monotonic generation tags: a Task is a value type and cannot be compared by identity, so each load bumps
+    /// its tag and captures it; a task only clears its stored handle when its captured tag still matches, so a
+    /// task completing after a clear()+restart can tell it is no longer the current handle and leaves it alone.
+    private var loadGen = 0
+    private var genreGen = 0
+    private var discoverGen = 0
 
     /// Available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres) even with
     /// no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
@@ -296,15 +339,19 @@ final class CollectionsHubModel: ObservableObject {
             loadedRegion = region
             if Self.cacheIsFresh(region: region) { return }   // fresh enough; skip the refetch
         }
-        loadTask = Task { [weak self] in
+        loadGen += 1; let myGen = loadGen
+        let thisTask = Task { [weak self] in
             let fetched = await TMDBClient.regionProviders(region: region)
             guard let self, !Task.isCancelled else { return }
-            self.loadTask = nil
+            // Only clear the stored handle if it still points at this task; a load() racing a clear()
+            // (which nils loadTask before starting a fresh one) must not null out the newer load's handle.
+            if self.loadGen == myGen { self.loadTask = nil }
             guard !fetched.isEmpty else { return }   // keep cache/old on an empty fetch
             self.providers = Self.applyOrder(fetched)
             self.loadedRegion = region
             Self.cacheProviders(fetched, region: region)
         }
+        loadTask = thisTask
     }
 
     func clear() {
@@ -323,7 +370,8 @@ final class CollectionsHubModel: ObservableObject {
         if let cached = Self.cachedGenreBackdrops(region: region) { genreBackdrops = cached }
         if Self.genreCacheIsFresh(region: region) { return }
         guard genreTask == nil else { return }
-        genreTask = Task { [weak self] in
+        genreGen += 1; let myGen = genreGen
+        let thisTask = Task { [weak self] in
             var out: [String: String] = [:]
             let genres = CollectionsHubModel.genreList
             let batchSize = 4   // cap concurrency: a once-daily op, kept gentle on TMDB to avoid 429s
@@ -342,11 +390,16 @@ final class CollectionsHubModel: ObservableObject {
                 if Task.isCancelled { break }
                 i += batchSize
             }
-            guard let self, !Task.isCancelled, !out.isEmpty else { self?.genreTask = nil; return }
+            // Only clear the stored handle if it still points at this task (see load()).
+            guard let self, !Task.isCancelled, !out.isEmpty else {
+                if self?.genreGen == myGen { self?.genreTask = nil }
+                return
+            }
+            if self.genreGen == myGen { self.genreTask = nil }
             self.genreBackdrops = out          // keep the prior cache on an all-empty fetch (don't blank the tiles)
-            self.genreTask = nil
             Self.cacheGenreBackdrops(out, region: region)
         }
+        genreTask = thisTask
     }
 
     private static func genreCacheKey(_ region: String) -> String { "vortx.collections.genreBackdrops.\(region)" }
@@ -376,7 +429,8 @@ final class CollectionsHubModel: ObservableObject {
         if let cached = Self.cachedDiscoverBackdrops(region: region) { discoverBackdrops = cached }
         if Self.discoverCacheIsFresh(region: region) { return }
         guard discoverTask == nil else { return }
-        discoverTask = Task { [weak self] in
+        discoverGen += 1; let myGen = discoverGen
+        let thisTask = Task { [weak self] in
             var out: [DiscoverList: String] = [:]
             // Only four cards, so a single gentle task group is enough (no batching needed); kept 429-safe.
             await withTaskGroup(of: (DiscoverList, String?).self) { group in
@@ -387,11 +441,16 @@ final class CollectionsHubModel: ObservableObject {
                 }
                 for await (card, url) in group { if let url { out[card] = url } }
             }
-            guard let self, !Task.isCancelled, !out.isEmpty else { self?.discoverTask = nil; return }
+            // Only clear the stored handle if it still points at this task (see load()).
+            guard let self, !Task.isCancelled, !out.isEmpty else {
+                if self?.discoverGen == myGen { self?.discoverTask = nil }
+                return
+            }
+            if self.discoverGen == myGen { self.discoverTask = nil }
             self.discoverBackdrops = out       // keep the prior cache on an all-empty fetch (don't blank the tiles)
-            self.discoverTask = nil
             Self.cacheDiscoverBackdrops(out, region: region)
         }
+        discoverTask = thisTask
     }
 
     private static func discoverCacheKey(_ region: String) -> String { "vortx.collections.discoverBackdrops.\(region)" }
@@ -468,6 +527,19 @@ final class CollectionsHubModel: ObservableObject {
     }
 
     // MARK: genre tiles (incl. Anime keyword + Documentary)
+
+    /// Browse-by-decade tiles, newest first, back to the 1950s. Fixed windows (the current decade's window runs
+    /// to its natural end; TMDB simply has few entries past today, and popularity.desc surfaces the real ones).
+    static let decadeList: [DecadeSpec] = [
+        DecadeSpec(title: "2020s", symbol: "calendar", startYear: 2020, endYear: 2029),
+        DecadeSpec(title: "2010s", symbol: "calendar", startYear: 2010, endYear: 2019),
+        DecadeSpec(title: "2000s", symbol: "calendar", startYear: 2000, endYear: 2009),
+        DecadeSpec(title: "1990s", symbol: "calendar", startYear: 1990, endYear: 1999),
+        DecadeSpec(title: "1980s", symbol: "calendar", startYear: 1980, endYear: 1989),
+        DecadeSpec(title: "1970s", symbol: "calendar", startYear: 1970, endYear: 1979),
+        DecadeSpec(title: "1960s", symbol: "calendar", startYear: 1960, endYear: 1969),
+        DecadeSpec(title: "1950s", symbol: "calendar", startYear: 1950, endYear: 1959),
+    ]
 
     static let genreList: [GenreSpec] = [
         GenreSpec("Action", "flame.fill", hue: 0.02, movie: 28, tv: 10759),

@@ -97,7 +97,10 @@ enum PlayerEngineRouter {
         // iOS only (AVAssetDownloadURLSession is unavailable on tvOS and native macOS), so it never fires there.
         if url.isFileURL, url.pathExtension.lowercased() == "movpkg" { return .avfoundation }
 
-        // (2) Explicit user override wins for non-torrents.
+        // (2) Explicit user override wins for non-torrents. NOTE: an `.mpv` override short-circuits BEFORE
+        // the DV rules below, silently disabling the true-DV remux lane for Dolby Vision streams. This
+        // function runs per render, so the guardrail message for that case (DiagnosticsLog + one-shot
+        // in-player notice) lives in the chrome at play start (TVPlayerView.onAppear), not here.
         switch override {
         case .mpv:          return .mpv
         case .avfoundation: return .avfoundation
@@ -144,14 +147,18 @@ enum PlayerEngineRouter {
     /// container AVPlayer handles natively. Used by rule (3) so the DV flip only fires when it can succeed.
     static func isAVPlayerContainer(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
-        if ext == "mp4" || ext == "m4v" || ext == "mov" || isHLS(url) { return true }
+        if ext == "mp4" || ext == "m4v" || ext == "mov" { return true }
+        if isHLS(url) { return true }
         // Debrid/CDN links carry the filename in a query param or an extensionless /download/<id> path
-        // (e.g. TorBox "...?file=Movie.DV.mp4"), so pathExtension is empty and a genuinely-playable DV mp4
-        // wrongly went to libmpv. Only widen when the path has NO usable extension, so a real .mkv path
-        // still returns false and stays on libmpv.
+        // (e.g. TorBox "...?file=Movie.DV.mp4"), so pathExtension is empty. Scan ONLY the filename + query,
+        // NOT the whole URL: a stray ".mp4" token in the host or path (a CDN id, a "trailer.mp4" query) used to
+        // mislabel a real MKV as AVPlayer-native, which then routed the DV MKV to raw AVPlayer (no Matroska
+        // demuxer -> item .failed -> "can't play this file"). A Matroska hint in the filename/query VETOES, so a
+        // DV MKV is never called native; only a genuine mp4/m4v/mov filename token widens.
         if ext.isEmpty {
-            let s = url.absoluteString.lowercased()
-            if s.contains(".mp4") || s.contains(".m4v") || s.contains(".mov") { return true }
+            let hint = (url.lastPathComponent + " " + (url.query ?? "")).lowercased()
+            if hint.contains(".mkv") || hint.contains("matroska") { return false }
+            if hint.contains(".mp4") || hint.contains(".m4v") || hint.contains(".mov") { return true }
         }
         return false
     }
@@ -164,7 +171,12 @@ enum PlayerEngineRouter {
         guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
         let host = (url.host ?? "").lowercased()
         if host == "127.0.0.1" || host == "localhost" || host.isEmpty { return false }
-        if isAVPlayerContainer(url) { return false }   // a real mp4/mov/m4v/HLS never needs remux
+        // A genuine path-level mp4/m4v/mov (or HLS) is AVPlayer-native and never needs the remux. Do NOT gate on
+        // isAVPlayerContainer here: its extensionless mp4-token heuristic wrongly disqualified DV MKVs delivered
+        // as extensionless debrid links carrying a stray ".mp4" token, so they routed to raw AVPlayer AND could
+        // not remux -> dead end. Only a real native path extension vetoes; the Matroska checks below then decide.
+        let pathExt = url.pathExtension.lowercased()
+        if pathExt == "mp4" || pathExt == "m4v" || pathExt == "mov" || isHLS(url) { return false }
         let s = url.absoluteString.lowercased()
         let ext = url.pathExtension.lowercased()
         if ext == "mkv" { return true }

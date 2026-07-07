@@ -141,7 +141,16 @@ enum StremioServer {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = data
-        URLSession.shared.dataTask(with: req).resume()
+        // Fire-and-forget, but read the response so a failed torrent-create is not silently masked
+        // (a peerless engine surfaces later as the "sources didn't load" red triangle). We do not
+        // retry here -- the file endpoint blocks until ready and /create is idempotent -- we just log.
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            if let err = err {
+                NSLog("[create-probe] prepare %@: %@", ih, err.localizedDescription)
+            } else if let code = (resp as? HTTPURLResponse)?.statusCode, code / 100 != 2 {
+                NSLog("[create-probe] prepare %@: HTTP %d", ih, code)
+            }
+        }.resume()
     }
 
     /// (Re)prime the embedded torrent engine for a KNOWN INFO HASH (not a full Stream), injecting the
@@ -162,7 +171,16 @@ enum StremioServer {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = data
-        URLSession.shared.dataTask(with: req).resume()
+        // Fire-and-forget, but read the response so a failed prime is not silently masked (an
+        // unprimed CW resume surfaces later as the "sources didn't load" red triangle). No retry:
+        // /create is idempotent and the player's warm-up polling is the real readiness gate.
+        URLSession.shared.dataTask(with: req) { _, resp, err in
+            if let err = err {
+                NSLog("[create-probe] primeTorrent %@: %@", hash, err.localizedDescription)
+            } else if let code = (resp as? HTTPURLResponse)?.statusCode, code / 100 != 2 {
+                NSLog("[create-probe] primeTorrent %@: HTTP %d", hash, code)
+            }
+        }.resume()
     }
 
     /// Cap the embedded server's torrent cache once it's reachable. The server defaults to a

@@ -287,8 +287,11 @@ function startPlayback(vid: HTMLVideoElement): void {
     // Autoplay with audio was blocked. Mute and retry so the picture starts; mark that we auto-muted so the
     // unmute affordance appears and a later user gesture can restore sound.
     if (wasMuted) return; // already muted by the user's saved preference; nothing to recover
-    vid.muted = true;
+    // Flag the auto-mute BEFORE muting: the mute fires `volumechange`, and the volume UI persists on that
+    // event - it must see autoMuted so it does NOT save this as a user "muted" preference (which poisoned
+    // every later mobile session into a permanent silent start; see renderVolume in playerControls).
     controller?.setAutoMuted(true);
+    vid.muted = true;
     vid.play().catch(() => {
       /* even muted autoplay blocked; the visible Play button lets the user start it */
     });

@@ -49,6 +49,13 @@ struct InHeroTrailerView: View {
     /// the view, never shared with the main player's coordinator.
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
 
+    /// "A fullscreen player is up" signal. This hero view stays MOUNTED under a presented player (the
+    /// browse UI is not torn down by fullScreenCover / the Mac host), so without this gate the clip's
+    /// libmpv instance kept decoding + re-fetching its looping 1080p trailer beneath the whole movie:
+    /// micro stutter and audio crackle on every stream. The clip unmounts while a player is active and
+    /// remounts (with a fresh reveal fade) when playback closes.
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
+
     /// Flips true once the clip has actually started decoding AND the start-delay beat has passed, which
     /// cross-fades it in over the still backdrop. Gating the reveal on real playback means a clip that never
     /// loads (offline server, resolver miss) simply never appears, leaving the still art.
@@ -80,7 +87,7 @@ struct InHeroTrailerView: View {
 
     var body: some View {
         ZStack {
-            if serverReady, !failed {
+            if serverReady, !failed, !playbackGate.playerActive {
                 // The muted, looping libmpv surface. Opacity-gated (not conditionally mounted) so the
                 // player keeps decoding behind the scrim while we wait for the start-delay beat; revealing
                 // it is a pure cross-fade with no reload.
@@ -121,20 +128,35 @@ struct InHeroTrailerView: View {
                 serverReady = true
             }
         }
+        // A fullscreen player presented over this hero just unmounted the clip (libmpv torn down). Reset
+        // the reveal beat so the clip re-runs its decode-gated fade-in when it remounts after playback
+        // closes, instead of flashing a black not-yet-decoding surface at full opacity.
+        // Single-parameter onChange form: the iOS target deploys to 16.0, where the zero-parameter
+        // iOS 17 overload does not exist (it broke the CI iOS build).
+        .onChange(of: playbackGate.playerActive) { active in
+            if active { showClip = false; didStart = false; startedDelay = false }
+        }
         // Decorative ambient layer; the hero title / actions carry the accessible content.
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the hero backdrop uses, so the title / meta stay legible over video and the band
-    /// reads consistently whether the still art or the clip is showing.
+    /// The scrim the moving clip carries so the title / logo / meta / synopsis stay legible over video.
+    /// A moving clip has bright motion the still backdrop does not, so this scrim is tuned to match OR
+    /// EXCEED the still-backdrop scrim (see the hero `backdrop` overlays): a deeper vertical fade, a top
+    /// scrim for the chrome discs, and a leading fade for the title column. Without the top scrim and the
+    /// deeper mid stops the logo looked washed out / covered once the clip faded in (owner report), even
+    /// though the details paint ABOVE the clip in the ZStack.
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas.opacity(0.30), location: 0.45),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.72),
+                .init(color: Theme.Palette.canvas.opacity(0.90), location: 0.90),
                 .init(color: Theme.Palette.canvas, location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }

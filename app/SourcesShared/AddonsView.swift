@@ -70,6 +70,13 @@ final class AddonHealthStore: ObservableObject {
 
     nonisolated private static func check(_ transportUrl: String) async -> AddonHealth {
         guard let url = URL(string: transportUrl) else { return .down }
+        // SSRF guard, same policy as installAddon/previewAddonManifest (AddonURLGuard). A transportUrl can
+        // arrive from a synced account doc or the web dashboard, not just a user paste, so never let this
+        // auto-firing reachability probe hit an arbitrary private / LAN / link-local / metadata target and
+        // turn the app into a network scanner. The ONE legitimate private target is the app's own loopback
+        // streaming server (the default 127.0.0.1 local add-on); a discard-response GET to loopback has no
+        // attacker feedback channel, so it is exempt while everything else private is refused.
+        if !isLoopbackHost(url.host), await AddonURLGuard.validate(url) != nil { return .down }
         var req = URLRequest(url: url)
         req.timeoutInterval = timeout
         // Some add-on CDNs reject non-browser User-Agents (same lesson as AddonClient + the libmpv fetches).
@@ -84,6 +91,15 @@ final class AddonHealthStore: ObservableObject {
         } catch {
             return .down
         }
+    }
+
+    /// True when `host` is on-device loopback (localhost / 127.0.0.0/8 / ::1). Exempt from the probe's SSRF
+    /// guard so the default 127.0.0.1 local-add-on still reports its real status (see check(_:)).
+    nonisolated private static func isLoopbackHost(_ host: String?) -> Bool {
+        guard var h = host, !h.isEmpty else { return false }
+        if h.hasPrefix("[") && h.hasSuffix("]") { h = String(h.dropFirst().dropLast()) }  // unbracket IPv6 literals
+        let lower = h.lowercased()
+        return lower == "localhost" || lower == "::1" || lower.hasPrefix("127.")
     }
 }
 
@@ -102,11 +118,18 @@ struct AddonsView: View {
     @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
     @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
     @State private var showPairing = false         // the Install-by-QR "pair once, add many" sheet
+    // Observed + READ in body (see `let _ = orderObserver.revision`) so the list re-sorts LIVE after a
+    // reorder. appliedAddonOrder is a plain UserDefaults static, not @Published, so this is SwiftUI's only
+    // signal to re-run orderedByApplied; without it the new order showed only on the next cold launch.
+    @ObservedObject private var orderObserver = AddonOrderObserver.shared
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
+                    // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
+                    let _ = orderObserver.revision
                     Text("Add-ons").screenTitleStyle()
                     if !account.isSignedIn {
                         hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
@@ -129,16 +152,50 @@ struct AddonsView: View {
                                 .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                             }
                             .buttonStyle(.plain)
+                            // Drag add-ons into the order you want. The order is the PRIORITY spine (which
+                            // add-on's catalogs and sources come first) and syncs to the dashboard + your
+                            // other devices via doc.addonOrder, the same order the dashboard drag writes.
+                            // iOS / Mac only: the drag-reorder List needs the touch/pointer drag tvOS lacks
+                            // (tvOS reorder is a separate focus-based UX); the dashboard covers tvOS ordering.
+                            #if !os(tvOS)
+                            if core.addons.count > 1 {
+                                NavigationLink { AddonReorderView() } label: {
+                                    HStack(spacing: Theme.Space.md) {
+                                        Label("Reorder add-ons", systemImage: "arrow.up.arrow.down")
+                                            .font(Theme.Typography.cardTitle)
+                                            .foregroundStyle(Theme.Palette.textPrimary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+                                    }
+                                    .padding(Theme.Space.md)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            #endif
                             hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
                             HStack {
+                                // tvOS: keep the button LEFT-aligned so it sits directly above the first
+                                // add-on row (also left-aligned) and a Down press lands on that row. Right-
+                                // aligned behind a Spacer, it sat off the rows' downward focus beam, so focus
+                                // stalled at "Re-check status" and never entered the list (owner-reported).
+                                // NOT wrapping rows in per-row .focusSection() on purpose: stacked sibling
+                                // focus sections make tvOS skip rows (the Collections-hub region-jump lesson);
+                                // plain VStack rows step geometrically once entry is on-axis.
+                                #if !os(tvOS)
                                 Spacer()
+                                #endif
                                 Button { health.probe(core.addons.map(\.transportUrl), force: true) } label: {
                                     Label("Re-check status", systemImage: "arrow.clockwise")
                                 }
                                 .buttonStyle(ChipButtonStyle(selected: false))
                                 .fixedSize()
+                                #if os(tvOS)
+                                Spacer()
+                                #endif
                             }
-                            ForEach(core.addons) { addon in addonRow(addon) }
+                            ForEach(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })) { addon in addonRow(addon) }
                         }
                     }
                 }
@@ -245,10 +302,31 @@ struct AddonsView: View {
         let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
         let tint = isOff ? Theme.Palette.textTertiary
                          : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
-        if let logo = addon.manifest.logo, let url = URL(string: logo) {
-            AsyncImage(url: url) { phase in
-                if let image = phase.image {
-                    image.resizable().scaledToFit()
+        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff)
+    }
+
+    /// Add-on logo, DOWNSAMPLED via PosterImageLoader (maxPixel 168 = the 56pt @3x on-screen size) instead of
+    /// AsyncImage, which decoded each logo at FULL resolution. With a whole account's worth of add-ons rendered
+    /// at once (a synced account can carry 25+), that burst of full-res bitmaps ballooned resident memory into
+    /// the hundreds of MB / ~1 GB and made the Add-ons screen lag badly (owner-reported "unusable" on Mac).
+    /// Falls back to the capability SF Symbol when there is no logo or it fails to load. Mirrors PosterCardiOS's
+    /// warm-cache + `.task(id:)` pattern so a revisit never flashes blank.
+    private struct AddonLogoIcon: View {
+        let logo: String?
+        let symbol: String
+        let tint: Color
+        let isOff: Bool
+        @State private var image: VXPosterImage?
+
+        private var warmCache: VXPosterImage? {
+            guard let logo, let u = URL(string: logo) else { return nil }
+            return PosterImageLoader.cached(u)
+        }
+
+        var body: some View {
+            Group {
+                if let img = image ?? warmCache {
+                    imageView(img).resizable().scaledToFit()
                         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
                         .opacity(isOff ? 0.5 : 1)
                 } else {
@@ -256,8 +334,19 @@ struct AddonsView: View {
                 }
             }
             .frame(width: 56, height: 56)
-        } else {
-            Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint).frame(width: 56)
+            .task(id: logo) {
+                guard image == nil, let logo, !logo.isEmpty else { return }
+                // 168px = 56pt @3x: only the on-screen size ever sits in memory, never a 1000px+ full-res logo.
+                if let img = await PosterImageLoader.load(logo, maxPixel: 168) { image = img }
+            }
+        }
+
+        private func imageView(_ img: VXPosterImage) -> Image {
+            #if canImport(UIKit)
+            Image(uiImage: img)
+            #else
+            Image(nsImage: img)
+            #endif
         }
     }
 
@@ -294,36 +383,45 @@ struct AddonsView: View {
         .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
     }
 
-    /// The add-on's action chips, laid out in their own horizontally-scrolling row beneath the info so they
-    /// never steal width from the name / detail column. Scrolls rather than wrapping so a phone with several
-    /// chips stays one clean line.
+    /// The add-on's action chips, in their own row beneath the info so they never steal width from the name /
+    /// detail column. On iPhone the four chips of a configurable add-on (Configure + link + eye + Remove)
+    /// overflowed a single horizontal-scroll row and CLIPPED Remove off the right edge (owner-reported "the
+    /// add-on page is cut off from the side" - the clipped chip was the one you most need). So on iOS / Mac
+    /// they now WRAP (FlowLayout): a narrow phone drops Remove to a second line instead of hiding it, while
+    /// iPad / Mac keep them on one line. tvOS is wide and focus-driven, so it keeps the scroll row unchanged.
     @ViewBuilder private func addonActions(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        #if os(tvOS)
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: Theme.Space.sm) {
-                // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
-                // regardless of protected state; protected defaults are not configurable anyway.
-                if addon.isConfigurable {
-                    Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
-                        .buttonStyle(ChipButtonStyle(selected: false))
-                        .fixedSize()
-                }
-                if !addon.isProtected {
-                    // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
-                    // URL first, then removes the old, so a bad URL never leaves you with neither.
-                    Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
-                        .buttonStyle(ChipButtonStyle(selected: false))
-                        .fixedSize()
-                    // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
-                    Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
-                        Image(systemName: isOff ? "eye.slash" : "eye")
-                    }
-                    .buttonStyle(ChipButtonStyle(selected: !isOff))
-                    .fixedSize()
-                    Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
-                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
-                        .fixedSize()
-                }
+            HStack(spacing: Theme.Space.sm) { addonActionChips(addon, isOff: isOff) }
+        }
+        #else
+        FlowLayout(spacing: Theme.Space.sm) { addonActionChips(addon, isOff: isOff) }
+        #endif
+    }
+
+    @ViewBuilder private func addonActionChips(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
+        // regardless of protected state; protected defaults are not configurable anyway.
+        if addon.isConfigurable {
+            Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .fixedSize()
+        }
+        if !addon.isProtected {
+            // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
+            // URL first, then removes the old, so a bad URL never leaves you with neither.
+            Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .fixedSize()
+            // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
+            Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
+                Image(systemName: isOff ? "eye.slash" : "eye")
             }
+            .buttonStyle(ChipButtonStyle(selected: !isOff))
+            .fixedSize()
+            Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
+                .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                .fixedSize()
         }
     }
 
@@ -335,6 +433,66 @@ struct AddonsView: View {
             .padding(.top, Theme.Space.sm)
     }
 }
+
+#if !os(tvOS)
+/// Drag the installed add-ons into your preferred PRIORITY order (which add-on's catalogs and sources come
+/// first). Each drop writes `VortXSyncManager.appliedAddonOrder` and pushes it immediately, so the order
+/// syncs to the dashboard and your other devices via doc.addonOrder - the same order the dashboard drag
+/// writes. iOS forces edit mode on; macOS reorders by native row drag. iOS / Mac only (tvOS lacks the drag).
+struct AddonReorderView: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
+    @State private var ordered: [CoreDescriptor] = []
+
+    var body: some View {
+        List {
+            ForEach(ordered) { addon in
+                HStack(spacing: Theme.Space.md) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(addon.manifest.name)
+                            .font(Theme.Typography.cardTitle)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .lineLimit(1)
+                        Text(addon.host)
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .padding(.vertical, 4)
+                .listRowBackground(Theme.Palette.surface1)
+                .listRowSeparator(.hidden)
+            }
+            .onMove(perform: move)
+        }
+        .scrollContentBackground(.hidden)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle("Reorder Add-ons")
+        .navigationBarTitleDisplayMode(.inline)
+        .environment(\.editMode, .constant(.active))
+        #endif
+        .macBackAffordance()
+        .onAppear { reload() }
+        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
+        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
+    }
+
+    /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
+    /// in any add-on installed since (appended at the end by orderedByApplied).
+    private func reload() {
+        ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
+    }
+
+    private func move(from source: IndexSet, to destination: Int) {
+        ordered.move(fromOffsets: source, toOffset: destination)
+        VortXSyncManager.shared.applyInAppAddonOrder(ordered.map { $0.transportUrl })
+    }
+}
+#endif
 
 /// Configure a configurable add-on. On iPhone, iPad, and Mac it opens the add-on's web configuration
 /// page in the browser; on Apple TV (which has no browser) it shows that page as a QR to finish on a

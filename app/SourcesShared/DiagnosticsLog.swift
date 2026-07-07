@@ -29,12 +29,25 @@ enum DiagnosticsLog {
     static func logSync(_ category: String, _ message: String) {
         let line = "\(stamp.string(from: Date())) [\(category)] \(message)\n"
         queue.sync { append(line) }
+        mirrorToProbe(category, message)
     }
 
     /// Append one line. Safe from any thread; never throws, never blocks the caller.
     static func log(_ category: String, _ message: String) {
         let line = "\(stamp.string(from: Date())) [\(category)] \(message)\n"
         queue.async { append(line) }
+        mirrorToProbe(category, message)
+    }
+
+    /// Mirror into the EXPORTABLE probe log (Caches/vortx-diag.log). The in-app log export serves ONLY
+    /// VXProbe's file (VXDiagExport), while this diagnostics.log is a devicectl-pull escape hatch users
+    /// never send, so every DV/HDR/demote breadcrumb written only here was invisible in user reports
+    /// (#76: the exported trail misleadingly ended at "remux classify"). Gated on VXProbe.enabled so
+    /// probe-off runs pay nothing; VXProbeFileLog.record is async on its own utility queue and swallows
+    /// all errors, and it never calls back into DiagnosticsLog, so there is no recursion.
+    private static func mirrorToProbe(_ category: String, _ message: String) {
+        guard VXProbe.enabled else { return }
+        VXProbeFileLog.shared.record(category: category, message: message)
     }
 
     private static func append(_ line: String) {

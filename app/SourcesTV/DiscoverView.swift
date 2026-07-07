@@ -55,7 +55,7 @@ struct DiscoverView: View {
         }
         .onAppear { if core.discover == nil { core.loadDiscover() }; seed(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: core.discover?.items.first?.id) { seed() }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Home too
     }
 
     private func seed() {

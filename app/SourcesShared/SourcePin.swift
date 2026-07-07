@@ -41,7 +41,7 @@ struct ResolvedPin: Equatable {
 
 /// The minimal title context a stream list needs to offer pinning: the meta id (the movie or the show)
 /// and whether it is a series, which only changes the menu wording ("this show" vs "this movie").
-struct SourcePinContext {
+struct SourcePinContext: Equatable {
     let metaId: String
     let isSeries: Bool
     var entryNoun: String { isSeries ? "show" : "movie" }

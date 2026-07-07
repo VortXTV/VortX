@@ -32,6 +32,9 @@ actor MoatToken {
     private var cached: (token: String, expiresAt: Date)?
     /// A single in-flight mint shared by concurrent callers, so N simultaneous gated reads mint once.
     private var inFlight: Task<String?, Never>?
+    /// Monotonic tag identifying the current mint. clear() bumps it so a stale mint's store()/clearInFlight
+    /// (which run after its await returns) cannot clobber a newer mint's state.
+    private var mintGeneration: UInt64 = 0
 
     /// Refresh the token this far BEFORE its stated expiry, so a read never rides an about-to-die token across
     /// the worker's clock skew. 60 s covers a slow mint + request latency.
@@ -56,11 +59,18 @@ actor MoatToken {
         }
         // Coalesce concurrent mints onto one task.
         if let task = inFlight { return await task.value }
+        // Tag each mint with a token so store()/clearInFlight only act when THIS mint still owns inFlight; a
+        // concurrent clear()/re-mint bumps the tag so a stale task cannot clobber the newer one.
+        mintGeneration &+= 1
+        let generation = mintGeneration
         let task = Task<String?, Never> { [weak self] in
             guard let self else { return nil }
             let minted = await Self.mint()
-            await self.store(minted)
-            await self.clearInFlight()
+            // A concurrent clear() cancels this task and may have already started a fresh mint; if so, do not
+            // store a stale result or clear the newer in-flight pointer (which would defeat coalescing).
+            if Task.isCancelled { return nil }
+            await self.store(minted, generation: generation)
+            await self.clearInFlight(generation: generation)
             return minted?.token
         }
         inFlight = task
@@ -78,6 +88,7 @@ actor MoatToken {
         cached = nil
         inFlight?.cancel()
         inFlight = nil
+        mintGeneration &+= 1   // orphan any in-flight mint so its late store()/clearInFlight is a no-op
     }
 
     // MARK: - Header stamping helpers
@@ -93,6 +104,11 @@ actor MoatToken {
     /// The moat token as a query-param value for `<img>`/`<video>` element loads that cannot carry a custom
     /// header (trickplay sprites, pooled art). Returns nil when there is no token. The worker reads `vmoat`
     /// as the query fallback for `X-VX-Moat`, mirroring the `VortXEdgeAuth` query-sig convention.
+    ///
+    /// LEAKAGE NOTE: prefer `stamp(_:isSignedIn:)` (the header path) wherever the loader can carry a header; a
+    /// token on the URL is short-lived but can otherwise linger in logs and the persistent URLCache. Callers
+    /// that must use this query form MUST NOT log the built URL and SHOULD load it on an ephemeral session so
+    /// the token is not written to the on-disk cache. This type itself logs nothing.
     func queryValue(isSignedIn: Bool) async -> String? {
         await current(isSignedIn: isSignedIn)
     }
@@ -159,12 +175,18 @@ actor MoatToken {
 
     // MARK: - Actor-isolated mutators (called from the mint Task)
 
-    private func store(_ minted: Minted?) {
+    private func store(_ minted: Minted?, generation: UInt64) {
+        guard generation == mintGeneration else { return }   // a clear()/re-mint superseded this mint: drop it
         guard let minted else { return }   // keep any still-valid cached token on a failed refresh
         cached = (token: minted.token, expiresAt: minted.expiresAt)
     }
 
-    private func clearInFlight() { inFlight = nil }
+    /// Clear the in-flight pointer only if this generation still owns it, so a stale mint completing after a
+    /// concurrent clear()/re-mint does not null out the newer in-flight task (which would defeat coalescing).
+    private func clearInFlight(generation: UInt64) {
+        guard generation == mintGeneration else { return }
+        inFlight = nil
+    }
 
     // MARK: - Wire shape
 
