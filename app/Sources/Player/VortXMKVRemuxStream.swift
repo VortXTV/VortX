@@ -220,9 +220,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var mappable = Set<Int>()
         var audioSeen: [String] = []
         var hasDecodableAudio = false
-        // The first audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/
-        // PCM..., a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable
-        // track: stream-copy always beats a transcode.
+        // Gap A: collect EVERY audio track (not just the first), then pick the best AFTER the scan. A UHD
+        // remux commonly orders a stereo or commentary track BEFORE the multichannel bed; picking the first
+        // decodable track silently dropped the real (often EAC3-JOC Atmos) audio. Each tuple carries the track's
+        // channel count, its stream-copy codec rank, and its language tag (the pick keeps to the source's
+        // target language so raising the channel/EAC3 preference can never swap in a same-channel foreign dub).
+        // `decodableAudio` = AVPlayer stream-copyable tracks; `transcodableAudio` = FFmpeg-decodable-only tracks
+        // that must be transcoded (TrueHD/DTS/... - the b160 lane).
+        var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String)] = []
+        var transcodableAudio: [(index: Int, channels: Int32, lang: String)] = []
+        // The audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/PCM...,
+        // a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable track:
+        // stream-copy always beats a transcode. Chosen (below) as the highest-channel transcodable track.
         var transcodeAudioIn = -1
         // The base-layer (primary) video track. For DUAL-TRACK Profile 7 (separate BL + EL video streams), the
         // FIRST video stream is the base layer we keep; any later video stream is the enhancement layer, which
@@ -244,25 +253,57 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // Additional video streams (a dual-track P7 enhancement layer) are intentionally NOT mapped.
             case AVMEDIA_TYPE_AUDIO:
                 audioSeen.append(Self.codecName(par.pointee.codec_id))
-                // Map ONLY the FIRST AVPlayer-decodable audio track. A UHD remux can carry 10+ AC3 language
-                // dubs; mapping all of them makes the fragmented muxer's delay_moov wait for a first packet from
-                // EVERY audio stream before it can write the moov, but frag_keyframe cuts the first fragment at
-                // the opening video keyframe before the sparse later tracks deliver one, so the moov write fails
-                // ("Cannot write moov before AC3 packets") and the mux aborts. AVPlayer plays one track anyway.
-                if !hasDecodableAudio, Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
-                    hasDecodableAudio = true
-                    mappable.insert(i)
-                } else if transcodeAudioIn < 0,
-                          !Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue),
-                          avcodec_find_decoder(par.pointee.codec_id) != nil {
-                    // Remember the first FFmpeg-decodable track as the transcode candidate; only mapped
-                    // below if the whole scan finds NO stream-copyable audio.
-                    transcodeAudioIn = i
+                // Collect the track; the single best one is mapped after the scan. Only ONE audio track is ever
+                // mapped: a UHD remux can carry 10+ dubs, and mapping several makes the fragmented muxer's
+                // delay_moov wait for a first packet from EVERY audio stream before it can write the moov, but
+                // frag_keyframe cuts the first fragment at the opening video keyframe before the sparse later
+                // tracks deliver one, so the moov write fails ("Cannot write moov before AC3 packets") and the
+                // mux aborts. AVPlayer plays one track anyway.
+                let audioChannels = par.pointee.ch_layout.nb_channels
+                let audioLang = Self.streamLanguage(inStream)
+                if Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
+                    decodableAudio.append((i, audioChannels, Self.audioCopyRank(par.pointee.codec_id), audioLang))
+                } else if avcodec_find_decoder(par.pointee.codec_id) != nil {
+                    transcodableAudio.append((i, audioChannels, audioLang))
                 }
             default:
                 break   // subtitles/data/attachments are never mapped (see the header note)
             }
         }
+        // The target language each pick keeps to: the language of the FIRST track of its OWN kind in scan order,
+        // which is exactly the track the old first-decodable / first-transcodable code played. Keeping to it
+        // means the new channel/EAC3 ordering reorders only WITHIN that language and can never swap in a
+        // same-channel foreign dub. When the source tags no language the demuxer substitutes ONE default value
+        // for every track (matroska -> "eng"), so untagged tracks all match and the pick collapses to pure
+        // channel/codec order, exactly as intended.
+        let decodableTargetLang = decodableAudio.first?.lang ?? ""
+        let transcodeTargetLang = transcodableAudio.first?.lang ?? ""
+        // Gap A pick: among all AVPlayer-decodable audio tracks, first keep to the target language, then prefer
+        // the MOST channels (a commentary or stereo downmix is 1-2ch; the main bed is 6-8ch), breaking ties
+        // toward EAC3 (Dolby Atmos JOC rides in EAC3, so it beats AC3, which beats lossy/stereo-lossless), then
+        // original order for determinism. This stops a stereo track ordered first from masking the real
+        // multichannel Atmos bed, without stealing audio away from the original language.
+        var mappedAudioIn = -1
+        if let best = decodableAudio.min(by: { a, b in
+            let am = a.lang == decodableTargetLang, bm = b.lang == decodableTargetLang
+            if am != bm { return am }
+            if a.channels != b.channels { return a.channels > b.channels }
+            if a.rank != b.rank { return a.rank < b.rank }
+            return a.index < b.index
+        }) {
+            hasDecodableAudio = true
+            mappedAudioIn = best.index
+            mappable.insert(best.index)
+        }
+        // The transcode candidate follows the same target-language-then-highest-channel order (a 5.1 DTS bed in
+        // the original language over a 2.0 DTS commentary or a foreign dub), used ONLY when nothing is
+        // stream-copyable.
+        transcodeAudioIn = transcodableAudio.min(by: { a, b in
+            let am = a.lang == transcodeTargetLang, bm = b.lang == transcodeTargetLang
+            if am != bm { return am }
+            if a.channels != b.channels { return a.channels > b.channels }
+            return a.index < b.index
+        })?.index ?? -1
         // Insert the transcode candidate into the map ONLY when nothing stream-copyable exists (stream-copy is
         // always preferred over a transcode). `transcodeActive` is the single switch the setup + mux loops key on.
         let transcodeActive = !hasDecodableAudio && transcodeAudioIn >= 0
@@ -271,10 +312,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if transcodeActive, let s = inCtx.pointee.streams[transcodeAudioIn], let p = s.pointee.codecpar {
             transcodeAudioName = Self.codecName(p.pointee.codec_id)
         }
+        // The exact stream-copied audio track + its channel count, so an on-device probe log reveals whether the
+        // multichannel EAC3-JOC bed (not a stereo dub) is what actually reached AVPlayer.
+        var mappedAudioName = "none"
+        if hasDecodableAudio, mappedAudioIn >= 0, let s = inCtx.pointee.streams[mappedAudioIn], let p = s.pointee.codecpar {
+            mappedAudioName = "\(Self.codecName(p.pointee.codec_id))/\(p.pointee.ch_layout.nb_channels)ch"
+        }
         // [dv] classify probe: one greppable line of what the source actually carries (DV profile, dims, and
         // the audio codecs seen / whether any is AVPlayer-decodable). This is the line that explains WHY a DV
         // source did or did not stay on the true-DV AVPlayer lane. Gated, so free in shipping builds.
-        VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio) transcodeAudio=\(transcodeAudioName)")
+        VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio) mappedAudio=\(mappedAudioName) transcodeAudio=\(transcodeAudioName)")
 
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
@@ -609,6 +656,29 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         AV_CODEC_ID_AAC.rawValue, AV_CODEC_ID_AC3.rawValue, AV_CODEC_ID_EAC3.rawValue,
         AV_CODEC_ID_ALAC.rawValue, AV_CODEC_ID_MP3.rawValue, AV_CODEC_ID_FLAC.rawValue
     ]
+
+    /// Preference rank for a stream-copyable audio codec when several tie on channel count: lower is better.
+    /// EAC3 carries Dolby Atmos (JOC in its syncframes) so it wins any tie; AC3 (Dolby Digital 5.1) is next;
+    /// the lossy / stereo-lossless fallbacks share the bottom. Only consulted AFTER channel count in the
+    /// classify scan, so a 6ch AC3 main bed still beats a 2ch EAC3 commentary.
+    private static func audioCopyRank(_ id: AVCodecID) -> Int {
+        switch id {
+        case AV_CODEC_ID_EAC3: return 0
+        case AV_CODEC_ID_AC3:  return 1
+        default:               return 2
+        }
+    }
+
+    /// The ISO-639 language tag on a stream ("eng", "ger", ...), lowercased. Read from the demuxer's per-stream
+    /// metadata (matroska's Language element, MP4's language atom). NOTE: the matroska demuxer substitutes its
+    /// spec default "eng" for a track with no Language element, and MP4 often yields "und", so this rarely
+    /// returns "" in practice; what matters for the pick is that all untagged tracks in ONE file share the same
+    /// substituted value, so the language key stays a no-op among them (it never spuriously splits them).
+    private static func streamLanguage(_ stream: UnsafeMutablePointer<AVStream>) -> String {
+        guard let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
+              let value = entry.pointee.value else { return "" }
+        return String(cString: value).lowercased()
+    }
 
     /// Per-session tally of Profile-7 -> 8.1 RPU conversion outcomes, logged once at mux exit so a DV source
     /// that mounts but still demotes to mpv reveals WHERE it broke: converted>0 with fellBack==0 means libdovi
