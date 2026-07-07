@@ -51,6 +51,8 @@ struct iOSSettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    // "1" = the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
+    @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.keepPlayingInBackground) private var keepPlayingInBackground = true
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
@@ -249,7 +251,8 @@ struct iOSSettingsView: View {
             // from echoing back as roster edits. Single-param onChange: the zero-/two-param forms are
             // iOS 17+, target here is iOS 16.
             .onChange(of: prefAudioLang) { _ in StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
-            .onChange(of: prefSubLang) { _ in ProfileStore.shared.capturePlayback() }
+            .onChange(of: prefSubLang) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
+            .onChange(of: matchAudioSubRaw) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
             .onChange(of: prefForced) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subFont) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
@@ -1065,10 +1068,20 @@ struct iOSSettingsView: View {
             // re-realizes the FIRST menu Picker per Section when the inherited Form tint changes, so
             // without this the 2nd+ pickers' trailing value labels kept the previous accent color
             // (the "not all settings change colour" report, #21 follow-up). The .id forces a rebuild.
-            Picker("Audio language", selection: $prefAudioLang) {
-                ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
+            Toggle("Match audio to subtitle languages", isOn: Binding(
+                get: { matchAudioSubRaw == "1" },
+                set: { matchAudioSubRaw = $0 ? "1" : "0" }))
+                .tint(Theme.Palette.accent)
+            if matchAudioSubRaw != "1" {
+                Picker("Audio language", selection: primaryAudioLang) {
+                    ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .tint(Theme.Palette.accent).id("audioLang-\(theme.accentID)")
+                Picker("Fallback audio language", selection: fallbackAudioLang) {
+                    ForEach(fallbackLanguageOptions, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .tint(Theme.Palette.accent).id("audioLangFallback-\(theme.accentID)")
             }
-            .tint(Theme.Palette.accent).id("audioLang-\(theme.accentID)")
             Picker("Subtitle language", selection: primarySubLang) {
                 ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
             }
@@ -1087,7 +1100,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Audio & Subtitles")
         } footer: {
-            Text("The player auto-picks these when a title starts. The fallback language is used when the title has no subtitles in your first choice. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
         }
     }
 
@@ -1133,6 +1146,30 @@ struct iOSSettingsView: View {
             set: { newFallback in
                 let primary = prefSubLang.split(separator: ",").first.map(String.init) ?? "en"
                 prefSubLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
+    }
+
+    /// Audio primary / fallback: the SAME two-picker derivation as the subtitle chain, over the
+    /// `TrackPreferences.Key.audio` list. Shown only when "Match audio to subtitle languages" is off.
+    private var primaryAudioLang: Binding<String> {
+        Binding(
+            get: { prefAudioLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefAudioLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    private var fallbackAudioLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefAudioLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefAudioLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
             })
     }
 

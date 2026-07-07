@@ -39,6 +39,8 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    // When "1", the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
+    @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
     @AppStorage(VXProbe.defaultsKey) private var probeLogging = false   // gated diagnostic logging + heartbeat
@@ -126,7 +128,8 @@ struct SettingsView: View {
         // the theme). The equality guard inside capturePlayback stops a profile switch's own
         // flat-key writes from echoing back as roster edits.
         .onChange(of: prefAudioLang) { StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
-        .onChange(of: prefSubLang) { ProfileStore.shared.capturePlayback() }
+        .onChange(of: prefSubLang) { if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
+        .onChange(of: matchAudioSubRaw) { if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
         .onChange(of: prefForced) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subFont) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
@@ -796,13 +799,19 @@ struct SettingsView: View {
 
     private var audioSubtitleSection: some View {
         section("Audio & Subtitles") {
-            choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: $prefAudioLang)
+            choiceRow(String(localized: "Match audio to subtitle languages"), [("0", "Off"), ("1", "On")], selection: $matchAudioSubRaw)
+            if matchAudioSubRaw != "1" {
+                choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: primaryAudioLang)
+                choiceRow(String(localized: "Fallback audio language"),
+                          [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
+                          selection: fallbackAudioLang)
+            }
             choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: primarySubLang)
             choiceRow(String(localized: "Fallback subtitle language"),
                       [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
                       selection: fallbackSubLang)
             choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
-            Text("The player auto-picks these when a title starts. The fallback language is used when the title has no subtitles in your first choice. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
@@ -833,6 +842,30 @@ struct SettingsView: View {
             set: { newFallback in
                 let primary = prefSubLang.split(separator: ",").first.map(String.init) ?? "en"
                 prefSubLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
+    }
+
+    /// Audio primary / fallback: the SAME two-picker derivation as the subtitle chain, over the
+    /// `TrackPreferences.Key.audio` list. Shown only when "Match audio to subtitle languages" is off.
+    private var primaryAudioLang: Binding<String> {
+        Binding(
+            get: { prefAudioLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefAudioLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    private var fallbackAudioLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefAudioLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefAudioLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
             })
     }
 
