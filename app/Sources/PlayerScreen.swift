@@ -264,6 +264,10 @@ struct PlayerScreen: View {
     @State private var externalLinkDead = false      // pre-flight probe found the stream URL dead before handoff
     @State private var subtitleLoadFailed = false    // an add-on subtitle download timed out / failed
     @State private var subtitleLoadingURL: String?   // an add-on subtitle is downloading (shows Loading… on its row)
+    // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
+    // the preferred language chain but an add-on does). Reset with appliedAutoTracks so a source hop /
+    // episode switch re-evaluates cleanly; latched after one attempt so a failure never loops.
+    @State private var autoAddonSubTried = false
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var showShare = false             // system share sheet
     @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
@@ -1869,7 +1873,7 @@ struct PlayerScreen: View {
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         configureCommunityTrickplayProvisional()
-        appliedSize = false; appliedAutoTracks = false; appliedVolume = false   // re-apply saved volume to the new engine
+        appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false   // re-apply saved volume to the new engine
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
@@ -2865,6 +2869,40 @@ struct PlayerScreen: View {
             addonSubs = subs
             VXProbe.log("subs", "add-on subtitles listed count=\(subs.count)")
             if panel == .subtitles { panelRows = rows(for: .subtitles) }
+            // The add-on list can land AFTER autoSelectTracks already ran (and left subs off because the
+            // container had no chain match): re-evaluate the add-on fallback now that candidates exist.
+            autoSelectAddonSubtitleIfNeeded()
+        }
+    }
+
+    /// Auto-load an ADD-ON subtitle in the user's preferred language when the container itself has none.
+    /// Mirror of TVPlayerView.autoSelectAddonSubtitleIfNeeded (this same UI runs on iOS and macOS): the
+    /// embedded auto-select honors the preference chain for EMBEDDED tracks only, so a file with no track in
+    /// the chain left subs off even when an installed subtitle add-on had the language. Fires at most once per
+    /// load (latched), never overrides an already-selected track or a manual pick, respects the off /
+    /// forced-only policies via TrackSelector.wantsExternalSubtitle, and fails SOFT: an auto-load failure just
+    /// leaves subtitles off (no subtitleLoadFailed alert; the user did not ask for this download).
+    private func autoSelectAddonSubtitleIfNeeded() {
+        guard appliedAutoTracks, !autoAddonSubTried, !addonSubs.isEmpty, subtitleLoadingURL == nil else { return }
+        // A subtitle track is already showing (embedded auto-pick matched, or the user picked one): keep it.
+        guard !subtitleTracks.contains(where: { $0.selected }) else { autoAddonSubTried = true; return }
+        let prefs = TrackPreferences.current
+        guard TrackSelector.wantsExternalSubtitle(audio: audioTracks, subtitles: subtitleTracks, preferences: prefs) else {
+            autoAddonSubTried = true
+            return
+        }
+        var pick: AddonSubtitle?
+        for lang in prefs.subtitleLanguages {
+            if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
+        }
+        guard let sub = pick else { autoAddonSubTried = true; return }
+        autoAddonSubTried = true
+        subtitleLoadingURL = sub.url
+        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+            subtitleLoadingURL = nil
+            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+            refreshSoon()
+            VXProbe.log("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok ? "Y" : "N"))")
         }
     }
 
@@ -3621,6 +3659,10 @@ struct PlayerScreen: View {
         VXProbe.log("subs", "auto-select sub=\(pick.subtitle.map(String.init) ?? "none") audio=\(pick.audio.map(String.init) ?? "none")")
         contributeContainerLanguagesIfNeeded()   // pool the file's REAL track langs (provenance "container")
         refreshSoon()
+        // The container had no track in the preferred language chain (subs stayed off): try the add-on list.
+        // Either completion point can land first (tracks vs the add-on fetch), so both call this; the guards
+        // + the one-shot latch inside make the double call safe.
+        autoSelectAddonSubtitleIfNeeded()
     }
 
     /// Contribute the file's REAL audio + subtitle track languages to the community language index with

@@ -2,6 +2,7 @@
 import Foundation
 import AVKit
 import AVFoundation
+import CoreMedia
 import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
@@ -85,16 +86,22 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // DV-for-MKV streaming remux (Phase 1). When non-nil, this session is playing an MKV that was remuxed
     // in-process to fragmented MP4 and served to AVPlayer over the `vortxremux://` scheme. Held for the whole
     // session so its resource-loader delegate + remux thread stay alive; torn down in stop()/loadFile().
+    // LEGACY delivery: kept compiled as the rollback path behind VortXRemuxHLSServer.deliveryEnabled.
     private var remuxLoader: VortXRemuxResourceLoader?
-    /// Whether the forward-only DV remux is mounted for the CURRENT item. The chrome reads this to suppress
-    /// its Continue-Watching resume seek: the remux advertises isByteRangeAccessSupported=false and produces
-    /// bytes linearly, so a pre-start seek lands in bytes that do not exist yet, no frame ever arrives, and
-    /// the start watchdog demotes the whole session to libmpv (killing BOTH true DV and Atmos on every replay).
-    var isRemuxMounted: Bool { remuxLoader != nil }
+    // DV-for-MKV streaming remux, LOCAL HLS delivery (b166, the default). The same remux stream, indexed
+    // into init + media segments and served to AVPlayer as vanilla HLS from 127.0.0.1, which is the one
+    // delivery AVFoundation supports for a growing fMP4 (the progressive loader path above never framed on
+    // device). Held for the whole session; torn down in stop()/loadFile().
+    private var remuxHLSServer: VortXRemuxHLSServer?
+    /// Whether the forward-only DV remux is mounted for the CURRENT item (either delivery). The chrome reads
+    /// this to suppress its Continue-Watching resume seek: the remux produces bytes linearly, so a pre-start
+    /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
+    /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
+    var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
     /// Bytes the mounted DV remux has produced so far; -1 when no remux is mounted. The chrome's start
     /// watchdog reads this to tell a still-muxing remux (bytes growing, extend the deadline) from a dead
     /// mount (no growth, demote to libmpv exactly as before).
-    var remuxProducedBytes: Int { remuxLoader?.producedBytes ?? -1 }
+    var remuxProducedBytes: Int { remuxHLSServer?.producedBytes ?? remuxLoader?.producedBytes ?? -1 }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
@@ -121,29 +128,41 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         AVPlayerAudioSession.activateForMovie()
         #endif
         // DV-for-MKV streaming remux path (Phase 1, opt-in): if the router flagged this URL for the in-process
-        // MKV -> fMP4 remux, mount an AVURLAsset over the `vortxremux://` scheme backed by our resource-loader
-        // delegate instead of loading the MKV directly (AVFoundation has no Matroska demuxer). Everything below
+        // MKV -> fMP4 remux, mount the remux instead of loading the MKV directly (AVFoundation has no Matroska
+        // demuxer). DEFAULT delivery (b166) is LOCAL HLS: the remux output is indexed into init + media
+        // segments and served from 127.0.0.1 as vanilla HLS, the one way AVFoundation consumes a growing fMP4
+        // (and the lane Apple documents for Dolby Vision 8.1). The legacy `vortxremux://` progressive loader
+        // stays compiled behind VortXRemuxHLSServer.deliveryEnabled for instant rollback. Everything below
         // (KVO, track selection, trickplay tap) is identical; only the asset's source differs.
         let newAsset: AVURLAsset
-        if PlayerEngineRouter.shouldDVRemux(url: url),
-           let built = VortXRemuxResourceLoader.make(input: url, headers: headers) {
+        let wantsRemux = PlayerEngineRouter.shouldDVRemux(url: url)
+        if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
+           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers) {
+            remuxHLSServer = mounted.server
+            mounted.server.start()
+            newAsset = AVURLAsset(url: mounted.playlistURL)
+            DiagnosticsLog.log("avplayer", "dv-remux mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+            // [dv] the true-DV remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
+            // fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties the reason
+            // to the observed engine flip, giving one greppable [dv] trail.
+            VXProbe.log("dv", "remux mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+        } else if wantsRemux, !VortXRemuxHLSServer.deliveryEnabled,
+                  let built = VortXRemuxResourceLoader.make(input: url, headers: headers) {
             remuxLoader = built.loader
             let asset = AVURLAsset(url: built.assetURL)
             asset.resourceLoader.setDelegate(built.loader, queue: remuxLoaderQueue)
             built.loader.start()
             newAsset = asset
             DiagnosticsLog.log("avplayer", "dv-remux mount host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
-            // [dv] the true-DV remux lane mounted: AVPlayer is now fed a vortxremux:// fMP4 stream. If a
-            // classify fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties
-            // the reason to the observed engine flip, giving one greppable [dv] trail.
             VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
-        } else if PlayerEngineRouter.shouldDVRemux(url: url) {
-            // The router demanded the DV-for-MKV remux lane but VortXRemuxResourceLoader.make returned nil (loader
-            // could not be built). AVFoundation has no Matroska demuxer, so loading the raw MKV here would mount an
-            // item AVPlayer can never produce a frame from. Fail-soft immediately so the chrome demotes to libmpv
-            // HDR10 instead of stalling on an un-demuxable asset. This ties into the [dv] demotion trail below.
-            DiagnosticsLog.log("avplayer", "dv-remux loader build failed host=\(url.host ?? "?") -> demoting to libmpv")
-            VXProbe.log("dv", "remux loader build failed -> endFileError demote host=\(url.host ?? "?")")
+        } else if wantsRemux {
+            // The router demanded the DV-for-MKV remux lane but the mount could not be built (the local HLS
+            // server failed to bind, or the legacy loader could not be assembled). AVFoundation has no
+            // Matroska demuxer, so loading the raw MKV here would mount an item AVPlayer can never produce a
+            // frame from. Fail-soft immediately so the chrome demotes to libmpv HDR10 instead of stalling on
+            // an un-demuxable asset. This ties into the [dv] demotion trail below.
+            DiagnosticsLog.log("avplayer", "dv-remux mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
+            VXProbe.log("dv", "remux mount build failed -> endFileError demote host=\(url.host ?? "?")")
             fatalErrorEmitted = true
             emit(MPVProperty.endFileError, "DV remux unavailable")
             return
@@ -167,9 +186,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // previously never set preferredDisplayCriteria at all). fps/size are unknown pre-attach; the
         // readyToPlay request below re-asserts with the real values. Fail-soft: a refused/ignored request
         // changes nothing about playback, and reset() on stop() restores the default mode.
-        if remuxLoader != nil || contentIsDolbyVision {
+        if isRemuxMounted || contentIsDolbyVision {
             HDRDisplayMode.request(.dolbyVision, fps: 0, width: 0, height: 0, in: nil)
-            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (remux=\(remuxLoader != nil) dvFlag=\(contentIsDolbyVision))")
+            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (remux=\(isRemuxMounted) dvFlag=\(contentIsDolbyVision))")
         } else {
             // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
             // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.
@@ -243,11 +262,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         item = nil
     }
 
-    /// Tear down the DV-for-MKV remux session (stop the remux thread + unblock any waiting loader request).
-    /// Called before loading a new file and on stop(), so the remux never straddles two titles.
+    /// Tear down the DV-for-MKV remux session (stop the remux thread + the local HLS server / unblock any
+    /// waiting loader request). Called before loading a new file and on stop(), so the remux never straddles
+    /// two titles.
     private func teardownRemux() {
         remuxLoader?.invalidate()
         remuxLoader = nil
+        remuxHLSServer?.invalidate()
+        remuxHLSServer = nil
     }
 
     // MARK: Video sizing
@@ -583,7 +605,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // libmpv (HDR10 + no Atmos) on EVERY resume of a DV title. Start at 0 instead; the chrome
                 // keeps its resume offset for progress-save continuity. Belt-and-braces with the chrome's
                 // own remux-aware resume suppression (TVPlayerView.maybeResume).
-                if remuxLoader != nil {
+                if isRemuxMounted {
                     DiagnosticsLog.log("dv", "dropped pre-start resume seek to \(Int(target))s: DV remux is forward-only, starting from 0")
                 } else {
                     player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
@@ -605,14 +627,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // ordering). Covers the remux lane (it only mounts for DV) AND any DV-flagged native route
                 // (DV MP4/MOV/HLS); window:nil uses HDRDisplayMode's fallback window. reset() on stop()
                 // returns the TV to its default mode.
-                if remuxLoader != nil || contentIsDolbyVision {
+                if isRemuxMounted || contentIsDolbyVision {
                     let size = item.presentationSize
                     let fps = item.tracks.first { $0.assetTrack?.mediaType == .video }?.assetTrack?.nominalFrameRate ?? 0
                     HDRDisplayMode.request(.dolbyVision, fps: Double(fps),
                                            width: Int(size.width), height: Int(size.height), in: nil)
-                    VXProbe.log("dv", "AVPlayer ready -> re-asserted Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(remuxLoader != nil)")
+                    VXProbe.log("dv", "AVPlayer ready -> re-asserted Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(isRemuxMounted)")
                 }
                 #endif
+                // Case-C visibility (#76 b166): a NATIVE DV mp4 reached readyToPlay on ozdek's device, played
+                // its Atmos audio, but produced NO video and misreported 3840x2160 as 1280x720. Dump every
+                // video track's format description once per DV-flagged load so the next diagnostics export
+                // names WHAT VideoToolbox refused (fourcc / coded dimensions / dvcC-dvvC presence / enabled).
+                if isRemuxMounted || contentIsDolbyVision { logDVVideoTrackDiagnostics(item) }
             }
         case .failed:
             let ns = item.error as NSError?
@@ -628,6 +655,47 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             emit(MPVProperty.endFileError, item.error?.localizedDescription ?? "Playback failed")
         default:
             break
+        }
+    }
+
+    /// Case-C diagnostics (#76 b166): once per DV-flagged load that reaches readyToPlay, log every video
+    /// track's sample-entry fourcc, coded dimensions, natural size, enabled flag, and which sample
+    /// description extension atoms (dvcC/dvvC/hvcC/...) are present. This is the data that separates "the
+    /// file's DV carriage is one tvOS cannot decode" (audio over black, wrong presentationSize) from any
+    /// app-side cause, without changing playback behavior in any way. Fail-soft: any load error just logs.
+    private func logDVVideoTrackDiagnostics(_ item: AVPlayerItem) {
+        let asset = item.asset
+        Task { @MainActor in
+            let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            if tracks.isEmpty {
+                DiagnosticsLog.log("dv", "readyToPlay with ZERO video tracks (audio-only mount)")
+                return
+            }
+            for track in tracks {
+                let descs = (try? await track.load(.formatDescriptions)) ?? []
+                let natural = (try? await track.load(.naturalSize)) ?? .zero
+                let enabled = (try? await track.load(.isEnabled)) ?? true
+                if descs.isEmpty {
+                    DiagnosticsLog.log("dv", "video track id=\(track.trackID) has NO format description natural=\(Int(natural.width))x\(Int(natural.height)) enabled=\(enabled)")
+                    continue
+                }
+                for desc in descs {
+                    let sub = CMFormatDescriptionGetMediaSubType(desc)
+                    var fourcc = ""
+                    for shift in [24, 16, 8, 0] {
+                        let byte = UInt8(truncatingIfNeeded: sub >> UInt32(shift))
+                        fourcc.append(byte >= 32 && byte < 127 ? Character(UnicodeScalar(byte)) : "?")
+                    }
+                    let dims = CMVideoFormatDescriptionGetDimensions(desc)
+                    var atoms = "none"
+                    if let ext = CMFormatDescriptionGetExtension(
+                        desc, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms),
+                       let dict = ext as? [String: Any] {
+                        atoms = dict.keys.sorted().joined(separator: ",")
+                    }
+                    DiagnosticsLog.log("dv", "video track id=\(track.trackID) fourcc=\(fourcc) coded=\(dims.width)x\(dims.height) natural=\(Int(natural.width))x\(Int(natural.height)) enabled=\(enabled) atoms=[\(atoms)]")
+                }
+            }
         }
     }
 
@@ -687,6 +755,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         observations.forEach { $0.invalidate() }
         NotificationCenter.default.removeObserver(self)   // matches teardownObservers(): drop AVPlayerItem note observers before dealloc
         remuxLoader?.invalidate()
+        remuxHLSServer?.invalidate()
     }
 }
 

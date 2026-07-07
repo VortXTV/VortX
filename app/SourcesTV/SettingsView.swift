@@ -797,11 +797,43 @@ struct SettingsView: View {
     private var audioSubtitleSection: some View {
         section("Audio & Subtitles") {
             choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: $prefAudioLang)
-            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: $prefSubLang)
+            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: primarySubLang)
+            choiceRow(String(localized: "Fallback subtitle language"),
+                      [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
+                      selection: fallbackSubLang)
             choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
-            Text("The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Text("The player auto-picks these when a title starts. The fallback language is used when the title has no subtitles in your first choice. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
+    }
+
+    /// The stored subtitle preference (`TrackPreferences.Key.subtitle`) is a comma-separated PRIORITY LIST
+    /// ("tr,en") that TrackSelector already walks in order; the UI presents it as two pickers via these
+    /// derived bindings. Primary = the first entry; setting it keeps the existing fallback (dropping it only
+    /// when it would duplicate the new primary). The raw `prefSubLang` @AppStorage stays the storage anchor,
+    /// so profile capture (.onChange(of: prefSubLang)) and cross-device sync round-trip the whole list.
+    private var primarySubLang: Binding<String> {
+        Binding(
+            get: { prefSubLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefSubLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    /// Fallback = the second entry of the stored chain ("" = none). Choosing None (or the primary itself)
+    /// stores just the primary.
+    private var fallbackSubLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefSubLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefSubLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
     }
 
     // MARK: Subtitle style

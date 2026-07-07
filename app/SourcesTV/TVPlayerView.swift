@@ -75,6 +75,11 @@ struct TVPlayerView: View {
     @State private var addedSubURLs: Set<String> = []
     @State private var subtitleLoadingURL: String?     // an add-on subtitle is downloading (shows Loading… in its row)
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
+    // One-shot latch for the ADD-ON subtitle auto-select fallback (fires when the container has no track in
+    // the preferred language chain but an add-on does). Reset wherever appliedAutoTracks resets, so a source
+    // hop / episode switch / reload re-evaluates cleanly; latched after one attempt so a failed or declined
+    // auto-load never loops.
+    @State private var autoAddonSubTried = false
 
     // Community-subtitle system (pooled subs P2, sync offset P3, embedded upload P4). All fail-soft + gated.
     @State private var pooledSubs: [SubtitlePoolClient.PooledSubtitle] = []
@@ -164,7 +169,7 @@ struct TVPlayerView: View {
     // (Apple TV device log: mount at 06.851s, classify at 15.129s, converted=0 bytes=0), so every DV file on
     // Apple TV fell back to HDR10. 20s covers the remux startup while the 30s loadTimeout + AVPlayer .failed
     // path stay as backstops for a genuinely dead mount.
-    private let avStartWatchdogSeconds: Double = 20
+    private let avStartWatchdogSeconds: Double = 10
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -1543,7 +1548,7 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         appliedResume = false
         bufferedTime = 0   // new stream: clear the buffered-ahead band until the new demuxer reports
-        buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; appliedVolume = false; loadErrorMsg = ""
+        buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
         // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
@@ -1814,6 +1819,10 @@ struct TVPlayerView: View {
         }
         contributeContainerLanguagesIfNeeded()   // pool the file's REAL track langs (provenance "container")
         refreshTracksSoon()
+        // The container had no track in the preferred language chain (subs stayed off): try the add-on list.
+        // Either completion point can land first (tracks vs the add-on fetch), so both call this; the guards
+        // + the one-shot latch inside make the double call safe.
+        autoSelectAddonSubtitleIfNeeded()
     }
 
     // MARK: - Load failure
@@ -1881,7 +1890,7 @@ struct TVPlayerView: View {
         plog.info("mid-playback stall, reloading at \(currentTime, privacy: .public)")
         DiagnosticsLog.log("player", "mid-playback stall \(stallRecoveries), reloading at \(Int(currentTime))s")
         resumeSeconds = currentTime
-        appliedResume = false; appliedAutoTracks = false
+        appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false
         buffering = true
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
     }
@@ -2087,42 +2096,25 @@ struct TVPlayerView: View {
         // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
         if PlayerEngineRouter.isHLS(url) { return }
         avStartWatchdog = Task { @MainActor in
-            // Remux-aware bounded extension (#76 b163/b164): a cold-debrid DV remux can keep producing bytes
-            // well past 20s before AVPlayer reaches readyToPlay, and the fixed deadline silently demoted every
-            // such session to libmpv HDR10 (mount -> classify -> loaded on mpv ~20-22s later in both user logs).
-            // If the remux is mounted and its produced-byte count measurably GREW since the previous check,
-            // extend one more round (cap 2 extensions, 60s total) instead of demoting. Any abnormal read (no
-            // remux, produced 0, accessor -1, no growth) demotes exactly as before, and the .failed instant
-            // demote path is untouched, so a genuinely dead mount still falls back on today's schedule.
-            var lastProducedBytes = 0
-            var extensionsUsed = 0
-            let maxExtensions = 2
-            while true {
-                try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
-                guard !Task.isCancelled, !hasStartedPlaying else { return }
-                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-                let engine = coordinator.player as? AVPlayerEngineController
-                let remuxMounted = engine?.isRemuxMounted == true
-                let producedBytes = engine?.remuxProducedBytes ?? -1
-                if remuxMounted, extensionsUsed < maxExtensions, producedBytes > 0, producedBytes > lastProducedBytes {
-                    extensionsUsed += 1
-                    lastProducedBytes = producedBytes
-                    // The 30s loadTimeout cannot see remux progress (bufferedTime stays 0 pre-ready) and would
-                    // hop away mid-extension; hold it off for this bounded window. demoteAVPlayerToMPV re-arms
-                    // it via startLoadTimeout, so the mpv reload keeps its full watchdog coverage either way.
-                    loadTimeout?.cancel()
-                    DiagnosticsLog.log("dv", "start watchdog: remux still producing (bytes=\(producedBytes)), extending \(Int(avStartWatchdogSeconds))s (\(extensionsUsed)/\(maxExtensions))")
-                    continue
-                }
-                DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted), extensions used=\(extensionsUsed)), falling back to libmpv")
-                if remuxMounted {
-                    // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
-                    // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
-                    DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s (+\(extensionsUsed) extensions) -> libmpv HDR10")
-                }
-                demoteAVPlayerToMPV()
-                return
+            // Fail FAST to libmpv when the AVPlayer / DV-remux lane produces no frame (#76 b165/b166). ozdek's
+            // device logs proved this lane has a 0% first-frame rate on his 4K debrid DV MKVs: it either
+            // .fails "Cannot Open" in ~3s or never reaches readyToPlay at all, and an earlier attempt to EXTEND
+            // the deadline (waiting up to 60s while the remux kept muxing bytes) only made the user wait a full
+            // minute for the SAME inevitable HDR10 fallback, the exact "loads for a minute then just plays HDR"
+            // the owner reported. Waiting longer never turned into a frame, so a short single deadline bails to
+            // the fast libmpv HDR10 path instead. A genuinely-working remux reaches readyToPlay (timePos cancels
+            // this) well inside the window; the .failed instant-demote path is untouched.
+            try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+            guard !Task.isCancelled, !hasStartedPlaying else { return }
+            guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
+            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
+            if remuxMounted {
+                // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
+                // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
+                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s -> libmpv HDR10")
             }
+            demoteAVPlayerToMPV()
         }
     }
 
@@ -2339,7 +2331,7 @@ struct TVPlayerView: View {
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
-        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; appliedVolume = false; loadErrorMsg = ""
+        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false; loadErrorMsg = ""
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
         startLoadTimeout()
     }
@@ -2385,6 +2377,42 @@ struct TVPlayerView: View {
             guard addonSubsKey == key else { return }   // episode changed mid-fetch
             addonSubs = subs
             if showOptions, panelKind == .subtitles { panelRows = optionRows }
+            // The add-on list can land AFTER autoSelectTracks already ran (and left subs off because the
+            // container had no chain match): re-evaluate the add-on fallback now that candidates exist.
+            autoSelectAddonSubtitleIfNeeded()
+        }
+    }
+
+    /// Auto-load an ADD-ON subtitle in the user's preferred language when the container itself has none.
+    /// The embedded auto-select (autoSelectTracks) already honors the preference chain for EMBEDDED tracks;
+    /// this is the missing half: a title whose file carries no track in the chain used to end "subs selected
+    /// off (auto)" even when an installed subtitle add-on had the language. Fires at most once per load
+    /// (latched), never overrides an already-selected track or a manual pick, respects the off/forced-only
+    /// policies via TrackSelector.wantsExternalSubtitle, and fails soft: a download failure just leaves
+    /// subtitles off exactly as before.
+    private func autoSelectAddonSubtitleIfNeeded() {
+        guard appliedAutoTracks, !autoAddonSubTried, !addonSubs.isEmpty, subtitleLoadingURL == nil else { return }
+        // A subtitle track is already showing (embedded auto-pick matched, or the user picked one): keep it.
+        guard !subtitleTracks.contains(where: { $0.selected }) else { autoAddonSubTried = true; return }
+        let prefs = TrackPreferences.current
+        guard TrackSelector.wantsExternalSubtitle(audio: audioTracks, subtitles: subtitleTracks, preferences: prefs) else {
+            autoAddonSubTried = true
+            return
+        }
+        // Walk the preference chain in priority order against the add-on list (same tolerant language match
+        // the embedded selector uses, so "tur"/"tr-TR" still hit a "tr" preference).
+        var pick: AddonSubtitle?
+        for lang in prefs.subtitleLanguages {
+            if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
+        }
+        guard let sub = pick else { autoAddonSubTried = true; return }
+        autoAddonSubTried = true
+        subtitleLoadingURL = sub.url
+        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+            subtitleLoadingURL = nil
+            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+            refreshTracksSoon()
+            VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok))")
         }
     }
 
@@ -2870,7 +2898,7 @@ struct TVPlayerView: View {
         let leavingHash = currentTorrentHash
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
-        loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; appliedVolume = false
+        loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false
         suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode

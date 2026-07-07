@@ -91,6 +91,7 @@ struct RemoteConfigData: Decodable {
     struct Features: Decodable {
         let communityTrickplay: Bool?
         let dvRemux: Bool?
+        let dvRemuxHLS: Bool?   // b166: local-HLS delivery of the DV remux (kill-switch back to the loader path)
         let diskCache: Bool?
         let trailers: Bool?
         let vortxRatings: Bool?
@@ -570,6 +571,7 @@ actor RemoteConfig {
             func put(_ key: String, _ value: Bool?) { if let value { features[key] = value } }
             put("communityTrickplay", f.communityTrickplay)
             put("dvRemux", f.dvRemux)
+            put("dvRemuxHLS", f.dvRemuxHLS)
             put("diskCache", f.diskCache)
             put("trailers", f.trailers)
             put("vortxRatings", f.vortxRatings)

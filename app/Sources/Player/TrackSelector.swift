@@ -11,6 +11,19 @@ enum TrackSelector {
         return (audioPick?.id, subtitle)
     }
 
+    /// Whether the chrome should fall back to an EXTERNAL (add-on) subtitle for this load: the user's
+    /// preferences wanted FULL subtitles but no embedded track matched the language chain. Mirrors
+    /// `selectSubtitle`'s policy logic exactly, so the add-on fallback never fires when the user asked for
+    /// subtitles off / forced-only while their preferred audio is present, and never fires when an embedded
+    /// track already satisfies the chain (the embedded auto-select handles that case).
+    static func wantsExternalSubtitle(audio: [MPVTrack], subtitles: [MPVTrack], preferences p: TrackPreferences) -> Bool {
+        let gotPreferredAudio = firstMatch(audio, languages: p.audioLanguages, reject: p.rejectTerms) != nil
+        // With preferred audio present, only the "always" policy shows full subtitles; off/forced-only must
+        // not trigger a full external sub. Foreign-language content (no preferred audio) always wants them.
+        if gotPreferredAudio && p.forcedPolicy != .always { return false }
+        return firstMatch(subtitles, languages: p.subtitleLanguages, reject: p.rejectTerms) == nil
+    }
+
     /// First track whose language matches the priority list and whose title isn't rejected.
     private static func firstMatch(_ tracks: [MPVTrack], languages: [String], reject: [String]) -> MPVTrack? {
         for lang in languages {

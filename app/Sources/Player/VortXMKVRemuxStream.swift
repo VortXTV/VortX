@@ -55,10 +55,82 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// freed object.
     private static let avioBufferSize = 1 << 16   // 64 KiB muxer write chunk
 
-    init(input: String, headers: [String: String]?) {
+    /// HLS delivery mode (b166). AVFoundation does NOT support a plain progressive fragmented MP4: it treats
+    /// the vortxremux:// asset as a regular file, cannot index an open-ended fMP4, and either fails the item
+    /// "Cannot Open" or scans forever without producing a frame (the ozdek b165 log: ~0% first-frame rate on
+    /// this lane). The one supported way to feed AVPlayer a GROWING fMP4 stream, and the one Apple documents
+    /// for Dolby Vision 8.1, is HLS. When this flag is set the stream additionally indexes its own muxed
+    /// output into an init segment (ftyp+moov) plus closed media segments (byte ranges + exact durations,
+    /// cut by this class at keyframe boundaries), which `VortXRemuxHLSServer` serves to AVPlayer as local
+    /// HLS from 127.0.0.1. When false (the legacy vortxremux:// loader path, kept for rollback) none of the
+    /// indexing runs and the produced byte stream is byte-identical to before.
+    private let hlsIndexingEnabled: Bool
+
+    init(input: String, headers: [String: String]?, indexForHLS: Bool = false) {
         self.input = input
         self.headers = headers
+        self.hlsIndexingEnabled = indexForHLS
     }
+
+    // MARK: - HLS output index (b166; populated only when `hlsIndexingEnabled`)
+
+    /// One closed fMP4 media segment: `byteOffset..<byteOffset+byteLength` of the produced stream, holding
+    /// one or more complete moof+mdat pairs, `duration` seconds long (exact, from the muxed video DTS).
+    struct HLSSegment {
+        let index: Int
+        let byteOffset: Int
+        let byteLength: Int
+        let duration: Double
+    }
+
+    /// What the master playlist needs to advertise so tvOS engages TRUE Dolby Vision: the RFC-6381 codec
+    /// strings, the DV SUPPLEMENTAL-CODECS compatibility brand, and VIDEO-RANGE. Apple's HLS authoring spec
+    /// calls the brand + VIDEO-RANGE mandatory cross-checks for DV 8.1.
+    struct HLSSignaling {
+        let videoCodec: String        // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5)
+        let supplementalCodec: String?// "dvh1.08.06/db1p" for P8.1; nil when not applicable
+        let videoRange: String?       // "PQ" / "HLG"
+        let audioCodec: String?       // "ec-3" / "ac-3" / "mp4a.40.2" / ...
+        let width: Int
+        let height: Int
+        let bandwidth: Int
+    }
+
+    /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
+    /// serve queue). The head-scan / cut state further down is remux-thread-only and needs no lock.
+    private let hlsLock = NSLock()
+    private var _hlsInitData: Data?
+    private var _hlsSegments: [HLSSegment] = []
+    private var _hlsEnded = false
+    private var _hlsSignaling: HLSSignaling?
+
+    /// Consistent snapshot of the published HLS index for the local server.
+    func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
+        hlsLock.lock(); defer { hlsLock.unlock() }
+        return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
+    }
+
+    // Init-segment head scan state (remux thread only). Accumulates the first produced bytes until the end
+    // of the top-level `moov` box is buffered; everything up to there (ftyp+moov) IS the init segment, kept
+    // resident for the whole session (it is a few KB and AVPlayer may re-request it on a seek, long after
+    // the sliding window evicted those offsets).
+    private var hlsHeadBuf: [UInt8] = []
+    private var hlsHeadDone = false
+    private static let hlsHeadCap = 4 << 20   // ftyp+moov land with the first fragment flush, far under 4 MiB
+
+    // Segment-cut state (remux thread only).
+    private var hlsSegmentStartSec: Double?   // first video DTS of the OPEN segment (input timebase seconds)
+    private var hlsSegmentStartByte: Int?     // byte offset the open segment starts at (nil until init known)
+    private var hlsLastVideoSec: Double = 0   // last written video DTS, for the final segment's duration
+    private static let hlsTargetSegmentSecs = 1.0   // cut at the first keyframe past this
+    private static let hlsMaxSegmentSecs = 4.0      // hard cut so one long GOP cannot outgrow TARGETDURATION
+    /// Byte-size hard cut: the producer parks once (windowFloor + producerLead) bytes are resident, and only
+    /// PUBLISHED (closed) segments are readable, so an open segment must never be able to swallow the whole
+    /// producer lead (64 MiB) or the pipeline would stall un-publishable at extreme bitrates. 32 MiB keeps
+    /// the open tail comfortably under the lead; at sane bitrates the time cuts always fire first.
+    private static let hlsMaxSegmentBytes = 32 << 20
+    /// The playlist's EXT-X-TARGETDURATION: must be >= every EXTINF and stay constant across reloads.
+    static let hlsTargetDuration = 5
 
     /// Start the remux on a dedicated background thread. Idempotent-ish: call once per session.
     ///
@@ -180,6 +252,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 if me.isCancelled { return AVERROR_EXIT_CONST }   // abort muxing on cancel
                 me.buffer.append(buf, count: Int(size))
                 me.scanForDec3(buf, count: Int(size))   // one-time Atmos-signaling verification; no-op once done
+                me.hlsIndexHead(buf, count: Int(size))  // HLS lane: delimit the ftyp+moov init segment; no-op once done
                 return size
             },
             nil         // seek: forward-only (Phase 1); the muxer only appends with these movflags
@@ -356,10 +429,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
            bpar.pointee.codec_id == AV_CODEC_ID_HEVC {
             hvc1Check = Self.checkHvc1Extradata(bpar)
         }
-        // In-band VPS/SPS/PPS harvested from the first base-video access unit (Annex-B form), used to rebuild
-        // the output extradata when the source's CodecPrivate cannot produce a valid hvcC. nil = not needed,
+        // In-band VPS/SPS/PPS harvested from the first base-video access unit (raw NALs), used to REBUILD the
+        // output hvcC when the source's CodecPrivate carries empty parameter-set arrays. nil = not needed,
         // or nothing usable was found (the stream setup then fails fast, BEFORE write_header).
-        var hvc1Harvest: (bytes: [UInt8], vps: Int, sps: Int, pps: Int)? = nil
+        var hvc1Harvest: (nals: [(type: UInt8, bytes: [UInt8])], vps: Int, sps: Int, pps: Int)? = nil
 
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
@@ -396,13 +469,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                             VXProbe.log("dv", "in-band RPU detected dvProfile=\(prof) (no container DOVI config)")
                         }
                     }
-                    // Extradata repair harvest: collect the access unit's VPS/SPS/PPS in Annex-B form so the
-                    // stream setup below can rebuild the output extradata (libavformat's hevc.c builds a
-                    // complete hvcC with array_completeness=1 from Annex-B extradata, valid for 'hvc1' and
-                    // for AVPlayer). A failed walk just leaves the harvest nil; the setup loop then fails
-                    // fast BEFORE write_header rather than mux a moov AVPlayer cannot open.
+                    // Extradata repair harvest: collect the access unit's raw VPS/SPS/PPS NALs so the stream
+                    // setup below can rebuild the output hvcC's parameter-set arrays in place. NOT Annex-B
+                    // extradata (the b164 shape): movenc treats Annex-B extradata as proof the BITSTREAM is
+                    // Annex-B too and runs ff_hevc_annexb2mp4 over every already-length-prefixed packet
+                    // (movenc.c:6851-6861), which would corrupt every sample. A failed walk just leaves the
+                    // harvest nil; the setup loop then fails fast BEFORE write_header rather than mux a moov
+                    // AVPlayer cannot open.
                     if !hvc1Check.eligible {
-                        hvc1Harvest = Self.harvestParameterSetsAnnexB(p, nalLengthSize: scanNalLen)
+                        hvc1Harvest = Self.harvestParameterSets(p, nalLengthSize: scanNalLen)
                     }
                     break   // decided on the first base-video packet either way
                 }
@@ -479,17 +554,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
                 // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
                 // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
-                // source extradata cannot produce a valid hvcC (validated in the classify step), install the
-                // in-band parameter sets harvested from the first access unit as Annex-B extradata, which
-                // hevc.c turns into a complete hvcC; the file then plays as true DV instead of failing. If no
-                // harvest exists either, fail fast BEFORE write_header, the same fail-soft shape as the
-                // no-audio bail above: the chrome demotes to libmpv within the probe window, quickly and
-                // cleanly, instead of after a mounted-then-rejected AVPlayer item.
+                // source extradata cannot produce a valid hvcC (validated in the classify step), REBUILD the
+                // hvcC: keep the source record's header bytes (profile/tier/level/lengthSize, which the
+                // WEB-DL-derived MKVs this repairs carry correctly even with empty arrays) and graft in the
+                // parameter sets harvested from the first access unit. NEVER install Annex-B extradata here:
+                // movenc takes Annex-B extradata as proof the bitstream is Annex-B too and would run
+                // ff_hevc_annexb2mp4 over the already-length-prefixed packets, corrupting every sample (the
+                // b164 latent bug). If no rebuild is possible, fail fast BEFORE write_header, the same
+                // fail-soft shape as the no-audio bail above: the chrome demotes to libmpv within the probe
+                // window, quickly and cleanly, instead of after a mounted-then-rejected AVPlayer item.
                 if !hvc1Check.eligible {
-                    if let h = hvc1Harvest, Self.installExtradata(outStream.pointee.codecpar, h.bytes) {
-                        DiagnosticsLog.log("dv", "hvc1 extradata repaired from in-band parameter sets: vps=\(h.vps) sps=\(h.sps) pps=\(h.pps) annexB=\(h.bytes.count)B (source extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps))")
+                    if let h = hvc1Harvest,
+                       let rebuilt = Self.buildRepairedHvcC(source: outStream.pointee.codecpar, nals: h.nals),
+                       Self.installExtradata(outStream.pointee.codecpar, rebuilt) {
+                        DiagnosticsLog.log("dv", "hvc1 extradata repaired: hvcC arrays rebuilt from in-band parameter sets vps=\(h.vps) sps=\(h.sps) pps=\(h.pps) hvcC=\(rebuilt.count)B (source extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps))")
                     } else {
-                        DiagnosticsLog.log("dv", "remux output rejected pre-mux: hvc1 needs out-of-band VPS/SPS/PPS and the source has none usable (extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps); in-band harvest empty) -> demoting to libmpv HDR10")
+                        DiagnosticsLog.log("dv", "remux output rejected pre-mux: hvc1 needs out-of-band VPS/SPS/PPS and the source has none usable (extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps); in-band harvest empty or not hvcC-rebuildable) -> demoting to libmpv HDR10")
                         VXProbe.log("dv", "HDR10 FALLBACK: hvc1 parameter sets unavailable (extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps))")
                         buffer.fail("HEVC parameter sets unavailable for the hvc1 sample entry")
                         return
@@ -596,6 +676,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let wh = avformat_write_header(outCtx, &opts)
         if wh < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avformat_write_header rc=\(wh) (convertP7=\(convertP7); the relabel-8.1 dvvC box or the fMP4 muxer rejected the mapped streams)"); buffer.fail("avformat_write_header failed (\(wh))"); return }
 
+        // HLS lane: publish the master-playlist signaling now that the OUTPUT streams are final (post
+        // extradata repair + DOVI sanitize/relabel). The local server blocks its master.m3u8 answer on this.
+        if hlsIndexingEnabled { hlsBuildSignaling(outCtx: outCtx, inCtx: inCtx, info: info, baseVideoOut: baseVideoOut) }
+
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
 
@@ -637,6 +721,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if let transcoder, inIdx == transcodeAudioIn {
                 guard transcoder.feed(p, write: { av_interleaved_write_frame(outCtx, $0) }) else {
                     if isCancelled { break }
+                    DiagnosticsLog.log("dv", "audio transcode feed FAILED preMoov=\(buffer.producedCount == 0) [prebuffered drain]")
                     buffer.fail("audio transcode failed mid-stream [prebuffered drain]")
                     return
                 }
@@ -645,12 +730,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if convertP7, outIdx == baseVideoOut {
                 Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
+            // HLS lane: cut a segment boundary BEFORE this video packet when the open segment is long enough.
+            if hlsIndexingEnabled, outIdx == baseVideoOut {
+                hlsMaybeCut(outCtx: outCtx, pkt: p, timeBase: inStream.pointee.time_base)
+            }
             p.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(p, inStream.pointee.time_base, outStream.pointee.time_base)
             p.pointee.pos = -1
             let wf = av_interleaved_write_frame(outCtx, p)
             if wf < 0 {
                 if isCancelled { break }
+                // Case-A visibility (#76 b166): this abort used to be the ONLY silent death path between
+                // write_header and the delayed moov, so ozdek's "Cannot Open ~130ms after write_header" plays
+                // carried no clue which stream/rc killed the mux. preMoov=true means AVPlayer got ZERO bytes.
+                DiagnosticsLog.log("dv", "av_interleaved_write_frame FAILED rc=\(wf) stream=\(outIdx == baseVideoOut ? "video" : "audio") outIdx=\(outIdx) preMoov=\(buffer.producedCount == 0) [prebuffered drain]")
                 buffer.fail("av_interleaved_write_frame failed (\(wf)) [prebuffered drain]")
                 return
             }
@@ -693,6 +786,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 av_packet_unref(pkt)
                 if !fed {
                     if isCancelled { break }
+                    DiagnosticsLog.log("dv", "audio transcode feed FAILED preMoov=\(buffer.producedCount == 0)")
                     buffer.fail("audio transcode failed mid-stream")
                     return
                 }
@@ -706,6 +800,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if convertP7, outIdx == baseVideoOut {
                 Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
+            // HLS lane: cut a segment boundary BEFORE this video packet when the open segment is long enough.
+            if hlsIndexingEnabled, outIdx == baseVideoOut {
+                hlsMaybeCut(outCtx: outCtx, pkt: pkt, timeBase: inStream.pointee.time_base)
+            }
             pkt.pointee.stream_index = Int32(outIdx)
             av_packet_rescale_ts(pkt, inStream.pointee.time_base, outStream.pointee.time_base)
             pkt.pointee.pos = -1
@@ -713,6 +811,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             av_packet_unref(pkt)
             if wf < 0 {
                 if isCancelled { break }     // our write callback returned EXIT; expected on cancel
+                // Case-A visibility (#76 b166): the one silent death path between write_header and the delayed
+                // moov. preMoov=true means AVPlayer got ZERO bytes when the item then fails "Cannot Open"; the
+                // rc + stream name the exact movenc rejection (expected: handle_eac3 on unparseable DDP).
+                DiagnosticsLog.log("dv", "av_interleaved_write_frame FAILED rc=\(wf) stream=\(outIdx == baseVideoOut ? "video" : "audio") outIdx=\(outIdx) preMoov=\(buffer.producedCount == 0)")
                 buffer.fail("av_interleaved_write_frame failed (\(wf))")
                 return
             }
@@ -731,6 +833,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         // Flush the muxer trailer (writes the final fragment metadata), then mark the buffer complete.
         av_write_trailer(outCtx)
+        if hlsIndexingEnabled {
+            // Close the final segment (write_trailer flushed the last fragment + the AVIO tail) and mark the
+            // playlist ended so the server can append EXT-X-ENDLIST. Duration is a safe estimate for the tail.
+            avio_flush(outCtx.pointee.pb)
+            hlsCloseSegment(endSec: hlsLastVideoSec + Self.hlsTargetSegmentSecs)
+            hlsLock.lock(); _hlsEnded = true; hlsLock.unlock()
+        }
         buffer.finish()
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
     }
@@ -792,6 +901,189 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             if match { return i }
         }
         return nil
+    }
+
+    // MARK: - HLS output indexing (b166; every method no-ops unless `hlsIndexingEnabled`)
+
+    /// Delimit the init segment: accumulate the first produced bytes and walk the top-level boxes until the
+    /// END of the `moov` box is buffered (with delay_moov, movenc writes ftyp+moov at the first fragment
+    /// flush, so both arrive in one burst). Everything up to there is the init segment, retained as `Data`
+    /// for the whole session. Runs on the remux thread from the AVIO write callback; fail-soft: a malformed
+    /// walk just gives up (the server then never gets an init, the playlist starves, and the chrome's start
+    /// watchdog demotes to libmpv exactly like any other dead mount).
+    private func hlsIndexHead(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        guard hlsIndexingEnabled, !hlsHeadDone, count > 0 else { return }
+        hlsHeadBuf.append(contentsOf: UnsafeBufferPointer(start: bytes, count: count))
+        var pos = 0
+        while pos + 8 <= hlsHeadBuf.count {
+            let size = (Int(hlsHeadBuf[pos]) << 24) | (Int(hlsHeadBuf[pos + 1]) << 16)
+                     | (Int(hlsHeadBuf[pos + 2]) << 8) | Int(hlsHeadBuf[pos + 3])
+            let fourcc = String(bytes: hlsHeadBuf[(pos + 4)...(pos + 7)], encoding: .ascii) ?? "?"
+            guard size >= 8 else {   // 64-bit largesize / malformed header: give up (fail-soft, see doc)
+                hlsHeadDone = true; hlsHeadBuf = []
+                DiagnosticsLog.log("dv", "hls init scan aborted: unparseable top-level box size=\(size) type=\(fourcc)")
+                return
+            }
+            if fourcc == "moov" {
+                guard pos + size <= hlsHeadBuf.count else { return }   // moov not fully buffered yet: wait
+                let initLen = pos + size
+                let initData = Data(hlsHeadBuf[0..<initLen])
+                hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
+                hlsSegmentStartByte = initLen   // segment 0 starts right after the init
+                hlsHeadDone = true; hlsHeadBuf = []
+                DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov)")
+                return
+            }
+            if fourcc == "moof" || fourcc == "mdat" {   // fragment data before any moov: cannot delimit
+                hlsHeadDone = true; hlsHeadBuf = []
+                DiagnosticsLog.log("dv", "hls init scan aborted: \(fourcc) arrived before moov")
+                return
+            }
+            pos += size   // skip ftyp/free/... ; loop waits for more bytes if the next header is not in yet
+        }
+        if hlsHeadBuf.count > Self.hlsHeadCap {
+            hlsHeadDone = true; hlsHeadBuf = []
+            DiagnosticsLog.log("dv", "hls init scan aborted: no moov in the first \(Self.hlsHeadCap) bytes")
+        }
+    }
+
+    /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
+    /// target duration at a keyframe (clean, seekable cut) or the hard bound at any frame (so one long GOP
+    /// can never outgrow the playlist's fixed TARGETDURATION). The cut = drain the interleave queue + flush
+    /// the muxer's open fragment (`av_interleaved_write_frame(ctx, nil)`, the documented movenc fragment
+    /// cut) + flush the AVIO tail, after which `buffer.producedCount` is EXACTLY the segment's end byte.
+    /// movenc's own frag_duration auto-cuts continue as shipped; they simply become intra-segment fragments.
+    private func hlsMaybeCut(outCtx: UnsafeMutablePointer<AVFormatContext>,
+                             pkt: UnsafeMutablePointer<AVPacket>,
+                             timeBase: AVRational) {
+        guard hlsIndexingEnabled else { return }
+        let den = Double(timeBase.den)
+        guard den > 0 else { return }
+        let ts = pkt.pointee.dts != AV_NOPTS_VALUE_CONST ? pkt.pointee.dts : pkt.pointee.pts
+        guard ts != AV_NOPTS_VALUE_CONST else { return }
+        let sec = Double(ts) * Double(timeBase.num) / den
+        hlsLastVideoSec = sec
+        guard let start = hlsSegmentStartSec else {
+            hlsSegmentStartSec = sec   // the first base-video packet opens segment 0
+            return
+        }
+        let elapsed = sec - start
+        let isKey = (pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST) != 0
+        let openBytes = buffer.producedCount - (hlsSegmentStartByte ?? 0)
+        guard (isKey && elapsed >= Self.hlsTargetSegmentSecs)
+                || elapsed >= Self.hlsMaxSegmentSecs
+                || openBytes >= Self.hlsMaxSegmentBytes else { return }
+        _ = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
+        avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
+        hlsCloseSegment(endSec: sec)
+        hlsSegmentStartSec = sec
+    }
+
+    /// Publish the open segment as CLOSED (byte range + exact duration). Only closed segments appear in the
+    /// media playlist, so a segment's bytes are always fully produced before AVPlayer can request them.
+    private func hlsCloseSegment(endSec: Double) {
+        guard hlsIndexingEnabled, let segStartByte = hlsSegmentStartByte, let startSec = hlsSegmentStartSec else { return }
+        let endByte = buffer.producedCount
+        guard endByte > segStartByte else { return }   // the flush produced no bytes: nothing to publish
+        let duration = min(Double(Self.hlsTargetDuration), max(0.04, endSec - startSec))
+        hlsLock.lock()
+        let idx = _hlsSegments.count
+        _hlsSegments.append(HLSSegment(index: idx, byteOffset: segStartByte,
+                                       byteLength: endByte - segStartByte, duration: duration))
+        hlsLock.unlock()
+        hlsSegmentStartByte = endByte
+    }
+
+    /// Build the master-playlist signaling from the FINAL output streams (post extradata repair + DOVI
+    /// sanitize/relabel), per Apple's HLS authoring spec for Dolby Vision: P5 advertises CODECS="dvh1.05.LL";
+    /// P8.1 advertises the plain HEVC CODECS plus SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p" and VIDEO-RANGE=PQ
+    /// (the brand and VIDEO-RANGE are mandatory cross-checks; leaving either out is incorrect).
+    private func hlsBuildSignaling(outCtx: UnsafeMutablePointer<AVFormatContext>,
+                                   inCtx: UnsafeMutablePointer<AVFormatContext>,
+                                   info: SourceInfo, baseVideoOut: Int) {
+        var videoCodec = "hvc1.2.4.L153.B0"   // safe Main10 default when the hvcC parse fails
+        var dvLevel = 0
+        var blCompat = info.dvBLCompatId
+        var profile = info.dvProfile
+        if baseVideoOut >= 0, let vpar = outCtx.pointee.streams[baseVideoOut]?.pointee.codecpar {
+            let n = Int(vpar.pointee.nb_coded_side_data)
+            if n > 0, let arr = vpar.pointee.coded_side_data {
+                for i in 0..<n where arr[i].type == AV_PKT_DATA_DOVI_CONF {
+                    if let d = arr[i].data {
+                        d.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { r in
+                            dvLevel = Int(r.pointee.dv_level)
+                            blCompat = Int(r.pointee.dv_bl_signal_compatibility_id)
+                            profile = Int(r.pointee.dv_profile)
+                        }
+                    }
+                }
+            }
+            if let parsed = Self.hevcCodecString(vpar) { videoCodec = parsed }
+        }
+        var supplemental: String?
+        var range: String? = "PQ"
+        let lvl = String(format: "%02d", min(max(dvLevel, 1), 13))
+        if profile == 5 {
+            videoCodec = "dvh1.05.\(lvl)"   // Profile 5 is DV-only (no cross-compatible base layer)
+        } else if profile == 8 {
+            switch blCompat {
+            case 1, 6: supplemental = "dvh1.08.\(lvl)/db1p"                  // HDR10/PQ-compatible base
+            case 4:    supplemental = "dvh1.08.\(lvl)/db4h"; range = "HLG"   // HLG-compatible base (8.4)
+            default:   supplemental = nil                                    // unknown compat: plain HEVC HDR
+            }
+        }
+        var audio: String?
+        for i in 0..<Int(outCtx.pointee.nb_streams) {
+            guard let par = outCtx.pointee.streams[i]?.pointee.codecpar,
+                  par.pointee.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
+            audio = Self.audioCodecString(par.pointee.codec_id)
+        }
+        let br = Int(inCtx.pointee.bit_rate)
+        let bandwidth = br > 0 ? br + br / 4 : 25_000_000   // headroom over the container rate; generous 4K default
+        let sig = HLSSignaling(videoCodec: videoCodec, supplementalCodec: supplemental, videoRange: range,
+                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth)
+        hlsLock.lock(); _hlsSignaling = sig; hlsLock.unlock()
+        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") bw=\(bandwidth)")
+    }
+
+    /// RFC 6381 HEVC codec string ("hvc1.2.4.L153.B0") from an hvcC record's profile/tier/level bytes.
+    /// Returns nil (caller keeps a safe default) when the extradata is not a parseable hvcC record.
+    private static func hevcCodecString(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> String? {
+        guard let par, let ex = par.pointee.extradata else { return nil }
+        let n = Int(par.pointee.extradata_size)
+        guard n >= 23, ex[0] == 1 else { return nil }
+        let profileSpace = Int((ex[1] >> 6) & 0x3)
+        let tier = (ex[1] >> 5) & 0x1
+        let profileIdc = ex[1] & 0x1F
+        // general_profile_compatibility_flags, bit-reversed then hex, per RFC 6381 (e.g. Main10 -> "4").
+        var compat: UInt32 = (UInt32(ex[2]) << 24) | (UInt32(ex[3]) << 16) | (UInt32(ex[4]) << 8) | UInt32(ex[5])
+        var reversed: UInt32 = 0
+        for _ in 0..<32 { reversed = (reversed << 1) | (compat & 1); compat >>= 1 }
+        let level = ex[12]
+        // Constraint bytes 6..11 as hex, trailing zero bytes omitted (Apple's examples end ".B0").
+        var lastNonZero = -1
+        for k in 0..<6 where ex[6 + k] != 0 { lastNonZero = k }
+        var constraints: [String] = []
+        if lastNonZero >= 0 {
+            for k in 0...lastNonZero { constraints.append(String(format: "%X", ex[6 + k])) }
+        }
+        let spacePrefix = ["", "A", "B", "C"][profileSpace]
+        var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).\(tier == 0 ? "L" : "H")\(level)"
+        if !constraints.isEmpty { s += "." + constraints.joined(separator: ".") }
+        return s
+    }
+
+    /// RFC 6381 codec string for the one mapped audio track (nil = leave it out of CODECS).
+    private static func audioCodecString(_ id: AVCodecID) -> String? {
+        switch id {
+        case AV_CODEC_ID_EAC3: return "ec-3"
+        case AV_CODEC_ID_AC3:  return "ac-3"
+        case AV_CODEC_ID_AAC:  return "mp4a.40.2"
+        case AV_CODEC_ID_MP3:  return "mp4a.40.34"
+        case AV_CODEC_ID_FLAC: return "fLaC"
+        case AV_CODEC_ID_ALAC: return "alac"
+        default: return nil
+        }
     }
 
     // MARK: - Source diagnostics (mirrors MKVRemuxSession)
@@ -976,18 +1268,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return c
     }
 
-    /// Harvest the VPS/SPS/PPS NALs out of ONE length-prefixed base-video access unit into Annex-B
-    /// (00 00 00 01 start-code) extradata bytes. A parameter-sets-in-band stream repeats all three ahead of
-    /// its IDR slice in the very first access unit, which the DV pre-scan already prebuffers seek-free.
-    /// Returns nil unless the walk parses cleanly end-to-end AND finds at least one of each parameter set,
-    /// so a misaligned or Annex-B-framed packet can never smuggle garbage into the output extradata
-    /// (fail-soft: the caller then demotes to libmpv instead).
-    private static func harvestParameterSetsAnnexB(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int)
-        -> (bytes: [UInt8], vps: Int, sps: Int, pps: Int)? {
+    /// Harvest the raw VPS/SPS/PPS NALs out of ONE length-prefixed base-video access unit. A
+    /// parameter-sets-in-band stream repeats all three ahead of its IDR slice in the very first access unit,
+    /// which the DV pre-scan already prebuffers seek-free. Returns nil unless the walk parses cleanly
+    /// end-to-end AND finds at least one of each parameter set, so a misaligned or Annex-B-framed packet can
+    /// never smuggle garbage into the output extradata (fail-soft: the caller then demotes to libmpv).
+    /// The NALs feed `buildRepairedHvcC`, never Annex-B extradata (see the repair-site comment for why).
+    private static func harvestParameterSets(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int)
+        -> (nals: [(type: UInt8, bytes: [UInt8])], vps: Int, sps: Int, pps: Int)? {
         guard let src = pkt.pointee.data else { return nil }
         let total = Int(pkt.pointee.size)
         guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return nil }
-        var out = [UInt8]()
+        var out: [(type: UInt8, bytes: [UInt8])] = []
         var vps = 0, sps = 0, pps = 0
         var pos = 0
         while pos + nalLengthSize <= total {
@@ -997,8 +1289,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             guard nalLen > 0, nalStart + nalLen <= total else { return nil }   // malformed walk: no harvest
             let nalType = (src[nalStart] >> 1) & 0x3F
             if nalType == 32 || nalType == 33 || nalType == 34 {
-                out.append(contentsOf: [0, 0, 0, 1])
-                out.append(contentsOf: UnsafeBufferPointer(start: src + nalStart, count: nalLen))
+                out.append((type: nalType, bytes: Array(UnsafeBufferPointer(start: src + nalStart, count: nalLen))))
                 switch nalType {
                 case 32: vps += 1
                 case 33: sps += 1
@@ -1009,6 +1300,36 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         guard pos == total, vps > 0, sps > 0, pps > 0 else { return nil }
         return (out, vps, sps, pps)
+    }
+
+    /// Build a complete hvcC record by grafting the harvested in-band parameter sets onto the SOURCE hvcC's
+    /// header fields (bytes 0..21: configurationVersion through lengthSizeMinusOne, which the WEB-DL-derived
+    /// MKVs this repairs carry correctly even when their parameter-set arrays are empty). Each array is
+    /// written with array_completeness=1, matching what movenc requires for the 'hvc1' sample entry. Returns
+    /// nil (the caller then fails fast to libmpv) when the source extradata is not an hvcC record to begin
+    /// with; building the header fields from scratch would need a full SPS bit parse, and no such source has
+    /// been observed on this lane.
+    private static func buildRepairedHvcC(source: UnsafeMutablePointer<AVCodecParameters>?,
+                                          nals: [(type: UInt8, bytes: [UInt8])]) -> [UInt8]? {
+        guard let source, let ex = source.pointee.extradata else { return nil }
+        let n = Int(source.pointee.extradata_size)
+        guard n >= 23, ex[0] == 1, !nals.isEmpty else { return nil }
+        var out = [UInt8](UnsafeBufferPointer(start: ex, count: 22))   // header bytes 0..21 verbatim
+        let grouped = Dictionary(grouping: nals, by: { $0.type })
+        let arrayTypes: [UInt8] = [32, 33, 34].filter { grouped[$0] != nil }   // VPS, SPS, PPS in spec order
+        out.append(UInt8(arrayTypes.count))                            // numOfArrays
+        for t in arrayTypes {
+            let list = grouped[t] ?? []
+            guard list.count <= 0xFFFF else { return nil }
+            out.append(0x80 | t)                                       // array_completeness=1 + NAL unit type
+            out.append(UInt8((list.count >> 8) & 0xFF)); out.append(UInt8(list.count & 0xFF))
+            for nal in list {
+                guard nal.bytes.count <= 0xFFFF else { return nil }
+                out.append(UInt8((nal.bytes.count >> 8) & 0xFF)); out.append(UInt8(nal.bytes.count & 0xFF))
+                out.append(contentsOf: nal.bytes)
+            }
+        }
+        return out
     }
 
     /// Replace the output codecpar's extradata with `bytes` (an av_malloc'd copy, zero-padded by
@@ -1244,6 +1565,12 @@ private let AVERROR_ETIMEDOUT_CONST: Int32 = -60
 
 /// AVFMT_FLAG_CUSTOM_IO is a plain #define (0x0080) not always surfaced as a Swift constant.
 private let AVFMT_FLAG_CUSTOM_IO_CONST: Int32 = 0x0080
+
+/// AV_NOPTS_VALUE = INT64_MIN via a cast macro the Swift importer does not surface.
+private let AV_NOPTS_VALUE_CONST: Int64 = Int64.min
+
+/// AV_PKT_FLAG_KEY is a plain #define (0x0001) not always surfaced as a Swift constant.
+private let AV_PKT_FLAG_KEY_CONST: Int32 = 0x0001
 
 /// AV_INPUT_BUFFER_PADDING_SIZE is a plain #define (64) the Swift importer does not always surface. libav
 /// bitstream readers over-read past the end of a packet buffer by up to this many bytes, so an av_malloc'd
