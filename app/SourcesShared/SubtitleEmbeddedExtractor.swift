@@ -169,15 +169,17 @@ enum SubtitleEmbeddedExtractor {
         return lang.isEmpty || lang == "und" ? nil : lang
     }
 
-    /// Extract the visible text from an ASS/SSA "Dialogue" event line. The format is 9 comma-separated fields
-    /// (Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect) then the Text (which may itself contain
-    /// commas), so we split on the first 9 commas and take the remainder, then strip `{...}` override tags and
-    /// convert `\N` / `\n` to newlines.
+    /// Extract the visible text from a libavcodec ASS/SSA event packet. The FFmpeg `ass` codec format is
+    /// `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text` (Start/End live in the packet pts, and
+    /// a ReadOrder is prepended), so there are 8 fields before the Text, which may itself contain commas. We
+    /// split on the first 8 commas and take the 9th part, then strip `{...}` override tags and convert `\N` /
+    /// `\n` to newlines.
     private static func plainTextFromASS(_ ass: String) -> String {
-        // libavcodec's `ass` rect is the event line WITHOUT the "Dialogue: " prefix but WITH the leading
-        // ReadOrder/Layer fields. Split into at most 10 parts on comma; the 10th is the text.
-        let parts = ass.split(separator: ",", maxSplits: 9, omittingEmptySubsequences: false)
-        let textField = parts.count >= 10 ? String(parts[9]) : ass
+        // Split on the first 8 commas; the 9th part is the Text. (The old split-on-9 assumed the .ass FILE
+        // field count and dropped the first comma-run of every cue, or fell back to the raw line when the
+        // text had no comma, corrupting every ASS/SSA subtitle cue.)
+        let parts = ass.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
+        let textField = parts.count >= 9 ? String(parts[8]) : ass
         let noTags = textField.replacingOccurrences(of: #"\{[^}]*\}"#, with: "", options: .regularExpression)
         return noTags
             .replacingOccurrences(of: "\\N", with: "\n")

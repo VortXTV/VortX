@@ -41,6 +41,10 @@ struct iOSCollectionsHub: View {
         guard !prefs.isCategoryHidden(HubCategoryKey.genresSection) else { return [] }
         return model.genres.filter { !prefs.isCategoryHidden(HubCategoryKey.genre($0)) }
     }
+    private var visibleDecades: [DecadeSpec] {
+        guard !prefs.isCategoryHidden(HubCategoryKey.decadesSection) else { return [] }
+        return model.decades.filter { !prefs.isCategoryHidden(HubCategoryKey.decade($0)) }
+    }
     /// Whether the streaming-services section is shown (a single section switch, not per-service).
     private var showStreaming: Bool { !prefs.isCategoryHidden(HubCategoryKey.streamingSection) }
     /// The streaming tiles with TMDB's split brand entries collapsed to one per brand (H1: the owner saw
@@ -70,6 +74,13 @@ struct iOSCollectionsHub: View {
                 hubSection(title: "Browse by Genre") {
                     ForEach(visibleGenres, id: \.self) { g in
                         NavigationLink(value: HubTarget.genre(g)) { iOSGenreTile(genre: g, backdrop: model.genreBackdrops[g.title], width: tileWidth) }.buttonStyle(.plain)
+                    }
+                }
+            }
+            if !visibleDecades.isEmpty {
+                hubSection(title: "Browse by Decade") {
+                    ForEach(visibleDecades, id: \.self) { d in
+                        NavigationLink(value: HubTarget.decade(d)) { iOSDecadeTile(decade: d, width: tileWidth) }.buttonStyle(.plain)
                     }
                 }
             }
@@ -107,9 +118,9 @@ struct iOSCollectionsHub: View {
 enum iOSPillMetrics {
     /// The shared tile/pill column width used across the hub tiles and the poster cards.
     static let cardWidth: CGFloat = 224
-    /// Poster-grid card width on a COMPACT iPhone only (#104): 224 fit just one column on a phone, so the
-    /// vertical poster grid + its cards use this narrower width there to show ~3 across. iPad/Mac stay at 224.
-    static let gridPosterWidthCompact: CGFloat = 116
+    /// Poster-grid card width on a COMPACT iPhone only (#104): the default now shows ~2 across (matching the
+    /// Streaming Services / Discover category tiles) instead of the old smaller 3-across. iPad/Mac stay at 224.
+    static let gridPosterWidthCompact: CGFloat = 168
 
     /// The poster-card / grid-track width for the user's Poster Style preset, size-class aware. The grid and
     /// the cards both call this so they stay in lockstep and the adaptive column count recomputes from the
@@ -288,6 +299,27 @@ struct iOSGenreTile: View {
             HStack(spacing: 6) {
                 Image(systemName: genre.symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
                 Text(LocalizedStringKey(genre.title)).font(.system(size: 15, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+            }
+            .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
+            .padding(10)
+        }
+        .frame(width: width, height: width * 0.5)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+}
+
+/// A browse-by-decade tile: the same ember-tinted card as iOSGenreTile with a calendar glyph and the decade
+/// label. No backdrop (the gradient carries it), so nothing to decode.
+struct iOSDecadeTile: View {
+    let decade: DecadeSpec
+    var width: CGFloat = iOSPillMetrics.cardWidth
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
+            HStack(spacing: 6) {
+                Image(systemName: decade.symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
+                Text(decade.title).font(.system(size: 15, weight: .bold)).foregroundStyle(.white).lineLimit(1)
             }
             .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
             .padding(10)
@@ -521,6 +553,7 @@ struct iOSDiscoverSettingsView: View {
                 categoryToggle("Discover cards", key: HubCategoryKey.discoverSection)
                 categoryToggle("Streaming services", key: HubCategoryKey.streamingSection)
                 categoryToggle("Genres", key: HubCategoryKey.genresSection)
+                categoryToggle("Decades", key: HubCategoryKey.decadesSection)
             } header: {
                 Text("Sections")
             } footer: {
@@ -539,6 +572,14 @@ struct iOSDiscoverSettingsView: View {
                 Section("Genres") {
                     ForEach(CollectionsHubModel.genreList, id: \.self) { g in
                         categoryToggle(g.title, key: HubCategoryKey.genre(g))
+                    }
+                }
+            }
+
+            if !prefs.isCategoryHidden(HubCategoryKey.decadesSection) {
+                Section("Decades") {
+                    ForEach(CollectionsHubModel.decadeList, id: \.self) { d in
+                        categoryToggle(d.title, key: HubCategoryKey.decade(d))
                     }
                 }
             }

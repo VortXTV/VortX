@@ -246,6 +246,9 @@ enum NodeServer {
         NSLog("StremioX: starting node streaming server (HOME=\(caches), log=\(logPath))")
         var argv: [UnsafeMutablePointer<CChar>?] =
             [strdup("node"), strdup("-r"), strdup(preloadPath), strdup(scriptPath), nil]
+        // strdup mallocs each argv entry; node_start returns when the runtime exits, so free
+        // them afterward to avoid leaking on every (re)start and on the exit path.
+        defer { argv.forEach { if let p = $0 { free(p) } } }
         let rc = node_start(4, &argv)
         exitCode = rc
         NSLog("StremioX: node server exited rc=\(rc)")

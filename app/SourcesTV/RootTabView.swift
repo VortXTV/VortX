@@ -39,6 +39,11 @@ struct PlaybackRequest: Identifiable {
     /// false for an auto-pick (Watch Now / a Continue-Watching resume). TVPlayerView honors an explicit
     /// pick on a start-timeout (retries in place) instead of silently hopping to a lower-quality source.
     var wasExplicitPick: Bool = false
+    /// True when this play is a Continue-Watching RESUME (directResume). A resume plays its exact stored source
+    /// FIRST (like an explicit pick, so a slow warming link retries in place rather than hopping), but on a HARD
+    /// load failure it MUST hop to a fresh source instead of dead-ending: a stored debrid link expires, and the
+    /// resume's job is to get you watching. Distinct from wasExplicitPick, where a manual source-row tap dead-ends.
+    var wasResume: Bool = false
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -88,7 +93,8 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
-                             audioSidecarURL: req.audioSidecarURL, startedFromExplicitPick: req.wasExplicitPick,
+                             audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
+                             startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }

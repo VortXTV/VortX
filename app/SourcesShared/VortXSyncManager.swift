@@ -1,5 +1,23 @@
 import Foundation
 import SwiftUI
+import CryptoKit   // Curve25519 for the QR sign-in pairing session (QrJoinSession.ephemeral)
+
+/// Bridges the thread-agnostic `VortXSyncManager.addonOrderChangedNote` to a `@Published` the add-on list
+/// READS in its body, so a reorder re-sorts the live list immediately. A never-read `@State` bumped from
+/// `.onReceive` did not survive the Reorder screen's NavigationStack push/pop (SwiftUI snapshots the covered
+/// root); an `@ObservedObject` whose value is read in body does, because SwiftUI re-renders a reappearing
+/// view when a tracked dependency changed while it was covered. Small + dedicated so views observing it do
+/// not also re-render on VortXSyncManager's unrelated account/sign-in @Published churn.
+final class AddonOrderObserver: ObservableObject {
+    static let shared = AddonOrderObserver()
+    @Published private(set) var revision = 0
+    private init() {
+        // queue: .main -> the block (and the @Published mutation) run on the main thread, which SwiftUI requires.
+        NotificationCenter.default.addObserver(forName: VortXSyncManager.addonOrderChangedNote, object: nil, queue: .main) { [weak self] _ in
+            self?.revision &+= 1
+        }
+    }
+}
 
 /// The VortX end-to-end-encrypted account on-device: create / sign in / recover / sign out, plus
 /// push and pull the encrypted sync document. Mirrors the website (vortx-site/src/lib/vault.ts) and
@@ -28,11 +46,40 @@ final class VortXSyncManager: ObservableObject {
     /// version-wins guard stays consistent across relaunches: an in-memory 0 after a cold launch would treat
     /// the account's current doc as "newer" and re-apply it once on every launch (harmless but wasteful, and
     /// it re-runs the restore). Seeded from UserDefaults at init.
-    private static let kVersionKey = "vortx.sync.lastSyncedVersion"
-    private var lastSyncedVersion = UserDefaults.standard.integer(forKey: VortXSyncManager.kVersionKey)
-    private func persistLastSyncedVersion() {
-        UserDefaults.standard.set(lastSyncedVersion, forKey: Self.kVersionKey)
+    /// MIGRATION flip for the version-bound sync-document format (see VortXSyncCrypto.sealDocument). Stays
+    /// FALSE until the dual-read build is broadly adopted: a v2 doc is unreadable by any client that predates
+    /// openDocument, so writing v2 before then breaks sync for a user whose OTHER device/surface is still on
+    /// an older build. openDocument always reads BOTH formats regardless of this flag; only WRITE is gated.
+    ///
+    /// DO NOT flip to true until ALL of the following hold (each is a hard gate; a premature flip either
+    /// breaks or fails to protect real accounts):
+    ///   1. Dual-read shipped + adopted on EVERY sync client: this app, the vortx-site dashboard
+    ///      (vortx.tv), AND the web client (webapp/, web.vortx.tv) - all three, each with WRITE_SYNC_DOC_V2
+    ///      still false. (Dual-read + the decrypt-fail guard is DONE on all three as of this change.)
+    ///   2. H-1, a per-account "seen v2" ratchet: once an account's doc has opened as v2 (or this client
+    ///      wrote v2), REFUSE a bare-legacy doc for that account thereafter - else a backend can serve an
+    ///      archived pre-flip legacy ciphertext under a forged higher version and the legacy read path opens
+    ///      it, so the rollback protection is theatre for every account that ever had a legacy doc. NOT DONE.
+    ///   3. H-2, a per-account version high-water floor: reject a pulled doc whose version is below the last
+    ///      version this device applied FOR THAT ACCOUNT (lastSyncedVersion is currently global, so this
+    ///      needs per-account keying to avoid breaking account-switch), so an honest-label replay of an old
+    ///      (ciphertext, version) pair cannot become a stale merge base that drops other surfaces' writes.
+    ///      NOT DONE.
+    /// Flip this AND WRITE_SYNC_DOC_V2 in vortx-site vault.ts AND webapp/src/lib/vault.ts together.
+    static let writeSyncDocV2 = false
+    private static let kVersionKey = "vortx.sync.lastSyncedVersion"   // legacy GLOBAL key (pre per-account)
+    // H-2: the newest doc version this device has pushed or applied, keyed PER ACCOUNT so the version-wins
+    // guard and the merge-base floor follow the signed-in account. A single global int broke on account-switch
+    // (sign out of A at v1000, into B at v5 -> B's pulls would look stale). A fresh per-account key starts at
+    // 0, so the first pull is treated as newer and applied once, then stamps the key - the same harmless
+    // self-heal the global value had on a cold launch. The computed setter persists immediately.
+    private func versionKey(for accountId: String?) -> String { "vortx.sync.lastSyncedVersion." + (accountId ?? "") }
+    private var lastSyncedVersion: Int {
+        get { UserDefaults.standard.integer(forKey: versionKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: versionKey(for: account?.id)) }
     }
+    private func persistLastSyncedVersion() { /* the computed setter above persists per-account; no-op kept so
+        the advance-then-persist call sites read unchanged */ }
     /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
     /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
     /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
@@ -46,9 +93,54 @@ final class VortXSyncManager: ObservableObject {
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
     /// the converged order. Empty means "no shared order yet" (fall back to the descriptor spine).
     private static let kAddonOrderKey = "vortx.sync.appliedAddonOrder"
+    /// Upper bound on the persisted order length. A real account has a few dozen add-ons; this only exists so a
+    /// malicious/garbage synced `doc.addonOrder` can't balloon UserDefaults. Applied in the setter, which is the
+    /// single chokepoint for both the in-app reorder and the syncDown apply.
+    private static let maxAddonOrderEntries = 1024
     static var appliedAddonOrder: [String] {
         get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: kAddonOrderKey) }
+        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
+    }
+    /// Posted (main thread) whenever the shared add-on order changes: an in-app Reorder drag or a remote
+    /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
+    /// appliedAddonOrder is a plain UserDefaults static (not @Published) and gives SwiftUI no other signal.
+    static let addonOrderChangedNote = Notification.Name("vortx.addonOrderChanged")
+
+    /// Sort a live list of items by the shared `appliedAddonOrder` (the in-app / dashboard reorder), keyed
+    /// by each item's transport URL. Items present in the order come first, in that order; any not yet in it
+    /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
+    /// order returns the input unchanged, so this is a no-op until the user actually reorders.
+    static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
+        let order = appliedAddonOrder
+        guard !order.isEmpty else { return items }
+        var index: [String: Int] = [:]
+        for (i, u) in order.enumerated() { index[u] = i }
+        return items.enumerated().sorted { a, b in
+            let ia = index[AddonTombstones.normalize(url(a.element))]
+            let ib = index[AddonTombstones.normalize(url(b.element))]
+            switch (ia, ib) {
+            case let (x?, y?): return x < y
+            case (_?, nil):    return true                 // ordered items before not-yet-ordered
+            case (nil, _?):    return false
+            case (nil, nil):   return a.offset < b.offset  // stable for the un-ordered tail
+            }
+        }.map(\.element)
+    }
+
+    /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY
+    /// so the dashboard and the user's other devices converge, mirroring the dashboard's doc.addonOrder write.
+    /// The immediate push avoids the debounce-starvation that delayed removals (see uninstallAddon).
+    func applyInAppAddonOrder(_ transportUrls: [String]) {
+        let normalized = transportUrls.map { AddonTombstones.normalize($0) }
+        guard normalized != Self.appliedAddonOrder else { return }
+        Self.appliedAddonOrder = normalized
+        // Refresh any live add-on list NOW: appliedAddonOrder is a plain UserDefaults static, not @Published,
+        // so views showing the list have no other signal to re-run orderedByApplied on their current body.
+        NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
+        Task {
+            let ok = await pushThisDevice()
+            NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", normalized.count, ok ? "yes" : "no")
+        }
     }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
     /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
@@ -116,7 +208,7 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - HTTP
 
-    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false) async -> (Int, [String: Any]?) {
+    private func request(_ method: String, _ path: String, body: [String: Any]? = nil, auth: Bool = false, bearer: String? = nil) async -> (Int, [String: Any]?) {
         guard let url = URL(string: base + path) else { return (0, nil) }
         var req = URLRequest(url: url)
         req.httpMethod = method
@@ -124,7 +216,9 @@ final class VortXSyncManager: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "content-type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         }
-        if auth, let token { req.setValue("Bearer " + token, forHTTPHeaderField: "authorization") }
+        // `bearer` is a one-off token override (the QR joiner calls /me with the freshly issued session
+        // token BEFORE it is adopted); otherwise `auth` uses the stored session token.
+        if let t = bearer ?? (auth ? token : nil) { req.setValue("Bearer " + t, forHTTPHeaderField: "authorization") }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -193,6 +287,8 @@ final class VortXSyncManager: ObservableObject {
         let (_, pre) = await request("POST", "/v1/auth/prelogin", body: ["login": login])
         guard let saltStr = pre?["kdfSalt"] as? String, let salt = Data(base64Encoded: saltStr),
               let iters = pre?["kdfIters"] as? Int else { return .failed("Could not reach VortX. Try again.") }
+        // Reject a downgraded work factor from the UNAUTHENTICATED prelogin response before deriving the key.
+        guard iters >= VortXSyncCrypto.minIters else { return .failed("Could not verify VortX security parameters. Try again.") }
         let masterKey = VortXSyncCrypto.masterKey(password: password, kdfSalt: salt, iters: iters)
         var body: [String: Any] = ["login": login, "authVerifier": VortXSyncCrypto.authVerifier(masterKey: masterKey, password: password)]
         if let totp, !totp.isEmpty { body["totp"] = totp }
@@ -214,6 +310,8 @@ final class VortXSyncManager: ObservableObject {
               let iters = start?["kdfIters"] as? Int, let wrappedRec = start?["wrappedKeyRecovery"] as? String else {
             return .failed("No recovery is set up for that email.")
         }
+        // Same downgrade guard as signIn: recover-start is unauthenticated too.
+        guard iters >= VortXSyncCrypto.minIters else { return .failed("Could not verify VortX security parameters. Try again.") }
         let recoveryKey = VortXSyncCrypto.recoveryKey(recoveryCode: trimmed, kdfSalt: salt, iters: iters)
         guard let dk = VortXSyncCrypto.open(key: recoveryKey, wrappedRec) else { return .failed("That recovery code is not correct.") }
         // Keep the existing kdfSalt (it also derives the recovery key); derive the new master from it.
@@ -235,11 +333,34 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - Encrypted sync document
 
-    func pullSyncDoc() async -> [String: Any]? {
+    // H-1 downgrade ratchet (per account): once this account's doc has opened as v2 (or this client wrote v2),
+    // a bare-legacy blob is treated as TAMPER and never opened. A legacy blob authenticates at ANY version, so
+    // without this a backend could replay an archived pre-flip legacy ciphertext under a forged higher version
+    // and defeat the version binding. Dormant until v2 docs exist (post-flip). Keyed by accountId.
+    private static func sawDocV2(_ accountId: String) -> Bool {
+        !accountId.isEmpty && UserDefaults.standard.bool(forKey: "vortx.sync.sawDocV2." + accountId)
+    }
+    private static func markSawDocV2(_ accountId: String) {
+        guard !accountId.isEmpty else { return }
+        UserDefaults.standard.set(true, forKey: "vortx.sync.sawDocV2." + accountId)
+    }
+    /// Open a pulled sync document, enforcing the H-1 ratchet. Returns nil (tamper / undecryptable) rather than
+    /// ever surfacing an empty doc, so a caller never clobbers the account from a refused or failed open.
+    private func openSyncDocument(_ stored: String, version: Int) -> Data? {
         guard let dataKey else { return nil }
+        let acctId = account?.id ?? ""
+        let isV2 = stored.hasPrefix(VortXSyncCrypto.docV2Prefix)
+        if !isV2, Self.sawDocV2(acctId) { return nil }             // legacy after v2 seen -> tamper
+        let pt = VortXSyncCrypto.openDocument(dataKey: dataKey, stored: stored, accountId: acctId, version: version)
+        if pt != nil, isV2 { Self.markSawDocV2(acctId) }           // this account is now on v2
+        return pt
+    }
+
+    func pullSyncDoc() async -> [String: Any]? {
+        guard dataKey != nil else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let doc = json?["document"] as? String,
-              let pt = VortXSyncCrypto.open(key: dataKey, doc) else { return nil }
+              let pt = openSyncDocument(doc, version: (json?["version"] as? Int) ?? 0) else { return nil }
         return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
     }
 
@@ -248,24 +369,29 @@ final class VortXSyncManager: ObservableObject {
     /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
     private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
     private func pullSyncDocResult() async -> SyncDocPull {
-        guard let dataKey else { return .failed }
+        guard dataKey != nil else { return .failed }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
         guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
-        guard let pt = VortXSyncCrypto.open(key: dataKey, docStr),
-              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable: do not clobber
+        let pulledVersion = (json?["version"] as? Int) ?? 0
+        // H-2: refuse an honest-label replay of a doc OLDER than what this account has already applied. syncUp
+        // uses this as its merge base, so a stale base would drop newer writes made on another surface. A real
+        // server only ever returns a version >= what we last stamped, so this only fires on rollback/replay.
+        if pulledVersion < lastSyncedVersion { return .failed }
+        guard let pt = openSyncDocument(docStr, version: pulledVersion),
+              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable / ratchet-refused: do not clobber
         return .doc(obj)
     }
 
     /// Pull the doc plus its server version, so the foreground pull can apply only changes that are
     /// newer than what this device already has (and not re-apply its own last push).
     private func pullDocVersioned() async -> (doc: [String: Any], version: Int)? {
-        guard let dataKey else { return nil }
+        guard dataKey != nil else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
         guard code == 200, let docStr = json?["document"] as? String,
               let version = json?["version"] as? Int,
-              let pt = VortXSyncCrypto.open(key: dataKey, docStr),
+              let pt = openSyncDocument(docStr, version: version),
               let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return nil }
         return (obj, version)
     }
@@ -279,7 +405,7 @@ final class VortXSyncManager: ObservableObject {
     private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }
     private func pushSyncDocAt(_ obj: [String: Any], version: Int) async -> PushOutcome {
         guard let dataKey, let pt = try? JSONSerialization.data(withJSONObject: obj),
-              let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return .error }
+              let ct = VortXSyncCrypto.sealDocument(dataKey: dataKey, plaintext: pt, accountId: account?.id ?? "", version: version, writeV2: Self.writeSyncDocV2) else { return .error }
         let (code, json) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still
@@ -288,6 +414,7 @@ final class VortXSyncManager: ObservableObject {
         if accepted {
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
+            if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
             return .accepted(version: version)
         }
         // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
@@ -296,13 +423,34 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push at an epoch-ms version. Used by callers that push a fully-formed doc they do
-    /// not re-derive (they hold no local pending changes to re-merge). Fixed so a rejected write no longer
-    /// advances lastSyncedVersion: it returns false so the caller / the next natural pull reconciles.
+    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
+    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
+    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
+    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
+    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
+    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
+    /// reconciles.
     @discardableResult
     func pushSyncDoc(_ obj: [String: Any]) async -> Bool {
-        let version = Int(Date().timeIntervalSince1970 * 1000)
-        if case .accepted = await pushSyncDocAt(obj, version: version) { return true }
+        var version = Int(Date().timeIntervalSince1970 * 1000)
+        for attempt in 0..<2 {
+            switch await pushSyncDocAt(obj, version: version) {
+            case .accepted:
+                return true
+            case .error:
+                return false
+            case .rejected(let storedVersion):
+                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
+                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
+                // clock still produces a higher version than the stored one, so the device is never locked out.
+                guard attempt < 1 else { return false }
+                if let stored = storedVersion {
+                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
+                } else {
+                    version = Int(Date().timeIntervalSince1970 * 1000)
+                }
+            }
+        }
         return false
     }
 
@@ -611,14 +759,25 @@ final class VortXSyncManager: ObservableObject {
     static func currentAddonOrder() -> [String] {
         let removed = AddonTombstones.all()
         var seen = Set<String>()
-        var order: [String] = []
+        var live: [String] = []
         for raw in CoreBridge.shared.rawAddonDescriptorsOrdered() {
             guard let url = raw["transportUrl"] as? String, !url.isEmpty else { continue }
             let normalized = AddonTombstones.normalize(url)
             guard !removed.contains(normalized), seen.insert(normalized).inserted else { continue }
-            order.append(normalized)
+            live.append(normalized)
         }
-        return order
+        // Prefer the user's shared order (in-app Reorder screen or the dashboard drag): take the applied
+        // order intersected with the LIVE set (so an uninstalled/removed add-on drops out), then append any
+        // live add-on not yet in it (a fresh install) so it is never lost. This makes an in-app reorder the
+        // value that gets PUSHED, so it converges instead of the next push overwriting it with the raw engine
+        // Vec order. Empty applied order -> the live engine order unchanged (no behavior change until reorder).
+        let applied = appliedAddonOrder
+        guard !applied.isEmpty else { return live }
+        let liveSet = Set(live)
+        var result = applied.filter { liveSet.contains($0) }
+        let inResult = Set(result)
+        result.append(contentsOf: live.filter { !inResult.contains($0) })
+        return result
     }
 
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
@@ -679,8 +838,10 @@ final class VortXSyncManager: ObservableObject {
             if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
             // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
             // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
-            // path explicitly). @MainActor hop because the coordinator is main-actor isolated.
-            Task { @MainActor in DebridCoordinator.shared.reload() }
+            // path explicitly). @MainActor hop because the coordinator is main-actor isolated. This runs
+            // AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the body
+            // in its own suppression to keep reload()'s writes from re-arming a self-echo push.
+            Task { @MainActor in Self.shared.withRemoteApplySuppressed { DebridCoordinator.shared.reload() } }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
@@ -714,6 +875,10 @@ final class VortXSyncManager: ObservableObject {
         // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
         // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
         // reinstalled on the next hydrate even before this uninstall runs.
+        // ALWAYS fold the incoming removals (never version-gate them): merging a removal tombstone is
+        // union-safe - it only ADDS to the durable removal set, it can never resurrect an add-on. Gating it on
+        // a "strictly newer" pull is what let a web/other-device removal be SKIPPED on an equal/forced pull, so
+        // the tombstone never merged and the roster union re-added the add-on (the WatchHub/YouTube resurrection).
         var incomingAddonRemovals: [String] = []
         if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
             incomingAddonRemovals += removed
@@ -733,15 +898,22 @@ final class VortXSyncManager: ObservableObject {
             if normalized != Self.appliedAddonOrder {
                 Self.appliedAddonOrder = normalized
                 restored = true
+                // A remote reorder landed: refresh any live add-on list on the main thread.
+                DispatchQueue.main.async { NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil) }
             }
         }
         let removedAddonSet = AddonTombstones.all()
         if !removedAddonSet.isEmpty {
+            // Runs AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the
+            // uninstall loop in its own suppression: uninstallAddon writes UserDefaults, which would otherwise
+            // fire the observer and re-arm a self-echo push of the just-applied removal.
             Task { @MainActor in
-                for addon in CoreBridge.shared.addons
-                where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
-                    && !addon.isOfficial && !addon.isProtected {
-                    CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                Self.shared.withRemoteApplySuppressed {
+                    for addon in CoreBridge.shared.addons
+                    where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
+                        && !addon.isOfficial && !addon.isProtected {
+                        CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                    }
                 }
             }
         }
@@ -771,6 +943,8 @@ final class VortXSyncManager: ObservableObject {
         // Web-authored profile edits (vortx.tv dashboard writes doc.profileEdits, a SIBLING key the app
         // preserves via syncUp's read-merge-write, unlike doc.vortx which the app overwrites). Apply
         // name/familyEdit/pin + per-profile library adds, LWW by editedAt, once per stamp.
+        // Guarded by the per-stamp editedAt LWW below (once per stamp), which is the correct conflict rule here;
+        // no extra version gate (that was reverted with the tombstone gates, since it blocked legitimate edits).
         if let edits = doc["profileEdits"] as? [String: Any] {
             let editedAt = (edits["editedAt"] as? Double) ?? Double((edits["editedAt"] as? Int) ?? 0)
             if editedAt > lastAppliedProfileEditsAt {
@@ -870,8 +1044,12 @@ final class VortXSyncManager: ObservableObject {
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
         guard !ownedLibrary.isEmpty else { return }
-        // Only recover when the engine's account library is genuinely empty (a fresh / cold device).
-        let engineLibrary = CoreBridge.shared.library?.catalog ?? []
+        // Only recover when the engine's account library is genuinely empty (a fresh / cold device). Require
+        // the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
+        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account
+        // library while the engine is still loading its real one. A nil library defers recovery to a later
+        // call once the engine has emitted its library field.
+        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
         let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
         guard !engineHasLibrary else { return }
         var recovered = 0
@@ -963,6 +1141,79 @@ final class VortXSyncManager: ObservableObject {
         a.twoFactorEnabled = acct["twoFactorEnabled"] as? Bool ?? a.twoFactorEnabled
         account = a
         persist()
+    }
+
+    // MARK: - VortX-account QR sign-in (device pairing)
+    //
+    // A device with no keyboard (Apple TV) signs into the VortX account by showing a QR/code. A device
+    // already signed into VortX (a phone, or web.vortx.tv) approves it and hands over the sync data key,
+    // ECDH-wrapped to the TV's ephemeral key. The relay (/v1/qr/*) never sees the key.
+    //
+    // JOINER (TV):    POST /v1/qr/start {devicePublicKey} -> {pairingID, code}; then poll
+    //                 GET /v1/qr/status?id=... -> {pending} | {token, payload} | 404/410 expired.
+    // HOLDER (phone/web, signed in): POST /v1/qr/authorize {code, wrappedPayload} (Bearer).
+    //
+    // The worker mints the session `token` itself; the joiner wraps NOTHING and the holder wraps only the
+    // raw 32-byte `dataKey`. The opaque `payload` string is a JSON envelope so the holder's ephemeral
+    // public key travels with the sealed key: {"claim": <b64url holder pubkey>, "wrapped": <b64url iv‖ct‖tag>}.
+    // Both the app holder (qrApprove) and the web holder (vortx-site vault.ts qrApprove) MUST emit this exact
+    // envelope, and both joiners MUST parse it. Crypto contract: PairingCrypto (salt vortx-pairing-salt-v1,
+    // info vortx-pairing-v1, base64url, iv‖ct‖tag) — identical across app + web.
+
+    /// A live joiner pairing: the id to poll, the human code to show, and our ephemeral key kept in memory
+    /// only (never persisted) until the handoff completes. `devicePublicKey` is embedded in the shown QR.
+    struct QrJoinSession {
+        let pairingID: String
+        let code: String
+        let devicePublicKey: String
+        let ephemeral: Curve25519.KeyAgreement.PrivateKey
+    }
+
+    enum QrJoinResult: Equatable { case pending, expired, failed, signedIn(email: String) }
+
+    /// JOINER (TV): open a pairing. Returns the session to poll, or nil on a transport failure.
+    func qrStart() async -> QrJoinSession? {
+        let eph = PairingCrypto.newEphemeral()
+        let pub = eph.publicKeyBase64URL
+        let (code, json) = await request("POST", "/v1/qr/start", body: ["devicePublicKey": pub])
+        guard code == 200, let id = json?["pairingID"] as? String, let human = json?["code"] as? String else { return nil }
+        return QrJoinSession(pairingID: id, code: human, devicePublicKey: pub, ephemeral: eph.privateKey)
+    }
+
+    /// JOINER (TV): poll once. On approval, unwrap the data key, fetch the account via /me with the freshly
+    /// issued token, and adopt. Security: the token is DISCARDED (never adopted) if the unwrap fails, so a
+    /// session with no decryptable data key can never leave a half-signed-in device.
+    func qrPoll(_ session: QrJoinSession) async -> QrJoinResult {
+        let (code, json) = await request("GET", "/v1/qr/status?id=\(session.pairingID)")
+        if code == 404 || code == 410 { return .expired }
+        guard code == 200 else { return .pending }
+        if json?["pending"] as? Bool == true { return .pending }
+        guard let token = json?["token"] as? String, let payloadStr = json?["payload"] as? String else { return .pending }
+        // Parse the {"claim","wrapped"} envelope and unwrap the sync data key with our ephemeral private key.
+        guard let pData = payloadStr.data(using: .utf8),
+              let env = (try? JSONSerialization.jsonObject(with: pData)) as? [String: Any],
+              let claim = env["claim"] as? String, let wrapped = env["wrapped"] as? String,
+              let dk = PairingCrypto.unwrapDataKey(wrapped: wrapped, holderPublicKey: claim, using: session.ephemeral)
+        else { return .failed }
+        // Fetch the account this session belongs to, authing with the freshly issued token (not yet adopted).
+        let (mc, mj) = await request("GET", "/v1/auth/me", bearer: token)
+        guard mc == 200, let acct = mj?["account"] as? [String: Any] else { return .failed }
+        adopt(token: token, account: acct, dataKey: dk)
+        return .signedIn(email: acct["email"] as? String ?? "")
+    }
+
+    /// HOLDER (a signed-in device, and the shared shape the web holder mirrors): approve a joining device's
+    /// `code`, wrapping our data key to the device's ephemeral public key (from the QR's `k` param). Returns
+    /// false if we are not signed in (no data key), the wrap fails, or the relay rejects it.
+    func qrApprove(code: String, devicePublicKey: String) async -> Bool {
+        guard let dataKey else { return false }
+        guard let (claim, wrapped) = PairingCrypto.wrapDataKey(dataKey, toJoinerPublicKey: devicePublicKey),
+              let envData = try? JSONSerialization.data(withJSONObject: ["claim": claim, "wrapped": wrapped]),
+              let envelope = String(data: envData, encoding: .utf8) else { return false }
+        let (c, _) = await request("POST", "/v1/qr/authorize",
+            body: ["code": code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(), "wrappedPayload": envelope],
+            auth: true)
+        return c == 200
     }
 
     /// Auto-sync: a debounced push, called whenever a setting / profile / key changes. Coalesces a burst

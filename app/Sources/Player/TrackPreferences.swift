@@ -216,6 +216,7 @@ struct TrackPreferences: Equatable {
         ("en", "English"), ("es", "Spanish"), ("fr", "French"), ("de", "German"),
         ("it", "Italian"), ("pt", "Portuguese"), ("hi", "Hindi"), ("ja", "Japanese"),
         ("ko", "Korean"), ("zh", "Chinese"), ("ar", "Arabic"), ("ru", "Russian"),
+        ("tr", "Turkish"), ("nl", "Dutch"), ("pl", "Polish"), ("sv", "Swedish"),
     ]
 
     /// The device's preferred languages as ISO codes, deduplicated, used as the default.

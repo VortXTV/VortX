@@ -467,7 +467,7 @@ struct DetailView: View {
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
                                              watched: watched,
-                                             initialSeason: primary?.video.season)
+                                             initialSeason: resumeSeasonHint(videos, metaID: meta.id) ?? primary?.video.season)
                             .id("detailContent")
                         castSection
                         whereToWatchSection
@@ -965,6 +965,19 @@ struct DetailView: View {
         return f
     }()
 
+    /// The season of the episode the viewer was LAST on (from the resume videoId), decoupled from the
+    /// watched-gate seriesPrimaryEpisode applies. Opening Details from Continue Watching should land on the
+    /// season you were last in, even if that episode is now marked watched (seriesPrimaryEpisode would jump to
+    /// the next-unwatched season instead). nil when there is no resume position, so the caller falls back to the
+    /// primary/next-unwatched season. seriesPrimaryEpisode still drives the Resume/Play button unchanged.
+    private func resumeSeasonHint(_ videos: [CoreVideo], metaID: String) -> Int? {
+        let videoId: String? = profiles.activeUsesEngineHistory
+            ? core.metaDetails?.libraryItem?.state.videoId
+            : profiles.watch[metaID]?.videoId
+        guard let videoId else { return nil }
+        return sortedEpisodes(videos).first { $0.id == videoId }?.season
+    }
+
     private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
         // Resume position: the engine's library entry is account level, so overlay
@@ -1058,12 +1071,23 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
     @EnvironmentObject private var profiles: ProfileStore   // per-profile progress + live updates
 
+    @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (#7 return-to-episode)
     @State private var season: Int = 1
+    @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
+    @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
     // `videos`; episodes additionally on `season`.
     @State private var seasons: [Int] = []
     @State private var episodes: [CoreVideo] = []
+
+    /// The engine's CURRENT resume episode id for this series (advances as continuous-play moves through
+    /// episodes), read from the same source as resumeSeasonHint: the engine library for the main profile,
+    /// the per-profile overlay otherwise. This is where Back should land after continuous play (#7).
+    private var resumeVideoId: String? {
+        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+    }
+    private var resumeSeason: Int? { resumeVideoId.flatMap { id in videos.first { $0.id == id }?.season } }
 
     private func recomputeSeasons() { seasons = Array(Set(videos.map { $0.season ?? 0 })).sorted() }
     private func recomputeEpisodes() {
@@ -1117,18 +1141,47 @@ struct CoreSeasonedEpisodes: View {
             }
 
             VStack(spacing: Theme.Space.sm) {
-                ForEach(episodes) { v in episodeRow(v) }
+                ForEach(episodes) { v in episodeRow(v).focused($focusedEpisode, equals: v.id) }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
         }
-        .onAppear {
-            recomputeSeasons()
-            let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
-            if seasons.contains(preferred) { season = preferred }
-            else if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        .onAppear { applyPreferredSeason() }
+        // #7: when the player closes, continuous-play may have advanced to a LATER episode (even a later
+        // season). The detail page stays mounted behind the player, so this panel keeps the season/focus it
+        // launched from. On close, jump to the episode the engine now resumes at: switch season if it moved,
+        // then focus that row (tvOS auto-scrolls focus into view) so Back returns to the CURRENT episode, not
+        // the one originally launched. Async so the row exists after a season switch and the shell is frontmost.
+        .onChange(of: presenter.request == nil) {
+            guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
+            if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
+            DispatchQueue.main.async { focusedEpisode = id }
+        }
+        .onChange(of: season) {
+            // Any season change (a manual tap, OR our own programmatic apply below) locks the auto-pick, so a
+            // later videos-arrived pass never clobbers the season you chose.
+            didApplyInitial = true
             recomputeEpisodes()
         }
-        .onChange(of: season) { recomputeEpisodes() }
+        // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
+        // on first appear can be stale or empty, and the initial-season hint (from Continue Watching) may not
+        // resolve until they arrive. Re-run the resolver when the videos array grows so the hint still lands.
+        .onChange(of: videos.count) { applyPreferredSeason() }
+    }
+
+    /// Resolve and apply the preferred season, re-applying the Continue-Watching `initialSeason` hint until it
+    /// actually lands on a season present in `seasons` (guarded by `didApplyInitial` so a manual tap is never
+    /// overridden when late videos arrive). This is what makes "open Details on the season I was last watching"
+    /// survive the common case where a large series' episode list streams in after the panel first appears.
+    private func applyPreferredSeason() {
+        recomputeSeasons()
+        if !didApplyInitial {
+            let preferred = initialSeason ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if seasons.contains(preferred) {
+                season = preferred   // triggers onChange(season) -> didApplyInitial = true
+            }
+        }
+        if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        recomputeEpisodes()
     }
 
     private var firstUnwatchedSeason: Int? {
@@ -1384,7 +1437,6 @@ struct CoreStreamList: View {
     @FocusState private var watchFocused: Bool
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
-    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     // Debrid cache AWARENESS: which raw torrents the user's debrid account has cached, so they badge +
     // rank up. Empty (no badges, ranking unchanged) with no debrid key configured.
     @StateObject private var debridCache = DebridCacheAwareness()
@@ -1426,32 +1478,50 @@ struct CoreStreamList: View {
         return secs >= 1 ? secs : nil
     }
 
+    /// Owns the source-list assembly + ranking OFF the SwiftUI render path (see `SourceListModel`):
+    /// snapshot -> merge -> tombstone subtraction -> direct-links filter -> rank, coalesced at ~250 ms
+    /// and run off-main, publishing once per real change. This body reads only the published output,
+    /// so the CoreBridge revision storm during source search costs it nothing (the earlier
+    /// DetailRankMemo cached only the rank and still re-assembled + re-signed per body eval).
+    @StateObject private var sourceList = SourceListModel()
+
     var body: some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                                debridCachedHashes: debridCache.cachedHashes)   // best source first within each add-on
-        let streamCount = groups.reduce(0) { $0 + $1.streams.count }
-        let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
-        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
-        let loadingAddons = addons.total == 0 || addons.loaded < addons.total
+        // While the player is up the tvOS shell stays MOUNTED behind it (RootView renders the player over an
+        // opacity(0).disabled() RootTabView, it does not unmount the shell), so this body re-evaluates on every
+        // CoreBridge @Published bump. Rebuilding a 1000+ stream ranked list behind the video saturates the main
+        // thread and starves the mpv Metal surface of a layout pass (the "video stuck in a small rectangle /
+        // 30s stall" symptom). Skip the whole rankedGroups(displayGroups(...)) + best + watchReady work and hold
+        // a same-size placeholder; the view stays mounted so its @State (filter / collapse / picker) survives and
+        // the list + focus target restore unchanged when the player closes (presenter.request flips back to nil).
+        if presenter.request != nil {
+            return AnyView(Color.clear.frame(minHeight: 1))
+        }
         // Per-series quality memory: bias Watch Now toward the quality signature of
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin,
-                                      debridCachedHashes: debridCache.cachedHashes)
+        // Read the ranked list from the SourceListModel's published output. This body still re-evaluates
+        // on every CoreBridge @Published bump while the list is open, but each eval is now a couple of
+        // published-array reads: the assembly (merges + tombstones + direct-links filter) AND the rank
+        // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is a few
+        // cheap reads behind an equality guard, safe from body.
+        sourceList.setContext(metaId: meta?.libraryId ?? "", streamId: nil, continuity: remembered, pin: sourcePin)
+        let groups = sourceList.groups                               // best source first within each add-on
+        let best = sourceList.best
+        let streamCount = groups.reduce(0) { $0 + $1.streams.count }
+        let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
+        let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
         // button hostage: the timeout opens the gate anyway.
         let watchReady = !loadingAddons || settleTimedOut
 
-        return VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // PINNED Singularity: the best few community-corroborated sources floated to the VERY top, above
-            // the Watch/quality controls and the add-on grouping, so at least one Singularity-labeled source
-            // is always visible without scrolling past a popular title's thousands of add-on rows. `groups`
-            // is already ranked + merged, so this slice is best-first. Empty pool → nothing renders. The rest
-            // of the Singularity sources still live under the normal grouping / the All-sources list.
-            singularitySection(groups)
+        return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // Singularity renders INLINE ONLY: its merged group flows through the ranked list like any
+            // add-on, sortable with the user's sort (owner decision; the pinned duplicate section that
+            // floated an unsortable top-6 above the list was removed on both platforms).
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
@@ -1590,13 +1660,25 @@ struct CoreStreamList: View {
         // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
         .onChange(of: core.streamLoadProgress().loaded) { _ in
             // Unfiltered: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
-            // would drop, plus the TorBox search sources, so those rows badge too. Orthogonal to the filter.
-            debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups()))
+            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
+            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
             refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
         }
+        // The Singularity pool answers asynchronously (a network fetch), so re-run the debrid cache check when
+        // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
+        // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
+        .onChange(of: sourceIndex.streams.count) { _ in
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
+        }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
-        // by imdb id inside refresh). Live channels pass nil, so this no-ops for them.
-        .onAppear { torboxSearch.refresh(imdbId: imdbId); refreshSourceIndex() }
+        // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
+        // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).
+        .onAppear {
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
+            torboxSearch.refresh(imdbId: imdbId)
+            refreshSourceIndex()
+        }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -1613,7 +1695,7 @@ struct CoreStreamList: View {
             Button("Cancel", role: .cancel) { pendingDownload = nil }
         } message: {
             Text("tvOS can reclaim app storage when the device runs low, so a saved download may be removed by the system. Re-download it any time it is gone.")
-        }
+        })
     }
 
     // MARK: Offline download (#30)
@@ -1687,19 +1769,6 @@ struct CoreStreamList: View {
         }
     }
 
-    private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        // Merge the TorBox search sources first (no-op with no TorBox key / no results), then the community
-        // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
-        // Direct-links-only filter so a search/community source is filtered on the same rule as an add-on's.
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
-        guard directLinksOnly else { return withSearch }
-        return withSearch.compactMap { group in
-            let streams = group.streams.filter { !$0.isTorrent }
-            guard !streams.isEmpty else { return nil }
-            return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
-        }
-    }
-
     /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
     /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
     private var sourceContentID: String? {
@@ -1766,8 +1835,8 @@ struct CoreStreamList: View {
     }
 
     /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in
-    /// parallel so we reach a genuinely-cached link fast instead of committing to `best` alone, which — when
-    /// `best` is a false-cached row (an add-on ⚡ that this account does not actually hold) — serially times
+    /// parallel so we reach a genuinely-cached link fast instead of committing to `best` alone, which, when
+    /// `best` is a false-cached row (an add-on ⚡ that this account does not actually hold), serially times
     /// out before the user reaches a real one. `groups` is already StreamRanking-ordered (continuity / binge /
     /// pin applied), so flattening it preserves that order as the candidate order. FAIL-SOFT: if the parallel
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
@@ -1808,7 +1877,7 @@ struct CoreStreamList: View {
         let candidates = groups.flatMap(\.streams)
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
             candidates: candidates, cachedHashes: debridCache.cachedHashes,
-            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: best) {
             // A parallel-cached winner is a remote direct link: present it exactly as the single-resolve
             // debrid branch does (engine wired for state, torrent:false, no /create, no closeTorrent).
             core.loadEnginePlayer(for: win.stream)
@@ -1861,32 +1930,6 @@ struct CoreStreamList: View {
                 }
             }
             .padding(.vertical, Theme.Space.xs)
-        }
-    }
-
-    /// A pinned, labeled "Singularity" section at the very top of the source list. Shows the best few
-    /// community-corroborated Singularity sources (sliced from the already-ranked `groups`, best-first, capped
-    /// at `pinnedSectionMax`) so at least one Singularity-labeled source is always visible without scrolling.
-    /// Empty pool (SERVE off / signed out / nothing corroborated) → nothing renders (pure pass-through). Rows
-    /// reuse `streamRow`, so they play / pin exactly like any other source and stay clearly labeled.
-    @ViewBuilder private func singularitySection(_ groups: [CoreStreamSourceGroup]) -> some View {
-        let pinned = SourceIndexClient.pinnedStreams(from: groups)
-        if !pinned.isEmpty {
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "sparkles").font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text(SourceIndexClient.groupAddon.uppercased())
-                        .font(Theme.Typography.eyebrow).tracking(1.5)
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text("Community").font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .padding(.horizontal, Theme.Space.md)
-                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
-                    streamRow(SourceIndexClient.groupAddon, stream)
-                }
-            }
         }
     }
 

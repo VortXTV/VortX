@@ -53,6 +53,8 @@ enum ProviderBrandLogo {
         38:   "bbciplayer",     // BBC iPlayer
         11:   "mubi",           // MUBI
         344:  "viki",           // Rakuten Viki
+        232:  "zee5",           // ZEE5 (regional, bundled mark shipped)
+        237:  "sonyliv",        // Sony LIV (regional, bundled mark shipped)
     ]
 
     /// The bundled logo slug for a provider, or nil when we don't ship a mark (fall back to TMDB logoURL).
@@ -112,6 +114,18 @@ enum ProviderBrandLogo {
         38:   BrandTileStyle(top: srgb(255, 78, 152),  bottom: srgb(214, 60, 124),  tintWhite: true),  // BBC iPlayer
         11:   BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // MUBI
         344:  BrandTileStyle(top: srgb(18, 179, 227),  bottom: srgb(14, 144, 182),  tintWhite: true),  // Rakuten Viki
+        // Regional services (India-heavy long tail). We ship no bundled PNG for these yet, so the tile does
+        // not take the full-bleed logo branch; the same brand color is mirrored in ProviderBrandMap.colors,
+        // which frames the TMDB remote mark and the full-NAME text fallback (never a single letter). These
+        // brandStyle rows are the shared home for the color, ready the moment a bundled mark is added.
+        232:  BrandTileStyle(top: srgb(140, 20, 140),  bottom: srgb(90, 12, 96),    tintWhite: true),  // ZEE5 (purple/magenta)
+        237:  BrandTileStyle(top: srgb(16, 16, 22),    bottom: srgb(8, 8, 12),      tintWhite: true),  // Sony LIV (dark)
+        220:  BrandTileStyle(top: srgb(16, 16, 18),    bottom: srgb(8, 8, 10),      tintWhite: true),  // JioCinema (dark)
+        121:  BrandTileStyle(top: srgb(60, 24, 120),   bottom: srgb(40, 14, 84),    tintWhite: true),  // Voot (purple)
+        515:  BrandTileStyle(top: srgb(20, 20, 24),    bottom: srgb(10, 10, 12),    tintWhite: true),  // MX Player (dark)
+        532:  BrandTileStyle(top: srgb(214, 30, 38),   bottom: srgb(150, 18, 24),   tintWhite: true),  // Aha (red)
+        218:  BrandTileStyle(top: srgb(16, 16, 20),    bottom: srgb(8, 8, 10),      tintWhite: true),  // Eros Now (dark)
+        442:  BrandTileStyle(top: srgb(16, 16, 18),    bottom: srgb(8, 8, 10),      tintWhite: true),  // Lionsgate Play (dark)
     ]
 }
 

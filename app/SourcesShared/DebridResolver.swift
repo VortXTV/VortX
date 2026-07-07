@@ -21,6 +21,19 @@ enum DebridProbe {
 /// link, fail soft to the torrent engine) is a separate step. Full API specs: Brain
 /// `wiki/projects/stremiox/vortx-debrid-implementation.md`.
 
+// MARK: - Query encoding
+
+/// Percent-encoding for query-string VALUES. `CharacterSet.urlQueryAllowed` is the wrong set for a value: it
+/// leaves the sub-delimiters `&`, `=`, `+` and `,` intact, so an unescaped value can inject extra params.
+/// `valueAllowed` strips those so a joined hash list stays inside its `hash=` parameter.
+enum DebridQuery {
+    static let valueAllowed: CharacterSet = {
+        var set = CharacterSet.urlQueryAllowed
+        set.remove(charactersIn: "&=+,")
+        return set
+    }()
+}
+
 // MARK: - Value types
 
 /// One file inside a debrid torrent. `id` is the provider's file id used to request the stream link.
@@ -131,14 +144,17 @@ enum DebridResolve {
     static func pickFile(_ files: [DebridFile], episode: DebridEpisode?, fileIdx: Int?) -> DebridFile? {
         if let idx = fileIdx, files.indices.contains(idx) { return files[idx] }
         let videos = files.filter(\.isVideo)
-        guard let episode else { return videos.max(by: { $0.size < $1.size }) }
-        let scored = videos.compactMap { f -> (DebridFile, Int)? in
+        // Provider omitted filenames (isVideo false for every entry, e.g. AllDebrid on a cached single-file
+        // torrent): fall back to the whole file list so size selection still resolves instead of noMatchingFile.
+        let pool = videos.isEmpty ? files : videos
+        guard let episode else { return pool.max(by: { $0.size < $1.size }) }
+        let scored = pool.compactMap { f -> (DebridFile, Int)? in
             let s = episodeMatchScore(filename: f.shortName.isEmpty ? f.name : f.shortName,
                                       season: episode.season, episode: episode.episode)
             return s > 0 ? (f, s) : nil
         }
         if let best = scored.max(by: { $0.1 < $1.1 })?.0 { return best }
-        return videos.max(by: { $0.size < $1.size })   // pack fallback: biggest video
+        return pool.max(by: { $0.size < $1.size })   // pack fallback: biggest video
     }
 
     /// Score a filename against a SxEy target (SnnEnn, n x nn, "season n ... episode n"). 0 = no match.
@@ -160,6 +176,9 @@ actor TorBoxResolver: DebridResolving {
     private let apiKey: String
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/torrents"
+    /// Percent-encode a query VALUE (drops the sub-delimiters `&`/`=`/`+`/`,` that `.urlQueryAllowed` leaves
+    /// intact) so a joined hash list can never break out of the `hash=` parameter.
+    fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -208,7 +227,8 @@ actor TorBoxResolver: DebridResolving {
         // Up to 100 hashes per call.
         for chunk in hashes.chunked(into: 100) {
             let joined = chunk.joined(separator: ",")
-            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(joined)&format=list&list_files=true") else { continue }
+            let encoded = joined.addingPercentEncoding(withAllowedCharacters: Self.queryValueAllowed) ?? joined
+            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(encoded)&format=list&list_files=true") else { continue }
             let env: Envelope<[Cached]> = try await get(url)
             for c in env.data ?? [] {
                 out[c.hash.lowercased()] = (c.files ?? []).map(file(from:))
@@ -281,7 +301,9 @@ actor TorBoxResolver: DebridResolving {
     /// The `requestdl` leg: mint a direct stream URL for a known torrent_id+file_id. A missing file surfaces
     /// as `.notCached` (a 404/"not found" from TorBox) so the caller can re-add.
     private func requestDL(torrentId: Int, fileId: Int) async throws -> URL {
-        guard let url = URL(string: "\(Self.base)/requestdl?token=\(apiKey)&torrent_id=\(torrentId)&file_id=\(fileId)&redirect=false") else {
+        // Auth rides the Authorization: Bearer header set by `get`; do NOT also put the key in the query string
+        // (it would leak into URL logs/caches). token= is intentionally omitted.
+        guard let url = URL(string: "\(Self.base)/requestdl?torrent_id=\(torrentId)&file_id=\(fileId)&redirect=false") else {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
@@ -380,6 +402,7 @@ actor TorBoxUsenetResolver {
     private let apiKey: String
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/usenet"
+    fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
 
     init(apiKey: String) {
         self.apiKey = apiKey
@@ -434,7 +457,8 @@ actor TorBoxUsenetResolver {
         var out: [String: [DebridFile]] = [:]
         for chunk in hashes.chunked(into: 100) {
             let joined = chunk.joined(separator: ",")
-            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(joined)&format=list&list_files=true") else { continue }
+            let encoded = joined.addingPercentEncoding(withAllowedCharacters: Self.queryValueAllowed) ?? joined
+            guard let url = URL(string: "\(Self.base)/checkcached?hash=\(encoded)&format=list&list_files=true") else { continue }
             let env: Envelope<[Cached]> = try await get(url)
             for c in env.data ?? [] {
                 out[c.hash.lowercased()] = (c.files ?? []).map(file(from:))
@@ -490,7 +514,8 @@ actor TorBoxUsenetResolver {
 
     /// The `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id.
     private func requestDL(usenetId: Int, fileId: Int) async throws -> URL {
-        guard let url = URL(string: "\(Self.base)/requestdl?token=\(apiKey)&usenet_id=\(usenetId)&file_id=\(fileId)&redirect=false") else {
+        // Auth rides the Authorization: Bearer header set by `get`; the key is not repeated in the query string.
+        guard let url = URL(string: "\(Self.base)/requestdl?usenet_id=\(usenetId)&file_id=\(fileId)&redirect=false") else {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
@@ -685,9 +710,39 @@ actor AllDebridResolver: DebridResolving {
         self.session = URLSession(configuration: cfg)
     }
 
-    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+    /// `GET /magnet/instant`, `magnets[]` = infohashes. AllDebrid still ships this in 2026 (only Real-Debrid
+    /// removed its cache-check), but it is known to be flaky, so a failed/empty chunk simply yields no
+    /// confirmations for those hashes and the resolve path still works. Batch ~40.
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] {
+        guard !hashes.isEmpty else { return [:] }
+        var out: [String: [DebridFile]] = [:]
+        for chunk in hashes.chunked(into: 40) {
+            let items = chunk.map { URLQueryItem(name: "magnets[]", value: $0) }
+            guard let env: Env<InstantData> = try? await get(authed("/magnet/instant", items)),
+                  env.status == "success", let magnets = env.data?.magnets else { continue }
+            for m in magnets where (m.instant ?? false) {
+                let files = (m.files ?? []).compactMap { f -> DebridFile? in
+                    guard let n = f.n else { return nil }
+                    return DebridFile(id: 0, name: n, shortName: (n as NSString).lastPathComponent, size: f.s ?? 0, mimetype: nil)
+                }
+                // A cached hash MUST map to a non-empty file list to enter the confirmed-cached set; if the
+                // instant tree was omitted, a placeholder keeps the hash confirmed (resolve picks the file).
+                out[m.hash.lowercased()] = files.isEmpty ? [DebridFile(id: 0, name: m.hash, shortName: m.hash, size: 0, mimetype: nil)] : files
+            }
+        }
+        return out
+    }
 
     private struct Env<T: Decodable>: Decodable { let status: String; let data: T? }
+    private struct InstantData: Decodable {
+        let magnets: [InstantMagnet]?
+        struct InstantMagnet: Decodable {
+            let hash: String
+            let instant: Bool?
+            let files: [IFile]?
+            struct IFile: Decodable { let n: String?; let s: Int64? }
+        }
+    }
     private struct UploadData: Decodable { let magnets: [UpMagnet]?; struct UpMagnet: Decodable { let id: Int? } }
     private struct StatusData: Decodable {
         let magnets: StatusMagnet?
@@ -752,7 +807,40 @@ actor PremiumizeResolver: DebridResolving {
         self.session = URLSession(configuration: cfg)
     }
 
-    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }
+    /// `POST /api/cache/check` with `items[]` = bare infohashes. The response arrays are positionally aligned
+    /// with `items[]`; a `true` in `response` means `transfer/directdl` will succeed instantly for that hash.
+    /// It does not consume fair-use quota. Premiumize still ships this in 2026 (only Real-Debrid removed its
+    /// cache-check). Any failure yields no confirmations for that chunk (resolve still works); batch ~80.
+    func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] {
+        guard !hashes.isEmpty else { return [:] }
+        var out: [String: [DebridFile]] = [:]
+        for chunk in hashes.chunked(into: 80) {
+            guard let r: CacheCheck = try? await formItems("/cache/check", chunk.map { ("items[]", $0) }),
+                  r.status == "success", let flags = r.response else { continue }
+            for (i, hash) in chunk.enumerated() where i < flags.count && flags[i] {
+                let name = (r.filename.flatMap { i < $0.count ? $0[i] : nil } ?? nil) ?? hash
+                let size = r.filesize.flatMap { i < $0.count ? $0[i].value : nil } ?? 0
+                out[hash.lowercased()] = [DebridFile(id: 0, name: name, shortName: (name as NSString).lastPathComponent, size: size, mimetype: nil)]
+            }
+        }
+        return out
+    }
+
+    private struct CacheCheck: Decodable {
+        let status: String
+        let response: [Bool]?
+        let filename: [String?]?
+        let filesize: [PMSize]?
+    }
+    /// Premiumize returns `filesize` as a base-10 STRING on a hit and the integer `0` on a miss; decode both.
+    private struct PMSize: Decodable {
+        let value: Int64
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let s = try? c.decode(String.self) { value = Int64(s) ?? 0 }
+            else { value = (try? c.decode(Int64.self)) ?? 0 }
+        }
+    }
 
     private struct DirectDL: Decodable {
         let status: String
@@ -787,6 +875,20 @@ actor PremiumizeResolver: DebridResolving {
         req.httpMethod = "POST"
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = DebridForm.encode(fields)
+        return try await DebridHTTP.decode(session, req)
+    }
+
+    /// POST with REPEATED form keys (the `[String: String]` `form` above collapses duplicate keys, but
+    /// `/cache/check` needs many `items[]=...`). `apikey` rides the query, matching `form`.
+    private func formItems<T: Decodable>(_ path: String, _ pairs: [(String, String)]) async throws -> T {
+        var c = URLComponents(string: Self.base + path)
+        c?.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        var req = URLRequest(url: c?.url ?? URL(string: Self.base)!)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = pairs
+            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.1)" }
+            .joined(separator: "&").data(using: .utf8)
         return try await DebridHTTP.decode(session, req)
     }
 }
@@ -1118,8 +1220,18 @@ extension DebridCoordinator {
     /// `stream` it resolved from, so the caller can wire the engine / headers / quality signature off the
     /// exact winning row (`DebridPlaybackRef` itself is a persisted value type and deliberately carries no
     /// `CoreStream`).
+    /// - Parameter labeledBest: the exact stream the "Watch Now" label was composed from (`StreamRanking.best`),
+    ///   so the race can keep its promise. When supplied AND the labeled best is itself confirmed-cached (so it
+    ///   is guaranteed to resolve), the race REFUSES any winner of a lower resolution than the label: a faster
+    ///   lower-quality leg can no longer silently override the promised quality (the device-verified "button
+    ///   says 4K DV, plays 1080p" divergence). Such a race returns `nil`, so the caller single-resolves the
+    ///   labeled best and the played quality matches the button. When the labeled best is NOT confirmed-cached
+    ///   (a false add-on ⚡ this account does not hold, which would time out serially), the completion-order race
+    ///   is kept as-is so the user still reaches a genuinely-cached source fast. `nil` (the default) preserves
+    ///   the pre-cap completion-order behaviour for every non-Watch-Now caller.
     func resolveFirstPlayable(candidates: [CoreStream], episode: DebridEpisode? = nil,
                               cachedHashes: Set<String>, cachedUsenetURLs: Set<String> = [],
+                              labeledBest: CoreStream? = nil,
                               max: Int = 4) async -> (ref: DebridPlaybackRef, stream: CoreStream)? {
         // Zero-await no-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this
         // returns nil before any provider contact, so the caller's fallback runs its unchanged path.
@@ -1142,9 +1254,41 @@ extension DebridCoordinator {
         // of parallel resolves; the losers are cancelled the moment one wins.
         let cap = Swift.min(Swift.max(max, 1), 4)
         let racing = Array(cached.prefix(cap))
-        // A single confirmed-cached candidate is just the existing single resolve (no group overhead).
+
+        // LABEL-AUTHORITATIVE GATE. The Watch-Now label is composed from `labeledBest`; the played source must
+        // not be a LOWER resolution than that promise. We can only hold the promise when the labeled best is
+        // itself guaranteed to resolve, i.e. it is confirmed-cached (a raw torrent whose hash is in
+        // `cachedHashes`, a usenet nzb in `cachedUsenetURLs`, or a url-bearing direct/debrid row). In that case
+        // we REFUSE any race winner whose resolution is below the label and let the caller single-resolve the
+        // labeled best instead. When the labeled best is NOT confirmed-cached (a false add-on ⚡ that would time
+        // out serially), we keep the completion-order race exactly as before so the user still reaches a real
+        // cached source fast. With no `labeledBest` the gate is inert (accept anything).
+        let bestRank = labeledBest.map(StreamRanking.resolutionRank)
+        let bestConfirmedCached: Bool = {
+            guard let best = labeledBest else { return false }
+            if best.url != nil { return true }   // direct / debrid link resolves without an add-then-download
+            if let h = best.infoHash?.lowercased(), !h.isEmpty, cachedHashes.contains(h) { return true }
+            if let nzb = best.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
+            return false
+        }()
+        // A winner is acceptable unless the label is a confirmed-cached HIGHER resolution than it (which we can
+        // and must deliver instead). Equal-or-higher-resolution winners always pass, so a same-tier faster leg
+        // (e.g. two 4K sources) still wins the race.
+        func acceptable(_ s: CoreStream) -> Bool {
+            guard bestConfirmedCached, let br = bestRank else { return true }
+            return StreamRanking.resolutionRank(s) >= br
+        }
+
+        // A single confirmed-cached candidate is just the existing single resolve (no group overhead). Still
+        // honour the gate: a lone winner below a confirmed-cached label is refused so the caller resolves the
+        // labeled best instead.
         if racing.count == 1 {
-            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode) else { return nil }
+            guard acceptable(racing[0]) else { return nil }
+            // Re-assert the confirmed-cached gate at resolve time: a candidate evicted between the cache check
+            // and this call returns nil with ZERO network instead of starting an add-then-download.
+            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode,
+                                                      confirmedCachedHashes: cachedHashes,
+                                                      confirmedUsenetURLs: cachedUsenetURLs) else { return nil }
             return (ref, racing[0])
         }
 
@@ -1152,17 +1296,24 @@ extension DebridCoordinator {
             for stream in racing {
                 group.addTask {
                     // Each leg carries its own 15s bound + RD fast-fail (it is a full resolvedPlaybackRef).
-                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode)
+                    // Pass the confirmed-cached sets so a candidate evicted between the cache check and this
+                    // leg returns nil with ZERO network rather than kicking off an add-then-download.
+                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode,
+                                                                                       confirmedCachedHashes: cachedHashes,
+                                                                                       confirmedUsenetURLs: cachedUsenetURLs)
                     else { return nil }
                     return (ref, stream)
                 }
             }
-            // First leg to produce a real ref WINS. A leg that fails/fast-fails returns nil; keep draining
-            // until a non-nil ref appears or every leg has reported. Then cancel the remaining (in-flight)
-            // legs so we stop hitting the provider the instant we have a playable link.
+            // First leg to produce a real ref that PASSES the label-authoritative gate wins. A leg that
+            // fails/fast-fails returns nil, and a leg that resolves but is a lower resolution than a
+            // confirmed-cached label is skipped (not accepted as a silent lower-quality substitute); we keep
+            // draining until an acceptable ref appears or every leg has reported. Then cancel the remaining
+            // (in-flight) legs. When every resolved leg is below a confirmed-cached label the winner stays nil
+            // and the caller single-resolves the labeled best, so the played quality matches the button.
             var winner: (ref: DebridPlaybackRef, stream: CoreStream)?
             for await result in group {
-                if let result { winner = result; break }
+                if let result, acceptable(result.stream) { winner = result; break }
             }
             group.cancelAll()
             return winner

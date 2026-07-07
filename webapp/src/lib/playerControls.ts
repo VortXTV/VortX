@@ -16,7 +16,10 @@ import { getSettings, updateSettings } from "./settings";
 // returned controller: setHls() wires the quality/audio menus once hls.js is up; refreshSubtitles() rebuilds
 // the CC menu as <track>s arrive.
 
-const VOL_KEY = "vortx.web.player.volume.v1";
+// v2: v1 could contain a `muted: true` written from the autoplay auto-mute (not a real user choice), which
+// made every later mobile session start silently with no unmute affordance. Bumping the key drops that
+// poisoned state so affected devices reset to sound-on; going forward the auto-mute is never persisted.
+const VOL_KEY = "vortx.web.player.volume.v2";
 const ASPECT_KEY = "vortx.web.player.aspect.v1";
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 // Aspect / zoom, mirroring the apps' "Aspect Ratio" panel (original / fill / stretch).
@@ -255,7 +258,10 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     const off = video.muted || video.volume === 0;
     $("pl-mute")!.innerHTML = off ? icon("volume-x") || "🔇" : video.volume < 0.5 ? icon("volume-1") || "🔉" : icon("volume-2") || "🔊";
     try {
-      localStorage.setItem(VOL_KEY, JSON.stringify({ volume: video.volume, muted: video.muted }));
+      // Persist the user's real intent, NOT an autoplay auto-mute: while auto-muted, save muted:false so the
+      // next session starts sound-on (the tap-to-unmute path still restores audio this session). A genuine
+      // user mute (mute button / volume 0) has autoMuted === false and is remembered as before.
+      localStorage.setItem(VOL_KEY, JSON.stringify({ volume: video.volume, muted: autoMuted ? false : video.muted }));
     } catch {
       /* best-effort */
     }

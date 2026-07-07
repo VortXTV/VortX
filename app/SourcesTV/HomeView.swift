@@ -36,31 +36,31 @@ struct HomeView: View {
                 // the rails lands straight on the tab bar.
                 // detailsBottom = strip height (470) + a breathing gap, so the synopsis can never
                 // run into the rail header regardless of tab-bar safe-area shifts.
-                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
+                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520) {
                     // #44: once focus SETTLES on a catalog item for ~3s, its muted FULL trailer fades in
-                    // behind the hero art (over the still backdrop, under the rails + details). Gated on
-                    // the same autoplay-trailers setting + reduce-motion as the detail hero, and keyed on
-                    // the resolved URL so a focus change (which clears it) tears the libmpv layer down.
-                    // Non-focusable + no hit-testing inside the view, so the focus engine is untouched.
-                    .overlay {
-                        // Also gated by the RemoteConfig fleet kill-switch `features.trailers`: a remote
-                        // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
-                        // is degraded). Baked default true => absent/null remote is identical to shipping; the
-                        // user's "Auto-play trailers" setting still governs.
-                        //
-                        // `presenter.request == nil`: the player presents OVER the shell, which is only
-                        // opacity-hidden + disabled, NOT unmounted - so without this gate the hero clip's
-                        // libmpv instance kept decoding its looping 1080p trailer (and re-fetching it from
-                        // the CDN) underneath the whole movie: micro stutter and audio crackle on EVERY
-                        // stream, on every playback started while a hero clip was up. Unmounting here tears
-                        // the clip down the moment the player presents; it remounts fresh on close.
-                        if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-                           !reduceMotion, presenter.request == nil, let url = heroTrailer.url {
-                            TVInHeroTrailerView(url: url)
-                                .ignoresSafeArea()
-                                .allowsHitTesting(false)
-                        }
+                    // over the still backdrop but UNDER the logo / meta / synopsis (and under the rails), so
+                    // the hero details stay visible OVER the clip exactly as they read over the still art.
+                    // (The clip used to be an `.overlay` here, which painted it above the details and blanked
+                    // the hero of all its text while the clip played.) Gated on the same autoplay-trailers
+                    // setting + reduce-motion as the detail hero, and keyed on the resolved URL so a focus
+                    // change (which clears it) tears the libmpv layer down. Non-focusable + no hit-testing
+                    // inside the view, so the focus engine is untouched.
+                    // Also gated by the RemoteConfig fleet kill-switch `features.trailers`: a remote
+                    // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
+                    // is degraded). Baked default true => absent/null remote is identical to shipping; the
+                    // user's "Auto-play trailers" setting still governs.
+                    // `presenter.request == nil` (PR #106): the player presents OVER this shell, which stays
+                    // mounted (opacity-hidden), so without this gate the hero clip's libmpv instance kept
+                    // decoding its looping 1080p trailer under the whole movie (micro stutter + audio crackle
+                    // on every stream). Unmounting tears it down the moment the player presents; it remounts
+                    // fresh on close.
+                    if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
+                       !reduceMotion, presenter.request == nil, let url = heroTrailer.url {
+                        TVInHeroTrailerView(url: url)
+                            .ignoresSafeArea()
+                            .allowsHitTesting(false)
                     }
+                }
                 // The rails live in a bottom strip. The focus engine centers focused rows inside
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {
@@ -130,7 +130,7 @@ struct HomeView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
         .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
-        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } else { collectionsHub.clear() } }
+        .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
@@ -449,6 +449,21 @@ struct CoreContinueWatchingRow: View {
             // cross-source auto-pick ("Tried N sources / this source didn't load"). CWResume mints a fresh
             // link for the SAME file when the entry carries debrid provenance; a non-debrid entry returns the
             // stored url unchanged (refreshed == false), so those paths are byte-identical to before.
+            // Seed the community pool with the FULL assembled source groups this resume produces. A card resume
+            // never opens the detail view, so the detail-view hoard never runs for it; the resume kicks a
+            // background loadMeta (below, on every branch) that fills streamGroups, and this polls for that then
+            // fires the same full-group hoard the detail view uses. The older single-source hoard no-op'd for
+            // debrid/direct resumes (the common case), so those playbacks seeded nothing. Fire-and-forget,
+            // deduped per content, gated inside SourceIndexClient (consent + fleet flag). No-op when the library
+            // id is not a real imdb id or no groups assemble.
+            if let cid = SourceIndexClient.contentID(imdbId: item.id, season: entry.season, episode: entry.episode) {
+                let streamId = entry.videoId
+                Task.detached {
+                    await SourceIndexClient.hoardResumedGroups(contentID: cid) {
+                        CoreBridge.shared.streamGroups(forStreamId: streamId)
+                    }
+                }
+            }
             Task { @MainActor in
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
                 let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
@@ -467,21 +482,23 @@ struct CoreContinueWatchingRow: View {
                         debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
                                                      torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
                                                      fileIdx: entry.fileIdx),
-                        wasExplicitPick: true)
+                        wasExplicitPick: true, wasResume: true)
                     return
                 }
                 // No fresh link (non-debrid entry, or the source is genuinely gone): replay the stored url as
-                // before. For a MOVIE, kick off a background load of the title's streams so a stale stored link
-                // auto-hops to a FRESH source instead of dead-ending; the stored link still plays immediately.
+                // before. Kick off a background load of the title's streams so a stale stored link auto-hops to a
+                // FRESH source instead of dead-ending; the stored link still plays immediately. This runs for
+                // BOTH movie and series so every resume branch assembles the title's stream groups, which also
+                // gives the resume-path community hoard (above) the groups it polls for (series was previously
+                // left unloaded here, so a series fallback resume seeded nothing).
                 NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL path=fallback-stored-url", entry.debridService ?? "-", hashShort, entry.fileIdx.map(String.init) ?? "-")
-                if entry.type == "movie",
-                   bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
-                    bridge.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+                if bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
+                    bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
                 }
                 presenter.request = PlaybackRequest(
                     url: resolvedURL, title: entry.title, meta: meta,
                     episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
-                    headers: entry.headers)
+                    headers: entry.headers, wasResume: true)
             }
         }
     }

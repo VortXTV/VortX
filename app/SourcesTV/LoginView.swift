@@ -1,25 +1,26 @@
 import SwiftUI
 
-/// tvOS sign-in for a Stremio account. Link login is the default so passwords are entered on
-/// Stremio's own web flow; password login remains available as a fallback.
+/// tvOS sign-in. VortX-account sign-in (QR pairing) is the PRIMARY path, so you sign into the account that
+/// owns your add-ons, library, and cross-device sync. Connecting a Stremio account (its own QR link, or a
+/// password) stays available as a secondary "bring your Stremio library" step.
 struct LoginView: View {
     @ObservedObject var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @Environment(\.dismiss) private var dismiss
 
-    @State private var mode: Mode = .link
+    @State private var mode: Mode = .vortx
     @State private var email = ""
     @State private var password = ""
     @State private var passwordBusy = false
-    // Run the sign-in handoff exactly once. `@Published` re-publishes on every assignment, so a
-    // future unconditional `isSignedIn = true` could otherwise re-enter this sink in a loop (the bug
-    // that froze the iOS sign-in). Parity with iOSSignInView's latch — defensive, costs nothing.
+    // Run the Stremio sign-in handoff exactly once. `@Published` re-publishes on every assignment, so a
+    // future unconditional `isSignedIn = true` could otherwise re-enter this sink in a loop (the bug that
+    // froze the iOS sign-in). Parity with iOSSignInView's latch, defensive, costs nothing.
     @State private var didHandleSignIn = false
     /// H22: an explicit first-responder identity for each credential field, so the tvOS system keyboard
     /// (and the iPhone Continuity Keyboard) binds to a concrete field the same way Search's field does.
     @FocusState private var focusedField: Field?
 
-    private enum Mode { case link, password }
+    private enum Mode { case vortx, stremioLink, stremioPassword }
     private enum Field { case email, password }
 
     var body: some View {
@@ -28,61 +29,88 @@ struct LoginView: View {
             VStack(spacing: Theme.Space.lg) {
                 VortXWordmark(fontSize: 54)
 
-                Text(mode == .link
-                     ? "Scan the QR code or enter the code on another device to sign in."
-                     : "Sign in to your Stremio account to load your addons and streams.")
+                Text(headline)
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center)
 
-                if mode == .link { LinkLoginView(account: account) }
-                else { passwordLogin }
-
-                Button {
-                    switchMode()
-                } label: {
-                    Text(mode == .link ? "Use password instead" : "Use QR code instead")
-                        .frame(width: 320)
+                switch mode {
+                case .vortx:           VortXAccountJoinerView(onSignedIn: { dismiss() })
+                case .stremioLink:     LinkLoginView(account: account)
+                case .stremioPassword: passwordLogin
                 }
-                .buttonStyle(ChipButtonStyle())
+
+                secondaryActions
             }
             .padding(Theme.Space.screenEdge)
         }
+        // The Stremio paths finish through StremioAccount.isSignedIn; the VortX path dismisses itself via
+        // the joiner's onSignedIn. This sink covers only the Stremio link/password sign-in handoff.
         .onReceive(account.$isSignedIn) { signedIn in
             guard signedIn, !didHandleSignIn else { return }
             didHandleSignIn = true
             core.signedInWithLegacyAuthKey()   // seed the engine now, not on next launch
-            // Account-owns-everything snapshot-on-import: once the engine has pulled this Stremio
-            // account's add-ons, snapshot the full descriptor set into the VortX account doc so the
-            // account OWNS them (they hydrate later with no live Stremio session). Delayed so
-            // PullAddonsFromAPI has landed; no-op (never-zero guarded) if still empty / signed out.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                Task { @MainActor in await VortXSyncManager.shared.snapshotOwnedFromEngine() }
+            // Account-owns-everything snapshot-on-import: once the engine has pulled this Stremio account's
+            // add-ons, snapshot the full descriptor set into the VortX account doc so the account OWNS them
+            // (they hydrate later with no live Stremio session). We AWAIT the engine's PullAddonsFromAPI
+            // settling (awaitAddonsHydrated) rather than a fixed delay: a fixed delay snapshotted a slow
+            // host mid-pull, capturing only SOME add-ons (the partial-import bug). No-op (never-zero guarded)
+            // if still empty / signed out.
+            Task { @MainActor in
+                await core.awaitAddonsHydrated()
+                await VortXSyncManager.shared.snapshotOwnedFromEngine()
             }
             dismiss()
         }
     }
 
+    private var headline: String {
+        switch mode {
+        case .vortx:           return "Scan the code or enter it on a device signed in to VortX."
+        case .stremioLink:     return "Scan the QR code or enter the code on another device to connect Stremio."
+        case .stremioPassword: return "Sign in to your Stremio account to load your add-ons and streams."
+        }
+    }
+
+    @ViewBuilder private var secondaryActions: some View {
+        switch mode {
+        case .vortx:
+            Button { mode = .stremioLink } label: {
+                Text("Connect a Stremio account instead").frame(width: 380)
+            }
+            .buttonStyle(ChipButtonStyle())
+        case .stremioLink:
+            HStack(spacing: Theme.Space.sm) {
+                Button { mode = .stremioPassword } label: { Text("Use password").frame(width: 200) }
+                    .buttonStyle(ChipButtonStyle())
+                Button { mode = .vortx } label: { Text("Sign in to VortX").frame(width: 240) }
+                    .buttonStyle(ChipButtonStyle())
+            }
+        case .stremioPassword:
+            HStack(spacing: Theme.Space.sm) {
+                Button { mode = .stremioLink } label: { Text("Use QR code").frame(width: 200) }
+                    .buttonStyle(ChipButtonStyle())
+                Button { mode = .vortx } label: { Text("Sign in to VortX").frame(width: 240) }
+                    .buttonStyle(ChipButtonStyle())
+            }
+        }
+    }
+
     private var passwordLogin: some View {
         VStack(spacing: Theme.Space.md) {
-            // H22 CONTINUITY KEYBOARD: the iPhone Continuity Keyboard detected the Apple TV but never
-            // connected on these fields (it works in the Search tab, which uses the system .searchable
-            // field). Continuity attaches to the standard tvOS credential-entry path, which the OS
-            // recognizes when the identifier + secret are declared as a `.username`/`.password` CREDENTIAL
-            // PAIR (not a bare `.emailAddress`), and each field carries an explicit `keyboardType` +
-            // `submitLabel` so the system keyboard (and thus Continuity) presents its full entry sheet.
-            // The `focused($focusedField)` binding gives each field a real first-responder identity so the
-            // Continuity session binds to a concrete field the way the search controller does. This makes
-            // the fields use the same standard tvOS text-entry path Search uses.
+            // H22 CONTINUITY KEYBOARD: the earlier fix declared these as a `.username`/`.password` CREDENTIAL
+            // PAIR (textContentType), but the iPhone Continuity Keyboard detects the Apple TV yet never
+            // CONNECTS on login, while it works fine in Search. Search uses `.searchable` (plain text, NO
+            // textContentType), so it never enters the tvOS AutoFill-Passwords / iCloud Keychain CREDENTIAL
+            // negotiation that a `.password` / `.username` field triggers. That autofill negotiation stalling
+            // over Continuity is the likely cause. So drop textContentType (and the tvOS-irrelevant
+            // keyboardType) and use plain text entry like Search; the SecureField still masks the password.
             field { TextField("Email or username", text: $email)
-                .textContentType(.username)
-                .keyboardType(.emailAddress)
                 .submitLabel(.next)
                 .focused($focusedField, equals: .email)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .onSubmit { focusedField = .password } }
             field { SecureField("Password", text: $password)
-                .textContentType(.password)
                 .submitLabel(.go)
                 .focused($focusedField, equals: .password)
                 .onSubmit { if !email.isEmpty && !password.isEmpty { submitSignIn() } } }
@@ -107,14 +135,6 @@ struct LoginView: View {
         Task {
             await account.signIn(email: email, password: password)
             await MainActor.run { passwordBusy = false }
-        }
-    }
-
-    private func switchMode() {
-        if mode == .link {
-            mode = .password
-        } else {
-            mode = .link
         }
     }
 

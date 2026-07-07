@@ -105,10 +105,16 @@ enum NodeServer {
     /// entries server.js honours). With ffmpeg present, server.js auto-detects the macOS
     /// `videotoolbox` hw-accel profile on boot and uses h264_videotoolbox / hevc_videotoolbox.
     private static func ffmpegBinaries() -> (ffmpeg: String, ffprobe: String)? {
+        // SECURITY NOTE: we hand whichever ffmpeg/ffprobe we find here to node, which
+        // execs it for transcoding. There is no signature/ownership check, so we trust
+        // whatever sits at these paths. Homebrew prefixes are world-writable on many
+        // Macs, so we probe the system path (/usr/bin) FIRST and only fall back to a
+        // Homebrew-installed binary when the system has none (macOS ships no ffmpeg by
+        // default, so the Homebrew fallback is what actually enables transcoding).
         let prefixes = [
+            "/usr/bin",            // system (preferred: not world-writable)
             "/opt/homebrew/bin",   // Homebrew, Apple silicon
             "/usr/local/bin",      // Homebrew, Intel / manual installs
-            "/usr/bin",            // system
         ]
         let fm = FileManager.default
         for prefix in prefixes {

@@ -53,6 +53,12 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// Begin remuxing. Call once before / as the asset is mounted.
     func start() { stream.start() }
 
+    /// Total bytes the remux has produced so far (monotonic; the buffer snapshot is lock-guarded). Read-only
+    /// progress probe for the chrome's start watchdog: a count that keeps growing means the remux is alive
+    /// and still muxing toward readyToPlay, so the watchdog can extend instead of demoting a working DV
+    /// session to the libmpv HDR10 fallback.
+    var producedBytes: Int { stream.buffer.status().produced }
+
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
         invalidateLock.lock()

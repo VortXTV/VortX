@@ -13,7 +13,7 @@ import UIKit
 ///
 ///   1. FETCH-FIRST (`fetch`): on opening a title, compute the content key and GET
 ///      `trickplay.vortx.tv/tp/{key}`. On a hit, download the sprite-sheet + WEBVTT index ONCE and serve
-///      scrub previews by cropping the sprite sub-rect for the scrubbed time — so a title brand new to this
+///      scrub previews by cropping the sprite sub-rect for the scrubbed time, so a title brand new to this
 ///      device shows previews immediately from the community, with no local generation.
 ///
 ///   2. UPLOAD-AFTER-GENERATE (`buildAndUpload`): after the device finishes generating its own local
@@ -27,7 +27,7 @@ import UIKit
 /// bucket keeps different cuts (theatrical vs extended, or a mismatched file) from colliding.
 ///
 /// Privacy: uploads ONLY the generated sprite + vtt + the content key/metadata (imdb / season / episode /
-/// duration-bucket). NEVER an account token, user id, or any PII — none is referenced here.
+/// duration-bucket). NEVER an account token, user id, or any PII; none is referenced here.
 enum CommunityTrickplay {
     /// The trickplay edge base. Sourced from the RemoteConfig `endpoints.trickplay` dial (validated https +
     /// *.vortx.tv host, else the baked default), so the owner can repoint it with no app update. Baked default
@@ -104,7 +104,7 @@ enum CommunityTrickplay {
             if let tt = await fetchExternalIMDbID(media: media, tmdbID: numeric) {
                 tmdb2ttCache[cacheKey] = tt
                 UserDefaults.standard.set(tmdb2ttCache, forKey: tmdb2ttDefaultsKey)
-                NSLog("[trickplay] resolved %@ -> %@ (%@)", rawId, tt, media)
+                VXProbe.log("tp", "resolved \(rawId) -> \(tt) (\(media))")
                 return tt
             }
         }
@@ -126,6 +126,7 @@ enum CommunityTrickplay {
         let edge = RemoteConfig.snapshot.catalogsEndpoint.absoluteString
         if let tt = await read(URL(string: "\(edge)/\(media)/\(tmdbID)/external_ids"), sign: true) { return tt }
         if let key = ApiKeys.tmdbKey() {
+            // SECURITY: this URL carries the user's TMDB key as api_key=. Never log it verbatim (VXProbe / diag).
             return await read(URL(string: "https://api.themoviedb.org/3/\(media)/\(tmdbID)/external_ids?api_key=\(key)"), sign: false)
         }
         return nil
@@ -230,38 +231,90 @@ enum CommunityTrickplay {
         // max 30..600). Baked defaults (min 1, max 600) == the shipping literals, so a null/out-of-range
         // remote value is behaviorally identical to today.
         let frameBounds = RemoteConfig.snapshot.trickplayFrameBounds
-        guard sorted.count >= frameBounds.min, sorted.count <= frameBounds.max else { return false }
+        // The sheet builder below needs >= 2 tiles (`while budget >= 2`). Clamp the effective lower bound to 2 so a
+        // 1-frame set is rejected up front with a clear reason instead of silently falling through the geometry loop
+        // and failing at the floor with a misleading "compose/encode failure" log.
+        let minFrames = max(2, frameBounds.min)
+        guard sorted.count >= minFrames, sorted.count <= frameBounds.max else {
+            VXProbe.log("tp", "buildAndUpload skipped: sorted=\(sorted.count) below buildable floor \(minFrames) (need >=2 tiles)")
+            return false
+        }
 
-        // Tile size: 16:9 at 480 wide is the local capture's native shape (480px, aspect-preserved).
-        let tileW = 480, tileH = 270
-        let cols = Int(ceil(sqrt(Double(sorted.count))))   // roughly square sheet to bound max dimension
-        let rows = Int(ceil(Double(sorted.count) / Double(cols)))
+        // Bound one sheet to a 3 MB-safe tile budget. A long watch produces far more 480x270 tiles than fit
+        // under the worker's 3 MB cap, so the full-session sheet blew the cap and the upload was dropped before
+        // the POST ever fired (the "frames=401 -> failed" case). Instead of TRUNCATING to the first N tiles
+        // (which would only ever preview the film's opening), DECIMATE evenly across the whole capture so the
+        // sheet still spans the entire duration, just at a coarser scrub interval. A short watch (<= budget) is
+        // untouched: stride 1, effectiveInterval == intervalS, identical to before.
+        let maxTiles = max(1, RemoteConfig.snapshot.trickplayMaxTilesValue)
+        // Tile size: 16:9 at 320 wide. Smaller than the 480px local capture so a `maxTiles`-tile sheet stays a
+        // fraction of the pixels of the old 480x270 sheet, keeping q0.7 under the 3 MB cap in the common case.
+        let tileW = 320, tileH = 180
+        let maxBytes = 3 * 1024 * 1024
 
-        guard let sheetJPEG = renderSheet(frames: sorted, tileW: tileW, tileH: tileH, cols: cols, rows: rows)
-        else { return false }
-        // Defensive: keep the upload under the worker's 3 MB cap.
-        guard sheetJPEG.count <= 3 * 1024 * 1024 else { return false }
+        // UNCONDITIONAL byte-bound. A sheet must satisfy TWO server limits: <= 3 MB (MAX_UPLOAD_BYTES) and
+        // >= 2 frames (the worker rejects frame_count < MIN_FRAME_COUNT=2). Start at the configured tile budget
+        // and, on a 3 MB overflow OR a compose/encode failure, HALVE the budget and rebuild the WHOLE geometry
+        // (stride, effective frames, effectiveInterval, cols, rows) together so the render, the vtt, and the meta
+        // always describe ONE consistent grid. The floor is 2 tiles: a 2-tile 320x180 sheet (640x180) cannot
+        // approach 3 MB, so a legitimate capture is never dropped for size, only ever for a true allocation or
+        // encoder failure at the floor. Coverage is invariant under decimation (frame_count shrinks as
+        // effectiveInterval grows), so a re-decimated sheet still clears the worker's MIN_SERVE_COVERAGE floor.
+        var budget = min(sorted.count, maxTiles)
+        var picked: (jpeg: Data, count: Int, cols: Int, interval: Double)?
+        while budget >= 2 {
+            let stride = sorted.count > budget ? Int(ceil(Double(sorted.count) / Double(budget))) : 1
+            let effective = stride > 1
+                ? sorted.enumerated().compactMap { $0.offset % stride == 0 ? $0.element : nil }
+                : sorted
+            let effectiveInterval = intervalS * Double(stride)
+            let cols = max(1, Int(ceil(sqrt(Double(effective.count)))))
+            let rows = Int(ceil(Double(effective.count) / Double(cols)))
 
-        let vtt = buildVTT(frameCount: sorted.count, cols: cols, tileW: tileW, tileH: tileH, intervalS: intervalS)
+            guard let composed = renderSheetImage(frames: effective, tileW: tileW, tileH: tileH, cols: cols, rows: rows) else {
+                VXProbe.log("tp", "buildAndUpload compose FAILED tiles=\(effective.count) cols=\(cols) rows=\(rows) budget=\(budget) -> re-decimate")
+                if budget == 2 { break }
+                budget = max(2, budget / 2)
+                continue
+            }
+            var fit: Data?
+            for q in [0.7, 0.5, 0.4] {
+                if let d = composed.jpegData(quality: CGFloat(q)), d.count <= maxBytes { fit = d; break }
+            }
+            if let fit {
+                picked = (fit, effective.count, cols, effectiveInterval)
+                break
+            }
+            VXProbe.log("tp", "buildAndUpload over 3MB at q0.4 tiles=\(effective.count) cols=\(cols) rows=\(rows) budget=\(budget) -> re-decimate")
+            if budget == 2 { break }
+            budget = max(2, budget / 2)
+        }
+        guard let picked else {
+            VXProbe.log("tp", "buildAndUpload could not build a >=2-tile sheet under 3MB (compose/encode failure at floor, sorted=\(sorted.count)) -> dropped")
+            return false
+        }
+
+        let vtt = buildVTT(frameCount: picked.count, cols: picked.cols, tileW: tileW, tileH: tileH, intervalS: picked.interval)
 
         let meta: [String: Any] = [
             "imdb": imdbId,
             "season": season ?? 0,
             "episode": episode ?? 0,
             "durationBucket": durationBucket,
-            "frame_count": sorted.count,
+            "frame_count": picked.count,
             "tile_w": tileW,
             "tile_h": tileH,
-            "interval_s": intervalS,
-            "cols": cols,
+            "interval_s": picked.interval,
+            "cols": picked.cols,
             "src_height": srcHeight,
         ]
-        return await post(key: key, sprite: sheetJPEG, vtt: vtt, meta: meta)
+        return await post(key: key, sprite: picked.jpeg, vtt: vtt, meta: meta)
     }
 
-    /// Compose the frames into one sheet bitmap and JPEG-encode it. Each frame is drawn scaled-to-fill into
-    /// its tile cell. Returns nil on any drawing/encoding failure.
-    private static func renderSheet(frames: [CapturedFrame], tileW: Int, tileH: Int, cols: Int, rows: Int) -> Data? {
+    /// Compose the frames into one sheet bitmap and return the composed CGImage (the caller JPEG-encodes it,
+    /// re-encoding at descending quality until it fits the upload cap). Each frame is drawn scaled-to-fill into
+    /// its tile cell. Returns nil on any drawing failure.
+    private static func renderSheetImage(frames: [CapturedFrame], tileW: Int, tileH: Int, cols: Int, rows: Int) -> CGImage? {
         let sheetW = cols * tileW, sheetH = rows * tileH
         guard sheetW > 0, sheetH > 0 else { return nil }
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -281,8 +334,7 @@ enum CommunityTrickplay {
             let y = (rows - 1 - row) * tileH
             ctx.draw(src, in: CGRect(x: col * tileW, y: y, width: tileW, height: tileH))
         }
-        guard let composed = ctx.makeImage() else { return nil }
-        return composed.jpegData(quality: 0.7)
+        return ctx.makeImage()
     }
 
     /// WEBVTT mapping each tile window [t, t+interval) to `sprite#xywh=x,y,w,h`. Matches the worker's expected
@@ -355,13 +407,12 @@ enum CommunityTrickplay {
             // reason in the terminal log, not just a silent false. Trim the body to the first 200 chars.
             let bodyStr = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)B>"
             let bodyHead = String(bodyStr.prefix(200))
-            NSLog("[tp-probe] POST %@ httpStatus=%d ok=%@ stored=%@ body=%@",
-                  url.absoluteString, code, ok ? "true" : "false", stored ? "true" : "false", bodyHead)
+            VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=\(code) ok=\(ok ? "true" : "false") stored=\(stored ? "true" : "false") body=\(bodyHead)")
             guard code == 200 else { return false }
             return stored
         } catch {
             let errHead = String(String(describing: error).prefix(200))
-            NSLog("[tp-probe] POST %@ httpStatus=err ok=false stored=false body=%@", url.absoluteString, errHead)
+            VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=err ok=false stored=false body=\(errHead)")
             return false
         }
     }

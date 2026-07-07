@@ -29,6 +29,11 @@ struct iOSSettingsView: View {
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
     @State private var showSignIn = false
+    // Diagnostic-log export over the LAN: the sheet flag + the started (url, qr) payload. Identical to the
+    // tvOS SettingsView flow (settings parity); the phone scans the QR to download vortx-diag.log.
+    @State private var showDiagExport = false
+    @State private var diagExport: (url: String, qr: Image)?
+    @State private var diagMacPath: String?
     #if os(macOS)
     /// Drives the "Share streaming server on this network" toggle (macOS only). Backed by
     /// NodeServer.sharedOnLAN, which persists + restarts the node process when it flips.
@@ -46,6 +51,8 @@ struct iOSSettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    // "1" = the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
+    @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.keepPlayingInBackground) private var keepPlayingInBackground = true
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
@@ -73,8 +80,8 @@ struct iOSSettingsView: View {
     // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
     // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
     @AppStorage(MoatConsent.key) private var moatContribute = true
-    // "Singularity" community source index SERVE opt-in (per device). Default OFF; requires sign-in to use.
-    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = false
+    // "Singularity" community source index SERVE opt-in (per device). Default ON; requires sign-in to use.
+    @AppStorage(SourceIndexClient.serveKey) private var singularityServe = true
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     /// Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id.
@@ -156,6 +163,12 @@ struct iOSSettingsView: View {
             .navigationTitle("Settings")
             #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
+            .sheet(isPresented: $showDiagExport, onDismiss: {
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            }) {
+                diagExportSheet
+            }
             .fileExporter(isPresented: $showBackupExporter, document: backupDocument,
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in
                 switch result {
@@ -238,7 +251,8 @@ struct iOSSettingsView: View {
             // from echoing back as roster edits. Single-param onChange: the zero-/two-param forms are
             // iOS 17+, target here is iOS 16.
             .onChange(of: prefAudioLang) { _ in StreamRanking.invalidateCaches(); ProfileStore.shared.capturePlayback() }
-            .onChange(of: prefSubLang) { _ in ProfileStore.shared.capturePlayback() }
+            .onChange(of: prefSubLang) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang }; ProfileStore.shared.capturePlayback() }
+            .onChange(of: matchAudioSubRaw) { _ in if matchAudioSubRaw == "1", prefAudioLang != prefSubLang { prefAudioLang = prefSubLang } }
             .onChange(of: prefForced) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subFont) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
@@ -393,13 +407,13 @@ struct iOSSettingsView: View {
     /// them from VortX. Turn one ON to make VortX track Stremio for that category (adds and removes).
     @ViewBuilder private var stremioMirrorSection: some View {
         Section {
-            Toggle("Mirror add-ons from Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
+            Toggle("Two-way sync add-ons with Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
             Toggle("Mirror library from Stremio", isOn: $mirrorLibrary).tint(Theme.Palette.accent)
             Toggle("Mirror Continue Watching from Stremio", isOn: $mirrorCW).tint(Theme.Palette.accent)
         } header: {
             Text("Stremio mirror")
         } footer: {
-            Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+            Text("Off (recommended) is one-way: VortX pulls in your Stremio add-ons but never edits your Stremio account, so removing an add-on in VortX hides it here only and leaves your Stremio account untouched. On is two-way: adding or removing an add-on in VortX also adds or removes it in your Stremio account. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
         }
     }
 
@@ -528,11 +542,79 @@ struct iOSSettingsView: View {
                 .onChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
             Text("Logs detailed activity for troubleshooting.")
                 .font(.caption).foregroundStyle(.secondary)
+            // Export the rolling diagnostic log. On macOS the Mac has a filesystem, so save it to Downloads
+            // and reveal it in Finder; on iOS a phone on the same Wi-Fi scans the QR to download it.
+            Button("Export diagnostic log") {
+                #if os(macOS)
+                diagMacPath = VXDiagExport.shared.revealInFinder()
+                #else
+                diagExport = VXDiagExport.shared.start()
+                #endif
+                showDiagExport = true
+            }
+            .tint(Theme.Palette.accent)
         } header: {
             Text("Advanced (mpv options)")
         } footer: {
             Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
+    }
+
+    /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
+    /// LAN, and sends it on. Dismissing stops the local server so the log is not left served. Kept visually
+    /// identical to the tvOS export overlay for settings parity.
+    @ViewBuilder private var diagExportSheet: some View {
+        VStack(spacing: 24) {
+            Text("Export diagnostic log")
+                .font(.title2.bold()).foregroundStyle(Theme.Palette.textPrimary)
+            #if os(macOS)
+            if let path = diagMacPath {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 48)).foregroundStyle(Theme.Palette.accent)
+                Text("Saved to Downloads and revealed in Finder.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                Text(path)
+                    .font(.footnote).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).textSelection(.enabled)
+                Text("Send that vortx-diag.log file over.")
+                    .font(.subheadline).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Could not write the diagnostic log. Turn on Diagnostic logging first, then try again.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            #else
+            if let export = diagExport {
+                export.qr
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 320, maxHeight: 320)
+                    .background(Color.white)
+                    .padding(12)
+                Text(export.url)
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Scan with your phone on the same Wi-Fi to download the log, then send it over.")
+                    .font(.subheadline).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Text("Connect this device to Wi-Fi to export the diagnostic log.")
+                    .font(.headline).foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+            }
+            #endif
+            Button("Done") {
+                showDiagExport = false
+                VXDiagExport.shared.stop()
+                diagExport = nil
+            }
+            .tint(Theme.Palette.accent)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
 
     /// External players present on this device, the choices the "Play in" picker offers. Evaluated once
@@ -986,14 +1068,29 @@ struct iOSSettingsView: View {
             // re-realizes the FIRST menu Picker per Section when the inherited Form tint changes, so
             // without this the 2nd+ pickers' trailing value labels kept the previous accent color
             // (the "not all settings change colour" report, #21 follow-up). The .id forces a rebuild.
-            Picker("Audio language", selection: $prefAudioLang) {
-                ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
+            Toggle("Match audio to subtitle languages", isOn: Binding(
+                get: { matchAudioSubRaw == "1" },
+                set: { matchAudioSubRaw = $0 ? "1" : "0" }))
+                .tint(Theme.Palette.accent)
+            if matchAudioSubRaw != "1" {
+                Picker("Audio language", selection: primaryAudioLang) {
+                    ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .tint(Theme.Palette.accent).id("audioLang-\(theme.accentID)")
+                Picker("Fallback audio language", selection: fallbackAudioLang) {
+                    ForEach(fallbackLanguageOptions, id: \.id) { Text($0.label).tag($0.id) }
+                }
+                .tint(Theme.Palette.accent).id("audioLangFallback-\(theme.accentID)")
             }
-            .tint(Theme.Palette.accent).id("audioLang-\(theme.accentID)")
-            Picker("Subtitle language", selection: $prefSubLang) {
+            Picker("Subtitle language", selection: primarySubLang) {
                 ForEach(languageOptions, id: \.id) { Text($0.label).tag($0.id) }
             }
             .tint(Theme.Palette.accent).id("subLang-\(theme.accentID)")
+            // Second menu Picker in the Section: needs its OWN .tint + accent-keyed .id (see the note above).
+            Picker("Fallback subtitle language", selection: fallbackSubLang) {
+                ForEach(fallbackLanguageOptions, id: \.id) { Text($0.label).tag($0.id) }
+            }
+            .tint(Theme.Palette.accent).id("subLangFallback-\(theme.accentID)")
             Picker("Subtitles", selection: $prefForced) {
                 ForEach(TrackPreferences.ForcedPolicy.allCases, id: \.rawValue) {
                     Text($0.label).tag($0.rawValue)
@@ -1003,7 +1100,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Audio & Subtitles")
         } footer: {
-            Text("The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
         }
     }
 
@@ -1016,6 +1113,64 @@ struct iOSSettingsView: View {
             out.append((id: code, label: code.uppercased()))
         }
         return out
+    }
+
+    /// Fallback picker options: None (clears the chain's second entry) plus the usual language list.
+    private var fallbackLanguageOptions: [(id: String, label: String)] {
+        [(id: "", label: String(localized: "None"))] + languageOptions
+    }
+
+    /// The stored subtitle preference (`TrackPreferences.Key.subtitle`) is a comma-separated PRIORITY LIST
+    /// ("tr,en") that TrackSelector already walks in order; the UI presents it as two pickers via these
+    /// derived bindings. Primary = the first entry; setting it keeps the existing fallback (dropping it only
+    /// when it would duplicate the new primary). The raw `prefSubLang` @AppStorage stays the storage anchor,
+    /// so profile capture (.onChange(of: prefSubLang)) and cross-device sync round-trip the whole list.
+    private var primarySubLang: Binding<String> {
+        Binding(
+            get: { prefSubLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefSubLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    /// Fallback = the second entry of the stored chain ("" = none). Choosing None (or the primary itself)
+    /// stores just the primary.
+    private var fallbackSubLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefSubLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefSubLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefSubLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
+    }
+
+    /// Audio primary / fallback: the SAME two-picker derivation as the subtitle chain, over the
+    /// `TrackPreferences.Key.audio` list. Shown only when "Match audio to subtitle languages" is off.
+    private var primaryAudioLang: Binding<String> {
+        Binding(
+            get: { prefAudioLang.split(separator: ",").first.map(String.init) ?? "en" },
+            set: { newPrimary in
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                let fallback = parts.count > 1 ? parts[1] : ""
+                prefAudioLang = (fallback.isEmpty || fallback == newPrimary) ? newPrimary : "\(newPrimary),\(fallback)"
+            })
+    }
+
+    private var fallbackAudioLang: Binding<String> {
+        Binding(
+            get: {
+                let parts = prefAudioLang.split(separator: ",").map(String.init)
+                return parts.count > 1 ? parts[1] : ""
+            },
+            set: { newFallback in
+                let primary = prefAudioLang.split(separator: ",").first.map(String.init) ?? "en"
+                prefAudioLang = (newFallback.isEmpty || newFallback == primary) ? primary : "\(primary),\(newFallback)"
+            })
     }
 
     // MARK: Subtitle style

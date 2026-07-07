@@ -51,7 +51,7 @@ struct HLSPlayerView: View {
     #if os(iOS)
     var body: some View {
         ChromeBody(url: url, title: title, headers: headers, resumeSeconds: resumeSeconds,
-                   onProgress: onProgress, onClose: onClose)
+                   onProgress: onProgress, onClose: onClose, onLoadFailed: onLoadFailed)
     }
     #elseif os(tvOS)
     // tvOS: keep the bare AVPlayerViewController. A custom focusable overlay would compete with the
@@ -92,6 +92,7 @@ extension HLSPlayerView {
         let resumeSeconds: Double
         let onProgress: (Double, Double) -> Void
         let onClose: () -> Void
+        var onLoadFailed: () -> Void = {}
 
         @StateObject private var model = AVPlayerModel()
         @State private var controlsVisible = true
@@ -123,7 +124,8 @@ extension HLSPlayerView {
             .statusBarHidden(true)
             .animation(.easeOut(duration: 0.18), value: controlsVisible)
             .onAppear {
-                model.configure(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress)
+                model.configure(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress,
+                                onLoadFailed: onLoadFailed)
                 scheduleHide()
             }
             .onDisappear { model.teardown(); hideTask?.cancel() }
@@ -318,6 +320,7 @@ private final class AVPlayerModel: NSObject, ObservableObject {
     let player = AVPlayer()
 
     private var onProgress: (Double, Double) -> Void = { _, _ in }
+    private var onLoadFailed: () -> Void = {}
     private var resumeSeconds = 0.0
     private var didResume = false
     private var lastReported = -10.0
@@ -330,9 +333,11 @@ private final class AVPlayerModel: NSObject, ObservableObject {
     private var pipController: AVPictureInPictureController?
 
     func configure(url: URL, headers: [String: String]?, resumeSeconds: Double,
-                   onProgress: @escaping (Double, Double) -> Void) {
+                   onProgress: @escaping (Double, Double) -> Void,
+                   onLoadFailed: @escaping () -> Void = {}) {
         guard item == nil else { return }   // configure once
         self.onProgress = onProgress
+        self.onLoadFailed = onLoadFailed
         self.resumeSeconds = resumeSeconds
 
         // Activate .playback before play so PiP and locked-screen/background audio work (PiP refuses to start
@@ -415,6 +420,14 @@ private final class AVPlayerModel: NSObject, ObservableObject {
     }
 
     private func handleReady(_ item: AVPlayerItem) {
+        if item.status == .failed {
+            // A dead/unplayable HLS link (403, unsupported codec, open-time drop) never reaches .readyToPlay,
+            // so the buffering overlay would spin FOREVER with no fallback. Clear it and let PlayerScreen
+            // re-present the stream on libmpv (the AVPlayer -> libmpv demotion the full chrome already has).
+            buffering = false
+            onLoadFailed()
+            return
+        }
         guard item.status == .readyToPlay else { return }
         isReady = true
         let dur = item.duration.seconds

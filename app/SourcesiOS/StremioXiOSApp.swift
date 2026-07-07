@@ -370,6 +370,16 @@ import AppKit
 /// routine window/focus changes and must NOT tear the server down. Without this the `node` child is
 /// reparented to launchd and keeps holding port 11470 (the orphaned-process leak this fixes).
 final class MacAppDelegate: NSObject, NSApplicationDelegate {
+    // Install the macOS 26 (Tahoe) NSToolbar-insert crash guard before any window
+    // stands up its (hidden) toolbar. SwiftUI's ToolbarBridge otherwise throws an
+    // NSException inserting into the shared window toolbar when an off-main model
+    // republishes under a pushed detail screen, and AppKit turns that into a fatal
+    // SIGTRAP. The window toolbar is hidden and unused here, so the guard swallowing
+    // a failed insert has no visible effect. See VortXToolbarCrashGuard.mm.
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        VortXInstallToolbarCrashGuard()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         NodeServer.stop()
     }

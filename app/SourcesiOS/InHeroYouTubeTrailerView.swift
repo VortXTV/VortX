@@ -27,13 +27,19 @@ struct InHeroYouTubeTrailerView: View {
     /// Set if the embed reports it cannot play: keeps the clip hidden so the still backdrop stays visible.
     @State private var failed = false
 
+    /// "A fullscreen player is up" signal. This hero embed stays MOUNTED under a presented player (the browse
+    /// UI is not torn down by fullScreenCover / the Mac host), so without this gate the WKWebView kept decoding
+    /// its looping trailer beneath the whole movie: the Lite-build twin of the InHeroTrailerView regression
+    /// PR #106 fixed for the native path. The embed unmounts while a player is active and fades back in on close.
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
+
     /// How long the still backdrop holds before the muted trailer dissolves in (matches `InHeroTrailerView`).
     private static let startDelay: Duration = .milliseconds(400)
     private static let fadeDuration: Double = 0.6
 
     var body: some View {
         ZStack {
-            if !failed {
+            if !failed, !playbackGate.playerActive {
                 // COVER-FILL the whole hero band (A3 fill intent for the YouTube path): the YouTube IFrame
                 // renders a 16:9 player letterboxed inside its 100%x100% frame, so on a wide Mac band a plain
                 // fit would show black bars top/bottom. Size the embed to a 16:9 box that COVERS the band
@@ -69,20 +75,40 @@ struct InHeroYouTubeTrailerView: View {
             guard !failed else { return }
             withAnimation(reduceMotion ? nil : .easeOut(duration: Self.fadeDuration)) { showClip = true }
         }
+        // A fullscreen player presented over this hero unmounts the embed (WKWebView torn down, no more decode).
+        // On close, re-run the still-hold beat and fade the fresh embed back in, matching the first-mount reveal.
+        // Single-parameter onChange for iOS 16 (the zero-parameter iOS 17 overload broke the CI iOS build once).
+        .onChange(of: playbackGate.playerActive) { active in
+            if active {
+                showClip = false
+            } else {
+                Task {
+                    showClip = false
+                    try? await Task.sleep(for: Self.startDelay)
+                    guard !failed, !playbackGate.playerActive else { return }
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: Self.fadeDuration)) { showClip = true }
+                }
+            }
+        }
         // Decorative ambient layer; the hero title / actions carry the accessible content.
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the hero backdrop uses, so the title / meta stay legible over the trailer and the
-    /// band reads consistently whether the still art or the trailer is showing (mirrors `InHeroTrailerView`).
+    /// The scrim the moving trailer carries so the title / logo / meta / synopsis stay legible over video
+    /// (mirrors `InHeroTrailerView`): a deep vertical fade tuned to match OR EXCEED the still-backdrop scrim,
+    /// a top scrim for the chrome discs, and a leading fade for the title column. The extra depth keeps the
+    /// logo readable once the bright moving embed dissolves in over the still art (owner report).
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.55),
-                .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.85),
+                .init(color: Theme.Palette.canvas.opacity(0.30), location: 0.45),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.72),
+                .init(color: Theme.Palette.canvas.opacity(0.90), location: 0.90),
                 .init(color: Theme.Palette.canvas, location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }

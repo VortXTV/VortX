@@ -100,7 +100,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             // Diagnose an empty server table: log WHY we never key (the remaining culprits are a non-tt,
             // non-tmdb libraryId, e.g. kitsu:/paste-a-link, or a zero duration).
             if enabled, communityKey == nil {
-                NSLog("[trickplay] community NOT keyed (need a tt-imdb id + duration>0): imdb=%@ dur=%.0f", imdbId ?? "nil", duration)
+                VXProbe.log("tp", "community NOT keyed (need a tt-imdb id + duration>0): imdb=\(imdbId ?? "nil") dur=\(Int(duration))")
             }
             return
         }
@@ -111,7 +111,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         if communityKey == key { return }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
         let rekeying = communityKey != nil
-        NSLog("[trickplay] community %@: %@ (imdb=%@ real=%@)", rekeying ? "re-keyed" : "keyed", key, imdbId, isRealDuration ? "yes" : "no")
+        VXProbe.log("tp", "community \(rekeying ? "re-keyed" : "keyed"): \(key) (imdb=\(imdbId) real=\(isRealDuration ? "yes" : "no"))")
         communityKey = key
         communityImdb = imdbId
         communitySeason = season
@@ -149,7 +149,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             await MainActor.run {
                 guard let self else { return }
                 guard let tt else {
-                    NSLog("[trickplay] tmdb->imdb resolve FAILED for %@ (session stays local-only)", rawId)
+                    VXProbe.log("tp", "tmdb->imdb resolve FAILED for \(rawId) (session stays local-only)")
                     return
                 }
                 self.configureCommunity(imdbId: tt, season: season, episode: episode,
@@ -158,19 +158,41 @@ final class ScrubThumbnailsStore: ObservableObject {
         }
     }
 
+    /// Monotonic token so a slow disk read+decode that resolves after the user has scrubbed on (or after a
+    /// community-sheet / in-memory hit already set a newer frame) is discarded instead of clobbering the
+    /// current preview with a stale one.
+    private var showToken = 0
+
     /// Shows the stored frame nearest to `time`. Call while the user is scrubbing. Community sheet first
     /// (shared), then the per-device local cache.
+    ///
+    /// The synchronous fast paths (community crop + in-memory NSCache hit) assign `image` inline so a warm
+    /// scrub stays instant. A cache MISS used to do a blocking `ioQueue.sync` disk read + JPEG decode ON THE
+    /// MAIN THREAD during scrubbing; that read+decode is now hopped off the main actor and the resolved frame
+    /// is assigned back on the MainActor, gated by `showToken` so a stale late result can't overwrite a newer one.
     func show(time: Double) {
+        showToken &+= 1
         if let sheet = communitySheet, let crop = sheet.crop(at: time) {
             image = crop
             return
         }
-        guard let key = localCacheKey,
-              let local = Self.localFrameCache.image(for: key, time: time) else {
+        guard let key = localCacheKey else {
             image = nil
             return
         }
-        image = local
+        // In-memory hit resolves synchronously so a warm scrub is instant and never touches disk.
+        if let cached = Self.localFrameCache.memoryImage(for: key, time: time) {
+            image = cached
+            return
+        }
+        // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
+        let token = showToken
+        Self.localFrameCache.imageAsync(for: key, time: time) { [weak self] resolved in
+            Task { @MainActor in
+                guard let self, self.showToken == token else { return }   // user scrubbed on; drop the stale frame
+                self.image = resolved
+            }
+        }
     }
 
     func clear() {
@@ -185,7 +207,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// failed to decode or the frame is near-black (unrendered) and should be dropped. Fail-soft: logs the drop.
     nonisolated static func decodeCapturedFrame(_ data: Data, at time: Double) -> ScrubImage? {
         guard let decoded = ScrubImage(data: data) else {
-            NSLog("[trickplay] dropping frame at %.0fs: JPEG decode failed", time)
+            VXProbe.log("tp", "dropping frame at \(Int(time))s: JPEG decode failed")
             return nil
         }
         #if canImport(AppKit)
@@ -209,16 +231,15 @@ final class ScrubThumbnailsStore: ObservableObject {
         }
         let bigEnoughToBeReal = data.count >= nonBlackByteFloor
         let kept = bigEnoughToBeReal || !samplerBlack
-        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=%@ kept=%@",
-              time, data.count, samplerBlack ? "true" : "false", kept ? "true" : "false")
+        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=\(samplerBlack ? "true" : "false") kept=\(kept ? "true" : "false")")
         if !kept {
-            NSLog("[trickplay] dropping frame at %.0fs: near-black (unrendered) bytes=%d", time, data.count)
+            VXProbe.log("tp", "dropping frame at \(Int(time))s: near-black (unrendered) bytes=\(data.count)")
             return nil
         }
         #else
         // Non-AppKit platforms have no pixel sampler here, so nothing is dropped as near-black; still emit the probe
         // so the log shows the size verdict for every captured frame on every platform.
-        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=n/a kept=true", time, data.count)
+        VXProbe.log("tp", "frame at \(Int(time))s bytes=\(data.count) samplerBlack=n/a kept=true")
         #endif
         return decoded
     }
@@ -256,17 +277,18 @@ final class ScrubThumbnailsStore: ObservableObject {
         // (capture is ~every 10s, so effectively every ~10s of new coverage). This replaces the old ~1-minute
         // batch so trickplay contributes live, not only at teardown.
         let minNewFrames = 1
+        // The community sheet builder needs >= 2 tiles: buildAndUpload's `while budget >= 2` loop is skipped for a
+        // single frame, so a 1-frame push is admitted then dropped at the floor (the noisy sorted=1 failure every
+        // session). Never spawn a progressive push until we actually have a buildable (>= 2) frame count.
+        let minBuildableFrames = 2
         // Evaluate each guard clause up front so the probe can report WHY we do or do not upload this tick.
         let enabled = CommunityTrickplay.isEnabled
         let hasKey = communityKey != nil
         let beatsStored = sessionFrames.count > communityExistingFrameCount   // keep-fuller: don't clobber a fuller set
         let hasNewCoverage = sessionFrames.count >= lastUploadedCount + minNewFrames
-        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && communityImdb != nil
-        NSLog("[tp-probe] upload-gate frames=%d existing=%d lastUploaded=%d minNew=%d enabled=%@ hasKey=%@ imdb=%@ beatsStored=%@ hasNewCoverage=%@ -> %@",
-              sessionFrames.count, communityExistingFrameCount, lastUploadedCount, minNewFrames,
-              enabled ? "true" : "false", hasKey ? "true" : "false", communityImdb ?? "nil",
-              beatsStored ? "true" : "false", hasNewCoverage ? "true" : "false",
-              willUpload ? "UPLOAD" : "skip")
+        let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
+        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && enoughToBuild && communityImdb != nil
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) minNew=\(minNewFrames) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -282,19 +304,16 @@ final class ScrubThumbnailsStore: ObservableObject {
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
         // No hasRealDuration gate (see maybeUploadProgressively) so a debrid MKV that never emitted mpv's
-        // `duration` event still flushes on exit. Store even a tiny capture (>=1 frame) so a short watch or a
-        // quick bug-test is never lost - the owner asked that even ~5s of coverage be stored + served.
+        // `duration` event still flushes on exit. Requires >= 2 kept frames: the sheet builder needs >= 2 tiles
+        // (`while budget >= 2`), so a lone-frame flush can only reproduce the sorted=1 drop. Capture is ~every 10s,
+        // so a ~20s+ watch stores; a shorter single-frame watch is structurally unbuildable, not dropped in error.
         let enabled = CommunityTrickplay.isEnabled
         let hasKey = communityKey != nil
-        let hasFrames = sessionFrames.count >= 1
+        let hasFrames = sessionFrames.count >= 2   // sheet builder floors at 2 tiles; a lone frame is unbuildable
         let grewSinceUpload = sessionFrames.count > lastUploadedCount
         let beatsStored = sessionFrames.count > communityExistingFrameCount
         let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && communityImdb != nil
-        NSLog("[tp-probe] teardown-flush frames=%d existing=%d lastUploaded=%d enabled=%@ hasKey=%@ hasFrames=%@ grewSinceUpload=%@ beatsStored=%@ -> %@",
-              sessionFrames.count, communityExistingFrameCount, lastUploadedCount,
-              enabled ? "true" : "false", hasKey ? "true" : "false", hasFrames ? "true" : "false",
-              grewSinceUpload ? "true" : "false", beatsStored ? "true" : "false",
-              willFlush ? "FLUSH" : "skip")
+        VXProbe.log("tp", "teardown-flush frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") hasFrames=\(hasFrames ? "true" : "false") grewSinceUpload=\(grewSinceUpload ? "true" : "false") beatsStored=\(beatsStored ? "true" : "false") -> \(willFlush ? "FLUSH" : "skip")")
         guard willFlush, let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
     }
@@ -307,13 +326,13 @@ final class ScrubThumbnailsStore: ObservableObject {
         let frames = sessionFrames
         let season = communitySeason, episode = communityEpisode
         let bucket = communityDurationBucket, height = communitySrcHeight
-        NSLog("[tp-probe] pushUpload FIRING key=%@ imdb=%@ frames=%d", key, imdb, frames.count)
+        VXProbe.log("tp", "pushUpload FIRING key=\(key) imdb=\(imdb) frames=\(frames.count)")
         Task.detached(priority: .utility) {
             let ok = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,
                 durationBucket: bucket, srcHeight: height,
                 intervalS: Self.captureInterval, frames: frames)
-            NSLog("[trickplay] upload key=%@ frames=%d -> %@", key, frames.count, ok ? "stored" : "failed")
+            VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(ok ? "stored" : "failed")")
         }
     }
 
@@ -406,19 +425,35 @@ private final class LocalTrickplayFrameCache {
         }
     }
 
-    func image(for key: String, time: Double) -> ScrubImage? {
+    /// Synchronous in-memory-only lookup: returns the nearest already-decoded thumbnail without ever touching
+    /// disk, so a warm scrub can resolve on the main thread with no I/O. Returns nil on a miss; the caller
+    /// then falls back to `imageAsync` for the off-thread read+decode.
+    func memoryImage(for key: String, time: Double) -> ScrubImage? {
         let target = bucketFor(time)
-        return ioQueue.sync {
-            let minBucket = max(0, target - maxLookbackBuckets)
+        let minBucket = max(0, target - maxLookbackBuckets)
+        for bucket in stride(from: target, through: minBucket, by: -1) {
+            if let cached = memory.object(forKey: memKey(key, bucket)) { return cached }
+        }
+        return nil
+    }
+
+    /// Off-main-thread read + JPEG decode of the nearest stored frame. Runs on the private `ioQueue` and calls
+    /// `completion` (also on `ioQueue`) with the decoded image or nil. Kept async so scrubbing never blocks the
+    /// main thread on a disk read + decode; the in-memory fast path is `memoryImage(for:)` above.
+    func imageAsync(for key: String, time: Double, completion: @escaping (ScrubImage?) -> Void) {
+        let target = bucketFor(time)
+        ioQueue.async {
+            let minBucket = max(0, target - self.maxLookbackBuckets)
             for bucket in stride(from: target, through: minBucket, by: -1) {
-                if let cached = memory.object(forKey: memKey(key, bucket)) { return cached }
-                let url = fileURL(for: key, bucket: bucket)
+                if let cached = self.memory.object(forKey: self.memKey(key, bucket)) { completion(cached); return }
+                let url = self.fileURL(for: key, bucket: bucket)
                 guard let data = try? Data(contentsOf: url),
                       let decoded = ScrubImage(data: data) else { continue }
-                memory.setObject(decoded, forKey: memKey(key, bucket))
-                return decoded
+                self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
+                completion(decoded)
+                return
             }
-            return nil
+            completion(nil)
         }
     }
 

@@ -66,6 +66,9 @@ struct TVInHeroTrailerView: View {
     @State private var serverReady = false
     /// Gate so the start-delay beat is armed exactly once per mounted URL.
     @State private var startedDelay = false
+    /// The reveal-beat sleep task, held so it can be cancelled on disappear / url-change instead of
+    /// leaking a live Task that flips `showClip` after the layer has been torn down or rebuilt.
+    @State private var revealTask: Task<Void, Never>? = nil
 
     /// Seconds the still backdrop holds before the muted clip dissolves in, matched to the iOS detail beat.
     /// A detail page is a destination, so the trailer eases in rather than slamming on appear.
@@ -105,8 +108,17 @@ struct TVInHeroTrailerView: View {
         // Rebuild the whole layer (new coordinator, restarted delay) when the trailer changes, so A's clip
         // never lingers over B's backdrop.
         .id(url)
+        .onDisappear {
+            // Cancel a still-sleeping reveal beat so it can't flip `showClip` after teardown. The
+            // libmpv Coordinator itself is torn down by SwiftUI dismantling MPVMetalPlayerView (stop()).
+            revealTask?.cancel()
+            revealTask = nil
+        }
         .task(id: url) {
-            // Reset state for the (possibly new) URL, then decide whether to mount the clip.
+            // Reset state for the (possibly new) URL, then decide whether to mount the clip. Cancel any
+            // reveal beat carried over from the previous URL so it never reveals B's clip on A's timing.
+            revealTask?.cancel()
+            revealTask = nil
             serverReady = false
             showClip = false
             didStart = false
@@ -137,16 +149,20 @@ struct TVInHeroTrailerView: View {
         .accessibilityHidden(true)
     }
 
-    /// The same dual scrim the tvOS `FullBleedBackdrop` uses, so the title / meta stay legible over video
-    /// and the band reads consistently whether the still art or the clip is showing.
+    /// The scrim the moving clip carries. It is based on the tvOS `FullBleedBackdrop` scrim but tuned
+    /// slightly DEEPER (and with an added top scrim) because a moving clip has bright motion the still art
+    /// does not, so the logo / meta / synopsis (which paint ABOVE this clip) stay legible once it fades in
+    /// (owner report: the clip appeared to cover the details). Still-art legibility is unchanged.
     private var scrim: some View {
         ZStack {
             LinearGradient(stops: [
                 .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.18), location: 0.50),
-                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.78),
-                .init(color: Theme.Palette.canvas.opacity(0.88), location: 1.0),
+                .init(color: Theme.Palette.canvas.opacity(0.28), location: 0.50),
+                .init(color: Theme.Palette.canvas.opacity(0.62), location: 0.78),
+                .init(color: Theme.Palette.canvas.opacity(0.92), location: 1.0),
             ], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.40), .clear],
+                           startPoint: .top, endPoint: .center)
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                            startPoint: .leading, endPoint: .center)
         }
@@ -187,9 +203,12 @@ struct TVInHeroTrailerView: View {
     private func armReveal() {
         guard !startedDelay else { return }
         startedDelay = true
-        Task { @MainActor in
+        revealTask?.cancel()
+        revealTask = Task { @MainActor in
             try? await Task.sleep(for: Self.startDelay)
-            guard !failed else { return }
+            // Bail if the layer disappeared / rebuilt for a new URL while we slept (cancelled), or the
+            // clip failed to load, so we never reveal over a torn-down or swapped backdrop.
+            guard !Task.isCancelled, !failed else { return }
             withAnimation(reduceMotion ? nil : .easeOut(duration: Self.fadeDuration)) { showClip = true }
         }
     }

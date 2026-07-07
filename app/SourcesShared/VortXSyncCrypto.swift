@@ -17,6 +17,12 @@ import CommonCrypto
 ///   document     = base64(AES-256-GCM(syncDocJSON, key=dataKey))
 enum VortXSyncCrypto {
     static let defaultIters = 210_000
+    /// Hard floor for a server-supplied `kdfIters`. `/v1/auth/prelogin` and `/v1/auth/recover-start` are
+    /// UNAUTHENTICATED, so a spoofed/compromised api.vortx.tv (or a MITM) could return `kdfIters: 1` and make
+    /// the client derive a near-unstretched master key, collapsing the offline cost of cracking the account's
+    /// stored wrapped key. Reject anything below this floor before deriving. Well under defaultIters so every
+    /// legitimate account (minted at 210k) passes; far above any downgrade an attacker would want.
+    static let minIters = 100_000
 
     // MARK: PBKDF2-SHA256 (CryptoKit has no PBKDF2; CommonCrypto provides it)
 
@@ -52,6 +58,45 @@ enum VortXSyncCrypto {
         guard let data = Data(base64Encoded: base64Ciphertext),
               let box = try? AES.GCM.SealedBox(combined: data) else { return nil }
         return try? AES.GCM.open(box, using: SymmetricKey(data: key))
+    }
+
+    // MARK: Sync-document sealing with version binding (rollback protection)
+    //
+    // The sync `document` (ONLY - never the wrapped keys) is bound to the (accountId, version) it was written
+    // at via AES-GCM additional-authenticated-data. Because the GCM tag then covers that version, a storage
+    // backend that cannot read the data key still cannot replay an OLD ciphertext under a fabricated HIGHER
+    // version to silently roll the account back (the client's monotonic lastSyncedVersion check alone let a
+    // faked-higher version through). A "v2." prefix marks the new format; legacy docs (bare base64, no AAD)
+    // still open, so this is backward-compatible. The webapp (vortx-site/src/lib/vault.ts) mirrors this byte
+    // for byte, and the Worker stores the document as an opaque string and already echoes the authentic
+    // version, so no Worker change is needed. MIGRATION: ship dual-READ everywhere first (writeV2 == false),
+    // then flip to writeV2 == true once every client can read v2 (a v2 doc is unreadable by an older client).
+    static let docV2Prefix = "v2."
+
+    /// The AAD bytes that bind a sync document to its account + version. Identical construction in the webapp.
+    static func documentAAD(accountId: String, version: Int) -> Data {
+        Data("vortx/sync-doc/v2\n\(accountId)\n\(version)".utf8)
+    }
+
+    /// Seal the sync document. `writeV2 == true` binds (accountId, version) as GCM AAD and marks the blob
+    /// "v2."; `false` writes the legacy no-AAD format so an older client can still read it during migration.
+    static func sealDocument(dataKey: Data, plaintext: Data, accountId: String, version: Int, writeV2: Bool) -> String? {
+        guard writeV2 else { return seal(key: dataKey, plaintext) }
+        let aad = documentAAD(accountId: accountId, version: version)
+        guard let combined = try? AES.GCM.seal(plaintext, using: SymmetricKey(data: dataKey), authenticating: aad).combined
+        else { return nil }
+        return docV2Prefix + combined.base64EncodedString()
+    }
+
+    /// Open a sync document of either format. A "v2." blob MUST authenticate against (accountId, version):
+    /// a replay under a different version, or a stripped/forged prefix, fails the GCM tag and returns nil. A
+    /// bare-base64 (legacy) blob opens without AAD. `version` is ignored for legacy blobs.
+    static func openDocument(dataKey: Data, stored: String, accountId: String, version: Int) -> Data? {
+        guard stored.hasPrefix(docV2Prefix) else { return open(key: dataKey, stored) }
+        let b64 = String(stored.dropFirst(docV2Prefix.count))
+        guard let data = Data(base64Encoded: b64), let box = try? AES.GCM.SealedBox(combined: data) else { return nil }
+        let aad = documentAAD(accountId: accountId, version: version)
+        return try? AES.GCM.open(box, using: SymmetricKey(data: dataKey), authenticating: aad)
     }
 
     // MARK: Derived values

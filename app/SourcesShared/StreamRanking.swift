@@ -107,7 +107,7 @@ enum StreamRanking {
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                      pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
-        if SourcePreferences.shared.useAddonOrder {
+        if SourcePreferences.reading.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
             // explicit "play THIS" - so an applicable pin still wins, falling back to add-on order.
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
@@ -154,7 +154,7 @@ enum StreamRanking {
         guard let hint = rememberedQuality, !hint.isEmpty else {
             return seconds > 4                                         // fresh play: original snappy window
         }
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         let torrentOK = prefs.useAddonOrder || prefs.typeOrder.first == .torrent
         let qualityReady = groups.contains { group in
             group.streams.contains { s in
@@ -205,9 +205,19 @@ enum StreamRanking {
         else if boundedMatch(text, #"dvd[ .\-_]?rip"#) { score -= 200 }
         else if text.contains("tvrip") || text.contains("satrip") || boundedMatch(text, #"pdtv"#) { score -= 300 }
         // Video range, fine-grained: DV > HDR10+ > HDR10/HLG > SDR. Checked specific-first so HDR10+
-        // is not swallowed by the generic "hdr" test. Any HDR is effectively strict over SDR; the
-        // gradations between HDR flavours are soft (a size tiebreak can nudge), which is fine.
-        if text.contains("dolby vision") || text.contains("dolbyvision") || text.contains("dovi") { score += 30 }
+        // is not swallowed by the generic "hdr" test. Any HDR is effectively strict over SDR.
+        //
+        // DV uses the SAME wide predicate the engine router trusts (isDolbyVision), not a narrow
+        // "dolby vision"/"dovi" token match. Two reasons: (1) a source labeled only by profile
+        // (DV.P8, Profile 8, BL+RPU, DoViHDR) routes to the true-DV AVPlayer lane at play time but,
+        // under the old narrow match, scored as pure SDR here, so any "hdr" peer (+18) outranked it
+        // and the auto-pick took HDR10 over a real DV source; using isDolbyVision makes ranking and
+        // routing agree. (2) The bonus is raised to +45 so a real DV source beats an equal-resolution
+        // HDR10 source (+18) by MORE than the size tiebreak can swing (cap +12 below), so an equal-res
+        // HDR10 file cannot overtake DV on file size alone. +45 still sits well below the source and
+        // resolution tiers (remux +230, bluray +150, and the resolution ladder), so a 1080p DV source
+        // never leapfrogs a 4K HDR10 remux: DV stays a within-tier preference, not a cross-tier override.
+        if StreamRanking.isDolbyVision(text) { score += 45 }
         else if text.contains("hdr10+") || text.contains("hdr10plus") { score += 24 }
         else if text.contains("hdr") || text.contains("hlg") { score += 18 }
         // File size is now a SMALL final tiebreaker (cap +12), not a primary signal: it only orders
@@ -254,7 +264,7 @@ enum StreamRanking {
         // awareness-only slice, so it still plays via the torrent server, not debrid. The +8000 cached
         // bonus above lifts it WITHIN the torrent tier; the .debrid retag waits for the cached-PLAY path.
         let type = sourceType(s, text)
-        score += SourcePreferences.shared.tierWeight(for: type)
+        score += SourcePreferences.reading.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
         // providers without ever crossing a quality or tier boundary.
         score += providerOffset(for: provider(text))
@@ -553,7 +563,7 @@ enum StreamRanking {
     /// Whether a stream survives the user's keyword + safety filters (Settings > Streams). Default
     /// preferences pass everything, so this is a no-op until the user opts in.
     static func passesUserFilters(_ s: CoreStream) -> Bool {
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         let kids = ProfileStore.activeIsKids()
         if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
         let text = qualityText(s)
@@ -624,7 +634,7 @@ enum StreamRanking {
 
     static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
-        let prefs = SourcePreferences.shared
+        let prefs = SourcePreferences.reading
         // A Kids profile must run passesUserFilters even with zero manual filters (its content guard
         // lives there), so only take the no-op fast path when not a Kids profile.
         guard !prefs.noFiltersActive || ProfileStore.activeIsKids() else { return groups }
@@ -637,7 +647,7 @@ enum StreamRanking {
     static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                              debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
         let groups = applyUserFilters(groups)
-        guard !SourcePreferences.shared.useAddonOrder else { return groups }
+        guard !SourcePreferences.reading.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {
@@ -652,7 +662,7 @@ enum StreamRanking {
     static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
-        if SourcePreferences.shared.useAddonOrder {
+        if SourcePreferences.reading.useAddonOrder {
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
         }
@@ -863,7 +873,7 @@ enum StreamRanking {
     /// and made best() pick that 1080p file over genuine peers.
     private static func explicitResolution(_ t: String) -> Int? {
         for (token, value) in [("2160", 4000), ("1440", 1440), ("1080", 1080),
-                               ("720", 720), ("576", 540), ("540", 540), ("480", 480)] {
+                               ("720", 720), ("576", 576), ("540", 540), ("480", 480)] {
             if boundedMatch(t, "\(token)p?") { return value }
         }
         return nil
@@ -915,7 +925,7 @@ enum StreamRanking {
         let t = qualityText(s)
         var why: [String] = []
         if isCached(s, t) { why.append("instant from cache") }
-        if SourcePreferences.shared.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
+        if SourcePreferences.reading.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
         guard !why.isEmpty else { return nil }
         return why.joined(separator: " · ")
     }
@@ -1012,14 +1022,18 @@ enum StreamRanking {
             return true
         }
         // "[RD download]" forms, "⏳" hourglass, "⬇" download arrow, "❌ not ready", "🎟" ticket.
+        // "download" is only a cache signal inside a bracketed service tag ([PM download]); the bare
+        // word appears in ordinary release names ("Download.2005") and must not force uncached.
         if text.contains("⏳") || text.contains("⬇") || text.contains("uncached")
             || text.contains("not ready") || text.contains("🎟")
-            || boundedMatch(text, "download") {
+            || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\s+download\]"#) {
             return false
         }
         // "[RD+]"-style plus tags, "⚡" bolt, "(Instant RD)", plain "cached", "🎫" ticket.
-        if text.contains("⚡") || text.contains("+]") || text.contains("instant")
-            || text.contains("cached") || text.contains("🎫") {
+        // The "+" plus tag only counts bound to a known service code inside brackets; a bare "+]"
+        // substring occurs in ordinary release names and would misclassify them as cached.
+        if text.contains("⚡") || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\+\]"#)
+            || text.contains("instant") || text.contains("cached") || text.contains("🎫") {
             return true
         }
         return s.url != nil && s.infoHash == nil   // plain URL with no contrary marker

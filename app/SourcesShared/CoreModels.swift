@@ -95,8 +95,8 @@ struct CoreLibState: Decodable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        timeOffset = try c.decode(Double.self, forKey: .timeOffset)
-        duration = try c.decode(Double.self, forKey: .duration)
+        timeOffset = (try c.decodeIfPresent(Double.self, forKey: .timeOffset)) ?? 0
+        duration = (try c.decodeIfPresent(Double.self, forKey: .duration)) ?? 0
         videoId = try c.decodeIfPresent(String.self, forKey: .videoId)
         flaggedWatched = (try c.decodeIfPresent(Int.self, forKey: .flaggedWatched)) ?? 0
         timesWatched = (try c.decodeIfPresent(Int.self, forKey: .timesWatched)) ?? 0
@@ -136,9 +136,16 @@ struct CoreLibState: Decodable {
 /// truly unavailable.
 @MainActor
 enum CWResume {
-    /// Resolve the exact stored source to a playable URL. `refreshed` is true only when a fresh debrid link
-    /// was minted for the same file (the caller can then treat the URL as authoritative and skip its
-    /// stale-link failover priming). Never throws: any failure collapses to the stored `url`.
+    /// How recently the stored debrid link must have been minted for a resume to replay it INSTANTLY without
+    /// a reresolve round-trip. Debrid direct links live for hours, so a link minted within this window is
+    /// almost certainly still valid; a conservative 20 minutes keeps the "quick pause then resume" case
+    /// instant while anything older takes the reliable reresolve path.
+    private static let freshLinkWindow: TimeInterval = 20 * 60
+
+    /// Resolve the exact stored source to a playable URL. `refreshed` is true when the URL is AUTHORITATIVE
+    /// and should be played directly (a freshly minted debrid link, OR a stored link still inside the fresh
+    /// window); false only when we fell back to a possibly-stale stored link because the source could not be
+    /// reresolved, so the caller keeps its stale-link failover priming. Never throws.
     static func resolvedURL(for entry: LastStreamStore.Entry) async -> (url: URL, refreshed: Bool) {
         let stored = URL(string: entry.url)
         // No debrid provenance (plain-direct / torrent / usenet with no reresolve id): the stored link is
@@ -147,9 +154,20 @@ enum CWResume {
               let infoHash = entry.infoHash, !infoHash.isEmpty else {
             return (stored ?? URL(fileURLWithPath: "/"), false)
         }
-        // Mint a FRESH link for the SAME file through the SAME provider. On TorBox this is a single requestdl
-        // off the stored torrentId+fileId (no re-add); other providers re-add from the infoHash+fileIdx, still
-        // far cheaper than a full source re-resolve, and still the SAME source.
+        // INSTANT RESUME (Step 4): the previous behaviour reresolved a fresh link on EVERY resume, a blocking
+        // network round-trip before the player appeared (the "CW resume is slow" regression). But a debrid
+        // link minted moments ago is still valid, so when the stored link is inside the fresh window hand it
+        // straight back with refreshed:true. The caller plays it immediately and attaches the debridRef, whose
+        // ids let the player's own load-failure failover mint a fresh link ONLY if this fresh link somehow
+        // dead-ends (strictly safer than today's fallback, which already plays a possibly-STALE stored link).
+        if let stored, let savedAt = entry.linkSavedAt {
+            let age = Date().timeIntervalSince(savedAt)
+            if age >= 0, age < Self.freshLinkWindow { return (stored, true) }
+        }
+        // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
+        // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
+        // providers re-add from the infoHash+fileIdx, still far cheaper than a full source re-resolve, and
+        // still the SAME source.
         if let fresh = try? await DebridCoordinator.shared.reresolve(
             service: service, infoHash: infoHash,
             torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx) {
@@ -194,10 +212,19 @@ enum CoreLoadable<T: Decodable>: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        switch try container.decode(String.self, forKey: .type) {
+        let tag = try container.decode(String.self, forKey: .type)
+        switch tag {
         case "Ready": self = .ready(try container.decode(T.self, forKey: .content))
         case "Err": self = .err
-        default: self = .loading
+        case "Loading": self = .loading
+        // Any other tag (an engine "Err"-shape rename, or a genuinely errored group with an
+        // unknown tag) is TERMINAL, not still-loading. Decoding it as .loading would leave
+        // streamLoadProgress stuck at N-1/N and spin the source list forever. Treat it as
+        // terminal (.err, which streamLoadProgress already counts as settled) and log the
+        // surprise so an engine tag rename is visible instead of silent.
+        default:
+            NSLog("[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            self = .err
         }
     }
 
@@ -618,7 +645,7 @@ struct CoreStreamGroup: Decodable {
 
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
-struct CoreStream: Decodable, Identifiable {
+struct CoreStream: Decodable, Identifiable, Equatable {
     let url: String?
     let ytId: String?
     let infoHash: String?
@@ -708,7 +735,7 @@ struct CoreStream: Decodable, Identifiable {
     }
 }
 
-struct CoreStreamBehaviorHints: Decodable {
+struct CoreStreamBehaviorHints: Decodable, Equatable {
     let notWebReady: Bool?
     let bingeGroup: String?
     let filename: String?
@@ -716,12 +743,12 @@ struct CoreStreamBehaviorHints: Decodable {
 }
 
 /// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.
-struct CoreProxyHeaders: Decodable {
+struct CoreProxyHeaders: Decodable, Equatable {
     let request: [String: String]?
 }
 
 /// Streams grouped by source addon, for the per-addon filter + source labels.
-struct CoreStreamSourceGroup: Identifiable {
+struct CoreStreamSourceGroup: Identifiable, Equatable {
     let id: String
     let addon: String
     let streams: [CoreStream]

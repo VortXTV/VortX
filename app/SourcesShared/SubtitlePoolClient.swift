@@ -75,6 +75,7 @@ enum SubtitlePoolClient {
             return PooledSubtitle(id: id, lang: lang, format: format,
                                   origin: raw.origin ?? "", score: raw.score ?? 0, url: subURL)
         }
+        VXProbe.log("sing", "sub fetchPooled key=\(contentKey) subs=\(subs.count) offsetMs=\(decoded.offset?.offsetMs.map(String.init) ?? "-")")
         return (subs, decoded.offset?.offsetMs)
     }
 
@@ -139,6 +140,7 @@ enum SubtitlePoolClient {
         ]
         if let fingerprint, !fingerprint.isEmpty { body["fingerprint"] = fingerprint }
 
+        VXProbe.log("sing", "sub upload key=\(contentKey) lang=\(lang) origin=\(origin) fmt=\(format) bytes=\(bytes)")
         await postJSON(path: "subs", body: body)
     }
 
@@ -159,6 +161,7 @@ enum SubtitlePoolClient {
         ]
         if let fingerprint, !fingerprint.isEmpty { body["fingerprint"] = fingerprint }
 
+        VXProbe.log("sing", "sub postOffset key=\(contentKey) lang=\(lang) offsetMs=\(offsetMs)")
         await postJSON(path: "offset", body: body)
     }
 
