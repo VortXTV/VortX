@@ -2884,8 +2884,11 @@ struct PlayerScreen: View {
     /// leaves subtitles off (no subtitleLoadFailed alert; the user did not ask for this download).
     private func autoSelectAddonSubtitleIfNeeded() {
         guard appliedAutoTracks, !autoAddonSubTried, !addonSubs.isEmpty, subtitleLoadingURL == nil else { return }
-        // A subtitle track is already showing (embedded auto-pick matched, or the user picked one): keep it.
-        guard !subtitleTracks.contains(where: { $0.selected }) else { autoAddonSubTried = true; return }
+        // Whether to pull an add-on sub is decided ENTIRELY by wantsExternalSubtitle (does any EMBEDDED track
+        // match the preferred language chain). A stale or off-chain embedded selection must NOT short-circuit
+        // this: a default English track being auto-selected while the viewer wants Turkish was latching the
+        // add-on fetch off, missing the exact case the feature exists for. wantsExternalSubtitle already keeps
+        // a real chain match (returns false) and respects the off / forced-only policies.
         let prefs = TrackPreferences.current
         guard TrackSelector.wantsExternalSubtitle(audio: audioTracks, subtitles: subtitleTracks, preferences: prefs) else {
             autoAddonSubTried = true
