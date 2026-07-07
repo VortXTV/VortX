@@ -56,6 +56,10 @@ struct TVPlayerView: View {
     @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
     @State private var isHDR = false            // metadata line: HDR/DV detected (sig-peak > 1)
     @State private var resumeSeconds: Double? = nil   // nil until fetched; applied once duration known
+    // Set when a resume seek was SUPPRESSED because the forward-only DV remux is mounted (maybeResume):
+    // playback restarts at 0, and progress saves below this floor are skipped so the viewer's real resume
+    // point is not regressed by the replay. Cleared once playback passes the floor or on the next title.
+    @State private var suppressedResumeFloor: Double? = nil
     @State private var appliedResume = false
     @State private var lastSaved = -1.0               // last position persisted (throttle)
     @State private var showInfo = true
@@ -323,6 +327,13 @@ struct TVPlayerView: View {
             startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
+            // Guardrail (message-only): an "Always libmpv" engine override short-circuits the router BEFORE
+            // the DV rules, silently disabling the true-DV remux lane; a DV title then tone-maps to HDR10
+            // with no clue why. Say so once, in the log AND on screen, so the setting is discoverable.
+            if StreamRanking.isDolbyVision(sourceHint ?? ""), PlayerEngineRouter.currentOverride == .mpv {
+                DiagnosticsLog.log("dv", "engine override 'Always libmpv' is forcing libmpv on a Dolby Vision stream; the DV remux lane is disabled")
+                showEngineNote("Player engine override is forcing libmpv, so Dolby Vision plays as HDR10. Set Settings > Player engine to Auto for true Dolby Vision.")
+            }
             startStallWatchdog()
             scheduleHide(); startHideLoop()
             if episodes.isEmpty, let m = curMeta, loadedEpisodes.isEmpty {
@@ -354,6 +365,12 @@ struct TVPlayerView: View {
             } else {
                 resumeSeconds = 0   // selftest / no library context, nothing to resume
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: HDRDisplayMode.userHintNotification)) { note in
+            // HDRDisplayMode refused a display-mode switch because Match Dynamic Range is OFF (posted once
+            // per process): surface the exact tvOS setting to the viewer instead of only logging it. This is
+            // the #1 silent-defeat path for DV/HDR (the toggle is OFF by default on every Apple TV).
+            if let message = note.userInfo?["message"] as? String { showEngineNote(message) }
         }
         .onDisappear {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
@@ -401,7 +418,12 @@ struct TVPlayerView: View {
         // [dv] routing probe: first line of the DV trail (route -> mount -> classify -> fallback -> demote).
         // Gated, so free in shipping builds. AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv
         // here means the DV source tone-maps to HDR10.
-        VXProbe.log("dv", "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(PlayerEngineRouter.isDVRemuxCandidate(url)) container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)")
+        let routeLine = "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(PlayerEngineRouter.isDVRemuxCandidate(url)) container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
+        VXProbe.log("dv", routeLine)
+        // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag in an exportable
+        // diagnostics log (the VXProbe line above is gated off in shipping builds, which is why user DV
+        // reports arrived with no route trail). Deduped, because this computed property runs per render.
+        DVRouteBreadcrumb.log(routeLine)
         return chosen == .avfoundation
     }
 
@@ -411,7 +433,8 @@ struct TVPlayerView: View {
     @ViewBuilder private var playerSurface: some View {
         if useAVPlayerEngine {
             AVPlayerEngineView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers)
+                .play(initialPlayback.url, headers: initialPlayback.headers,
+                      isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
                 .live(initialLiveMode)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
                 .ignoresSafeArea()
@@ -447,6 +470,13 @@ struct TVPlayerView: View {
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
                     autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
                     applyDefaultVolume()            // D5: start at the user's saved "Default volume" (the launch mount begins at 100%)
+                    // Honest badge (message-only): a Dolby Vision title on the libmpv lane (a DV torrent, or
+                    // a demoted remux) outputs tone-mapped HDR10, and the mpv lane no longer requests the
+                    // panel's DV mode over decoded pixels. Say so once, so an HDR10 badge on a DV title is
+                    // understood instead of being reported as "DV doesn't work".
+                    if !isAVPlayerActive, StreamRanking.isDolbyVision(curHint ?? sourceHint ?? "") {
+                        showEngineNote("Dolby Vision title, HDR10 output (this source is playing on the built-in player)")
+                    }
                     // Live has no resumable position, so don't seed Continue-Watching direct-resume
                     // for it (mirrors PlayerScreen.recordLastStream's live guard).
                     if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
@@ -483,7 +513,11 @@ struct TVPlayerView: View {
                 if !isCurrentLiveStream, lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
                     lastSaved = d
                     saveProgress(at: d)
-                    core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
+                    // Same floor as saveProgress: a remux replay that restarted at 0 (suppressed resume) must
+                    // not regress the ENGINE library's resume point either, until playback passes it.
+                    if suppressedResumeFloor == nil || d >= (suppressedResumeFloor ?? 0) {
+                        core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
+                    }
                 }
                 if !markedWatched, duration > 0, d / duration >= 0.9, let m = curMeta {
                     markedWatched = true            // ~90% in → flip the watched marker live
@@ -1903,6 +1937,10 @@ struct TVPlayerView: View {
     private func demoteAVPlayerToMPV() -> Bool {
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        // Always-on [dv] breadcrumb: the demotion edge, recorded in the exportable log (the VXProbe lines
+        // around it are gated off in user builds). After this line the session is libmpv = HDR10 tone-map
+        // + decoded multichannel PCM; true DV/Atmos for this play is over.
+        DiagnosticsLog.log("dv", "AVPlayer -> libmpv demote in place (engine flip; DV/Atmos lane lost for this play)")
         coordinator.player?.stop()
         // SILENT demote. Flipping `avEngineFailed` re-renders `playerSurface` to the mpv surface on the SAME
         // view, which re-loads the SAME stream URL (initialPlayback.url) on libmpv. It does NOT increment
@@ -2029,7 +2067,13 @@ struct TVPlayerView: View {
             try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
             guard !Task.isCancelled, !hasStartedPlaying else { return }
             guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, falling back to libmpv")
+            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
+            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
+            if remuxMounted {
+                // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
+                // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
+                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s -> libmpv HDR10")
+            }
             demoteAVPlayerToMPV()
         }
     }
@@ -2779,6 +2823,7 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; appliedVolume = false
+        suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
         // source still fails over automatically instead of dead-ending an unattended binge on "choose another
@@ -3069,6 +3114,18 @@ struct TVPlayerView: View {
         guard !appliedResume, duration > 0, let r = resumeSeconds else { return }
         appliedResume = true
         guard r > 5, r < duration - 10 else { return }   // ignore trivial / near-end positions
+        // FORWARD-ONLY DV REMUX: never fire the resume seek while the AVPlayer remux is mounted. The remux
+        // produces bytes linearly (isByteRangeAccessSupported=false), so a resume seek lands in bytes that do
+        // not exist yet, no frame ever arrives, and the 20s start watchdog demotes the session to libmpv,
+        // killing BOTH true Dolby Vision and Atmos on every replay/resume of a DV title (the "same on every
+        // 2nd+ test" report). Start at 0 instead, keep the stored resume as a progress-save floor (below), and
+        // tell the viewer once. Seekable remux (HTTP Range + keyframe restart) is the documented Phase-2 fix.
+        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
+            DiagnosticsLog.log("dv", "resume seek to \(Int(r))s suppressed: DV remux is forward-only; starting from 0 (progress floor keeps the resume point)")
+            suppressedResumeFloor = r
+            showEngineNote("Dolby Vision stream starts from the beginning; resume for these comes in a later update")
+            return
+        }
         coordinator.player?.seek(to: r)
         currentTime = r
         lastSaved = r
@@ -3080,6 +3137,13 @@ struct TVPlayerView: View {
     private func saveProgress(at position: Double) {
         guard !isCurrentLiveStream else { return }
         guard let m = curMeta, duration > 0, position >= 0 else { return }
+        // A DV-remux play whose resume seek was suppressed (maybeResume) starts from 0: do not let the
+        // periodic saves REGRESS the stored resume point below where the viewer actually was. Saves resume
+        // once playback passes the old position (or the floor is cleared on the next title).
+        if let floor = suppressedResumeFloor {
+            if position < floor { return }
+            suppressedResumeFloor = nil
+        }
         let dur = duration
         Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
     }
@@ -3326,6 +3390,23 @@ struct TVPlayerView: View {
         guard t.isFinite, t >= 0 else { return "0:00" }
         let s = Int(t), h = s / 3600, m = (s % 3600) / 60, sec = s % 60
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+    }
+}
+
+// MARK: - Always-on DV route breadcrumb
+
+/// Deduplicated DiagnosticsLog for the engine-route line: `useAVPlayerEngine` is a computed property that
+/// runs on every SwiftUI render pass, so an unconditional DiagnosticsLog there would flood the exportable
+/// log. This records the line only when it CHANGES (a new title / route decision), giving user builds an
+/// always-on route -> mount -> demote trail without the VXProbe gate. Plain static state, not SwiftUI state,
+/// so writing it during a render pass is safe (it is not observed).
+@MainActor
+private enum DVRouteBreadcrumb {
+    private static var last = ""
+    static func log(_ message: String) {
+        guard message != last else { return }
+        last = message
+        DiagnosticsLog.log("dv", message)
     }
 }
 

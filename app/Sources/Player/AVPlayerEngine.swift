@@ -86,6 +86,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // in-process to fragmented MP4 and served to AVPlayer over the `vortxremux://` scheme. Held for the whole
     // session so its resource-loader delegate + remux thread stay alive; torn down in stop()/loadFile().
     private var remuxLoader: VortXRemuxResourceLoader?
+    /// Whether the forward-only DV remux is mounted for the CURRENT item. The chrome reads this to suppress
+    /// its Continue-Watching resume seek: the remux advertises isByteRangeAccessSupported=false and produces
+    /// bytes linearly, so a pre-start seek lands in bytes that do not exist yet, no frame ever arrives, and
+    /// the start watchdog demotes the whole session to libmpv (killing BOTH true DV and Atmos on every replay).
+    var isRemuxMounted: Bool { remuxLoader != nil }
+    /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
+    /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
+    /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
+    /// with only the remux-gated post-ready request, a native DV MP4/MOV/HLS routed here never switched the
+    /// panel at all (a raw AVPlayerLayer gets no AVKit auto-switching).
+    var contentIsDolbyVision = false
     // Dedicated serial queue for the resource-loader delegate callbacks, so the blocking buffer reads never
     // run on the main thread.
     private let remuxLoaderQueue = DispatchQueue(label: "vortx.dvremux.delegate")
@@ -144,6 +155,23 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         ])
         newItem.add(output)
         videoOutput = output
+        #if os(tvOS)
+        // TRUE DOLBY VISION: switch the panel into DV mode BEFORE the item is attached (Apple Tech Talk 503:
+        // "perform this switch before assigning the AVPlayerItem"; current tvOS can even reject mismatched
+        // VIDEO-RANGE HLS variants with -11868 when the panel is not switched first). Fires when the DV remux
+        // mounted (it only mounts for DV) OR the routed stream is DV-flagged (a native DV MP4/MOV/HLS, which
+        // previously never set preferredDisplayCriteria at all). fps/size are unknown pre-attach; the
+        // readyToPlay request below re-asserts with the real values. Fail-soft: a refused/ignored request
+        // changes nothing about playback, and reset() on stop() restores the default mode.
+        if remuxLoader != nil || contentIsDolbyVision {
+            HDRDisplayMode.request(.dolbyVision, fps: 0, width: 0, height: 0, in: nil)
+            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (remux=\(remuxLoader != nil) dvFlag=\(contentIsDolbyVision))")
+        } else {
+            // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
+            // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.
+            HDRDisplayMode.reset(in: nil)
+        }
+        #endif
         // START PROMPTLY. With the default (true), AVPlayer waits to build a stall-proof buffer before it
         // begins; for a large 4K / Dolby Vision debrid stream that wait can outlast any reasonable start
         // deadline, so the player mounts, shows the chrome, and never produces a frame (no item .failed, no
@@ -545,7 +573,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
-                player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
+                // FORWARD-ONLY REMUX: never apply a pre-start (resume) seek while the DV remux is mounted.
+                // The remux produces bytes linearly and advertises no byte-range access, so seeking into
+                // not-yet-produced bytes yields no frame and the chrome's start watchdog then demotes to
+                // libmpv (HDR10 + no Atmos) on EVERY resume of a DV title. Start at 0 instead; the chrome
+                // keeps its resume offset for progress-save continuity. Belt-and-braces with the chrome's
+                // own remux-aware resume suppression (TVPlayerView.maybeResume).
+                if remuxLoader != nil {
+                    DiagnosticsLog.log("dv", "dropped pre-start resume seek to \(Int(target))s: DV remux is forward-only, starting from 0")
+                } else {
+                    player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
+                }
             }
             if !didStart {
                 didStart = true
@@ -558,16 +596,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 VXProbeState.shared.setPlayer(state: "playing", source: host, engine: "avplayer")
                 VXProbe.event("player", "ready \(host)")
                 #if os(tvOS)
-                // TRUE DOLBY VISION lights the TV's DV mode. This AVPlayer remux lane carries the genuine
-                // Profile-8.1 stream, but (unlike the libmpv lane) it never asked tvOS to switch the display,
-                // so DV showed as HDR10. Gate on the remux session (it only mounts for DV); window:nil uses
-                // HDRDisplayMode's fallback window. reset() on stop() returns the TV to its default mode.
-                if remuxLoader != nil {
+                // TRUE DOLBY VISION: re-assert the DV display mode with the REAL fps/size now that the item
+                // is ready (the authoritative request already fired pre-attach in loadFile, per Tech Talk 503
+                // ordering). Covers the remux lane (it only mounts for DV) AND any DV-flagged native route
+                // (DV MP4/MOV/HLS); window:nil uses HDRDisplayMode's fallback window. reset() on stop()
+                // returns the TV to its default mode.
+                if remuxLoader != nil || contentIsDolbyVision {
                     let size = item.presentationSize
                     let fps = item.tracks.first { $0.assetTrack?.mediaType == .video }?.assetTrack?.nominalFrameRate ?? 0
                     HDRDisplayMode.request(.dolbyVision, fps: Double(fps),
                                            width: Int(size.width), height: Int(size.height), in: nil)
-                    VXProbe.log("dv", "AVPlayer remux ready -> requested Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height))")
+                    VXProbe.log("dv", "AVPlayer ready -> re-asserted Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height)) remux=\(remuxLoader != nil)")
                 }
                 #endif
             }

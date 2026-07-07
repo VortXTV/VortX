@@ -179,6 +179,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 let me = Unmanaged<VortXMKVRemuxStream>.fromOpaque(opaque).takeUnretainedValue()
                 if me.isCancelled { return AVERROR_EXIT_CONST }   // abort muxing on cancel
                 me.buffer.append(buf, count: Int(size))
+                me.scanForDec3(buf, count: Int(size))   // one-time Atmos-signaling verification; no-op once done
                 return size
             },
             nil         // seek: forward-only (Phase 1); the muxer only appends with these movflags
@@ -227,7 +228,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // target language so raising the channel/EAC3 preference can never swap in a same-channel foreign dub).
         // `decodableAudio` = AVPlayer stream-copyable tracks; `transcodableAudio` = FFmpeg-decodable-only tracks
         // that must be transcoded (TrueHD/DTS/... - the b160 lane).
-        var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String)] = []
+        var decodableAudio: [(index: Int, channels: Int32, rank: Int, lang: String, atmos: Bool)] = []
         var transcodableAudio: [(index: Int, channels: Int32, lang: String)] = []
         // The audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/PCM...,
         // a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable track:
@@ -262,7 +263,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 let audioChannels = par.pointee.ch_layout.nb_channels
                 let audioLang = Self.streamLanguage(inStream)
                 if Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
-                    decodableAudio.append((i, audioChannels, Self.audioCopyRank(par.pointee.codec_id), audioLang))
+                    // FFmpeg's EAC3 probe sets codecpar.profile to DDP_ATMOS when the bitstream carries the
+                    // Dolby Atmos JOC extension; tvOS lights Atmos ONLY from a 5.1-core+JOC E-AC3 track, so
+                    // the pick below must prefer this over raw channel count (a 7.1/8ch non-JOC E-AC3 or PCM
+                    // track must never shadow the 6ch EAC3-JOC bed).
+                    let isAtmosJOC = par.pointee.codec_id == AV_CODEC_ID_EAC3
+                        && par.pointee.profile == Self.eac3AtmosProfile
+                    decodableAudio.append((i, audioChannels, Self.audioCopyRank(par.pointee.codec_id), audioLang, isAtmosJOC))
                 } else if avcodec_find_decoder(par.pointee.codec_id) != nil {
                     transcodableAudio.append((i, audioChannels, audioLang))
                 }
@@ -281,13 +288,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Audio pick: keep to the TARGET LANGUAGE first (the original / main-program language), so a
         // higher-channel FOREIGN dub never displaces the original-language track - a Japanese 2.0 original must
         // beat an English 5.1 dub for a sub-watcher, and the remux maps only ONE track so there is no in-player
-        // recovery. WITHIN the target language then prefer the MOST channels, so the real 6-8ch Atmos/surround
+        // recovery. WITHIN the target language then prefer an EAC3-JOC (Dolby Atmos) track BEFORE raw channel
+        // count: tvOS renders Atmos only from a 5.1-core+JOC E-AC3 bed, so a 7.1/8ch non-JOC track (E-AC3 or
+        // otherwise) must never shadow the 6ch EAC3-JOC bed. Then the MOST channels, so the real 6-8ch surround
         // bed is never masked by a 1-2ch stereo downmix or commentary ordered ahead of it (the "Atmos plays as
-        // stereo" report), then EAC3 (Dolby Atmos JOC rides in EAC3, beating AC3, then lossy), then file order.
+        // stereo" report), then EAC3 (beating AC3, then lossy), then file order.
         var mappedAudioIn = -1
         if let best = decodableAudio.min(by: { a, b in
             let am = a.lang == decodableTargetLang, bm = b.lang == decodableTargetLang
             if am != bm { return am }
+            if a.atmos != b.atmos { return a.atmos }
             if a.channels != b.channels { return a.channels > b.channels }
             if a.rank != b.rank { return a.rank < b.rank }
             return a.index < b.index
@@ -313,11 +323,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         if transcodeActive, let s = inCtx.pointee.streams[transcodeAudioIn], let p = s.pointee.codecpar {
             transcodeAudioName = Self.codecName(p.pointee.codec_id)
         }
-        // The exact stream-copied audio track + its channel count, so an on-device probe log reveals whether the
-        // multichannel EAC3-JOC bed (not a stereo dub) is what actually reached AVPlayer.
+        // The exact stream-copied audio track + its channel count + its codec profile (the JOC/Atmos proof),
+        // so an on-device probe log reveals whether the multichannel EAC3-JOC bed (not a stereo dub, not a
+        // non-JOC track) is what actually reached AVPlayer.
         var mappedAudioName = "none"
         if hasDecodableAudio, mappedAudioIn >= 0, let s = inCtx.pointee.streams[mappedAudioIn], let p = s.pointee.codecpar {
-            mappedAudioName = "\(Self.codecName(p.pointee.codec_id))/\(p.pointee.ch_layout.nb_channels)ch"
+            let profile = p.pointee.profile
+            let joc = p.pointee.codec_id == AV_CODEC_ID_EAC3 && profile == Self.eac3AtmosProfile
+            mappedAudioName = "\(Self.codecName(p.pointee.codec_id))/\(p.pointee.ch_layout.nb_channels)ch profile=\(profile) joc=\(joc)"
+            // Arm the one-time dec3 verification scan for a stream-copied E-AC3 track: the produced init
+            // segment's dec3 box must carry the JOC extension for tvOS to light Atmos, and the log proves in
+            // one diagnostics export whether the muxer wrote it (see scanForDec3). Message-only, fail-soft.
+            if p.pointee.codec_id == AV_CODEC_ID_EAC3 { dec3ScanDone = false }
         }
         // [dv] classify probe: one greppable line of what the source actually carries (DV profile, dims, and
         // the audio codecs seen / whether any is AVPlayer-decodable). This is the line that explains WHY a DV
@@ -647,6 +664,65 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
     }
 
+    // MARK: - dec3 (E-AC3 / Atmos JOC signaling) verification, message-only and fail-soft
+
+    /// Accumulates the FIRST bytes of muxed output until the `dec3` sample-entry box is found (it rides in
+    /// the moov, which movenc writes with the first fragment under delay_moov) or the cap is hit. Touched
+    /// only on the remux thread (the AVIO write callback). Armed (dec3ScanDone = false) only when an E-AC3
+    /// track was stream-copied; otherwise the scan never runs.
+    private var dec3ScanBuf: [UInt8] = []
+    private var dec3ScanDone = true
+    private static let dec3ScanCap = 1 << 20   // the moov lands with the first fragment, well inside 1 MiB
+
+    /// One-time scan for the `dec3` box, logging whether the muxer wrote the Dolby Atmos JOC extension.
+    /// Per ETSI TS 103 420 / FFmpeg movenc, a dec3 payload that carries the extension ENDS with the byte
+    /// `0000000 1` (7 reserved bits + flag_ec3_extension_type_a) followed by `complexity_index_type_a`
+    /// (non-zero for a real Atmos track). The bundled libavformat 62.x writes those bytes when the mapped
+    /// track's profile is DDP_ATMOS, so this log turns one diagnostics export into proof of whether the
+    /// produced fMP4 SIGNALS Atmos, separating "muxed correctly" from any downstream AVPlayer/HDMI cause.
+    private func scanForDec3(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        guard !dec3ScanDone else { return }
+        dec3ScanBuf.append(contentsOf: UnsafeBufferPointer(start: bytes, count: count))
+        let needle: [UInt8] = [0x64, 0x65, 0x63, 0x33]   // 'd' 'e' 'c' '3'
+        if let pos = Self.firstIndex(of: needle, in: dec3ScanBuf) {
+            dec3ScanDone = true
+            var detail = "found, payload unreadable"
+            if pos >= 4 {
+                // The 4 bytes before the fourcc are the big-endian box size (header 8 bytes + payload).
+                let size = (Int(dec3ScanBuf[pos - 4]) << 24) | (Int(dec3ScanBuf[pos - 3]) << 16)
+                         | (Int(dec3ScanBuf[pos - 2]) << 8) | Int(dec3ScanBuf[pos - 1])
+                let payloadStart = pos + 4
+                let payloadLen = size - 8
+                if payloadLen > 0, payloadLen <= 64, payloadStart + payloadLen <= dec3ScanBuf.count {
+                    let payload = Array(dec3ScanBuf[payloadStart..<(payloadStart + payloadLen)])
+                    let hex = payload.map { String(format: "%02x", $0) }.joined()
+                    let hasExt = payloadLen >= 2 && (payload[payloadLen - 2] & 0x01) == 1
+                    let complexity = hasExt ? Int(payload[payloadLen - 1]) : 0
+                    detail = "payload=\(hex) atmosExt=\(hasExt ? "YES complexity_index_type_a=\(complexity)" : "ABSENT")"
+                }
+            }
+            DiagnosticsLog.log("dv", "dec3 box in muxed init segment: \(detail)")
+            dec3ScanBuf = []
+        } else if dec3ScanBuf.count >= Self.dec3ScanCap {
+            dec3ScanDone = true
+            DiagnosticsLog.log("dv", "no dec3 box in the first \(Self.dec3ScanCap) muxed bytes (moov landed later than expected)")
+            dec3ScanBuf = []
+        }
+    }
+
+    /// Naive first-occurrence search (the haystack is capped at 1 MiB and scanned at most ~16 times, so
+    /// O(n*m) is fine and avoids any stdlib-availability dependency).
+    private static func firstIndex(of needle: [UInt8], in haystack: [UInt8]) -> Int? {
+        guard haystack.count >= needle.count else { return nil }
+        let end = haystack.count - needle.count
+        for i in 0...end {
+            var match = true
+            for j in 0..<needle.count where haystack[i + j] != needle[j] { match = false; break }
+            if match { return i }
+        }
+        return nil
+    }
+
     // MARK: - Source diagnostics (mirrors MKVRemuxSession)
 
     /// Audio codecs AVPlayer can decode out of an fMP4 (compared by rawValue), always stream-copied when
@@ -657,6 +733,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         AV_CODEC_ID_AAC.rawValue, AV_CODEC_ID_AC3.rawValue, AV_CODEC_ID_EAC3.rawValue,
         AV_CODEC_ID_ALAC.rawValue, AV_CODEC_ID_MP3.rawValue, AV_CODEC_ID_FLAC.rawValue
     ]
+
+    /// FFmpeg's `AV_PROFILE_EAC3_DDP_ATMOS` (libavcodec/defs.h): the E-AC3 probe sets `codecpar.profile` to
+    /// this when the bitstream carries the Dolby Atmos JOC extension. Mirrored as a named literal because
+    /// simple `#define` macros do not reliably import through the Libavcodec Swift module map.
+    private static let eac3AtmosProfile: Int32 = 30
 
     /// Preference rank for a stream-copyable audio codec when several tie on channel count: lower is better.
     /// EAC3 carries Dolby Atmos (JOC in its syncframes) so it wins any tie; AC3 (Dolby Digital 5.1) is next;

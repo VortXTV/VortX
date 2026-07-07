@@ -97,7 +97,10 @@ enum PlayerEngineRouter {
         // iOS only (AVAssetDownloadURLSession is unavailable on tvOS and native macOS), so it never fires there.
         if url.isFileURL, url.pathExtension.lowercased() == "movpkg" { return .avfoundation }
 
-        // (2) Explicit user override wins for non-torrents.
+        // (2) Explicit user override wins for non-torrents. NOTE: an `.mpv` override short-circuits BEFORE
+        // the DV rules below, silently disabling the true-DV remux lane for Dolby Vision streams. This
+        // function runs per render, so the guardrail message for that case (DiagnosticsLog + one-shot
+        // in-player notice) lives in the chrome at play start (TVPlayerView.onAppear), not here.
         switch override {
         case .mpv:          return .mpv
         case .avfoundation: return .avfoundation

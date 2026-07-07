@@ -1039,13 +1039,15 @@ final class MPVMetalViewController: PlatformViewController {
             }
         }
 #if os(tvOS)
-        // Match the reference player: when the launching stream is Dolby Vision, drive the Apple TV into its
-        // Dolby Vision display mode even though this lane renders the DV base layer as PQ. Without it a DV file
-        // that lands on libmpv (a DV torrent, or a DV MKV the true-DV remux lane could not run) badges HDR10 on
-        // the TV, which is the "DV does not work" report. Colorspace + target-trc stay PQ (the .dolbyVision case
-        // maps to PQ), so only the display-mode request changes; the true-DV remux lane still delivers real DV
-        // where it can. A tone-mapped-to-SDR choice is respected (range is only promoted up from .hdr10).
-        if contentIsDolbyVision, range == .hdr10 { range = .dolbyVision }
+        // HONEST OUTPUT: the mpv lane decodes/tone-maps Dolby Vision to PQ pixels, so it requests HDR10 and
+        // NEVER the panel's Dolby Vision mode. An earlier build promoted .hdr10 -> .dolbyVision here when the
+        // stream was DV-flagged; that flips the TV into real DV mode over tone-mapped PQ pixels ("fake Dolby
+        // Vision", the behavior other players are criticized for), and decoded-pixel pipelines deliberately
+        // downgrade DV requests to HDR10 for exactly this reason. The DV badge is earned only by the AVPlayer
+        // remux lane, which carries the genuine bitstream to VideoToolbox. Message-only breadcrumb below.
+        if contentIsDolbyVision, range == .hdr10 {
+            DiagnosticsLog.log("dv", "DV title on the libmpv lane: requesting HDR10 output (tone-mapped PQ; true DV plays only on the AVPlayer remux lane)")
+        }
 #endif
         guard range != appliedDynamicRange else { return }
         appliedDynamicRange = range
