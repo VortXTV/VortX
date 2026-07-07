@@ -278,11 +278,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // channel/codec order, exactly as intended.
         let decodableTargetLang = decodableAudio.first?.lang ?? ""
         let transcodeTargetLang = transcodableAudio.first?.lang ?? ""
-        // Gap A pick: among all AVPlayer-decodable audio tracks, first keep to the target language, then prefer
-        // the MOST channels (a commentary or stereo downmix is 1-2ch; the main bed is 6-8ch), breaking ties
-        // toward EAC3 (Dolby Atmos JOC rides in EAC3, so it beats AC3, which beats lossy/stereo-lossless), then
-        // original order for determinism. This stops a stereo track ordered first from masking the real
-        // multichannel Atmos bed, without stealing audio away from the original language.
+        // Audio pick: keep to the TARGET LANGUAGE first (the original / main-program language), so a
+        // higher-channel FOREIGN dub never displaces the original-language track - a Japanese 2.0 original must
+        // beat an English 5.1 dub for a sub-watcher, and the remux maps only ONE track so there is no in-player
+        // recovery. WITHIN the target language then prefer the MOST channels, so the real 6-8ch Atmos/surround
+        // bed is never masked by a 1-2ch stereo downmix or commentary ordered ahead of it (the "Atmos plays as
+        // stereo" report), then EAC3 (Dolby Atmos JOC rides in EAC3, beating AC3, then lossy), then file order.
         var mappedAudioIn = -1
         if let best = decodableAudio.min(by: { a, b in
             let am = a.lang == decodableTargetLang, bm = b.lang == decodableTargetLang

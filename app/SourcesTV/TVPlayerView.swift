@@ -417,7 +417,8 @@ struct TVPlayerView: View {
                 .ignoresSafeArea()
         } else {
             MPVMetalPlayerView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL)
+                .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
+                      isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
                 .live(initialLiveMode)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
                 .ignoresSafeArea()
@@ -1430,6 +1431,12 @@ struct TVPlayerView: View {
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (url == self.url) ? audioSidecarURL : nil
+        // Tell the libmpv lane whether the stream being loaded is Dolby Vision (same flag the engine router
+        // uses) so a DV file that lands on libmpv (a DV torrent, or a DV MKV the remux lane could not run)
+        // drives the Apple TV into DV display mode instead of HDR10. Use curHint (the CURRENTLY-playing stream's
+        // signature, updated on every switch + binge auto-advance BEFORE this runs), NOT the immutable launch
+        // sourceHint, so switching to a non-DV source clears DV mode and switching to a DV source engages it.
+        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(curHint ?? sourceHint ?? "")
         if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
             coordinator.player?.loadFile(proxied, headers: nil, live: live, audioSidecar: sidecar)
         } else {
@@ -1458,6 +1465,11 @@ struct TVPlayerView: View {
         curIsTorrent = stream.isTorrent
         curIsLive = isLiveMeta(curMeta) && !stream.isTorrent
         curBinge = stream.behaviorHints?.bingeGroup
+        // Keep curHint (the "what is playing now" signature) in step with the switched-to source, so BOTH source
+        // continuity ranking (which already updates curBinge here) and the libmpv DV display-mode flag (set from
+        // curHint in loadIntoPlayer) track the CURRENT source, not the launch source. A different rip can differ
+        // in Dolby Vision and quality, so a manual switch to a non-DV source must clear DV mode and vice versa.
+        curHint = StreamRanking.signature(stream)
         curHeaders = stream.requestHeaders
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         // Reset the local-capture throttle on a stream switch: otherwise the new stream's capture is gated

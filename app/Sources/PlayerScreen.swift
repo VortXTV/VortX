@@ -511,7 +511,8 @@ struct PlayerScreen: View {
 
     @ViewBuilder private var mpvSurface: some View {
         MPVMetalPlayerView(coordinator: coordinator)
-            .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL)
+            .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
+                  isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
             .live(initialIsLive)
             .onPropertyChange { _, name, data in handleProperty(name, data) }
             .ignoresSafeArea()
@@ -1295,6 +1296,10 @@ struct PlayerScreen: View {
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (u == url) ? audioSidecarURL : nil
+        // Tell the libmpv lane whether this stream is Dolby Vision (same flag the engine router uses) so a DV
+        // file that lands on libmpv drives the display into DV mode instead of HDR10 (tvOS effect; harmless on
+        // iOS/macOS, which have no display-mode switch).
+        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(recordQualityText ?? "")
         coordinator.player?.loadFile(p.url, headers: p.headers, live: live, audioSidecar: sidecar)
     }
 

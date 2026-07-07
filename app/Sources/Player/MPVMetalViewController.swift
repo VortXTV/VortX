@@ -75,7 +75,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// backend and known to crash it (double free); the app does the HDR signalling itself in
     /// syncDisplayDynamicRange.
     private var appliedDynamicRange: ContentDynamicRange? = nil
-    
+
+    /// Set by the launch site (via the `PlayerEngine` protocol) from the stream's Dolby Vision flag. When true,
+    /// `syncDisplayDynamicRange` drives the Apple TV into Dolby Vision display mode for DV content this lane
+    /// renders as a tone-mapped PQ base layer, so the TV lights its DV badge exactly as the reference player
+    /// does on a decoded MKV. tvOS-only effect (the display-mode request is tvOS); harmless elsewhere.
+    var contentIsDolbyVision = false
+
     override func viewDidLoad() {
         super.viewDidLoad()
         
@@ -1032,13 +1038,22 @@ final class MPVMetalViewController: PlatformViewController {
                 range = .sdr
             }
         }
+#if os(tvOS)
+        // Match the reference player: when the launching stream is Dolby Vision, drive the Apple TV into its
+        // Dolby Vision display mode even though this lane renders the DV base layer as PQ. Without it a DV file
+        // that lands on libmpv (a DV torrent, or a DV MKV the true-DV remux lane could not run) badges HDR10 on
+        // the TV, which is the "DV does not work" report. Colorspace + target-trc stay PQ (the .dolbyVision case
+        // maps to PQ), so only the display-mode request changes; the true-DV remux lane still delivers real DV
+        // where it can. A tone-mapped-to-SDR choice is respected (range is only promoted up from .hdr10).
+        if contentIsDolbyVision, range == .hdr10 { range = .dolbyVision }
+#endif
         guard range != appliedDynamicRange else { return }
         appliedDynamicRange = range
 
         // Synchronous breadcrumbs: if any of these statements kills the process
         // (MoltenVK owns the layer's drawables and mid-stream colorspace changes
         // are crash-suspect territory), the last line in diagnostics.log names it.
-        let trc = range == .hdr10 ? "pq" : (range == .hlg ? "hlg" : "auto")
+        let trc = (range == .hdr10 || range == .dolbyVision) ? "pq" : (range == .hlg ? "hlg" : "auto")
         let prim = range == .sdr ? "auto" : "bt.2020"
         DiagnosticsLog.logSync("mpv", "applying target-trc=\(trc)")
         checkError(mpv_set_property_string(handle, "target-trc", trc))
