@@ -29,6 +29,13 @@ struct HomeView: View {
     }
 
     var body: some View {
+        homeChangeHandlers
+    }
+
+    /// The Home shell: the hero backdrop, the rail strip, and the header overlay. Split out of
+    /// `body` so the change-handler chain applied over it (see `homeChangeHandlers`) type-checks
+    /// as its own expression.
+    private var homeShell: some View {
         NavigationStack {
             ZStack {
                 // The living backdrop: whichever poster is focused fills the screen with its
@@ -129,6 +136,16 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
+    }
+
+    // The `.onAppear` plus nine `.onChange` handlers used to hang off `body` as one chain, which
+    // overran the SwiftUI type checker's budget. They are applied in two passes across `some View`
+    // boundaries below so each group type-checks as its own expression; triggers and closures are
+    // unchanged, and the pass order preserves the original modifier order.
+
+    /// First pass: initial seed on appear, plus the row / Continue Watching / profile re-seed triggers.
+    private var homeSeedHandlers: some View {
+        homeShell
         .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
@@ -137,6 +154,11 @@ struct HomeView: View {
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
         .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
+    }
+
+    /// Second pass: the release-calendar / meta-source triggers and the focus-settled hero trailer.
+    private var homeChangeHandlers: some View {
+        homeSeedHandlers
         // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
         // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
