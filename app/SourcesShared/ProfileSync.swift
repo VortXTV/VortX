@@ -20,8 +20,14 @@ struct WatchEntry: Codable, Equatable {
     }
 }
 
-/// Syncs profile data through the Stremio account's datastore, so profiles and their watch
-/// history follow the account to every device running StremioX.
+/// The LEGACY / optional Stremio-datastore transport for profiles and their watch history.
+///
+/// VortX (doc.vortx.* via VortXSyncManager) is now AUTHORITATIVE for the roster and the per-profile
+/// overlay watch history. This transport is used for two things only: the one-time IMPORT read that
+/// migrates a user's existing Stremio-datastore data into the VortX account, and, when the user opts into
+/// the "also sync to Stremio" mirror (`alsoSyncToStremio`, default OFF), the legacy two-way Stremio sync.
+/// The automatic Stremio WRITE is dormant by default. `repairPoisonedLibrary` still runs on every launch
+/// as a permanent safety scan (an old build on the same account can still poison official library sync).
 ///
 /// Transport: our OWN datastore collection. Official clients only ever pull the collections they
 /// know ("libraryItem", ...), so documents in a different collection are invisible to them and
@@ -38,6 +44,14 @@ enum ProfileSync {
     private static let collection = "stremioxProfiles"     // our own, invisible to official clients
     private static let rosterID = "stremiox:profiles"
     private static let log = Logger(subsystem: "com.stremiox.app", category: "profilesync")
+
+    /// UserDefaults key for the opt-in "also sync to Stremio" mirror (a future Settings toggle writes it).
+    static let alsoSyncKey = "vortx.profiles.alsoSyncToStremio"
+    /// Whether the app should ALSO write the roster + per-profile overlay watch history to the legacy Stremio
+    /// account datastore. VortX (doc.vortx.*) is authoritative, so this is OFF by default and the automatic
+    /// Stremio write stays dormant. It turns ON only when the user opts into the mirror. The one-time IMPORT
+    /// read from Stremio is separate and always allowed (it is how existing data migrates into VortX).
+    static var alsoSyncToStremio: Bool { UserDefaults.standard.bool(forKey: alsoSyncKey) }
 
     /// nil = not probed yet; false = the API refused our collection, cloud sync is disabled and
     /// profiles stay per-device (never fall back to libraryItem smuggling again).
