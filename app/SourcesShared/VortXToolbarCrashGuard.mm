@@ -22,7 +22,7 @@
 //  guards EVERY NSToolbar instance in the process, on every thread, silently absorbing
 //  any NSToolbar insert exception (not only the one hidden shared-window toolbar). That
 //  is acceptable ONLY because this app ships no functional/visible toolbars at all: the
-//  one window toolbar is hidden and unused — VortXiOSApp sets
+//  one window toolbar is hidden and unused, VortXiOSApp sets
 //  `.windowStyle(.hiddenTitleBar)` + `.toolbar(.hidden, for: .windowToolbar)`, and the
 //  traffic lights are restored WITHOUT attaching a toolbar (MacWindowChrome). So a
 //  skipped insert has no visible effect anywhere: the invisible item is simply not added
