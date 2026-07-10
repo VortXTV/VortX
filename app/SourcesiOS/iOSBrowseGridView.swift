@@ -381,6 +381,9 @@ struct iOSCategoryBrowse: View {
     @State private var lastPush = Date.distantPast
     /// In-flight guard for the async tmdb:->tt resolve so a slow (>0.6s) resolve cannot be pushed twice.
     @State private var resolving = false
+    /// The async tmdb:->tt resolve task, held so onDisappear can cancel it: a slow resolve otherwise appends
+    /// to the NavigationPath after the user has already left, force-pushing a detail page behind them.
+    @State private var resolveTask: Task<Void, Never>?
 
     /// The persistent cinematic hero at the top of the browse screen - the same ambient billboard Home /
     /// Discover use, seeded from the selected pill's top items. tvOS's TVCategoryBrowse already has a hero
@@ -419,7 +422,9 @@ struct iOSCategoryBrowse: View {
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
-        .onDisappear { loadTask?.cancel() }
+        // Stop the hero's rotation/wake tasks and cancel the resolve so a popped browse leaves nothing looping
+        // in the background and never pushes a detail page after the user has left.
+        .onDisappear { loadTask?.cancel(); resolveTask?.cancel(); hero.stop() }
     }
 
     private var pills: some View {
@@ -459,9 +464,12 @@ struct iOSCategoryBrowse: View {
         // letting a second tap push the same detail twice. Gate the async path on a dedicated in-flight flag.
         guard !resolving else { return }
         resolving = true
-        Task { @MainActor in
+        resolveTask = Task { @MainActor in
             let tt = await TMDBClient.imdbID(forCatalogID: item.id, type: item.type)
             resolving = false
+            // The user may have popped this screen during a cold-cache resolve; don't append a detail page
+            // behind them (onDisappear cancels this task).
+            guard !Task.isCancelled else { return }
             path.append(tt.map { item.withResolvedIMDbID($0) } ?? item)
         }
     }

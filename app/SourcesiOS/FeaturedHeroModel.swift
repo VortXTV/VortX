@@ -72,8 +72,25 @@ final class FeaturedHeroModel: ObservableObject {
     private var motionEnabled = true
 
     /// Session-wide enrichment cache (logo + trailer + synopsis + better art), keyed by id, shared
-    /// across all three screens' models so a title enriched on Home is instant on Discover.
+    /// across all three screens' models so a title enriched on Home is instant on Discover. Bounded by
+    /// `enrichmentCacheCap` (FIFO) so it cannot grow for the whole process lifetime under heavy browsing.
     private static var enrichmentCache: [String: FeaturedHeroItem] = [:]
+    /// First-insert order of the cached ids, for the FIFO eviction in `cacheEnrichment`.
+    private static var enrichmentOrder: [String] = []
+    /// Max enriched titles kept across the session. Pools are tiny (<= 5 per screen) and a title enriches
+    /// once, so a few hundred entries comfortably cover heavy browsing while bounding the static cache.
+    private static let enrichmentCacheCap = 300
+
+    /// Store an enriched item, evicting the oldest entries once the cache passes its cap (FIFO). Re-enriching
+    /// an id already present refreshes its value without duplicating its order slot.
+    private static func cacheEnrichment(_ item: FeaturedHeroItem, for id: String) {
+        if enrichmentCache[id] == nil { enrichmentOrder.append(id) }
+        enrichmentCache[id] = item
+        while enrichmentOrder.count > enrichmentCacheCap {
+            let oldest = enrichmentOrder.removeFirst()
+            enrichmentCache.removeValue(forKey: oldest)
+        }
+    }
 
     /// Base URLs of installed meta-serving add-ons, walked for enrichment the way the engine would
     /// (Cinemeta first for `tt` ids, then every installed meta add-on for tmdb:/tvdb:/kitsu: ids).
@@ -227,6 +244,15 @@ final class FeaturedHeroModel: ObservableObject {
         interactionHeld = false
     }
 
+    /// A popped screen must not leave the ambient billboard's wake tasks looping (the tasks capture self
+    /// weakly, so they no-op after dealloc, but an uncancelled rotation still wakes every 12s forever). The
+    /// view calls stop() on disappear; this is the belt-and-suspenders for a model dropped without it.
+    deinit {
+        rotationTask?.cancel()
+        resumeTask?.cancel()
+        pendingSeedTask?.cancel()
+    }
+
     /// Feature a SPECIFIC item in the hero (macOS keyboard browse: the focused poster drives the hero, the
     /// touch analogue of the tvOS focused-card hero). Holds the ambient rotation while the user navigates so
     /// the billboard doesn't yank to a different title mid-browse; `noteInteraction()` (called when focus
@@ -300,7 +326,7 @@ final class FeaturedHeroModel: ObservableObject {
                 let enriched = item.enriched(with: meta)
                 NSLog("[Hero] enriched \(item.name): rating=\(enriched.imdbRating ?? "-") year=\(enriched.releaseInfo ?? "-") runtime=\(enriched.runtime ?? "-") genres=\(enriched.genres.count) via \(url.host ?? "?")")
                 await MainActor.run {
-                    Self.enrichmentCache[item.id] = enriched
+                    Self.cacheEnrichment(enriched, for: item.id)
                     self?.enriching.remove(item.id)
                     guard let self, self.hero?.id == item.id else { return }
                     // No animation here: this is an in-place content upgrade of the SAME hero, not a
