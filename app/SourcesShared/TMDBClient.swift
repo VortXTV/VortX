@@ -641,14 +641,47 @@ enum TMDBClient {
     /// absorbed Showtime; JioHotstar merged Disney+ Hotstar and JioCinema). Absent -> keep TMDB's own name.
     private static let canonicalDisplayName: [Int: String] = [531: "Paramount+", 2336: "JioHotstar"]
 
-    private static func providerPage(media: String, region: String) async -> [(tile: ProviderTile, priority: Int)] {
+    private static func providerPage(media: String, region: String?) async -> [(tile: ProviderTile, priority: Int)] {
         let key = ApiKeys.effectiveTMDBKey()
-        guard let obj = await get("/watch/providers/\(media)?api_key=\(key)&watch_region=\(region)"),
+        let regionParam = region.map { "&watch_region=\($0)" } ?? ""   // nil => the GLOBAL list (no region filter)
+        guard let obj = await get("/watch/providers/\(media)?api_key=\(key)\(regionParam)"),
               let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { p in
             guard let id = p["provider_id"] as? Int, let name = p["provider_name"] as? String else { return nil }
             let priority = (p["display_priority"] as? Int) ?? 999
             return (ProviderTile(providerID: id, name: name, logoPath: p["logo_path"] as? String), priority)
+        }
+    }
+
+    /// The GLOBAL provider list (no `watch_region`), for the user-selectable services picker and to resolve a
+    /// SELECTED service that is not in the viewer's region to a real name + logo tile. Deduped + rewritten to
+    /// canonical identity exactly like `regionProviders`, featured brands first then the long tail by name, but
+    /// UNCAPPED (the caller selects the ids it wants). The keyless edge already caches /watch/providers, so this
+    /// costs nothing extra for signed-out users.
+    static func allProviders() async -> [ProviderTile] {
+        async let movieList = providerPage(media: "movie", region: nil)
+        async let tvList = providerPage(media: "tv", region: nil)
+        var byID: [Int: (tile: ProviderTile, priority: Int)] = [:]
+        for entry in (await movieList) + (await tvList) {
+            let canonical = Self.canonicalProviderID(entry.tile.providerID)
+            if let existing = byID[canonical] {
+                let existingIsCanonical = existing.tile.providerID == canonical
+                let entryIsCanonical = entry.tile.providerID == canonical
+                if existingIsCanonical && !entryIsCanonical { continue }
+                if existingIsCanonical == entryIsCanonical && existing.priority <= entry.priority { continue }
+            }
+            byID[canonical] = entry
+        }
+        let ranked = byID.values.sorted { a, b in
+            let ra = featuredProviderRank[Self.canonicalProviderID(a.tile.providerID)] ?? (10_000 + a.priority)
+            let rb = featuredProviderRank[Self.canonicalProviderID(b.tile.providerID)] ?? (10_000 + b.priority)
+            return ra != rb ? ra < rb : a.tile.name < b.tile.name
+        }
+        return ranked.map { entry in
+            let canonical = Self.canonicalProviderID(entry.tile.providerID)
+            return ProviderTile(providerID: canonical,
+                                name: Self.canonicalDisplayName[canonical] ?? entry.tile.name,
+                                logoPath: entry.tile.logoPath)
         }
     }
 

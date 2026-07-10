@@ -1002,7 +1002,7 @@ struct iOSSettingsView: View {
                 Text("Twice daily").tag("twiceDaily")
                 Text("4x daily").tag("fourTimesDaily")
             }
-            NavigationLink("Reorder streaming services") { iOSReorderServicesView() }
+            NavigationLink("Streaming services") { iOSReorderServicesView() }
             NavigationLink("Discover & region") { iOSDiscoverSettingsView() }
             // Fold Search into Discover (one combined surface with a search field above the browse) so the
             // tab bar is less cluttered on mobile. Default OFF, fully reversible — Search returns as its own tab.

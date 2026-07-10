@@ -157,9 +157,9 @@ private struct iOSTileImage<Placeholder: View>: View {
     var maxPixel: CGFloat = 900
     var contentMode: ContentMode = .fill
     @ViewBuilder var placeholder: () -> Placeholder
-    @State private var image: UIImage?
+    @State private var image: VXPosterImage?
 
-    private var synchronousCache: UIImage? {
+    private var synchronousCache: VXPosterImage? {
         guard let raw = url, let u = URL(string: raw) else { return nil }
         return PosterImageLoader.cached(u)
     }
@@ -167,12 +167,20 @@ private struct iOSTileImage<Placeholder: View>: View {
     var body: some View {
         Group {
             if let image = image ?? synchronousCache {
-                Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+                imageView(image).resizable().aspectRatio(contentMode: contentMode)
             } else {
                 placeholder()
             }
         }
         .task(id: url) { await load() }
+    }
+
+    private func imageView(_ img: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
     }
 
     private func load() async {
@@ -507,54 +515,109 @@ struct iOSCategoryBrowse: View {
     }
 }
 
-// MARK: - Reorder streaming services (Settings)
+// MARK: - Streaming services picker (Settings)
 
-/// Settings screen to reorder the streaming-service tiles (owner: "Prime first, Netflix last"). A standard
-/// drag-to-reorder List; iOS forces edit mode on, macOS reorders by native row drag. Persists immediately.
+/// Settings screen to CHOOSE and reorder the streaming-service tiles on Home and Discover. "Your services"
+/// drag-reorders (iOS edit mode / macOS native drag) and removes; "All services" is a searchable list to add
+/// any service TMDB knows, even one outside the viewer's region. With nothing chosen the hub shows every
+/// service in the region (AUTO), exactly as before. Rows load through PosterImageLoader (dedicated cache,
+/// bounded concurrency, off-main decode), so this screen never re-introduces the AsyncImage main-thread decode.
 struct iOSReorderServicesView: View {
     @ObservedObject private var model = CollectionsHubModel.shared
+    @State private var allServices: [TMDBClient.ProviderTile] = []
+    @State private var loadingAll = true
+    @State private var search = ""
+
+    private var selectedIDs: Set<Int> { Set(model.providers.map(\.providerID)) }
+    private var addable: [TMDBClient.ProviderTile] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        return allServices.filter { !selectedIDs.contains($0.providerID) && (q.isEmpty || $0.name.lowercased().contains(q)) }
+    }
 
     var body: some View {
         List {
-            ForEach(model.providers) { provider in
-                HStack(spacing: Theme.Space.md) {
-                    ZStack {
-                        // The warm near-white plate (#95) so a dark provider mark is legible in the reorder
-                        // list too, matching the plated tiles on Home/Discover rather than a dark-on-dark chip.
-                        BundledLogo.plateFill
-                        if let logo = provider.logoURL, let url = URL(string: logo) {
-                            AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fit) } placeholder: { Color.clear }
-                                .padding(7)
-                        }
-                    }
-                    .frame(width: 52, height: 34)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                    Spacer()
-                    Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
+            Section {
+                ForEach(model.providers) { provider in
+                    serviceRow(provider)
+                        .listRowBackground(Theme.Palette.surface1)
+                        .listRowSeparator(.hidden)
                 }
-                .padding(.vertical, 6)
-                .listRowBackground(Theme.Palette.surface1)
-                .listRowSeparator(.hidden)
+                .onMove(perform: move)
+                .onDelete(perform: remove)
+            } header: {
+                Text("Your services")
+            } footer: {
+                Text("Drag to reorder, swipe or tap the minus to remove. With none chosen, every service in your region shows.")
             }
-            .onMove(perform: move)
+
+            Section {
+                if addable.isEmpty {
+                    Text(loadingAll ? "Loading services..." : "No more services to add.")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .listRowBackground(Theme.Palette.surface1)
+                } else {
+                    ForEach(addable) { provider in
+                        HStack(spacing: Theme.Space.md) {
+                            serviceLogo(provider)
+                            Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                            Spacer(minLength: 0)
+                            Button { model.addService(provider.providerID) } label: {
+                                Image(systemName: "plus.circle.fill").foregroundStyle(Theme.Palette.accent)
+                            }
+                            .buttonStyle(.borderless)   // stays tappable while the list is in edit mode
+                        }
+                        .listRowBackground(Theme.Palette.surface1)
+                        .listRowSeparator(.hidden)
+                    }
+                }
+            } header: {
+                Text("All services")
+            }
         }
         .scrollContentBackground(.hidden)
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        // iOS-only: a macOS navigationTitle on this pushed reorder list crashes the shared NSToolbar.
+        .searchable(text: $search, prompt: "Search services")
+        // iOS-only: a macOS navigationTitle on this pushed list crashes the shared NSToolbar.
         #if os(iOS)
-        .navigationTitle("Reorder Services")
+        .navigationTitle("Streaming services")
         .navigationBarTitleDisplayMode(.inline)
         .environment(\.editMode, .constant(.active))
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { model.load() }
+        .task { allServices = await model.allServices(); loadingAll = false }
+    }
+
+    @ViewBuilder private func serviceRow(_ provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            serviceLogo(provider)
+            Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// The warm near-white plate (#95) so a dark provider mark is legible in the list, matching the plated
+    /// Home/Discover tiles. The mark loads through PosterImageLoader, not AsyncImage.
+    private func serviceLogo(_ provider: TMDBClient.ProviderTile) -> some View {
+        ZStack {
+            BundledLogo.plateFill
+            if let logo = provider.logoURL {
+                iOSTileImage(url: logo, maxPixel: 300, contentMode: .fit) { Color.clear }.padding(7)
+            }
+        }
+        .frame(width: 52, height: 34)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func move(from: IndexSet, to: Int) {
         var tiles = model.providers
         tiles.move(fromOffsets: from, toOffset: to)
         model.reorder(to: tiles.map(\.providerID))
+    }
+
+    private func remove(at offsets: IndexSet) {
+        let ids = offsets.map { model.providers[$0].providerID }
+        for id in ids { model.removeService(id) }
     }
 }
 

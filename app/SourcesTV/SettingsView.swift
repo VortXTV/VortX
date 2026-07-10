@@ -631,7 +631,7 @@ struct SettingsView: View {
             choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
                       selection: $hubCadence)
             NavigationLink { TVReorderServicesView() } label: {
-                Label("Reorder streaming services", systemImage: "arrow.up.arrow.down")
+                Label("Streaming services", systemImage: "rectangle.stack.badge.plus")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
             NavigationLink { TVDiscoverSettingsView() } label: {

@@ -41,8 +41,6 @@ struct TVCollectionsHub: View {
             }
             if showStreaming, !model.providers.isEmpty {
                 section(title: "Streaming Services", eyebrow: "Browse by service") {
-                    // TODO(0.3.11): dedup by brand identity (move ProviderBrandMap.dedupeProviders from
-                    // SourcesiOS to SourcesShared so tvOS can call it; SourcesiOS is not in the tvOS target).
                     ForEach(model.providers) { p in
                         NavigationLink { TVCategoryBrowse(target: .service(id: p.providerID, name: p.name)) } label: { TVServiceTile(provider: p) }
                             .buttonStyle(CardFocusStyle())
@@ -477,39 +475,76 @@ struct TVCategoryBrowse: View {
     }
 }
 
-// MARK: - Reorder streaming services (Settings)
+// MARK: - Streaming services picker (Settings)
 
-/// Settings screen to reorder the streaming-service tiles (owner: "Prime first, Netflix last"). tvOS has no
-/// drag gesture, so each row carries Up / Down controls; the order persists immediately via the hub model.
+/// Settings screen to CHOOSE and reorder the streaming-service tiles on Home and Discover. tvOS has no drag
+/// gesture, so "Your services" rows carry Up / Down / Remove; "All services" is a LazyVStack of every service
+/// TMDB knows, each with Add. With nothing chosen the hub shows every service in the region (AUTO), exactly as
+/// before. Rows load through RemoteLogo (PosterImageLoader: dedicated cache, bounded concurrency, off-main
+/// decode); the "All services" list is a LazyVStack so its ~hundreds of rows never instantiate all at once.
 struct TVReorderServicesView: View {
     @ObservedObject private var model = CollectionsHubModel.shared
+    @State private var allServices: [TMDBClient.ProviderTile] = []
+
+    private var selectedIDs: Set<Int> { Set(model.providers.map(\.providerID)) }
+    private var addable: [TMDBClient.ProviderTile] { allServices.filter { !selectedIDs.contains($0.providerID) } }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                Text("Reorder Streaming Services").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
-                Text("Set the order services appear in the Streaming row on Home and Discover.")
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                Text("Streaming Services").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                Text("Choose and reorder the services on Home and Discover. With none chosen, every service in your region shows.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                    .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.md)
+                    .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.sm)
+
+                sectionHeader("Your services")
                 ForEach(Array(model.providers.enumerated()), id: \.element.id) { index, provider in
-                    HStack(spacing: Theme.Space.md) {
-                        Text("\(index + 1)").font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(Theme.Palette.textTertiary).frame(width: 44)
-                        if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
-                        Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
-                        Spacer()
-                        Button { move(index, by: -1) } label: { Image(systemName: "chevron.up") }
-                            .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == 0)
-                        Button { move(index, by: 1) } label: { Image(systemName: "chevron.down") }
-                            .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == model.providers.count - 1)
-                    }
-                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
+                    yourServiceRow(index: index, provider: provider)
+                }
+
+                sectionHeader("All services")
+                LazyVStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    ForEach(addable) { provider in allServiceRow(provider) }
                 }
             }
             .padding(.vertical, Theme.Space.lg)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { model.load() }
+        .task { allServices = await model.allServices() }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title).font(.system(size: 24, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
+            .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.sm)
+    }
+
+    private func yourServiceRow(index: Int, provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            Text("\(index + 1)").font(.system(size: 18, weight: .bold))
+                .foregroundStyle(Theme.Palette.textTertiary).frame(width: 44)
+            if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
+            Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer()
+            Button { move(index, by: -1) } label: { Image(systemName: "chevron.up") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == 0)
+            Button { move(index, by: 1) } label: { Image(systemName: "chevron.down") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == model.providers.count - 1)
+            Button { model.removeService(provider.providerID) } label: { Image(systemName: "minus.circle") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+        }
+        .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
+    }
+
+    private func allServiceRow(_ provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
+            Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer()
+            Button { model.addService(provider.providerID) } label: { Image(systemName: "plus.circle.fill") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+        }
+        .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
     }
 
     private func move(_ index: Int, by delta: Int) {

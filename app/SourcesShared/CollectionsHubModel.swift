@@ -135,7 +135,7 @@ enum CollectionsCatalog {
     static func subCatalogs(for target: HubTarget, region: String) -> [SubCatalog] {
         switch target {
         case .discover(let list): return discoverSubs(list, region: region)
-        case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region)
+        case .service(let id, _): return scopedSubs(movieScope: providerScope(id), tvScope: providerScope(id), region: region, serviceFallback: true)
         case .genre(let g):       return scopedSubs(movieScope: genreScope(g, media: "movie"), tvScope: genreScope(g, media: "tv"), region: region)
         case .decade(let d):      return decadeSubs(d, region: region)
         }
@@ -164,14 +164,14 @@ enum CollectionsCatalog {
 
     // MARK: the shared Movies/Shows/New/Top/Trending set (services + genres)
 
-    private static func scopedSubs(movieScope: String?, tvScope: String?, region: String) -> [SubCatalog] {
+    private static func scopedSubs(movieScope: String?, tvScope: String?, region: String, serviceFallback: Bool = false) -> [SubCatalog] {
         let today = TMDBClient.isoDate(daysAgo: 0)
         func sub(_ id: String, _ title: String, movieExtra: ((String) -> String)?, tvExtra: ((String) -> String)?) -> SubCatalog {
             SubCatalog(id: id, title: title, load: { page in
                 await mergedDiscover(
                     movie: movieScope.flatMap { s in movieExtra.map { $0(s) } },
                     tv:    tvScope.flatMap   { s in tvExtra.map   { $0(s) } },
-                    region: region, page: page)
+                    region: region, page: page, serviceRegionFallback: serviceFallback)
             })
         }
         // vote_count thresholds scale with the window: TMDB votes accrue slowly, so a 7-day window with a
@@ -246,8 +246,19 @@ enum CollectionsCatalog {
 
     // MARK: merge helper
 
-    /// Fetch the movie + TV buckets (skipping a nil bucket) and interleave, de-duplicating by id.
-    private static func mergedDiscover(movie: String?, tv: String?, region: String, page: Int) async -> [MetaPreview] {
+    /// Fetch the movie + TV buckets (skipping a nil bucket) and interleave, de-duplicating by id. When a SELECTED
+    /// service is empty in the viewer's region, retry once against US so the tile is not a dead end.
+    private static func mergedDiscover(movie: String?, tv: String?, region: String, page: Int, serviceRegionFallback: Bool = false) async -> [MetaPreview] {
+        let merged = await mergeBuckets(movie: movie, tv: tv, region: region, page: page)
+        // Gated hard: a service target ONLY, on the FIRST page ONLY, with a selection active ONLY, and not
+        // already US. Genres/decades/Discover and the AUTO region list never take this path, so no empty genre
+        // page ever double-calls TMDB fleet-wide.
+        guard merged.isEmpty, serviceRegionFallback, page == 1, region != "US",
+              !CollectionsHubModel.selectedProviders().isEmpty else { return merged }
+        return await mergeBuckets(movie: movie, tv: tv, region: "US", page: page)
+    }
+
+    private static func mergeBuckets(movie: String?, tv: String?, region: String, page: Int) async -> [MetaPreview] {
         async let m: [MetaPreview] = { if let e = movie { return await TMDBClient.discoverTitles(media: "movie", extra: e, region: region, page: page) } else { return [] } }()
         async let t: [MetaPreview] = { if let e = tv { return await TMDBClient.discoverTitles(media: "tv", extra: e, region: region, page: page) } else { return [] } }()
         let movies = await m, shows = await t
@@ -319,6 +330,9 @@ final class CollectionsHubModel: ObservableObject {
     private var loadGen = 0
     private var genreGen = 0
     private var discoverGen = 0
+    /// In-flight fetch of the global provider list (warmed only while a selection is active, so a selected
+    /// service outside the viewer's region still resolves to a named, logo'd tile).
+    private var globalTask: Task<Void, Never>?
 
     /// Available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres) even with
     /// no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
@@ -334,13 +348,16 @@ final class CollectionsHubModel: ObservableObject {
         guard Self.isAvailable else { providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil; return }
         loadGenreBackdrops(region: region)      // independent cadence-cached resolve (runs even when providers are cache-fresh)
         loadDiscoverBackdrops(region: region)   // same independent cadence-cached resolve for the Discover cards
+        // Selection active: keep the global list warm so a selected out-of-region service resolves to a real
+        // tile. Empty selection short-circuits before this new path, so AUTO is byte-identical to before.
+        if !Self.selectedProviders().isEmpty { warmGlobalProviders() }
         guard loadTask == nil else { return }   // never run two fetches at once
         // Already loaded for this region AND the cache is still fresh -> nothing to do. (A stale cache for the
         // same region falls through so the cadence refresh actually fires; the old `loadedRegion != region`
         // guard blocked every refresh for the session after the first load.)
         if loadedRegion == region, Self.cacheIsFresh(region: region) { return }
         if let cached = Self.cachedProviders(region: region) {
-            providers = Self.applyOrder(cached)
+            providers = Self.resolveForPublish(regionTiles: cached)
             loadedRegion = region
             if Self.cacheIsFresh(region: region) { return }   // fresh enough; skip the refetch
         }
@@ -352,7 +369,7 @@ final class CollectionsHubModel: ObservableObject {
             // (which nils loadTask before starting a fresh one) must not null out the newer load's handle.
             if self.loadGen == myGen { self.loadTask = nil }
             guard !fetched.isEmpty else { return }   // keep cache/old on an empty fetch
-            self.providers = Self.applyOrder(fetched)
+            self.providers = Self.resolveForPublish(regionTiles: fetched)
             self.loadedRegion = region
             Self.cacheProviders(fetched, region: region)
         }
@@ -363,6 +380,7 @@ final class CollectionsHubModel: ObservableObject {
         loadTask?.cancel(); loadTask = nil
         genreTask?.cancel(); genreTask = nil
         discoverTask?.cancel(); discoverTask = nil
+        globalTask?.cancel(); globalTask = nil
         providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil
     }
 
@@ -508,9 +526,59 @@ final class CollectionsHubModel: ObservableObject {
         return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
     }
 
+    // MARK: global provider cache (region-independent, for the services picker + out-of-region selections)
+
+    private static let globalCacheKey = "vortx.collections.globalProviders.v2"
+    private static let globalCacheAtKey = "vortx.collections.globalProvidersAt.v2"
+
+    private static func cacheGlobalProviders(_ tiles: [TMDBClient.ProviderTile]) {
+        let rows = tiles.map { ["id": $0.providerID, "name": $0.name, "logo": $0.logoPath ?? ""] as [String: Any] }
+        UserDefaults.standard.set(rows, forKey: globalCacheKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: globalCacheAtKey)
+    }
+    private static func cachedGlobalProviders() -> [TMDBClient.ProviderTile]? {
+        guard let rows = UserDefaults.standard.array(forKey: globalCacheKey) as? [[String: Any]], !rows.isEmpty else { return nil }
+        return rows.compactMap { r in
+            guard let id = r["id"] as? Int, let name = r["name"] as? String else { return nil }
+            let logo = (r["logo"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return TMDBClient.ProviderTile(providerID: id, name: name, logoPath: logo)
+        }
+    }
+    private static func globalCacheIsFresh() -> Bool {
+        let at = UserDefaults.standard.double(forKey: globalCacheAtKey)
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
+    }
+
     // MARK: user reorder (the owner's "Prime first, Netflix last")
 
     private static let orderKey = "vortx.collections.providerOrder"
+
+    // MARK: user-selected services (the CEO picker)
+
+    /// The user's explicit service selection: ordered canonical ids, comma-separated, e.g. "9,8,531,2336".
+    /// EMPTY == AUTO (the region list + featured order + legacy `providerOrder`), byte-identical to before the
+    /// picker; the same @AppStorage-compatible key on iOS/iPad/Mac AND tvOS.
+    static let selectedProvidersKey = "vortx.collections.selectedProviders"
+
+    /// The selection as canonical ids, canonicalized + order-stably de-duplicated on read. `nonisolated` so the
+    /// off-main sub-catalog loaders (`mergedDiscover`) can read it without a main-actor hop.
+    nonisolated static func selectedProviders() -> [Int] {
+        let raw = UserDefaults.standard.string(forKey: selectedProvidersKey) ?? ""
+        guard !raw.isEmpty else { return [] }
+        var seen = Set<Int>()
+        return raw.split(separator: ",").compactMap { token in
+            guard let id = Int(String(token).trimmingCharacters(in: .whitespaces)) else { return nil }
+            let canonical = TMDBClient.canonicalProviderID(id)
+            return seen.insert(canonical).inserted ? canonical : nil
+        }
+    }
+
+    nonisolated static func setSelectedProviders(_ ids: [Int]) {
+        var seen = Set<Int>()
+        let canonical = ids.map { TMDBClient.canonicalProviderID($0) }.filter { seen.insert($0).inserted }
+        UserDefaults.standard.set(canonical.map(String.init).joined(separator: ","), forKey: selectedProvidersKey)
+    }
 
     static func customOrder() -> [Int] {
         let saved = (UserDefaults.standard.array(forKey: orderKey) as? [Int]) ?? []
@@ -538,9 +606,87 @@ final class CollectionsHubModel: ObservableObject {
     }
 
     /// Persist a new explicit order (the reorder screen passes the full id list) and re-sort the live tiles.
+    /// AUTO mode writes the legacy `providerOrder` (no selection-semantic change while the selection is empty);
+    /// when a selection is active the selection list IS the order, so persist it there and republish.
     func reorder(to ids: [Int]) {
-        UserDefaults.standard.set(ids, forKey: Self.orderKey)
-        providers = Self.applyOrder(providers)
+        if Self.selectedProviders().isEmpty {
+            UserDefaults.standard.set(ids, forKey: Self.orderKey)
+            providers = Self.applyOrder(providers)
+        } else {
+            Self.setSelectedProviders(ids)
+            republishSelection()
+        }
+    }
+
+    // MARK: selection resolution + picker actions
+
+    /// The published tile list for the current selection. EMPTY selection short-circuits to the AUTO path
+    /// (region list in the user's order) FIRST, so AUTO is byte-identical to before. A non-empty selection
+    /// renders only the selected services, in selection order, resolved to the region tile when present else
+    /// the cached global tile; an id in neither is skipped until the global list loads.
+    static func resolveForPublish(regionTiles: [TMDBClient.ProviderTile]) -> [TMDBClient.ProviderTile] {
+        let selection = selectedProviders()
+        guard !selection.isEmpty else { return applyOrder(regionTiles) }
+        let regionByID = Dictionary(regionTiles.map { ($0.providerID, $0) }, uniquingKeysWith: { first, _ in first })
+        let globalByID = Dictionary((cachedGlobalProviders() ?? []).map { ($0.providerID, $0) }, uniquingKeysWith: { first, _ in first })
+        return selection.compactMap { regionByID[$0] ?? globalByID[$0] }
+    }
+
+    /// Re-map the published tiles for the current selection against the freshest region + global caches.
+    private func republishSelection() {
+        let region = Self.cachedProviders(region: loadedRegion ?? TMDBClient.deviceRegion) ?? []
+        providers = Self.resolveForPublish(regionTiles: region)
+    }
+
+    /// Fetch (or reuse) the global provider list once so a selected out-of-region service resolves to a real
+    /// tile. No-op when the cache is fresh, when a fetch is already running, or when no selection is active.
+    private func warmGlobalProviders() {
+        guard !Self.selectedProviders().isEmpty, !Self.globalCacheIsFresh(), globalTask == nil else { return }
+        globalTask = Task { [weak self] in
+            let fetched = await TMDBClient.allProviders()
+            guard let self else { return }
+            self.globalTask = nil
+            guard !fetched.isEmpty else { return }
+            Self.cacheGlobalProviders(fetched)
+            self.republishSelection()
+        }
+    }
+
+    /// The full global provider list for the services picker (cadence-cached). Also warms the cache
+    /// `resolveForPublish` reads for out-of-region selections.
+    func allServices() async -> [TMDBClient.ProviderTile] {
+        if Self.globalCacheIsFresh(), let cached = Self.cachedGlobalProviders() { return cached }
+        let fetched = await TMDBClient.allProviders()
+        guard !fetched.isEmpty else { return Self.cachedGlobalProviders() ?? [] }
+        Self.cacheGlobalProviders(fetched)
+        return fetched
+    }
+
+    /// The ids to seed an edit from: the active selection, else the current AUTO list, so the first add/remove
+    /// prefills the selection with everything currently shown (nothing silently disappears on the first edit).
+    private func currentSelectionOrAuto() -> [Int] {
+        let selection = Self.selectedProviders()
+        return selection.isEmpty ? providers.map(\.providerID) : selection
+    }
+
+    /// Add a service to the selection (activating the picker if it was AUTO), appended to the end.
+    func addService(_ id: Int) {
+        let canonical = TMDBClient.canonicalProviderID(id)
+        var ids = currentSelectionOrAuto()
+        guard !ids.contains(canonical) else { return }
+        ids.append(canonical)
+        Self.setSelectedProviders(ids)
+        warmGlobalProviders()
+        republishSelection()
+    }
+
+    /// Remove a service from the selection (activating the picker from the AUTO list if needed).
+    func removeService(_ id: Int) {
+        let canonical = TMDBClient.canonicalProviderID(id)
+        var ids = currentSelectionOrAuto()
+        ids.removeAll { $0 == canonical }
+        Self.setSelectedProviders(ids)
+        republishSelection()
     }
 
     // MARK: genre tiles (incl. Anime keyword + Documentary)
