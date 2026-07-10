@@ -435,11 +435,32 @@ final class CoreBridge: ObservableObject {
             && !ProfileSync.alsoSyncToStremio
 
         if isLoggedIn() {
-            // The engine already holds a session from its own persisted storage. Pull/sync from Stremio only
-            // while we have NOT yet moved this account onto VortX (still importing) OR the user opted into the
-            // mirror. Post-import + opt-out: skip the Stremio pull entirely; the engine-local bucket + the VortX
-            // account doc are authoritative, so SyncLibraryWithAPI / PullAddonsFromAPI never fire.
-            if !importedAway { refreshFromAPI() }
+            if importedAway {
+                // Wave 4 (Finding 2): this account is migrated to VortX and NOT opted into two-way sync, yet the
+                // engine still holds a live Stremio session from its own persisted storage. stremio-core
+                // auto-persists library / progress mutations to api.strem.io whenever a session is loaded (the
+                // same upstream-persist behavior the add-on delete paths guard against), so leaving it logged in
+                // keeps writing to Stremio behind our back and the device is not actually independent. Unload the
+                // engine session ONCE. Logout resets the engine to its default profile (clearing its LOCAL
+                // library), so gate it on the account doc being reachable THIS launch, then re-hydrate the owned
+                // add-ons + recover the owner library (resume offsets come from the local VortX cache). The
+                // Keychain token is kept for opt-in reconnect. Next launch isLoggedIn() is false, so this runs
+                // at most once; on an unreachable launch we keep the session and retry next launch (no empty UI).
+                Task { @MainActor in
+                    if await VortXSyncManager.shared.accountDocReachable() {
+                        NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session (token retained)")
+                        self.logOut()   // Ctx Logout + clearUserState; the Keychain token is intentionally kept
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    } else {
+                        NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
+                    }
+                    self.loadBoard()
+                }
+                loadBoard()
+                return
+            }
+            // Not migrated yet (or opted into two-way sync): pull/sync from Stremio as before.
+            refreshFromAPI()
             // VortX-first (account-owns-everything): hydrate the VortX account's owned add-ons into the engine
             // on EVERY launch, not only when degraded, so doc.vortx.addons is the source of truth and a still-
             // valid Stremio session reconciles ON TOP of it rather than the engine's Stremio-sourced storage
@@ -1182,9 +1203,16 @@ final class CoreBridge: ObservableObject {
         // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
         // throughout this file (markPlaybackWatched, removeFromLibrary, setLibraryItemWatched, finishedWatching).
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
-        guard let item = metaDetails?.libraryItem else { return nil }
-        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId { return 0 }
-        return max(0, item.state.timeOffset / 1000.0)
+        guard let item = metaDetails?.libraryItem else { return vortxOwnedResumeSeconds(for: meta) }
+        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId {
+            return vortxOwnedResumeSeconds(for: meta) ?? 0
+        }
+        let engine = max(0, item.state.timeOffset / 1000.0)
+        // Wave 4: the engine bucket lost this title's offset (re-added at 0 on a cold / recovered / post-import
+        // device, since stremio-core has no action to re-inject a saved offset), so fall back to the VortX-owned
+        // resume cache. A positive engine offset always wins (freshest local play); the cache only fills the
+        // zero the engine can no longer hold.
+        return engine > 0 ? engine : (vortxOwnedResumeSeconds(for: meta) ?? engine)
     }
 
     /// Resume position (seconds) for `meta` read from the engine's LOCAL library bucket BY ID: the currently
@@ -1204,14 +1232,33 @@ final class CoreBridge: ObservableObject {
             if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId { return 0 }
             return max(0, item.state.timeOffset / 1000.0)
         }
-        if let loaded = metaDetails?.libraryItem, loaded.id == meta.libraryId { return resume(loaded) }
-        if let cw = continueWatching.first(where: { $0.id == meta.libraryId }) { return resume(cw) }
+        var engineVal: Double?
+        if let loaded = metaDetails?.libraryItem, loaded.id == meta.libraryId { engineVal = resume(loaded) }
+        else if let cw = continueWatching.first(where: { $0.id == meta.libraryId }) { engineVal = resume(cw) }
         // The published `continueWatching` is pruned of finished titles; read the RAW preview too so a finished
         // movie or a mid-series roll-forward still resolves its stored offset.
-        if let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?
-            .items.first(where: { $0.id == meta.libraryId }) { return resume(preview) }
-        if let lib = library?.catalog.first(where: { $0.id == meta.libraryId }) { return resume(lib) }
-        return nil
+        else if let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?
+            .items.first(where: { $0.id == meta.libraryId }) { engineVal = resume(preview) }
+        else if let lib = library?.catalog.first(where: { $0.id == meta.libraryId }) { engineVal = resume(lib) }
+        // A positive engine offset wins (freshest local play). Otherwise (engine has the title at 0, or does not
+        // know it) fall back to the VortX-owned resume cache so a cold / recovered / post-import device still
+        // resumes at device A's position, since stremio-core cannot re-inject a saved offset into its bucket.
+        if let engineVal, engineVal > 0 { return engineVal }
+        if let cached = vortxOwnedResumeSeconds(for: meta) { return cached }
+        return engineVal
+    }
+
+    /// The VortX-owned resume offset (seconds) for `meta.libraryId` held in the local owner-resume cache
+    /// (`OwnerResumeStore`, populated from `doc.vortx.library` on cold recovery). Consulted ONLY when the
+    /// engine's own library bucket has no positive offset for the title: a cold / reinstalled / post-import
+    /// device re-adds owner titles at time 0 because stremio-core exposes no action to inject a saved offset,
+    /// so this cache is what restores cross-device resume. Series: only when the cached episode matches. Returns
+    /// nil (not 0) when there is no positive cached offset, so a genuine "start from 0" is never overridden.
+    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
+        guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
+        if meta.type == "series", let v = entry.v, v != meta.videoId { return nil }
+        return entry.t
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)

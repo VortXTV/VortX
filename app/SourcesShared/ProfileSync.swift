@@ -2,6 +2,48 @@ import Foundation
 import CryptoKit
 import os
 
+/// Wave 4: local, per-device cache of the OWNER library's resume offsets (id -> seconds), sourced from the
+/// VortX account doc (`doc.vortx.library`). stremio-core exposes NO action to inject a saved timeOffset back
+/// into its own library bucket (only AddToLibrary, which starts an item at time 0, RewindLibraryItem, and the
+/// Player's live TimeChanged), so a cold / reinstalled / post-import-Logout device re-adds owner titles at 0
+/// and would otherwise lose every resume position. This cache is the VortX-owned resume source that CoreBridge's
+/// resume reads consult when the engine's own bucket has no positive offset for a title, so a second VortX-only
+/// device resumes exactly where device A left off.
+///
+/// Read-only convenience for playback: it never gates library membership and never deletes a title. Entries are
+/// refreshed from the authoritative doc on every cold recovery, so a stale value self-heals on the next sync.
+enum OwnerResumeStore {
+    private static let key = "vortx.owner.resumeCache.v1"
+
+    /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a series.
+    struct Entry { let t: Double; let d: Double; let v: String? }
+
+    /// Merge owner-library resume entries (from `doc.vortx.library`) into the cache. `t`/`d` are in SECONDS.
+    /// Last write wins per id: the caller passes the authoritative doc set, so this tracks the account truth.
+    static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?)]) {
+        guard !entries.isEmpty else { return }
+        var map = (UserDefaults.standard.dictionary(forKey: key)) ?? [:]
+        for e in entries where !e.id.isEmpty {
+            map[e.id] = ["t": e.t, "d": e.d, "v": e.v ?? ""]
+        }
+        UserDefaults.standard.set(map, forKey: key)
+    }
+
+    /// The cached resume entry for an owner-library id, or nil when the cache has none.
+    static func entry(forId id: String) -> Entry? {
+        guard let map = UserDefaults.standard.dictionary(forKey: key),
+              let raw = map[id] as? [String: Any] else { return nil }
+        func seconds(_ v: Any?) -> Double {
+            if let d = v as? Double { return d }
+            if let n = v as? NSNumber { return n.doubleValue }
+            if let i = v as? Int { return Double(i) }
+            return 0
+        }
+        let v = raw["v"] as? String
+        return Entry(t: seconds(raw["t"]), d: seconds(raw["d"]), v: (v?.isEmpty == false) ? v : nil)
+    }
+}
+
 /// One title's watch state inside a profile's private overlay: enough to render Continue Watching,
 /// resume, and watched markers without touching the account's shared library.
 struct WatchEntry: Codable, Equatable {
