@@ -4,14 +4,14 @@ import UIKit
 #endif
 
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
-/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors StremioTVApp's
+/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
 ///
 /// 0.3.0 Track 1, built incrementally: this scaffold proves the shared engine layer compiles and
 /// the Rust⇄Swift FFI links on iOS (the schema-version log is the smoke check). Screens land one
 /// by one on top of this shell.
 @main
-struct StremioXiOSApp: App {
+struct VortXiOSApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @Environment(\.scenePhase) private var scenePhase

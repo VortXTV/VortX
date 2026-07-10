@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct StremioTVApp: App {
+struct VortXTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var presenter = PlayerPresenter()
