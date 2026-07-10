@@ -1,36 +1,67 @@
 # Contributing to VortX
 
-Contributions are welcome, and the bar to clear is low: the project has merged community PRs within hours of them opening. Here is what makes that fast.
+Contributions are welcome, and the bar to clear is low. The project has merged
+community pull requests within hours of them opening, and contributors are
+credited by name in the release notes for the version their work ships in. This
+guide covers the few things that keep that fast.
 
-## Building from source
+## Licensing and the CLA
 
-macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust nightly with rust-src. No local Stremio install needed.
+VortX source code is licensed under **GPL-3.0-or-later** (see [LICENSE](LICENSE)).
+The VortX name and logo are separate from the code licence and are covered by the
+brand-use policy in [TRADEMARK.md](TRADEMARK.md).
 
-```bash
-./scripts/fetch-server-deps.sh        # NodeMobile, server.js, subtitle fonts (all public downloads)
-./scripts/build-core-xcframework.sh   # the stremio-core engine (Rust, needs nightly + rust-src)
-cd app && xcodegen generate           # then open VortX.xcodeproj
+Before your first contribution can be merged, we ask you to sign the project's
+**Contributor License Agreement** ([CLA.md](CLA.md)). It is short and it is not
+hostile:
+
+- You keep the copyright in everything you write. The CLA does not assign or
+  transfer your copyright.
+- You grant the project a broad, lasting licence to use your contribution, which
+  is what lets the project keep its licensing options open over time.
+
+### How to sign
+
+Open a pull request that adds your signed record to the bottom of [CLA.md](CLA.md),
+filling in the signature block (full name, GitHub username, email, and date). One
+signature covers all of your present and future contributions, so you only do this
+once. If you prefer a different submission path, ask in your pull request or an
+issue and the maintainer will confirm the process. An automated CLA check may be
+added later; until then this manual path is the way to sign.
+
+## Pull request mechanics
+
+- Keep each pull request focused on one thing.
+- Include before and after screenshots for anything visual. The existing pull
+  requests set the pattern.
+- Build against the oldest practical SDK. The CI runners lag the newest Xcode,
+  and newer-only APIs have failed CI there before. The CI run on your pull
+  request will tell you if you hit this.
+
+### Commit messages
+
+Use conventional commit titles, scoped by platform, for example:
+
+```
+feat(tvos): add a resume button to the series hero
+fix(ios): stop the player straddling the previous title
+chore: bump the fetch script pins
 ```
 
-The tvOS app runs fine in the Apple TV simulator. Code signing is allowed in the project so you can deploy to your own hardware from Xcode.
+### No em dashes
 
-## Pull requests
+Do not use em dashes in any prose, including code comments, commit messages,
+pull request descriptions, changelog entries, and documentation. Use commas,
+colons, periods, or parentheses instead.
 
-- Branch from `main`, keep PRs focused on one thing.
-- Before/after screenshots for anything visual. The existing PRs set the pattern.
-- Build against the OLDEST practical SDK: GitHub's runners lag the newest Xcode, and APIs like `controlSize` have failed CI there before. If in doubt, the CI run on your PR will tell you.
-- Conventional commit style for titles: `feat(tvos): ...`, `fix(tvos): ...`, `chore: ...`.
+## The Xcode project is generated
 
-## The per-profile invariant (read this if you touch watched state)
+`app/project.yml` is the single source of truth for the Xcode project.
+`VortX.xcodeproj` is generated from it and is gitignored, so never edit the
+`.xcodeproj` directly. After changing `project.yml`, regenerate the project:
 
-Anything that reads or writes watch history (watched ticks, progress, resume points, Continue Watching) must respect `ProfileStore.activeUsesEngineHistory`:
+```bash
+cd app && xcodegen generate
+```
 
-- `true` (the main profile): read and write through the engine (`CoreBridge`), which syncs to the account.
-- `false` (overlay profiles): read and write `ProfileStore`'s watch overlay. A non-main profile must NEVER mutate the account's library.
-
-`DetailView` and `CoreBridge` have worked examples of both paths.
-
-## Safety rails
-
-- Never write app data into `libraryItem` documents or any schema field official Stremio clients parse. An early build corrupted library sync for official apps this way; `ProfileSync.swift` documents the incident.
-- The release workflow builds from source for verification. Anything that affects the build must keep `scripts/` reproducible from public downloads.
+Commit the change to `project.yml`, not to the generated project.
