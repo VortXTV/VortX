@@ -759,10 +759,22 @@ struct iOSHomeView: View {
             if showCuratedRails { curated.load() }
             if showCollectionsHub { collectionsHub.load() }
         }
-        // Hero reseeds are gated on the visible tab: `seed` re-arms the rotation timer, which would
-        // defeat the hidden-tab pause above on every engine re-emit. The isActive onChange reseeds on return.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks(); refreshReleaseCalendar() }
-        .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // Key Home refreshes off COARSE signals instead of `core.revision`, which bumps on EVERY NewState
+        // (background sync, catalog paging, search echoes, meta_details bursts) and so re-ran Top Picks, the
+        // Upcoming Episodes calendar, and the hero reseed on idle engine churn. These fire only on real
+        // Continue Watching / library / board changes, matching tvOS HomeView. The refresh models no-op on an
+        // unchanged seed set and `hero.seed` ignores no-op reseeds, so each fire was already cheap; this drops
+        // the fire entirely on irrelevant emits. hero.seed stays gated on the visible tab (`isActive`): `seed`
+        // re-arms the rotation timer, which a hidden (opacity-switched) Home must not do; the isActive onChange
+        // reseeds on return.
+        .onChange(of: core.boardRows.first?.id) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        .onChange(of: core.continueWatching.first?.id) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
+        // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
+        .onChange(of: profiles.cwItems.first?.id) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
+        .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
