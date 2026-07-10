@@ -485,7 +485,13 @@ enum TMDBClient {
     /// One TMDB discover-by-provider page: (tmdb id, media, title, poster URL) rows, flatrate + most popular.
     private static func discoverProviderPage(media: String, providerID: Int, region: String, key: String)
         async -> [(tmdbID: Int, media: String, name: String, poster: String?)] {
-        let path = "/discover/\(media)?api_key=\(key)&watch_region=\(region)&with_watch_providers=\(providerID)"
+        // Query the whole brand FAMILY (canonical + region aliases), exactly like the hub's providerScope, so the
+        // Home rail matches the hub (Paramount+ US = 531%7C2303%7C2304%7C2616, not the retired single 531). Joined
+        // with a percent-encoded pipe ONLY: a raw `|` nils URL(string:) on iOS 16 (our deployment floor) and
+        // bypasses the edge cache on 17+. Family ids come back canonical-first then ascending, so the query is
+        // stable and the edge never fragments on ordering. An alias-less id yields just its own id (unchanged).
+        let family = providerFamilyMembers(canonicalProviderID(providerID)).map(String.init).joined(separator: "%7C")
+        let path = "/discover/\(media)?api_key=\(key)&watch_region=\(region)&with_watch_providers=\(family)"
             + "&with_watch_monetization_types=flatrate&sort_by=popularity.desc&language=en-US&page=1"
         guard let obj = await get(path), let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { r in
