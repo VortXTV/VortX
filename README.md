@@ -350,3 +350,5 @@ Because VortX hosts no content, a copyright complaint about a specific stream be
 ## License
 
 [GPL-3.0](LICENSE), because the app links MPVKit-GPL. The streaming server's own components come from Stremio and remain under their own terms; this repository does not include them, they are fetched at build time.
+
+The code is under that license; the VortX name and logo are not. Forks are welcome and encouraged, but ship yours under its own name and icon rather than as VortX. See [TRADEMARK.md](TRADEMARK.md) for the brand-use policy.
