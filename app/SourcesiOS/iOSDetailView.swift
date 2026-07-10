@@ -286,6 +286,8 @@ struct iOSDetailView: View {
     /// compute per title/episode set.
     @State private var langChips: [(code: String, label: String)] = []
     @State private var langChipsKey = ""
+    @State private var langChipsDebounce: Task<Void, Never>? = nil
+    private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
 
     /// The one thing presented full-screen at a time: a resolved player stream or the trailer. Both play
     /// IN-APP through the native libmpv player; there is no longer a YouTube web-embed presentation.
@@ -525,7 +527,7 @@ struct iOSDetailView: View {
         // source list empty ("No stream add-ons responded"). That race is why SERIES found no streams on
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
         // detail's loadMeta replaces the resident meta anyway, so leaving it loaded is harmless.
-        .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel() }
+        .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel(); langChipsDebounce?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(20))
@@ -1661,34 +1663,38 @@ struct iOSDetailView: View {
         // Gate the whole compute (incl. the TMDB spoken_languages verify fetch) on the master feature flag, so
         // it is a hard no-op when off rather than relying only on the per-client internal no-ops.
         guard LanguageIndexClient.isEnabled, let contentKey = languageContentKey else { return }
-        // AGGREGATE across EVERY loaded source for this title (all add-ons), scanning BOTH the stream `name`
-        // AND its `description`: add-ons commonly split the release name into `name` and the audio/sub language
-        // tags into `description` (or vice-versa), so `name ?? description` under-labelled a lazy add-on. Taking
-        // both widens the union of language tokens (MULTI, DUAL, KOR+ENG, audio/sub tags) we can see.
-        let names: [String] = displayGroups(core.streamGroups())
-            .flatMap { $0.streams }
-            .flatMap { [$0.name, $0.description] }
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-        // Re-run only when the title or the set of observed names changes (sources stream in over time).
-        let key = "\(contentKey)#\(names.count)"
+        // Cheap main-thread dedup: an integer stream count over the per-profile filtered snapshot, NO per-stream
+        // string/regex work. The O(N) name flatten + the ~10^5-regex audioSubCodes parse both move off the main
+        // thread below, so this gate can no longer stall the render even when it fires per loaded tick.
+        let snapshot = displayGroups(core.streamGroups())      // per-profile filtered, value-type snapshot on main
+        let streamCount = snapshot.reduce(0) { $0 + $1.streams.count }
+        let key = "\(contentKey)#\(streamCount)"
         guard key != langChipsKey else { return }
         langChipsKey = key
-
-        // Split into AUDIO vs SUBTITLE claims per stream context: a bare release-name language word is an audio
-        // claim (verified below); a code from a subtitle-marked string (vostfr, "ESubs", ...) is a subtitle
-        // claim (kept). This split is what lets the verify drop a FALSE audio claim without dropping real subs.
-        let observed = LanguageIndexClient.audioSubCodes(fromNames: names)
         let imdb = ratingsImdbID
-        Task { @MainActor in
+        let mediaType = type
+        langChipsDebounce?.cancel()                            // supersede any in-flight settle
+        langChipsDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.langChipsDebounceMs))
+            guard !Task.isCancelled, languageContentKey == contentKey else { return }   // title switched during settle
+            // AGGREGATE across EVERY loaded source for this title (all add-ons), scanning BOTH the stream `name`
+            // AND its `description`, then split into AUDIO vs SUBTITLE claims. The heavy flatten + regex parse
+            // runs OFF the main thread; audioSubCodes is pure/static so it is safe to call from the detached task.
+            let observed = await Task.detached(priority: .utility) { () -> (audio: [String], sub: [String]) in
+                let names = snapshot.flatMap { $0.streams }
+                    .flatMap { [$0.name, $0.description] }
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                return LanguageIndexClient.audioSubCodes(fromNames: names)
+            }.value
+            guard languageContentKey == contentKey else { return }
             // Fetch the community index AND TMDB's real spoken_languages in PARALLEL: the two verification
             // sources for a name-parsed audio claim. Both fail soft to nil (no signal), never falsely contradict.
             async let availabilityTask = LanguageIndexClient.fetch(contentKey: contentKey)
-            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: type)
+            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: mediaType)
             let availability = await availabilityTask
             let tmdbSpoken = await spokenTask
-            // Guard against a title switch mid-fetch.
-            guard languageContentKey == contentKey else { return }
+            guard languageContentKey == contentKey else { return }   // title switched mid-fetch
             // VERIFY: drop a name-only AUDIO language that BOTH TMDB (not in spoken_languages) and the community
             // (no/low count) contradict -- the false-claim fix. Subtitle + community + TMDB codes are kept.
             // The chip row is horizontally scrollable now (#8), so a wider cap fits without clutter.
@@ -1697,13 +1703,13 @@ struct iOSDetailView: View {
                                                                       availability: availability,
                                                                       tmdbSpoken: tmdbSpoken,
                                                                       limit: 24)
-        }
-        // Fire-and-forget: contribute the name-parsed codes so the index learns from real users.
-        Task.detached {
-            await LanguageIndexClient.contribute(contentKey: contentKey,
-                                                 audioLangs: observed.audio,
-                                                 subLangs: observed.sub,
-                                                 provenance: "name")
+            // Fire-and-forget: contribute the name-parsed codes so the index learns from real users.
+            Task.detached {
+                await LanguageIndexClient.contribute(contentKey: contentKey,
+                                                     audioLangs: observed.audio,
+                                                     subLangs: observed.sub,
+                                                     provenance: "name")
+            }
         }
     }
 

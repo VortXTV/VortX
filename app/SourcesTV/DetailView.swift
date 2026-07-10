@@ -35,6 +35,8 @@ struct DetailView: View {
     /// `features.languageIndex`, rendered only when non-empty. `langChipsKey` de-dupes the compute.
     @State private var langChips: [(code: String, label: String)] = []
     @State private var langChipsKey = ""
+    @State private var langChipsDebounce: Task<Void, Never>? = nil
+    private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
     /// yt-direct: the ambient hero trailer's ATTEMPTED device-direct resolve, keyed by meta id so a stale
     /// resolve never paints over another title. `url == nil` = attempted, no direct stream (mount the /yt
     /// worker URL). The layer waits for the attempt so the clip never remounts mid-play on a late resolve.
@@ -110,6 +112,7 @@ struct DetailView: View {
             refreshLanguageChips()
         }
         .onDisappear {
+            langChipsDebounce?.cancel()
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
             // user presses Back the NavigationStack pops but the bar can stay hidden at its scroll-
             // suppressed position. Heal it the same way the player-close path does.
@@ -153,29 +156,35 @@ struct DetailView: View {
         // Gate the whole compute (incl. the TMDB spoken_languages verify fetch) on the master feature flag, so
         // it is a hard no-op when off rather than relying only on the per-client internal no-ops.
         guard LanguageIndexClient.isEnabled, let contentKey = languageContentKey else { return }
-        // AGGREGATE across EVERY loaded source (all add-ons), scanning BOTH `name` AND `description` per stream:
-        // add-ons split the release name and the audio/sub language tags across the two fields, so `name ??
-        // description` under-labelled a lazy add-on. Taking both widens the union of tokens (MULTI, DUAL,
-        // KOR+ENG, audio/sub tags) we can see for this title.
-        let names: [String] = core.streamGroups()
-            .flatMap { $0.streams }
-            .flatMap { [$0.name, $0.description] }
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-        let key = "\(contentKey)#\(names.count)"
+        // Cheap main-thread dedup: an integer stream count, NO per-stream string/regex work. The O(N) name
+        // flatten + the ~10^5-regex audioSubCodes parse both move off the main thread below, so this gate can
+        // no longer stall the render even when it fires per loaded tick.
+        let snapshot = core.streamGroups()                     // value-type COW snapshot, O(1)
+        let streamCount = snapshot.reduce(0) { $0 + $1.streams.count }
+        let key = "\(contentKey)#\(streamCount)"
         guard key != langChipsKey else { return }
         langChipsKey = key
-
-        // Split into AUDIO vs SUBTITLE claims per stream context: a bare release-name language word is an audio
-        // claim (verified below); a code from a subtitle-marked string (vostfr, "ESubs", ...) is a subtitle
-        // claim (kept). This split is what lets the verify drop a FALSE audio claim without dropping real subs.
-        let observed = LanguageIndexClient.audioSubCodes(fromNames: names)
         let imdb = ratingsImdbID
-        Task { @MainActor in
+        let mediaType = type
+        langChipsDebounce?.cancel()                            // supersede any in-flight settle
+        langChipsDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.langChipsDebounceMs))
+            guard !Task.isCancelled, languageContentKey == contentKey else { return }   // title switched during settle
+            // AGGREGATE across EVERY loaded source (all add-ons), scanning BOTH `name` AND `description` per
+            // stream, then split into AUDIO vs SUBTITLE claims. The heavy flatten + regex parse runs OFF the
+            // main thread; audioSubCodes is pure/static so it is safe to call from the detached task.
+            let observed = await Task.detached(priority: .utility) { () -> (audio: [String], sub: [String]) in
+                let names = snapshot.flatMap { $0.streams }
+                    .flatMap { [$0.name, $0.description] }
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                return LanguageIndexClient.audioSubCodes(fromNames: names)
+            }.value
+            guard languageContentKey == contentKey else { return }
             // Community index + TMDB spoken_languages fetched in PARALLEL: the two verification sources. Both
             // fail soft to nil (no signal), so a missing source never falsely contradicts an audio claim.
             async let availabilityTask = LanguageIndexClient.fetch(contentKey: contentKey)
-            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: type)
+            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: mediaType)
             let availability = await availabilityTask
             let tmdbSpoken = await spokenTask
             guard languageContentKey == contentKey else { return }   // title switched mid-fetch
@@ -186,12 +195,12 @@ struct DetailView: View {
                                                                       observedSub: observed.sub,
                                                                       availability: availability,
                                                                       tmdbSpoken: tmdbSpoken)
-        }
-        Task.detached {
-            await LanguageIndexClient.contribute(contentKey: contentKey,
-                                                 audioLangs: observed.audio,
-                                                 subLangs: observed.sub,
-                                                 provenance: "name")
+            Task.detached {
+                await LanguageIndexClient.contribute(contentKey: contentKey,
+                                                     audioLangs: observed.audio,
+                                                     subLangs: observed.sub,
+                                                     provenance: "name")
+            }
         }
     }
 
