@@ -547,7 +547,13 @@ struct iOSReorderServicesView: View {
             } header: {
                 Text("Your services")
             } footer: {
+                // Honest per platform: iOS forces edit mode (swipe + the leading minus); macOS List has no swipe,
+                // so the row carries an explicit trailing minus button instead.
+                #if os(macOS)
+                Text("Drag to reorder, tap the minus to remove. With none chosen, every service in your region shows.")
+                #else
                 Text("Drag to reorder, swipe or tap the minus to remove. With none chosen, every service in your region shows.")
+                #endif
             }
 
             Section {
@@ -593,6 +599,15 @@ struct iOSReorderServicesView: View {
             serviceLogo(provider)
             Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
             Spacer(minLength: 0)
+            // macOS List has no swipe-to-delete and edit mode is not forced here, so `.onDelete` gives no
+            // affordance. Provide an explicit remove control (like the tvOS row) wired to the same removal path.
+            // iOS keeps its native swipe / edit-mode minus and never shows this button.
+            #if os(macOS)
+            Button { model.removeService(provider.providerID) } label: {
+                Image(systemName: "minus.circle.fill").foregroundStyle(Theme.Palette.accent)
+            }
+            .buttonStyle(.borderless)
+            #endif
         }
     }
 
