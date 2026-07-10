@@ -113,6 +113,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let width: Int
         let height: Int
         let bandwidth: Int
+        let fps: Double                // base video frame rate; 0 when unknown (FRAME-RATE then omitted)
     }
 
     /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
@@ -572,14 +573,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             outStream.pointee.codecpar.pointee.codec_tag = 0
             if i == baseVideoIn {
                 baseVideoOut = Int(outIndex)
-                // DV HEVC in mp4 MUST use the 'hvc1' sample entry (parameter sets out-of-band in hvcC). A Dolby
-                // Vision config box (dvcC/dvvC) on an 'hev1' entry (in-band parameter sets) is rejected by
-                // movenc's mov_init with EINVAL, and the codec_tag=0 above lets the muxer derive 'hev1' for some
-                // Profile 7 rips - which is exactly the write_header rc=-22 we hit only on convertP7. Force
-                // 'hvc1' (MKTAG little-endian) on the base video so the DV config box sits on a valid entry.
-                outStream.pointee.codecpar.pointee.codec_tag =
-                    UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
-                    | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24
+                // A Dolby Vision config box (dvcC/dvvC) demands a sample entry whose parameter sets are
+                // OUT-OF-BAND: on an 'hev1' entry (in-band parameter sets) movenc's mov_init rejects it with
+                // EINVAL, and the codec_tag=0 above lets the muxer derive 'hev1' for some rips (the convertP7
+                // write_header rc=-22). Force the correct entry (MKTAG little-endian): 'dvh1' for the DV-ONLY
+                // Profile 5 (per Dolby's ISOBMFF spec + Apple authoring rule 1.10, a P5 stream is not
+                // cross-compatible so it takes the DV sample entry), and 'hvc1' for the cross-compatible 8.x
+                // profiles so a non-DV decoder can still read the base layer. movenc accepts both tags for HEVC
+                // in mp4; the hvcC parameter sets stay out-of-band either way, so the extradata-repair gate
+                // below still applies.
+                outStream.pointee.codecpar.pointee.codec_tag = info.dvProfile == 5
+                    ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
+                        | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                    : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
+                        | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
                 // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
                 // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
                 // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
@@ -621,6 +628,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     // desync it from a metadata-compressed bitstream); the common rip is already NONE, so the
                     // box stays byte-identical to today for it.
                     Self.sanitizeOutputDoVi(outStream.pointee.codecpar, relabelProfile81: false)
+                }
+                // The mov muxer writes the dvcC/dvvC box and the dby1 ftyp brand ONLY from an
+                // AV_PKT_DATA_DOVI_CONF record on the output codecpar; it never parses the bitstream RPUs to
+                // derive one. A source that signalled Dolby Vision solely through in-band HEVC RPUs (no
+                // container dvcC/dvvC) reaches here with no such record, so both sanitize calls above were
+                // no-ops: without synthesis the moov ships as plain HEVC and AVPlayer decodes it as HDR10
+                // silently. Build the record the muxer needs from the fields already known (converted-to-8.1
+                // for a P7 source, else the detected profile). It is built already-conformant, so
+                // sanitizeOutputDoVi is NOT re-run over it.
+                if !Self.hasDoViSideData(outStream.pointee.codecpar) {
+                    Self.attachSyntheticDoVi(outStream.pointee.codecpar,
+                                             profile: convertP7 ? 8 : info.dvProfile,
+                                             width: info.width, height: info.height,
+                                             fps: Self.frameRate(inStream))
                 }
             }
             // fMP4 requires each AUDIO track to carry a frame_size; a matroska stream-copy usually leaves it 0,
@@ -707,7 +728,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
         // HLS lane: publish the master-playlist signaling now that the OUTPUT streams are final (post
         // extradata repair + DOVI sanitize/relabel). The local server blocks its master.m3u8 answer on this.
-        if hlsIndexingEnabled { hlsBuildSignaling(outCtx: outCtx, inCtx: inCtx, info: info, baseVideoOut: baseVideoOut) }
+        if hlsIndexingEnabled { hlsBuildSignaling(outCtx: outCtx, inCtx: inCtx, info: info, baseVideoOut: baseVideoOut, baseVideoIn: baseVideoIn) }
 
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
@@ -1080,7 +1101,33 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init
         hlsHeadDone = true; hlsHeadBuf = []
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B)")
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))")
+    }
+
+    /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so
+    /// the marker proves what actually shipped: the dvcC/dvvC box's profile, level, and BL-compatibility id, or
+    /// `dovi=MISSING` when neither box is present (an in-band-only source that reached the muxer with no record).
+    /// dvcC/dvvC are plain boxes, so the 24-byte DOVIDecoderConfigurationRecord starts right after the fourcc.
+    private static func describeInitDoVi(_ data: Data) -> String {
+        return data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> String in
+            guard let base = raw.baseAddress else { return "dovi=MISSING" }
+            let b = base.assumingMemoryBound(to: UInt8.self)
+            let n = raw.count
+            let d = UInt8(ascii: "d"), v = UInt8(ascii: "v"), c = UInt8(ascii: "c"), C = UInt8(ascii: "C")
+            var f = 0
+            while f + 4 + 5 <= n {   // fourcc (4) + at least 5 record bytes to read profile/level/compat
+                if b[f] == d, b[f + 1] == v, (b[f + 2] == v || b[f + 2] == c), b[f + 3] == C {
+                    let name = b[f + 2] == v ? "dvvC" : "dvcC"
+                    let p = f + 4
+                    let profile = (Int(b[p + 2]) >> 1) & 0x7F
+                    let level = ((Int(b[p + 2]) & 1) << 5) | ((Int(b[p + 3]) >> 3) & 0x1F)
+                    let compat = (Int(b[p + 4]) >> 4) & 0x0F
+                    return "dovi=\(name) p\(profile) l\(level) c\(compat)"
+                }
+                f += 1
+            }
+            return "dovi=MISSING"
+        }
     }
 
     /// Give up on the init scan (fail-soft): the playlist starves and the start watchdog demotes to libmpv.
@@ -1142,7 +1189,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// (the brand and VIDEO-RANGE are mandatory cross-checks; leaving either out is incorrect).
     private func hlsBuildSignaling(outCtx: UnsafeMutablePointer<AVFormatContext>,
                                    inCtx: UnsafeMutablePointer<AVFormatContext>,
-                                   info: SourceInfo, baseVideoOut: Int) {
+                                   info: SourceInfo, baseVideoOut: Int, baseVideoIn: Int) {
         var videoCodec = "hvc1.2.4.L153.B0"   // safe Main10 default when the hvcC parse fails
         var dvLevel = 0
         var blCompat = info.dvBLCompatId
@@ -1182,10 +1229,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         let br = Int(inCtx.pointee.bit_rate)
         let bandwidth = br > 0 ? br + br / 4 : 25_000_000   // headroom over the container rate; generous 4K default
+        // FRAME-RATE comes from the INPUT base-video stream: parameters_copy never sets the OUTPUT stream's
+        // avg_frame_rate, and inCtx must be read at baseVideoIn specifically because a Profile 7 source carries
+        // an enhancement-layer video track too, so "the first video stream" is the wrong one.
+        let fps = baseVideoIn >= 0 ? Self.frameRate(inCtx.pointee.streams[baseVideoIn]) : 0
         let sig = HLSSignaling(videoCodec: videoCodec, supplementalCodec: supplemental, videoRange: range,
-                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth)
+                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps)
         hlsLock.lock(); _hlsSignaling = sig; hlsLock.unlock()
-        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") bw=\(bandwidth)")
+        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth)")
     }
 
     /// RFC 6381 HEVC codec string ("hvc1.2.4.L153.B0") from an hvcC record's profile/tier/level bytes.
@@ -1528,8 +1579,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     ///
     /// Mutates the existing `AV_PKT_DATA_DOVI_CONF` record that `avcodec_parameters_copy` already duplicated
     /// onto the output codecpar (the buffer is output-owned, so an in-place edit is safe). No-op if the source
-    /// carried no DOVI side data (the per-packet RPU conversion still runs and the muxer derives a box from the
-    /// converted bitstream).
+    /// carried no DOVI side data; that in-band-only case is handled by `attachSyntheticDoVi`, which builds and
+    /// attaches a conformant record so the muxer has one to write the dvvC box + dby1 brand from.
     private static func sanitizeOutputDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?, relabelProfile81: Bool) {
         guard let par else { return }
         let n = Int(par.pointee.nb_coded_side_data)
@@ -1555,6 +1606,84 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
             return
         }
+    }
+
+    /// True when the output codecpar already carries an AV_PKT_DATA_DOVI_CONF record (a container dvcC/dvvC that
+    /// `avcodec_parameters_copy` duplicated onto it). When this is false the source signalled DV only through
+    /// in-band RPUs and `attachSyntheticDoVi` must build the record the mov muxer needs.
+    private static func hasDoViSideData(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> Bool {
+        guard let par, let arr = par.pointee.coded_side_data else { return false }
+        let n = Int(par.pointee.nb_coded_side_data)
+        for i in 0..<n where arr[i].type == AV_PKT_DATA_DOVI_CONF { return true }
+        return false
+    }
+
+    /// Synthesize and attach an AV_PKT_DATA_DOVI_CONF record for a source whose Dolby Vision was carried only as
+    /// in-band HEVC RPUs (no container dvcC/dvvC). movenc writes the dvvC box and the dby1 brand from this
+    /// record, so attaching it is what makes AVPlayer engage true DV instead of decoding the base layer as
+    /// HDR10. Built already-conformant (single-layer, RPU present, uncompressed) so no later sanitize pass is
+    /// needed. `av_dovi_alloc` allocates the struct (its size is not part of the public ABI) and
+    /// `av_packet_side_data_add` takes ownership of that av_malloc'd block on success, so the record is freed
+    /// here only when the add fails.
+    private static func attachSyntheticDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?,
+                                            profile: Int, width: Int, height: Int, fps: Double) {
+        guard let par else { return }
+        var recSize = 0
+        guard let rec = av_dovi_alloc(&recSize), recSize > 0 else {
+            DiagnosticsLog.log("dv", "synthetic dvvC record: av_dovi_alloc failed")
+            return
+        }
+        rec.pointee.dv_version_major = 1
+        rec.pointee.dv_version_minor = 0
+        rec.pointee.dv_profile = UInt8(max(0, min(profile, 255)))
+        rec.pointee.dv_level = doViLevel(width: width, height: height, fps: fps)
+        rec.pointee.rpu_present_flag = 1
+        rec.pointee.el_present_flag = 0     // no lane maps or keeps an enhancement layer
+        rec.pointee.bl_present_flag = 1
+        // Base-layer compatibility: Profile 5 is DV-only (0); a converted-P7 or native P8 base is HDR10/PQ
+        // compatible (1). blCompat cannot be recovered from libdovi (DoviRpuDataHeader exposes only
+        // guessed_profile), so the one case the default 1 would mislabel, a hypothetical in-band-only 8.4/HLG
+        // source, is disambiguated by the demuxer's transfer characteristic: ARIB STD-B67 (VUI transfer 18)
+        // means HLG, which is blCompat 4 and makes hlsBuildSignaling emit db4h + VIDEO-RANGE HLG. When the
+        // source leaves the transfer unspecified the PQ default stands, correct for every mainstream rip.
+        var blCompat: UInt8 = profile == 5 ? 0 : 1
+        if profile != 5, par.pointee.color_trc == AVCOL_TRC_ARIB_STD_B67 { blCompat = 4 }
+        rec.pointee.dv_bl_signal_compatibility_id = blCompat
+        rec.pointee.dv_md_compression = UInt8(AV_DOVI_COMPRESSION_NONE.rawValue)
+        if av_packet_side_data_add(&par.pointee.coded_side_data, &par.pointee.nb_coded_side_data,
+                                   AV_PKT_DATA_DOVI_CONF, rec, recSize, 0) == nil {
+            av_free(rec)
+            DiagnosticsLog.log("dv", "synthetic dvvC record: side-data add failed (record freed)")
+        } else {
+            DiagnosticsLog.log("dv", "synthesized dvvC record for in-band-only DV source: profile=\(rec.pointee.dv_profile) level=\(rec.pointee.dv_level) blCompat=\(blCompat)")
+        }
+    }
+
+    /// Dolby Vision `dv_level` from the output resolution and frame rate (ISOBMFF spec ladder). The level rises
+    /// with pixel rate; the boundaries are the documented (resolution, fps) tiers: 1080p24=3 ... 2160p24=6,
+    /// 2160p30=7, 2160p60=9. Used only when synthesizing a record for an in-band-only source (a container
+    /// record already carries its own level).
+    private static func doViLevel(width: Int, height: Int, fps: Double) -> UInt8 {
+        let dim = max(width, height)
+        let f = fps > 0 ? fps : 24
+        switch dim {
+        case ...1280: return f <= 24 ? 1 : 2
+        case ...2048: return f <= 24 ? 3 : (f <= 30 ? 4 : 5)
+        case ...4096: return f <= 24 ? 6 : (f <= 30 ? 7 : (f <= 48 ? 8 : (f <= 60 ? 9 : 10)))
+        default:      return f <= 24 ? 11 : (f <= 30 ? 12 : 13)
+        }
+    }
+
+    /// The base video track's frame rate in fps, read from the INPUT stream. `avcodec_parameters_copy` copies
+    /// codecpar only, never avg_frame_rate, so the OUTPUT stream's rate stays 0/0 and the input stream is the
+    /// one authority. Prefers avg_frame_rate, falls back to r_frame_rate, and returns 0 when neither is known.
+    private static func frameRate(_ stream: UnsafeMutablePointer<AVStream>?) -> Double {
+        guard let stream else { return 0 }
+        let avg = stream.pointee.avg_frame_rate
+        if avg.num > 0, avg.den > 0 { return Double(avg.num) / Double(avg.den) }
+        let r = stream.pointee.r_frame_rate
+        if r.num > 0, r.den > 0 { return Double(r.num) / Double(r.den) }
+        return 0
     }
 
     /// Detect the Dolby Vision profile from an IN-BAND HEVC RPU when the container carried no DOVI config. Walks

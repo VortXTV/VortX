@@ -254,6 +254,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
+        // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
+        // is provably HDR, and that choice is session-persistent, so a master fetched mid-switch can pin the
+        // lifeboat (HDR10 output) for the whole title. Bounded and fail-OPEN: on timeout the lifeboat still
+        // guarantees a playable variant. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
+        // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
+        _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
         // DV variant FIRST (Apple authoring-spec truth: SUPPLEMENTAL-CODECS + VIDEO-RANGE) so it is the
@@ -263,6 +270,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         dvInf += ",CODECS=\"\(codecs)\""
         if let supplemental = sig.supplementalCodec { dvInf += ",SUPPLEMENTAL-CODECS=\"\(supplemental)\"" }
         if let range = sig.videoRange { dvInf += ",VIDEO-RANGE=\(range)" }
+        if sig.fps > 0 { dvInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
         // Lifeboat (the b170 -1002 fix): same URI, same CODECS, NO VIDEO-RANGE / NO SUPPLEMENTAL-CODECS.
         // AVFoundation's multivariant selector drops any variant carrying an explicit non-SDR VIDEO-RANGE
         // (PQ/HLG) whenever the output pipeline is not provably HDR at the instant the master is parsed
@@ -274,9 +282,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // either way: the fMP4 sample entry (hvc1+dvvC) and the in-band RPUs drive the actual DV decode, and
         // VortX forces the Apple TV panel itself via HDRDisplayMode. BANDWIDTH-1 keeps the DV variant
         // preferred when both survive; identical URIs make any ABR switch a no-op.
-        var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 1, 1))"
+        // BANDWIDTH is dropped by 100 kbps (not 1) so the readyToPlay access-log's indicatedBitrate reveals
+        // which variant AVFoundation latched: ~the DV BANDWIDTH means the DV variant, ~100 kbps lower means the
+        // lifeboat. Same ordering (DV preferred), identical URI, so playback is unchanged.
+        var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 100_000, 1))"
         if sig.width > 0, sig.height > 0 { fbInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
         fbInf += ",CODECS=\"\(codecs)\""
+        if sig.fps > 0 { fbInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
         let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia.m3u8\n"
         DiagnosticsLog.log("dv", "hls master served (2 variants)")
         respond(connection, body: Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")

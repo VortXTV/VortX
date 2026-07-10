@@ -621,6 +621,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 player.play()
                 player.rate = requestedRate
                 DiagnosticsLog.log("avplayer", "readyToPlay -> play() rate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                // Variant-pick observability: whether the output pipeline is HDR-eligible, plus which master
+                // variant latched. The DV variant and the range-unlabeled lifeboat differ by 100 kbps of
+                // BANDWIDTH, so the access log's indicatedBitrate names the pick; it is -1 until the first
+                // access-log event, which is logged as-is (fail-soft, not an error).
+                let indicatedBitrate = item.accessLog()?.events.last?.indicatedBitrate ?? -1
+                DiagnosticsLog.log("avplayer", "readyToPlay variant: eligibleForHDRPlayback=\(AVPlayer.eligibleForHDRPlayback) indicatedBitrate=\(Int(indicatedBitrate))")
                 let host = (item.asset as? AVURLAsset)?.url.host ?? "?"
                 VXProbeState.shared.setPlayer(state: "playing", source: host, engine: "avplayer")
                 VXProbe.event("player", "ready \(host)")

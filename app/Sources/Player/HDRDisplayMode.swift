@@ -42,11 +42,47 @@ enum HDRDisplayMode {
         DiagnosticsLog.log("hdr", message)
     }
 
+    /// Serialized access to the switch-settle flag: written on the main queue by the mode-switch observers,
+    /// read on the HLS server's background serve queue. Declared OUTSIDE `#if os(tvOS)` because
+    /// VortXRemuxHLSServer compiles for iOS and macOS too and reads `isSwitchSettled` there; those platforms
+    /// never renegotiate an HDMI display mode, so the flag simply stays true for them.
+    private static let switchLock = NSLock()
+    private static var switchSettled = true
+
+    /// False from the instant a Dolby Vision / HDR display-mode switch is requested until the HDMI
+    /// renegotiation ends. The HLS master answer holds until this reads true (bounded, fail-open) so
+    /// AVFoundation parses the master AFTER the pipeline is provably HDR, not mid-switch where it would drop
+    /// the explicit-PQ DV variant for the whole session. Always true on iOS/macOS and whenever no switch was
+    /// requested (Match Dynamic Range OFF, or an SDR request that resets instead of switching).
+    static var isSwitchSettled: Bool {
+        switchLock.lock(); defer { switchLock.unlock() }
+        return switchSettled
+    }
+
+    private static func setSwitchSettled(_ value: Bool) {
+        switchLock.lock(); switchSettled = value; switchLock.unlock()
+    }
+
 #if os(tvOS)
     /// Ground truth on the HDMI renegotiation, straight from AVKit. Referencing
     /// these notification constants also creates the hard symbol dependency that
     /// keeps the linker from dropping AVKit (see project.yml).
     private static var observersInstalled = false
+
+    /// The pending "no switch is coming" timer and a monotonically increasing epoch, both guarded by the
+    /// shared `switchLock`. The timer exists because tvOS posts no mode-switch notifications when the panel
+    /// is already in the target mode (see `request`); the epoch stops a superseded timer from settling a
+    /// gate a newer request opened.
+    private static var noSwitchTimeout: DispatchWorkItem?
+    private static var switchEpoch: UInt64 = 0
+
+    /// Window after the criteria are set within which a real switch's `AVDisplayManagerModeSwitchStart` is
+    /// expected to post. It sits above the sub-second main-runloop + AVKit delivery latency of a genuine
+    /// switch's Start, and below the +2.5s in-progress checkpoint in `request`, so a real switch trips Start
+    /// and cancels the timer first; only a genuinely absent switch (panel already in the target mode) lets
+    /// the timer fire and settle the gate. Caps the common-case (back-to-back Dolby Vision) master wait near
+    /// this value instead of the 6s serveMaster fail-open.
+    private static let noSwitchSettleSeconds: TimeInterval = 1.0
 
     @MainActor
     private static func installModeSwitchObservers() {
@@ -54,10 +90,57 @@ enum HDRDisplayMode {
         observersInstalled = true
         let center = NotificationCenter.default
         center.addObserver(forName: .AVDisplayManagerModeSwitchStart, object: nil, queue: .main) { _ in
+            // A real HDMI renegotiation is underway: drop the no-switch timer and keep the gate closed until
+            // ModeSwitchEnd, exactly as before. When the panel is already in the target mode no Start posts,
+            // and the no-switch timer settles the gate instead.
+            cancelNoSwitchTimeout()
             DiagnosticsLog.logSync("hdr", "display mode switch STARTED (system notification)")
         }
         center.addObserver(forName: .AVDisplayManagerModeSwitchEnd, object: nil, queue: .main) { _ in
+            cancelNoSwitchTimeout()   // switch finished; a lingering no-switch timer must not re-fire
+            setSwitchSettled(true)   // release the HLS master gate: the pipeline is now provably HDR
             DiagnosticsLog.logSync("hdr", "display mode switch ENDED (system notification)")
+        }
+    }
+
+    /// Cancel any pending no-switch timer and advance the epoch so a timer already dequeued cannot settle a
+    /// gate a newer request opened. Returns the epoch the caller's fresh timer must carry. Non-isolated (like
+    /// `setSwitchSettled`) so the main-queue notification observers can call it without actor friction.
+    private static func beginNoSwitchWindow() -> UInt64 {
+        switchLock.lock()
+        noSwitchTimeout?.cancel()
+        noSwitchTimeout = nil
+        switchEpoch &+= 1
+        let epoch = switchEpoch
+        switchLock.unlock()
+        return epoch
+    }
+
+    private static func armNoSwitchTimer(_ item: DispatchWorkItem) {
+        switchLock.lock(); noSwitchTimeout = item; switchLock.unlock()
+    }
+
+    /// Cancel and forget any pending no-switch timer and advance the epoch. Used by ModeSwitchStart (a real
+    /// switch is underway, so wait for ModeSwitchEnd instead) and by `reset` (teardown / SDR).
+    private static func cancelNoSwitchTimeout() {
+        switchLock.lock()
+        noSwitchTimeout?.cancel()
+        noSwitchTimeout = nil
+        switchEpoch &+= 1
+        switchLock.unlock()
+    }
+
+    /// The no-switch timer fired: settle the master gate only if no later request superseded this timer.
+    private static func settleNoSwitchIfCurrent(epoch: UInt64) {
+        switchLock.lock()
+        let current = (epoch == switchEpoch)
+        if current {
+            switchSettled = true
+            noSwitchTimeout = nil
+        }
+        switchLock.unlock()
+        if current {
+            note("display switch: no ModeSwitchStart within \(noSwitchSettleSeconds)s, panel already in target mode; master gate settled")
         }
     }
 
@@ -99,6 +182,22 @@ enum HDRDisplayMode {
         }
         let encoded = (criteria.value(forKey: "videoDynamicRange") as? Int) ?? -999
         manager.preferredDisplayCriteria = criteria
+        // Close the master-parse race at its earliest point: a switch is now pending but the ModeSwitchStart
+        // notification has not necessarily fired yet, so mark unsettled here rather than waiting on Start. The
+        // early returns above (no window, SDR reset, Match Dynamic Range OFF, criteria build failure) never
+        // reach this line, so the gate stays a no-op whenever no switch is actually requested.
+        setSwitchSettled(false)
+        // tvOS posts ModeSwitchStart/End only when it actually renegotiates the HDMI link. When the panel is
+        // already in the target mode (a second Dolby Vision play in a row, or a TV already in Dolby Vision
+        // mode) it renegotiates nothing and posts neither, so the flag set false just above would never
+        // return to true and every later master fetch would eat the full serveMaster fail-open. Arm a short
+        // timer: if Start has not posted within the window no switch is needed and the gate settles; if Start
+        // does post it cancels this timer and the ModeSwitchEnd path settles the gate as before, so the
+        // pre-Start race stays closed either way.
+        let epoch = beginNoSwitchWindow()
+        let noSwitchTimer = DispatchWorkItem { settleNoSwitchIfCurrent(epoch: epoch) }
+        armNoSwitchTimer(noSwitchTimer)
+        DispatchQueue.main.asyncAfter(deadline: .now() + noSwitchSettleSeconds, execute: noSwitchTimer)
         note("display switch requested: \(range.rawValue) @\(rate)fps \(width)x\(height) criteriaRange=\(encoded) switchInProgress=\(manager.isDisplayModeSwitchInProgress)")
         // The HDMI renegotiation takes a beat; record whether tvOS actually started one.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
@@ -181,6 +280,11 @@ enum HDRDisplayMode {
     /// Return the TV to its default display mode. Safe to call repeatedly.
     @MainActor
     static func reset(in window: UIWindow?) {
+        // Teardown or an SDR request must never leave the master gate closed for the next playback. Cancel any
+        // pending no-switch timer and settle the flag up front, ahead of the window/manager guards below that
+        // can return early (the player view is often already detached from its window during teardown).
+        cancelNoSwitchTimeout()
+        setSwitchSettled(true)
         guard let window = window ?? fallbackWindow,
               let manager = displayManager(of: window) else { return }
         if manager.preferredDisplayCriteria != nil {
