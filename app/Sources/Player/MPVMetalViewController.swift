@@ -355,7 +355,7 @@ final class MPVMetalViewController: PlatformViewController {
         if !startMuted { configureAudioSession() }
         mpv = mpv_create()
         if mpv == nil {
-            print("failed creating context\n")
+            mpvLog.error("failed creating mpv context")
             exit(1)
         }
 
@@ -654,7 +654,14 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     #if canImport(UIKit)
+    /// Whether playback was actually playing when we backgrounded, so `enterForeground` resumes only a title
+    /// that was playing and never un-pauses one the user paused (or one that never started).
+    private var wasPlayingBeforeBackground = false
+
     @objc public func enterBackground() {
+        // Remember the play state BEFORE we pause below, so foregrounding does not silently resume a
+        // user-paused title.
+        wasPlayingBeforeBackground = mpv != nil && !getFlag(MPVProperty.pause)
         // Always drop video decode (fixes the black screen on return and saves GPU). On iOS, whether
         // AUDIO keeps going is the keep-alive choice (#74): continuing audio holds the AVAudioSession
         // active so iOS won't suspend the app and freeze the embedded streaming server mid-stream; opting
@@ -672,15 +679,19 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     @objc public func enterForeground() {
-        // Reclaim the session in case another app deactivated it while we were backgrounded,
-        // then re-evaluate the audio route (it may have changed off-screen).
-        do { try AVAudioSession.sharedInstance().setActive(true) } catch {
-            mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
+        // A silent hero preview never claimed the audio session (setupMpv skips configureAudioSession when
+        // startMuted), so it must not reactivate the session or reapply the channel policy here either.
+        if !startMuted {
+            // Reclaim the session in case another app deactivated it while we were backgrounded,
+            // then re-evaluate the audio route (it may have changed off-screen).
+            do { try AVAudioSession.sharedInstance().setActive(true) } catch {
+                mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
+            }
+            applyChannelPolicy()
         }
-        applyChannelPolicy()
         checkError(mpv_set_property_string(mpv, "vid", "auto"))   // runtime toggle: property, not option (no-op post-init)
         applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
-        play()
+        if wasPlayingBeforeBackground { play() }   // only resume a title that was actually playing
     }
 
     /// The (channels, sampleRate) last pushed to mpv, so a route-change storm does not reinit the
@@ -797,7 +808,6 @@ final class MPVMetalViewController: PlatformViewController {
         var playURL = url
         var sidecar = audioSidecar
         var args = [playURL.absoluteString]
-        var options = [String]()
 
         args.append("replace")
 
@@ -927,10 +937,6 @@ final class MPVMetalViewController: PlatformViewController {
             mpv_set_property_string(mpv, "demuxer-max-bytes", String(applied))
         } else {
             mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
-        }
-
-        if !options.isEmpty {
-            args.append(options.joined(separator: ","))
         }
 
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
@@ -1717,8 +1723,11 @@ final class MPVMetalViewController: PlatformViewController {
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
                 default:
-                    let eventName = mpv_event_name(event!.pointee.event_id )
-                    print("event: \(String(cString: (eventName)!))");
+                    #if DEBUG
+                    let eventName = mpv_event_name(event!.pointee.event_id)
+                    print("event: \(String(cString: eventName!))")
+                    #endif
+                    break
                 }
                 
             }
@@ -1728,7 +1737,7 @@ final class MPVMetalViewController: PlatformViewController {
     
     private func checkError(_ status: CInt) {
         if status < 0 {
-            print("MPV API error: \(String(cString: mpv_error_string(status)))\n")
+            mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
         }
     }
     

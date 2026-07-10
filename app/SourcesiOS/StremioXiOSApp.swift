@@ -59,7 +59,8 @@ struct StremioXiOSApp: App {
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
         // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
-        DiskCacheSetting.clearCache()
+        // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
+        Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
         CoreBridge.shared.start()
         NSLog("[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }

@@ -52,8 +52,15 @@ enum PosterImageLoader {
     /// before any image request, so the first poster page is served warm. Idempotent (lazy statics build once).
     static func configureSharedCache() {
         _ = session
-        NSLog("[poster-probe] configureSharedCache built dedicated poster cache memory=%dMB disk=%dMB diskPath=vortx-images",
-              64, 512)
+        VXProbe.log("poster", "configureSharedCache built dedicated poster cache memory=64MB disk=512MB diskPath=vortx-images")
+    }
+
+    /// Privacy: a poster URL can carry a title id (and, for some art sources, signed query params) in its path,
+    /// so probe logs only ever record the HOST, never the raw URL. Enough to tell which art source served a
+    /// poster without leaking what the user is browsing. Evaluated lazily inside `VXProbe.log`'s autoclosure.
+    private static func probeHost(_ urlString: String?) -> String {
+        guard let raw = urlString, let host = URL(string: raw)?.host else { return "?" }
+        return host
     }
 
     // MARK: bounded-concurrency image session
@@ -154,29 +161,28 @@ enum PosterImageLoader {
     /// real failure OR on cancellation (the caller treats nil-from-cancel as "retry next appear", so a
     /// scroll-away never latches a blank card). `maxPixel` downsamples very large art to a sane on-card size.
     static func load(_ urlString: String?, maxPixel: CGFloat = 900) async -> VXPosterImage? {
-        NSLog("[poster-probe] load ENTRY url=%@ maxPixel=%d",
-              (urlString?.isEmpty == false) ? urlString! : "nil/empty", Int(maxPixel))
+        VXProbe.log("poster", "load ENTRY host=\(probeHost(urlString)) maxPixel=\(Int(maxPixel))")
         guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else {
-            NSLog("[poster-probe] load BAIL bad/empty url=%@ -> nil", (urlString?.isEmpty == false) ? urlString! : "nil/empty")
+            VXProbe.log("poster", "load BAIL bad/empty host=\(probeHost(urlString)) -> nil")
             return nil
         }
         if let hit = memory.object(forKey: url as NSURL) {
-            NSLog("[poster-probe] memory-cache HIT url=%@ -> returning cached", raw)
+            VXProbe.log("poster", "memory-cache HIT host=\(probeHost(raw)) -> returning cached")
             return hit
         }
-        NSLog("[poster-probe] memory-cache MISS url=%@", raw)
+        VXProbe.log("poster", "memory-cache MISS host=\(probeHost(raw))")
 
         // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
         // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
         guard await gate.acquire() else {
-            NSLog("[poster-probe] gate ACQUIRE cancelled url=%@ -> nil (no permit held)", raw)
+            VXProbe.log("poster", "gate ACQUIRE cancelled host=\(probeHost(raw)) -> nil (no permit held)")
             return nil
         }
-        NSLog("[poster-probe] gate ACQUIRE granted url=%@", raw)
+        VXProbe.log("poster", "gate ACQUIRE granted host=\(probeHost(raw))")
         defer { Task { await gate.release() } }
         // A cancel between acquiring the gate and starting the fetch: bail without a network hit.
         if Task.isCancelled {
-            NSLog("[poster-probe] cancelled after gate, before fetch url=%@ -> nil-because-cancelled", raw)
+            VXProbe.log("poster", "cancelled after gate, before fetch host=\(probeHost(raw)) -> nil-because-cancelled")
             return nil
         }
 
@@ -184,22 +190,21 @@ enum PosterImageLoader {
             var req = URLRequest(url: url)
             req.cachePolicy = .returnCacheDataElseLoad   // poster art is immutable; prefer the (now large) disk cache
             let (data, _) = try await session.data(for: req)
-            NSLog("[poster-probe] fetch OK url=%@ bytes=%d", raw, data.count)
+            VXProbe.log("poster", "fetch OK host=\(probeHost(raw)) bytes=\(data.count)")
             if Task.isCancelled {
-                NSLog("[poster-probe] cancelled after fetch, before decode url=%@ -> nil-because-cancelled", raw)
+                VXProbe.log("poster", "cancelled after fetch, before decode host=\(probeHost(raw)) -> nil-because-cancelled")
                 return nil
             }
             // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
             guard let image = decode(data, maxPixel: maxPixel) else {
-                NSLog("[poster-probe] decode FAILED url=%@ bytes=%d -> nil-because-failed", raw, data.count)
+                VXProbe.log("poster", "decode FAILED host=\(probeHost(raw)) bytes=\(data.count) -> nil-because-failed")
                 return nil
             }
             memory.setObject(image, forKey: url as NSURL)
-            NSLog("[poster-probe] load SUCCESS url=%@ image=%dx%d", raw, Int(image.size.width), Int(image.size.height))
+            VXProbe.log("poster", "load SUCCESS host=\(probeHost(raw)) image=\(Int(image.size.width))x\(Int(image.size.height))")
             return image
         } catch {
-            NSLog("[poster-probe] fetch ERROR url=%@ error=%@ -> nil-because-failed (or cancel; caller retries)",
-                  raw, error.localizedDescription)
+            VXProbe.log("poster", "fetch ERROR host=\(probeHost(raw)) error=\(error.localizedDescription) -> nil-because-failed (or cancel; caller retries)")
             return nil   // includes URLError.cancelled; the caller retries on the next appear
         }
     }
@@ -212,8 +217,7 @@ enum PosterImageLoader {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else {
             let fallback = VXPosterImage(data: data)   // fall back to the platform decoder (e.g. a format ImageIO thumbnails oddly)
-            NSLog("[poster-probe] decode ImageIO source-create FAILED bytes=%d -> platform-decoder fallback=%@",
-                  data.count, fallback != nil ? "ok" : "nil")
+            VXProbe.log("poster", "decode ImageIO source-create FAILED bytes=\(data.count) -> platform-decoder fallback=\(fallback != nil ? "ok" : "nil")")
             return fallback
         }
         let downsampleOptions = [
@@ -224,11 +228,10 @@ enum PosterImageLoader {
         ] as [CFString: Any] as CFDictionary
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, downsampleOptions) else {
             let fallback = VXPosterImage(data: data)
-            NSLog("[poster-probe] decode ImageIO thumbnail FAILED bytes=%d -> platform-decoder fallback=%@",
-                  data.count, fallback != nil ? "ok" : "nil")
+            VXProbe.log("poster", "decode ImageIO thumbnail FAILED bytes=\(data.count) -> platform-decoder fallback=\(fallback != nil ? "ok" : "nil")")
             return fallback
         }
-        NSLog("[poster-probe] decode ImageIO ok pixels=%dx%d", cg.width, cg.height)
+        VXProbe.log("poster", "decode ImageIO ok pixels=\(cg.width)x\(cg.height)")
         #if canImport(UIKit)
         return UIImage(cgImage: cg)
         #elseif canImport(AppKit)

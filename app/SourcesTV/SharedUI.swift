@@ -55,6 +55,11 @@ struct PosterArt: View {
     }
 
     private func load() async {
+        // A recycled cell may still carry the previous title's art in `image`/`failed` (both @State outlive the
+        // poster change), so clear them first: a changed URL that fails then shows the placeholder instead of the
+        // stale image, and a warm poster repaints instantly from the synchronous cache in `body`.
+        image = nil
+        failed = false
         guard let raw = poster, !raw.isEmpty else { failed = true; return }   // no poster → film placeholder
         // Shared loader: dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode. Same fix as
         // iOS/Mac (posters were re-fetching through a tiny shared cache and decoding on the main thread).
@@ -146,6 +151,10 @@ extension CoreCWItem {
     @Published private(set) var detailsVisible = true
     private var pending: Task<Void, Never>?
     private static var enrichmentCache: [String: FocusedHero] = [:]   // session-wide, across pages
+    /// Recency order (least-recently-used first) for `enrichmentCache`, so the in-memory map and its on-disk
+    /// copy stay bounded instead of growing for every title ever focused.
+    private static var enrichmentOrder: [String] = []
+    private static let enrichmentCap = 400
 
     func focus(_ hero: FocusedHero, showsDetails: Bool = true) {
         if hero == self.hero {
@@ -176,6 +185,7 @@ extension CoreCWItem {
     private static func resolve(_ hero: FocusedHero) -> FocusedHero {
         loadCacheIfNeeded()
         guard let cached = enrichmentCache[hero.id] else { return hero }
+        touchEnrichment(hero.id)
         let watchedTail = hero.metaLine.components(separatedBy: "  ·  ").first { $0.hasSuffix("% watched") }
         let line = watchedTail.map { "\(cached.metaLine)  ·  \($0)" } ?? cached.metaLine
         return FocusedHero(id: hero.id, type: hero.type, title: hero.title,
@@ -201,7 +211,7 @@ extension CoreCWItem {
                                metaLine: parts.joined(separator: "  ·  "), overview: overview,
                                genreLine: genreLine, logo: metahubLogo(for: id))
         guard enrichmentCache[id] != hero else { return }
-        enrichmentCache[id] = hero
+        storeEnrichment(id, hero)
         saveCache()
     }
 
@@ -219,12 +229,42 @@ extension CoreCWItem {
         if let data = try? Data(contentsOf: cacheURL),
            let decoded = try? JSONDecoder().decode([String: FocusedHero].self, from: data) {
             enrichmentCache = decoded
+            enrichmentOrder = Array(decoded.keys)
+            enforceEnrichmentCap()   // trim a pre-cap on-disk cache down to the bound on first load
+        }
+    }
+
+    /// Insert or refresh a hero and mark it most-recently-used, evicting the least-recently-used entries once
+    /// the cap is exceeded so neither the in-memory map nor the persisted copy grows without bound.
+    private static func storeEnrichment(_ id: String, _ hero: FocusedHero) {
+        enrichmentCache[id] = hero
+        touchEnrichment(id)
+        enforceEnrichmentCap()
+    }
+
+    /// Move an id to most-recently-used on a cache hit so an actively focused title survives eviction.
+    private static func touchEnrichment(_ id: String) {
+        if let i = enrichmentOrder.firstIndex(of: id) { enrichmentOrder.remove(at: i) }
+        enrichmentOrder.append(id)
+    }
+
+    /// Drop the least-recently-used entries until the map is back within the cap.
+    private static func enforceEnrichmentCap() {
+        while enrichmentOrder.count > enrichmentCap {
+            let evict = enrichmentOrder.removeFirst()
+            enrichmentCache.removeValue(forKey: evict)
         }
     }
 
     private static func saveCache() {
-        if let data = try? JSONEncoder().encode(enrichmentCache) {
-            try? data.write(to: cacheURL, options: .atomic)
+        // Snapshot on the caller (main) and encode + write on a background task so the per-open disk rewrite
+        // never blocks the main thread. The dictionary is a value type, so the snapshot is stable off-main.
+        let snapshot = enrichmentCache
+        let url = cacheURL
+        Task.detached(priority: .utility) {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
@@ -281,7 +321,7 @@ extension CoreCWItem {
                                            overview: meta.description, genreLine: genreLine,
                                            logo: meta.logo ?? hero.logo)
                 await MainActor.run {
-                    Self.enrichmentCache[hero.id] = enriched
+                    Self.storeEnrichment(hero.id, enriched)
                     Self.saveCache()
                     guard apply, let self, self.hero?.id == hero.id else { return }
                     self.hero = Self.resolve(hero)   // re-resolve so the live progress tail merges in

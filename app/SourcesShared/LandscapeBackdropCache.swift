@@ -35,7 +35,12 @@ actor LandscapeBackdropCache {
         let result = await task.value
         // Only cache a POSITIVE result. A transient TMDB failure returns (nil, nil); caching that latched the
         // card into poster-fallback for the WHOLE session. Leaving a miss uncached lets a later appear retry.
-        if result.backdrop != nil || result.logo != nil { cache[id] = result }
+        if result.backdrop != nil || result.logo != nil {
+            // Bounded so a long browsing session cannot grow the map without limit; on overflow reset the whole
+            // cache (worst case a re-resolve of the few visible cards, still correct), mirroring ResumeSeedGuard.
+            if cache.count > 2000 { cache.removeAll(keepingCapacity: true) }
+            cache[id] = result
+        }
         inflight[id] = nil
         return result
     }
