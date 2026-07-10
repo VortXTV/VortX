@@ -42,6 +42,27 @@ enum HDRDisplayMode {
         DiagnosticsLog.log("hdr", message)
     }
 
+    /// Serialized access to the switch-settle flag: written on the main queue by the mode-switch observers,
+    /// read on the HLS server's background serve queue. Declared OUTSIDE `#if os(tvOS)` because
+    /// VortXRemuxHLSServer compiles for iOS and macOS too and reads `isSwitchSettled` there; those platforms
+    /// never renegotiate an HDMI display mode, so the flag simply stays true for them.
+    private static let switchLock = NSLock()
+    private static var switchSettled = true
+
+    /// False from the instant a Dolby Vision / HDR display-mode switch is requested until the HDMI
+    /// renegotiation ends. The HLS master answer holds until this reads true (bounded, fail-open) so
+    /// AVFoundation parses the master AFTER the pipeline is provably HDR, not mid-switch where it would drop
+    /// the explicit-PQ DV variant for the whole session. Always true on iOS/macOS and whenever no switch was
+    /// requested (Match Dynamic Range OFF, or an SDR request that resets instead of switching).
+    static var isSwitchSettled: Bool {
+        switchLock.lock(); defer { switchLock.unlock() }
+        return switchSettled
+    }
+
+    private static func setSwitchSettled(_ value: Bool) {
+        switchLock.lock(); switchSettled = value; switchLock.unlock()
+    }
+
 #if os(tvOS)
     /// Ground truth on the HDMI renegotiation, straight from AVKit. Referencing
     /// these notification constants also creates the hard symbol dependency that
@@ -57,6 +78,7 @@ enum HDRDisplayMode {
             DiagnosticsLog.logSync("hdr", "display mode switch STARTED (system notification)")
         }
         center.addObserver(forName: .AVDisplayManagerModeSwitchEnd, object: nil, queue: .main) { _ in
+            setSwitchSettled(true)   // release the HLS master gate: the pipeline is now provably HDR
             DiagnosticsLog.logSync("hdr", "display mode switch ENDED (system notification)")
         }
     }
@@ -99,6 +121,11 @@ enum HDRDisplayMode {
         }
         let encoded = (criteria.value(forKey: "videoDynamicRange") as? Int) ?? -999
         manager.preferredDisplayCriteria = criteria
+        // Close the master-parse race at its earliest point: a switch is now pending but the ModeSwitchStart
+        // notification has not necessarily fired yet, so mark unsettled here rather than waiting on Start. The
+        // early returns above (no window, SDR reset, Match Dynamic Range OFF, criteria build failure) never
+        // reach this line, so the gate stays a no-op whenever no switch is actually requested.
+        setSwitchSettled(false)
         note("display switch requested: \(range.rawValue) @\(rate)fps \(width)x\(height) criteriaRange=\(encoded) switchInProgress=\(manager.isDisplayModeSwitchInProgress)")
         // The HDMI renegotiation takes a beat; record whether tvOS actually started one.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {

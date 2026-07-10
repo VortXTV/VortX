@@ -254,6 +254,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
+        // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
+        // is provably HDR, and that choice is session-persistent, so a master fetched mid-switch can pin the
+        // lifeboat (HDR10 output) for the whole title. Bounded and fail-OPEN: on timeout the lifeboat still
+        // guarantees a playable variant. HDRDisplayMode.isSwitchSettled is always true on iOS/macOS and
+        // whenever Match Dynamic Range never started a switch, so this is a no-op except on the tvOS DV path.
+        _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
         // DV variant FIRST (Apple authoring-spec truth: SUPPLEMENTAL-CODECS + VIDEO-RANGE) so it is the
