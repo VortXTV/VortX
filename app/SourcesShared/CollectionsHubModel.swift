@@ -613,7 +613,17 @@ final class CollectionsHubModel: ObservableObject {
             UserDefaults.standard.set(ids, forKey: Self.orderKey)
             providers = Self.applyOrder(providers)
         } else {
-            Self.setSelectedProviders(ids)
+            // The reorder screen only passes the VISIBLE tiles. A selected service that is out of the viewer's
+            // region and not yet resolved (warmGlobalProviders still loading the global tile) is skipped by
+            // resolveForPublish, so it never reaches the visible list. Persisting `ids` alone would write that
+            // pin OUT of the selection: a silent loss of a service the user chose. Keep the visible order, then
+            // append any still-unresolved selected pins after it so a reorder can never drop them.
+            let incoming = Set(ids.map { TMDBClient.canonicalProviderID($0) })
+            var merged = ids
+            for pinned in Self.selectedProviders() where !incoming.contains(pinned) {
+                merged.append(pinned)
+            }
+            Self.setSelectedProviders(merged)
             republishSelection()
         }
     }
