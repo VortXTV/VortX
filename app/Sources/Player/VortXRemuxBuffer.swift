@@ -47,14 +47,24 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Total bytes produced so far across the whole session (monotonic; NOT storage.count once eviction starts).
     private(set) var producedCount: Int = 0
 
-    /// The re-read floor: how many already-delivered bytes to keep behind the reader's low-water mark before
-    /// evicting. Kept small (a fragment or two) so a benign re-read at the current position still succeeds while
-    /// RAM stays flat. Sourced from RemoteConfig so the fleet can widen it (e.g. for a future seek lane) without
-    /// an app update; clamped to a sane floor here so a bad remote value can never make the window degenerate.
-    private static var windowFloorBytes: Int {
-        let mib = max(4, RemoteConfig.snapshot.dvRemuxWindowMiB)   // never below 4 MiB
-        return mib * 1024 * 1024
-    }
+    /// Design minimum for the re-read window, in MiB: two full HLS segments' worth, i.e. 2 x
+    /// VortXMKVRemuxStream.hlsMaxSegmentBytes (2 x 32 MiB = 64). Keep in lockstep with that constant. This is the
+    /// worst-case concurrent two-segment read skew, so any floor below it can evict a range that is still being
+    /// served on an open connection: the reader's next request then falls below `storageBase`, the HLS
+    /// connection is cut, and AVPlayer demotes Dolby Vision to HDR10. The shipped RemoteConfig default
+    /// (`dvRemuxWindowMiB` = 64) is exactly this value, so this constant is a fleet no-op today; it exists only
+    /// so a pathological remote value can never starve the window below the two-segment minimum.
+    private static let windowFloorMinMiB = 64
+
+    /// The re-read floor (bytes): how many already-delivered bytes to keep behind the reader's low-water mark
+    /// before evicting. Kept small (a fragment or two) so a benign re-read at the current position still
+    /// succeeds while RAM stays flat. Captured ONCE at buffer creation, NOT read per fragment: reading it live
+    /// took `RemoteConfig.snapshot`'s process-wide lock and copied the whole config struct on the DV hot path
+    /// (append per fMP4 fragment, evict per read), contending with the RemoteConfig refresh writer. A mid-play
+    /// fleet dial change only ever took effect on the NEXT playback anyway, so capturing at init changes nothing
+    /// observable. Floored at the two-segment design minimum so a bad remote value can never degenerate the
+    /// window.
+    private let windowFloorBytes: Int = max(VortXRemuxBuffer.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024
 
     /// Producer-lead budget on top of the re-read floor. This is the slack the remux thread is allowed to run
     /// ahead of the reader before `append` blocks. Without it the producer (a stream-copy that muxes as fast as
@@ -76,7 +86,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     func append(_ bytes: UnsafePointer<UInt8>, count: Int) {
         guard count > 0 else { return }
         condition.lock()
-        let ceiling = Self.windowFloorBytes + Self.producerLeadBytes
+        let ceiling = windowFloorBytes + Self.producerLeadBytes
         while residentCount >= ceiling && !isFinished {
             condition.wait(until: Date().addingTimeInterval(0.25))
         }
@@ -226,7 +236,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Drop already-delivered bytes so only a `windowFloorBytes` re-read floor remains behind `readHead`.
     /// Caller holds the lock. Keeps `storageBase` and `storage` consistent (storage[0] == absolute storageBase).
     private func evictBelow(_ readHead: Int) {
-        let keepFrom = max(storageBase, readHead - Self.windowFloorBytes)
+        let keepFrom = max(storageBase, readHead - windowFloorBytes)
         let dropCount = keepFrom - storageBase
         guard dropCount > 0, dropCount <= storage.count else { return }
         storage.removeFirst(dropCount)
@@ -237,7 +247,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         // Apple TV this class exists to protect. Once the reclaimable prefix reaches the floor, compact:
         // `subdata` copies the retained window into a fresh 0-based buffer and frees the old backing.
         // Amortized ~1x (one window-sized copy per window-sized advance) and it keeps `startIndex` bounded.
-        if storage.startIndex >= Self.windowFloorBytes {
+        if storage.startIndex >= windowFloorBytes {
             storage = storage.subdata(in: storage.startIndex..<storage.endIndex)
         }
         // Resident bytes dropped: wake a producer parked on the high-water mark in `append`.

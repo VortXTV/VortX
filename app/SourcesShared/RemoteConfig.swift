@@ -36,14 +36,16 @@ enum RemoteConfigDefaults {
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
     static let vodReadaheadSecs = 300        // demuxer-readahead-secs for VOD (configureLiveMode else-branch)
-    static let dvRemuxWindowMiB = 64         // Re-read floor MUST stay >= hlsMaxSegmentBytes (32 MiB) + avio lag, else
-                                             // the 3 startup segments cannot fit the buffer park and a high-bitrate DV
-                                             // remux starves its playlist -> the 20s watchdog demotes to HDR10 (the exact
-                                             // symptom the tier fix rescues). Kept at 64 for the DV emergency build so the
-                                             // ONLY DV change is the tier + buffer fixes; the memory win comes from the
-                                             // AVPlayer preferredForwardBufferDuration cap + the server fixes. Lowering this
-                                             // (with a matching smaller hlsMaxSegmentBytes) is a follow-up, trialable on the
-                                             // fleet via the RemoteConfig dial without a build.
+    static let dvRemuxWindowMiB = 64         // Re-read floor, in MiB. MUST stay >= two full HLS segments
+                                             // (2 x hlsMaxSegmentBytes = 2 x 32 MiB = 64), the worst-case
+                                             // concurrent two-segment read skew. A floor below that can evict a
+                                             // range still being served on an open connection: the reader's next
+                                             // request falls below the window, the HLS connection is cut, and
+                                             // AVPlayer demotes DV to HDR10. (It is NOT a startup guard;
+                                             // producerLeadBytes supplies startup headroom independently.) 64 is
+                                             // both the design minimum and the shipped value, so the clamp and
+                                             // VortXRemuxBuffer.windowFloorMinMiB agree. Widening (never lowering)
+                                             // is trialable on the fleet via the RemoteConfig dial without a build.
 
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
     static let detailSettleIOSSecs = 12
@@ -479,7 +481,14 @@ actor RemoteConfig {
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse else { return }   // keep last-good
-            if http.statusCode == 304 { return }                        // unchanged, keep last-good
+            if http.statusCode == 304 {
+                // A 304 is a successful "still fresh" fetch, so stamp the fetch time too: otherwise
+                // refreshIfForegroundDue never sees a recent lastFetch in the steady state (the config rarely
+                // changes, so every foreground refresh 304s), the 30-minute throttle never engages, and we
+                // re-hit the network on every scene activation. Keep last-good either way.
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)
+                return
+            }
             guard http.statusCode == 200 else { return }                // any other status: keep last-good
 
             let decoded = try JSONDecoder().decode(RemoteConfigData.self, from: data)
@@ -541,9 +550,14 @@ actor RemoteConfig {
         let reduced = max(floor, clamp(data.player?.readAhead?.reducedCeilingMiB, RemoteConfigDefaults.reducedCeilingMiB, 64, 192))
         let mac = max(floor, clamp(data.player?.readAhead?.macCeilingMiB, RemoteConfigDefaults.macCeilingMiB, 128, 1536))
         let vodSecs = clamp(data.player?.vodReadaheadSecs, RemoteConfigDefaults.vodReadaheadSecs, 30, 600)
-        // DV-remux buffer window floor: keep at least 4 MiB (a fragment or two) and cap at 512 MiB so a remote
-        // value can widen the re-read floor without ever letting it approach the whole-movie RAM this replaced.
-        let dvWindow = clamp(data.player?.readAhead?.dvRemuxWindowMiB, RemoteConfigDefaults.dvRemuxWindowMiB, 4, 512)
+        // DV-remux buffer window floor: keep at least 64 MiB (two full HLS segments, matching
+        // VortXRemuxBuffer.windowFloorMinMiB) and cap at 512 MiB. The lower bound is the design invariant, not a
+        // convenience: a floor below the two-segment skew can evict a range still being served on an open
+        // connection (reader request drops below storageBase -> HLS connection cut -> AVPlayer demotes DV to
+        // HDR10). It is NOT a startup-starvation guard; producerLeadBytes supplies the startup headroom
+        // independently. The upper cap keeps a widened re-read floor from approaching the whole-movie RAM this
+        // window replaced.
+        let dvWindow = clamp(data.player?.readAhead?.dvRemuxWindowMiB, RemoteConfigDefaults.dvRemuxWindowMiB, 64, 512)
 
         // --- Timeouts. ---
         let settleIOS = clamp(data.timeouts?.detailSettleIOSSecs, RemoteConfigDefaults.detailSettleIOSSecs, 5, 60)

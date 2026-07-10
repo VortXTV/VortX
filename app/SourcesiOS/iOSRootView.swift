@@ -759,10 +759,46 @@ struct iOSHomeView: View {
             if showCuratedRails { curated.load() }
             if showCollectionsHub { collectionsHub.load() }
         }
-        // Hero reseeds are gated on the visible tab: `seed` re-arms the rotation timer, which would
-        // defeat the hidden-tab pause above on every engine re-emit. The isActive onChange reseeds on return.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks(); refreshReleaseCalendar() }
-        .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // Key Home refreshes off COARSE signals instead of `core.revision`, which bumps on EVERY NewState
+        // (background sync, catalog paging, search echoes, meta_details bursts) and so re-ran Top Picks, the
+        // Upcoming Episodes calendar, and the hero reseed on idle engine churn.
+        //
+        // THE RULE per signal: a BOUNDED collection is keyed on its EXACT ordered id set (zero missed changes);
+        // an UNBOUNDED one is keyed on a "<first id>#<count>" FINGERPRINT plus a documented bound, because an
+        // exact id key would be O(collection) work on EVERY body evaluation, the very storm this removes.
+        //   - `profiles.cwItems` is BOUNDED (hard-capped at 30 in Profiles.cwItems `.prefix(30)`), so it keys on
+        //     the exact ordered id set joined by a control char no id contains: insert, remove, reorder, AND an
+        //     interior swap all fire; a pure progress tick does not.
+        //   - `core.continueWatching` is UNBOUNDED: it is the engine `continue_watching_preview`, i.e. every
+        //     in-progress library title, bounded only by the (unbounded) library, with no in-app cap. So it
+        //     keeps the fingerprint. `core.library` (whole library) is the same case.
+        //   - `core.boardRows` is small in practice but keeps the fingerprint too, DELIBERATELY: it feeds only
+        //     the hero pool, where a miss is cosmetic and self-heals on the next distinguishing change, so the
+        //     cheap key is worth the asymmetry with cwItems.
+        // DOCUMENTED BOUND for the fingerprinted signals: a same-count interior swap in a SINGLE emit (one title
+        // replaced by another at a non-head position) leaves first-id and count unchanged and does not fire; a
+        // per-body content hash is deliberately avoided (this body re-evaluates far too often to hash an
+        // unbounded collection each pass). The next real CW / board / profile change, or an app foreground,
+        // reconciles it. No key fires on a pure progress tick (the set is unchanged), so the refresh models
+        // still no-op and `hero.seed` ignores the no-op reseed. hero.seed stays gated on the visible tab
+        // (`isActive`): `seed` re-arms the rotation timer, which a hidden (opacity-switched) Home must not do;
+        // the isActive onChange reseeds on return.
+        .onChange(of: "\(core.boardRows.first?.id ?? "-")#\(core.boardRows.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
+        .onChange(of: "\(core.continueWatching.first?.id ?? "-")#\(core.continueWatching.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems` (bounded, exact id-set key
+        // above), not the engine, so its own plays must also re-seed the hero and Top Picks (the engine-CW
+        // onChange never fires for them).
+        .onChange(of: profiles.cwItems.map(\.id).joined(separator: "\u{1}")) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
+        // Unbounded, so keyed on catalog.count with the same-count-swap bound documented above.
+        .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
