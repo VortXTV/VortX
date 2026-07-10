@@ -929,10 +929,10 @@ final class VortXSyncManager: ObservableObject {
         // addedAt: that is the point, it is how a genuine reinstall stops peers from re-uninstalling it. The
         // deletedAddons array carries the effective removed set for older clients; the deletedAddonsTs companion
         // carries the stamps, and a deletedAddons url with no stamp folds at the migration epoch so any real
-        // reinstall out-races it. webAddonRemovals is stamp-less and persistent, so it is passed SEPARATELY as
-        // webIDs (syncDown is the single mint chokepoint): merge mints a removedAt=now for a web url only when it
-        // is neither stamped nor already locally tracked, so a month-old stale web entry can never beat a recent
-        // reinstall, and the minted stamp is published in deletedAddonsTs on the next push.
+        // reinstall out-races it. webAddonRemovals is stamp-less and persistent, so it is folded in a SEPARATE
+        // mint step AFTER the baseline below (syncDown is still the single mint chokepoint): merge mints a
+        // removedAt=now for a web url only when it is neither stamped nor already locally tracked, so a month-old
+        // stale web entry can never beat a recent reinstall, and the minted stamp publishes in deletedAddonsTs next push.
         var incomingAddonRemovals: [String] = []
         var incomingAddonRemovalsTs: [String: Any] = [:]
         if let vortx = doc["vortx"] as? [String: Any] {
@@ -940,14 +940,28 @@ final class VortXSyncManager: ObservableObject {
             if let ts = vortx["deletedAddonsTs"] as? [String: Any] { incomingAddonRemovalsTs = ts }
         }
         let webAddonRemovals = (doc["webAddonRemovals"] as? [String]) ?? []   // web agent owns this write; we only READ it
-        if AddonTombstones.merge(legacyIDs: incomingAddonRemovals, stampsRaw: incomingAddonRemovalsTs, webIDs: webAddonRemovals) { restored = true }
-        // Baseline-stamp installed add-ons AFTER the incoming removal fold above but BEFORE the uninstall set is
-        // computed below. Ordering is load-bearing: run before the fold and a genuine wall-clock b172 removal is
-        // not yet in local state, so the baseline would stamp addedAt=now over it and resurrect a peer's deletion
-        // (the baselineInstalled guard also refuses to stamp over a real post-epoch removedAt). Run after the
-        // uninstall set and a legacy migration-epoch removal would strip the add-on before the baseline can
+        // STEP 1: fold the legacy + STAMPED removals only (no webIDs, no mint). A genuine wall-clock b172 removal
+        // arriving via deletedAddonsTs lands in local removedAt HERE, before the baseline, so the baseline guard
+        // (refuse to stamp over a post-epoch removedAt) still honors it and the removal is not resurrected. The
+        // stamp-less web MINT is split off to STEP 3 below so it runs AFTER the baseline: minting a persistent web
+        // removal before the baseline stamps addedAt would fire on an add-on the user reinstalled on b171 whose
+        // install this fleet has never stamped, and the minted removedAt would then out-race every peer and
+        // uninstall a currently-installed add-on fleet-wide (the F2 wrong-uninstall class, at first run).
+        let addonFoldRestored = AddonTombstones.merge(legacyIDs: incomingAddonRemovals, stampsRaw: incomingAddonRemovalsTs)
+        // STEP 2: baseline-stamp installed add-ons AFTER the incoming removal fold above but BEFORE the web mint and
+        // the uninstall set below. Ordering is load-bearing: run before the fold and a genuine wall-clock b172
+        // removal is not yet in local state, so the baseline would stamp addedAt=now over it and resurrect a peer's
+        // deletion (the baselineInstalled guard also refuses to stamp over a real post-epoch removedAt). Run after
+        // the uninstall set and a legacy migration-epoch removal would strip the add-on before the baseline can
         // protect it. One-shot and self-suppressed; a no-op if the engine has not hydrated its add-ons yet.
         baselineInstalledAddonsOnce()
+        // STEP 3: NOW mint the stamp-less web removals. The baseline has stamped addedAt on every installed add-on,
+        // so merge's mint guard (mint only when the url is neither stamped nor holds a local removedAt nor a local
+        // addedAt) blocks the mint for an add-on the user currently has, closing the first-run window. A genuine web
+        // removal of an add-on this device never had still carries no addedAt, so it still mints and is still
+        // suppressed on the next hydrate. OR both merges' change flags so neither restored signal is dropped.
+        let addonMintRestored = AddonTombstones.merge(legacyIDs: [], stampsRaw: [:], webIDs: webAddonRemovals)
+        if addonFoldRestored || addonMintRestored { restored = true }
         // Cross-device LIBRARY REMOVAL tombstones (the library analogue of the deletedAddons fold above).
         // ALWAYS fold the incoming removals (never version-gate them): the fold is a per-id last-writer-wins
         // max on both stamps (removedAt / addedAt), which is monotone and idempotent, so folding a stale,
