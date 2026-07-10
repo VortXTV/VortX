@@ -53,6 +53,38 @@ enum ProfileSync {
     /// read from Stremio is separate and always allowed (it is how existing data migrates into VortX).
     static var alsoSyncToStremio: Bool { UserDefaults.standard.bool(forKey: alsoSyncKey) }
 
+    // MARK: Wave 4: one-time Stremio library import gate (VortX owns the library + Continue Watching)
+
+    /// Per-Stremio-account flag: the engine's Stremio-synced OWNER library + Continue Watching have been
+    /// captured into the VortX account doc (`doc.vortx.library`). Once set, the app stops LOADING the Stremio
+    /// token into the stremio-core engine (`CoreBridge.bootstrapAuth`) and stops the direct Stremio progress
+    /// writes (`StremioAccount.saveProgress`/`resumeOffset`). The engine then runs on its purely-LOCAL library
+    /// bucket, which is ALREADY mirrored to `doc.vortx.library` (FLOOR union, never shrinks) and re-hydrated on
+    /// cold devices, so nothing is lost. Keyed by a SHA-256 prefix of the authKey (the same shape as
+    /// `repairDoneKey`) so the raw token never lands in UserDefaults and a DIFFERENT account re-imports.
+    ///
+    /// Non-destructive + idempotent: the flag ONLY records that the VortX copy exists; it never deletes a
+    /// library item or a removal tombstone, and the library mirror keeps running regardless of this flag. A
+    /// reinstall that clears the flag re-imports additively (union), so it can never lose a title. The Keychain
+    /// token itself is never dropped here: the user can still Connect Stremio, or opt into `alsoSyncToStremio`.
+    private static func libraryImportKey(_ authKey: String) -> String {
+        let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "vortx.library.importedFromStremio.\(digest)"
+    }
+
+    /// True once THIS Stremio account's library has been imported into the VortX account doc.
+    static func libraryImportedFromStremio(authKey: String) -> Bool {
+        guard !authKey.isEmpty else { return false }
+        return UserDefaults.standard.bool(forKey: libraryImportKey(authKey))
+    }
+
+    /// Record the completed one-time library import. Call ONLY after a confirmed, non-failed capture into the
+    /// VortX account doc (see `VortXSyncManager.importOwnerLibraryFromStremioOnce`), never speculatively.
+    static func markLibraryImportedFromStremio(authKey: String) {
+        guard !authKey.isEmpty else { return }
+        UserDefaults.standard.set(true, forKey: libraryImportKey(authKey))
+    }
+
     /// nil = not probed yet; false = the API refused our collection, cloud sync is disabled and
     /// profiles stay per-device (never fall back to libraryItem smuggling again).
     private(set) static var cloudAvailable: Bool?

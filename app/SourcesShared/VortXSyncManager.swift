@@ -1234,6 +1234,38 @@ final class VortXSyncManager: ObservableObject {
         await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
     }
 
+    /// Wave 4: one-time-per-account import of the engine's (Stremio-synced) OWNER library + Continue Watching
+    /// into the VortX account doc, after which `CoreBridge.bootstrapAuth` stops seeding the engine with the
+    /// Stremio token and `StremioAccount.saveProgress`/`resumeOffset` stop hitting api.strem.io by default.
+    ///
+    /// Data-safe migration (design step 4 ordering): CAPTURE first, RECORD only after a confirmed non-failed
+    /// push, so the VortX copy is PROVEN to exist before the token-load is dropped. Never deletes: `vortxSummary`
+    /// FLOOR-unions the engine add-ons + owner library into `doc.vortx.*` (never shrinks, subtracts only the
+    /// user's own removal tombstones), so this can only ADD. Idempotent: once the per-account flag is set this
+    /// is a fast no-op, and a re-run after a reinstall (flag cleared) re-captures additively, losing nothing.
+    ///
+    /// `stremioToken` is the live Stremio authKey (Keychain-only; used solely to key the per-account flag and
+    /// is never written to the account doc).
+    func importOwnerLibraryFromStremioOnce(stremioToken: String) async {
+        guard !stremioToken.isEmpty else { return }
+        guard isSignedIn else { return }                                             // need a VortX account to import INTO
+        guard !ProfileSync.libraryImportedFromStremio(authKey: stremioToken) else { return }   // already migrated
+        // Make the engine load its account library into the readable `library` field so `vortxSummary` captures
+        // the FULL set (the engine persists its bucket locally, so this reflects the Stremio-pulled library).
+        await CoreBridge.shared.loadLibraryAndAwait()
+        // Require the engine to have POSITIVELY reported a library (`library != nil`): a nil library is "still
+        // loading / unknown", not "empty", so we never confirm the import against an unknown state. Retry next launch.
+        guard CoreBridge.shared.library != nil else { return }
+        // Confirm the VortX account doc is reachable (a `.failed`/`.empty` pull means a degraded network: retry
+        // next launch rather than mark imported while unreachable), then push the FLOOR union.
+        guard case .doc = await pullSyncDocResult() else { return }
+        guard await syncUp() else { return }   // push failed: do NOT record the import
+        // The VortX copy is confirmed on the server. Record it so the next launch can stop loading the Stremio
+        // token. The Keychain token is left intact (opt-in reconnect / two-way sync).
+        ProfileSync.markLibraryImportedFromStremio(authKey: stremioToken)
+        DiagnosticsLog.log("sync", "imported the Stremio-owned library into the VortX account (one-time); the engine can now run local")
+    }
+
     /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an
     /// already-synced launch can snapshot-on-import exactly once. A `.failed`/`.empty` pull returns false
     /// (nothing to do / no doc), so we never snapshot before the account is reachable.
