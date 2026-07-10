@@ -1446,6 +1446,12 @@ struct FullBleedBackdrop: View {
 
 /// The per-addon stream list from the engine: source filter chips + each addon's streams shown
 /// exactly as the addon labelled them (name + full description), with direct/debrid vs torrent.
+/// A stable-identity source row: a content id (`CoreStream.id`) plus an occurrence index disambiguates
+/// duplicate streams that share the same id, so the ~4/sec republish no longer reassigns every row's identity
+/// (which stranded the tvOS focus handle and defeated Lazy diffing). Built bounded to the render window, so the
+/// per-row string work stays capped no matter how many thousand sources a title returns.
+private struct SourceRow: Identifiable { let id: String; let addon: String; let stream: CoreStream }
+
 struct CoreStreamList: View {
     let title: String
     var meta: PlaybackMeta? = nil
@@ -1460,6 +1466,12 @@ struct CoreStreamList: View {
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
     private static let sourceRefreshDebounceMs = 400   // trailing settle for the add-on load storm, mirrors coalesceMs intent
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
+    // Render only the top N ranked rows at a time; a popular title returns 4000+ sources and instantiating
+    // every row (even lazily) plus reassigning identity ~4x/sec starved the tvOS focus engine. "Show more"
+    // grows the window by a step. Ranking + auto-pick still run over the FULL list; this caps RENDERING only.
+    @State private var sourceRenderLimit = Self.sourceWindowInitial
+    private static let sourceWindowInitial = 100
+    private static let sourceWindowStep = 100
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
@@ -1549,6 +1561,24 @@ struct CoreStreamList: View {
         let best = sourceList.best
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+        // Window the RENDERED rows: build at most `sourceRenderLimit` stable-id rows from the visible groups,
+        // stopping the moment the budget is hit (bounded string work, no matter how many thousand sources land).
+        // Ranking + auto-pick (playBest below) still read the FULL `groups`, never these windowed rows, so
+        // Watch-Now always picks the GLOBAL best, not the best of the first 100.
+        var seen: [String: Int] = [:]
+        var rows: [SourceRow] = []
+        rows.reserveCapacity(sourceRenderLimit)
+        buildRows: for g in visible {
+            for s in g.streams {
+                let base = s.id
+                let n = seen[base, default: 0]; seen[base] = n + 1
+                rows.append(SourceRow(id: "\(base)#\(n)", addon: g.addon, stream: s))
+                if rows.count >= sourceRenderLimit { break buildRows }
+            }
+        }
+        let shownRows = rows
+        let visibleCount = visible.reduce(0) { $0 + $1.streams.count }   // total in the filtered view, for "Show more"
+        let hasMore = visibleCount > shownRows.count
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
@@ -1642,15 +1672,22 @@ struct CoreStreamList: View {
                 }
                 if showAllSources {
                     if groups.count > 1 { filterBar(groups, total: streamCount) }
-                    // LazyVStack so only on-screen rows are built: a popular title can return 2000+ sources,
-                    // and a plain VStack instantiated them all at once, OOM-crashing the Apple TV mid-load.
+                    // LazyVStack so only on-screen rows are built; the window caps how many rows exist at all,
+                    // keeping the focus tree small. Rows carry a stable content id (SourceRow), so the ~4/sec
+                    // republish no longer reshuffles the focus handle mid-scroll.
                     LazyVStack(spacing: Theme.Space.sm) {
-                        ForEach(visible) { group in
-                            ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
-                                streamRow(group.addon, stream)
+                        ForEach(shownRows) { row in streamRow(row.addon, row.stream) }
+                        if hasMore {
+                            Button { sourceRenderLimit += Self.sourceWindowStep } label: {
+                                Label("Show more · \(visibleCount - shownRows.count) more", systemImage: "chevron.down")
                             }
+                            .buttonStyle(ChipButtonStyle())
                         }
                     }
+                    // The source column is its own focus section, so "Show more" stays reachable and a press
+                    // can't dump focus to the tab bar. The Watch-Now default-focus seat sits ABOVE this section,
+                    // outside it, so seating is unaffected.
+                    .focusSection()
                 }
             } else if loadingAddons {
                 // Searching: a focusable, primary-styled loading button (focus can't escape to the tab bar
@@ -1701,6 +1738,10 @@ struct CoreStreamList: View {
         // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
         // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
         .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
+        // Reset the render window when the list collapses (so re-expanding starts fresh at the top) or the
+        // title changes (a new list should not inherit the previous title's expanded window).
+        .onChange(of: showAllSources) { _ in if !showAllSources { sourceRenderLimit = Self.sourceWindowInitial } }
+        .onChange(of: meta?.libraryId) { _ in sourceRenderLimit = Self.sourceWindowInitial }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
         // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
         // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).

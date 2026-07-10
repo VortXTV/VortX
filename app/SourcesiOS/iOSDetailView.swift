@@ -3203,6 +3203,16 @@ private struct iOSProgressStripe: View {
 ///
 /// It owns its own filter / collapse / picker UI state and plays a chosen source through the `play`
 /// closure handed in by `iOSDetailView` (which resolves resume + presents the native player).
+/// A stable-identity source row: a content id (`CoreStream.id`) plus an occurrence index disambiguates
+/// duplicate streams that share the same id, so the ~4/sec republish keeps each row's identity stable (Lazy
+/// diffing no longer reshuffles the list). Built bounded to the render window, so the per-row string work stays
+/// capped no matter how many thousand sources a title returns.
+private struct SourceRow: Identifiable { let id: String; let addon: String; let stream: CoreStream }
+
+/// One add-on section in the windowed render plan: the group (for its header) plus only the rows that fit the
+/// shared render budget. A collapsed group carries an empty `rows` (its header still shows the full count).
+private struct WindowedGroup: Identifiable { let id: String; let group: CoreStreamSourceGroup; let rows: [SourceRow] }
+
 struct iOSSourceList: View {
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
@@ -3259,6 +3269,12 @@ struct iOSSourceList: View {
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
+    // Render only the top N ranked rows across the expanded groups; a popular title returns 4000+ sources and
+    // reassigning row identity ~4x/sec starved diffing. "Show more" grows the window by a step. Ranking +
+    // auto-pick still run over the FULL list (see controlBar); this caps RENDERING only.
+    @State private var renderLimit = Self.sourceWindowInitial
+    private static let sourceWindowInitial = 100
+    private static let sourceWindowStep = 100
     /// Rows whose per-row download was tapped this session (keyed by playable URL), so the icon flips to
     /// a check and disables; the tap used to give ZERO feedback, reading as "does nothing" (#21).
     @State private var queuedDownloads: Set<String> = []
@@ -3295,6 +3311,37 @@ struct iOSSourceList: View {
     private var loading: Bool { !settleTimedOut && (progress.total == 0 || progress.loaded < progress.total) }
     private var visibleGroups: [CoreStreamSourceGroup] {
         groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+    }
+
+    /// Windowed render plan for the grouped list: walk the visible groups, spending a shared row budget
+    /// (`renderLimit`) only on EXPANDED groups. A collapsed group emits its header but no rows and spends
+    /// nothing. Rows carry a stable content id (SourceRow), and the build is bounded to the budget, so the
+    /// per-row string work stays capped. `expandable` is the count of rows that COULD still render (visible +
+    /// not collapsed), so "Show more" is offered only when growing the window actually reveals more rows.
+    private var windowedPlan: (groups: [WindowedGroup], shown: Int, expandable: Int) {
+        var budget = renderLimit
+        var shown = 0
+        var expandable = 0
+        var out: [WindowedGroup] = []
+        for group in visibleGroups {
+            if collapsed.contains(group.addon) {
+                out.append(WindowedGroup(id: group.addon, group: group, rows: []))
+                continue
+            }
+            let streams = sortedStreams(group)
+            expandable += streams.count
+            let take = min(budget, streams.count)   // budget is never negative: take <= budget each step
+            var seen: [String: Int] = [:]
+            let rows = streams.prefix(take).map { s -> SourceRow in
+                let base = s.id
+                let n = seen[base, default: 0]; seen[base] = n + 1
+                return SourceRow(id: "\(base)#\(n)", addon: group.addon, stream: s)
+            }
+            out.append(WindowedGroup(id: group.addon, group: group, rows: Array(rows)))
+            budget -= take
+            shown += take
+        }
+        return (out, shown, expandable)
     }
 
     /// Empty result, told apart by CAUSE. If one or more add-ons actually ERRORED (fetch / timeout /
@@ -3421,6 +3468,11 @@ struct iOSSourceList: View {
                 }
             }
         }
+        // Reset the render window when the list collapses (re-expanding starts fresh at the top) or the title
+        // changes (a new title must not inherit the previous one's grown window). pinContext carries the metaId,
+        // so it flips on a title change even while this view stays mounted across a navigation.
+        .onChange(of: showAllSources) { _ in if !showAllSources { renderLimit = Self.sourceWindowInitial } }
+        .onChange(of: pinContext) { _ in renderLimit = Self.sourceWindowInitial }
     }
 
     // MARK: Controls (Watch-in-X · Quality picker · All sources)
@@ -3534,19 +3586,24 @@ struct iOSSourceList: View {
     /// One collapsible section per add-on. LazyVStack so only on-screen rows are built — a popular
     /// title can return thousands of sources, and instantiating them all at once OOM-crashed on tvOS.
     private var groupedList: some View {
-        LazyVStack(spacing: Theme.Space.sm) {
-            ForEach(visibleGroups) { group in
+        let plan = windowedPlan
+        return LazyVStack(spacing: Theme.Space.sm) {
+            ForEach(plan.groups) { wg in
                 // Header + rows as flat SIBLINGS, NOT wrapped in `Section {} header: {}`. On macOS the
                 // LazyVStack + Section(header:) combo mis-measures section geometry during lazy realization -
                 // a not-yet-built section reserves a near-viewport-height blank, which is the reported
                 // "sources vanish / big blank gaps on scroll". Emitting them flat removes that reservation
                 // while KEEPING the LazyVStack, so a title with thousands of sources still won't OOM on tvOS.
-                sectionHeader(group)
-                if !collapsed.contains(group.addon) {
-                    ForEach(Array(sortedStreams(group).enumerated()), id: \.offset) { _, stream in
-                        streamRow(group.addon, stream)
-                    }
+                sectionHeader(wg.group)
+                if !collapsed.contains(wg.group.addon) {
+                    ForEach(wg.rows) { row in streamRow(row.addon, row.stream) }
                 }
+            }
+            if plan.shown < plan.expandable {
+                Button { renderLimit += Self.sourceWindowStep } label: {
+                    Label("Show more · \(plan.expandable - plan.shown) more", systemImage: "chevron.down")
+                }
+                .buttonStyle(ChipButtonStyle())
             }
         }
     }
