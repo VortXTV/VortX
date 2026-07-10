@@ -673,7 +673,13 @@ final class VortXSyncManager: ObservableObject {
         // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
         // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
         // resurrecting them. Empty set is omitted so a fresh account never writes the key.
-        let deleted = store.deletedProfileIDs
+        // UNION the account's already-owned tombstones (existingVortx) with the local set so a push can NEVER
+        // SHRINK the deleted-profiles set, symmetric with how foldDocTombstones protects deletedLibrary /
+        // deletedAddons. Without this, a device whose local set is momentarily empty (a fresh reinstall before
+        // its first syncDown fold) could drop the account's tombstones and let a peer resurrect a deleted
+        // profile. A profile is never un-deleted (the owner is never tombstoned), so the union only ever grows.
+        var deleted = store.deletedProfileIDs
+        if let priorDeleted = existingVortx?["deletedProfiles"] as? [String] { deleted.formUnion(priorDeleted) }
         if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
         // Durable cross-device add-on REMOVAL tombstones (app-authoritative, exactly like deletedProfiles;
         // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer

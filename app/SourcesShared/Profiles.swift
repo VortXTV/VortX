@@ -745,23 +745,40 @@ final class ProfileStore: ObservableObject {
     /// stamps the per-account flag so it runs exactly once. The order is the data-safety rule: never mark the
     /// import done while the data still lives only in Stremio.
     private func importProfilesFromStremio(authKey: String) async {
-        // Roster: UNION into the live store (never a REPLACE), so neither a local-only nor a Stremio-only
-        // profile is dropped. A unioned-back profile keeps its own watch cache, so its overlay is preserved.
-        if let remote = await ProfileSync.fetchRoster(authKey: authKey) {
-            await MainActor.run { self.mergeInRoster(remote.profiles, incomingModified: remote.mtime) }
-        }
-        // Per-profile overlay watch: fold each overlay profile's Stremio history into its local cache, last
-        // writer wins per title. Engine-backed (owner / own-account) profiles are skipped: their history is
-        // the account library, not an overlay, and applyRemoteOverlay refuses them anyway (the invariant).
-        let overlayIDs = await MainActor.run { self.profiles.filter { !$0.usesEngineHistory }.map(\.id) }
+        // ORDER AFTER A VORTX PULL FIRST. On a reinstall the local delete-tombstone set is empty until a pull
+        // folds it, so pushing before folding could emit a doc that OMITS deletedProfiles and let a peer that
+        // still holds a deleted profile re-seed it into the cloud roster (the sync-wound resurrection). Pull
+        // first so the account's roster and its profile tombstones are folded into the local store before we
+        // merge Stremio in and push. Plain (not forced) so a genuine local edit made in the first seconds
+        // after launch, which arms a pending push, still defers this pull instead of being clobbered.
+        await VortXSyncManager.shared.syncDown()
+        // Read the legacy Stremio roster (do not merge yet: the overlays are folded first, below).
+        let remoteRoster = await ProfileSync.fetchRoster(authKey: authKey)
+        // Per-profile overlay watch, folded BEFORE the roster merge (last writer wins per title). Two reasons
+        // for the ordering: (1) collapseEmptyDuplicateSecondaries runs inside mergeInRoster and decides
+        // "empty" by reading the watch cache, so folding overlays first means a just-imported same-name
+        // secondary that HAS history is seen as history-bearing and is never dropped as an empty duplicate;
+        // (2) engine-backed (owner / own-account) profiles are skipped, since their history is the account
+        // library and applyRemoteOverlay refuses them anyway (the per-profile invariant). Reading the remote
+        // roster's own flags avoids depending on whether the profile is merged locally yet.
+        let overlayIDs = (remoteRoster?.profiles ?? []).filter { !$0.usesEngineHistory }.map(\.id)
         for id in overlayIDs {
             guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: authKey),
                   !remote.isEmpty else { continue }
             await MainActor.run { self.applyRemoteOverlay(profileID: id, entries: remote) }
         }
+        // Roster: ADDITIVE union (incomingModified: nil). VortX is authoritative, so a shared profile keeps
+        // its VortX-owned fields (name, PIN, avatar, playback, isKids, disabledAddons) and Stremio only
+        // APPENDS profiles it alone has. Passing Stremio's real mtime here would let a stale frozen-Stremio
+        // record win a shared id wholesale and roll back a field the user changed on the new build, then
+        // propagate that revert on push. This matches every other mergeInRoster caller (all pass nil).
+        if let remoteRoster {
+            await MainActor.run { self.mergeInRoster(remoteRoster.profiles, incomingModified: nil) }
+        }
         // Fold complete: push the merged roster + overlays into the VortX account so doc.vortx.* owns them.
-        // pushThisDevice() is syncUp(): it read-merges onto the account base (never clobbers another surface's
-        // keys) and reports whether the write landed.
+        // pushThisDevice() is syncUp(): it read-merges onto a freshly pulled account base (never clobbers
+        // another surface's keys, and vortxSummary unions the account's profile tombstones so the push can
+        // never shrink them) and reports whether the write landed.
         let pushed = await VortXSyncManager.shared.pushThisDevice()
         // STAMP THE FLAG ONLY once the VortX copy is confirmed, so the import is never marked done while the
         // data lives only in Stremio. If there is no VortX account yet, there is nothing to confirm and
