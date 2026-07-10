@@ -1311,17 +1311,19 @@ final class CoreBridge: ObservableObject {
     /// on the next play. `@discardableResult` keeps fire-and-forget callers unchanged.
     @MainActor
     @discardableResult
-    func addCatalogItemToAccount(id: String, type: String) async -> Bool {
+    func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true) async -> Bool {
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return false }
-        // Explicit add supersedes a prior removal tombstone (dashboard add-to-library targeting the owner).
-        // Harmless during recoverOwnerLibraryIfEmpty: that path already SKIPS tombstoned ids, so no tombstoned
-        // id ever reaches here, and forget on a non-tombstoned id is a no-op.
-        LibraryTombstones.forget(id)
+        // An explicit user/dashboard add-to-library targeting the owner stamps the add so it supersedes a prior
+        // removal on every device (stampIntent: true, the default). The cold-device library recovery passes
+        // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt
+        // there could mint a machine timestamp that beats a real removal this device has not folded yet,
+        // durably resurrecting a removed title.
+        if stampIntent { LibraryTombstones.forget(id) }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         return true
     }

@@ -45,8 +45,9 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
-    /// Newest doc version this device has pushed or applied. Persisted to UserDefaults (kVersionKey) so the
-    /// version-wins guard stays consistent across relaunches: an in-memory 0 after a cold launch would treat
+    /// Newest doc version this device has pushed or applied. Persisted to UserDefaults per account (see
+    /// versionKey(for:)) so the version-wins guard stays consistent across relaunches: an in-memory 0 after a
+    /// cold launch would treat
     /// the account's current doc as "newer" and re-apply it once on every launch (harmless but wasteful, and
     /// it re-runs the restore). Seeded from UserDefaults at init.
     /// MIGRATION flip for the version-bound sync-document format (see VortXSyncCrypto.sealDocument). Stays
@@ -70,7 +71,6 @@ final class VortXSyncManager: ObservableObject {
     ///      NOT DONE.
     /// Flip this AND WRITE_SYNC_DOC_V2 in vortx-site vault.ts AND webapp/src/lib/vault.ts together.
     static let writeSyncDocV2 = false
-    private static let kVersionKey = "vortx.sync.lastSyncedVersion"   // legacy GLOBAL key (pre per-account)
     // H-2: the newest doc version this device has pushed or applied, keyed PER ACCOUNT so the version-wins
     // guard and the merge-base floor follow the signed-in account. A single global int broke on account-switch
     // (sign out of A at v1000, into B at v5 -> B's pulls would look stale). A fresh per-account key starts at
@@ -83,13 +83,16 @@ final class VortXSyncManager: ObservableObject {
     }
     private func persistLastSyncedVersion() { /* the computed setter above persists per-account; no-op kept so
         the advance-then-persist call sites read unchanged */ }
-    /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
-    /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
-    /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
-    private static let kEditsAtKey = "vortx.sync.lastAppliedProfileEditsAt"
+    /// LWW stamp of the last web profileEdits applied, keyed PER ACCOUNT (mirroring versionKey(for:)) so an
+    /// account switch cannot skip the new account's dashboard edits against the previous account's high-water
+    /// mark. Persisted to UserDefaults so a sign-out / re-login for the SAME account does not re-window an old
+    /// dashboard edit (e.g. a delete the app has already honored); a fresh per-account key starts at 0, and
+    /// re-apply is idempotent regardless. The per-account key RETAINS each account's high-water mark across
+    /// re-login, so signOut deliberately does NOT reset it.
+    private func editsAtKey(for accountId: String?) -> String { "vortx.sync.lastAppliedProfileEditsAt." + (accountId ?? "") }
     private var lastAppliedProfileEditsAt: Double {
-        get { UserDefaults.standard.double(forKey: Self.kEditsAtKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.kEditsAtKey) }
+        get { UserDefaults.standard.double(forKey: editsAtKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: editsAtKey(for: account?.id)) }
     }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
@@ -207,6 +210,11 @@ final class VortXSyncManager: ObservableObject {
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         Keychain.set(nil, for: kcAccount)
+        // The shared add-on ORDER is a global static with no account context, so a switched-in account would
+        // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
+        // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
+        // version and edits high-water marks are deliberately NOT reset (they are keyed by account id).
+        Self.appliedAddonOrder = []
     }
 
     // MARK: - HTTP
@@ -574,8 +582,9 @@ final class VortXSyncManager: ObservableObject {
         // SUBTRACT the durable removal tombstones from the library union (the library analogue of subtracting
         // deletedAddons from the add-on union): a title the user removed must NOT come back, even if the engine
         // still briefly holds it OR a peer device's prior doc.vortx.library still carries it. Compared on the
-        // same normalized id the tombstone is stored under. A legitimate re-add already cleared the tombstone
-        // (LibraryTombstones.forget), so this only ever drops genuinely-removed titles.
+        // same normalized id the tombstone is stored under. A legitimate re-add stamped a newer add time
+        // (LibraryTombstones.forget), so `all()` returns only the effectively-removed ids and this only ever
+        // drops genuinely-removed titles.
         let removedLibrary = LibraryTombstones.all()
         if !removedLibrary.isEmpty {
             for id in libraryByID.keys where removedLibrary.contains(LibraryTombstones.normalize(id)) {
@@ -670,10 +679,21 @@ final class VortXSyncManager: ObservableObject {
         // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
         // device uninstalls them on its next pull instead of re-hydrating them. Empty set is omitted.
         if !removedAddons.isEmpty { v["deletedAddons"] = Array(removedAddons) }
+        // Last-writer-wins companion for the add-on tombstones above: per-url {removedAt, addedAt} stamps
+        // under the same app namespace, so a peer folds a genuine reinstall's addedAt and stops re-emitting
+        // (and re-uninstalling) a stale removal. Additive: the dashboard and clients that do not know the
+        // field keep reading deletedAddons as before.
+        let removedAddonsTs = AddonTombstones.timestampsForSync()
+        if !removedAddonsTs.isEmpty { v["deletedAddonsTs"] = removedAddonsTs }
         // Durable cross-device library REMOVAL tombstones (app-authoritative, exactly like deletedAddons; the
         // dashboard only READS it). Carries the normalized ids the user removed so a peer device drops them on
         // its next pull instead of re-hydrating / recovering them. Empty set is omitted.
         if !removedLibrary.isEmpty { v["deletedLibrary"] = Array(removedLibrary) }
+        // Last-writer-wins companion for the tombstones above: per-id {removedAt, addedAt} stamps under the
+        // same app namespace, so a peer folds a genuine re-add's addedAt and stops re-emitting a stale removal.
+        // Additive: the dashboard and clients that do not know the field keep reading deletedLibrary as before.
+        let removedLibraryTs = LibraryTombstones.timestampsForSync()
+        if !removedLibraryTs.isEmpty { v["deletedLibraryTs"] = removedLibraryTs }
         return v
     }
 
@@ -719,6 +739,12 @@ final class VortXSyncManager: ObservableObject {
         case .empty: doc = [:]
         case .doc(let existing): doc = existing
         }
+        // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
+        // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
+        // overwriting the doc with a local-only view; this also re-seeds the maps after a b171 peer push that
+        // carried only the legacy arrays. Not the mint chokepoint (no webIDs). Suppressed because these
+        // UserDefaults writes happen outside syncDown's window and would otherwise self-arm a push.
+        withRemoteApplySuppressed { foldDocTombstones(doc) }
         // UNION the cloud's roster into the local one BEFORE makeBackup(), so a device with FEWER
         // profiles never shrinks the cloud's profile set: the pushed blob already contains both sides.
         // Any cloud-only profile that gets merged back keeps its own watch overlay (mergeInRoster does
@@ -818,10 +844,14 @@ final class VortXSyncManager: ObservableObject {
         if !force, hasPendingPush { return false }
         guard let pulled = await pullDocVersioned() else { return false }
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
-        // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
+        // is a no-op. lastSyncedVersion is persisted per account (versionKey(for:)) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
+        // Baseline-stamp installed add-ons before any fold runs, so the add-on removal fold + uninstall loop
+        // below can never re-uninstall an add-on the user demonstrably has on the first b172 run (see the
+        // helper). One-shot and self-suppressed; a no-op if the engine has not hydrated its add-ons yet.
+        baselineInstalledAddonsOnce()
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
         // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
         // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
@@ -893,28 +923,47 @@ final class VortXSyncManager: ObservableObject {
         // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
         // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
         // reinstalled on the next hydrate even before this uninstall runs.
-        // ALWAYS fold the incoming removals (never version-gate them): merging a removal tombstone is
-        // union-safe - it only ADDS to the durable removal set, it can never resurrect an add-on. Gating it on
+        // ALWAYS fold the incoming removals (never version-gate them): the fold is a per-id last-writer-wins
+        // max on both stamps (removedAt / addedAt), which is monotone and idempotent, so folding a stale,
+        // equal, or forced pull can only advance a stamp a newer pull would also advance and can never regress
+        // state; whichever stamp is newer wins and every device converges regardless of pull order. Gating it on
         // a "strictly newer" pull is what let a web/other-device removal be SKIPPED on an equal/forced pull, so
         // the tombstone never merged and the roster union re-added the add-on (the WatchHub/YouTube resurrection).
+        // Unlike a plain union, this fold CAN flip a url back to present when a peer's reinstall carries a newer
+        // addedAt: that is the point, it is how a genuine reinstall stops peers from re-uninstalling it. The
+        // deletedAddons array carries the effective removed set for older clients; the deletedAddonsTs companion
+        // carries the stamps, and a deletedAddons url with no stamp folds at the migration epoch so any real
+        // reinstall out-races it. webAddonRemovals is stamp-less and persistent, so it is passed SEPARATELY as
+        // webIDs (syncDown is the single mint chokepoint): merge mints a removedAt=now for a web url only when it
+        // is neither stamped nor already locally tracked, so a month-old stale web entry can never beat a recent
+        // reinstall, and the minted stamp is published in deletedAddonsTs on the next push.
         var incomingAddonRemovals: [String] = []
-        if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
-            incomingAddonRemovals += removed
+        var incomingAddonRemovalsTs: [String: Any] = [:]
+        if let vortx = doc["vortx"] as? [String: Any] {
+            if let removed = vortx["deletedAddons"] as? [String] { incomingAddonRemovals += removed }
+            if let ts = vortx["deletedAddonsTs"] as? [String: Any] { incomingAddonRemovalsTs = ts }
         }
-        if let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
-            incomingAddonRemovals += webRemoved
-        }
-        if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
+        let webAddonRemovals = (doc["webAddonRemovals"] as? [String]) ?? []   // web agent owns this write; we only READ it
+        if AddonTombstones.merge(legacyIDs: incomingAddonRemovals, stampsRaw: incomingAddonRemovalsTs, webIDs: webAddonRemovals) { restored = true }
         // Cross-device LIBRARY REMOVAL tombstones (the library analogue of the deletedAddons fold above).
-        // ALWAYS fold the incoming removals (never version-gate them): merging a removal tombstone is
-        // union-safe - it only ADDS to the durable removal set, it can never resurrect a title. This makes a
-        // removal made on device A durable HERE, so this device's vortxSummary keeps subtracting it from the
-        // library union and recoverOwnerLibraryIfEmpty keeps skipping it: a peer removal can no longer be
-        // union-resurrected or recovered back onto a cold engine. Enforcement is by subtract + recovery-skip
-        // (no live-engine uninstall loop, unlike add-ons: the owner library is the account library and a
-        // logged-out engine has none to mutate; the next cold hydrate simply honors the tombstone).
-        if let vortx = doc["vortx"] as? [String: Any], let removedLib = vortx["deletedLibrary"] as? [String] {
-            if LibraryTombstones.merge(removedLib) { restored = true }
+        // ALWAYS fold the incoming removals (never version-gate them): the fold is a per-id last-writer-wins
+        // max on both stamps (removedAt / addedAt), which is monotone and idempotent, so folding a stale,
+        // equal, or forced pull can only advance a stamp a newer pull would also advance and can never regress
+        // state; whichever stamp is newer wins and every device converges regardless of pull order. A removal
+        // made on device A stays durable HERE, so this device's vortxSummary keeps subtracting it from the
+        // library union and recoverOwnerLibraryIfEmpty keeps skipping it. Unlike a plain union, this fold CAN
+        // flip an id back to present when a peer's re-add carries a newer addedAt: that is the point, it is how
+        // a genuine re-add propagates instead of being suppressed forever. The legacy array carries the
+        // effective removed set for older clients; the deletedLibraryTs companion carries the stamps, and a
+        // legacy id with no stamp folds at the migration epoch so any real add out-races it. Enforcement is by
+        // subtract + recovery-skip (no live-engine uninstall loop, unlike add-ons: the owner library is the
+        // account library and a logged-out engine has none to mutate; the next cold hydrate honors the state).
+        if let vortx = doc["vortx"] as? [String: Any] {
+            let removedLib = (vortx["deletedLibrary"] as? [String]) ?? []
+            let removedLibTs = (vortx["deletedLibraryTs"] as? [String: Any]) ?? [:]
+            if !removedLib.isEmpty || !removedLibTs.isEmpty {
+                if LibraryTombstones.merge(legacyIDs: removedLib, stampsRaw: removedLibTs) { restored = true }
+            }
         }
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
@@ -1007,10 +1056,19 @@ final class VortXSyncManager: ObservableObject {
     func hydrateEngineFromOwnedAddons() async {
         guard isSignedIn else { return }
         guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
+        // Fold the doc's tombstone stamps into the local stores BEFORE computing the hydrate + recovery sets,
+        // so a cold launch (no prior syncDown) honors the removals the doc already carries: ownedAddons(from:)
+        // reads AddonTombstones.all() and recoverOwnerLibraryIfEmpty reads LibraryTombstones.all(), both of
+        // which would otherwise be stale on a fresh device. Suppressed so these UserDefaults writes do not
+        // self-arm a push.
+        withRemoteApplySuppressed { foldDocTombstones(doc) }
         let owned = Self.ownedAddons(from: doc)
         if !owned.isEmpty {
             CoreBridge.shared.hydrateAddonsFromAccount(owned)
         }
+        // The engine now holds the hydrated add-ons, so baseline-stamp them once (a no-op once syncDown or a
+        // prior hydrate already did it, or while the installed set is still empty).
+        baselineInstalledAddonsOnce()
         await recoverOwnerLibraryIfEmpty(from: doc)
     }
 
@@ -1083,8 +1141,11 @@ final class VortXSyncManager: ObservableObject {
         guard !engineHasLibrary else { return }
         // SKIP any id the user removed (the library analogue of ownedAddons(from:) excluding AddonTombstones):
         // a cold/empty engine must not RE-ADD a title the user explicitly removed, which was the exact
-        // resurrection path (the doc's deletedLibrary subset was already folded into this local set on
-        // syncDown, and we read the local set so even a doc that predates the removal is honored).
+        // resurrection path. The doc's deletedLibrary/deletedLibraryTs were folded into this local set on
+        // syncDown AND, on a cold launch, by hydrateEngineFromOwnedAddons right before this runs, so even a
+        // doc that predates the removal is honored. stampIntent: false because this is a machine re-add of
+        // account-owned titles: stamping an addedAt here could mint a machine timestamp that beats a real
+        // removedAt this device has not folded yet, durably resurrecting a removed title.
         let removedLibrary = LibraryTombstones.all()
         var recovered = 0
         for item in ownedLibrary {
@@ -1093,12 +1154,47 @@ final class VortXSyncManager: ObservableObject {
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
                   id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
-            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type)
+            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type, stampIntent: false)
             recovered += 1
         }
         if recovered > 0 {
             DiagnosticsLog.log("sync", "recovered \(recovered) owner-library title(s) from the VortX account on a cold device")
         }
+    }
+
+    /// Fold a pulled doc's app-owned tombstones (library + add-on, both the effective-removed arrays and the
+    /// {removedAt, addedAt} stamp companions) into the local last-writer-wins stores. Shared by the push-path
+    /// read-merge (mergeLocalIntoDoc) and the cold-launch hydrate so both honor the stamps the doc already
+    /// carries; the max-fold is idempotent, so calling it on paths that also fold elsewhere is safe. Never
+    /// passes webAddonRemovals (syncDown is the single mint chokepoint for stamp-less web removals). Callers
+    /// wrap this in withRemoteApplySuppressed.
+    private func foldDocTombstones(_ doc: [String: Any]) {
+        let vortx = doc["vortx"] as? [String: Any]
+        let libIDs = (vortx?["deletedLibrary"] as? [String]) ?? []
+        let libTs = (vortx?["deletedLibraryTs"] as? [String: Any]) ?? [:]
+        if !libIDs.isEmpty || !libTs.isEmpty {
+            LibraryTombstones.merge(legacyIDs: libIDs, stampsRaw: libTs)
+        }
+        let addonIDs = (vortx?["deletedAddons"] as? [String]) ?? []
+        let addonTs = (vortx?["deletedAddonsTs"] as? [String: Any]) ?? [:]
+        if !addonIDs.isEmpty || !addonTs.isEmpty {
+            AddonTombstones.merge(legacyIDs: addonIDs, stampsRaw: addonTs)
+        }
+    }
+
+    private static let addonBaselineStampedKey = "vortx.sync.addonBaselineStampedV2"
+    /// One-shot on first b172 run: stamp addedAt = now for every currently-installed non-official, non-protected
+    /// add-on, so a stale pre-b172 peer array (which for a b171-reinstalled add-on carries a removal but no
+    /// addedAt) cannot re-uninstall an add-on the user demonstrably has. Skips WITHOUT setting the flag when the
+    /// engine has not hydrated its add-ons yet, so a later call retries; self-suppressed so the stamping writes
+    /// do not arm a push. Accepted trade-off: a genuine new removal made on a still-b171 peer will not beat
+    /// these baseline stamps until that peer updates.
+    private func baselineInstalledAddonsOnce() {
+        guard !UserDefaults.standard.bool(forKey: Self.addonBaselineStampedKey) else { return }
+        let installed = CoreBridge.shared.addons.filter { !$0.isOfficial && !$0.isProtected }
+        guard !installed.isEmpty else { return }   // engine not hydrated yet: retry on a later call, flag unset
+        withRemoteApplySuppressed { AddonTombstones.baselineInstalled(installed.map { $0.transportUrl }) }
+        UserDefaults.standard.set(true, forKey: Self.addonBaselineStampedKey)
     }
 
     /// Snapshot the engine's CURRENT add-ons (full descriptors) into the account doc, anchoring
@@ -1292,6 +1388,12 @@ final class VortXSyncManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             if Task.isCancelled { return }
             await self?.syncUp()
+            // A newer edit that arrived while syncUp awaited cancelled this task and queued its own push.
+            // Clearing the flag here would open the pull guard while that newer push is still pending, letting
+            // an interleaved pull re-apply the account's pre-edit value and revert the just-made edit.
+            // Cancellation reliably means superseded, so bail without clearing: the final, non-cancelled task
+            // always reaches this line and clears the flag, so it can never stick true.
+            if Task.isCancelled { return }
             self?.hasPendingPush = false
         }
     }
