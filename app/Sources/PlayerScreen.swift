@@ -2012,7 +2012,11 @@ struct PlayerScreen: View {
             .buttonStyle(.plain)
         }
         .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        // Floating Up Next card over the video tail: Liquid Glass on OS 26, the frosted material on older
+        // systems. Non-interactive (the card is a surface; its own buttons stay pressable).
+        .glassChrome(in: RoundedRectangle(cornerRadius: 18, style: .continuous)) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.ultraThinMaterial)
+        }
         .frame(maxWidth: 480)
         .padding(.horizontal, 24).padding(.bottom, 96)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
@@ -2239,6 +2243,9 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
+        // The trailing transport discs sit shoulder to shoulder; group them so OS 26 blends the glass into
+        // one continuous bar instead of a run of isolated discs. Passthrough (unchanged layout) below 26.
+        .glassChromeCluster()
         .padding(.horizontal).padding(.top, 8)
     }
 
@@ -2838,7 +2845,10 @@ struct PlayerScreen: View {
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white).padding(11).background(.black.opacity(0.35), in: Circle())
+                .foregroundStyle(.white).padding(11)
+                // Floating transport chrome over the video: Liquid Glass on OS 26, the dark scrim disc on
+                // older systems. Interactive glass since these are pressable controls.
+                .glassChrome(in: Circle(), interactive: true) { Circle().fill(.black.opacity(0.35)) }
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
