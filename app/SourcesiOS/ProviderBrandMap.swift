@@ -41,6 +41,7 @@ enum ProviderBrandMap {
             119:  hex(9, 58, 92),      // Amazon Prime Video (alias)
             337:  hex(17, 24, 66),     // Disney+ - deep navy
             122:  hex(17, 24, 66),     // Disney+ Hotstar - shares the Disney navy
+            2336: hex(17, 24, 66),     // JioHotstar (canonical) - shares the Disney navy
             1899: hex(30, 17, 54),     // Max - dark violet
             384:  hex(30, 17, 54),     // HBO Max (alias)
             350:  hex(22, 22, 24),     // Apple TV+ - near-black

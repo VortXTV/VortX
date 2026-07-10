@@ -144,7 +144,12 @@ enum CollectionsCatalog {
     // MARK: scope fragments
 
     private static func providerScope(_ id: Int) -> String? {
-        "with_watch_providers=\(id)&with_watch_monetization_types=flatrate"
+        // Query the whole brand FAMILY (canonical + region aliases), joined with a percent-encoded pipe ONLY: a
+        // raw `|` nils URL(string:) on iOS 16 (our deployment floor) and bypasses the edge cache on 17+. Family
+        // ids come back canonical-first then ascending, so the joined query is stable and the edge never
+        // fragments on ordering.
+        let family = TMDBClient.providerFamilyMembers(id).map(String.init).joined(separator: "%7C")
+        return "with_watch_providers=\(family)&with_watch_monetization_types=flatrate"
     }
 
     /// nil when the genre has nothing to filter that media on (e.g. a movies-only genre's TV bucket), so the
@@ -479,8 +484,10 @@ final class CollectionsHubModel: ObservableObject {
 
     // MARK: provider cache (UserDefaults, region-keyed, cadence-throttled)
 
-    private static func cacheKey(_ region: String) -> String { "vortx.collections.providers.\(region)" }
-    private static func cacheAtKey(_ region: String) -> String { "vortx.collections.providersAt.\(region)" }
+    // v2 keys: the brand-family / canonical-tile rework changes the shape of the cached list, so bump BOTH the
+    // data key and its timestamp so the fix lands immediately instead of waiting out the daily cadence.
+    private static func cacheKey(_ region: String) -> String { "vortx.collections.providers.v2.\(region)" }
+    private static func cacheAtKey(_ region: String) -> String { "vortx.collections.providersAt.v2.\(region)" }
 
     private static func cacheProviders(_ tiles: [TMDBClient.ProviderTile], region: String) {
         let rows = tiles.map { ["id": $0.providerID, "name": $0.name, "logo": $0.logoPath ?? ""] as [String: Any] }
@@ -505,7 +512,17 @@ final class CollectionsHubModel: ObservableObject {
 
     private static let orderKey = "vortx.collections.providerOrder"
 
-    static func customOrder() -> [Int] { (UserDefaults.standard.array(forKey: orderKey) as? [Int]) ?? [] }
+    static func customOrder() -> [Int] {
+        let saved = (UserDefaults.standard.array(forKey: orderKey) as? [Int]) ?? []
+        guard !saved.isEmpty else { return [] }
+        // Canonicalize on read so a pin saved under a since-aliased id (NL/IN Prime 119, GB Discovery+ 524, the
+        // Paramount+ tier ids) still matches the canonical tile the region query now returns; dedupe stably.
+        var seen = Set<Int>()
+        return saved.compactMap { id in
+            let canonical = TMDBClient.canonicalProviderID(id)
+            return seen.insert(canonical).inserted ? canonical : nil
+        }
+    }
 
     /// Re-sort the region/featured tiles by the user's explicit order: pinned ids first in their saved order,
     /// any provider the user hasn't placed yet keeps its incoming (region/featured) position after them.

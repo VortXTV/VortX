@@ -524,9 +524,8 @@ enum TMDBClient {
         283: 8,               // Crunchyroll (anime)
         344: 9,               // Rakuten Viki (K-drama / Asian)
         430: 10,              // HiDive (anime)
-        122: 11,              // Disney+ Hotstar
+        2336: 11,             // JioHotstar (was Disney+ Hotstar 122 + JioCinema 970, both dead brands now)
         43: 12,               // Starz
-        37: 13,               // Showtime
         526: 14,              // AMC+
         520: 15, 524: 15,     // Discovery+
         38: 16,               // BBC iPlayer
@@ -549,11 +548,10 @@ enum TMDBClient {
         29: 29,               // Sky Go
         223: 30,              // Hayu
         381: 31,              // Canal+
-        74: 32,               // Videoland
-        155: 33,              // NLZIET
+        72: 32,               // Videoland (real id; 74 was a dead entry)
+        472: 33,              // NLZIET (real id; 155 was actually History)
         232: 34,              // Zee5
         237: 35,              // SonyLIV
-        970: 36,              // JioCinema
         195: 37,              // Shahid VIP
         330: 38,              // iQIYI
         307: 39,              // Globoplay
@@ -596,13 +594,52 @@ enum TMDBClient {
             let rb = featuredProviderRank[Self.canonicalProviderID(b.tile.providerID)] ?? (1000 + b.priority)
             return ra != rb ? ra < rb : a.tile.name < b.tile.name
         }
-        return Array(ranked.map(\.tile).prefix(limit))
+        // Rewrite each winning tile to its CANONICAL identity so a brand tiles once under one id: gives tvOS the
+        // brand dedupe it lacked, kills the GB Paramount+ duplicate, and keys the saved reorder off the canonical
+        // id. The display name is corrected where TMDB's post-merge name is stale (Paramount+, JioHotstar).
+        return ranked.prefix(limit).map { entry in
+            let canonical = Self.canonicalProviderID(entry.tile.providerID)
+            return ProviderTile(providerID: canonical,
+                                name: Self.canonicalDisplayName[canonical] ?? entry.tile.name,
+                                logoPath: entry.tile.logoPath)
+        }
     }
 
-    /// Some brands appear under two TMDB provider ids; map the alias to the canonical (kept) id so each brand
-    /// tiles once: Apple TV+ (2 -> 350), Prime Video (119 -> 9), Max (384 -> 1899), Discovery+ (524 -> 520).
-    private static let providerAlias: [Int: Int] = [2: 350, 119: 9, 384: 1899, 524: 520]
-    private static func canonicalProviderID(_ id: Int) -> Int { providerAlias[id] ?? id }
+    /// Some brands appear under several TMDB provider ids; map every alias to the canonical (kept) id so each
+    /// brand tiles once: Apple TV+ (2 -> 350), Prime Video (119 -> 9), Max (384 -> 1899), Discovery+ (524 -> 520),
+    /// Paramount+ (the 2303/2616/2304 tier ids that replaced the retired US 531 entry), JioHotstar (the dead
+    /// Disney+ Hotstar 122 and JioCinema 970 ids folded into the merged brand 2336).
+    private static let providerAlias: [Int: Int] = [
+        2: 350, 119: 9, 384: 1899, 524: 520,
+        2303: 531, 2616: 531, 2304: 531,   // Paramount+ Premium / Essential / legacy tier -> Paramount+
+        122: 2336, 970: 2336,              // Disney+ Hotstar + JioCinema -> JioHotstar
+    ]
+    static func canonicalProviderID(_ id: Int) -> Int { providerAlias[id] ?? id }
+
+    /// A brand's full family (the canonical id plus every alias id) derived by INVERTING `providerAlias`, so a
+    /// family is never hand-listed. Hand-listing silently breaks a brand wherever TMDB lists it under a region
+    /// alias rather than the canonical: Prime is 119 (not 9) in NL/IN, Discovery+ is 524 (not 520) in GB, and a
+    /// scope query built from the wrong id returns nothing there. Inverting the map keeps every alias paired
+    /// with its canonical automatically.
+    private static let providerFamilyByCanonical: [Int: [Int]] = {
+        var inverse: [Int: Set<Int>] = [:]
+        for (alias, canonical) in providerAlias {
+            inverse[canonical, default: [canonical]].insert(alias)
+        }
+        return inverse.reduce(into: [Int: [Int]]()) { out, pair in
+            out[pair.key] = [pair.key] + pair.value.subtracting([pair.key]).sorted()
+        }
+    }()
+
+    /// The member ids for a brand: canonical first, then aliases ascending, so the joined scope query is stable
+    /// and the edge cache never fragments on ordering. An id with no aliases yields just `[id]`.
+    static func providerFamilyMembers(_ canonical: Int) -> [Int] {
+        providerFamilyByCanonical[canonical] ?? [canonical]
+    }
+
+    /// The corrected display name for a canonical brand whose TMDB entry name is stale after a merge (Paramount+
+    /// absorbed Showtime; JioHotstar merged Disney+ Hotstar and JioCinema). Absent -> keep TMDB's own name.
+    private static let canonicalDisplayName: [Int: String] = [531: "Paramount+", 2336: "JioHotstar"]
 
     private static func providerPage(media: String, region: String) async -> [(tile: ProviderTile, priority: Int)] {
         let key = ApiKeys.effectiveTMDBKey()

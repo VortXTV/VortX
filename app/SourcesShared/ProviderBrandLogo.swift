@@ -35,6 +35,7 @@ enum ProviderBrandLogo {
         119:  "primevideo",     // Amazon Prime Video (alias)
         337:  "disneyplus",     // Disney+
         122:  "hotstar",        // Disney+ Hotstar
+        2336: "hotstar",        // JioHotstar (canonical: Disney+ Hotstar 122 + JioCinema 970 merged)
         1899: "max",            // Max
         384:  "max",            // HBO Max (alias)
         350:  "appletv",        // Apple TV+
@@ -96,6 +97,7 @@ enum ProviderBrandLogo {
         119:  BrandTileStyle(top: srgb(19, 153, 255),  bottom: srgb(15, 121, 198),  tintWhite: true),  // Prime Video (alias)
         337:  BrandTileStyle(top: srgb(12, 22, 103),   bottom: srgb(27, 44, 138),   tintWhite: true),  // Disney+
         122:  BrandTileStyle(top: srgb(12, 22, 103),   bottom: srgb(27, 44, 138),   tintWhite: true),  // Disney+ Hotstar
+        2336: BrandTileStyle(top: srgb(12, 22, 103),   bottom: srgb(27, 44, 138),   tintWhite: true),  // JioHotstar (canonical)
         1899: BrandTileStyle(top: srgb(10, 30, 220),   bottom: srgb(59, 10, 160),   tintWhite: true),  // Max
         384:  BrandTileStyle(top: srgb(10, 30, 220),   bottom: srgb(59, 10, 160),   tintWhite: true),  // HBO Max (alias)
         350:  BrandTileStyle(top: srgb(10, 10, 10),    bottom: srgb(0, 0, 0),       tintWhite: true),  // Apple TV+
