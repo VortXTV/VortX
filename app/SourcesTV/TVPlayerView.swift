@@ -415,7 +415,10 @@ struct TVPlayerView: View {
             // which captures nothing). Independent of the engine-teardown rules below.
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
             saveProgress(at: currentTime)   // no-op for live
-            if !isCurrentLiveStream {
+            // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
+            // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
+            // the viewer actually was. saveProgress(at:) just above already cleared the floor if playback passed it.
+            if !isCurrentLiveStream, suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
                 core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
             }
             // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
@@ -1413,6 +1416,9 @@ struct TVPlayerView: View {
             return [OptionRow(label: "Loading sources…", isHeader: true)]
         }
         for group in groups {
+            // T22: at the source cap, BREAK (stop scanning further groups) instead of continuing, so we do not
+            // pointlessly re-score every remaining group's streams. The empty-group case below still continues.
+            guard count < maxInPlayerSources else { break }
             // Score each stream ONCE; the old sort recomputed the (string-heavy)
             // score inside the comparator, which is what melted the main thread
             // on thousand-source titles.
@@ -1421,7 +1427,7 @@ struct TVPlayerView: View {
                 .sorted { $0.rank > $1.rank }
                 .prefix(perAddon)
                 .map(\.stream)
-            guard !best.isEmpty, count < maxInPlayerSources else { continue }
+            guard !best.isEmpty else { continue }
             rows.append(OptionRow(label: group.addon, isHeader: true))
             for stream in best {
                 guard count < maxInPlayerSources else { break }
@@ -1568,7 +1574,10 @@ struct TVPlayerView: View {
         currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
-        recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
+        // R11: only a USER-initiated pick re-arms the overall recovery cap. An automatic source hop
+        // (userInitiated == false, via hopToNextSource) must PRESERVE the running deadline, otherwise the 150s
+        // cap resets on every hop and never bounds a cascade of automatically failing sources.
+        if userInitiated { recoveryDeadline?.cancel(); recoveryDeadline = nil }
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
         prepareTorrent(stream)   // mid-playback switches never announced the torrent before
         resumeSeconds = currentTime
@@ -2006,9 +2015,27 @@ struct TVPlayerView: View {
         // Re-arm the load state + start watchdog for the libmpv re-load. Without this the mpv re-open after the
         // AVPlayer->mpv demote runs with NO start watchdog, so a stalled mpv re-open never fails over or surfaces
         // an error (mirrors iOS PlayerScreen.demoteAVPlayerToMPV).
+        let reconcileResume: Double? = hasStartedPlaying ? currentTime : resumeSeconds   // capture BEFORE the reset below zeroes hasStartedPlaying
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         avEngineFailed = true
         startLoadTimeout()
+        // R10 (ports iOS PlayerScreen.demoteAVPlayerToMPV): flipping avEngineFailed re-renders the mpv surface,
+        // which auto-loads the immutable LAUNCH url (initialPlayback.url). If this session switched source or
+        // episode IN PLACE, curURL moved off the launch url, so the flip alone would play the WRONG stream.
+        // Re-point mpv at the ACTIVE stream once its controller exists. The deferral is MANDATORY: the mpv
+        // controller only becomes coordinator.player on the NEXT SwiftUI render. The (cu != url) gate avoids a
+        // redundant double load when nothing was switched. resumeSeconds is set first so maybeResume restores
+        // the live position (not the stale switch-time offset); appliedResume is re-cleared inside the task so
+        // the resume lands on the switched stream, not the launch one.
+        if let cu = curURL, cu != url {
+            resumeSeconds = reconcileResume
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard avEngineFailed, !Task.isCancelled else { return }
+                appliedResume = false
+                loadIntoPlayer(cu, headers: curHeaders, live: curIsLive)
+            }
+        }
         return true
     }
 
@@ -2086,22 +2113,38 @@ struct TVPlayerView: View {
     /// "2:05:00"), used by the provisional-key self-heal above.
     private static func parseRuntimeSeconds(_ raw: String?) -> Double {
         guard let r = raw?.lowercased().trimmingCharacters(in: .whitespaces), !r.isEmpty else { return 0 }
+        // R23 twin (mirrors PlayerScreen.parseRuntimeSeconds / CoreMeta.runtimeSeconds): the raw string is
+        // add-on/Cinemeta-supplied, so compute in Double and cap each field. A garbage value like
+        // "3000000000000000:00:00" must yield 0, not trap on Int overflow or poison the trickplay bucket key.
+        // A field over 24h (86_400s) is rejected; the total must be finite and positive, clamped to a 24h ceiling.
+        let maxSeconds = 86_400.0
+        func field(_ rawField: Substring) -> Double? {
+            guard let n = Double(rawField.trimmingCharacters(in: .whitespaces)),
+                  n.isFinite, n >= 0, n <= maxSeconds else { return nil }
+            return n
+        }
+        func finalize(_ seconds: Double) -> Double {
+            guard seconds.isFinite, seconds > 0 else { return 0 }
+            return min(seconds, maxSeconds)
+        }
         if r.contains(":") {
-            let p = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if p.count == 3 { return Double(p[0] * 3600 + p[1] * 60 + p[2]) }
-            if p.count == 2 { return Double(p[0] * 60 + p[1]) }
+            let p = r.split(separator: ":").compactMap { field($0) }
+            if p.count == 3 { return finalize(p[0] * 3600 + p[1] * 60 + p[2]) }
+            if p.count == 2 { return finalize(p[0] * 60 + p[1]) }
         }
         if let hRange = r.range(of: #"\d+\s*h"#, options: .regularExpression) {
-            let h = Int(r[hRange].filter(\.isNumber)) ?? 0
-            var mins = 0
+            let h = Double(r[hRange].filter(\.isNumber)) ?? 0
+            var mins = 0.0
             if let mRange = r.range(of: #"\d+\s*m"#, options: .regularExpression,
                                     range: hRange.upperBound..<r.endIndex) {
-                mins = Int(r[mRange].filter(\.isNumber)) ?? 0
+                mins = Double(r[mRange].filter(\.isNumber)) ?? 0
             }
-            return Double(h * 3600 + mins * 60)
+            guard h <= maxSeconds, mins <= maxSeconds else { return 0 }
+            return finalize(h * 3600 + mins * 60)
         }
-        let minutes = Int(r.prefix { $0.isNumber }) ?? 0
-        return Double(minutes * 60)
+        let minutes = Double(r.prefix { $0.isNumber }) ?? 0
+        guard minutes <= maxSeconds else { return 0 }
+        return finalize(minutes * 60)
     }
 
     /// AVPlayer-only START watchdog. AVPlayer can mount and present its chrome yet never produce a playable
@@ -2118,7 +2161,9 @@ struct TVPlayerView: View {
         // HLS start can legitimately take more than the short watchdog to first-frame. Never demote HLS on the
         // no-frame timer: a genuinely-dead HLS link is still recovered by AVPlayer's own .failed path. The
         // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
-        if PlayerEngineRouter.isHLS(url) { return }
+        // T16: key the HLS exemption off the CURRENTLY-playing stream, not the immutable launch url, so an
+        // in-place switch to an HLS source is exempted and a switch away from one re-arms the watchdog.
+        if PlayerEngineRouter.isHLS(curURL ?? url) { return }
         avStartWatchdog = Task { @MainActor in
             // The AVPlayer no-frame safety net (#76 b165/b166/b170). Historically this lane first-framed 0% of
             // the time on 4K debrid DV MKVs because the local HLS master was rejected outright (-1002, the
@@ -2749,14 +2794,19 @@ struct TVPlayerView: View {
     /// pill simply appears once the result lands, normally well before the intro is reached.
     private func fetchSkipTimestamps() {
         guard let m = curMeta else { plog.info("skip: no curMeta, not fetching"); return }
+        let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
         guard SkipTimestampService.supports(metaId: m.libraryId) else {
             skipFetchTask?.cancel()
             apiSkipCandidates = []
-            skipFetchKey = ""
+            // T18: an unsupported title still resolves chapter-derived skip segments, so a NEW episode must reset
+            // the per-episode auto-skip dedup + pill dismissal here too (the supported branch below already does).
+            // Guard on the key so a same-episode re-fetch (a source switch re-fires the duration event) does not
+            // clobber mid-episode; store the real key (not "") so the next unsupported episode is detectable.
+            if key != skipFetchKey { autoSkippedStarts = []; skipPillDismissedStart = nil }
+            skipFetchKey = key
             refreshSkipSegments()
             return
         }
-        let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
         if key != skipFetchKey { apiSkipCandidates = []; autoSkippedStarts = []; skipPillDismissedStart = nil }   // new episode: reset auto-skip + pill dismissal
         skipFetchKey = key
         let dur = duration
@@ -3086,6 +3136,12 @@ struct TVPlayerView: View {
                 resumeSeconds = await account.resumeOffset(for: newMeta)
                 loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                 startLoadTimeout()
+                // R12: re-arm the guard only now that this episode's load is COMMITTED (loadIntoPlayer +
+                // startLoadTimeout done), and BEFORE the engine-handoff wait below. The old synchronous clear
+                // ran before this Task's tail, so a rapid double Next could interleave two loads; clearing after
+                // the 0..<60 loop would instead block a legitimate next switch for up to 15s. Mirrors the
+                // fallback branch, which clears switchingEpisode inside its own Task.
+                switchingEpisode = false
                 // Hand the stream to the engine Player once its meta_details catches up, so
                 // Continue Watching keeps tracking; harmless if it never matches.
                 for _ in 0..<60 {
@@ -3096,7 +3152,6 @@ struct TVPlayerView: View {
                     try? await Task.sleep(for: .milliseconds(250))
                 }
             }
-            switchingEpisode = false   // preload resolve done: re-arm for the next switch
             return
         }
 
