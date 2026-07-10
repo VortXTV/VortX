@@ -163,6 +163,15 @@ enum PlayerEngineRouter {
         return false
     }
 
+    /// True iff `hint` (a lowercased filename + query string) carries one of `exts` as a REAL container
+    /// extension: the token appears with its leading dot AND is followed by a delimiter or end-of-string, so a
+    /// stray in-path fragment (a ".ts" buried in a CDN id, a ".mov" inside a longer token) never counts. The
+    /// boundary-aware form of a plain substring scan; `exts` are given without the leading dot.
+    private static func hasContainerExtension(_ hint: String, _ exts: [String]) -> Bool {
+        let pattern = "\\.(" + exts.joined(separator: "|") + ")(?![a-z0-9])"
+        return hint.range(of: pattern, options: .regularExpression) != nil
+    }
+
     /// True for a source the DV-for-MKV remux path can attempt: an MKV (or a link with no mp4/mov/m4v token
     /// and a Matroska hint), served over http(s) from a non-loopback host. It must NOT already be an
     /// AVPlayer-native container (those take rule 3 directly) and NOT be a loopback/torrent URL. This is the
@@ -177,20 +186,22 @@ enum PlayerEngineRouter {
         // not remux -> dead end. Only a real native path extension vetoes; the Matroska checks below then decide.
         let pathExt = url.pathExtension.lowercased()
         if pathExt == "mp4" || pathExt == "m4v" || pathExt == "mov" || isHLS(url) { return false }
-        let s = url.absoluteString.lowercased()
-        let ext = url.pathExtension.lowercased()
-        if ext == "mkv" { return true }
-        // Debrid links often hide the filename in a query param with no path extension: treat a Matroska
-        // token as a candidate. A path that is a plain mp4/mov/m4v was already excluded above.
-        if s.contains(".mkv") || s.contains("matroska") { return true }
+        if pathExt == "mkv" { return true }
+        // Scan ONLY the filename + query, not the whole URL, and match container tokens on an extension
+        // BOUNDARY (the leading dot plus a trailing delimiter / end-of-string). A bare
+        // absoluteString.contains(".ts") used to veto on a stray ".ts" buried in a CDN path id or host, wrongly
+        // sending a true DV MKV to the tone-map lane; a boundary match over the filename/query never does.
+        let hint = (url.lastPathComponent + " " + (url.query ?? "")).lowercased()
+        // Debrid links often hide the filename in a query param with no path extension: a Matroska token there
+        // is a candidate. A path that is a plain mp4/mov/m4v was already excluded above.
+        if hasContainerExtension(hint, ["mkv"]) || hint.contains("matroska") { return true }
         // Fully extensionless debrid link with NO container hint at all (e.g. TorBox "/download/<id>" with
         // no filename token): a DV stream that reached here (rule 3b) is one whose text label said DV but the
         // URL gives no container. The remux stream probes the real container and FAILS FAST (no video mounted)
         // if it isn't a remuxable DV MKV, so attempting is safe and lets a genuinely-DV-MKV extensionless link
         // play true DV instead of silently tone-mapping. Only widen for the truly hint-less case, so a link
-        // that DOES carry a non-mkv container token above is unaffected.
-        if ext.isEmpty, !s.contains(".mp4"), !s.contains(".m4v"), !s.contains(".mov"),
-           !s.contains(".webm"), !s.contains(".avi"), !s.contains(".ts") {
+        // that DOES carry a non-mkv container token in its filename/query is unaffected.
+        if pathExt.isEmpty, !hasContainerExtension(hint, ["mp4", "m4v", "mov", "webm", "avi", "ts"]) {
             return true
         }
         return false

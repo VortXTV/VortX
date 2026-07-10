@@ -35,11 +35,16 @@ class MetalLayer: CAMetalLayer {
 
     /// Schedule a single frame capture. handler(texture) fires on a Metal completion thread when
     /// the GPU blit finishes, or handler(nil) fires immediately if the blit cannot be submitted.
-    /// Replaces any pending unserviced handler (best-effort, no backlog).
+    /// Replaces any pending unserviced handler (best-effort, no backlog); that replaced handler is
+    /// fired with nil so its caller's in-flight guard is never left stuck.
     func requestCapture(handler: @escaping (MTLTexture?) -> Void) {
         captureLock.lock()
+        let previous = _captureHandler
         _captureHandler = handler
         captureLock.unlock()
+        // Honor the always-fires contract for a still-pending handler this request replaces (no drawable
+        // serviced it yet). Invoked OUTSIDE the lock so the callback can never re-enter captureLock.
+        previous?(nil)
     }
 
     override func nextDrawable() -> (any CAMetalDrawable)? {
