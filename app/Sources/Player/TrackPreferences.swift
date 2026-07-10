@@ -63,7 +63,7 @@ enum PlaybackSettings {
     }
 
     static var directLinksOnlyForced: Bool {
-        #if STREMIOX_NO_EMBEDDED_SERVER
+        #if VORTX_NO_EMBEDDED_SERVER
         true
         #else
         false
@@ -71,7 +71,7 @@ enum PlaybackSettings {
     }
 
     static var directLinksOnly: Bool {
-        #if STREMIOX_NO_EMBEDDED_SERVER
+        #if VORTX_NO_EMBEDDED_SERVER
         true
         #else
         UserDefaults.standard.bool(forKey: Key.directLinksOnly)

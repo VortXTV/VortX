@@ -10,7 +10,7 @@ enum StremioServer {
     /// torrent request refused. On the Lite build (no embedded server) and on macOS (MacNodeServer reclaims
     /// and rebinds 11470 reliably via its own port handling), this stays the fixed 11470.
     static var embeddedPort: Int {
-        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
         if let p = NodeServer.discoveredPort { return p }
         #endif
         return 11470
@@ -28,7 +28,7 @@ enum StremioServer {
 
     /// Whether the embedded server can proxy (the Lite build ships no node server, so it can't).
     static var canProxy: Bool {
-        #if STREMIOX_NO_EMBEDDED_SERVER
+        #if VORTX_NO_EMBEDDED_SERVER
         return false
         #else
         return true
@@ -118,7 +118,7 @@ enum StremioServer {
     static func isOnline() async -> Bool {
         if await respondsAsServer("\(base)/settings") { return true }
         guard !isCustom else { return false }
-        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
         // Only the in-process iOS/tvOS server drifts; macOS (MacNodeServer) reclaims and rebinds 11470,
         // and the Lite build ships no embedded server, so neither scans (and NodeServer.latch is absent there).
         for port in 11470...11474 where port != embeddedPort {

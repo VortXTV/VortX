@@ -15,7 +15,7 @@ struct VortXTVApp: App {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
@@ -60,7 +60,7 @@ struct VortXTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
-                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    #if !VORTX_NO_EMBEDDED_SERVER
                     // Heal a drifted embedded-server session without visiting Settings: one GET that latches
                     // the real bound port if server.js fell back off 11470 while we were suspended.
                     Task.detached(priority: .utility) { _ = await StremioServer.isOnline() }

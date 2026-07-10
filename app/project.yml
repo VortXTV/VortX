@@ -175,7 +175,7 @@ targets:
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
         # webview, so this flag gates that proxy off there to shed footprint (issue #56, 2 GB Apple TV HD).
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_WEB_HOST"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_WEB_HOST"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -466,7 +466,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.12"
         CURRENT_PROJECT_VERSION: "173"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"

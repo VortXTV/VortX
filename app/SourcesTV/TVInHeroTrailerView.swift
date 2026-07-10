@@ -22,7 +22,7 @@ import SwiftUI
 ///     mounts this view when a trailer exists, so reduced-motion / setting-off never starts a clip.
 ///   • Only LOOPBACK urls (the embedded node server) wait on an async server-reachability probe; remote
 ///     urls (the `/clip` resolver, a direct CDN stream) mount immediately, so the Lite build
-///     (`STREMIOX_NO_EMBEDDED_SERVER`) plays remote clips like any other target.
+///     (`VORTX_NO_EMBEDDED_SERVER`) plays remote clips like any other target.
 ///   • If libmpv reports a load failure (`endFileError`, e.g. ytdl extraction failed), the clip hides and
 ///     the still backdrop stays.
 ///

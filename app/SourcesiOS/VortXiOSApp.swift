@@ -25,7 +25,7 @@ struct VortXiOSApp: App {
     // gives us the one reliable "the app is really quitting" hook (applicationWillTerminate),
     // which scenePhase .background/.inactive does NOT provide on macOS — those fire on ordinary
     // window/focus changes, so killing the server there would wrongly stop it mid-use.
-    #if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+    #if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     #endif
 
@@ -45,7 +45,7 @@ struct VortXiOSApp: App {
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()
         VXProbe.log("boot", "VortX launched probe=\(VXProbe.enabled)")
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
@@ -71,7 +71,7 @@ struct VortXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
-                        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
                         // Heal a drifted embedded-server session without visiting Settings: one GET that
                         // latches the real bound port if server.js fell back off 11470 while suspended.
                         // macOS is excluded: MacNodeServer reclaims and rebinds 11470 reliably.
@@ -374,7 +374,7 @@ private struct MacWindowChrome: NSViewRepresentable {
 }
 #endif
 
-#if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+#if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
 import AppKit
 
 /// macOS app delegate whose sole job is to kill the embedded node streaming server when the app
