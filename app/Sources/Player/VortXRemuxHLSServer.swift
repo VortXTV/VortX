@@ -263,6 +263,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         dvInf += ",CODECS=\"\(codecs)\""
         if let supplemental = sig.supplementalCodec { dvInf += ",SUPPLEMENTAL-CODECS=\"\(supplemental)\"" }
         if let range = sig.videoRange { dvInf += ",VIDEO-RANGE=\(range)" }
+        if sig.fps > 0 { dvInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
         // Lifeboat (the b170 -1002 fix): same URI, same CODECS, NO VIDEO-RANGE / NO SUPPLEMENTAL-CODECS.
         // AVFoundation's multivariant selector drops any variant carrying an explicit non-SDR VIDEO-RANGE
         // (PQ/HLG) whenever the output pipeline is not provably HDR at the instant the master is parsed
@@ -274,9 +275,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // either way: the fMP4 sample entry (hvc1+dvvC) and the in-band RPUs drive the actual DV decode, and
         // VortX forces the Apple TV panel itself via HDRDisplayMode. BANDWIDTH-1 keeps the DV variant
         // preferred when both survive; identical URIs make any ABR switch a no-op.
-        var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 1, 1))"
+        // BANDWIDTH is dropped by 100 kbps (not 1) so the readyToPlay access-log's indicatedBitrate reveals
+        // which variant AVFoundation latched: ~the DV BANDWIDTH means the DV variant, ~100 kbps lower means the
+        // lifeboat. Same ordering (DV preferred), identical URI, so playback is unchanged.
+        var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 100_000, 1))"
         if sig.width > 0, sig.height > 0 { fbInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
         fbInf += ",CODECS=\"\(codecs)\""
+        if sig.fps > 0 { fbInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
         let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia.m3u8\n"
         DiagnosticsLog.log("dv", "hls master served (2 variants)")
         respond(connection, body: Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")

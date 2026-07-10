@@ -113,6 +113,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let width: Int
         let height: Int
         let bandwidth: Int
+        let fps: Double                // base video frame rate; 0 when unknown (FRAME-RATE then omitted)
     }
 
     /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
@@ -721,7 +722,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
         // HLS lane: publish the master-playlist signaling now that the OUTPUT streams are final (post
         // extradata repair + DOVI sanitize/relabel). The local server blocks its master.m3u8 answer on this.
-        if hlsIndexingEnabled { hlsBuildSignaling(outCtx: outCtx, inCtx: inCtx, info: info, baseVideoOut: baseVideoOut) }
+        if hlsIndexingEnabled { hlsBuildSignaling(outCtx: outCtx, inCtx: inCtx, info: info, baseVideoOut: baseVideoOut, baseVideoIn: baseVideoIn) }
 
         guard let pkt = av_packet_alloc() else { buffer.fail("av_packet_alloc returned nil"); return }
         defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
@@ -1182,7 +1183,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// (the brand and VIDEO-RANGE are mandatory cross-checks; leaving either out is incorrect).
     private func hlsBuildSignaling(outCtx: UnsafeMutablePointer<AVFormatContext>,
                                    inCtx: UnsafeMutablePointer<AVFormatContext>,
-                                   info: SourceInfo, baseVideoOut: Int) {
+                                   info: SourceInfo, baseVideoOut: Int, baseVideoIn: Int) {
         var videoCodec = "hvc1.2.4.L153.B0"   // safe Main10 default when the hvcC parse fails
         var dvLevel = 0
         var blCompat = info.dvBLCompatId
@@ -1222,10 +1223,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         let br = Int(inCtx.pointee.bit_rate)
         let bandwidth = br > 0 ? br + br / 4 : 25_000_000   // headroom over the container rate; generous 4K default
+        // FRAME-RATE comes from the INPUT base-video stream: parameters_copy never sets the OUTPUT stream's
+        // avg_frame_rate, and inCtx must be read at baseVideoIn specifically because a Profile 7 source carries
+        // an enhancement-layer video track too, so "the first video stream" is the wrong one.
+        let fps = baseVideoIn >= 0 ? Self.frameRate(inCtx.pointee.streams[baseVideoIn]) : 0
         let sig = HLSSignaling(videoCodec: videoCodec, supplementalCodec: supplemental, videoRange: range,
-                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth)
+                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps)
         hlsLock.lock(); _hlsSignaling = sig; hlsLock.unlock()
-        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") bw=\(bandwidth)")
+        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth)")
     }
 
     /// RFC 6381 HEVC codec string ("hvc1.2.4.L153.B0") from an hvcC record's profile/tier/level bytes.
