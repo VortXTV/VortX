@@ -12,7 +12,7 @@ struct OpenLinkView: View {
     @State private var fileChoices: [LinkOpener.TorrentFile]? = nil   // multi-file pack → show the picker
     @State private var magnetLink: String? = nil                     // the magnet the open picker belongs to (#81)
     @State private var saved: [SavedLinksStore.Entry] = []           // saved magnets/links for this profile (#81)
-    @State private var resolveTask: Task<Void, Never>? = nil          // in-flight Twitch resolve, cancelled on dismiss
+    @State private var resolveTask: Task<Void, Never>? = nil          // in-flight resolve (Twitch/YouTube/magnet), cancelled on dismiss
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
     var body: some View {
@@ -183,9 +183,11 @@ struct OpenLinkView: View {
     private func playMagnet(_ magnet: LinkOpener.Magnet, link: String) {
         working = true
         status = "Fetching torrent info… this can take up to a minute"
-        Task { @MainActor in
+        resolveTask = Task { @MainActor in
             defer { working = false }
-            guard let resolution = await LinkOpener.resolveMagnet(magnet) else {
+            let resolution = await LinkOpener.resolveMagnet(magnet)
+            guard !Task.isCancelled else { return }   // sheet closed mid-resolve → don't present the player
+            guard let resolution else {
                 status = "Could not fetch the torrent. No reachable peers, or a dead magnet."
                 return
             }

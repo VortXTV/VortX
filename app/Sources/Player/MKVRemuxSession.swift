@@ -63,8 +63,9 @@ enum MKVRemuxSession {
         var info = SourceInfo()
 
         var ifmt: UnsafeMutablePointer<AVFormatContext>? = nil
-        guard avformat_open_input(&ifmt, input, nil, nil) == 0, let inCtx = ifmt else {
-            throw RemuxError.openInput(-1)
+        let oi = avformat_open_input(&ifmt, input, nil, nil)
+        guard oi == 0, let inCtx = ifmt else {
+            throw RemuxError.openInput(oi)
         }
         defer { var p: UnsafeMutablePointer<AVFormatContext>? = inCtx; avformat_close_input(&p) }
 

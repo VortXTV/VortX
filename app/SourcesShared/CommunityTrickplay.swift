@@ -74,14 +74,22 @@ enum CommunityTrickplay {
         return String(raw[r])
     }
 
-    /// tmdb->imdb map, persisted so each title resolves over the network at most ONCE per install.
+    /// tmdb->imdb map, persisted so each title resolves over the network at most ONCE per install. It is read
+    /// from `cachedIMDbID` (any thread) and mutated from `resolveIMDbID` (detached tasks) concurrently, so
+    /// every access goes through `tmdb2ttLock`. The UserDefaults write runs on a snapshot taken under the lock
+    /// but is issued outside it, so a slow defaults write never holds off other readers.
     private static let tmdb2ttDefaultsKey = "stremiox.trickplay.tmdb2tt"
+    private static let tmdb2ttLock = NSLock()
     private static var tmdb2ttCache: [String: String] = {
         (UserDefaults.standard.dictionary(forKey: tmdb2ttDefaultsKey) as? [String: String]) ?? [:]
     }()
 
     /// Synchronous cache lookup: the tt id previously resolved for a raw `tmdb:…` library id, or nil.
-    static func cachedIMDbID(for rawId: String) -> String? { tmdb2ttCache[rawId.lowercased()] }
+    static func cachedIMDbID(for rawId: String) -> String? {
+        let key = rawId.lowercased()
+        tmdb2ttLock.lock(); defer { tmdb2ttLock.unlock() }
+        return tmdb2ttCache[key]
+    }
 
     /// Resolve a `tmdb:…` library id (the identity our hub/TMDB catalogs key plays with) to its `tt…` IMDb id,
     /// so those plays contribute + fetch community trickplay exactly like Cinemeta (`tt…`) plays. THE bug this
@@ -94,7 +102,10 @@ enum CommunityTrickplay {
     /// nil on an unparseable id / both lookups missing.
     static func resolveIMDbID(rawId: String, seriesHint: Bool) async -> String? {
         let cacheKey = rawId.lowercased()
-        if let hit = tmdb2ttCache[cacheKey] { return hit }
+        tmdb2ttLock.lock()
+        let cached = tmdb2ttCache[cacheKey]
+        tmdb2ttLock.unlock()
+        if let cached { return cached }
         // "tmdb:693134" (canonical), tolerating "tmdb:movie:693134" / "tmdb:tv:693134".
         let parts = cacheKey.split(separator: ":").map(String.init)
         guard parts.first == "tmdb", let numeric = parts.dropFirst().first(where: { Int($0) != nil }) else { return nil }
@@ -102,8 +113,11 @@ enum CommunityTrickplay {
         let order = explicit.map { [$0] } ?? (seriesHint ? ["tv", "movie"] : ["movie", "tv"])
         for media in order {
             if let tt = await fetchExternalIMDbID(media: media, tmdbID: numeric) {
+                tmdb2ttLock.lock()
                 tmdb2ttCache[cacheKey] = tt
-                UserDefaults.standard.set(tmdb2ttCache, forKey: tmdb2ttDefaultsKey)
+                let snapshot = tmdb2ttCache
+                tmdb2ttLock.unlock()
+                UserDefaults.standard.set(snapshot, forKey: tmdb2ttDefaultsKey)
                 VXProbe.log("tp", "resolved \(rawId) -> \(tt) (\(media))")
                 return tt
             }

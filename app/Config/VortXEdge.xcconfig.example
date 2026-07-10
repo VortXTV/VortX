@@ -9,10 +9,17 @@
 // secret in git history is leaked forever. Keep the real value only in the local gitignored file
 // and in CI (a GitHub Actions repo secret), never in the tracked tree.
 //
-// VORTX_EDGE_SECRET is the 64-char hex shared secret. It is read at runtime from Info.plist
-// (key `VortXEdgeSecret`, which substitutes $(VORTX_EDGE_SECRET) at build time) by
-// SourcesShared/VortXEdgeAuth.swift, which signs requests to OUR gated edge hosts
-// (skip / trickplay / ratings / poster / erdb / trailer .vortx.tv) with X-VX-Ts + X-VX-Sig.
+// VORTX_EDGE_SECRET holds the MASKED secret blob, NOT the raw hex key. It is exactly the string returned
+// by VortXEdgeAuth.maskedValue(for: "<64-hex>"): the 64-char hex secret XORed with the runtime mask and
+// base64-encoded. At build time it substitutes $(VORTX_EDGE_SECRET) into Info.plist (key `VortXEdgeSecret`);
+// at runtime SourcesShared/VortXEdgeAuth.swift de-masks it back to the hex secret and signs requests to OUR
+// gated edge hosts (skip / trickplay / ratings / poster / erdb / trailer .vortx.tv) with X-VX-Ts + X-VX-Sig.
+//
+// DO NOT paste the raw 64-char hex key here. The de-mask path (VortXEdgeAuth.swift:72-82) XORs whatever it
+// finds against the mask, so a raw-hex value de-masks to non-hex bytes, fails the 64-hex validity check, and
+// SILENTLY collapses the secret to empty: no build error, no runtime warning, signing just turns into a
+// no-op, and the day enforce is flipped on every such build is locked out with no visible cause. Always run
+// the value through maskedValue(for:) first.
 //
 // EMPTY is safe: the workers run in OBSERVE mode, so an absent/empty secret produces a no-op /
 // empty-key signature that observe lets through. Leave it blank for local builds; the owner

@@ -83,7 +83,9 @@ enum VortXCrashReporter {
         }
 
         // 7) Uncaught Obj-C / Swift exception handler. This is NOT a signal context (the runtime calls us
-        //    normally, just before it aborts), so Foundation is usable there.
+        //    normally, just before it aborts), so Foundation is usable there. Save any handler already in
+        //    place so ours can chain to it (another reporter, or the runtime default) after writing the marker.
+        gPreviousExceptionHandler = NSGetUncaughtExceptionHandler()
         NSSetUncaughtExceptionHandler(vortxExceptionHandler)
 
         DiagnosticsLog.log("crash", "reporter installed (foldedPrevious=\(!preserveExisting && gMarkerFD >= 0 ? "maybe" : "no"), fd=\(gMarkerFD))")
@@ -159,6 +161,10 @@ private let gScratchCapacity = 32
 
 /// Saved previous sigaction per signal number, so the handler can chain to it.
 private var gPrevActions: UnsafeMutablePointer<sigaction>?
+
+/// Uncaught-exception handler installed before ours (another reporter, or the runtime default), saved at
+/// install() so our exception handler can chain to it after writing the marker.
+private var gPreviousExceptionHandler: (@convention(c) (NSException) -> Void)?
 
 /// Best-effort single-writer guard for the terminal path: set once a marker has been written so an
 /// exception that then aborts (SIGABRT) does not double-write, and a re-entrant fault is ignored.
@@ -266,19 +272,23 @@ private func vortxSignalHandler(_ sig: Int32) {
 /// duplicate it (the signal handler still chains to the OS).
 private func vortxExceptionHandler(_ exception: NSException) {
     let fd = gMarkerFD
-    guard fd >= 0, gAlreadyWrote == 0 else { return }
-    gAlreadyWrote = 1
-    let name = exception.name.rawValue
-    let reason = exception.reason ?? "(no reason)"
-    let symbols = exception.callStackSymbols.joined(separator: "\n")
-    let epoch = Int(Date().timeIntervalSince1970)
-    let block = "EXCEPTION:\(name) \(epoch)\n\(reason)\n\(symbols)\n"
-    if let data = block.data(using: .utf8) {
-        data.withUnsafeBytes { raw in
-            if let base = raw.baseAddress, raw.count > 0 {
-                _ = write(fd, base, raw.count)
+    if fd >= 0, gAlreadyWrote == 0 {
+        gAlreadyWrote = 1
+        let name = exception.name.rawValue
+        let reason = exception.reason ?? "(no reason)"
+        let symbols = exception.callStackSymbols.joined(separator: "\n")
+        let epoch = Int(Date().timeIntervalSince1970)
+        let block = "EXCEPTION:\(name) \(epoch)\n\(reason)\n\(symbols)\n"
+        if let data = block.data(using: .utf8) {
+            data.withUnsafeBytes { raw in
+                if let base = raw.baseAddress, raw.count > 0 {
+                    _ = write(fd, base, raw.count)
+                }
             }
         }
+        fsync(fd)
     }
-    fsync(fd)
+    // Chain to the handler installed before us so its reporter still runs; the runtime then aborts, and the
+    // ensuing SIGABRT is caught by the signal handler, which chains on to the OS default for the .ips report.
+    gPreviousExceptionHandler?(exception)
 }

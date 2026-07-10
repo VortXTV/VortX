@@ -47,15 +47,26 @@ final class ScrubThumbnailsStore: ObservableObject {
     private var hasRealDuration = false
     /// Raw JPEG frames captured THIS session, time-ordered build input for the upload sprite-sheet.
     private var sessionFrames: [CommunityTrickplay.CapturedFrame] = []
-    /// Frame count at the last upload. Throttles progressive re-uploads and lets the teardown flush skip a
-    /// re-send when no new coverage arrived. Replaces the old one-shot `didUpload` (which lost everything to a
-    /// missing teardown).
+    /// Frame count at the last upload. Lets the teardown flush skip a re-send when no new coverage arrived.
+    /// Replaces the old one-shot `didUpload` (which lost everything to a missing teardown).
     private var lastUploadedCount = 0
+    /// Monotonic timestamp (seconds) of the last progressive push, throttling re-uploads to at most one per
+    /// minute. 0 = none yet this title. Monotonic (not wall-clock) so a clock change can neither wedge nor
+    /// fast-forward the gate.
+    private var lastUploadUptime: TimeInterval = 0
+    /// True while a detached progressive upload is still building/POSTing, so a burst of captures does not spawn
+    /// overlapping re-encodes of the same session set.
+    private var uploadInFlight = false
     /// Capture cadence the local pipeline records at (~every 10s); also the sheet/vtt tile interval. Sourced
     /// from the RemoteConfig `trickplay.captureIntervalSecs` dial (clamped 2..60), so the owner can tune
     /// coverage density with no app update. Baked default 10 == the shipping value; a null/out-of-range remote
     /// value keeps 10. Read once at use; the value is stable for a playback session.
     private static var captureInterval: Double { Double(RemoteConfig.snapshot.captureIntervalSecs) }
+
+    /// Seconds on a monotonic clock (uptime), used to space progressive uploads independently of wall time.
+    nonisolated private static func monotonicNow() -> TimeInterval {
+        Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+    }
 
     func configure(localCacheKey: String?) {
         guard self.localCacheKey != localCacheKey else { return }
@@ -70,6 +81,8 @@ final class ScrubThumbnailsStore: ObservableObject {
         hasRealDuration = false
         sessionFrames = []
         lastUploadedCount = 0
+        lastUploadUptime = 0
+        uploadInFlight = false
     }
 
     /// Plumb the shareable identity + kick off the L1 community fetch. Call EARLY with a provisional duration
@@ -268,27 +281,31 @@ final class ScrubThumbnailsStore: ObservableObject {
 
     /// Upload DURING playback so trickplay is never lost to a missing teardown (movie ends -> home, sleep,
     /// auto-advance, or jetsam all skip the teardown flush below). Called after EACH kept capture (~every 10s),
-    /// this now pushes progressively as soon as even ONE new kept frame beats the stored set: the old
-    /// `lastUploadedCount + perMinute` batch gate meant no upload fired during a normal watch, so mid-play
-    /// contribution never happened and only a teardown (which frequently never fires) could store anything. The
-    /// worker is overwrite-wins / keep-fuller, so each small push just improves the stored set.
+    /// but rate-limited to at most one push per minute so a fuller set replaces a thinner one without a storm.
+    /// The worker is overwrite-wins / keep-fuller, so each push just improves the stored set.
     private func maybeUploadProgressively() {
-        // Minimum NEW kept frames since the last upload before we push again. 1 == push on every fresh kept frame
-        // (capture is ~every 10s, so effectively every ~10s of new coverage). This replaces the old ~1-minute
-        // batch so trickplay contributes live, not only at teardown.
-        let minNewFrames = 1
+        // Wall-clock throttle: at most one progressive push per minute. The whole session sheet is rebuilt and
+        // re-encoded on each push, so pushing on EVERY kept frame (the old minNewFrames=1) is O(N^2) re-encode
+        // work and, on a long film, up to ~1 GB uploaded for a first contributor. captureInterval is a
+        // fleet-tunable 2..60s dial, so a per-frame push could fire every ~2s; a fixed 60s wall gate decouples
+        // upload cadence from capture cadence. The teardown flush still sends the final full set.
+        let minUploadIntervalS: TimeInterval = 60
         // The community sheet builder needs >= 2 tiles: buildAndUpload's `while budget >= 2` loop is skipped for a
         // single frame, so a 1-frame push is admitted then dropped at the floor (the noisy sorted=1 failure every
         // session). Never spawn a progressive push until we actually have a buildable (>= 2) frame count.
         let minBuildableFrames = 2
         // Evaluate each guard clause up front so the probe can report WHY we do or do not upload this tick.
+        let now = Self.monotonicNow()
         let enabled = CommunityTrickplay.isEnabled
         let hasKey = communityKey != nil
         let beatsStored = sessionFrames.count > communityExistingFrameCount   // keep-fuller: don't clobber a fuller set
-        let hasNewCoverage = sessionFrames.count >= lastUploadedCount + minNewFrames
+        let hasNewCoverage = sessionFrames.count > lastUploadedCount          // nothing new since our last push
+        let throttleElapsed = lastUploadUptime == 0 || now - lastUploadUptime >= minUploadIntervalS
         let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
-        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && enoughToBuild && communityImdb != nil
-        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) minNew=\(minNewFrames) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
+        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && throttleElapsed
+            && enoughToBuild && !uploadInFlight && communityImdb != nil
+        let sincePushS = lastUploadUptime == 0 ? -1 : Int(now - lastUploadUptime)
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) sincePushS=\(sincePushS) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") throttleElapsed=\(throttleElapsed ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") inFlight=\(uploadInFlight ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -323,16 +340,19 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// server table can be traced (capture vs key vs POST) from the device log.
     private func pushUpload(key: String, imdb: String) {
         lastUploadedCount = sessionFrames.count
+        lastUploadUptime = Self.monotonicNow()
+        uploadInFlight = true
         let frames = sessionFrames
         let season = communitySeason, episode = communityEpisode
         let bucket = communityDurationBucket, height = communitySrcHeight
         VXProbe.log("tp", "pushUpload FIRING key=\(key) imdb=\(imdb) frames=\(frames.count)")
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
             let ok = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,
                 durationBucket: bucket, srcHeight: height,
                 intervalS: Self.captureInterval, frames: frames)
             VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(ok ? "stored" : "failed")")
+            await MainActor.run { self?.uploadInFlight = false }
         }
     }
 
@@ -404,16 +424,6 @@ private final class LocalTrickplayFrameCache {
 
     init() {
         ioQueue.async { _ = self.cacheDirectory }
-    }
-
-    func hasFrames(for key: String?) -> Bool {
-        guard let key, !key.isEmpty else { return false }
-        return ioQueue.sync {
-            // NSCache isn't enumerable by prefix; the on-disk presence is the source of truth here.
-            let prefix = filePrefix(for: key) + "-"
-            let files = (try? FileManager.default.contentsOfDirectory(at: cacheDirectory, includingPropertiesForKeys: nil)) ?? []
-            return files.contains { $0.lastPathComponent.hasPrefix(prefix) }
-        }
     }
 
     func store(image: ScrubImage, data: Data, for key: String, time: Double) {

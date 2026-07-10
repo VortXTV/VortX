@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// Client for VortX's community SOURCE INDEX at `sources.vortx.tv` ("Singularity"): the pooled record of which
 /// SOURCES (torrent / usenet / direct) exist for a title, corroborated across users.
@@ -37,7 +36,7 @@ enum SourceIndexClient {
     /// One anonymized source descriptor for the HOARD upload. Carries ONLY public, non-personal fields.
     struct Descriptor: Encodable {
         let kind: String
-        let id: String            // infohash (torrent) | nzb id (usenet) | sha256(url) (direct)
+        let id: String            // infohash (torrent) | real nzb link (usenet) | real http link (direct)
         let quality: String       // e.g. "4K", "1080p", "Other" (from StreamRanking.qualityLabel)
         let sizeBytes: Int64      // 0 when the add-on advertised no size
         let sourceTag: String     // the add-on / provider label the source came from (no user data)
@@ -72,8 +71,10 @@ enum SourceIndexClient {
     /// app's. Skips YouTube trailers and any stream with no derivable public id. Deduped by descriptor id.
     ///
     /// PRIVACY: the debrid-resolved `url` of a torrent that a service already unlocked is a PERSONAL link, so it
-    /// is never sent. A torrent/usenet source is keyed by its infohash / nzb id; a plain direct link is keyed by
-    /// sha256(url) (one-way), never the url itself. No account token, user id, or filename is included.
+    /// is never sent (the public infohash is used instead). A torrent is keyed by its infohash, a usenet source
+    /// by its real nzb link, and a plain direct source by its real http link (owner directive 2026-07-05), with
+    /// the worker stripping credential query params before storing. No account token, user id, or filename is
+    /// included.
     static func descriptors(from groups: [CoreStreamSourceGroup]) -> [Descriptor] {
         var seen = Set<String>()
         var out: [Descriptor] = []
@@ -370,11 +371,6 @@ enum SourceIndexClient {
         RemoteConfig.snapshot.endpoint("sources") ?? URL(string: RemoteConfigDefaults.endpointSources)!
     }
 
-    /// Lowercase hex SHA-256 of a string, for the one-way `id` of usenet / direct sources (never the raw link).
-    private static func sha256Hex(_ input: String) -> String {
-        SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
     /// Trim + bound the source tag so it stays a short provider label with no accidental user data. Caps length.
     private static func sanitizeTag(_ raw: String) -> String {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -458,8 +454,12 @@ final class SourceIndexServeSource: ObservableObject {
     func refresh(contentID: String?, isSignedIn: Bool) {
         guard SourceIndexClient.serveEnabled, SourceIndexClient.isEnabled, isSignedIn,
               let contentID, contentID != lastContentID else {
-            // When SERVE is off (or signed out / no consent), clear any previously-merged community sources.
-            if !SourceIndexClient.serveEnabled && !streams.isEmpty { streams = [] }
+            // Clear any previously-merged community sources whenever the SERVE gate is CLOSED (toggle off, signed
+            // out, or consent/fleet-flag withdrawn), so stale Singularity rows do not linger after the gate
+            // closes. A skip for an unchanged / nil content id with the gate still open leaves them in place.
+            if (!SourceIndexClient.serveEnabled || !SourceIndexClient.isEnabled || !isSignedIn), !streams.isEmpty {
+                streams = []
+            }
             return
         }
         lastContentID = contentID
@@ -523,9 +523,9 @@ final class SourceIndexServeSource: ObservableObject {
             guard let key else { continue }
             if seen.insert(key).inserted { own.append(s) }
         }
-        // NOTE: `own` is deduped ONLY within Singularity's own list (by infoHash); it is deliberately NOT
-        // deduped against the user's add-on groups, so a release your add-ons already return still appears
-        // under the Singularity label.
+        // NOTE: `own` is deduped ONLY within Singularity's own list (by replayable identity: torrent infohash,
+        // usenet nzb link, or direct url); it is deliberately NOT deduped against the user's add-on groups, so a
+        // release your add-ons already return still appears under the Singularity label.
         guard !own.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
     }

@@ -379,9 +379,14 @@ actor SkipTimestampStore {
     func entry(for key: String) -> Entry? {
         loadIfNeeded()
         guard let entry = entries?[key] else { return nil }
-        let ttl: TimeInterval = entry.spans.isEmpty ? 86_400 : 14 * 86_400
-        guard Date().timeIntervalSince(entry.fetchedAt) < ttl else { return nil }
+        guard Date().timeIntervalSince(entry.fetchedAt) < Self.ttl(for: entry) else { return nil }
         return entry
+    }
+
+    /// Hits live 14 days; misses (empty spans) 1 day, since the databases grow and a missing title is
+    /// worth re-asking tomorrow but not every play.
+    private static func ttl(for entry: Entry) -> TimeInterval {
+        entry.spans.isEmpty ? 86_400 : 14 * 86_400
     }
 
     func store(_ entry: Entry, for key: String) {
@@ -407,12 +412,15 @@ actor SkipTimestampStore {
 
     private func loadIfNeeded() {
         guard entries == nil else { return }
-        if let data = try? Data(contentsOf: fileURL),
-           let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) {
-            entries = decoded
-        } else {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) else {
             entries = [:]
+            return
         }
+        // Prune rows already past their TTL on this first load, so the map, and every whole-map
+        // re-encode in store(), stops carrying expired entries forever.
+        let now = Date()
+        entries = decoded.filter { now.timeIntervalSince($0.value.fetchedAt) < Self.ttl(for: $0.value) }
     }
 }
 
@@ -421,6 +429,8 @@ actor SkipTimestampStore {
 /// gap for the `kitsu:` / `mal:` ids anime add-ons hand out. Fail-soft throughout: an unmapped id, a
 /// 404, or a network error just yields [], and the SegmentResolver clamps whatever comes back.
 enum AniSkipService {
+    private static let log = Logger(subsystem: "com.stremiox.app", category: "skiptimes")
+
     /// Cheap sync check (no network) used by the player's skip gate: AniSkip can handle the anime id
     /// schemes. The actual MAL resolution + fetch happen in `candidates`, which fails soft if they miss.
     static func supports(metaId: String) -> Bool {
@@ -440,8 +450,15 @@ enum AniSkipService {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         guard let (data, resp) = try? await URLSession.shared.data(for: request),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let res = try? JSONDecoder().decode(Response.self, from: data), res.found else { return [] }
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+        let res: Response
+        do {
+            res = try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            log.info("aniskip mal \(mal, privacy: .public) ep \(episode, privacy: .public): decode failed, \(String(describing: error), privacy: .public)")
+            return []
+        }
+        guard res.found else { return [] }
         return res.results.compactMap { r in
             let kind: SkipSegment.Kind
             switch r.skipType {
@@ -492,23 +509,25 @@ enum AniSkipService {
     private struct Response: Decodable {
         let found: Bool
         let results: [Result]
-        // AniSkip omits `results` entirely on a not-found episode ({"found": false}); decode soft so
-        // that body parses to an empty list instead of throwing a swallowed keyNotFound.
+        // AniSkip omits `found` / `results` on a not-found episode ({"found": false}); a genuinely
+        // absent key decodes soft (found=false, results=[]). A malformed value is NOT swallowed here:
+        // decodeIfPresent propagates the decode error so the caller can log it, instead of silently
+        // yielding no segments the way a v1/v2 key mismatch on the results elements otherwise would.
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
-            found = (try? c.decode(Bool.self, forKey: .found)) ?? false
-            results = (try? c.decode([Result].self, forKey: .results)) ?? []
+            found = try c.decodeIfPresent(Bool.self, forKey: .found) ?? false
+            results = try c.decodeIfPresent([Result].self, forKey: .results) ?? []
         }
         enum CodingKeys: String, CodingKey { case found, results }
+        // v2 skip-times payloads are camelCase (`skipType`, `interval.startTime`, `interval.endTime`),
+        // so the synthesized coding keys match the wire names with no remapping.
         struct Result: Decodable {
             let interval: Interval
             let skipType: String
-            enum CodingKeys: String, CodingKey { case interval; case skipType = "skip_type" }
         }
         struct Interval: Decodable {
             let startTime: Double
             let endTime: Double
-            enum CodingKeys: String, CodingKey { case startTime = "start_time"; case endTime = "end_time" }
         }
     }
 }

@@ -1,10 +1,15 @@
 import Foundation
 import CryptoKit
 
-/// Verbose source-resolve diagnostic probe. TEMPORARY (stripped before release): every resolve decision
-/// logs `[src-probe]` to stdout so the debrid resolve, cache-gate, and fail path are traceable end to end.
+/// Verbose source-resolve diagnostic probe: every resolve decision logs `[src-probe]` so the debrid
+/// resolve, cache-gate, and fail path are traceable end to end. Gated on `VXProbe.enabled`, the same
+/// "Diagnostic logging" toggle the rest of VXProbe honors, so a release build with diagnostics off stays
+/// silent on the playback hot path (these lines carry infoHash prefixes) and pays nothing.
 enum DebridProbe {
-    static func log(_ category: String, _ message: String) { NSLog("[src-probe] %@: %@", category, message) }
+    static func log(_ category: String, _ message: String) {
+        guard VXProbe.enabled else { return }
+        NSLog("[src-probe] %@: %@", category, message)
+    }
     static func h8(_ s: String) -> String { String(s.prefix(8)) }
     static func since(_ start: Date) -> Int { Int(Date().timeIntervalSince(start) * 1000) }
     static func ms(_ d: Duration) -> Int { Int(d.components.seconds) * 1000 }
@@ -1202,9 +1207,10 @@ extension DebridCoordinator {
     /// badges. A stream already carrying a direct `url` is skipped (nothing to resolve; the caller plays it
     /// directly). Anything not confirmed cached is left out so we never kick off an uncached add-then-download.
     ///
-    /// Each leg reuses `resolvedPlaybackRef` verbatim, so every per-leg guarantee holds: the existing 15s
-    /// bound, the RealDebrid active-download fast-fail, the season-pack file pick, and the fail-soft nil. The
-    /// whole group is therefore bounded by that same 15s per leg, and settles as soon as ONE leg wins.
+    /// Each leg reuses `resolvedPlaybackRef` verbatim, so every per-leg guarantee holds: the existing
+    /// `DebridCoordinator.resolveTimeout` bound, the RealDebrid active-download fast-fail, the season-pack
+    /// file pick, and the fail-soft nil. The whole group is therefore bounded by that same
+    /// `resolveTimeout` per leg, and settles as soon as ONE leg wins.
     ///
     /// FAIL-SOFT: returns `nil` when nothing is confirmed-cached to race (e.g. no key, or no cached row) or
     /// when every raced leg fails — the caller then falls back to today's single-resolve / local-engine path,
@@ -1295,7 +1301,7 @@ extension DebridCoordinator {
         return await withTaskGroup(of: (ref: DebridPlaybackRef, stream: CoreStream)?.self) { group in
             for stream in racing {
                 group.addTask {
-                    // Each leg carries its own 15s bound + RD fast-fail (it is a full resolvedPlaybackRef).
+                    // Each leg carries its own `DebridCoordinator.resolveTimeout` bound + RD fast-fail (it is a full resolvedPlaybackRef).
                     // Pass the confirmed-cached sets so a candidate evicted between the cache check and this
                     // leg returns nil with ZERO network rather than kicking off an add-then-download.
                     guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode,

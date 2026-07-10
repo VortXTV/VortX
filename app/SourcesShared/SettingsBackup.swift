@@ -125,6 +125,8 @@ enum SettingsBackup {
     /// Suggested filename for the exporter (the `.json` extension is appended from the content type).
     static func defaultFilename() -> String {
         let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.calendar = Calendar(identifier: .gregorian)
         df.dateFormat = "yyyy-MM-dd-HHmm"
         return "VortX-Backup-\(df.string(from: Date()))"
     }

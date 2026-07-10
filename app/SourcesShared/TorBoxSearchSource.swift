@@ -83,15 +83,17 @@ enum TorBoxSearch {
     /// any failure (no key handled by the caller's gate; a network error / decode failure / timeout all
     /// collapse to empty). `apiKey` lifts the anonymous rate limit (0/min: keyless requests always 429).
     /// `season`/`episode` scope a series fetch to one episode; nil for movies.
-    /// Combined usenet + torrent results plus a `rateLimited` flag: `true` when the index answered 429 (the
-    /// account is over its TorBox scraper allowance / in the daily search cooldown). The caller uses the flag
-    /// to back off instead of re-firing on the next title and burning more of the quota.
-    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool) {
-        guard imdbId.hasPrefix("tt") else { return ([], false) }
+    /// Combined usenet + torrent results plus two signal flags. `rateLimited` is `true` when the index
+    /// answered 429 (the account is over its TorBox scraper allowance / in the daily search cooldown), so the
+    /// caller backs off instead of re-firing on the next title and burning more of the quota. `transportError`
+    /// is `true` when a leg's request never completed (offline, DNS/TLS failure, timeout), so the caller keeps
+    /// the empty result OUT of the session cache and re-fetches for real once the network is back.
+    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
+        guard imdbId.hasPrefix("tt") else { return ([], false, false) }
         async let usenet = fetch(kind: "usenet", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         async let torrents = fetch(kind: "torrents", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         let (u, t) = await (usenet, torrents)
-        return (u.streams + t.streams, u.rateLimited || t.rateLimited)
+        return (u.streams + t.streams, u.rateLimited || t.rateLimited, u.transportError || t.transportError)
     }
 
     /// One `GET /{kind}/imdb_id:{id}` call, bounded and fail-soft. The id-type prefix must be `imdb_id:`
@@ -99,7 +101,7 @@ enum TorBoxSearch {
     /// come back empty. Auth is the Bearer header ONLY (the JSON endpoints take no `apikey` query param,
     /// and the key must not ride in URLs anyway); anonymous requests are hard-429'd by the index.
     /// `check_cache=true` asks the index to flag which results the user's own account already has cached.
-    private static func fetch(kind: String, imdbId: String, season: Int?, episode: Int?, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool) {
+    private static func fetch(kind: String, imdbId: String, season: Int?, episode: Int?, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
         var comps = URLComponents(string: "\(base)/\(kind)/imdb_id:\(imdbId)")
         var query = [
             URLQueryItem(name: "metadata", value: "false"),
@@ -108,7 +110,7 @@ enum TorBoxSearch {
         if let season { query.append(URLQueryItem(name: "season", value: String(season))) }
         if let episode { query.append(URLQueryItem(name: "episode", value: String(episode))) }
         comps?.queryItems = query
-        guard let url = comps?.url else { return ([], false) }
+        guard let url = comps?.url else { return ([], false, false) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 12
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -116,16 +118,19 @@ enum TorBoxSearch {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 12
         let session = URLSession(configuration: cfg)
+        // A request that never completed (offline, DNS/TLS failure, timeout) yields no HTTP response. Report it
+        // as a distinct transportError so the caller does not cache the empty result as "no results" for the
+        // session; that is what made an offline first open stick until the app was relaunched.
         guard let (data, response) = try? await session.data(for: req),
-              let code = (response as? HTTPURLResponse)?.statusCode else { return ([], false) }
+              let code = (response as? HTTPURLResponse)?.statusCode else { return ([], false, true) }
         // 429 = over the TorBox scraper allowance (the account's daily search cooldown). The index returns
         // "Rate limit exceeded: 0 per 1 minute" for EVERY search until the cooldown resets (~24h), so surface
         // it as a distinct signal instead of an empty "no results" the caller can't tell apart.
-        if code == 429 { return ([], true) }
+        if code == 429 { return ([], true, false) }
         guard (200...299).contains(code),
-              let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false) }
+              let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false, false) }
         let items = (decoded.data?.nzbs ?? []) + (decoded.data?.torrents ?? [])
-        return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false)
+        return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false, false)
     }
 
     /// Build a `CoreStream` from one search item. Usenet vs torrent is discriminated by the index's own
@@ -264,6 +269,13 @@ final class TorBoxSearchSource: ObservableObject {
                 // empty result, so it re-fetches for real once the cooldown lifts.
                 self.cooldownUntil = Date().addingTimeInterval(15 * 60)
                 NSLog("[torbox-search] rate-limited (scraper cooldown) for id=%@ - backing off ~15m", imdbId)
+                return
+            }
+            if result.transportError {
+                // The request never completed (offline / network failure). Do NOT cache the empty result and do
+                // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
+                // back. Without this, an offline first open cached an empty list for the whole session.
+                NSLog("[torbox-search] transport error for id=%@ - not caching, will retry", imdbId)
                 return
             }
             NSLog("[torbox-search] fetched %d stream(s) for id=%@", result.streams.count, imdbId)

@@ -20,6 +20,7 @@ enum DiagnosticsLog {
     private static let stamp: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter
     }()
 

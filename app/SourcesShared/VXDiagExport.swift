@@ -30,6 +30,14 @@ final class VXDiagExport {
     private var listener: NWListener?
     private var port: UInt16 = 0
 
+    /// Open accepted connections, so `stop()` can cancel any that are mid-request instead of leaking them.
+    /// Guarded by `stateLock` (touched from `queue` on accept/teardown and from `stop()`'s `queue.sync`).
+    private let stateLock = NSLock()
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+
+    /// Header-read deadline so a phone that connects and then stalls never leaks its connection.
+    private static let headerDeadline: TimeInterval = 15
+
     /// Set once the LAN server has actually served the log to a phone at least once this session, so `stop()`
     /// (export screen dismissed) can CLEAR the rolling log then and only then, giving the next export a fresh
     /// buffer without wiping data that was never downloaded. Owner request: "once exported, clear it."
@@ -65,6 +73,12 @@ final class VXDiagExport {
             listener?.cancel()
             listener = nil
             port = 0
+            // Cancel any connection still mid-request so a stalled phone is not left holding an open socket.
+            stateLock.lock()
+            let open = Array(connections.values)
+            connections.removeAll()
+            stateLock.unlock()
+            open.forEach { $0.cancel() }
             // Clear the rolling log ONLY if it was actually downloaded this session, so the next export starts
             // fresh (owner request) without discarding a log the phone never fetched.
             if didServe {
@@ -124,18 +138,36 @@ final class VXDiagExport {
 
     // MARK: - Per-connection handling
 
-    /// Accept one phone connection: read its request header, then serve the log file.
+    /// Accept one phone connection: read its request header, then serve the log file. The connection is
+    /// tracked so `stop()` can cancel it, and a deadline force-cancels a client that never sends a header.
     private func handle(_ connection: NWConnection) {
+        stateLock.lock()
+        connections[ObjectIdentifier(connection)] = connection
+        stateLock.unlock()
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            switch state {
+            case .cancelled, .failed:
+                guard let self, let connection else { return }
+                self.stateLock.lock()
+                self.connections.removeValue(forKey: ObjectIdentifier(connection))
+                self.stateLock.unlock()
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
-        readRequest(connection, buffer: Data())
+        let deadline = DispatchWorkItem { connection.cancel() }
+        queue.asyncAfter(deadline: .now() + Self.headerDeadline, execute: deadline)
+        readRequest(connection, buffer: Data(), deadline: deadline)
     }
 
     /// Read until the header terminator (CRLFCRLF), then serve. Bounds the read so a malformed client
-    /// cannot make us buffer without limit.
-    private func readRequest(_ connection: NWConnection, buffer: Data) {
+    /// cannot make us buffer without limit; the deadline force-cancels a header that never completes.
+    private func readRequest(_ connection: NWConnection, buffer: Data, deadline: DispatchWorkItem) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [weak self] chunk, _, isComplete, error in
             guard let self else { return }
             if error != nil {
+                deadline.cancel()
                 connection.cancel()
                 return
             }
@@ -146,14 +178,16 @@ final class VXDiagExport {
 
             let terminator = Data("\r\n\r\n".utf8)
             if accumulated.range(of: terminator) != nil {
+                deadline.cancel()
                 self.serve(connection)
                 return
             }
             if isComplete || accumulated.count > 64_000 {
+                deadline.cancel()
                 connection.cancel()
                 return
             }
-            self.readRequest(connection, buffer: accumulated)
+            self.readRequest(connection, buffer: accumulated, deadline: deadline)
         }
     }
 
