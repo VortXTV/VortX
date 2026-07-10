@@ -759,10 +759,34 @@ struct iOSHomeView: View {
             if showCuratedRails { curated.load() }
             if showCollectionsHub { collectionsHub.load() }
         }
-        // Hero reseeds are gated on the visible tab: `seed` re-arms the rotation timer, which would
-        // defeat the hidden-tab pause above on every engine re-emit. The isActive onChange reseeds on return.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks(); refreshReleaseCalendar() }
-        .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // Key Home refreshes off COARSE signals instead of `core.revision`, which bumps on EVERY NewState
+        // (background sync, catalog paging, search echoes, meta_details bursts) and so re-ran Top Picks, the
+        // Upcoming Episodes calendar, and the hero reseed on idle engine churn. Each list signal is a composite
+        // "<first id>#<count>" key: first-id ALONE misses a removal or insertion at any non-head position (e.g.
+        // finishing the LAST Continue Watching item on another device leaves the head id unchanged), and count
+        // alone misses a reorder or a replace-at-head. Together they catch reorder, insert, remove, and
+        // replace-at-head, so a stale CW list can no longer sit behind Top Picks. A pure progress tick on the
+        // same set changes neither component, so the refresh models still no-op and `hero.seed` ignores the
+        // no-op reseed. hero.seed stays gated on the visible tab (`isActive`): `seed` re-arms the rotation
+        // timer, which a hidden (opacity-switched) Home must not do; the isActive onChange reseeds on return.
+        .onChange(of: "\(core.boardRows.first?.id ?? "-")#\(core.boardRows.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
+        .onChange(of: "\(core.continueWatching.first?.id ?? "-")#\(core.continueWatching.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
+        // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
+        .onChange(of: "\(profiles.cwItems.first?.id ?? "-")#\(profiles.cwItems.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
+        // KNOWN BOUND: keyed on catalog.count, so a same-count swap in a SINGLE emit (one title removed and
+        // another added at once) does not fire here; a per-body content hash is deliberately avoided because
+        // this body re-evaluates far too often to hash the whole catalog each pass. The next real
+        // CW / board / profile change, or an app foreground, reconciles it.
+        .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
