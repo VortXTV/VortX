@@ -518,6 +518,9 @@ final class CoreBridge: ObservableObject {
     /// republishes the rail. No-op for overlay profiles (their history never touches the engine).
     func syncLibraryNow() {
         guard ProfileStore.shared.activeUsesEngineHistory else { return }
+        // Signed-out (and anonymous) engines have no authenticated session for SyncLibraryWithAPI to
+        // pull from, so the dispatch was dead weight on every player exit. Skip it.
+        guard isLoggedIn() else { return }
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
 
