@@ -657,9 +657,11 @@ final class CoreBridge: ObservableObject {
     /// (Engine-lane follow-up: a dedicated typed live-catalog load would avoid hydrating the whole Home
     /// board here, see [[vortx-engine-needs]] #7 IPTV + the source-registry.)
     func ensureLiveCatalogsLoaded() {
-        // RAW count (tombstoned add-ons included): ghost catalogs still occupy engine board indices,
-        // so the widen bound must cover them or trailing live catalogs would never range-load.
-        let needed = installedCatalogs(includeTombstoned: true).count
+        // RAW count (tombstoned AND per-profile disabled add-ons included): both kinds of catalog
+        // still occupy engine board indices, so the widen bound must cover them or trailing live
+        // catalogs that sit behind them would never range-load. Rendering is unaffected: the
+        // disabled / tombstone filters still apply where rows are built and listed.
+        let needed = installedCatalogs(includeTombstoned: true, includeDisabled: true).count
         if boardRows.isEmpty {
             loadBoard(rows: max(needed, 30))
             return
@@ -1852,7 +1854,7 @@ final class CoreBridge: ObservableObject {
     /// Excludes the catalogs of REMOVED add-ons the engine still holds (see `tombstonedBases`), so the
     /// catalog manager never lists a ghost entry for an add-on the user uninstalled (#121).
     var allCatalogs: [CatalogInfo] {
-        installedCatalogs(includeTombstoned: false)
+        installedCatalogs(includeTombstoned: false, includeDisabled: false)
     }
 
     /// Normalized transport URLs of engine-ctx add-ons the user REMOVED (durable `AddonTombstones`)
@@ -1875,14 +1877,15 @@ final class CoreBridge: ObservableObject {
     }
 
     /// The enumeration behind `allCatalogs`. `includeTombstoned: true` keeps the catalogs of removed
-    /// add-ons the engine still holds: `ensureLiveCatalogsLoaded` needs that RAW count because ghost
-    /// catalogs still occupy engine board indices, so widening the board by a filtered count could
+    /// add-ons the engine still holds, and `includeDisabled: true` keeps the catalogs of add-ons the
+    /// active profile disabled: `ensureLiveCatalogsLoaded` needs that RAW count because both kinds of
+    /// catalog still occupy engine board indices, so widening the board by a filtered count could
     /// leave trailing live catalogs outside the range-loaded window.
-    private func installedCatalogs(includeTombstoned: Bool) -> [CatalogInfo] {
+    private func installedCatalogs(includeTombstoned: Bool, includeDisabled: Bool) -> [CatalogInfo] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
         var out: [CatalogInfo] = []
         var seen = Set<String>()
-        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let disabledAddons: Set<String> = includeDisabled ? [] : ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         let ghostBases: Set<String> = includeTombstoned ? [] : Self.tombstonedBases(in: ctx.profile.addons)
         for addon in ctx.profile.addons {
             guard !disabledAddons.contains(addon.transportUrl) else { continue }
