@@ -504,7 +504,18 @@ struct TVPlayerView: View {
             if let b = data as? Bool {
                 isPaused = b
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
-                if b { saveProgress(at: currentTime) }   // persist on pause
+                if b {
+                    saveProgress(at: currentTime)   // persist on pause
+                    // Keep the ENGINE's library copy in step too (same floor rule as the 20s tick).
+                    // The engine previously only heard the throttled tick + the exit flush, so its
+                    // copy could lag far behind the account writes — and any engine-side push (the
+                    // watched/unwatched toggle, a sync) then resurrected that stale position over
+                    // the newer account value (the "unmarked watched, an old scrub position came
+                    // back" report). Engine dispatches are ordered, so this can never race backward.
+                    if !isCurrentLiveStream, suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
+                        core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)
+                    }
+                }
             }
         case MPVProperty.timePos:
             if let d = data as? Double {
@@ -3362,6 +3373,15 @@ struct TVPlayerView: View {
         currentTime = scrubTarget; lastSaved = scrubTarget
         inFlightSeekTarget = scrubTarget   // stale pre-seek ticks must not clobber this commit
         inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+        // A commit is exactly when the position jumps by minutes, and `lastSaved = scrubTarget` above
+        // suppresses the next throttled tick — so without this the ENGINE's library copy only learned
+        // the new position at the exit flush, and an engine-side push (watched toggle, sync) in between
+        // resurrected the pre-scrub position. Report the committed position immediately; the account
+        // write keeps its pause/20s/exit cadence (network saves are unordered, so fewer is safer there).
+        if !isCurrentLiveStream, duration > 0,
+           suppressedResumeFloor == nil || scrubTarget >= (suppressedResumeFloor ?? 0) {
+            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration)
+        }
         scrubThumbnails.clear()
         flashControls()
     }
