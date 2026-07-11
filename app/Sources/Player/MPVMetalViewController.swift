@@ -69,6 +69,18 @@ final class MPVMetalViewController: PlatformViewController {
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
     private var activeReadAheadCap: String?
+    /// The back-buffer cap (`demuxer-max-back-bytes`) every file starts with on this platform: the
+    /// setupMpv pre-load default. shedForMemoryPressure drops the live option to 8MiB for the rest of the
+    /// CURRENT file, and nothing else re-applied it for LATER files on the same instance (loadFile's clamp
+    /// reset only restored the forward cap, and configureLiveMode(false) skips its write when consecutive
+    /// loads are both non-live), so every post-shed load inherited the shrunken seek-back buffer. loadFile
+    /// re-applies this default per non-live file in its clamp-reset block; live keeps configureLiveMode's
+    /// own tight value.
+    #if os(macOS)
+    private let defaultBackBufferCap = "64MiB"
+    #else
+    private let defaultBackBufferCap = "24MiB"
+    #endif
     /// Pending "still paused after the grace period" cache clamp; cancelled on resume / new load / stop.
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
@@ -465,13 +477,13 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "300"))
 #if os(macOS)
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "64MiB"))
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", defaultBackBufferCap))
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "256MiB"))
 #else
         // iOS/tvOS: the server is in-process and jetsam-bound and its RSS includes these mpv buffers, so
         // keep the back-buffer (already-played, for seek-back) small. The per-file demuxer-max-bytes below
         // overrides the forward cache; this init is just the pre-load default.
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "24MiB"))
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", defaultBackBufferCap))
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
@@ -989,6 +1001,12 @@ final class MPVMetalViewController: PlatformViewController {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         pausedCacheClamped = false
         memoryCacheClamped = false
+        // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
+        // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
+        // back for later files on this instance (configureLiveMode(false) skips its write when
+        // consecutive loads are both non-live), so every post-shed load started with the shrunken
+        // seek-back buffer. Live stays untouched: configureLiveMode(live) above owns its tight 8MiB.
+        if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
 
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
