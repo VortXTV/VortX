@@ -552,11 +552,39 @@ struct iOSSettingsView: View {
                 showDiagExport = true
             }
             .tint(Theme.Palette.accent)
+            // Direct save/share of the same rolling log, with no QR and no second device: the native share
+            // sheet offers Files, AirDrop, and Mail (macOS gets the share menu). Additive to the QR path
+            // above, which stays. Offered whenever the log file has content, regardless of the toggle, so a
+            // user who turned logging off after capturing can still hand it over (matching the QR path, which
+            // serves whatever bytes are on disk). Only when no capture has ever happened does a guidance
+            // button explain how to produce a log, so we never hand over a nonexistent or empty file.
+            if let logURL = diagLogExportURL {
+                ShareLink("Save or share log", item: logURL)
+                    .tint(Theme.Palette.accent)
+            } else {
+                Button("Save or share log") {
+                    backupAlert = BackupAlert(title: String(localized: "No Diagnostic Log Yet"),
+                        message: String(localized: "Turn on Diagnostic logging, reproduce the issue, then export the log."))
+                }
+                .tint(Theme.Palette.accent)
+            }
         } header: {
             Text("Advanced (mpv options)")
         } footer: {
             Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
+    }
+
+    /// The rolling diagnostic log to hand to the share sheet, or nil when the log is empty/missing. Keyed on
+    /// file content, not on VXProbe.enabled, so turning Diagnostic logging off after a capture still lets the
+    /// user save what was recorded (the QR export path serves the same bytes with no toggle gate). Gating on
+    /// the file size the way exportActiveLibrary guards its empty case means it never shares a nonexistent or
+    /// empty file; nil drives the guidance button instead.
+    private var diagLogExportURL: URL? {
+        let url = VXProbe.logFileURL
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size > 0 else { return nil }
+        return url
     }
 
     /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
