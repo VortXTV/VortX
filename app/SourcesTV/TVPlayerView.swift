@@ -529,6 +529,19 @@ struct TVPlayerView: View {
                     fetchAddonSubtitles()
                 }
                 currentTime = d
+                // Durationless-stream fallback (the "watch position never saved / no resume on some
+                // debrid MKVs" report): many debrid direct-HTTP MKVs never DELIVER mpv's `duration`
+                // EVENT, yet the property itself reads fine (the subtitle-fingerprint path already
+                // relies on that). Everything downstream keys off `duration > 0` — the resume seek,
+                // the ~20s progress saves, watched-at-90%, Up Next — so those streams lost their watch
+                // position entirely and always restarted from 0. Poll the engine each (coalesced) tick
+                // until a real value lands and route it through the same handling as the event; one C
+                // property read at ~2-4 Hz, and it stops the moment duration is known. The AVPlayer
+                // engine returns 0 here (it delivers its duration event reliably), so this is mpv-only.
+                if duration <= 0, !isCurrentLiveStream,
+                   let engineDur = coordinator.player?.mediaDurationSeconds(), engineDur.isFinite, engineDur > 0 {
+                    handleProperty(MPVProperty.duration, engineDur)
+                }
                 updateCurrentSkip(at: d)
                 // Ensure the community key is provisioned off meta.runtime the moment the behind-playback
                 // meta lands (idempotent; no-op once keyed), so capture starts even without a duration event.

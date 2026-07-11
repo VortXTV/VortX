@@ -584,7 +584,30 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                                                name: .AVPlayerItemDidPlayToEndTime, object: item)
         NotificationCenter.default.addObserver(self, selector: #selector(failedToEnd(_:)),
                                                name: .AVPlayerItemFailedToPlayToEndTime, object: item)
+        #if canImport(UIKit)
+        // Jetsam relief (mirrors MPVMetalViewController.shedForMemoryPressure): a paused AVPlayer keeps
+        // filling its forward buffer at its own discretion, and a 4K / DV-remux HLS stream buffers
+        // hundreds of MB — on tvOS the pause also lets the screensaver (its own 4K pipeline) start on
+        // top, and jetsam reaps this app. The memory warning is the system's last call before that;
+        // respond by capping the item's forward buffer so AVFoundation trims instead of being killed.
+        // Registered per-load because teardownObservers() drops every observer on this object.
+        NotificationCenter.default.addObserver(self, selector: #selector(handleMemoryWarningNote),
+                                               name: UIApplication.didReceiveMemoryWarningNotification,
+                                               object: nil)
+        #endif
     }
+
+    #if canImport(UIKit)
+    /// System memory warning: cap the current item's forward buffer (default 0 = "system decides", which
+    /// on a high-bitrate stream is far too generous for a jetsam-bound app). 30s at even remux bitrates
+    /// is a modest, survivable footprint, and AVFoundation releases already-buffered media beyond the new
+    /// preference. Sticky for the rest of this item; the next loadFile mints a fresh item with defaults.
+    @objc private func handleMemoryWarningNote() {
+        guard let item, item.preferredForwardBufferDuration != 30 else { return }
+        item.preferredForwardBufferDuration = 30
+        DiagnosticsLog.log("avplayer", "memory warning: preferredForwardBufferDuration capped to 30s")
+    }
+    #endif
 
     private func handleStatus(_ item: AVPlayerItem) {
         switch item.status {
