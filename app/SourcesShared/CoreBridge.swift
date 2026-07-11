@@ -854,7 +854,7 @@ final class CoreBridge: ObservableObject {
     /// surfaces those under `metaStreams`, which this layer previously never read, so every such add-on
     /// showed zero sources. The disabled-add-on and tombstone guards apply identically to both surfaces.
     /// An add-on that answers via BOTH surfaces merges into ONE group (two same-id groups would collide in
-    /// the list's ForEach identity), dropping exact per-stream repeats by stream id.
+    /// the list's ForEach identity), dropping only EXACT repeats (full Equatable match).
     @MainActor
     private func assembleStreamGroups(_ details: CoreMetaDetails, streamId: String?) -> [CoreStreamSourceGroup] {
         let names = addonNamesByBase()
@@ -868,10 +868,17 @@ final class CoreBridge: ObservableObject {
             guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             if let i = indexByBase[group.request.base] {
-                let existing = groups[i]
-                var seen = Set(existing.streams.map(\.id))
-                let merged = existing.streams + streams.filter { seen.insert($0.id).inserted }
-                groups[i] = CoreStreamSourceGroup(id: existing.id, addon: existing.addon, streams: merged)
+                // Dedupe by FULL Equatable containment, not CoreStream.id: the id fingerprint excludes
+                // behaviorHints and fileIdx, so keying on it could conflate two genuinely different
+                // streams (a shared infoHash split into episodes only by fileIdx, or one URL carried on
+                // both surfaces with different proxy headers) and silently drop one. Containment is
+                // O(n^2) over the merged group, which is fine here: it runs only on a same-base
+                // collision (rare), and a single add-on's group is tens of streams.
+                var merged = groups[i].streams
+                for stream in streams where !merged.contains(stream) {
+                    merged.append(stream)
+                }
+                groups[i] = CoreStreamSourceGroup(id: groups[i].id, addon: groups[i].addon, streams: merged)
             } else {
                 indexByBase[group.request.base] = groups.count
                 groups.append(CoreStreamSourceGroup(id: group.request.base,
