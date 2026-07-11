@@ -325,7 +325,9 @@ struct DetailView: View {
         let metaResident = core.metaDetails?.meta?.id == id
         guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
-        let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
+        // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
+        // same stream path id, and their presence means the engine already selected this id.
+        let hasStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
         if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
         core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)

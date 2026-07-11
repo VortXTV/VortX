@@ -852,17 +852,47 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
+        return assembleStreamGroups(details, streamId: nil)
+    }
+
+    /// Shared assembly for both `streamGroups` overloads: walk the meta-embedded stream groups
+    /// (`metaStreams`) FIRST, then the stream-resource responses, mirroring the engine's own
+    /// `[meta_streams, streams]` concat. This is the #122 fix: add-ons that serve plain HTTP / HLS links
+    /// usually embed them in the meta's videos instead of implementing a `stream` resource; the engine
+    /// surfaces those under `metaStreams`, which this layer previously never read, so every such add-on
+    /// showed zero sources. The disabled-add-on and tombstone guards apply identically to both surfaces.
+    /// An add-on that answers via BOTH surfaces merges into ONE group (two same-id groups would collide in
+    /// the list's ForEach identity), dropping only EXACT repeats (full Equatable match).
+    @MainActor
+    private func assembleStreamGroups(_ details: CoreMetaDetails, streamId: String?) -> [CoreStreamSourceGroup] {
         let names = addonNamesByBase()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         let removed = AddonTombstones.all()                        // durable removal set, hoisted once
         var groups: [CoreStreamSourceGroup] = []
-        for group in details.streams {
+        var indexByBase: [String: Int] = [:]
+        for group in details.allStreamGroups {
+            if let streamId, group.request.path.id != streamId { continue }
             guard !disabledAddons.contains(group.request.base) else { continue }
             guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
-            groups.append(CoreStreamSourceGroup(id: group.request.base,
-                                                addon: names[group.request.base] ?? "Add-on",
-                                                streams: streams))
+            if let i = indexByBase[group.request.base] {
+                // Dedupe by FULL Equatable containment, not CoreStream.id: the id fingerprint excludes
+                // behaviorHints and fileIdx, so keying on it could conflate two genuinely different
+                // streams (a shared infoHash split into episodes only by fileIdx, or one URL carried on
+                // both surfaces with different proxy headers) and silently drop one. Containment is
+                // O(n^2) over the merged group, which is fine here: it runs only on a same-base
+                // collision (rare), and a single add-on's group is tens of streams.
+                var merged = groups[i].streams
+                for stream in streams where !merged.contains(stream) {
+                    merged.append(stream)
+                }
+                groups[i] = CoreStreamSourceGroup(id: groups[i].id, addon: groups[i].addon, streams: merged)
+            } else {
+                indexByBase[group.request.base] = groups.count
+                groups.append(CoreStreamSourceGroup(id: group.request.base,
+                                                    addon: names[group.request.base] ?? "Add-on",
+                                                    streams: streams))
+            }
         }
         return groups
     }
@@ -888,14 +918,18 @@ final class CoreBridge: ObservableObject {
     /// to tell users whether to keep waiting or whether loading has stalled.
     func streamLoadProgress() -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
+        // Count the meta-embedded groups too (they land Ready the moment the meta resolves), so a title
+        // whose ONLY sources are embedded HTTP/HLS streams settles at loaded == total instead of hanging
+        // the UI on the `total == 0` "still loading" state forever.
+        let all = details.allStreamGroups
         var loaded = 0
-        for group in details.streams {
+        for group in all {
             switch group.content {
             case .some(.ready), .some(.err): loaded += 1
             default: break   // .loading or nil → not done yet
             }
         }
-        return (loaded, details.streams.count)
+        return (loaded, all.count)
     }
 
     /// Ready stream groups for a specific stream/episode id, matched on the stream request's own
@@ -905,26 +939,14 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
-        let names = addonNamesByBase()
-        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
-        let removed = AddonTombstones.all()                        // durable removal set (see streamGroups())
-        var groups: [CoreStreamSourceGroup] = []
-        for group in details.streams where group.request.path.id == streamId {
-            guard !disabledAddons.contains(group.request.base) else { continue }
-            guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
-            guard let streams = group.content?.ready, !streams.isEmpty else { continue }
-            groups.append(CoreStreamSourceGroup(id: group.request.base,
-                                                addon: names[group.request.base] ?? "Add-on",
-                                                streams: streams))
-        }
-        return groups
+        return assembleStreamGroups(details, streamId: streamId)
     }
 
     /// Stream-addon load progress for one stream/episode id (see `streamLoadProgress`).
     func streamLoadProgress(forStreamId streamId: String) -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
         var loaded = 0, total = 0
-        for group in details.streams where group.request.path.id == streamId {
+        for group in details.allStreamGroups where group.request.path.id == streamId {
             total += 1
             switch group.content {
             case .some(.ready), .some(.err): loaded += 1
@@ -1695,8 +1717,8 @@ final class CoreBridge: ObservableObject {
                         // Count ready streams across every source group so the log shows when streams
                         // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
                         // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
-                        let readyStreams = (details?.streams ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.streams.count ?? 0) streams=\(readyStreams)")
+                        let readyStreams = (details?.allStreamGroups ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
+                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
                         if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
                     }
                     DispatchQueue.main.async { [weak self] in
@@ -1743,7 +1765,10 @@ final class CoreBridge: ObservableObject {
             || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
             return true
         }
-        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+        // Signature over BOTH stream surfaces: the meta-embedded groups (metaStreams, the HTTP/HLS
+        // add-on shape, #122) land on the meta republish, and without them in the diff that arrival
+        // looked like "nothing changed" and the source list never rebuilt.
+        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
     }
 
     /// True when a republish changed something the SOURCE LIST derives from: presence, the loaded
@@ -1753,7 +1778,8 @@ final class CoreBridge: ObservableObject {
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
         if current.meta?.id != next.meta?.id { return true }
-        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+        // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
+        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
     }
 
     /// A cheap signature of the ready streams per source group: the group's path id plus its ready
