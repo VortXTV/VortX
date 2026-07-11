@@ -391,9 +391,19 @@ struct TVPlayerView: View {
             showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
             UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
             if let m = curMeta {
-                if let engineResume = core.engineResumeSeconds(for: m) {
-                    resumeSeconds = engineResume; maybeResume()       // engine library = source of truth
+                if let engineResume = core.engineResumeSeconds(for: m), engineResume > 5 {
+                    resumeSeconds = engineResume; maybeResume()       // engine has a real position: use it
                 } else {
+                    // Engine has no entry — OR answered "start fresh" (0, including its stale-video_id
+                    // mismatch branch). The engine's library copy can lag the account: it hears TimeChanged
+                    // on a throttle and its video_id can be left stale by a watched/unwatched toggle, while
+                    // this device's exit save already put the fresh position on the account. Trusting the
+                    // bare 0 replayed the title from 0:00 and the early exit then SAVED ~0 over the real
+                    // position (the "scrubbed to 06:20, reopened at the beginning, position lost" report).
+                    // Consulting the account here is episode-safe by construction: resumeOffset does its
+                    // own video_id match and returns 0 for a different episode, so the wrong-episode resume
+                    // the engine's 0-answer guards against cannot happen. Overlay profiles keep their own
+                    // private-history path inside resumeOffset, exactly as before.
                     Task { @MainActor in resumeSeconds = await account.resumeOffset(for: m); maybeResume() }
                 }
             } else {
