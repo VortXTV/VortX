@@ -23,9 +23,9 @@ The native streaming client for Apple devices, **formerly StremioX**. Fully nati
 
 > **StremioX is now VortX, as of v0.3.5.** The app takes its new name, gold-on-obsidian icon, and animated intro starting with this release. It is an in-place update, so your library, add-ons, watch history, and settings are exactly where you left them, signed into the same account. The repository and docs follow next, along with a website, a subreddit, and a Discord. A later update will move VortX to a fresh identity all the way down; when that lands your library and history still return on sign-in, but local settings could start fresh, which is why this release adds **Backup & Restore**.
 
-## New in the 0.3.8 line
+## New in the 0.3.13 line
 
-The 0.3.8 betas (current: **Beta 15**) added a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext, plus a wave of discovery, playback, and power-user features:
+0.3.13 is the community release: it carries the first outside code contribution, a player reliability series by [jbecker-it](https://github.com/jbecker-it) (the pause-shortly-after-start crash is gone, watch progress saves on streams that never report a length, heavy scrubbing can no longer lose your place, and audio stays clean after big seeks), plus a set of community-reported fixes: add-on HTTP and HLS streams now appear, removed add-ons no longer ghost the Home customize list, and the diagnostic log saves without a QR code. Recent lines also brought **true Dolby Vision from MKVs delivered as local HLS**, the **launch profile picker on iPhone, iPad, and Mac**, **Liquid Glass** on the floating controls, and a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext:
 
 - **A Collections hub** on Home and Discover: Discover cards (Trending, Popular, Latest, Upcoming), Streaming Services shown with their logos, and Genres, each tapping into a browse grid. Reorderable, and toggleable per screen.
 - **Native debrid playback**: a cached torrent on your Real-Debrid, TorBox, AllDebrid, or Premiumize account plays instantly straight from the cache, with more than one service checked at once.
@@ -323,6 +323,7 @@ This is an independent community project. It is not affiliated with or endorsed 
 - [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile), for the embedded server runtime.
 - Claude (Anthropic) wrote the code.
 - [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the VortX Lite build, the stream-ranking reports that drove the cached-first fixes, the build-from-source report that made a fresh clone work for everyone, and the Apple TV search-suggestion interleaving.
+- [jbecker-it](https://github.com/jbecker-it), for the player reliability series in 0.3.13: the pause-crash relief, watch progress on durationless streams, the scrub and watched-mark guards, the post-seek audio fix, and the Continue Watching exit refresh, every fix root-caused and verified on real hardware.
 - **[SkipDB](https://skipdb.tv)**, the open, community-built skip-segment database, also created by [OrigamiSpace](https://github.com/OrigamiSpace). VortX's skip feature is built on it: we read from it, contribute every submission back to it, and publish our own skip data openly under the same [Open Database License](https://opendatacommons.org/licenses/odbl/) at [skip.vortx.tv/dump](https://skip.vortx.tv/dump). Open projects like this are why the ecosystem works, and VortX is proud to give back to it.
 
 See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
