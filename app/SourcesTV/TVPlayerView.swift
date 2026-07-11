@@ -266,6 +266,19 @@ struct TVPlayerView: View {
     @State private var scrubStep = 10.0
     @State private var lastScrubAt = 0.0
     @State private var scrubCommit: Task<Void, Never>?
+    /// Seek-in-flight guard: the target of the last user-committed absolute seek (scrub commit, Restart,
+    /// the resume seek), plus when it was issued. While set, incoming timePos ticks that are still FAR
+    /// from the target are ignored instead of overwriting `currentTime`: after a committed seek, mpv can
+    /// keep emitting ticks from the OLD position for seconds (an exact seek on a big remux decodes from
+    /// the keyframe + refills the cache first, and back-and-forth scrubbing queues several seeks), and
+    /// those stale ticks clobbered the freshly committed position — so exiting right after HEAVY
+    /// scrubbing saved a stale spot ("progress stuck at 12:20 after scrubbing far past it"). Cleared as
+    /// soon as a tick lands near the target (the seek settled) or the settle window expires (the seek
+    /// genuinely ended elsewhere — clamped at EOF, failed — so live ticks win again).
+    @State private var inFlightSeekTarget: Double?
+    @State private var inFlightSeekIssuedAt = 0.0
+    private let inFlightSeekSettleWindow = 10.0   // seconds before stale-looking ticks are trusted again
+    private let inFlightSeekSnapRadius = 5.0      // a tick this close to the target means the seek landed
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
@@ -527,6 +540,17 @@ struct TVPlayerView: View {
                     // exactly that content. Fetch at playback start too (key-latched, so at most one real
                     // fetch runs); the duration-event call remains for streams that deliver it first.
                     fetchAddonSubtitles()
+                }
+                // Seek-in-flight guard (see the state declaration): drop stale pre-seek ticks so they
+                // cannot clobber the freshly committed position; everything downstream of a tick
+                // (progress saves, watched-at-90%, skip spans) waits with it.
+                if let target = inFlightSeekTarget {
+                    if abs(d - target) <= inFlightSeekSnapRadius
+                        || Date().timeIntervalSinceReferenceDate - inFlightSeekIssuedAt > inFlightSeekSettleWindow {
+                        inFlightSeekTarget = nil   // settled near the target, or the window expired: trust ticks again
+                    } else {
+                        return
+                    }
                 }
                 currentTime = d
                 // Durationless-stream fallback (the "watch position never saved / no resume on some
@@ -2915,6 +2939,7 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false
+        inFlightSeekTarget = nil   // any pending seek belonged to the PREVIOUS episode; new media ticks are authoritative
         suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
@@ -3221,6 +3246,8 @@ struct TVPlayerView: View {
         coordinator.player?.seek(to: r)
         currentTime = r
         lastSaved = r
+        inFlightSeekTarget = r   // same guard as commitScrub: pre-resume ticks near 0 must not clobber the resume point
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
     }
 
     /// Persist the current position to the account library (no-op without a library context). Also a
@@ -3256,6 +3283,8 @@ struct TVPlayerView: View {
         commitScrubIfNeeded()
         coordinator.player?.seek(to: 0)
         currentTime = 0; lastSaved = 0
+        inFlightSeekTarget = 0   // same guard as commitScrub: a stale tick must not undo the restart
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
         flashControls()
     }
 
@@ -3300,6 +3329,8 @@ struct TVPlayerView: View {
         scrubbing = false
         coordinator.player?.seek(to: scrubTarget)
         currentTime = scrubTarget; lastSaved = scrubTarget
+        inFlightSeekTarget = scrubTarget   // stale pre-seek ticks must not clobber this commit
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
         scrubThumbnails.clear()
         flashControls()
     }
