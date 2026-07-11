@@ -3801,23 +3801,30 @@ private struct iOSStreamLabel: View {
                 .font(.system(size: 26))
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    if pinned {
-                        Image(systemName: "pin.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(Theme.Palette.accent)
-                            .accessibilityLabel("Pinned source")
+                // On a narrow iPhone (below `Theme.Space.wideLayoutMinWidth`) the source column runs to
+                // `.infinity` and the badge row's only width guard is each badge's `fixedSize`, so a long
+                // add-on name plus the TORRENT / CACHED pills could run off-screen. A horizontal scroll keeps
+                // every badge at its intrinsic width and lets the row scroll instead of overflowing; on wide
+                // layouts they all fit, so nothing scrolls and the look is unchanged.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        if pinned {
+                            Image(systemName: "pin.fill")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(Theme.Palette.accent)
+                                .accessibilityLabel("Pinned source")
+                        }
+                        badge(quality, prominent: true)
+                        // Skip the add-on badge when it only repeats the resolution: some add-on configs are
+                        // literally named "1080p" / "4K", which rendered as a second quality pill next to the
+                        // one above (the reported double tag). Real add-on names still show.
+                        if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
+                        if stream.isTorrent { badge("TORRENT") }
+                        // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
+                        // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
+                        // badge style with a bolt glyph; only shows when cached.
+                        if cached { badge("⚡ CACHED", prominent: true) }
                     }
-                    badge(quality, prominent: true)
-                    // Skip the add-on badge when it only repeats the resolution: some add-on configs are
-                    // literally named "1080p" / "4K", which rendered as a second quality pill next to the
-                    // one above (the reported double tag). Real add-on names still show.
-                    if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
-                    if stream.isTorrent { badge("TORRENT") }
-                    // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
-                    // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
-                    // badge style with a bolt glyph; only shows when cached.
-                    if cached { badge("⚡ CACHED", prominent: true) }
                 }
                 // Parsed flavour tags + size — the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".
