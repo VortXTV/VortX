@@ -359,9 +359,14 @@ struct RailHeader: View {
     let title: String
 
     var body: some View {
+        // `title` / `eyebrow` arrive as raw English keys. SwiftUI's `Text(_ String)` renders verbatim with no
+        // localization lookup, so resolve them through the catalog first (mirrors BrowseGridView's
+        // `section(title:eyebrow:)`) so every rail header follows the app language.
         VStack(alignment: .leading, spacing: 6) {
-            if let eyebrow { Text(eyebrow).eyebrowStyle() }
-            Text(title).sectionTitleStyle()
+            if let eyebrow {
+                Text(String(localized: LocalizedStringResource(stringLiteral: eyebrow))).eyebrowStyle()
+            }
+            Text(String(localized: LocalizedStringResource(stringLiteral: title))).sectionTitleStyle()
         }
         .padding(.horizontal, Theme.Space.screenEdge)
     }
@@ -375,9 +380,13 @@ struct GroupHeader: View {
     let title: String
 
     var body: some View {
+        // `title` / `eyebrow` are raw English keys; resolve through the catalog so the group header localizes
+        // (Text(_ String) renders verbatim). Mirrors BrowseGridView's `section(title:eyebrow:)` and RailHeader.
         VStack(alignment: .leading, spacing: 8) {
-            if let eyebrow { Text(eyebrow).eyebrowStyle(Theme.Palette.accent) }
-            Text(title).screenTitleStyle()
+            if let eyebrow {
+                Text(String(localized: LocalizedStringResource(stringLiteral: eyebrow))).eyebrowStyle(Theme.Palette.accent)
+            }
+            Text(String(localized: LocalizedStringResource(stringLiteral: title))).screenTitleStyle()
             Rectangle()
                 .fill(Theme.Palette.accent)
                 .frame(width: 64, height: 4)
