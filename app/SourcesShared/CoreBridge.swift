@@ -256,6 +256,10 @@ final class CoreBridge: ObservableObject {
             // account) keep it. On the next real ctx event refreshAddons re-derives from the tombstone set
             // identically, so this is a pure local echo, not a divergent source of truth.
             refreshAddons()
+            // Also rebuild the board now: no engine event fires on this path, and buildBoardRows filters
+            // the removed add-on's rows via the tombstone set (#121), so the rebuild drops its Home rows
+            // (and the catalog manager entries, which read `allCatalogs`) immediately.
+            rebuildBoardRows()
         }
     }
 
@@ -653,7 +657,11 @@ final class CoreBridge: ObservableObject {
     /// (Engine-lane follow-up: a dedicated typed live-catalog load would avoid hydrating the whole Home
     /// board here, see [[vortx-engine-needs]] #7 IPTV + the source-registry.)
     func ensureLiveCatalogsLoaded() {
-        let needed = allCatalogs.count   // total catalogs across enabled add-ons; live ones can be last
+        // RAW count (tombstoned AND per-profile disabled add-ons included): both kinds of catalog
+        // still occupy engine board indices, so the widen bound must cover them or trailing live
+        // catalogs that sit behind them would never range-load. Rendering is unaffected: the
+        // disabled / tombstone filters still apply where rows are built and listed.
+        let needed = installedCatalogs(includeTombstoned: true, includeDisabled: true).count
         if boardRows.isEmpty {
             loadBoard(rows: max(needed, 30))
             return
@@ -1810,10 +1818,15 @@ final class CoreBridge: ObservableObject {
         guard let board = decode(CoreBoardState.self, field: "board") else { return [] }
         let titles = catalogTitleMap()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        // Removed-but-engine-retained add-ons (see `tombstonedBases`): their rows must not render on
+        // Home, matching the catalog manager filter, or a removed add-on's rows would ghost with no
+        // manager entry left to hide them (#121).
+        let ghostBases = Self.tombstonedBases(in: decode(CoreCtx.self, field: "ctx")?.profile.addons ?? [])
         var rows: [CoreBoardRow] = []
         for (engineIndex, catalog) in board.catalogs.enumerated() {
             guard let request = catalog.first?.request else { continue }
             guard !disabledAddons.contains(request.base) else { continue }
+            guard !ghostBases.contains(AddonTombstones.normalize(request.base)) else { continue }
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
             guard !items.isEmpty else { continue }
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
@@ -1838,13 +1851,45 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Every catalog the installed add-ons provide (deduped by key), titled the same way the board is.
+    /// Excludes the catalogs of REMOVED add-ons the engine still holds (see `tombstonedBases`), so the
+    /// catalog manager never lists a ghost entry for an add-on the user uninstalled (#121).
     var allCatalogs: [CatalogInfo] {
+        installedCatalogs(includeTombstoned: false, includeDisabled: false)
+    }
+
+    /// Normalized transport URLs of engine-ctx add-ons the user REMOVED (durable `AddonTombstones`)
+    /// that are still present in the engine collection. In the pull-only default (mirror OFF with a
+    /// live Stremio session) `uninstallAddon`/`refreshAddons` intentionally leave the engine collection
+    /// (and the user's Stremio account) intact and only suppress the add-on from the published `addons`
+    /// list, so every other ctx-derived read surface (the Home board rows, the catalog manager list)
+    /// must subtract this set too, or a removed add-on's catalogs ghost forever (#121). Read-side only:
+    /// stored hide/order prefs for a ghost key stay intact, so a genuine reinstall gets the user's old
+    /// catalog prefs back. Official/protected stubs are never suppressed, mirroring `refreshAddons`.
+    private static func tombstonedBases(in addons: [CoreDescriptor]) -> Set<String> {
+        let removed = AddonTombstones.all()
+        guard !removed.isEmpty else { return [] }
+        var out = Set<String>()
+        for addon in addons where !addon.isOfficial && !addon.isProtected {
+            let key = AddonTombstones.normalize(addon.transportUrl)
+            if removed.contains(key) { out.insert(key) }
+        }
+        return out
+    }
+
+    /// The enumeration behind `allCatalogs`. `includeTombstoned: true` keeps the catalogs of removed
+    /// add-ons the engine still holds, and `includeDisabled: true` keeps the catalogs of add-ons the
+    /// active profile disabled: `ensureLiveCatalogsLoaded` needs that RAW count because both kinds of
+    /// catalog still occupy engine board indices, so widening the board by a filtered count could
+    /// leave trailing live catalogs outside the range-loaded window.
+    private func installedCatalogs(includeTombstoned: Bool, includeDisabled: Bool) -> [CatalogInfo] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
         var out: [CatalogInfo] = []
         var seen = Set<String>()
-        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let disabledAddons: Set<String> = includeDisabled ? [] : ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let ghostBases: Set<String> = includeTombstoned ? [] : Self.tombstonedBases(in: ctx.profile.addons)
         for addon in ctx.profile.addons {
             guard !disabledAddons.contains(addon.transportUrl) else { continue }
+            guard !ghostBases.contains(AddonTombstones.normalize(addon.transportUrl)) else { continue }
             for catalog in addon.manifest.catalogs {
                 let key = Self.catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)
                 guard seen.insert(key).inserted else { continue }
