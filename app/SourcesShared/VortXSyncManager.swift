@@ -1006,6 +1006,11 @@ final class VortXSyncManager: ObservableObject {
                 if LibraryTombstones.merge(legacyIDs: removedLib, stampsRaw: removedLibTs) { restored = true }
             }
         }
+        // Wave 4 (Finding D): refresh the local owner-resume cache from the pulled owner library, so a WARM
+        // device (non-empty engine, which skips recoverOwnerLibraryIfEmpty) converges its resume offsets to the
+        // account truth without a cold relaunch. Runs after the tombstone fold above so a removed title is
+        // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
+        refreshOwnerResumeCache(from: doc)
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
@@ -1179,21 +1184,11 @@ final class VortXSyncManager: ObservableObject {
         // doc that predates the removal is honored.
         let removedLibrary = LibraryTombstones.all()
         // Wave 4 (Finding 1a): the engine re-adds each title at time 0 (AddToLibrary has no offset, and
-        // stremio-core exposes no action to inject one), so cache the VortX-owned resume offset for every
-        // non-tombstoned owned title (t/d are SECONDS in the doc) UNCONDITIONALLY, independent of the
-        // engine-empty gate below. This is what lets a cold / recovered / post-import device resume exactly
-        // where device A left off; it must populate even when the engine still reports a (stale, mid-Logout)
-        // library, so it runs before the recovery guards. CoreBridge's resume reads consult this cache when the
-        // engine bucket has no positive offset. Never destroys: it only records the account's own offsets.
-        let resumeEntries: [(id: String, t: Double, d: Double, v: String?)] = ownedLibrary.compactMap { item in
-            guard let id = item["id"] as? String, !id.isEmpty,
-                  !removedLibrary.contains(LibraryTombstones.normalize(id)) else { return nil }
-            return (id: id,
-                    t: Double(Self.libSeconds(item["t"])),
-                    d: Double(Self.libSeconds(item["d"])),
-                    v: item["v"] as? String)
-        }
-        OwnerResumeStore.merge(resumeEntries)
+        // stremio-core exposes no action to inject one), so cache the VortX-owned resume offsets from the doc
+        // UNCONDITIONALLY, before the engine-empty gate below. This is what lets a cold / recovered / post-import
+        // device resume exactly where device A left off; it must populate even when the engine still reports a
+        // (stale, mid-Logout) library, so it runs before the recovery guards. Never destroys.
+        refreshOwnerResumeCache(from: doc)
         // Only RE-ADD titles to the engine when its account library is genuinely empty (a fresh / cold device).
         // Require the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
         // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account library
@@ -1316,6 +1311,29 @@ final class VortXSyncManager: ObservableObject {
     func accountDocReachable() async -> Bool {
         if case .doc = await pullSyncDocResult() { return true }
         return false
+    }
+
+    /// Wave 4: refresh the local owner-resume cache (`OwnerResumeStore`) from a pulled doc's owner library.
+    /// stremio-core re-adds owner titles at time 0 (it has no action to inject a saved offset), so this cache is
+    /// the VortX-owned resume source. Called BOTH from recoverOwnerLibraryIfEmpty (cold device) AND from syncDown
+    /// (so a WARM device with a non-empty engine, which skips the re-add, still converges its resume offsets to
+    /// the account truth without a cold relaunch). Non-destructive: it only records offsets, and honors removal
+    /// tombstones so a removed title is never cached. A doc t==0 (a finished / rewound title) caches 0, which the
+    /// resume reads treat as "no resume", so a finish propagates correctly.
+    private func refreshOwnerResumeCache(from doc: [String: Any]) {
+        let vortx = doc["vortx"] as? [String: Any]
+        let ownedLibrary = (vortx?["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
+        guard !ownedLibrary.isEmpty else { return }
+        let removed = LibraryTombstones.all()
+        let entries: [(id: String, t: Double, d: Double, v: String?)] = ownedLibrary.compactMap { item in
+            guard let id = item["id"] as? String, !id.isEmpty,
+                  !removed.contains(LibraryTombstones.normalize(id)) else { return nil }
+            return (id: id,
+                    t: Double(Self.libSeconds(item["t"])),
+                    d: Double(Self.libSeconds(item["d"])),
+                    v: item["v"] as? String)
+        }
+        OwnerResumeStore.merge(entries)
     }
 
     /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an
