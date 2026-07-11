@@ -8,6 +8,16 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # jni 0.22 is a hard API break (GlobalRef removed -> Global<T>; JNIEnv split into EnvUnowned/Env;
+      # attach_current_thread redesigned around AttachGuard; call_method needs a MethodSignature; JValueGen
+      # removed). core/src/android_jni.rs targets the 0.21 mutable-borrow JNIEnv API, and the Apple build is
+      # cfg(target_os = "android")-gated away from it, so only android.yml catches the break and it fails.
+      # Pin to the 0.21.x line (patch updates still allowed); revisit only as a deliberate android_jni.rs port.
+      - dependency-name: "jni"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
   # GitHub Actions workflows (kept current as CI is added).
   - package-ecosystem: github-actions
     directory: /

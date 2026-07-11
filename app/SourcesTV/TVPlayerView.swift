@@ -284,6 +284,23 @@ struct TVPlayerView: View {
     @State private var scrubStep = 10.0
     @State private var lastScrubAt = 0.0
     @State private var scrubCommit: Task<Void, Never>?
+    /// Seek-in-flight guard: the target of the last user-committed absolute seek (scrub commit, Restart,
+    /// the resume seek), plus when it was issued. While set, incoming timePos ticks that are still FAR
+    /// from the target are ignored instead of overwriting `currentTime`: after a committed seek, mpv can
+    /// keep emitting ticks from the OLD position for seconds (an exact seek on a big remux decodes from
+    /// the keyframe + refills the cache first, and back-and-forth scrubbing queues several seeks), and
+    /// those stale ticks clobbered the freshly committed position — so exiting right after HEAVY
+    /// scrubbing saved a stale spot ("progress stuck at 12:20 after scrubbing far past it"). Cleared as
+    /// soon as a tick lands near the target (the seek settled) or the settle window expires (the seek
+    /// genuinely ended elsewhere — clamped at EOF, failed — so live ticks win again).
+    @State private var inFlightSeekTarget: Double?
+    @State private var inFlightSeekIssuedAt = 0.0
+    private let inFlightSeekSettleWindow = 10.0   // seconds before stale-looking ticks are trusted again
+    private let inFlightSeekSnapRadius = 5.0      // a tick this close to the target means the seek landed
+    /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
+    /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
+    /// scrub commit that merely LANDS past 90% can no longer mark the episode watched on its first tick.
+    @State private var watchedZoneSince: Double?
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
@@ -395,9 +412,19 @@ struct TVPlayerView: View {
             showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
             UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
             if let m = curMeta {
-                if let engineResume = core.engineResumeSeconds(for: m) {
-                    resumeSeconds = engineResume; maybeResume()       // engine library = source of truth
+                if let engineResume = core.engineResumeSeconds(for: m), engineResume > 5 {
+                    resumeSeconds = engineResume; maybeResume()       // engine has a real position: use it
                 } else {
+                    // Engine has no entry — OR answered "start fresh" (0, including its stale-video_id
+                    // mismatch branch). The engine's library copy can lag the account: it hears TimeChanged
+                    // on a throttle and its video_id can be left stale by a watched/unwatched toggle, while
+                    // this device's exit save already put the fresh position on the account. Trusting the
+                    // bare 0 replayed the title from 0:00 and the early exit then SAVED ~0 over the real
+                    // position (the "scrubbed to 06:20, reopened at the beginning, position lost" report).
+                    // Consulting the account here is episode-safe by construction: resumeOffset does its
+                    // own video_id match and returns 0 for a different episode, so the wrong-episode resume
+                    // the engine's 0-answer guards against cannot happen. Overlay profiles keep their own
+                    // private-history path inside resumeOffset, exactly as before.
                     Task { @MainActor in resumeSeconds = await account.resumeOffset(for: m); maybeResume() }
                 }
             } else {
@@ -417,7 +444,7 @@ struct TVPlayerView: View {
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
             // which captures nothing). Independent of the engine-teardown rules below.
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
-            saveProgress(at: currentTime)   // no-op for live
+            saveProgress(at: currentTime, thenSyncEngine: true)   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
             // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
             // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
             // the viewer actually was. saveProgress(at:) just above already cleared the floor if playback passed it.
@@ -511,7 +538,18 @@ struct TVPlayerView: View {
             if let b = data as? Bool {
                 isPaused = b
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
-                if b { saveProgress(at: currentTime) }   // persist on pause
+                if b {
+                    saveProgress(at: currentTime)   // persist on pause
+                    // Keep the ENGINE's library copy in step too (same floor rule as the 20s tick).
+                    // The engine previously only heard the throttled tick + the exit flush, so its
+                    // copy could lag far behind the account writes — and any engine-side push (the
+                    // watched/unwatched toggle, a sync) then resurrected that stale position over
+                    // the newer account value (the "unmarked watched, an old scrub position came
+                    // back" report). Engine dispatches are ordered, so this can never race backward.
+                    if !isCurrentLiveStream, suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
+                        core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)
+                    }
+                }
             }
         case MPVProperty.timePos:
             if let d = data as? Double {
@@ -552,7 +590,31 @@ struct TVPlayerView: View {
                     // fetch runs); the duration-event call remains for streams that deliver it first.
                     fetchAddonSubtitles()
                 }
+                // Seek-in-flight guard (see the state declaration): drop stale pre-seek ticks so they
+                // cannot clobber the freshly committed position; everything downstream of a tick
+                // (progress saves, watched-at-90%, skip spans) waits with it.
+                if let target = inFlightSeekTarget {
+                    if abs(d - target) <= inFlightSeekSnapRadius
+                        || Date().timeIntervalSinceReferenceDate - inFlightSeekIssuedAt > inFlightSeekSettleWindow {
+                        inFlightSeekTarget = nil   // settled near the target, or the window expired: trust ticks again
+                    } else {
+                        return
+                    }
+                }
                 currentTime = d
+                // Durationless-stream fallback (the "watch position never saved / no resume on some
+                // debrid MKVs" report): many debrid direct-HTTP MKVs never DELIVER mpv's `duration`
+                // EVENT, yet the property itself reads fine (the subtitle-fingerprint path already
+                // relies on that). Everything downstream keys off `duration > 0` — the resume seek,
+                // the ~20s progress saves, watched-at-90%, Up Next — so those streams lost their watch
+                // position entirely and always restarted from 0. Poll the engine each (coalesced) tick
+                // until a real value lands and route it through the same handling as the event; one C
+                // property read at ~2-4 Hz, and it stops the moment duration is known. The AVPlayer
+                // engine returns 0 here (it delivers its duration event reliably), so this is mpv-only.
+                if duration <= 0, !isCurrentLiveStream,
+                   let engineDur = coordinator.player?.mediaDurationSeconds(), engineDur.isFinite, engineDur > 0 {
+                    handleProperty(MPVProperty.duration, engineDur)
+                }
                 updateCurrentSkip(at: d)
                 // Ensure the community key is provisioned off meta.runtime the moment the behind-playback
                 // meta lands (idempotent; no-op once keyed), so capture starts even without a duration event.
@@ -569,9 +631,28 @@ struct TVPlayerView: View {
                         core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
                     }
                 }
-                if !markedWatched, duration > 0, d / duration >= 0.9, let m = curMeta {
-                    markedWatched = true            // ~90% in → flip the watched marker live
-                    core.markPlaybackWatched(m)
+                // ~90% in → flip the watched marker live. DWELL-GATED: a single tick past 90% is not
+                // proof of watching — a scrub commit that lands there (easy mid back-and-forth, since a
+                // held press ramps to 75s steps) used to mark the episode watched instantly, and the mark
+                // stuck even when the viewer scrubbed straight back and exited early: Continue Watching
+                // dropped the episode and the selector moved on (the same wipe as the EOF overshoot).
+                // Require a few seconds of SETTLED playback in the zone (not scrubbing, ticks flowing)
+                // before marking; leaving the zone re-arms. A natural finish is unaffected: the last 10%
+                // of any episode dwarfs the dwell, and a true EOF still marks watched via endFileEof.
+                if !markedWatched, duration > 0, d / duration >= 0.9 {
+                    let now = Date().timeIntervalSinceReferenceDate
+                    if scrubbing {
+                        watchedZoneSince = nil          // previewing, not watching: reset the dwell
+                    } else if let since = watchedZoneSince {
+                        if now - since >= 5, let m = curMeta {
+                            markedWatched = true
+                            core.markPlaybackWatched(m)
+                        }
+                    } else {
+                        watchedZoneSince = now          // entered the zone: start the dwell clock
+                    }
+                } else {
+                    watchedZoneSince = nil              // below the zone (scrubbed back out): re-arm
                 }
                 // ~60s in → the user is really watching this: auto-add to the Library (D8) + send the anon
                 // fleet watch ping (D9), once per playback. Idempotent + gated (D8 setting + per-profile dedup;
@@ -3083,6 +3164,8 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
+        inFlightSeekTarget = nil   // any pending seek belonged to the PREVIOUS episode; new media ticks are authoritative
+        watchedZoneSince = nil     // the watched-zone dwell belonged to the previous episode too
         suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
@@ -3396,12 +3479,21 @@ struct TVPlayerView: View {
         coordinator.player?.seek(to: r)
         currentTime = r
         lastSaved = r
+        inFlightSeekTarget = r   // same guard as commitScrub: pre-resume ticks near 0 must not clobber the resume point
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
     }
 
     /// Persist the current position to the account library (no-op without a library context). Also a
     /// no-op for live: persisting a live "position" would seed a bogus resume offset / fake Continue
     /// Watching entry the next time the channel opens. Mirrors PlayerScreen's live progress suppression.
-    private func saveProgress(at position: Double) {
+    /// `thenSyncEngine` (the EXIT flush only): after this save LANDS on the account API, ask the engine
+    /// to reconcile its library copy (CoreBridge.syncLibraryNow). The player writes progress straight to
+    /// the API, which the engine cannot see until a library sync — and none ran after playback, so the
+    /// Home dashboard's Continue Watching timestamp (and the resume it feeds) stayed at the pre-playback
+    /// value until a detail-page load happened to sync. Sequenced INSIDE the save task so the pull can
+    /// never race ahead of the write it needs to fetch. Exit-only: the periodic 20s / pause saves must
+    /// not each trigger an API library sync.
+    private func saveProgress(at position: Double, thenSyncEngine: Bool = false) {
         guard !isCurrentLiveStream else { return }
         guard let m = curMeta, duration > 0, position >= 0 else { return }
         // A DV-remux play whose resume seek was suppressed (maybeResume) starts from 0: do not let the
@@ -3412,7 +3504,10 @@ struct TVPlayerView: View {
             suppressedResumeFloor = nil
         }
         let dur = duration
-        Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
+        Task {
+            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur)
+            if thenSyncEngine { await MainActor.run { core.syncLibraryNow() } }
+        }
     }
 
     private func toggle() {
@@ -3431,6 +3526,8 @@ struct TVPlayerView: View {
         commitScrubIfNeeded()
         coordinator.player?.seek(to: 0)
         currentTime = 0; lastSaved = 0
+        inFlightSeekTarget = 0   // same guard as commitScrub: a stale tick must not undo the restart
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
         flashControls()
     }
 
@@ -3454,7 +3551,14 @@ struct TVPlayerView: View {
             scrubStep = 10                               // paused between presses → back to fine steps
         }
         lastScrubAt = now
-        scrubTarget = min(duration, max(0, scrubTarget + Double(dir) * scrubStep))
+        // Clamp an overshoot a few seconds BEFORE the end, never AT it. The accelerating ramp reaches the
+        // clamp in a few held presses, and a commit at the exact duration seeks straight into end-of-file:
+        // mpv fires EOF, the player treats that as "episode finished" — marks it watched and auto-advances
+        // — and the viewer's real progress is wiped (the "scrubbed fast, exited, progress and episode
+        // selection gone" report). Landing 5s short shows the actual ending and lets natural playback
+        // reach EOF with all the finished semantics intact; a short clip keeps the plain full-range clamp.
+        let scrubCeiling = duration > 30 ? duration - 5 : duration
+        scrubTarget = min(scrubCeiling, max(0, scrubTarget + Double(dir) * scrubStep))
         scrubThumbnails.show(time: scrubTarget)
         flashControls()
         scheduleScrubCommit()
@@ -3475,6 +3579,17 @@ struct TVPlayerView: View {
         scrubbing = false
         coordinator.player?.seek(to: scrubTarget)
         currentTime = scrubTarget; lastSaved = scrubTarget
+        inFlightSeekTarget = scrubTarget   // stale pre-seek ticks must not clobber this commit
+        inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+        // A commit is exactly when the position jumps by minutes, and `lastSaved = scrubTarget` above
+        // suppresses the next throttled tick — so without this the ENGINE's library copy only learned
+        // the new position at the exit flush, and an engine-side push (watched toggle, sync) in between
+        // resurrected the pre-scrub position. Report the committed position immediately; the account
+        // write keeps its pause/20s/exit cadence (network saves are unordered, so fewer is safer there).
+        if !isCurrentLiveStream, duration > 0,
+           suppressedResumeFloor == nil || scrubTarget >= (suppressedResumeFloor ?? 0) {
+            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration)
+        }
         scrubThumbnails.clear()
         flashControls()
     }

@@ -798,6 +798,15 @@ struct PlayerScreen: View {
                 }
                 if !scrubbing {
                     currentTime = d
+                    // Durationless-stream fallback (mirrors TVPlayerView): many debrid direct-HTTP MKVs
+                    // never DELIVER mpv's `duration` EVENT, yet the property reads fine — and the resume
+                    // seek, the ~5s progress pushes, and watched-at-90% all key off `duration > 0`, so
+                    // those streams never saved a watch position. Poll the engine each (coalesced) tick
+                    // until a real value lands and route it through the same handling as the event.
+                    if duration <= 0, !effectivelyLive,
+                       let engineDur = coordinator.player?.mediaDurationSeconds(), engineDur.isFinite, engineDur > 0 {
+                        handleProperty(MPVProperty.duration, engineDur)
+                    }
                     #if !os(tvOS)
                     if skipDBPreviewing, d >= skipDBEditStart {
                         skipDBPreviewing = false

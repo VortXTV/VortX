@@ -107,7 +107,7 @@ jobs:
           echo "staged Linux mpv AppDir at $dest"
 
       - name: Build the app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         with:
           projectPath: desktop
           args: --bundles ${{ matrix.bundles }}

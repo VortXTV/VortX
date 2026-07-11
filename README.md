@@ -333,11 +333,11 @@ The Full IPAs include `server.js`, the streaming server's own proprietary file, 
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=vortxtv%2Fvortx&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=VortXTV%2FVortX&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=vortxtv/vortx&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=VortXTV/VortX&type=date&theme=dark&legend=top-left&sealed_token=yKzKgEU0KdICBropM1k7qT6Xle5yPHDWjgz54noyNRyzQBn3OKydbicXr8owI-VOzFLbezoB5jWIhEdhLKRC7Rf_VGV3sxZyHglg4UKY81vwSYEedPXXQA" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=VortXTV/VortX&type=date&legend=top-left&sealed_token=yKzKgEU0KdICBropM1k7qT6Xle5yPHDWjgz54noyNRyzQBn3OKydbicXr8owI-VOzFLbezoB5jWIhEdhLKRC7Rf_VGV3sxZyHglg4UKY81vwSYEedPXXQA" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=VortXTV/VortX&type=date&legend=top-left&sealed_token=yKzKgEU0KdICBropM1k7qT6Xle5yPHDWjgz54noyNRyzQBn3OKydbicXr8owI-VOzFLbezoB5jWIhEdhLKRC7Rf_VGV3sxZyHglg4UKY81vwSYEedPXXQA" />
  </picture>
 </a>
 

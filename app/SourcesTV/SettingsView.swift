@@ -310,10 +310,27 @@ struct SettingsView: View {
             choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // Streaming cache, honest tvOS presentation. On this MPVKit build the buffer is HELD IN
+            // MEMORY (cache-on-disk does not reliably offload; see MPVMetalViewController.loadFile), and
+            // the applied budget is clamped to the device-safe RAM ceiling (~768 MB on Apple TV 4K) no
+            // matter how large a tier is chosen. The old 2/5/10/20 GB / Unlimited tiers therefore all
+            // resolved to the SAME cap while implying a big disk cache — the trap that had a viewer
+            // running "2 GB" for weeks without knowing they had tripled their memory exposure. tvOS now
+            // offers the honest binary: Off, or the larger memory buffer at its real ceiling (label
+            // computed from the live RemoteConfig dial, so a fleet re-tune re-labels itself). Picking On
+            // stores the same 2 GB value the old default tier wrote, so the engine path, sync payloads,
+            // and other platforms are completely unchanged; a bigger tier synced from another device
+            // still shows as On here. On the Apple TV HD the ceiling (~128 MB) barely exceeds the
+            // always-on standard buffer, so the row is disabled with the reason in the footer instead of
+            // offering a near-no-op that only adds memory pressure. Presentation-only change:
+            // DiskCacheSetting and the player path are untouched.
             choiceRow(String(localized: "Streaming cache"),
-                      DiskCacheSetting.pickerOptions.map { (String($0.id), $0.label) },
-                      selection: Binding(get: { String(diskCacheBytes) },
-                                         set: { diskCacheBytes = Int($0) ?? Int(DiskCacheSetting.defaultBytes) }))
+                      [("0", String(localized: "Off")),
+                       ("on", String(localized: "On (up to \(streamingCacheCeilingMB) MB of memory)"))],
+                      selection: Binding(get: { diskCacheBytes == 0 ? "0" : "on" },
+                                         set: { diskCacheBytes = ($0 == "on") ? Int(DiskCacheSetting.defaultBytes) : 0 }))
+                .disabled(PerformanceMode.isConstrainedDevice)
+                .opacity(PerformanceMode.isConstrainedDevice ? 0.4 : 1)
             Text(diskCacheFooter)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
@@ -439,18 +456,31 @@ struct SettingsView: View {
         [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
     }
 
-    /// Explains the streaming cache and shows live on-disk usage when on. On the Apple TV HD the cache
-    /// is additionally capped tight; Unlimited is always bounded to half of free storage and cleared
-    /// when a title finishes, so it never fills the device.
+    /// The REAL ceiling (in MB) the player will apply to this buffer on this device — the same
+    /// RemoteConfig dial `MPVMetalViewController.loadFile` clamps `demuxer-max-bytes` with (~768 MB on
+    /// Apple TV 4K, ~128 MB in reduced mode). Shown in the On chip + footer so the setting promises
+    /// exactly what it delivers. Uses `PerformanceMode.reduced` (not the hardware test) because that is
+    /// what the engine applies, so a forced reduced mode re-labels honestly too.
+    private var streamingCacheCeilingMB: Int {
+        RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: false) / (1024 * 1024)
+    }
+
+    /// Explains the streaming cache honestly for tvOS: the buffer is held in MEMORY on this build (the
+    /// on-disk offload does not engage; the old copy promised a disk cache), it is capped at the
+    /// device-safe ceiling, and a larger buffer trades seek-ahead runway for memory-pressure risk. On
+    /// the Apple TV HD (row disabled) it explains why the option is unavailable there.
     private var diskCacheFooter: String {
-        let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
+        if PerformanceMode.isConstrainedDevice {
+            return String(localized: "Not available on this Apple TV: this model would cap the buffer at about \(streamingCacheCeilingMB) MB, barely above the standard buffer that is always active, while adding memory pressure on its limited RAM.")
+        }
+        let base = String(localized: "Buffers more video ahead of the play head so you can seek further without re-buffering. On Apple TV this buffer is held in memory, capped at about \(streamingCacheCeilingMB) MB; a larger buffer can increase the chance tvOS closes the app under memory pressure. It clears when a title finishes.")
         guard diskCacheBytes != 0 else { return base }
-        // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the
-        // buffer is RAM-resident, not offloaded to disk), so it always read "0 KB" and looked broken. Show
-        // the real RAM-bounded budget the player will actually use instead (floored at 64 MiB, clamped to
-        // the device-safe ceiling), which is an honest non-zero number visible in Settings.
-        let budget = DiskCacheSetting.humanReadable(DiskCacheSetting.resolvedMaxBytes())
-        return base + " " + String(localized: "Cache budget: \(budget).")
+        // Show the budget the player will ACTUALLY apply: the stored choice, bounded by free disk and
+        // the device-safe RAM ceiling above — the same min() the engine computes at load. (The on-disk
+        // usage readout this once was stays retired: the mpv-cache dir is empty on this build.)
+        let applied = min(DiskCacheSetting.resolvedMaxBytes(),
+                          Int64(RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: false)))
+        return base + " " + String(localized: "Active buffer budget: \(DiskCacheSetting.humanReadable(applied)).")
     }
 
     private var effectiveDirectLinksOnly: Bool {
