@@ -552,11 +552,36 @@ struct iOSSettingsView: View {
                 showDiagExport = true
             }
             .tint(Theme.Palette.accent)
+            // Direct save/share of the same rolling log, with no QR and no second device: the native share
+            // sheet offers Files, AirDrop, and Mail (macOS gets the share menu). Additive to the QR path
+            // above, which stays. Only offered when logging is on and the log has content; otherwise a
+            // guidance button points at the toggle first, so we never hand over a nonexistent or empty file.
+            if let logURL = diagLogExportURL {
+                ShareLink("Save or share log", item: logURL)
+                    .tint(Theme.Palette.accent)
+            } else {
+                Button("Save or share log") {
+                    backupAlert = BackupAlert(title: String(localized: "Diagnostic Log Empty"),
+                        message: String(localized: "Turn on Diagnostic logging first, then try again."))
+                }
+                .tint(Theme.Palette.accent)
+            }
         } header: {
             Text("Advanced (mpv options)")
         } footer: {
             Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
+    }
+
+    /// The rolling diagnostic log to hand to the share sheet, or nil when logging is off or the log is
+    /// empty/missing. Gating the direct Save path this way means it never shares a nonexistent or empty file
+    /// (the same empty-guard exportActiveLibrary uses); nil drives the guidance button instead.
+    private var diagLogExportURL: URL? {
+        guard VXProbe.enabled else { return nil }
+        let url = VXProbe.logFileURL
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size > 0 else { return nil }
+        return url
     }
 
     /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
