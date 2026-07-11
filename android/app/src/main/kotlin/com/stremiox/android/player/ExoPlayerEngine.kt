@@ -124,7 +124,6 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         } else {
             DefaultMediaSourceFactory(appContext)
         }
-        player.setMediaSourceFactory(mediaSourceFactory)
 
         // External sidecar subtitles as side-loaded text tracks on the MediaItem. ExoPlayer needs a
         // concrete, parseable subtitle MIME (unlike mpv, which sniffs the file), so infer it from the
@@ -143,7 +142,10 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             .setSubtitleConfigurations(subtitleConfigs)
             .build()
 
-        player.setMediaItem(item)
+        // ExoPlayer has no runtime setMediaSourceFactory (that is a Builder-only API); the factory is
+        // applied per-load by creating the MediaSource here. DefaultMediaSourceFactory still handles the
+        // sidecar SubtitleConfigurations on the MediaItem (it merges them as side-loaded text tracks).
+        player.setMediaSource(mediaSourceFactory.createMediaSource(item))
         player.playWhenReady = true
         if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
         player.prepare()
