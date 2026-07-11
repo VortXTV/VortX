@@ -508,6 +508,19 @@ final class CoreBridge: ObservableObject {
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
 
+    /// Reconcile the engine's library copy with api.strem.io NOW. The tvOS player writes watch progress
+    /// directly to the account API (StremioAccount.saveProgress), which the engine cannot see until its
+    /// next library sync — and nothing scheduled one after playback, so the Home dashboard's Continue
+    /// Watching card kept the pre-playback timestamp (and fed a stale resume) until a detail-page load
+    /// happened to trigger a sync (the "have to long-press → Details to refresh the timestamp" report).
+    /// Called by the player's exit path AFTER its final save has landed on the API, so the pull can
+    /// never race the write it exists to fetch. The sync re-emits `continue_watching_preview`, which
+    /// republishes the rail. No-op for overlay profiles (their history never touches the engine).
+    func syncLibraryNow() {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return }
+        dispatchCtx(["action": "SyncLibraryWithAPI"])
+    }
+
     /// Seed the engine right after a fresh sign-in (LoginView wrote the authKey to the active
     /// profile's slot). When the engine still holds ANOTHER profile's session, this routes through
     /// the switch path instead, because bootstrapAuth would see "logged in" and keep the old session.

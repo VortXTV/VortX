@@ -423,7 +423,7 @@ struct TVPlayerView: View {
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
             // which captures nothing). Independent of the engine-teardown rules below.
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
-            saveProgress(at: currentTime)   // no-op for live
+            saveProgress(at: currentTime, thenSyncEngine: true)   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
             if !isCurrentLiveStream {
                 core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
             }
@@ -3298,7 +3298,14 @@ struct TVPlayerView: View {
     /// Persist the current position to the account library (no-op without a library context). Also a
     /// no-op for live: persisting a live "position" would seed a bogus resume offset / fake Continue
     /// Watching entry the next time the channel opens. Mirrors PlayerScreen's live progress suppression.
-    private func saveProgress(at position: Double) {
+    /// `thenSyncEngine` (the EXIT flush only): after this save LANDS on the account API, ask the engine
+    /// to reconcile its library copy (CoreBridge.syncLibraryNow). The player writes progress straight to
+    /// the API, which the engine cannot see until a library sync — and none ran after playback, so the
+    /// Home dashboard's Continue Watching timestamp (and the resume it feeds) stayed at the pre-playback
+    /// value until a detail-page load happened to sync. Sequenced INSIDE the save task so the pull can
+    /// never race ahead of the write it needs to fetch. Exit-only: the periodic 20s / pause saves must
+    /// not each trigger an API library sync.
+    private func saveProgress(at position: Double, thenSyncEngine: Bool = false) {
         guard !isCurrentLiveStream else { return }
         guard let m = curMeta, duration > 0, position >= 0 else { return }
         // A DV-remux play whose resume seek was suppressed (maybeResume) starts from 0: do not let the
@@ -3309,7 +3316,10 @@ struct TVPlayerView: View {
             suppressedResumeFloor = nil
         }
         let dur = duration
-        Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
+        Task {
+            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur)
+            if thenSyncEngine { await MainActor.run { core.syncLibraryNow() } }
+        }
     }
 
     private func toggle() {
