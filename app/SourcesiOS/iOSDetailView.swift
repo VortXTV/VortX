@@ -2568,12 +2568,18 @@ struct iOSDetailView: View {
                     HStack(spacing: Theme.Space.md) {
                         ForEach(avail.providers) { provider in
                             VStack(spacing: 6) {
+                                // TMDB watch-provider marks are dark / brand-hued app icons that read as
+                                // "very dark" drawn straight on the app's dark chrome (#95). Sit each mark on
+                                // the shared warm near-white plate (the same treatment the Streaming Services
+                                // tiles and RemoteLogo use) with a small inset, so a dark logo stays legible
+                                // and whole instead of blending into the background.
                                 AsyncImage(url: URL(string: provider.logoURL ?? "")) { img in
-                                    img.resizable().scaledToFit()
+                                    img.resizable().scaledToFit().padding(48 * BundledLogo.plateInsetFraction)
                                 } placeholder: {
                                     RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.Palette.surface1)
                                 }
                                 .frame(width: 48, height: 48)
+                                .background(BundledLogo.plateFill)
                                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                 Text(provider.name)
                                     .font(Theme.Typography.label)

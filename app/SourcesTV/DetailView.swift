@@ -425,7 +425,7 @@ struct DetailView: View {
                                 // tiles and RemoteLogo use) with a small inset, so a dark logo stays legible
                                 // and whole instead of blending into the background.
                                 AsyncImage(url: URL(string: provider.logoURL ?? "")) { img in
-                                    img.resizable().scaledToFit().padding(6)
+                                    img.resizable().scaledToFit().padding(56 * BundledLogo.plateInsetFraction)
                                 } placeholder: {
                                     RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous).fill(Theme.Palette.surface1)
                                 }
