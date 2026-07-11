@@ -410,10 +410,21 @@ enum LiveTypes {
 struct CoreMetaDetails: Decodable {
     let metaItems: [CoreMetaEntry]
     let streams: [CoreStreamGroup]
+    /// Streams EMBEDDED in the meta itself (`MetaDetails.meta_streams`): the engine lifts the selected
+    /// video's `video.streams` array into this parallel surface. Catalog add-ons that serve plain HTTP or
+    /// HLS links usually inline them in the meta's videos instead of implementing a separate `stream`
+    /// resource, so official clients list `metaStreams` alongside `streams`. Ignoring this field made every
+    /// such add-on show zero sources (#122). Optional so an older payload without it still decodes.
+    let metaStreams: [CoreStreamGroup]?
     /// The engine's library entry for this title (its state.timeOffset drives resume), if saved.
     let libraryItem: CoreCWItem?
     /// Watched episode ids, computed engine-side from the WatchedBitField (which isn't itself in JSON).
     let watchedVideoIds: [String]?
+
+    /// Meta-embedded stream groups plus the stream-resource responses, in the engine's own
+    /// `[meta_streams, streams]` concat order. The single source every stream surface should walk, so a
+    /// meta-embedded HTTP/HLS source is never invisible to a path that only read `streams`.
+    var allStreamGroups: [CoreStreamGroup] { (metaStreams ?? []) + streams }
 
     /// First fully-loaded meta (addons are queried in order; take the first that resolved).
     var meta: CoreMetaItem? { metaItems.compactMap { $0.content?.ready }.first }

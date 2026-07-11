@@ -1639,7 +1639,9 @@ struct iOSDetailView: View {
         let metaResident = core.metaDetails?.meta?.id == id
         guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
-        let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
+        // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
+        // same stream path id, and their presence means the engine already selected this id.
+        let hasStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
         // Dispatch under the AUTHORITATIVE type (meta.type when resident), NOT the hub's TMDB movie/tv guess,
         // so a TV-movie / mini-series / anime the hub mis-typed still matches the add-on that indexes it. Log
@@ -2756,7 +2758,7 @@ struct iOSEpisodeStreams: View {
             // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
             // Also (re)load whenever the loaded streams aren't this episode's; the engine de-dups an
             // identical meta+stream load, so this is cheap when the right streams are already present.
-            let hasThisEpisodeStreams = core.metaDetails?.streams.contains { $0.request.path.id == video.id } ?? false
+            let hasThisEpisodeStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == video.id } ?? false
             if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
                 core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
             }
