@@ -123,10 +123,33 @@ struct HomeView: View {
                         // The special rails above (Continue Watching, hub, Top Picks, Streaming, Upcoming)
                         // stay rails in both modes; only the add-on catalog sections reshape.
                         ForEach(core.boardRows) { row in
-                            if catalogPrefs.homeLayout == .wall {
-                                CoreCatalogWallSection(row: row, focusModel: focusModel)
-                            } else {
-                                CoreCatalogRowView(row: row, focusModel: focusModel)
+                            Group {
+                                if catalogPrefs.homeLayout == .wall {
+                                    CoreCatalogWallSection(row: row, focusModel: focusModel)
+                                } else {
+                                    CoreCatalogRowView(row: row, focusModel: focusModel)
+                                }
+                            }
+                            // Vertical board widening, mirroring iOS Home (iOSRootView's `ForEach(core.boardRows)`):
+                            // when the LAST populated board section appears, load the next window of Home catalogs.
+                            // Without it tvOS Home was silently capped at the engine board's first ~30 catalogs in
+                            // BOTH layouts, so a user with many add-on catalogs never saw the rest. Attached here at
+                            // the SECTION level (on the Group, above the wall/rail branch) so it fires in BOTH layouts,
+                            // not inside one. The `LazyVStack` materializes this only as scroll/focus nears the last
+                            // section, so it is not a per-frame call; repeats are gated inside `loadBoardNextPage`
+                            // (boardHasNextPage + boardPageInFlight, cleared on the next `board` emit), the SAME
+                            // idempotency `loadBoardRowNextPage` relies on, so no tvOS-side dedup is added, matching iOS.
+                            //
+                            // Composition with `ensureLiveCatalogsLoaded` (#121, driven from the Live tab): that
+                            // widens the window to a FIXED bound (every installed catalog) so trailing LIVE catalogs
+                            // sitting inside the loaded window hydrate; THIS grows the window itself incrementally as
+                            // Home is scrolled. Both only ever raise the shared `boardRowsLoaded` and share CoreBridge's
+                            // single in-flight gate, so they compose additively and never fight: whichever asks for
+                            // more wins, and neither narrows the window the other opened.
+                            .onAppear {
+                                if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
+                                    core.loadBoardNextPage()
+                                }
                             }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
