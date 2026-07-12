@@ -1671,6 +1671,12 @@ struct TVPlayerView: View {
         currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
+        // A switch to a new URL (the guard above proved newURL != curURL) is a fresh routing decision through
+        // PlayerEngineRouter.route, so a prior AVPlayer -> libmpv demote must NOT carry over and condemn a
+        // different source of the same title to HDR10: this switched-to source gets its own shot at true DV/Atmos
+        // on AVPlayer. Stickiness still holds for same-URL reloads and WITHIN one source's playback (nothing else
+        // clears this mid-source), and the per-episode reset in play(episode:) stays as is.
+        avEngineFailed = false
         // R11: only a USER-initiated pick re-arms the overall recovery cap. An automatic source hop
         // (userInitiated == false, via hopToNextSource) must PRESERVE the running deadline, otherwise the 150s
         // cap resets on every hop and never bounds a cascade of automatically failing sources.
