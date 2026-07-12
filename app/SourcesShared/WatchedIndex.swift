@@ -8,12 +8,15 @@ import Combine
 /// Sources, honoring the per-profile history invariant (the exact split LibraryView.isWatched uses):
 ///  - OWNER profile (`activeUsesEngineHistory`): the ENGINE's own watched bookkeeping,
 ///    `LibraryItem.state.timesWatched > 0` (upstream `LibraryItem::watched()`), read from the
-///    engine's persisted library buckets (`library_recent.json` / `library.json` in the
-///    stremio-core storage dir; the env writes them temp-then-rename, so a read never sees a torn
-///    file). The buckets cover the WHOLE library plus the temporary watched-from-catalog markers,
-///    not just the page the Library tab has loaded. The live published `library` /
-///    `continueWatching` models are unioned in so a fresh mark shows without waiting for the
-///    engine's async bucket persist.
+///    engine's persisted library buckets (`library_recent.json` / `library.json` in
+///    `CoreBridge.storageDirURL`, the same directory `start()` hands the engine; the env writes
+///    them temp-then-rename, so a read never sees a torn file). A bucket is consumed ONLY when its
+///    `uid` matches the live ctx uid (`CoreBridge.currentUID()`), mirroring the engine's own
+///    `LibraryBucket::merge_bucket` uid refusal, so a stale bucket from a previous account can
+///    never badge covers for the new one. The buckets cover the WHOLE library plus the temporary
+///    watched-from-catalog markers, not just the page the Library tab has loaded. The live
+///    published `library` / `continueWatching` models are unioned in so a fresh mark shows
+///    without waiting for the engine's async bucket persist.
 ///  - OVERLAY profile: only that profile's private overlay (`ProfileStore.watch` entries with a
 ///    non-empty `watchedVideoIds`), NEVER the account/engine set.
 ///
@@ -87,13 +90,18 @@ final class WatchedIndex: ObservableObject {
         var live = Set<String>()
         for item in CoreBridge.shared.library?.catalog ?? [] where item.isWatched { live.insert(item.id) }
         for item in CoreBridge.shared.continueWatching where item.isWatched { live.insert(item.id) }
+        // Capture the account identity NOW, on main, alongside the live state: the bucket reads
+        // below only honor files stamped with this uid (see bucketWatchedIDs). An account switch
+        // in the window before the resweep re-triggers rebuild via ctx events, and the generation
+        // guard drops these passes' publishes.
+        let expectedUID = CoreBridge.shared.currentUID()
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let first = Self.bucketWatchedIDs()
+            let first = Self.bucketWatchedIDs(expectedUID: expectedUID)
             DispatchQueue.main.async { self?.publish(live.union(first), ifCurrent: gen) }
             // Resweep: the engine persists the bucket as an async effect AFTER the NewState emit,
             // so the first pass can read the pre-mark file. One trailing re-read settles it.
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.resweepDelay) { [weak self] in
-                let second = Self.bucketWatchedIDs()
+                let second = Self.bucketWatchedIDs(expectedUID: expectedUID)
                 DispatchQueue.main.async { self?.publish(live.union(second), ifCurrent: gen) }
             }
         }
@@ -107,18 +115,27 @@ final class WatchedIndex: ObservableObject {
     }
 
     /// Ids with `state.timesWatched > 0` across BOTH persisted engine buckets (the recent split and
-    /// the rest). Removed-but-watched entries stay in: the user did watch them. Read-only; any
-    /// missing / unreadable file contributes nothing (fail-soft, never a crash).
-    private static func bucketWatchedIDs() -> Set<String> {
+    /// the rest), read from `CoreBridge.storageDirURL` (the single source of truth for the engine's
+    /// storage dir; never re-derive the path). Removed-but-watched entries stay in: the user did
+    /// watch them. Read-only; any missing / unreadable file contributes nothing (fail-soft, never
+    /// a crash).
+    ///
+    /// UID GATE: a bucket persists `{ uid, items }`, where `uid` is the auth user id (null when
+    /// signed out), and the engine itself refuses to merge a bucket whose uid mismatches
+    /// (`LibraryBucket::merge_bucket`). Mirror that: after an owner signs into a DIFFERENT account,
+    /// the on-disk bucket can still hold the previous account's entries for a window, so a file
+    /// whose uid does not match `expectedUID` is skipped entirely (degrades to no badges from that
+    /// file, the same fail-soft posture as missing/corrupt).
+    private static func bucketWatchedIDs(expectedUID: String?) -> Set<String> {
         var found = Set<String>()
-        guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return found
-        }
-        let dir = support.appendingPathComponent("stremio-core", isDirectory: true)
+        let dir = CoreBridge.storageDirURL
         for name in ["library_recent.json", "library.json"] {
             guard let data = try? Data(contentsOf: dir.appendingPathComponent(name)),
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let items = root["items"] as? [String: Any] else { continue }
+            // Absent / null uid decodes to nil and matches only the signed-out state (nil uid),
+            // exactly the engine's own equality semantics.
+            guard (root["uid"] as? String) == expectedUID else { continue }
             for (id, value) in items {
                 guard let item = value as? [String: Any],
                       let state = item["state"] as? [String: Any] else { continue }

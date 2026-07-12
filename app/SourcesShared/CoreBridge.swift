@@ -96,7 +96,7 @@ final class CoreBridge: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
-        let storageDir = Self.makeDir(.applicationSupportDirectory, "stremio-core")
+        let storageDir = Self.makeDir(at: Self.storageDirURL)
         let cacheDir = Self.makeDir(.cachesDirectory, "stremio-core-http")
         // The pointer is passed through but never dereferenced on the way back: the C callback
         // resolves `CoreBridge.shared` directly. An unretained pointer round-tripped through a
@@ -1505,9 +1505,12 @@ final class CoreBridge: ObservableObject {
         return profile["auth"] is [String: Any]
     }
 
-    /// The signed-in account's uid (`ctx.profile.auth.user._id`), nil when signed out. Used to
-    /// detect when an account switch has actually landed.
-    private func currentUID() -> String? {
+    /// The signed-in account's uid (`ctx.profile.auth.user._id`), nil when signed out or the ctx is
+    /// unavailable. Used to detect when an account switch has actually landed. This is the SAME
+    /// identity the engine stamps into its persisted library buckets (`LibraryBucket.uid` is
+    /// `Profile::uid()`, the auth user id), so it is internal (not private): `WatchedIndex` gates
+    /// its bucket-file reads on it (#111 review).
+    func currentUID() -> String? {
         guard let data = stateData("ctx"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let profile = object["profile"] as? [String: Any],
@@ -2001,6 +2004,22 @@ final class CoreBridge: ObservableObject {
 
     private static func catalogKey(base: String, type: String, id: String) -> String {
         "\(base)|\(type)|\(id)"
+    }
+
+    /// The engine's persisted-state directory: the SINGLE source of truth for where stremio-core
+    /// keeps its buckets. `start()` hands this exact directory to the engine; `WatchedIndex` reads
+    /// the persisted library buckets (library_recent.json / library.json) from it. Any reader must
+    /// consume THIS, never re-derive the path, so relocating it here can never silently strand a
+    /// reader on the old path (#111 review).
+    static let storageDirURL: URL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("stremio-core", isDirectory: true)
+
+    /// Create-if-needed and return the engine-facing path for a directory URL (the C init takes
+    /// plain paths).
+    private static func makeDir(at url: URL) -> String {
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url.path
     }
 
     private static func makeDir(_ directory: FileManager.SearchPathDirectory, _ name: String) -> String {
