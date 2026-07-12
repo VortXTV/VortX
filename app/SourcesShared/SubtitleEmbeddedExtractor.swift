@@ -180,8 +180,13 @@ enum SubtitleEmbeddedExtractor {
     /// standard layout: it is the file's own Dialogue fields with Start/End removed and a ReadOrder prepended
     /// (FFmpeg's `ass` decoder hands that row through verbatim), so a track whose Format declares a
     /// nonstandard field count (v4++ MarginB, trimmed machine-generated Formats, ...) must be split by ITS
-    /// declared layout -- the hardcoded standard split left metadata glued to the cue text (the issue #76
-    /// "0,0,0default"-style prefixes). Row shape: `ReadOrder,` + declared fields minus Start/End, Text last,
+    /// declared layout -- the hardcoded standard split left metadata glued to the cue text. NOTE on issue
+    /// #76: BOTH leak families exist. The pool poison actually ground-truthed live (imdb:tt32278481,
+    /// origin "embedded", `N,0,Default,,0,0,0,,text` on every first cue line) is the pre-0.3.11
+    /// split-on-9 raw-row fallback over STANDARD rows; nonstandard-Format files leak the same way under
+    /// any fixed-count split, which is what this Format-driven count fixes for NEW extractions. The
+    /// renderer's `stripLeakedASSMetadata` covers both families at display time for what is already
+    /// pooled. Row shape: `ReadOrder,` + declared fields minus Start/End, Text last,
     /// so pre-Text commas = declaredFields - 2 (+1 ReadOrder, -2 Start/End, -1 Text; each pre-Text field is
     /// comma-terminated). Falls back to the standard 8 when the header is missing or its Format line is
     /// absent or nonconforming.
@@ -223,11 +228,21 @@ enum SubtitleEmbeddedExtractor {
 
     /// Extract the visible text from a libavcodec ASS/SSA event packet: split on the stream's declared
     /// pre-Text comma count (see `assPreTextCommas`; commas INSIDE the Text are preserved), then strip
-    /// `{...}` override tags and convert `\N` / `\n` to newlines. Fail-soft: a malformed row (fewer fields
-    /// than its own Format declares) renders its raw text rather than guessing at field edges or crashing;
-    /// the AVPlayer-side renderer additionally scrubs any leaked field prefix at display time.
+    /// `{...}` override tags and convert `\N` / `\n` to newlines.
+    ///
+    /// Fail-soft, honestly stated:
+    ///  - A row with FEWER total commas than its header declares cannot carry the declared layout. When it
+    ///    still satisfies the STANDARD layout (8+ commas) it is split as standard; anything shorter renders
+    ///    its raw text (never crashes), and the renderer's display-time scrub covers the residue.
+    ///  - The one unrecoverable case: a header over-declaring the count (say 9) over standard rows whose
+    ///    TEXT contains commas. Such a row has >= 9 commas, is indistinguishable from a true 9-field row,
+    ///    and loses its first text segment up to the first comma. No split choice can tell those apart.
     private static func plainTextFromASS(_ ass: String, preTextCommas: Int) -> String {
-        let splits = max(1, preTextCommas)
+        let declared = max(1, preTextCommas)
+        let rowCommas = ass.lazy.filter { $0 == "," }.count
+        let splits = rowCommas >= declared
+            ? declared
+            : (rowCommas >= standardASSPreTextCommas ? standardASSPreTextCommas : declared)
         let parts = ass.split(separator: ",", maxSplits: splits, omittingEmptySubsequences: false)
         let textField = parts.count > splits ? String(parts[splits]) : ass
         let noTags = textField.replacingOccurrences(of: #"\{[^}]*\}"#, with: "", options: .regularExpression)
