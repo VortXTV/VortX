@@ -84,7 +84,8 @@ enum SubtitleEmbeddedExtractor {
             decoders[i] = ctx
             let lang = languageTag(of: stream) ?? "und"
             let timeBase = av_q2d(stream.pointee.time_base)
-            builders[i] = CueBuilder(lang: lang, timeBaseSeconds: timeBase > 0 ? timeBase : 0.001)
+            builders[i] = CueBuilder(lang: lang, timeBaseSeconds: timeBase > 0 ? timeBase : 0.001,
+                                     assPreTextCommas: assPreTextCommas(ctx: ctx))
         }
 
         guard !decoders.isEmpty else { return [] }   // no text subtitle tracks
@@ -137,7 +138,7 @@ enum SubtitleEmbeddedExtractor {
                 let s = String(cString: text)
                 if !s.isEmpty { lines.append(s) }
             } else if let ass = rect.pointee.ass {                // ASS/SSA event line; take the visible text field
-                let s = plainTextFromASS(String(cString: ass))
+                let s = plainTextFromASS(String(cString: ass), preTextCommas: builder.assPreTextCommas)
                 if !s.isEmpty { lines.append(s) }
             }
         }
@@ -169,17 +170,66 @@ enum SubtitleEmbeddedExtractor {
         return lang.isEmpty || lang == "und" ? nil : lang
     }
 
-    /// Extract the visible text from a libavcodec ASS/SSA event packet. The FFmpeg `ass` codec format is
-    /// `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text` (Start/End live in the packet pts, and
-    /// a ReadOrder is prepended), so there are 8 fields before the Text, which may itself contain commas. We
-    /// split on the first 8 commas and take the 9th part, then strip `{...}` override tags and convert `\N` /
-    /// `\n` to newlines.
-    private static func plainTextFromASS(_ ass: String) -> String {
-        // Split on the first 8 commas; the 9th part is the Text. (The old split-on-9 assumed the .ass FILE
-        // field count and dropped the first comma-run of every cue, or fell back to the raw line when the
-        // text had no comma, corrupting every ASS/SSA subtitle cue.)
-        let parts = ass.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
-        let textField = parts.count >= 9 ? String(parts[8]) : ass
+    /// The standard v4+ event row (`ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`) has
+    /// 8 commas before the Text field. Also what FFmpeg's own default header declares, so SRT / mov_text /
+    /// WebVTT events (whose ASS rows the decoders SYNTHESIZE in this exact layout) always use it.
+    private static let standardASSPreTextCommas = 8
+
+    /// How many commas precede the Text field in this stream's decoded event rows, read from the `[Events]`
+    /// `Format:` line of the decoder's subtitle header. A Matroska ASS/SSA block is NOT normalized to the
+    /// standard layout: it is the file's own Dialogue fields with Start/End removed and a ReadOrder prepended
+    /// (FFmpeg's `ass` decoder hands that row through verbatim), so a track whose Format declares a
+    /// nonstandard field count (v4++ MarginB, trimmed machine-generated Formats, ...) must be split by ITS
+    /// declared layout -- the hardcoded standard split left metadata glued to the cue text (the issue #76
+    /// "0,0,0default"-style prefixes). Row shape: `ReadOrder,` + declared fields minus Start/End, Text last,
+    /// so pre-Text commas = declaredFields - 2 (+1 ReadOrder, -2 Start/End, -1 Text; each pre-Text field is
+    /// comma-terminated). Falls back to the standard 8 when the header is missing or its Format line is
+    /// absent or nonconforming.
+    private static func assPreTextCommas(ctx: UnsafeMutablePointer<AVCodecContext>) -> Int {
+        guard let hdr = ctx.pointee.subtitle_header, ctx.pointee.subtitle_header_size > 0 else {
+            return standardASSPreTextCommas
+        }
+        let data = Data(bytes: hdr, count: Int(ctx.pointee.subtitle_header_size))
+        guard let header = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+            return standardASSPreTextCommas
+        }
+        // The header buffer may carry a trailing NUL (FFmpeg null-terminates it); drop NULs so the last
+        // line's fields still compare clean.
+        return preTextCommaCount(inASSHeader: header.replacingOccurrences(of: "\0", with: ""))
+    }
+
+    /// Parse `header` (a full ASS/SSA script head) for the `[Events]` section's `Format:` line and derive the
+    /// pre-Text comma count of a demuxed event row. Pure + fail-soft: any shape surprise returns the standard 8.
+    static func preTextCommaCount(inASSHeader header: String) -> Int {
+        var inEvents = false
+        for rawLine in header.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)   // tolerate \r\n headers
+            if line.hasPrefix("[") {
+                inEvents = line.lowercased().hasPrefix("[events]")
+                continue
+            }
+            guard inEvents, line.lowercased().hasPrefix("format:") else { continue }
+            let fields = line.dropFirst("format:".count)
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            // Only trust a well-formed Events format: Start/End present (they are what ReadOrder replaces in
+            // demuxed rows) and Text declared LAST (the only field that may itself contain commas).
+            guard fields.count >= 3, fields.last == "text",
+                  fields.contains("start"), fields.contains("end") else { return standardASSPreTextCommas }
+            return fields.count - 2
+        }
+        return standardASSPreTextCommas
+    }
+
+    /// Extract the visible text from a libavcodec ASS/SSA event packet: split on the stream's declared
+    /// pre-Text comma count (see `assPreTextCommas`; commas INSIDE the Text are preserved), then strip
+    /// `{...}` override tags and convert `\N` / `\n` to newlines. Fail-soft: a malformed row (fewer fields
+    /// than its own Format declares) renders its raw text rather than guessing at field edges or crashing;
+    /// the AVPlayer-side renderer additionally scrubs any leaked field prefix at display time.
+    private static func plainTextFromASS(_ ass: String, preTextCommas: Int) -> String {
+        let splits = max(1, preTextCommas)
+        let parts = ass.split(separator: ",", maxSplits: splits, omittingEmptySubsequences: false)
+        let textField = parts.count > splits ? String(parts[splits]) : ass
         let noTags = textField.replacingOccurrences(of: #"\{[^}]*\}"#, with: "", options: .regularExpression)
         return noTags
             .replacingOccurrences(of: "\\N", with: "\n")
@@ -194,11 +244,15 @@ enum SubtitleEmbeddedExtractor {
     private final class CueBuilder {
         let lang: String
         let timeBaseSeconds: Double
+        /// Commas before the Text field in this stream's decoded ASS/SSA event rows, derived from the
+        /// stream's OWN `[Events]` Format line (standard layout = 8). See `assPreTextCommas(ctx:)`.
+        let assPreTextCommas: Int
         private var cues: [(start: Double, end: Double, text: String)] = []
 
-        init(lang: String, timeBaseSeconds: Double) {
+        init(lang: String, timeBaseSeconds: Double, assPreTextCommas: Int) {
             self.lang = lang
             self.timeBaseSeconds = timeBaseSeconds
+            self.assPreTextCommas = assPreTextCommas
         }
 
         func add(startSeconds: Double, endSeconds: Double, text: String) {

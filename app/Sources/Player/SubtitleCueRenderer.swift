@@ -115,7 +115,64 @@ final class SubtitleCueRenderer {
             guard !cleaned.isEmpty, end > start else { continue }
             cues.append(SubtitleCue(start: start, end: end, text: cleaned))
         }
-        return cues.sorted { $0.start < $1.start }
+        return stripLeakedASSMetadata(from: cues.sorted { $0.start < $1.start })
+    }
+
+    // MARK: - Leaked ASS metadata repair (issue #76)
+
+    /// Anchored shapes of raw ASS/SSA event METADATA opening a cue line. Two forms:
+    ///  - a demuxed FFmpeg event row, `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,`: two
+    ///    leading integers, two free fields, three integer margins, one free field, each comma-terminated;
+    ///  - a full script `Dialogue` row, `Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,`: the
+    ///    two `H:MM:SS.cc` timestamps make it unmistakable.
+    /// Ordinary dialog essentially never OPENS with either full comma-run, and the per-file vote below
+    /// guards the residual case.
+    private static let leakedASSPrefixPatterns = [
+        #"^\d+,\d+,[^,\n]*,[^,\n]*,\d+,\d+,\d+,[^,\n]*,"#,
+        #"^(?:Dialogue:\s*)?\d+,\d+:\d{2}:\d{2}[.:]\d{1,3},\d+:\d{2}:\d{2}[.:]\d{1,3},[^,\n]*,[^,\n]*,\d+,\d+,\d+,[^,\n]*,"#,
+    ]
+
+    /// The range of a leaked ASS metadata prefix at the start of `line`, or nil.
+    private static func leakedASSPrefixRange(in line: String) -> Range<String.Index>? {
+        for pattern in leakedASSPrefixPatterns {
+            if let r = line.range(of: pattern, options: .regularExpression), r.lowerBound == line.startIndex {
+                return r
+            }
+        }
+        return nil
+    }
+
+    /// Strip raw ASS/SSA event fields that LEAKED into cue text (the issue #76 "0,0,0default…" prefixes):
+    /// a subtitle converted from ASS with a wrong field count carries `ReadOrder,Layer,Style,…,Effect,`
+    /// glued to the front of its lines. Community-pooled SRTs built by the pre-0.3.11 embedded extractor
+    /// are the known case (the pool still serves them), and a provider-side bad conversion has the same
+    /// shape. This is a per-FILE decision, not per-line: only when the leak shape opens at least 3 lines
+    /// AND at least 20% of all lines is the file treated as corrupted and scrubbed, so a legitimate
+    /// one-off comma-run line ("1,2,3,4,5,6,7,8!") in a healthy file is never touched. Runs inside
+    /// `parse`, the single parser behind `addExternalSubtitle`, so the auto-selected and manually
+    /// re-selected paths render identically. Fail-soft: only prefixes are removed; a cue left with no
+    /// text is dropped (it carried nothing but metadata).
+    private static func stripLeakedASSMetadata(from cues: [SubtitleCue]) -> [SubtitleCue] {
+        guard !cues.isEmpty else { return cues }
+        var totalLines = 0
+        var leakedLines = 0
+        for cue in cues {
+            for line in cue.text.components(separatedBy: "\n") {
+                totalLines += 1
+                if leakedASSPrefixRange(in: line) != nil { leakedLines += 1 }
+            }
+        }
+        guard leakedLines >= 3, leakedLines * 5 >= totalLines else { return cues }
+        return cues.compactMap { cue in
+            let cleanedLines = cue.text.components(separatedBy: "\n")
+                .map { line -> String in
+                    guard let r = leakedASSPrefixRange(in: line) else { return line }
+                    return String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                }
+                .filter { !$0.isEmpty }
+            guard !cleanedLines.isEmpty else { return nil }
+            return SubtitleCue(start: cue.start, end: cue.end, text: cleanedLines.joined(separator: "\n"))
+        }
     }
 
     /// Parse a timing line "HH:MM:SS,mmm --> HH:MM:SS,mmm" (SRT) or "HH:MM:SS.mmm --> HH:MM:SS.mmm ..." (VTT,
