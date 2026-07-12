@@ -303,7 +303,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let throttleElapsed = lastUploadUptime == 0 || now - lastUploadUptime >= minUploadIntervalS
         let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
         // Predict the Worker's coverage verdict from the RAW capture cadence + session frame count (uploadCanStore
-        // also accounts for the decimation buildAndUpload applies, which only raises coverage). A sub-floor sheet
+        // also evaluates the exact decimated sheet buildAndUpload will POST, so it never skips a storable one). A sub-floor sheet
         // is answered below_coverage_threshold and discarded, so firing it every ~60s is a wasted POST that also
         // logs a misleading "-> failed" (the whole
         // "15+ failed, contributes zero" field signal on #76). Fail-open when the bucket is unknown so a

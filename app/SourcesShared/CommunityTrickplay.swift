@@ -335,8 +335,9 @@ enum CommunityTrickplay {
         // (stride, effective frames, effectiveInterval, cols, rows) together so the render, the vtt, and the meta
         // always describe ONE consistent grid. The floor is 2 tiles: a 2-tile 320x180 sheet (640x180) cannot
         // approach 3 MB, so a legitimate capture is never dropped for size, only ever for a true allocation or
-        // encoder failure at the floor. Coverage is invariant under decimation (frame_count shrinks as
-        // effectiveInterval grows), so a re-decimated sheet still clears the worker's MIN_SERVE_COVERAGE floor.
+        // encoder failure at the floor. Coverage is NOT invariant under decimation (the numerator ceils up and the
+        // denominator re-rounds, so it can land either side of the raw value); uploadCanStore predicts the exact
+        // decimated frame_count and interval this posts, so a sheet the worker would keep is never skipped.
         var budget = min(sorted.count, maxTiles)
         var picked: (jpeg: Data, count: Int, cols: Int, interval: Double)?
         while budget >= 2 {
