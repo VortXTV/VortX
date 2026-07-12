@@ -91,6 +91,22 @@ enum PosterRadiusPreset: String, CaseIterable, Identifiable {
     }
 }
 
+/// How the tvOS Home renders its add-on catalog sections (#105). `.rails` is the shipping default
+/// (horizontal rows); `.wall` stacks each catalog as a vertical-scrolling poster grid under the same
+/// section header, so browsing a catalog reads like a full poster wall instead of a sideways rail.
+/// Continue Watching always stays a rail (it is a queue, not a browse surface), whichever mode is on.
+enum HomeLayoutPreset: String, CaseIterable, Identifiable {
+    case rails, wall
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .rails: return "Rails"
+        case .wall:  return "Poster wall"
+        }
+    }
+}
+
 /// A Discover HUB category the user can permanently hide (Discover cards, streaming services as a group, or
 /// a single genre). Distinct from `CatalogPrefsStore.hidden`, which hides an ADD-ON catalog row on Home. The
 /// hub filters these out when it lays out its tiles, and the region-ordering leaves the rest untouched.
@@ -121,6 +137,7 @@ enum CatalogPrefsStore {
     static let hideLabelsKey = "stremiox.catalog.hidePosterLabels"
     static let hiddenCategoriesKey = "vortx.discover.hiddenCategories"
     static let regionKey = "vortx.discover.regionPreference"   // "" / absent = follow the device region
+    static let homeLayoutKey = "vortx.home.layout"   // tvOS Home: "rails" (default) | "wall" (#105)
 
     static func hidden() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? []) }
     static func order() -> [String] { UserDefaults.standard.stringArray(forKey: orderKey) ?? [] }
@@ -165,6 +182,13 @@ enum CatalogPrefsStore {
     /// Hide the title label under each poster (default false = labels shown, today's look).
     static func hideLabels() -> Bool { UserDefaults.standard.bool(forKey: hideLabelsKey) }
     static func setHideLabels(_ value: Bool) { UserDefaults.standard.set(value, forKey: hideLabelsKey) }
+
+    /// tvOS Home catalog layout (#105). No stored key => `.rails`, the shipping horizontal rows, so
+    /// nothing changes unless the user opts into the poster wall.
+    static func homeLayout() -> HomeLayoutPreset {
+        (UserDefaults.standard.string(forKey: homeLayoutKey)).flatMap(HomeLayoutPreset.init(rawValue:)) ?? .rails
+    }
+    static func setHomeLayout(_ p: HomeLayoutPreset) { UserDefaults.standard.set(p.rawValue, forKey: homeLayoutKey) }
     /// Cinematic landscape (16:9) catalog cards vs the legacy portrait (2:3) posters. Defaults to ON
     /// (the key unset reads true), so a fresh install gets the cinematic look; the Appearance toggle
     /// lets anyone fall back to portrait. Read as a plain static so card views can size off-main.
@@ -206,6 +230,11 @@ final class CatalogPreferences: ObservableObject {
     /// Hide the title label under each poster. Default false = labels shown (today's look).
     @Published var hidePosterLabels: Bool = CatalogPrefsStore.hideLabels() {
         didSet { CatalogPrefsStore.setHideLabels(hidePosterLabels) }
+    }
+    /// tvOS Home catalog layout (#105): horizontal rails (default) or a vertical poster wall per catalog.
+    /// Two-way bound by the tvOS Poster Style screen; HomeView reads it so a change re-lays out live.
+    @Published var homeLayout: HomeLayoutPreset = CatalogPrefsStore.homeLayout() {
+        didSet { CatalogPrefsStore.setHomeLayout(homeLayout) }
     }
     /// Discover-hub categories the user has permanently hidden (see `HubCategoryKey`). The hub filters these
     /// off its tiles. Not `didSet`-persisted; mutated through `setCategoryHidden` so the write + republish + a
