@@ -715,6 +715,17 @@ struct TVPlayerView: View {
                 // rebuild for the common case. Genuine mpv failures fall through to the existing recovery.
                 if demoteAVPlayerToMPV() { return }
                 handleLoadFailure((data as? String) ?? "")
+            } else if isAVPlayerActive {
+                // #76 residual: a MID-PLAY AVPlayer failure. The audio-over-black watchdog is the canonical
+                // emitter here (native DV that plays Atmos over a black screen: the audio clock advances
+                // timePos, so hasStartedPlaying flipped and the start watchdog disarmed long ago), and a
+                // genuine mid-play item .failed / failed-to-play-to-end lands here too (previously it was
+                // silently IGNORED and the session just died on a frozen frame). Demote to libmpv in place,
+                // exactly like the pre-start path: mpv re-opens the same stream with an honest HDR10 picture
+                // and decoded audio. Mirrors iOS PlayerScreen, which already demotes mid-play. Genuine mpv
+                // mid-play errors are untouched (isAVPlayerActive is false): the stall recovery owns those.
+                DiagnosticsLog.log("dv", "mid-play AVPlayer endFileError (\((data as? String) ?? "-")) -> demote to libmpv in place")
+                demoteAVPlayerToMPV()
             }
         case MPVProperty.endFileEof:
             if handleLiveStreamEOF() { break }
@@ -2104,6 +2115,12 @@ struct TVPlayerView: View {
         let reconcileResume: Double? = hasStartedPlaying ? currentTime : resumeSeconds   // capture BEFORE the reset below zeroes hasStartedPlaying
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
+        // Carry the live position into the mpv re-load UNCONDITIONALLY (maybeResume reads resumeSeconds once
+        // duration lands; appliedResume was re-armed above). Pre-start this is an exact no-op (reconcileResume
+        // IS resumeSeconds). It matters for the MID-PLAY demotes (the audio-over-black watchdog, a mid-play
+        // .failed) on the LAUNCH url: the curURL!=url branch below never runs there, so without this the mpv
+        // re-open would rewind to the original launch offset instead of where the failure struck.
+        resumeSeconds = reconcileResume
         avEngineFailed = true
         startLoadTimeout()
         // R10 (ports iOS PlayerScreen.demoteAVPlayerToMPV): flipping avEngineFailed re-renders the mpv surface,
