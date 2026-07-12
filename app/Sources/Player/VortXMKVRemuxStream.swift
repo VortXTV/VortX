@@ -138,6 +138,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var hlsHeadBuf: [UInt8] = []
     private var hlsHeadDone = false
     private var hlsMoovStart: Int?            // absolute offset of the top-level moov box, once its header is seen
+    private var hlsMoovLocatedAt: Date?       // when the moov placeholder was located while awaiting its size
+                                              // backpatch; the init-starve guard (#76) fires if it never finalizes
     private static let hlsHeadCap = 4 << 20   // cap on the box-header WALK to locate moov (ftyp is tiny, so the
                                               // moov header lands almost immediately); moov CONTENT is unbounded
 
@@ -154,6 +156,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private static let hlsMaxSegmentBytes = 32 << 20
     /// The playlist's EXT-X-TARGETDURATION: must be >= every EXTINF and stay constant across reloads.
     static let hlsTargetDuration = 5
+    /// Belt-and-braces to the flush-rc check (#76): if the moov placeholder is located but its size backpatch
+    /// never lands within this window while packets still flow, the init is starved (an unparseable audio bed
+    /// blocking moov finalization); fail so the demotion runs in ~1s rather than at the 20s start watchdog.
+    private static let hlsInitStarveSecs = 4.0
 
     /// Start the remux on a dedicated background thread. Idempotent-ish: call once per session.
     ///
@@ -759,6 +765,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // seek-free half: the buffered packets are the exact bytes the loop would have read, so muxing them in
         // order reproduces a full stream. Same streamMap / convertP7 / rescale path as the live loop below.
         while !prebuffered.isEmpty, !isCancelled {
+            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
             let p = prebuffered.removeFirst()
             defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
             let inIdx = Int(p.pointee.stream_index)
@@ -803,6 +810,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var readRetries = 0
         let maxReadRetries = 4
         while !isCancelled {
+            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
             let rf = av_read_frame(inCtx, pkt)
             if rf < 0 {
                 if rf == AVERROR_EOF_CONST { break }   // genuine EOF: write the trailer + finish() below
@@ -1058,6 +1066,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 if size >= headerLen {
                     hlsFinalizeInit(moovStart: pos, moovSize: size)
                 } else {
+                    hlsMoovLocatedAt = Date()   // start the init-starve clock (#76): finalize must land soon
                     DiagnosticsLog.log("dv", "hls init: moov located at byte \(pos), awaiting size backpatch (placeholder size field=\(size))")
                 }
                 return
@@ -1136,6 +1145,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         DiagnosticsLog.log("dv", "hls init scan aborted: \(reason)")
     }
 
+    /// Belt-and-braces to the flush-rc check (#76): the moov placeholder was located but its size backpatch has
+    /// never landed to publish the init, `hlsInitStarveSecs` after it was seen and while packets are still being
+    /// fed. That means moov finalization is wedged (the unparseable audio bed blocking it), so the mount is dead;
+    /// the caller fails the buffer so demotion runs in ~1s rather than at the 20s start watchdog. Remux-thread only.
+    private func hlsInitStarved() -> Bool {
+        guard hlsIndexingEnabled, !hlsHeadDone, hlsMoovStart != nil, let located = hlsMoovLocatedAt else { return false }
+        return Date().timeIntervalSince(located) > Self.hlsInitStarveSecs
+    }
+
     /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
     /// target duration at a keyframe (clean, seekable cut) or the hard bound at any frame (so one long GOP
     /// can never outgrow the playlist's fixed TARGETDURATION). The cut = drain the interleave queue + flush
@@ -1162,7 +1180,17 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard (isKey && elapsed >= Self.hlsTargetSegmentSecs)
                 || elapsed >= Self.hlsMaxSegmentSecs
                 || openBytes >= Self.hlsMaxSegmentBytes else { return }
-        _ = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
+        let flushRc = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
+        if flushRc < 0 {
+            // A delayed moov (movflags delay_moov) is emitted on the FIRST fragment flush; when the audio bed's
+            // sample entry cannot be finalized (an E-AC3/DDP track libav could not parse) this flush fails and
+            // the moov is never written. That rc used to be discarded (`_ =`), so the init never published, the
+            // playlist starved, and only the 20s start watchdog demoted. Fail here so the HLS server 404s and
+            // the existing demotion runs in ~1s. (Every later cut flushes too; a failure there is just as fatal.)
+            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsHeadDone) (delayed moov write failed)")
+            buffer.fail("delayed moov write failed (\(flushRc))")
+            return
+        }
         avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
         hlsCloseSegment(endSec: sec)
         hlsSegmentStartSec = sec
