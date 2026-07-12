@@ -247,7 +247,9 @@ struct iOSRootView: View {
             offlineLaunchRouted = true
             guard verdict, tab == .home else { return }
             #if !os(tvOS)
-            if downloads.records.contains(where: { $0.state == .completed }) {
+            // Never route to a hidden tab (#117 x #120): with Library hidden the offline launch
+            // falls through to Settings, which is unhideable.
+            if !hideLibraryTab, downloads.records.contains(where: { $0.state == .completed }) {
                 // The Downloads screen lives INSIDE the Library tab's NavigationStack (the pill's
                 // value route), which the shell cannot reach directly: stage the push for the stack
                 // to consume when it mounts, then switch to Library.

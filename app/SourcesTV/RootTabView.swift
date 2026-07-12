@@ -279,7 +279,9 @@ struct RootTabView: View {
         .onReceive(connectivity.$launchOffline) { verdict in
             guard let verdict, !offlineLaunchRouted else { return }
             offlineLaunchRouted = true
-            guard verdict, selection == 0 else { return }
+            // Never route to a hidden tab (#117 x #120): a user who hid Library keeps the offline
+            // chip but stays on Home, the same fallback every other healer uses.
+            guard verdict, selection == 0, !hideLibraryTab else { return }
             selection = 2   // Library (tag 2): Downloads section + the cached library grid
         }
         // Back/Menu floor, depth-aware. SwiftUI routes the exit command to the NEAREST .onExitCommand in the
