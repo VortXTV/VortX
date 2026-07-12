@@ -280,8 +280,8 @@ enum TMDBClient {
         .init(providerID: 283, name: "Crunchyroll"),
     ]
 
-    /// Titles available on a streaming service in the region (TMDB /discover with_watch_providers, flatrate,
-    /// most-popular first), resolved to engine-playable Cinemeta (tt) previews so a tapped card plays through
+    /// Titles available on a streaming service in the region (TMDB /discover with_watch_providers, streaming
+    /// tiers, most-popular first), resolved to engine-playable Cinemeta (tt) previews so a tapped card plays through
     /// the engine like any other card. Movie + TV are merged. Returns [] when no TMDB key is set or nothing
     /// is available in-region; titles with no IMDb id are dropped (they would dead-tap without a TMDB meta
     /// add-on). Name + poster come from the discover row itself, so this is one discover call + one
@@ -482,7 +482,17 @@ enum TMDBClient {
         }
     }
 
-    /// One TMDB discover-by-provider page: (tmdb id, media, title, poster URL) rows, flatrate + most popular.
+    /// Monetization tiers that count as "streaming" for the Streaming Services hub tiles and Home rails:
+    /// subscription (flatrate) PLUS ad-supported and free catalogs, since TMDB/JustWatch tags some regions'
+    /// entries for a brand under `ads` or `free` (US Paramount+ with the ads tier, Tubi, Pluto TV) and a
+    /// flatrate-only query returns nothing there, which drops the whole rail (#114). Rent/buy stay excluded
+    /// so purchase-only storefront listings never pollute a service's catalog. Joined with a percent-encoded
+    /// pipe ONLY, for the same reason as the provider families below: a raw `|` nils URL(string:) on iOS 16.
+    /// ONE constant, shared by every streaming-scoped discover query, so a policy change is a one-line edit.
+    static let streamingMonetizationTypes = "flatrate%7Cads%7Cfree"
+
+    /// One TMDB discover-by-provider page: (tmdb id, media, title, poster URL) rows, streaming tiers
+    /// (`streamingMonetizationTypes`) + most popular.
     private static func discoverProviderPage(media: String, providerID: Int, region: String, key: String)
         async -> [(tmdbID: Int, media: String, name: String, poster: String?)] {
         // Query the whole brand FAMILY (canonical + region aliases), exactly like the hub's providerScope, so the
@@ -492,7 +502,7 @@ enum TMDBClient {
         // stable and the edge never fragments on ordering. An alias-less id yields just its own id (unchanged).
         let family = providerFamilyMembers(canonicalProviderID(providerID)).map(String.init).joined(separator: "%7C")
         let path = "/discover/\(media)?api_key=\(key)&watch_region=\(region)&with_watch_providers=\(family)"
-            + "&with_watch_monetization_types=flatrate&sort_by=popularity.desc&language=en-US&page=1"
+            + "&with_watch_monetization_types=\(streamingMonetizationTypes)&sort_by=popularity.desc&language=en-US&page=1"
         guard let obj = await get(path), let results = obj["results"] as? [[String: Any]] else { return [] }
         return results.compactMap { r in
             guard let id = r["id"] as? Int else { return nil }

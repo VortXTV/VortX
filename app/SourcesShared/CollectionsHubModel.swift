@@ -147,9 +147,10 @@ enum CollectionsCatalog {
         // Query the whole brand FAMILY (canonical + region aliases), joined with a percent-encoded pipe ONLY: a
         // raw `|` nils URL(string:) on iOS 16 (our deployment floor) and bypasses the edge cache on 17+. Family
         // ids come back canonical-first then ascending, so the joined query is stable and the edge never
-        // fragments on ordering.
+        // fragments on ordering. Monetization tiers come from the ONE shared constant (subscription + ads +
+        // free, never rent/buy) so the hub's sub-catalogs and the Home rails always agree on what "streaming" is.
         let family = TMDBClient.providerFamilyMembers(id).map(String.init).joined(separator: "%7C")
-        return "with_watch_providers=\(family)&with_watch_monetization_types=flatrate"
+        return "with_watch_providers=\(family)&with_watch_monetization_types=\(TMDBClient.streamingMonetizationTypes)"
     }
 
     /// nil when the genre has nothing to filter that media on (e.g. a movies-only genre's TV bucket), so the
