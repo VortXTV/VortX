@@ -488,6 +488,23 @@ final class SourceIndexServeSource: ObservableObject {
         }
     }
 
+    /// Empty the PUBLISHED community streams, cancelling any in-flight fetch first - its completion
+    /// publishes `streams` UNCONDITIONALLY (no content-id guard), so an uncancelled late answer for a
+    /// previous title would repopulate the pool after this clear. The cancel loses nothing durable: the
+    /// fetch banks its result BEFORE the liveness guard, so the process-lifetime result bank (which this
+    /// method never touches) still warms the next refresh for that title. `lastContentID` resets so a
+    /// later refresh for the SAME title re-publishes (bank-seeded) instead of being deduped into keeping
+    /// the emptied state. For an owner that reuses ONE instance across titles (the batch-download
+    /// coordinator #119, unlike the per-view @StateObjects that die with their screen): the result pool
+    /// is PER-TITLE, and a title that cannot query the pool (no imdb id -> nil content id) must see it
+    /// EMPTY, never a predecessor title's results - `refresh` skips a nil content id with the gate open
+    /// without clearing, so the owner clears explicitly.
+    func clearResults() {
+        task?.cancel()
+        lastContentID = nil
+        if !streams.isEmpty { streams = [] }
+    }
+
     /// Merge the community sources into `groups` as its OWN named source group, exactly like any other add-on.
     /// Singularity's corroborated sources appear under the "Singularity" label whenever the pool has any for this
     /// title, EVEN when one of your own add-ons also returns the same release: add-ons are never deduped against
