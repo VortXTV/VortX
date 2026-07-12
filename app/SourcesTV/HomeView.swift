@@ -15,6 +15,7 @@ struct HomeView: View {
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared   // #105: rails vs poster-wall Home layout
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
@@ -77,6 +78,9 @@ struct HomeView: View {
                             // The long-press menu is safe on every profile now: Details is pure
                             // navigation, and the dismiss routes into the overlay profile's own
                             // history inside CoreBridge.removeFromLibrary.
+                            // Continue Watching stays a RAIL at the top in BOTH Home layouts (#105): it is a
+                            // queue the user steps through in recency order, not a browse surface, so the
+                            // poster-wall option never reshapes it.
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
                         }
                         // Collections hub (Discover cards, Streaming-service tiles, Genre tiles), right after
@@ -114,8 +118,16 @@ struct HomeView: View {
                                 }
                             }
                         }
+                        // #105: each add-on catalog renders as a horizontal rail (default) or, with the
+                        // "Poster wall" Home layout, as a vertical grid under the same section header.
+                        // The special rails above (Continue Watching, hub, Top Picks, Streaming, Upcoming)
+                        // stay rails in both modes; only the add-on catalog sections reshape.
                         ForEach(core.boardRows) { row in
-                            CoreCatalogRowView(row: row, focusModel: focusModel)
+                            if catalogPrefs.homeLayout == .wall {
+                                CoreCatalogWallSection(row: row, focusModel: focusModel)
+                            } else {
+                                CoreCatalogRowView(row: row, focusModel: focusModel)
+                            }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
@@ -576,6 +588,68 @@ struct CoreCatalogRowView: View {
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// One engine catalog section in the POSTER-WALL Home layout (#105): the same `RailHeader` (so the
+/// localized title + any eyebrow treatment survive the mode switch) over a vertical `LazyVGrid` of the
+/// row's items, instead of `CoreCatalogRowView`'s horizontal rail. Column math is SHARED with
+/// `TVCategoryBrowse` through `TVGridMetrics` (#104): FIXED cells with the card told its EXACT cell
+/// width, so cards can never overlap their neighbours regardless of the user's width preset; 4 landscape
+/// / 7 portrait per row, the densest grid already proven safe against edge clipping on the TV.
+/// Compositor-cheap by construction: `LazyVGrid` only materializes cells near the viewport, and
+/// `PosterCard` is reused unchanged (no extra shadows). Each wall's grid is a `.focusSection()`; see the
+/// comment on that modifier below for why grids get one while rails deliberately do not.
+struct CoreCatalogWallSection: View {
+    let row: CoreBoardRow
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var core: CoreBridge   // for per-catalog pagination (#95), same as the rail
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+
+    /// Cell widths and counts come from `TVGridMetrics` (SharedUI.swift), the single source shared with
+    /// `TVCategoryBrowse` so the wall and the browse grid can never drift apart; see its doc comment for
+    /// the #104 footprint math and the 145 cell-vs-card overlap regression.
+    private var columns: [GridItem] {
+        catalogPrefs.landscapeCards && apiKeys.hasTMDB
+            ? Array(repeating: GridItem(.fixed(TVGridMetrics.landscapeCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.landscapeColumns)
+            : Array(repeating: GridItem(.fixed(TVGridMetrics.posterCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.posterColumns)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(title: row.title)
+            LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
+                ForEach(row.items) { item in
+                    PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                               width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
+                               menu: .catalog,
+                               onFocus: focusModel.map { model in
+                                   { model.focus(item.focusedHero) }
+                               })
+                        // #95 pagination, wall form: the SAME trailing-item trigger as the rail. LazyVGrid
+                        // materializes cells as D-pad focus scrolls the section toward its end, so the last
+                        // card's onAppear asks the engine for this catalog's next page and the section grows
+                        // in place (no-op while in flight / once exhausted, gated inside CoreBridge).
+                        .onAppear { if item.id == row.items.last?.id { core.loadBoardRowNextPage(engineIndex: row.engineIndex) } }
+                }
+            }
+            .padding(.horizontal, Theme.Space.screenEdge)
+            .padding(.vertical, Theme.Space.lg)   // room for the focus halo, matching the rail
+            // FOCUS: this MULTI-ROW grid is deliberately a focus section, and that is NOT the same case as
+            // the hub rails. The BrowseGridView hub lesson (see `section(title:eyebrow:)` there) applies to
+            // stacked 1-ROW rails: giving each single row its own focus section made tvOS route D-pad moves
+            // by REGION heuristics and skip rows, so rails carry NO focusSection. A multi-row LazyVGrid is
+            // the opposite shape: Apple's guidance is to bound the grid in `.focusSection()` so vertical
+            // moves inside the wall stay tile-to-tile and the UP/DOWN hand-off at the grid's edges lands on
+            // the neighbouring section predictably instead of a far-away nearest-neighbour hit. The only
+            // pre-existing LazyVGrid screens (TVCategoryBrowse, LibraryView) live alone on their screens and
+            // never needed this; a wall section is the first grid STACKED against other focusable sections.
+            // Do not strip this as "inconsistent with the rails": rails without, grids with, is the intent.
+            .focusSection()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

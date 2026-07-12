@@ -57,6 +57,16 @@ struct TVPosterStyleView: View {
                          : "Landscape 16:9 art needs a TMDB key (add one under the Metadata keys). Hide labels for a cleaner, poster-only grid.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                         .padding(.horizontal, Theme.Space.screenEdge)
+
+                    // Home catalog layout (`vortx.home.layout`, #105): horizontal rails (default) vs a
+                    // vertical poster wall per catalog. tvOS-only; the iOS/Mac Home keeps its own layout.
+                    choiceRow(String(localized: "Home layout"),
+                              HomeLayoutPreset.allCases.map { ($0.rawValue, $0.label) },
+                              selection: Binding(get: { prefs.homeLayout.rawValue },
+                                                 set: { prefs.homeLayout = HomeLayoutPreset(rawValue: $0) ?? .rails }))
+                    Text("Poster wall stacks each Home catalog as a vertical grid you scroll down through, instead of a sideways row. Continue Watching stays a row in both layouts.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        .padding(.horizontal, Theme.Space.screenEdge)
                 }
             }
             .padding(.vertical, Theme.Space.lg)

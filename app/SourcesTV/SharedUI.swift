@@ -11,6 +11,24 @@ let kPosterWidth: CGFloat = 200
 /// the 300pt poster height, so each rail reads as a cinematic stripe while shrinking vertically).
 let kLandscapeCardWidth: CGFloat = 390
 
+/// The ONE source of truth for multi-column grid cell widths on tvOS, shared by `TVCategoryBrowse`
+/// (BrowseGridView) and `CoreCatalogWallSection` (HomeView poster wall, #105) so the ratio can never
+/// drift between the two grids.
+///
+/// #104: the owner wants more per row (was 3 landscape / 6 poster). Fit 4 landscape cards into the SAME
+/// footprint 3 used (width * 3/4) so there is zero safe-area clipping risk on the TV, and 7 posters in
+/// the footprint 6 used. The CARDS must render at exactly these cell widths too (pass both values into
+/// `PosterCard` at every grid call site): the 145 regression shrank only the GridItem cells while the
+/// cards stayed full-size, so 4 tiles overlapped.
+enum TVGridMetrics {
+    static let landscapeCellWidth: CGFloat = kLandscapeCardWidth * 3.0 / 4.0
+    static let posterCellWidth: CGFloat = kPosterWidth * 6.0 / 7.0
+    /// Columns per row at those widths (4 landscape / 7 portrait), kept beside the widths because the
+    /// pair (cell width, count) is what guarantees the zero-clipping footprint.
+    static let landscapeColumns = 4
+    static let posterColumns = 7
+}
+
 /// Poster artwork with a warm placeholder and the system card radius. Not focusable on its own;
 /// `PosterCard` wraps it in the focusable button.
 ///
