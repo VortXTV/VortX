@@ -162,14 +162,27 @@ struct RootTabView: View {
     // its root instead of re-showing the detail page you had pushed (the "Search still shows the
     // series I opened" bug). Cheap because the data lives in CoreBridge, not in the view.
     @State private var resetTokens = [Int](repeating: 0, count: 7)
-    /// Hide the Live TV tab for users who do not use it (Settings toggle).
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    /// Per-tab bar visibility (#117): hide Live / Discover / Library / Search from the bar (Settings >
+    /// Tab bar). Home, Add-ons, and Settings are not hideable, so the shell always keeps its landing
+    /// anchor and the way back to this setting. Live's value is seeded from the legacy
+    /// stremiox.hideLiveTab toggle in init; selection heals to Home whenever the active tab is hidden
+    /// (the onChange observers below), so the TabView never points at a tag that no longer exists.
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
+    @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
+    @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
+    @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     /// Live connectivity (#120): drives the quiet "You're offline" chip and the one-shot offline
     /// launch routing below. The monitor debounces changes, so a brief flap never thrashes the shell.
     @ObservedObject private var connectivity = ConnectivityMonitor.shared
     /// One-shot latch for the offline LAUNCH routing (#120): set when the monitor's first verdict is
     /// consumed, so no later connectivity change can ever move tabs (mid-session offline = chip only).
     @State private var offlineLaunchRouted = false
+
+    /// Seed the per-tab Live key from the legacy toggle before the first @AppStorage read, so a user
+    /// who had hidden Live keeps it hidden across the #117 generalization.
+    init() {
+        TabBarPrefs.migrateLegacyLiveKey()
+    }
 
     /// The tvOS scroll-to-top key for a tab tag, matching the `TabScrollKeys` the screens observe.
     /// tvOS `TabView` selection uses integer tags; only Home / Discover / Library carry a scrollable
@@ -221,8 +234,13 @@ struct RootTabView: View {
         TabView(selection: selectionBinding) {
             HomeView().id(resetTokens[0])
                 .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
-            DiscoverView().id(resetTokens[1])
-                .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
+            // Discover / Live / Library / Search are the hideable tabs (#117): each drops out of the
+            // TabView entirely when its Settings > Tab bar toggle hides it, and the matching .onChange
+            // below heals the selection to Home so the TabView never points at a missing tag.
+            if !hideDiscoverTab {
+                DiscoverView().id(resetTokens[1])
+                    .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
+            }
             // Live TV sits after Discover. Tags 0–5 were already taken (Search uses 4, Add-ons 3),
             // so Live takes the next free tag 6 and reset slot 6 — the selection-reset .onChange
             // below stays in bounds against the resized 7-slot array.
@@ -230,10 +248,14 @@ struct RootTabView: View {
                 LiveView().id(resetTokens[6])
                     .tabItem { Label("Live", systemImage: "dot.radiowaves.left.and.right") }.tag(6)
             }
-            LibraryView().id(resetTokens[2])
-                .tabItem { Label("Library", systemImage: "books.vertical.fill") }.tag(2)
-            NavigationStack { SearchView() }.id(resetTokens[4])
-                .tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(4)
+            if !hideLibraryTab {
+                LibraryView().id(resetTokens[2])
+                    .tabItem { Label("Library", systemImage: "books.vertical.fill") }.tag(2)
+            }
+            if !hideSearchTab {
+                NavigationStack { SearchView() }.id(resetTokens[4])
+                    .tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(4)
+            }
             AddonsView().id(resetTokens[3])
                 .tabItem { Label("Add-ons", systemImage: "puzzlepiece.extension.fill") }.tag(3)
             SettingsView().id(resetTokens[5])
@@ -294,10 +316,20 @@ struct RootTabView: View {
             VXProbeState.shared.setRoute(name)
             VXProbe.event("nav", "tab \(name)")
         }
-        // If Live is hidden while it was the selected tab (e.g. synced from another device), fall back to Home
-        // so the TabView never points at a tag that no longer exists.
+        // If a hideable tab is hidden while it was the selected one (Settings toggle, or synced from
+        // another device), fall back to Home so the TabView never points at a tag that no longer exists
+        // (the TabBarHealer-adjacent selection heal, one observer per hideable tab).
         .onChange(of: hideLiveTab) { _, hidden in
             if hidden, selection == 6 { selection = 0 }
+        }
+        .onChange(of: hideDiscoverTab) { _, hidden in
+            if hidden, selection == 1 { selection = 0 }
+        }
+        .onChange(of: hideLibraryTab) { _, hidden in
+            if hidden, selection == 2 { selection = 0 }
+        }
+        .onChange(of: hideSearchTab) { _, hidden in
+            if hidden, selection == 4 { selection = 0 }
         }
         // The active profile owns the theme: mirror Settings changes into it so they survive a switch.
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }

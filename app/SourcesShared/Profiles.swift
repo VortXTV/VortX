@@ -70,6 +70,9 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var keywordsAreRegex: Bool? = nil
         var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 2160
         var maxFileSizeGB: Double? = nil       // 0 = no cap
+        var minResolution: Int? = nil          // 0 = no floor, else 720 / 1080 / 2160 (#117)
+        var hideUnknownResolution: Bool? = nil // drop sources with no recognizable resolution (#117)
+        var preferredAudioOnly: Bool? = nil    // drop clearly-foreign-audio releases, best effort (#117)
     }
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
@@ -438,7 +441,10 @@ final class ProfileStore: ObservableObject {
             includeKeywords: d["includeKeywords"] as? String ?? base?.includeKeywords,
             keywordsAreRegex: d["keywordsAreRegex"] as? Bool ?? base?.keywordsAreRegex,
             maxResolution: (d["maxResolution"] as? Int) ?? base?.maxResolution,
-            maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB)
+            maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB,
+            minResolution: (d["minResolution"] as? Int) ?? base?.minResolution,
+            hideUnknownResolution: d["hideUnknownResolution"] as? Bool ?? base?.hideUnknownResolution,
+            preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
@@ -490,7 +496,10 @@ final class ProfileStore: ObservableObject {
             includeKeywords: SourcePreferences.shared.includeKeywords,
             keywordsAreRegex: SourcePreferences.shared.keywordsAreRegex,
             maxResolution: SourcePreferences.shared.maxResolution,
-            maxFileSizeGB: SourcePreferences.shared.maxFileSizeGB)
+            maxFileSizeGB: SourcePreferences.shared.maxFileSizeGB,
+            minResolution: SourcePreferences.shared.minResolution,
+            hideUnknownResolution: SourcePreferences.shared.hideUnknownResolution,
+            preferredAudioOnly: SourcePreferences.shared.preferredAudioOnly)
     }
 
     /// Write `profile`'s playback preferences into the flat UserDefaults keys that
@@ -530,6 +539,9 @@ final class ProfileStore: ObservableObject {
             if let v = p.keywordsAreRegex { d.set(v, forKey: SourcePreferences.regexKey) }
             if let v = p.maxResolution { d.set(v, forKey: SourcePreferences.maxResolutionKey) }
             if let v = p.maxFileSizeGB { d.set(v, forKey: SourcePreferences.maxFileSizeKey) }
+            if let v = p.minResolution { d.set(v, forKey: SourcePreferences.minResolutionKey) }
+            if let v = p.hideUnknownResolution { d.set(v, forKey: SourcePreferences.hideUnknownResKey) }
+            if let v = p.preferredAudioOnly { d.set(v, forKey: SourcePreferences.preferredAudioKey) }
         } else {
             for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
                         TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,

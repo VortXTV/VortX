@@ -3791,6 +3791,9 @@ private struct iOSStreamLabel: View {
     /// the "⚡ CACHED" badge when the add-on's own text marks the source cached, so this only needs to be the
     /// native-hash signal; false by default so a coordinator with no key still defers to the text markers.
     var debridCached: Bool = false
+    /// Compact rows (#117): keep only the parsed line (quality badge + flavour tags + size + add-on) and
+    /// hide the raw release-name line beneath it. Device-local display preference; tvOS reads the SAME key.
+    @AppStorage("vortx.streams.compactLabels") private var compactLabels = false
 
     var body: some View {
         let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
@@ -3855,7 +3858,9 @@ private struct iOSStreamLabel: View {
                 // The release title for human context. Allowed two lines so the fuller release name
                 // shows (people want the detail) while a verbose multi-line add-on blurb still can't
                 // run away — `cleanTitle` already keeps only the first line of the add-on's name.
-                if let title = cleanTitle {
+                // Compact rows (#117) drop this line entirely: the parsed badges + tags + size above
+                // are the whole row.
+                if !compactLabels, let title = cleanTitle {
                     Text(title)
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textSecondary)

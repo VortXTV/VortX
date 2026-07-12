@@ -25,7 +25,12 @@ struct SettingsView: View {
     // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
     @State private var showDiagExport = false
     @State private var diagExport: (url: String, qr: Image)?
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
+    // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
+    @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
+    @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
+    @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
@@ -81,6 +86,8 @@ struct SettingsView: View {
     // Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
     // writes this same key, so the last level persists; this picker sets it explicitly. SAME key as iOS/Mac.
     @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
+    // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as iOS/Mac.
+    @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     // New-episode alerts (F5): a local notification at each upcoming episode's air time. Default ON. SAME key
     // the iOS view's NewEpisodeNotifications.enabledKey resolves to ("stremiox.notifyNewEpisodes"); that type
     // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
@@ -104,6 +111,7 @@ struct SettingsView: View {
                     streamsSection
                     communitySection
                     serverSection
+                    tabBarSection
                     appearanceSection
                     audioSubtitleSection
                     subtitleSection
@@ -572,6 +580,27 @@ struct SettingsView: View {
         return StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"
     }
 
+    // MARK: Tab bar
+
+    /// Which tabs show in the tab bar (#117), generalizing the old "Show Live TV tab" toggle into a
+    /// per-tab choice (SAME TabBarPrefs keys the iOS/Mac shell binds). Home / Add-ons / Settings have
+    /// no toggle: the shell must always keep its landing anchor and the way back to this screen.
+    /// RootTabView heals the selection to Home when the active tab is hidden.
+    private var tabBarSection: some View {
+        section("Tab Bar") {
+            choiceRow(String(localized: "Discover tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideDiscoverTab ? "0" : "1" }, set: { hideDiscoverTab = ($0 == "0") }))
+            choiceRow(String(localized: "Live TV tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
+            choiceRow(String(localized: "Library tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLibraryTab ? "0" : "1" }, set: { hideLibraryTab = ($0 == "0") }))
+            choiceRow(String(localized: "Search tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideSearchTab ? "0" : "1" }, set: { hideSearchTab = ($0 == "0") }))
+            Text("Choose which tabs appear in the tab bar. Home, Add-ons, and Settings always stay. If the tab you are on is hidden, you land on Home.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
     // MARK: Appearance (accent + chrome)
 
     /// "App language" (the empty tag = follow the app UI language) + every shipped language, for the Trailer
@@ -601,11 +630,6 @@ struct SettingsView: View {
                     showLangRestart = true
                 }))
             Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-
-            choiceRow(String(localized: "Show Live TV tab"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
-            Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],
@@ -778,10 +802,31 @@ struct SettingsView: View {
                       selection: Binding(get: { sourcePrefs.hdrOnly ? "1" : "0" }, set: { sourcePrefs.hdrOnly = ($0 == "1") }))
             choiceRow(String(localized: "Hide AV1 sources"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { sourcePrefs.excludeAV1 ? "1" : "0" }, set: { sourcePrefs.excludeAV1 = ($0 == "1") }))
+            // #117 (c): best-effort audio-language filter (SAME SourcePreferences property the iOS/Mac
+            // toggle binds), honest about its limits in the caption below.
+            choiceRow(String(localized: "Preferred audio only"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.preferredAudioOnly ? "1" : "0" }, set: { sourcePrefs.preferredAudioOnly = ($0 == "1") }))
+            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Max quality"),
                       [("0", String(localized: "Unlimited")), ("4000", "4K"), ("1080", "1080p"), ("720", "720p")],
                       selection: Binding(get: { String(sourcePrefs.maxResolution) }, set: { sourcePrefs.maxResolution = Int($0) ?? 0 }))
-            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown. Hide dead torrents drops sources with no seeders.")
+            // Minimum quality (#117): the floor twin of Max quality (SAME SourcePreferences property the
+            // iOS/Mac picker binds). Only drops a source whose KNOWN resolution sits below the floor.
+            choiceRow(String(localized: "Minimum quality"),
+                      [("0", String(localized: "Off")), ("720", "720p"), ("1080", "1080p"), ("2160", "4K")],
+                      selection: Binding(get: { String(sourcePrefs.minResolution) }, set: { sourcePrefs.minResolution = Int($0) ?? 0 }))
+            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule (SAME SourcePreferences
+            // property the iOS/Mac toggle binds).
+            choiceRow(String(localized: "Hide unknown quality"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.hideUnknownResolution ? "1" : "0" }, set: { sourcePrefs.hideUnknownResolution = ($0 == "1") }))
+            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown; Minimum quality hides sources below the floor (sources with no stated resolution are kept unless Hide unknown quality is on). Hide dead torrents drops sources with no seeders.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Compact source rows (#117): display-only (SAME vortx.streams.compactLabels key iOS/Mac binds).
+            choiceRow(String(localized: "Compact source rows"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { compactStreamLabels ? "1" : "0" }, set: { compactStreamLabels = ($0 == "1") }))
+            Text("Show each source as its parsed quality line (resolution, format, size) instead of the raw release name.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             // Pinned sources: long-press a source on any title to pin it; this clears them all. Shown only

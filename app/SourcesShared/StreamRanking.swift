@@ -622,6 +622,14 @@ enum StreamRanking {
         if prefs.hdrOnly, !(text.contains("hdr") || text.contains("dolby vision")
             || text.contains("dolbyvision") || text.contains("dovi")) { return false }
         if prefs.maxResolution > 0, resolution(text) > prefs.maxResolution { return false }  // cap known resolutions
+        if prefs.minResolution > 0, let res = knownResolution(text),
+           res < prefs.minResolution { return false }   // floor KNOWN resolutions; unlabelled sources are kept (#117)
+        if prefs.hideUnknownResolution, knownResolution(text) == nil { return false }  // no recognizable resolution token (#117)
+        // Best-effort audio-language filter (#117): drop ONLY when the parse POSITIVELY identifies a
+        // single foreign-audio release (languageScore's conservative -5000 case). A release with no
+        // language stated, the viewer's language, or multiple languages scores 0 and is always kept,
+        // so untagged add-on output can never be emptied by this toggle.
+        if prefs.preferredAudioOnly, languageScore(text) < 0 { return false }
         if prefs.maxFileSizeGB > 0 {                                                          // cap advertised file size
             let gb = sizeGB(text) > 0 ? sizeGB(text) : sizeMB(text) / 1024
             if gb > 0, gb > prefs.maxFileSizeGB { return false }                              // unknown-size sources pass
@@ -1029,10 +1037,18 @@ enum StreamRanking {
         return out
     }
 
-    private static func resolution(_ t: String) -> Int {
+    /// The parsed resolution when the text carries a recognizable token (an explicit "1080p"-style
+    /// number, or a bare 4K/UHD marketing tag), nil when the release advertises none. The minimum-
+    /// resolution floor needs "unknown" kept apart from "low" (an unlabelled source must never be
+    /// dropped as if it were small), which `resolution(_:)`'s scoring sentinel deliberately conflates.
+    static func knownResolution(_ t: String) -> Int? {
         if let r = explicitResolution(t) { return r }
         if boundedMatch(t, "4k") || boundedMatch(t, "uhd") { return 4000 }
-        return 100   // unknown resolution: below any labelled stream, above nothing
+        return nil
+    }
+
+    private static func resolution(_ t: String) -> Int {
+        knownResolution(t) ?? 100   // unknown resolution: below any labelled stream, above nothing
     }
 
     /// Whether this stream plays instantly. Explicit add-on markers override the URL-shape

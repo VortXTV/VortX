@@ -62,7 +62,12 @@ struct iOSSettingsView: View {
     // Streaming/seek cache budget, stored as a raw byte count (0 = Off, -1 = Unlimited). @AppStorage is
     // Int-typed; Int is 64-bit on every Apple device this runs on, so the byte budgets are exact.
     @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
+    // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
+    @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
+    @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
+    @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
@@ -70,6 +75,8 @@ struct iOSSettingsView: View {
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
+    // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as tvOS.
+    @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
@@ -137,6 +144,7 @@ struct iOSSettingsView: View {
                 streamsSection.listRowBackground(Theme.Palette.surface1)
                 communitySection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
+                tabBarSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
                 subtitleSection.listRowBackground(Theme.Palette.surface1)
@@ -792,12 +800,27 @@ struct iOSSettingsView: View {
             Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
             Toggle("HDR sources only", isOn: $sourcePrefs.hdrOnly).tint(Theme.Palette.accent)
             Toggle("Hide AV1 sources", isOn: $sourcePrefs.excludeAV1).tint(Theme.Palette.accent)
+            // #117 (c): best-effort audio-language filter, honest about its limits in the footnote below.
+            Toggle("Preferred audio languages only", isOn: $sourcePrefs.preferredAudioOnly).tint(Theme.Palette.accent)
+            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
+                .font(.footnote).foregroundStyle(.secondary)
             Picker("Max quality", selection: $sourcePrefs.maxResolution) {
                 Text("Unlimited").tag(0)
                 Text("4K").tag(4000)
                 Text("1080p").tag(1080)
                 Text("720p").tag(720)
             }
+            // Minimum quality (#117): the floor twin of Max quality. Only drops a source whose KNOWN
+            // resolution sits below the floor; sources with no stated resolution are kept.
+            Picker("Minimum quality", selection: $sourcePrefs.minResolution) {
+                Text("Off").tag(0)
+                Text("720p").tag(720)
+                Text("1080p").tag(1080)
+                Text("4K").tag(2160)
+            }
+            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule, for viewers who
+            // want only sources that state their quality.
+            Toggle("Hide unknown quality", isOn: $sourcePrefs.hideUnknownResolution).tint(Theme.Palette.accent)
             Picker("Max file size", selection: $sourcePrefs.maxFileSizeGB) {
                 Text("Unlimited").tag(0.0)
                 Text("2 GB").tag(2.0)
@@ -808,6 +831,11 @@ struct iOSSettingsView: View {
                 Text("30 GB").tag(30.0)
                 Text("50 GB").tag(50.0)
             }
+            // Compact source rows (#117): display-only, hides the raw release-name line under each source
+            // so a row reads as "2160p · Remux · DV · 12.4 GB" from the parsed badges + tags.
+            Toggle("Compact source rows", isOn: $compactStreamLabels).tint(Theme.Palette.accent)
+            Text("Show each source as its parsed quality line (resolution, format, size) instead of the raw release name.")
+                .font(.footnote).foregroundStyle(.secondary)
             // Pinned sources (#15): long-press a source on any title to pin it; this clears them all.
             if pinStore.pinnedCount > 0 {
                 Button(role: .destructive) { pinStore.clearAll() } label: {
@@ -824,6 +852,7 @@ struct iOSSettingsView: View {
                     Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                 }
                 Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
+                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept unless Hide unknown quality is on.")
             }
         }
     }
@@ -1013,11 +1042,27 @@ struct iOSSettingsView: View {
 
     // MARK: Appearance
 
+    // MARK: Tab bar
+
+    /// Which tabs show in the bottom bar (#117), generalizing the old "Show Live TV tab" toggle into a
+    /// per-tab choice. Home / Add-ons / Settings have no toggle: the shell must always keep its landing
+    /// anchor and the way back to this screen. The shell heals the selection to Home when the active
+    /// tab is hidden.
+    @ViewBuilder private var tabBarSection: some View {
+        Section {
+            Toggle("Show Discover tab", isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
+            Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
+            Toggle("Show Library tab", isOn: Binding(get: { !hideLibraryTab }, set: { hideLibraryTab = !$0 }))
+            Toggle("Show Search tab", isOn: Binding(get: { !hideSearchTab }, set: { hideSearchTab = !$0 }))
+        } header: {
+            Text("Tab bar")
+        } footer: {
+            Text("Choose which tabs appear in the tab bar. Home, Add-ons, and Settings always stay. If the tab you are on is hidden, you land on Home.")
+        }
+    }
+
     @ViewBuilder private var appearanceSection: some View {
         Section {
-            // Placed first so the Live TV tab toggle is easy to find at the top of Appearance
-            // (it was previously buried below all the pickers and steppers).
-            Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
             // The built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.) are Cinemeta-
             // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
             // cannot remove from Home" report).

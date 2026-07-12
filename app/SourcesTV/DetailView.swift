@@ -1567,6 +1567,9 @@ struct CoreStreamList: View {
     /// Once the user has confirmed (and dismissed) the storage-eviction warning the first time, never show
     /// it again. Per device (a plain @AppStorage bool), not synced.
     @AppStorage("stremiox.downloadEvictionAck") private var downloadEvictionAck = false
+    /// Compact rows (#117): show each source as its parsed quality line (resolution · format · size)
+    /// instead of the add-on's raw release name/blurb. Device-local; iOS/Mac read the SAME key.
+    @AppStorage("vortx.streams.compactLabels") private var compactLabels = false
     /// Drives the first-download confirmation dialog; carries the resolve closure to run on confirm.
     @State private var pendingDownload: (() -> Void)?
 
@@ -2159,14 +2162,25 @@ struct CoreStreamList: View {
                     // the neutral add-on/torrent badges; only shown when cached.
                     if cached { badge("⚡ CACHED", accent: true) }
                 }
-                if let name = stream.name, !name.isEmpty {
-                    Text(name).font(Theme.Typography.cardTitle)
+                if compactLabels {
+                    // Compact rows (#117): one parsed line ("4K · Remux · DV · Atmos · 12.4 GB") from the
+                    // SAME StreamRanking parse that powers the Watch affordances, instead of the add-on's
+                    // raw release name + multi-line blurb.
+                    let info = StreamRanking.sourceDetail(stream)
+                    Text(info.size.map { "\(info.tags) · \($0)" } ?? info.tags)
+                        .font(Theme.Typography.cardTitle)
                         .foregroundStyle(enabled ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-                if let desc = stream.description, !desc.isEmpty {
-                    Text(desc).font(.system(size: 18)).foregroundStyle(Theme.Palette.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                } else {
+                    if let name = stream.name, !name.isEmpty {
+                        Text(name).font(Theme.Typography.cardTitle)
+                            .foregroundStyle(enabled ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let desc = stream.description, !desc.isEmpty {
+                        Text(desc).font(.system(size: 18)).foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true).multilineTextAlignment(.leading)
+                    }
                 }
             }
             Spacer(minLength: 0)
