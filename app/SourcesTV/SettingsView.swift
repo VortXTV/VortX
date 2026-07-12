@@ -81,6 +81,8 @@ struct SettingsView: View {
     // Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
     // writes this same key, so the last level persists; this picker sets it explicitly. SAME key as iOS/Mac.
     @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
+    // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as iOS/Mac.
+    @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     // New-episode alerts (F5): a local notification at each upcoming episode's air time. Default ON. SAME key
     // the iOS view's NewEpisodeNotifications.enabledKey resolves to ("stremiox.notifyNewEpisodes"); that type
     // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
@@ -797,6 +799,12 @@ struct SettingsView: View {
             choiceRow(String(localized: "Hide unknown quality"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { sourcePrefs.hideUnknownResolution ? "1" : "0" }, set: { sourcePrefs.hideUnknownResolution = ($0 == "1") }))
             Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown; Minimum quality hides sources below the floor (sources with no stated resolution are kept unless Hide unknown quality is on). Hide dead torrents drops sources with no seeders.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Compact source rows (#117): display-only (SAME vortx.streams.compactLabels key iOS/Mac binds).
+            choiceRow(String(localized: "Compact source rows"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { compactStreamLabels ? "1" : "0" }, set: { compactStreamLabels = ($0 == "1") }))
+            Text("Show each source as its parsed quality line (resolution, format, size) instead of the raw release name.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             // Pinned sources: long-press a source on any title to pin it; this clears them all. Shown only

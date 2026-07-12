@@ -70,6 +70,8 @@ struct iOSSettingsView: View {
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
+    // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as tvOS.
+    @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemux = false   // Dolby Vision for MKV (Beta): in-app remux -> AVPlayer; default OFF
@@ -823,6 +825,11 @@ struct iOSSettingsView: View {
                 Text("30 GB").tag(30.0)
                 Text("50 GB").tag(50.0)
             }
+            // Compact source rows (#117): display-only, hides the raw release-name line under each source
+            // so a row reads as "2160p · Remux · DV · 12.4 GB" from the parsed badges + tags.
+            Toggle("Compact source rows", isOn: $compactStreamLabels).tint(Theme.Palette.accent)
+            Text("Show each source as its parsed quality line (resolution, format, size) instead of the raw release name.")
+                .font(.footnote).foregroundStyle(.secondary)
             // Pinned sources (#15): long-press a source on any title to pin it; this clears them all.
             if pinStore.pinnedCount > 0 {
                 Button(role: .destructive) { pinStore.clearAll() } label: {
