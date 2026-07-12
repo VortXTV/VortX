@@ -8,7 +8,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta, "android/**"]
     paths:
       - "android/**"
       - "core/**"
@@ -96,9 +96,12 @@ jobs:
           gpl_pattern='lib(mpv|player|avcodec|avformat|avutil)\.so'
           fail=0
           for apk in android/app/build/outputs/apk/play/debug/*.apk; do
-            if unzip -l "$apk" | grep -Eq "$gpl_pattern"; then
+            # Capture the full listing first so grep never SIGPIPEs unzip under pipefail
+            # (a short-circuiting grep -q on a long listing would make the step falsely pass).
+            listing="$(unzip -l "$apk")"
+            if grep -Eq "$gpl_pattern" <<<"$listing"; then
               echo "::error::GPL native lib found in play APK: $apk"
-              unzip -l "$apk" | grep -E "$gpl_pattern" || true
+              grep -E "$gpl_pattern" <<<"$listing" || true
               fail=1
             fi
           done
