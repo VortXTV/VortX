@@ -360,6 +360,8 @@ struct TVCategoryBrowse: View {
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     @State private var selectedID: String = ""
     @State private var items: [MetaPreview] = []
@@ -430,6 +432,7 @@ struct TVCategoryBrowse: View {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(items) { item in
                     PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                               isWatched: watchedIndex.ids.contains(item.id),
                                width: Self.posterCellWidth, landscapeWidth: Self.landscapeCellWidth,
                                menu: .catalog,
                                onFocus: { focusModel.focus(hero(for: item)) })

@@ -610,9 +610,11 @@ struct PosterCard: View {
     /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
     /// every non-CW card, so their tiles are unchanged.
     var resumeSeconds: Double? = nil
-    /// Watched state (DESIGN.md "PosterCard — Watched state: 55% opacity plus a check badge").
-    /// Mirrors the DetailView episode-thumbnail treatment. Only data-bearing callers pass it
-    /// (the Library grid); the default keeps every other card pixel-identical.
+    /// Watched state (DESIGN.md "PosterCard, Watched state: 55% opacity plus a check badge").
+    /// Mirrors the DetailView episode-thumbnail treatment. Data-bearing callers pass it: the
+    /// Library grid (its own per-profile helper) and, since #111, the Home catalog rails and
+    /// category grids (via the shared per-profile `WatchedIndex` set). The default keeps every
+    /// other card pixel-identical.
     var isWatched: Bool = false
     /// Explicit PORTRAIT card width, for callers that lay cards into FIXED grid cells (TVCategoryBrowse's
     /// 4-across grid) and need the card to EXACTLY fill its cell. nil = the self-sizing rails/surfaces, which

@@ -553,6 +553,8 @@ struct CoreCatalogRowView: View {
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var core: CoreBridge   // for per-row horizontal pagination (#95)
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -561,6 +563,7 @@ struct CoreCatalogRowView: View {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(row.items) { item in
                         PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   isWatched: watchedIndex.ids.contains(item.id),
                                    menu: .catalog,
                                    onFocus: focusModel.map { model in
                                        { model.focus(item.focusedHero) }
@@ -585,6 +588,8 @@ struct TopPicksRow: View {
     let items: [MetaPreview]
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -593,6 +598,7 @@ struct TopPicksRow: View {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
                         PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   isWatched: watchedIndex.ids.contains(item.id),
                                    menu: .catalog,
                                    onFocus: focusModel.map { model in
                                        { model.focus(hero(for: item)) }
@@ -623,6 +629,8 @@ struct StreamingRow: View {
     let items: [MetaPreview]
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -631,6 +639,7 @@ struct StreamingRow: View {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
                         PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   isWatched: watchedIndex.ids.contains(item.id),
                                    menu: .catalog,
                                    onFocus: focusModel.map { model in
                                        { model.focus(hero(for: item)) }
