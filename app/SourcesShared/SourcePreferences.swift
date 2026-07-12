@@ -68,6 +68,7 @@ protocol SourcePrefsReading {
     var excludeAV1: Bool { get }
     var hdrOnly: Bool { get }
     var maxResolution: Int { get }
+    var minResolution: Int { get }
     var maxFileSizeGB: Double { get }
     func tierWeight(for type: SourceType) -> Int
     func matches(_ regex: NSRegularExpression, _ text: String) -> Bool
@@ -86,6 +87,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let hideDeadKey           = "stremiox.streaming.hideDeadTorrents"
     static let instantOnlyKey        = "stremiox.streaming.instantOnly"
     static let maxResolutionKey      = "stremiox.streaming.maxResolution"
+    static let minResolutionKey      = "stremiox.streaming.minResolution"
     static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
     static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
@@ -152,6 +154,13 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     @Published var maxResolution: Int {
         didSet { UserDefaults.standard.set(maxResolution, forKey: Self.maxResolutionKey) }
     }
+    /// Floor the resolution of shown sources (0 = off, else 720 / 1080 / 2160): "hide everything below
+    /// 1080p" (#117). The inverse of `maxResolution`, with the SAME unknown-keeps rule mirrored: it only
+    /// drops a source whose KNOWN resolution sits below the floor, so an unlabelled source is never
+    /// mistaken for a low one. Off (0) by default.
+    @Published var minResolution: Int {
+        didSet { UserDefaults.standard.set(minResolution, forKey: Self.minResolutionKey) }
+    }
     /// Cap the file size of shown sources in GB (0 = unlimited). Only drops a source whose ADVERTISED
     /// size exceeds the cap, so sources with no stated size (many cached / debrid links) are kept.
     /// Off (0) by default. Pairs with `maxResolution` for "1080p but not a 20 GB file".
@@ -176,7 +185,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     var noFiltersActive: Bool {
         !keywordFilterActive && safetyMode == "off"
             && !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0
-            && maxFileSizeGB == 0
+            && minResolution == 0 && maxFileSizeGB == 0
     }
 
     /// Whether the Hide / Require fields impose any filter, accounting for regex vs substring mode.
@@ -199,6 +208,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
          hideDeadTorrents ? "1" : "0",
          instantOnly ? "1" : "0",
          String(maxResolution),
+         String(minResolution),
          String(maxFileSizeGB),
          hdrOnly ? "1" : "0",
          excludeAV1 ? "1" : "0",
@@ -242,6 +252,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         hideDeadTorrents = UserDefaults.standard.bool(forKey: Self.hideDeadKey)
         instantOnly     = UserDefaults.standard.bool(forKey: Self.instantOnlyKey)
         maxResolution   = UserDefaults.standard.integer(forKey: Self.maxResolutionKey)
+        minResolution   = UserDefaults.standard.integer(forKey: Self.minResolutionKey)
         maxFileSizeGB   = UserDefaults.standard.double(forKey: Self.maxFileSizeKey)
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
@@ -288,6 +299,8 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if keywordsAreRegex != rx { keywordsAreRegex = rx }
         let maxRes = d.integer(forKey: Self.maxResolutionKey)
         if maxResolution != maxRes { maxResolution = maxRes }
+        let minRes = d.integer(forKey: Self.minResolutionKey)
+        if minResolution != minRes { minResolution = minRes }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
     }
@@ -311,6 +324,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     func apply(_ preset: SourcePreset) {
         typeOrder = [.debrid, .usenet, .torrent, .direct]
         hideDeadTorrents = true
+        // Presets own the quality CAPS, so they also clear any resolution floor: leaving a user's 4K
+        // floor under Data Saver's 1080p cap would filter out every labelled source.
+        minResolution = 0
         switch preset {
         case .bestQuality:
             maxResolution = 0;    maxFileSizeGB = 0;  instantOnly = false; hdrOnly = false; excludeAV1 = false
@@ -349,6 +365,7 @@ extension SourcePreferences {
         let excludeAV1: Bool
         let hdrOnly: Bool
         let maxResolution: Int
+        let minResolution: Int
         let maxFileSizeGB: Double
 
         /// Same logic as `SourcePreferences.tierWeight`, over the snapshotted `typeOrder`.
@@ -369,7 +386,8 @@ extension SourcePreferences {
                  keywordsAreRegex: keywordsAreRegex, excludeRegex: excludeRegex, includeRegex: includeRegex,
                  excludeTerms: excludeTerms, includeTerms: includeTerms, safetyMode: safetyMode,
                  instantOnly: instantOnly, hideDeadTorrents: hideDeadTorrents, excludeAV1: excludeAV1,
-                 hdrOnly: hdrOnly, maxResolution: maxResolution, maxFileSizeGB: maxFileSizeGB)
+                 hdrOnly: hdrOnly, maxResolution: maxResolution, minResolution: minResolution,
+                 maxFileSizeGB: maxFileSizeGB)
     }
 
     /// The off-main override for the ranker. When installed (by `SourceListModel`'s detached rank via

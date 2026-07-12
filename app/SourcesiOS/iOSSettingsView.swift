@@ -798,6 +798,14 @@ struct iOSSettingsView: View {
                 Text("1080p").tag(1080)
                 Text("720p").tag(720)
             }
+            // Minimum quality (#117): the floor twin of Max quality. Only drops a source whose KNOWN
+            // resolution sits below the floor; sources with no stated resolution are kept.
+            Picker("Minimum quality", selection: $sourcePrefs.minResolution) {
+                Text("Off").tag(0)
+                Text("720p").tag(720)
+                Text("1080p").tag(1080)
+                Text("4K").tag(2160)
+            }
             Picker("Max file size", selection: $sourcePrefs.maxFileSizeGB) {
                 Text("Unlimited").tag(0.0)
                 Text("2 GB").tag(2.0)
@@ -824,6 +832,7 @@ struct iOSSettingsView: View {
                     Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                 }
                 Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
+                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept.")
             }
         }
     }
