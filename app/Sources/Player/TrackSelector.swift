@@ -4,10 +4,20 @@ import Foundation
 /// preferences. Pure and side-effect free, so it is unit-testable. Shared by both players.
 enum TrackSelector {
     /// The audio and subtitle track ids to select. A subtitle id of -1 means "off"; a nil audio id
-    /// means "leave mpv's default" (no preferred-language match was found).
+    /// means "leave the engine's default" (neither the user's chain nor the English fallback matched).
     static func select(audio: [MPVTrack], subtitles: [MPVTrack], preferences p: TrackPreferences) -> (audio: Int?, subtitle: Int?) {
-        let audioPick = firstMatch(audio, languages: p.audioLanguages, reject: p.rejectTerms)
-        let subtitle = selectSubtitle(subtitles, preferences: p, gotPreferredAudio: audioPick != nil)
+        let chainPick = firstMatch(audio, languages: p.audioLanguages, reject: p.rejectTerms)
+        // No track matches the user's language chain (#76, ozdek's report): do NOT leave the pick to the
+        // engine default. Unpicked, both engines defer to the container's default/first audio track, which
+        // on multi-language European releases is frequently the local dub, so a Turkish-only preference
+        // played French. Fall back to English, the original language of the overwhelming majority of the
+        // catalog (the app has no per-title original-language metadata to prefer first, and MPVTrack
+        // carries no channel counts to break ties on, so English is the strongest fallback available).
+        // A file with neither a chain match nor an English track still leaves the engine default.
+        // The subtitle policy keys off the CHAIN match, not the fallback: English-fallback audio counts as
+        // foreign-language content, so full subtitles in the user's language still auto-enable.
+        let audioPick = chainPick ?? firstMatch(audio, languages: ["en"], reject: p.rejectTerms)
+        let subtitle = selectSubtitle(subtitles, preferences: p, gotPreferredAudio: chainPick != nil)
         return (audioPick?.id, subtitle)
     }
 

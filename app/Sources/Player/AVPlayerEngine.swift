@@ -46,6 +46,18 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// notification can BOTH fire for one failure; a duplicate event lands after the chrome has already
     /// demoted to libmpv and used to punch through into its retry/error path (the DV "error screen").
     private var fatalErrorEmitted = false
+    // AUDIO-OVER-BLACK watchdog state (#76 residual, native DV lane only; see checkAudioOverBlackWatchdog).
+    // `videoFrameEverProduced` latches TRUE on the first observed video frame and permanently disarms the
+    // watchdog for this item, so it can never fire on a session that ever showed a picture. `audioOverBlackSince`
+    // anchors the sustained no-picture window (0 = not currently counting); `audioOverBlackFired` makes the
+    // demote one-shot per item, alongside the fatalErrorEmitted latch it shares with the other fatal paths.
+    private var videoFrameEverProduced = false
+    private var audioOverBlackSince: TimeInterval = 0
+    private var audioOverBlackFired = false
+    /// Sustained window of advancing playback clock with ZERO video frames before demoting. Long enough to
+    /// clear a slow first-frame on a healthy native DV start (normally sub-second once timePos ticks), short
+    /// enough that black-with-Atmos flips to a working picture on libmpv in well under ten seconds.
+    private let audioOverBlackWindowSeconds: TimeInterval = 8
     private var pendingSeek: Double?
     private var requestedRate: Float = 1
     private var timeObserver: Any?
@@ -114,6 +126,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         teardownObservers()
         teardownRemux()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
+        videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []
         disableExternalSubtitle()   // a new title starts with no external overlay sub
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
@@ -556,6 +569,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
                 let clock = ProcessInfo.processInfo.systemUptime
+                // AUDIO-OVER-BLACK probe (native DV lane only). Two boolean guards once latched/off-route,
+                // so the non-DV steady state pays nothing (see checkAudioOverBlackWatchdog).
+                self.checkAudioOverBlackWatchdog(clock: clock, position: time.seconds)
                 let minInterval = PerformanceMode.reduced ? 0.5 : 0.25
                 // Push the play head (and duration when known) into the probe, throttled.
                 if clock - self.lastProbeEmit >= minInterval {
@@ -729,6 +745,86 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 }
             }
         }
+    }
+
+    /// AUDIO-OVER-BLACK watchdog (#76 residual). On the NATIVE DV lane (a DV-flagged MP4/MOV/HLS routed to
+    /// AVPlayer; NOT the remux lane, whose VortXMKVRemuxStream classify guards already fail fast), some files
+    /// reach readyToPlay, play their Atmos audio, and never produce a picture (ozdek's Case C: the
+    /// diagnostics above name the refused carriage, but playback used to sit on black forever). The audio
+    /// clock advances timePos, so the chrome's start watchdog disarms on the first tick (hasStartedPlaying)
+    /// and nothing else ever intervenes. Detect it HERE, where the frame evidence lives, and emit the SAME
+    /// one-shot endFileError the .failed / remux-mount-failure paths use, so the chrome demotes to libmpv in
+    /// place and the viewer gets a real picture (honest HDR10 + decoded audio) instead of black-with-Atmos.
+    ///
+    /// Fires only when ALL of these hold for a sustained `audioOverBlackWindowSeconds` window:
+    ///  - the route is the native DV lane: `contentIsDolbyVision && !isRemuxMounted`. This lane cannot mount
+    ///    an intentional audio-only asset (the router only DV-flags video streams), so the "audio-only file"
+    ///    false positive is excluded by the route condition itself.
+    ///  - the item started (`didStart`) and the transport is actually running (`.playing` with an advancing
+    ///    clock); a pause or a buffering stall RESETS the window rather than counting toward it.
+    ///  - NO video frame was EVER produced for this item: `videoFrameEverProduced` latches permanently on the
+    ///    first frame seen by ANY signal in `hasProducedPicture` (layer readiness, live frame rate, frame
+    ///    tap), so a session that ever showed a picture can never demote through this path (a mid-play video
+    ///    freeze is the stall watchdog's job, not ours). The fire edge additionally re-checks
+    ///    `playerLayer.isReadyForDisplay` and stands down if the layer holds a displayable frame.
+    /// The demote log carries the presentationSize evidence. NOTE presentationSize is corroborating output
+    /// only, not a veto: ozdek's file misreported 3840x2160 as a NON-zero 1280x720 while producing nothing,
+    /// so a zero-size check alone would miss the confirmed case.
+    private func checkAudioOverBlackWatchdog(clock: TimeInterval, position: Double) {
+        guard !audioOverBlackFired, !videoFrameEverProduced else { return }
+        guard contentIsDolbyVision, !isRemuxMounted, didStart else { return }
+        guard position > 0, player.timeControlStatus == .playing else {
+            audioOverBlackSince = 0   // not advancing: never count paused/buffering time toward the window
+            return
+        }
+        if hasProducedPicture(atClock: position) {
+            videoFrameEverProduced = true
+            audioOverBlackSince = 0
+            return
+        }
+        if audioOverBlackSince == 0 { audioOverBlackSince = clock; return }
+        guard clock - audioOverBlackSince >= audioOverBlackWindowSeconds else { return }
+        // IRREVERSIBLE edge, so corroborate ONE more time against Apple's own layer signal right before the
+        // call: AVPlayerLayer.isReadyForDisplay is the documented "this layer has a displayable frame". The
+        // per-tick proxies can false-NEGATIVE (currentVideoFrameRate needs a stabilization run; the video
+        // output is poll-based and can be delivery-suspended), and a false demote is expensive (true DV +
+        // Atmos lost for the whole title), so the demote may only fire while the layer itself reports NO
+        // displayable frame, or no layer is attached at all.
+        if playerLayer?.isReadyForDisplay == true {
+            videoFrameEverProduced = true
+            audioOverBlackSince = 0
+            return
+        }
+        audioOverBlackFired = true
+        // Respect an earlier fatal FIRST, before any logging: a genuine item .failed can land inside the
+        // window, and the [dv] trail is triage-critical, so the watchdog must never log a demote claim for
+        // a fallback that .failed actually caused.
+        guard !fatalErrorEmitted else { return }
+        fatalErrorEmitted = true
+        let size = item?.presentationSize ?? .zero
+        DiagnosticsLog.log("dv", "audio-over-black watchdog: \(Int(audioOverBlackWindowSeconds))s of advancing clock with ZERO video frames (presentationSize=\(Int(size.width))x\(Int(size.height)) pos=\(Int(position))s) -> endFileError demote to libmpv HDR10")
+        VXProbe.log("dv", "audio-over-black demote: no frame in \(Int(audioOverBlackWindowSeconds))s presentationSize=\(Int(size.width))x\(Int(size.height))")
+        emit(MPVProperty.endFileError, "Dolby Vision video produced no picture (audio over a black screen)")
+    }
+
+    /// Whether the CURRENT item has demonstrably rendered a video frame. Three independent signals, any one
+    /// latches the watchdog off for the rest of the item:
+    ///  1. `AVPlayerLayer.isReadyForDisplay` -- Apple's documented "the layer has a frame to show". Checked
+    ///     first (authoritative and cheapest); nil when no layer host has attached yet, so it can never
+    ///     latch on absence alone.
+    ///  2. Any AVPlayerItemTrack reporting `currentVideoFrameRate > 0` -- the render pipeline's own live
+    ///     frame-rate report, which is 0.0 for audio tracks and for a video track producing nothing.
+    ///  3. The trickplay frame tap (`videoOutput`) holding a decoded pixel buffer for the current clock.
+    ///     Last because AVFoundation may suspend an unpolled output's delivery (a false NEGATIVE, never
+    ///     a false positive) -- all three signals only ever err toward "keep waiting", not toward demoting.
+    private func hasProducedPicture(atClock seconds: Double) -> Bool {
+        if playerLayer?.isReadyForDisplay == true { return true }
+        if let tracks = item?.tracks, tracks.contains(where: { $0.currentVideoFrameRate > 0 }) { return true }
+        if let output = videoOutput,
+           output.hasNewPixelBuffer(forItemTime: CMTime(seconds: seconds, preferredTimescale: 600)) {
+            return true
+        }
+        return false
     }
 
     @objc private func didPlayToEnd() {
