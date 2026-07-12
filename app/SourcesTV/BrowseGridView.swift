@@ -40,7 +40,7 @@ struct TVCollectionsHub: View {
                 }
             }
             if showStreaming, !model.providers.isEmpty {
-                section(title: "Streaming Services", eyebrow: "Browse by service") {
+                section(title: String(localized: "Streaming Services"), eyebrow: String(localized: "Browse by service")) {
                     ForEach(model.providers) { p in
                         NavigationLink { TVCategoryBrowse(target: .service(id: p.providerID, name: p.name)) } label: { TVServiceTile(provider: p) }
                             .buttonStyle(CardFocusStyle())
@@ -48,7 +48,7 @@ struct TVCollectionsHub: View {
                 }
             }
             if !visibleGenres.isEmpty {
-                section(title: "Browse by Genre", eyebrow: "Browse by genre") {
+                section(title: String(localized: "Browse by Genre"), eyebrow: String(localized: "Browse by genre")) {
                     ForEach(visibleGenres, id: \.self) { g in
                         NavigationLink { TVCategoryBrowse(target: .genre(g)) } label: { TVGenreTile(genre: g, backdrop: model.genreBackdrops[g.title]) }
                             .buttonStyle(CardFocusStyle())

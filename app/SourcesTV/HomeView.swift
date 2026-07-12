@@ -100,7 +100,7 @@ struct HomeView: View {
                         // soonest first; hidden when nothing is upcoming. Each card routes to the movie DetailView.
                         if !releaseCalendar.upcomingMovies.isEmpty {
                             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                                RailHeader(eyebrow: "Coming soon", title: "Upcoming Movies")
+                                RailHeader(eyebrow: String(localized: "Coming soon"), title: String(localized: "Upcoming Movies"))
                                 ScrollView(.horizontal, showsIndicators: false) {
                                     LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                                         ForEach(releaseCalendar.upcomingMovies) { m in
@@ -423,7 +423,7 @@ struct CoreContinueWatchingRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: "Pick up where you left off", title: "Continue Watching")
+            RailHeader(eyebrow: String(localized: "Pick up where you left off"), title: String(localized: "Continue Watching"))
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
@@ -588,7 +588,7 @@ struct TopPicksRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: "Based on what you watch", title: "Top Picks for you")
+            RailHeader(eyebrow: String(localized: "Based on what you watch"), title: String(localized: "Top Picks for you"))
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
@@ -626,7 +626,7 @@ struct StreamingRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: "Streaming now", title: title)
+            RailHeader(eyebrow: String(localized: "Streaming now"), title: title)
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
@@ -672,7 +672,7 @@ struct UpcomingEpisodesRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: "Coming soon", title: "Upcoming Episodes")
+            RailHeader(eyebrow: String(localized: "Coming soon"), title: String(localized: "Upcoming Episodes"))
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
@@ -712,7 +712,7 @@ struct UpcomingEpisodesRow: View {
 struct LoadingRail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(title: "Loading your library")
+            RailHeader(title: String(localized: "Loading your library"))
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: Theme.Space.lg) {
                     ForEach(0..<6, id: \.self) { _ in
