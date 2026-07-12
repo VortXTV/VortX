@@ -375,16 +375,13 @@ struct TVCategoryBrowse: View {
 
     private var subs: [SubCatalog] { CollectionsCatalog.subCatalogs(for: target, region: TMDBClient.deviceRegion) }
 
-    /// #104: the owner wants more per row (was 3 landscape / 6 poster). Fit 4 landscape cards into the SAME
-    /// footprint 3 used (width * 3/4) so there is zero safe-area clipping risk on the TV, and 7 posters.
-    /// The CARDS must render at exactly these cell widths too (passed into PosterCard below): the 145
-    /// regression shrank only the GridItem cells while the cards stayed full-size, so 4 tiles overlapped.
-    private static let landscapeCellWidth: CGFloat = kLandscapeCardWidth * 3.0 / 4.0
-    private static let posterCellWidth: CGFloat = kPosterWidth * 6.0 / 7.0
+    /// Cell widths and counts come from `TVGridMetrics` (SharedUI.swift), the single source shared with
+    /// the Home poster wall (#105); see its doc comment for the #104 footprint math and the 145
+    /// cell-vs-card overlap regression.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
-            ? Array(repeating: GridItem(.fixed(Self.landscapeCellWidth), spacing: Theme.Space.lg), count: 4)
-            : Array(repeating: GridItem(.fixed(Self.posterCellWidth), spacing: Theme.Space.lg), count: 7)
+            ? Array(repeating: GridItem(.fixed(TVGridMetrics.landscapeCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.landscapeColumns)
+            : Array(repeating: GridItem(.fixed(TVGridMetrics.posterCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.posterColumns)
     }
 
     var body: some View {
@@ -430,7 +427,7 @@ struct TVCategoryBrowse: View {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(items) { item in
                     PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                               width: Self.posterCellWidth, landscapeWidth: Self.landscapeCellWidth,
+                               width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
                                menu: .catalog,
                                onFocus: { focusModel.focus(hero(for: item)) })
                         .onAppear { if item.id == items.last?.id { Task { await loadNext() } } }

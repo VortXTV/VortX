@@ -592,11 +592,13 @@ struct CoreCatalogRowView: View {
 
 /// One engine catalog section in the POSTER-WALL Home layout (#105): the same `RailHeader` (so the
 /// localized title + any eyebrow treatment survive the mode switch) over a vertical `LazyVGrid` of the
-/// row's items, instead of `CoreCatalogRowView`'s horizontal rail. Column math mirrors `TVCategoryBrowse`
-/// (#104): FIXED cells with the card told its EXACT cell width, so cards can never overlap their
-/// neighbours regardless of the user's width preset; 4 landscape / 7 portrait per row, the densest grid
-/// already proven safe against edge clipping on the TV. Compositor-cheap by construction: `LazyVGrid`
-/// only materializes cells near the viewport, and `PosterCard` is reused unchanged (no extra shadows).
+/// row's items, instead of `CoreCatalogRowView`'s horizontal rail. Column math is SHARED with
+/// `TVCategoryBrowse` through `TVGridMetrics` (#104): FIXED cells with the card told its EXACT cell
+/// width, so cards can never overlap their neighbours regardless of the user's width preset; 4 landscape
+/// / 7 portrait per row, the densest grid already proven safe against edge clipping on the TV.
+/// Compositor-cheap by construction: `LazyVGrid` only materializes cells near the viewport, and
+/// `PosterCard` is reused unchanged (no extra shadows). Each wall's grid is a `.focusSection()`; see the
+/// comment on that modifier below for why grids get one while rails deliberately do not.
 struct CoreCatalogWallSection: View {
     let row: CoreBoardRow
     var focusModel: FocusedItemModel? = nil
@@ -605,14 +607,13 @@ struct CoreCatalogWallSection: View {
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
 
-    /// Same fixed-cell widths as `TVCategoryBrowse` (#104): 4 landscape cards in the footprint 3 used,
-    /// 7 posters in the footprint 6 used, so the wall packs the screen with zero safe-area clipping risk.
-    private static let landscapeCellWidth: CGFloat = kLandscapeCardWidth * 3.0 / 4.0
-    private static let posterCellWidth: CGFloat = kPosterWidth * 6.0 / 7.0
+    /// Cell widths and counts come from `TVGridMetrics` (SharedUI.swift), the single source shared with
+    /// `TVCategoryBrowse` so the wall and the browse grid can never drift apart; see its doc comment for
+    /// the #104 footprint math and the 145 cell-vs-card overlap regression.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
-            ? Array(repeating: GridItem(.fixed(Self.landscapeCellWidth), spacing: Theme.Space.lg), count: 4)
-            : Array(repeating: GridItem(.fixed(Self.posterCellWidth), spacing: Theme.Space.lg), count: 7)
+            ? Array(repeating: GridItem(.fixed(TVGridMetrics.landscapeCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.landscapeColumns)
+            : Array(repeating: GridItem(.fixed(TVGridMetrics.posterCellWidth), spacing: Theme.Space.lg), count: TVGridMetrics.posterColumns)
     }
 
     var body: some View {
@@ -621,7 +622,7 @@ struct CoreCatalogWallSection: View {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(row.items) { item in
                     PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                               width: Self.posterCellWidth, landscapeWidth: Self.landscapeCellWidth,
+                               width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
                                menu: .catalog,
                                onFocus: focusModel.map { model in
                                    { model.focus(item.focusedHero) }
@@ -635,6 +636,17 @@ struct CoreCatalogWallSection: View {
             }
             .padding(.horizontal, Theme.Space.screenEdge)
             .padding(.vertical, Theme.Space.lg)   // room for the focus halo, matching the rail
+            // FOCUS: this MULTI-ROW grid is deliberately a focus section, and that is NOT the same case as
+            // the hub rails. The BrowseGridView hub lesson (see `section(title:eyebrow:)` there) applies to
+            // stacked 1-ROW rails: giving each single row its own focus section made tvOS route D-pad moves
+            // by REGION heuristics and skip rows, so rails carry NO focusSection. A multi-row LazyVGrid is
+            // the opposite shape: Apple's guidance is to bound the grid in `.focusSection()` so vertical
+            // moves inside the wall stay tile-to-tile and the UP/DOWN hand-off at the grid's edges lands on
+            // the neighbouring section predictably instead of a far-away nearest-neighbour hit. The only
+            // pre-existing LazyVGrid screens (TVCategoryBrowse, LibraryView) live alone on their screens and
+            // never needed this; a wall section is the first grid STACKED against other focusable sections.
+            // Do not strip this as "inconsistent with the rails": rails without, grids with, is the intent.
+            .focusSection()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
