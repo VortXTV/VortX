@@ -45,6 +45,10 @@ struct StremioXiOSApp: App {
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()
         VXProbe.log("boot", "VortX launched probe=\(VXProbe.enabled)")
+        // Offline mode (#120): start the process-wide connectivity monitor before the shell mounts, so
+        // its FIRST verdict (launchOffline) is ready to route an offline launch to Downloads / Settings
+        // and the shell's "You're offline" banner tracks the live (debounced) state.
+        ConnectivityMonitor.shared.start()
         #if !STREMIOX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {

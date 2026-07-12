@@ -12,6 +12,10 @@ struct StremioTVApp: App {
         // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
         VortXCrashReporter.install()
+        // Offline mode (#120): start the process-wide connectivity monitor before the shell mounts, so
+        // its FIRST verdict (launchOffline) is ready to land an offline launch on the Library tab (where
+        // Downloads live) and the shell's "You're offline" chip tracks the live (debounced) state.
+        ConnectivityMonitor.shared.start()
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.

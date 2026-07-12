@@ -158,6 +158,12 @@ struct RootTabView: View {
     @State private var resetTokens = [Int](repeating: 0, count: 7)
     /// Hide the Live TV tab for users who do not use it (Settings toggle).
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    /// Live connectivity (#120): drives the quiet "You're offline" chip and the one-shot offline
+    /// launch routing below. The monitor debounces changes, so a brief flap never thrashes the shell.
+    @ObservedObject private var connectivity = ConnectivityMonitor.shared
+    /// One-shot latch for the offline LAUNCH routing (#120): set when the monitor's first verdict is
+    /// consumed, so no later connectivity change can ever move tabs (mid-session offline = chip only).
+    @State private var offlineLaunchRouted = false
 
     /// The tvOS scroll-to-top key for a tab tag, matching the `TabScrollKeys` the screens observe.
     /// tvOS `TabView` selection uses integer tags; only Home / Discover / Library carry a scrollable
@@ -228,6 +234,23 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
+        // Offline chip (#120): a quiet bottom capsule while the device has no network path. Pure
+        // signal (never focusable, never navigates); it clears on its own when connectivity returns,
+        // and online tabs stay reachable for cached browsing.
+        .overlay(alignment: .bottom) { offlineBanner }
+        .animation(.easeOut(duration: 0.25), value: connectivity.isOffline)
+        // Offline-at-LAUNCH routing (#120): the monitor's FIRST verdict (and only that one) may move
+        // the initial selection off Home to the Library tab, where the Downloads section
+        // (TVDownloadsView) lives, so an Apple TV opened with no connection lands on something usable.
+        // Strictly one-shot and pre-navigation: the latch consumes the verdict, and the
+        // `selection == 0` guard skips the redirect if the user already moved on their own (a late
+        // first verdict must never yank navigation). Going offline MID-SESSION only shows the chip.
+        .onReceive(connectivity.$launchOffline) { verdict in
+            guard let verdict, !offlineLaunchRouted else { return }
+            offlineLaunchRouted = true
+            guard verdict, selection == 0 else { return }
+            selection = 2   // Library (tag 2): Downloads section + the cached library grid
+        }
         // Back/Menu floor, depth-aware. SwiftUI routes the exit command to the NEAREST .onExitCommand in the
         // focused view's ancestry BEFORE UIKit's default NavigationStack pop, so this shell-level handler
         // fires from ANY push depth on a non-Home tab (55ceff8 assumed pushed pages kept a deeper Menu
@@ -271,6 +294,32 @@ struct RootTabView: View {
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.oled) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.textScale) { ProfileStore.shared.captureTheme() }
+    }
+
+    /// Quiet, persistent "You're offline" chip (#120), pinned to the bottom of the shell while the
+    /// device has no network path. A subdued surface capsule, not an alert: it says the app knows,
+    /// points at what still works (Downloads in Library), and clears on its own when connectivity
+    /// returns (the monitor's debounced signal, so a brief flap never flashes it). Hit-testing is off
+    /// so the focus engine never sees it; the remote keeps driving the tabs and content beneath.
+    @ViewBuilder private var offlineBanner: some View {
+        if connectivity.isOffline {
+            HStack(spacing: 10) {
+                Image(systemName: "wifi.slash")
+                    .font(.system(size: 22, weight: .semibold))
+                Text("You're offline. Downloads in your Library still play.")
+                    .font(Theme.Typography.label)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Theme.Palette.textSecondary)
+            .padding(.horizontal, Theme.Space.lg)
+            .padding(.vertical, Theme.Space.sm)
+            .background(Theme.Palette.surface1.opacity(0.92), in: Capsule())
+            .overlay(Capsule().stroke(Theme.Palette.hairline, lineWidth: 1))
+            .padding(.bottom, Theme.Space.lg)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .combine)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        }
     }
 
     /// The UIKit navigation controller backing the ACTIVE tab's `NavigationStack`, resolved from the

@@ -109,6 +109,12 @@ struct iOSRootView: View {
     /// downloads — the persistent "downloads are running, find them here" signal away from the detail page.
     @ObservedObject private var downloads = DownloadStore.shared
     #endif
+    /// Live connectivity (#120): drives the quiet "You're offline" strip and the one-shot offline
+    /// launch routing below. The monitor debounces changes, so a brief flap never thrashes the shell.
+    @ObservedObject private var connectivity = ConnectivityMonitor.shared
+    /// One-shot latch for the offline LAUNCH routing (#120): set when the monitor's first verdict is
+    /// consumed, so no later connectivity change can ever move tabs (mid-session offline = banner only).
+    @State private var offlineLaunchRouted = false
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
     /// Hide the Live TV tab for users who do not use it (Settings toggle). The Live screen is not mounted
     /// and the tab is dropped from the bar; selection falls back to Home if it was on Live.
@@ -190,7 +196,14 @@ struct iOSRootView: View {
             VXProbeState.shared.setRoute(newTab.probeName)
             VXProbe.event("nav", "tab \(newTab.probeName)")
         }
-        .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            // Offline strip above the update banner: both are shell-wide top inserts, so they stack
+            // rather than fight over the one safe-area slot.
+            VStack(spacing: 0) {
+                offlineBanner
+                updateBanner
+            }
+        }
         // Hide the whole shell (screens, tab bar, update banner) behind brand canvas while the launch
         // "Who's watching?" picker is owed, so none of the main profile's rails leak before a viewer is
         // chosen. The canvas background below stays fully opaque behind the faded shell. tvOS twin:
@@ -201,6 +214,30 @@ struct iOSRootView: View {
         .tint(Theme.Palette.accent)
         .animation(.easeOut(duration: 0.25), value: updates.available?.build)
         .animation(.easeOut(duration: 0.25), value: dismissedUpdateVersion)
+        .animation(.easeOut(duration: 0.25), value: connectivity.isOffline)
+        // Offline-at-LAUNCH routing (#120): the monitor's FIRST verdict (and only that one) may redirect
+        // the initial tab, so an app opened with no connection lands on something usable instead of a
+        // dead Home: the Downloads surface when a completed download exists, else Settings. Strictly
+        // one-shot and pre-navigation: the latch consumes the verdict, and the `tab == .home` guard
+        // skips the redirect if the user already moved on their own (a late first verdict must never
+        // yank navigation). Going offline MID-SESSION only shows the banner; when connectivity returns
+        // the banner clears and the user stays exactly where they are.
+        .onReceive(connectivity.$launchOffline) { verdict in
+            guard let verdict, !offlineLaunchRouted else { return }
+            offlineLaunchRouted = true
+            guard verdict, tab == .home else { return }
+            #if !os(tvOS)
+            if downloads.records.contains(where: { $0.state == .completed }) {
+                // The Downloads screen lives INSIDE the Library tab's NavigationStack (the pill's
+                // value route), which the shell cannot reach directly: stage the push for the stack
+                // to consume when it mounts, then switch to Library.
+                iOSLibraryView.pendingDownloadsPush = true
+                tab = .library
+                return
+            }
+            #endif
+            tab = .settings
+        }
         // What's New is no longer shown on launch; it lives in Settings > What's New (the full changelog).
         // Automatic update popup: appears once per launch when a newer build exists (and again when the
         // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
@@ -339,6 +376,35 @@ struct iOSRootView: View {
                 Theme.Palette.surface1
             }
             .ignoresSafeArea(edges: .bottom)
+        }
+    }
+
+    /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
+    /// network path. Deliberately NOT an alert and NOT the accent update banner: a subdued surface
+    /// chip that says the app knows, points at what still works, and clears on its own when
+    /// connectivity returns (the monitor's debounced signal, so a brief flap never flashes it).
+    /// Signal only: it never navigates, and online surfaces stay reachable for cached browsing.
+    @ViewBuilder private var offlineBanner: some View {
+        if connectivity.isOffline {
+            HStack(spacing: 8) {
+                Image(systemName: "wifi.slash")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("You're offline. Downloads and Settings still work.")
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(Theme.Palette.textSecondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background {
+                Theme.Palette.surface1
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Theme.Palette.hairline).frame(height: 0.5)
+                    }
+            }
+            .accessibilityElement(children: .combine)
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 
@@ -966,6 +1032,14 @@ struct iOSLibraryView: View {
         case downloads
     }
 
+    #if !os(tvOS)
+    /// One-shot handoff from the offline LAUNCH routing (#120): the Downloads screen lives inside THIS
+    /// tab's NavigationStack, which the shell cannot reach directly, so iOSRootView stages the push
+    /// here and switches to the Library tab; the freshly-mounted stack consumes it in onAppear.
+    /// Main-thread only (set and read on the SwiftUI update path).
+    static var pendingDownloadsPush = false
+    #endif
+
     /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
     /// own private watch overlay (every watched title), never the account.
     private var libraryItems: [RailItem] {
@@ -1074,6 +1148,14 @@ struct iOSLibraryView: View {
             if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
         }
         .onAppear {
+            #if !os(tvOS)
+            // Offline launch routing handoff (#120): land directly on the Downloads screen when the
+            // shell staged it (the app opened offline and a completed download exists to play).
+            if Self.pendingDownloadsPush {
+                Self.pendingDownloadsPush = false
+                path.append(LibraryRoute.downloads)
+            }
+            #endif
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
         }
