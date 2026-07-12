@@ -1677,12 +1677,15 @@ struct TVPlayerView: View {
         currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
-        // A switch to a new URL (the guard above proved newURL != curURL) is a fresh routing decision through
-        // PlayerEngineRouter.route, so a prior AVPlayer -> libmpv demote must NOT carry over and condemn a
-        // different source of the same title to HDR10: this switched-to source gets its own shot at true DV/Atmos
-        // on AVPlayer. Stickiness still holds for same-URL reloads and WITHIN one source's playback (nothing else
-        // clears this mid-source), and the per-episode reset in play(episode:) stays as is.
-        avEngineFailed = false
+        // A USER-initiated switch to a new URL (the guard above proved newURL != curURL) is a fresh routing
+        // decision through PlayerEngineRouter.route, so a prior AVPlayer -> libmpv demote must NOT carry over
+        // and condemn a different source of the same title to HDR10: the picked source gets its own shot at
+        // true DV/Atmos on AVPlayer. AUTOMATIC hops (hopToNextSource -> userInitiated: false) deliberately KEEP
+        // the demote sticky: a cascade of failing DV sources must fail over on cheap libmpv loads, not burn the
+        // 150s recovery cap on a full AVPlayer mount -> fail -> demote cycle per hop (mirrors the R11 rule just
+        // below). Same-URL reloads and one source's own playback stay sticky too; the per-episode reset in
+        // play(episode:) stays as is.
+        if userInitiated { avEngineFailed = false }
         // R11: only a USER-initiated pick re-arms the overall recovery cap. An automatic source hop
         // (userInitiated == false, via hopToNextSource) must PRESERVE the running deadline, otherwise the 150s
         // cap resets on every hop and never bounds a cascade of automatically failing sources.
@@ -3224,8 +3227,9 @@ struct TVPlayerView: View {
         // PER-TITLE, not per-session: this view is ONE continuous instance across a whole binge, and
         // without this reset a single demote on episode 1 silently pins every later episode to libmpv
         // HDR10. The next episode gets a fresh shot at true DV/Atmos on AVPlayer. WITHIN one title the
-        // demote stays sticky exactly as before (nothing else resets this flag mid-title), so a failing
-        // file can never ping-pong between the engines.
+        // demote stays sticky across same-URL reloads and AUTOMATIC source hops; only a USER-initiated
+        // switchStream pick also resets it (a deliberate new source is a fresh routing decision), so a
+        // failing file can never ping-pong between the engines on its own.
         avEngineFailed = false
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode

@@ -270,28 +270,33 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         #if os(tvOS)
-        // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published DV signaling (a
-        // decodable DV profile), and BEFORE the media playlist / any segment (the real video mount). This
-        // replaces the old pre-attach switch in loadFile, which fired on mount for every remux candidate and
-        // cycled the panel twice per hop whenever classify then rejected a non-DV / undecodable source (that
-        // path 404s the guard above and never reaches this line, so it never switches). The native (non-remux)
-        // DV lane still switches pre-attach because AVPlayer cannot report the profile before it demuxes.
-        // `request` is @MainActor and a no-op on iOS/macOS; only a signaling that actually advertises DV (a
-        // dvh1 P5 videoCodec or a SUPPLEMENTAL-CODECS P8.x) switches (a plain-HEVC HDR10 remux does not). Fire
-        // synchronously (bounded semaphore) so setSwitchSettled(false) lands before the settle-wait below, which
-        // is what closes the master-parse race the wait exists for.
-        let sigIsDV = sig.supplementalCodec != nil || sig.videoCodec.lowercased().hasPrefix("dvh1")
-        if sigIsDV {
-            let switched = DispatchSemaphore(value: 0)
-            let dvFps = sig.fps, dvWidth = sig.width, dvHeight = sig.height
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {   // request() is @MainActor; this closure runs on the main queue
-                    HDRDisplayMode.request(.dolbyVision, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
-                }
-                switched.signal()
+        // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published signaling, and BEFORE
+        // the media playlist / any segment (the real video mount). This replaces the old pre-attach switch in
+        // loadFile, which fired on mount for every remux candidate and cycled the panel twice per hop whenever
+        // classify then rejected a non-DV / undecodable source (that path fails the buffer BEFORE any signaling
+        // exists, 404s the guard above, and never reaches this line). Signaling PRESENCE is the gate: every
+        // served master is a classify-ACCEPTED DV source by construction (non-5/7/8 profiles are rejected
+        // pre-signaling), including a P8 with an unknown compat id whose CODECS string ships as plain HEVC.
+        // The native (non-remux) DV lane still switches pre-attach because AVPlayer cannot report the profile
+        // before it demuxes. `request` is @MainActor and a no-op on iOS/macOS. Fired synchronously (bounded
+        // semaphore) so setSwitchSettled(false) lands before the settle-wait below, which is what closes the
+        // master-parse race that wait exists for.
+        let switched = DispatchSemaphore(value: 0)
+        let dvFps = sig.fps, dvWidth = sig.width, dvHeight = sig.height
+        DispatchQueue.main.async { [weak self] in
+            defer { switched.signal() }   // signal on EVERY exit so the serve task never eats the full timeout
+            // Teardown race (#76 rework): if the user exited in this instant, invalidate() + stop()'s
+            // HDRDisplayMode.reset may already have run; an unguarded queued request would then flip the TV
+            // into DV mode on the home screen with nothing left to correct it. A torn-down server never
+            // switches the panel.
+            guard let self, !self.isInvalidated else { return }
+            MainActor.assumeIsolated {   // request() is @MainActor; this closure runs on the main queue
+                HDRDisplayMode.request(.dolbyVision, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
             }
-            _ = switched.wait(timeout: .now() + 2)   // bounded: a wedged main must not hang the serve task
-            DiagnosticsLog.log("dv", "remux classify confirmed DV -> requested Dolby Vision display mode before mount (fps=\(String(format: "%.3f", sig.fps)) \(sig.width)x\(sig.height))")
+            DiagnosticsLog.log("dv", "remux classify confirmed DV -> requested Dolby Vision display mode before mount (fps=\(String(format: "%.3f", dvFps)) \(dvWidth)x\(dvHeight))")
+        }
+        if switched.wait(timeout: .now() + 2) == .timedOut {   // bounded: a wedged main must not hang the serve task
+            DiagnosticsLog.log("dv", "DV display switch request not confirmed within 2s (main queue busy); the switch may land after the master is served")
         }
         #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant

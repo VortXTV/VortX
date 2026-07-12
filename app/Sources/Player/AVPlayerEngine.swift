@@ -272,7 +272,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// loadFile), so a genuinely broken mount fails the fresh item too and then demotes normally. Returns true
     /// iff a retry was issued, in which case the caller swallows this failure instead of demoting.
     func retryFreshItemOnHealthyMount() -> Bool {
-        guard let server = remuxHLSServer, server.isMountHealthy, !healthyMountRetried,
+        // `!didStart`: the retry restarts the mount at t=0, so it must refuse a mount that already PLAYED
+        // (a mid-play failure is the demote paths' job). Today unreachable mid-play via the chrome's
+        // !hasStartedPlaying gate; this makes the function safe on its own terms.
+        guard let server = remuxHLSServer, server.isMountHealthy, !healthyMountRetried, !didStart,
               let mountURL = (item?.asset as? AVURLAsset)?.url else { return false }
         healthyMountRetried = true
         DiagnosticsLog.log("dv", "healthy-mount retry (#76): item failed but remux healthy (init published, buffer OK) -> one fresh AVPlayerItem on 127.0.0.1:\(server.port)")
@@ -761,6 +764,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 if isRemuxMounted || contentIsDolbyVision { logDVVideoTrackDiagnostics(item) }
             }
         case .failed:
+            // Identity guard (#76 rework): a status Task enqueued for the OLD item can deliver after the
+            // healthy-mount retry swapped in a fresh item and reset fatalErrorEmitted; acting on it would
+            // re-emit endFileError and insta-demote the retry. Only the CURRENT item's failure may demote.
+            guard item === self.item else { break }
             let ns = item.error as NSError?
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
@@ -788,6 +795,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         let asset = item.asset
         Task { @MainActor in
             let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            // Identity guard (#76 rework): the awaits here can straddle a source/episode switch; without it the
+            // repair below would judge the OLD item's fourcc and ACT on the NEW load (forcing a healthy hvc1
+            // load through remux, or wrongly demoting). Same pattern as loadChapters/loadSelectionGroups.
+            guard player.currentItem === item else { return }   // a newer file loaded meanwhile
             if tracks.isEmpty {
                 // Neutral: an HLS asset (every healthy remux play) reports no AVAssetTrack objects here, so this
                 // is NOT an error and NOTHING keys logic off it. The native-lane repair below reads real tracks.
@@ -822,7 +833,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     // renders BLACK over decoded audio. Route it through the remux lane (which rewrites the sample
                     // entry to hvc1/dvh1) immediately, rather than sitting on black until the audio-over-black
                     // watchdog. Native DV lane only (the remux output is already hvc1/dvh1); one-shot per load.
+                    // The identity re-check covers the per-track awaits above, which can also straddle a switch.
                     if !isRemuxMounted, contentIsDolbyVision, !incompatibleEntryHandled,
+                       player.currentItem === item,
                        fourcc == "hev1" || fourcc == "dvhe" {
                         incompatibleEntryHandled = true
                         repairIncompatibleDVSampleEntry(fourcc)
