@@ -602,8 +602,8 @@ struct iOSHomeView: View {
     /// (`MacBrowseFocus.card(rail:item:)`), so arrow nav can step within a row and between rows.
     private var macRails: [(title: String, ids: [String])] {
         var rails: [(String, [String])] = []
-        if !continueWatchingItems.isEmpty { rails.append(("Continue Watching", continueWatchingItems.map(\.id))) }
-        if !topPicks.items.isEmpty { rails.append(("Top Picks for you", topPicks.items.map(\.id))) }
+        if !continueWatchingItems.isEmpty { rails.append((String(localized: "Continue Watching"), continueWatchingItems.map(\.id))) }
+        if !topPicks.items.isEmpty { rails.append((String(localized: "Top Picks for you"), topPicks.items.map(\.id))) }
         for row in core.boardRows where !row.items.isEmpty { rails.append((row.title, row.items.map(\.id))) }
         if showCuratedRails {
             for c in curated.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
@@ -698,7 +698,7 @@ struct iOSHomeView: View {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
                         // offers the engine's "Remove from Continue Watching" (#14).
-                        homeRail(PosterRail(title: "Continue Watching", items: continueWatchingItems,
+                        homeRail(PosterRail(title: String(localized: "Continue Watching"), items: continueWatchingItems,
                                             onTap: handleContinueWatchingTap, menu: .continueWatching,
                                             onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
                     }
@@ -711,7 +711,7 @@ struct iOSHomeView: View {
                     // Local recommendations seeded from this profile's recent watch history (#0.3.9).
                     // Hidden when there's no TMDB key, no history to seed from, or no results.
                     if !topPicks.items.isEmpty {
-                        homeRail(PosterRail(title: "Top Picks for you",
+                        homeRail(PosterRail(title: String(localized: "Top Picks for you"),
                                             items: topPicks.items.map {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
@@ -723,7 +723,7 @@ struct iOSHomeView: View {
                     // tap opens its detail page like any catalog card) with an "S2E5 · Jun 30" caption.
                     // Hidden when there is nothing upcoming, so the default path renders nothing.
                     if !releaseCalendar.upcoming.isEmpty {
-                        homeRail(PosterRail(title: "Upcoming Episodes",
+                        homeRail(PosterRail(title: String(localized: "Upcoming Episodes"),
                                             items: releaseCalendar.upcoming.map {
                                                 RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
                                                          poster: $0.video.thumbnail, progress: 0,
@@ -734,7 +734,7 @@ struct iOSHomeView: View {
                     // "Upcoming Movies": library movies with a future release date in the next 45 days, soonest
                     // first; hidden when nothing is upcoming. Each card routes to the movie detail like any card.
                     if !releaseCalendar.upcomingMovies.isEmpty {
-                        homeRail(PosterRail(title: "Upcoming Movies",
+                        homeRail(PosterRail(title: String(localized: "Upcoming Movies"),
                                             items: releaseCalendar.upcomingMovies.map {
                                                 RailItem(id: $0.id, type: "movie", name: $0.name,
                                                          poster: $0.poster, progress: 0, caption: $0.releaseDateLabel)

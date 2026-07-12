@@ -93,8 +93,8 @@ final class HomeGroupsModel: ObservableObject {
     private static func buildStreamingGroup(region: String) async -> CollectionGroup? {
         let rails = await StreamingRailsModel.streamingCollections(region: region)
         guard !rails.isEmpty else { return nil }
-        return CollectionGroup(id: "group.streaming", title: "Streaming",
-                               eyebrow: "Browse by service", rails: rails)
+        return CollectionGroup(id: "group.streaming", title: String(localized: "Streaming"),
+                               eyebrow: String(localized: "Browse by service"), rails: rails)
     }
 
     // MARK: Group 2 — Genres
@@ -120,8 +120,8 @@ final class HomeGroupsModel: ObservableObject {
         }
         let rails = resolved.sorted { $0.0 < $1.0 }.compactMap { $0.1 }
         guard !rails.isEmpty else { return nil }
-        return CollectionGroup(id: "group.genres", title: "Genres",
-                               eyebrow: "Browse by genre", rails: rails)
+        return CollectionGroup(id: "group.genres", title: String(localized: "Genres"),
+                               eyebrow: String(localized: "Browse by genre"), rails: rails)
     }
 
     /// Keyless fallback for a genre rail: blend Cinemeta's public `top` movie + series catalogs filtered to
@@ -150,10 +150,10 @@ final class HomeGroupsModel: ObservableObject {
     private static func buildTopNewGroup(region: String) async -> CollectionGroup? {
         let items = await TMDBClient.topNewTitles(region: region)
         guard !items.isEmpty else { return nil }
-        let rail = CuratedCollection(id: "group.topnew.all", title: "Popular This Season",
+        let rail = CuratedCollection(id: "group.topnew.all", title: String(localized: "Popular This Season"),
                                      items: Array(items.prefix(maxItemsPerRail)))
-        return CollectionGroup(id: "group.topnew", title: "Top New",
-                               eyebrow: "Hot right now", rails: [rail])
+        return CollectionGroup(id: "group.topnew", title: String(localized: "Top New"),
+                               eyebrow: String(localized: "Hot right now"), rails: [rail])
     }
 
     // MARK: Group 4 — New
@@ -162,10 +162,10 @@ final class HomeGroupsModel: ObservableObject {
     private static func buildNewGroup(region: String) async -> CollectionGroup? {
         let items = await TMDBClient.justNewTitles(region: region)
         guard !items.isEmpty else { return nil }
-        let rail = CuratedCollection(id: "group.new.all", title: "Just Released",
+        let rail = CuratedCollection(id: "group.new.all", title: String(localized: "Just Released"),
                                      items: Array(items.prefix(maxItemsPerRail)))
-        return CollectionGroup(id: "group.new", title: "New",
-                               eyebrow: "Just landed", rails: [rail])
+        return CollectionGroup(id: "group.new", title: String(localized: "New"),
+                               eyebrow: String(localized: "Just landed"), rails: [rail])
     }
 }
 
