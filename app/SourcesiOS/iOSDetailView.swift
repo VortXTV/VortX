@@ -8,11 +8,13 @@ import AppKit
 /// Torrents: ask the embedded server to start fetching peers before playback. No-op for direct/debrid
 /// URLs (those carry a `url`, so no `/create` is needed). Port of the tvOS `prepareTorrent`, reusing
 /// the shared `TorrentTrackers.sources` so the create carries the TCP/TLS trackers that reach a swarm
-/// from a sandboxed app. File-private free function so both the movie list and the per-episode list
-/// share one implementation. Returns the retry Task (or nil for a non-torrent / disabled prime) so the
-/// caller can store and cancel it — the backoff loop outlives the view otherwise, leaking on every pick.
+/// from a sandboxed app. Free function so the movie list, the per-episode list, and the batch-download
+/// coordinator (#119) share one implementation. Returns the retry Task (or nil for a non-torrent /
+/// disabled prime) so the caller can store and cancel it; the backoff loop outlives the view
+/// otherwise, leaking on every pick. (The loop also self-terminates after ~15s of backoff, which is
+/// what fire-and-forget callers rely on.)
 @discardableResult
-private func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
+func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     guard !PlaybackSettings.torrentsDisabled else { return nil }
     guard stream.url == nil, let hash = stream.infoHash?.lowercased(),
           let url = URL(string: "\(StremioServer.base)/\(hash)/create") else { return nil }
@@ -238,6 +240,14 @@ struct iOSDetailView: View {
     @StateObject private var sourceIndex = SourceIndexServeSource()
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
+    // Batch episode downloads (#119): the coordinator publishes the walk's status/summary; the two
+    // selection vars drive the episode multi-select mode (chosen over a from/to range sheet because it
+    // reuses the existing chip + row idiom, covers arbitrary picks AND ranges, and "whole season" is one
+    // tap via Download Season / Select Season). Selection survives a season-chip switch on purpose, so a
+    // pick can span seasons.
+    @ObservedObject private var batch = BatchDownloadCoordinator.shared
+    @State private var selectingEpisodes = false
+    @State private var selectedEpisodeIds: Set<String> = []
     #endif
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
@@ -2343,8 +2353,14 @@ struct iOSDetailView: View {
             let seasons = Array(Set(videos.compactMap { $0.season })).sorted()
             let watched = watchedSet
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                iOSRailHeader(eyebrow: "\(episodes(videos).count) episode\(episodes(videos).count == 1 ? "" : "s")",
-                              title: "Episodes")
+                HStack(alignment: .center, spacing: Theme.Space.sm) {
+                    iOSRailHeader(eyebrow: "\(episodes(videos).count) episode\(episodes(videos).count == 1 ? "" : "s")",
+                                  title: "Episodes")
+                    #if !os(tvOS)
+                    // Batch downloads (#119): whole current season, or a multi-select pass.
+                    episodeDownloadMenu(videos)
+                    #endif
+                }
 
                 // Always render the season chips (even single-season): they host the per-season /
                 // whole-series Mark-Watched menu (long-press), the same as tvOS.
@@ -2354,12 +2370,29 @@ struct iOSDetailView: View {
                             ForEach(seasons, id: \.self) { s in
                                 Button { season = s } label: { Text(seasonLabel(s)) }
                                     .buttonStyle(ChipButtonStyle(selected: season == s))
-                                    .contextMenu { seasonWatchedMenu(s) }
+                                    .contextMenu {
+                                        seasonWatchedMenu(s)
+                                        #if !os(tvOS)
+                                        // #119: download ANY season straight from its chip, without
+                                        // first switching the visible season.
+                                        Divider()
+                                        Button { startBatchDownload(episodesInSeason(s)) } label: {
+                                            Label("Download \(seasonLabel(s))", systemImage: "arrow.down.circle")
+                                        }
+                                        #endif
+                                    }
                             }
                         }
                         .padding(.vertical, Theme.Space.xs)
                     }
                 }
+
+                #if !os(tvOS)
+                // #119: live batch progress / end-of-batch summary for THIS series, and the
+                // multi-select action bar while picking episodes.
+                batchStatusLine
+                if selectingEpisodes { episodeSelectionBar(videos) }
+                #endif
 
                 VStack(spacing: Theme.Space.sm) {
                     ForEach(episodes(videos), id: \.id) { v in
@@ -2402,6 +2435,35 @@ struct iOSDetailView: View {
     /// picker) instead of silently auto-playing the best source — mirroring the tvOS `CoreEpisodeStreams`
     /// flow. The user sees every source for that episode and picks one, which plays via the primed path.
     @ViewBuilder private func episodeRow(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
+        #if !os(tvOS)
+        // #119 multi-select mode: rows toggle membership instead of pushing the source page. An
+        // already-downloaded episode is still selectable; the coordinator skips it and the summary says so.
+        if selectingEpisodes {
+            let isSelected = selectedEpisodeIds.contains(v.id)
+            Button {
+                if isSelected { selectedEpisodeIds.remove(v.id) } else { selectedEpisodeIds.insert(v.id) }
+            } label: {
+                HStack(spacing: Theme.Space.sm) {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .foregroundStyle(isSelected ? Theme.Palette.accent : Theme.Palette.textTertiary)
+                        .padding(.leading, Theme.Space.sm)
+                        .accessibilityHidden(true)
+                    episodeRowLabel(v, isWatched: isWatched, progress: progress)
+                }
+            }
+            .buttonStyle(RowFocusStyle())
+            .accessibilityValue(isSelected ? "Selected" : "")
+        } else {
+            episodeRowNavigation(v, isWatched: isWatched, progress: progress)
+        }
+        #else
+        episodeRowNavigation(v, isWatched: isWatched, progress: progress)
+        #endif
+    }
+
+    /// The normal (non-selecting) episode row: a NavigationLink pushing the episode's source page.
+    @ViewBuilder private func episodeRowNavigation(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
         if let m = meta {
             NavigationLink {
                 iOSEpisodeStreams(meta: m, video: v, season: v.season ?? season,
@@ -2415,6 +2477,15 @@ struct iOSDetailView: View {
                 Button(isWatched ? "Mark as Unwatched" : "Mark as Watched") {
                     core.markVideoWatched(v, !isWatched)
                 }
+                #if !os(tvOS)
+                // #119: one-episode auto-pick download from the list (best source via the same
+                // ranked pipeline), without opening the episode's source page.
+                if downloadChipState(videoId: v.id) == .none {
+                    Button { startBatchDownload([v]) } label: {
+                        Label("Download Episode", systemImage: "arrow.down.circle")
+                    }
+                }
+                #endif
             }
         } else {
             episodeRowLabel(v, isWatched: isWatched, progress: progress)
@@ -2447,10 +2518,130 @@ struct iOSDetailView: View {
                 }
             }
             Spacer(minLength: 0)
+            #if !os(tvOS)
+            // #119: per-episode offline state from the existing DownloadStore records, so a season
+            // batch shows which rows are already saved / in flight at a glance.
+            episodeDownloadStateBadge(v)
+            #endif
         }
         .padding(Theme.Space.md)
         .opacity(isWatched ? 0.55 : 1)
     }
+
+    #if !os(tvOS)
+    // MARK: Batch episode downloads (#119)
+
+    /// Trailing per-row offline indicator: a check for a completed download, a spinner while one is
+    /// queued / downloading / paused, nothing otherwise. Derived from the same `DownloadStore` records
+    /// the hero chip reads, so state is always consistent with DownloadsView.
+    @ViewBuilder private func episodeDownloadStateBadge(_ v: CoreVideo) -> some View {
+        switch downloadChipState(videoId: v.id) {
+        case .done:
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.callout)
+                .foregroundStyle(Theme.Palette.accent)
+                .accessibilityLabel("Downloaded")
+        case .inProgress:
+            ProgressView().controlSize(.small)
+                .accessibilityLabel("Downloading")
+        case .none:
+            EmptyView()
+        }
+    }
+
+    /// The Episodes-header Download menu: whole current season in one tap, or the multi-select mode for
+    /// a range / arbitrary picks. Shows a stop action while a batch is walking this series.
+    @ViewBuilder private func episodeDownloadMenu(_ videos: [CoreVideo]) -> some View {
+        Menu {
+            Button { startBatchDownload(episodes(videos)) } label: {
+                Label("Download \(seasonLabel(season))", systemImage: "arrow.down.circle")
+            }
+            Button { selectingEpisodes = true; selectedEpisodeIds = [] } label: {
+                Label("Select Episodes", systemImage: "checklist")
+            }
+            if batch.runningSeriesIds.contains(id) {
+                Divider()
+                Button(role: .destructive) { batch.cancel() } label: {
+                    Label("Stop Batch Download", systemImage: "xmark.circle")
+                }
+            }
+        } label: {
+            Label("Download", systemImage: "arrow.down.circle")
+        }
+        .buttonStyle(ChipButtonStyle())
+    }
+
+    /// Inline batch feedback for THIS series: the walk's live "S1E5 · 3 of 8" line with a Stop action,
+    /// then the end-of-batch summary (queued / already downloaded / skipped) until dismissed.
+    @ViewBuilder private var batchStatusLine: some View {
+        if batch.runningSeriesIds.contains(id), let status = batch.statusText {
+            HStack(spacing: Theme.Space.sm) {
+                ProgressView().controlSize(.small)
+                Text("Finding sources · \(status)")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                Spacer(minLength: 0)
+                Button("Stop") { batch.cancel() }
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.danger)
+                    .buttonStyle(.plain)
+            }
+        } else if let s = batch.summary, s.seriesIds.contains(id) {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+                Image(systemName: "arrow.down.circle")
+                    .font(.callout)
+                    .foregroundStyle(Theme.Palette.accent)
+                    .accessibilityHidden(true)
+                Text(s.text)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button { batch.dismissSummary() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
+            }
+        }
+    }
+
+    /// The multi-select action bar: Select Season adds the visible season's episodes to the pick,
+    /// Download hands the selection (in airing order, across seasons) to the coordinator, Cancel exits.
+    @ViewBuilder private func episodeSelectionBar(_ videos: [CoreVideo]) -> some View {
+        FlowLayout(spacing: Theme.Space.sm) {
+            Button { selectedEpisodeIds.formUnion(episodes(videos).map(\.id)) } label: {
+                Label("Select \(seasonLabel(season))", systemImage: "checklist")
+            }
+            .buttonStyle(ChipButtonStyle())
+            Button {
+                let chosen = sortedEpisodes(videos).filter { selectedEpisodeIds.contains($0.id) }
+                startBatchDownload(chosen)
+                selectingEpisodes = false
+                selectedEpisodeIds = []
+            } label: {
+                Label("Download \(selectedEpisodeIds.count)", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(ChipButtonStyle(selected: true))
+            .disabled(selectedEpisodeIds.isEmpty)
+            Button { selectingEpisodes = false; selectedEpisodeIds = [] } label: {
+                Text("Cancel")
+            }
+            .buttonStyle(ChipButtonStyle())
+        }
+    }
+
+    /// Hand an ordered episode list to the batch coordinator with the SAME ranking context a manual
+    /// best-download captures right now (quality continuity, source pin, confirmed debrid cache), so
+    /// every episode's auto-pick matches what "download best" would have chosen by hand.
+    private func startBatchDownload(_ vids: [CoreVideo]) {
+        guard let m = meta, !vids.isEmpty else { return }
+        BatchDownloadCoordinator.shared.enqueue(
+            seriesId: m.id, seriesName: m.name, fallbackPoster: m.poster, episodes: vids,
+            continuity: rememberedQuality, pin: sourcePin, cachedHashes: debridCache.cachedHashes)
+    }
+    #endif
 
     private func episodeThumbnail(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
         // Effective spoiler-blur: the user's explicit setting wins; else the RemoteConfig fleet default
