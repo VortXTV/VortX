@@ -265,10 +265,17 @@ struct iOSSettingsView: View {
             .onChange(of: subSize) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subColor) { _ in ProfileStore.shared.capturePlayback() }
             .onChange(of: subBackground) { _ in ProfileStore.shared.capturePlayback() }
-            // Source-ranking taste is per-profile too: the toggle and the reorder mutate
-            // SourcePreferences.shared, so fold those into the active profile the same way.
-            .onChange(of: sourcePrefs.useAddonOrder) { _ in ProfileStore.shared.capturePlayback() }
-            .onChange(of: sourcePrefs.typeOrder) { _ in ProfileStore.shared.capturePlayback() }
+            // Source-ranking taste AND the 13 stream filters are per-profile, but they bind
+            // DIRECTLY to the SourcePreferences singleton (no @AppStorage mirror), so without a
+            // capture a filter edit lived ONLY in the flat keys: the roster stayed nil and the
+            // first profile switch's resetUnset apply wiped it (b176 review finding). ONE aggregate
+            // trigger instead of a per-field chain: rankingSignature already folds every
+            // ranking/filter knob (type order, add-on order, all 13 filters) into a single string
+            // by design, so any change re-fires it, and 13 chained onChange modifiers blew the tvOS
+            // body's type-check budget (b176 gate; mirrored here to keep this body cheap too). The
+            // equality guard inside capturePlayback keeps a switch's own reload() echo from
+            // becoming a roster edit unless it genuinely materializes new values.
+            .onChange(of: sourcePrefs.rankingSignature) { _ in ProfileStore.shared.capturePlayback() }
             // Appearance is per-profile (accent + OLED chrome + text size, all mirrored into
             // ThemeManager); fold each change back into the active profile so it survives a
             // switch/relaunch, same as tvOS RootTabView. Without the accent/oled captures, the

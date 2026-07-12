@@ -28,9 +28,9 @@ enum SourceType: String, CaseIterable, Codable {
 
 /// One-tap source presets that set the quality caps + source-type order together, so a viewer can pick a
 /// taste ("biggest/best files" vs "save data") without tuning each control. Applying one writes the same
-/// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and the
-/// source-type order it sets is captured per-profile by the Settings `onChange(of: typeOrder)` exactly like a
-/// manual reorder. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
+/// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and every
+/// knob it sets is captured per-profile by the Settings `onChange(of: rankingSignature)` trigger exactly like a
+/// manual edit. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
 enum SourcePreset: String, CaseIterable, Identifiable {
     case bestQuality, balanced, dataSaver
     var id: String { rawValue }
@@ -81,8 +81,10 @@ protocol SourcePrefsReading {
 final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let shared = SourcePreferences()
 
-    private static let orderKey      = "stremiox.streaming.sourceTypeOrder"
-    private static let addonOrderKey = "stremiox.streaming.useAddonOrder"
+    // Internal (not private) so ProfileStore.applyPlayback writes the same flat keys the singleton reads,
+    // instead of re-typing the literal strings (they were the last two duplicated literals in that path).
+    static let orderKey              = "stremiox.streaming.sourceTypeOrder"
+    static let addonOrderKey         = "stremiox.streaming.useAddonOrder"
     static let excludeKey            = "stremiox.streaming.excludeKeywords"
     static let includeKey            = "stremiox.streaming.includeKeywords"
     static let safetyKey             = "stremiox.streaming.safetyMode"
@@ -97,6 +99,32 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
     static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
     static let regexKey              = "stremiox.streaming.keywordsAreRegex"
+
+    /// Documented per-profile stream-filter defaults, in ONE place. `init()` / `reload()` seed the
+    /// string-valued props from these (an absent flat key already reads as the same intrinsic zero /
+    /// false for the numeric and Bool ones), and `ProfileStore.applyPlayback` writes these back to the
+    /// flat keys when a profile SWITCH lands on a profile that never recorded a field, so the new
+    /// profile no longer INHERITS the previously active profile's value (b176 / #117). Change a default
+    /// here and both the seed and the switch-reset move together, so the two can never drift.
+    static let defaultSafetyMode            = "off"
+    static let defaultInstantOnly           = false
+    static let defaultHideDeadTorrents      = false
+    static let defaultHDROnly               = false
+    static let defaultExcludeAV1            = false
+    static let defaultExcludeKeywords       = ""
+    static let defaultIncludeKeywords       = ""
+    static let defaultKeywordsAreRegex      = false
+    static let defaultMaxResolution         = 0
+    static let defaultMaxFileSizeGB         = 0.0
+    static let defaultMinResolution         = 0
+    static let defaultHideUnknownResolution = false
+    static let defaultPreferredAudioOnly    = false
+    static let defaultUseAddonOrder         = false
+    /// A fresh install's source-type priority: the declared `SourceType` order (Debrid, Usenet,
+    /// Torrent, Direct), which is exactly the order `readOrder()` fills in for any missing type.
+    static let defaultTypeOrder: [SourceType] = SourceType.allCases
+    /// The default type order as the comma-joined raw string the flat key stores.
+    static var defaultTypeOrderCSV: String { defaultTypeOrder.map(\.rawValue).joined(separator: ",") }
 
     // Max possible quality score is ~13,800 (4K + cached + remux + HDR + atmos + file-size cap).
     // A 15,000-point tier gap means the preferred type ALWAYS beats a lower type regardless of quality.
@@ -266,9 +294,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     private init() {
         typeOrder       = Self.readOrder()
         useAddonOrder   = UserDefaults.standard.bool(forKey: Self.addonOrderKey)
-        excludeKeywords = UserDefaults.standard.string(forKey: Self.excludeKey) ?? ""
-        includeKeywords = UserDefaults.standard.string(forKey: Self.includeKey) ?? ""
-        safetyMode      = UserDefaults.standard.string(forKey: Self.safetyKey) ?? "off"
+        excludeKeywords = UserDefaults.standard.string(forKey: Self.excludeKey) ?? Self.defaultExcludeKeywords
+        includeKeywords = UserDefaults.standard.string(forKey: Self.includeKey) ?? Self.defaultIncludeKeywords
+        safetyMode      = UserDefaults.standard.string(forKey: Self.safetyKey) ?? Self.defaultSafetyMode
         hideDeadTorrents = UserDefaults.standard.bool(forKey: Self.hideDeadKey)
         instantOnly     = UserDefaults.standard.bool(forKey: Self.instantOnlyKey)
         maxResolution   = UserDefaults.standard.integer(forKey: Self.maxResolutionKey)
@@ -303,7 +331,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if useAddonOrder != addon { useAddonOrder = addon }
         // Stream filters, so a per-profile switch re-syncs the in-memory @Published values (not just the
         // type order). Guarded so an unchanged value never churns @Published or rebuilds keyword regexes.
-        let safety = d.string(forKey: Self.safetyKey) ?? "off"
+        let safety = d.string(forKey: Self.safetyKey) ?? Self.defaultSafetyMode
         if safetyMode != safety { safetyMode = safety }
         let instant = d.bool(forKey: Self.instantOnlyKey)
         if instantOnly != instant { instantOnly = instant }
@@ -313,9 +341,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if hdrOnly != hdr { hdrOnly = hdr }
         let av1 = d.bool(forKey: Self.excludeAV1Key)
         if excludeAV1 != av1 { excludeAV1 = av1 }
-        let exc = d.string(forKey: Self.excludeKey) ?? ""
+        let exc = d.string(forKey: Self.excludeKey) ?? Self.defaultExcludeKeywords
         if excludeKeywords != exc { excludeKeywords = exc }
-        let inc = d.string(forKey: Self.includeKey) ?? ""
+        let inc = d.string(forKey: Self.includeKey) ?? Self.defaultIncludeKeywords
         if includeKeywords != inc { includeKeywords = inc }
         let rx = d.bool(forKey: Self.regexKey)
         if keywordsAreRegex != rx { keywordsAreRegex = rx }

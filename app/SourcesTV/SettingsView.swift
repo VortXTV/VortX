@@ -143,10 +143,16 @@ struct SettingsView: View {
         .onChange(of: subSize) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subColor) { ProfileStore.shared.capturePlayback() }
         .onChange(of: subBackground) { ProfileStore.shared.capturePlayback() }
-        // Source-ranking taste is per-profile too: the toggle and the up/down reorder mutate
-        // SourcePreferences.shared, so fold those into the active profile the same way.
-        .onChange(of: sourcePrefs.useAddonOrder) { ProfileStore.shared.capturePlayback() }
-        .onChange(of: sourcePrefs.typeOrder) { ProfileStore.shared.capturePlayback() }
+        // Source-ranking taste AND the 13 stream filters are per-profile, but they bind DIRECTLY to
+        // the SourcePreferences singleton (no @AppStorage mirror), so without a capture a filter
+        // edit lived ONLY in the flat keys: the roster stayed nil and the first profile switch's
+        // resetUnset apply wiped it (b176 review finding). ONE aggregate trigger instead of a
+        // per-field chain: rankingSignature already folds every ranking/filter knob (type order,
+        // add-on order, all 13 filters) into a single string by design, so any change re-fires it,
+        // and 13 chained onChange modifiers blew this body's type-check budget (b176 gate). The
+        // equality guard inside capturePlayback keeps a switch's own reload() echo from becoming a
+        // roster edit unless it genuinely materializes new values.
+        .onChange(of: sourcePrefs.rankingSignature) { ProfileStore.shared.capturePlayback() }
         .task {
             // Live server monitor that NEVER gives up. The embedded server cold-starts well after
             // launch on a real Apple TV (node boots while the engine and sync are also busy), and

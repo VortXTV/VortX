@@ -264,12 +264,23 @@ final class ProfileStore: ObservableObject {
     /// Make `profile` active: applies its theme immediately and reports the account work left.
     @discardableResult
     func select(_ profile: UserProfile) -> SwitchOutcome {
+        // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile. The
+        // flat keys are, by the documented invariant, the ACTIVE profile's state, but the 13 stream
+        // filters bind straight to the SourcePreferences singleton on both settings screens, so a
+        // viewer's filter edits can exist ONLY in the flat keys while the roster still carries nil
+        // (every pre-b176 roster does: the filter fields entered PlaybackPrefs with no re-seed).
+        // Without this capture, the resetUnset apply below would overwrite those live values with
+        // defaults PERMANENTLY, even when re-picking the SAME profile from the launch picker, and the
+        // wipe would sync account-wide. capturePlayback's equality guard keeps this a no-op when the
+        // roster already matches, and it safely does nothing when there is no active profile
+        // (remove()'s select-after-removal: the removed profile is already gone from the roster).
+        capturePlayback()
         let beforeAccount = active.map(keychainAccount(for:))
         activeID = profile.id
         pickedThisLaunch = true
         persist(touch: false)   // selection is per-device, not a roster edit
         applyTheme(profile)
-        applyPlayback(profile)
+        applyPlayback(profile, resetUnset: true)   // a switch resets unset filters to defaults, never inherits the old profile's
         SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on a switch
         SourcePinStore.shared.reload()      // pinned sources are per-profile too
         loadWatchCache()
@@ -505,14 +516,37 @@ final class ProfileStore: ObservableObject {
     /// Write `profile`'s playback preferences into the flat UserDefaults keys that
     /// TrackPreferences, SubtitleStyle, and the @AppStorage bindings all read. The player and
     /// Settings need no changes: the flat keys simply always reflect the active profile.
-    private func applyPlayback(_ profile: UserProfile) {
+    ///
+    /// `resetUnset` distinguishes a real profile SWITCH from a background sync fold. On a switch
+    /// (`select`, the only true caller), a field the target profile never recorded is written back to
+    /// its documented default, so the new profile no longer INHERITS the previously active profile's
+    /// value: switching to a fresh profile now clears the last profile's filters instead of silently
+    /// carrying them over (the b176 / #117 data-correctness gap). On a sync fold (`adoptRemoteRoster`,
+    /// `reloadFromDefaults`, `mergeInRoster`, tombstone prune: default `false`) an unset field is left
+    /// untouched, so a peer's nil can never wipe the active device's LIVE keys at pull time; only a
+    /// later real switch applies.
+    ///
+    /// One sync-reachable switch DOES exist and is intended: syncDown -> applyProfileEdits ->
+    /// remove(the ACTIVE profile) -> select(first), when the dashboard deletes the profile this
+    /// device is on. That is a genuine forced switch to a SURVIVING profile, not a fold: select's
+    /// leading capturePlayback no-ops (the deleted profile is already out of the roster, so `active`
+    /// is nil and nothing of it leaks into the survivor), the survivor's OWN stored prefs are
+    /// applied, and defaults land only on fields the survivor itself never recorded. No surviving
+    /// profile's data is touched; the only state discarded is the deleted profile's, by design.
+    private func applyPlayback(_ profile: UserProfile, resetUnset: Bool = false) {
         let d = UserDefaults.standard
         // Per-profile add-on visibility: flatten this profile's disabled set into the key the off-main
         // board build and streamGroups read, so Home, Discover, and stream sources all honor it the
         // moment this profile becomes active. (Empty array = nothing hidden, the default.)
         d.set(profile.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
         d.set(profile.isKids, forKey: Self.activeKidsKey)   // Kids content guard for the stream filter
-        if let p = profile.playback {
+        let p = profile.playback
+        // Track languages + subtitle style. These PlaybackPrefs fields are non-optional, so they are
+        // present whenever the profile carries any playback record and are always written. When the
+        // profile has NO record at all, a SWITCH clears the keys so every reader falls back to its own
+        // documented default (device language, SubtitleStyle.default*), which IS applying the default;
+        // a sync fold leaves them as-is.
+        if let p {
             d.set(p.audioLang, forKey: TrackPreferences.Key.audio)
             d.set(p.subtitleLang, forKey: TrackPreferences.Key.subtitle)
             d.set(p.forcedPolicy, forKey: TrackPreferences.Key.forced)
@@ -521,42 +555,60 @@ final class ProfileStore: ObservableObject {
             d.set(p.subColor, forKey: SubtitleStyle.Key.color)
             d.set(p.subBackground, forKey: SubtitleStyle.Key.background)
             d.set(p.subSizeScale ?? 1.0, forKey: SubtitleStyle.Key.sizeScale)
-            // Source-ranking taste (older rosters have nil here, so leave the flat keys untouched).
-            if let order = p.sourceTypeOrder {
-                d.set(order.joined(separator: ","), forKey: "stremiox.streaming.sourceTypeOrder")
-            }
-            if let addon = p.useAddonOrder {
-                d.set(addon, forKey: "stremiox.streaming.useAddonOrder")
-            }
-            // Per-profile stream filters (nil = leave the flat key as-is, for older rosters).
-            if let v = p.safetyMode { d.set(v, forKey: SourcePreferences.safetyKey) }
-            if let v = p.instantOnly { d.set(v, forKey: SourcePreferences.instantOnlyKey) }
-            if let v = p.hideDeadTorrents { d.set(v, forKey: SourcePreferences.hideDeadKey) }
-            if let v = p.hdrOnly { d.set(v, forKey: SourcePreferences.hdrOnlyKey) }
-            if let v = p.excludeAV1 { d.set(v, forKey: SourcePreferences.excludeAV1Key) }
-            if let v = p.excludeKeywords { d.set(v, forKey: SourcePreferences.excludeKey) }
-            if let v = p.includeKeywords { d.set(v, forKey: SourcePreferences.includeKey) }
-            if let v = p.keywordsAreRegex { d.set(v, forKey: SourcePreferences.regexKey) }
-            if let v = p.maxResolution { d.set(v, forKey: SourcePreferences.maxResolutionKey) }
-            if let v = p.maxFileSizeGB { d.set(v, forKey: SourcePreferences.maxFileSizeKey) }
-            if let v = p.minResolution { d.set(v, forKey: SourcePreferences.minResolutionKey) }
-            if let v = p.hideUnknownResolution { d.set(v, forKey: SourcePreferences.hideUnknownResKey) }
-            if let v = p.preferredAudioOnly { d.set(v, forKey: SourcePreferences.preferredAudioKey) }
-        } else {
+        } else if resetUnset {
             for key in [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle,
                         TrackPreferences.Key.forced, SubtitleStyle.Key.font, SubtitleStyle.Key.size,
-                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale,
-                        "stremiox.streaming.sourceTypeOrder", "stremiox.streaming.useAddonOrder"] {
+                        SubtitleStyle.Key.color, SubtitleStyle.Key.background, SubtitleStyle.Key.sizeScale] {
                 d.removeObject(forKey: key)
             }
         }
+        // Source-type taste (Debrid-first vs Torrent-first, trust add-on order) + the per-profile stream
+        // filters. Every field below is OPTIONAL in PlaybackPrefs: nil means "this profile never recorded
+        // it". On a SWITCH the nil is resolved to SourcePreferences' documented default (single source of
+        // truth, no magic numbers here); on a sync fold the nil is left alone.
+        if let order = p?.sourceTypeOrder {
+            d.set(order.joined(separator: ","), forKey: SourcePreferences.orderKey)
+        } else if resetUnset {
+            d.set(SourcePreferences.defaultTypeOrderCSV, forKey: SourcePreferences.orderKey)
+        }
+        if let addon = p?.useAddonOrder {
+            d.set(addon, forKey: SourcePreferences.addonOrderKey)
+        } else if resetUnset {
+            d.set(SourcePreferences.defaultUseAddonOrder, forKey: SourcePreferences.addonOrderKey)
+        }
+        if let v = p?.safetyMode { d.set(v, forKey: SourcePreferences.safetyKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultSafetyMode, forKey: SourcePreferences.safetyKey) }
+        if let v = p?.instantOnly { d.set(v, forKey: SourcePreferences.instantOnlyKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultInstantOnly, forKey: SourcePreferences.instantOnlyKey) }
+        if let v = p?.hideDeadTorrents { d.set(v, forKey: SourcePreferences.hideDeadKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultHideDeadTorrents, forKey: SourcePreferences.hideDeadKey) }
+        if let v = p?.hdrOnly { d.set(v, forKey: SourcePreferences.hdrOnlyKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultHDROnly, forKey: SourcePreferences.hdrOnlyKey) }
+        if let v = p?.excludeAV1 { d.set(v, forKey: SourcePreferences.excludeAV1Key) }
+        else if resetUnset { d.set(SourcePreferences.defaultExcludeAV1, forKey: SourcePreferences.excludeAV1Key) }
+        if let v = p?.excludeKeywords { d.set(v, forKey: SourcePreferences.excludeKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultExcludeKeywords, forKey: SourcePreferences.excludeKey) }
+        if let v = p?.includeKeywords { d.set(v, forKey: SourcePreferences.includeKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultIncludeKeywords, forKey: SourcePreferences.includeKey) }
+        if let v = p?.keywordsAreRegex { d.set(v, forKey: SourcePreferences.regexKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultKeywordsAreRegex, forKey: SourcePreferences.regexKey) }
+        if let v = p?.maxResolution { d.set(v, forKey: SourcePreferences.maxResolutionKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultMaxResolution, forKey: SourcePreferences.maxResolutionKey) }
+        if let v = p?.maxFileSizeGB { d.set(v, forKey: SourcePreferences.maxFileSizeKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultMaxFileSizeGB, forKey: SourcePreferences.maxFileSizeKey) }
+        if let v = p?.minResolution { d.set(v, forKey: SourcePreferences.minResolutionKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultMinResolution, forKey: SourcePreferences.minResolutionKey) }
+        if let v = p?.hideUnknownResolution { d.set(v, forKey: SourcePreferences.hideUnknownResKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultHideUnknownResolution, forKey: SourcePreferences.hideUnknownResKey) }
+        if let v = p?.preferredAudioOnly { d.set(v, forKey: SourcePreferences.preferredAudioKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultPreferredAudioOnly, forKey: SourcePreferences.preferredAudioKey) }
         // Stream scores embed the preferred audio language (the language demotion) and source-type
         // tier weights, so any flat-key change here must drop the memoized scores. NOTE: the
         // SourcePreferences singleton is re-synced (reload()) only on an actual profile SWITCH
         // (select / adoptRemoteRoster), NOT here. applyPlayback also runs from the capture path
         // (capturePlayback -> update -> applyPlayback), where SourcePreferences is already the
-        // source of truth; reloading there would re-fire its @Published didSet and the
-        // SettingsView .onChange(typeOrder) observer, echoing back into capturePlayback.
+        // source of truth; reloading there would re-fire its @Published didSet and the Settings
+        // screens' .onChange(rankingSignature) capture observer, echoing back into capturePlayback.
         StreamRanking.invalidateCaches()
         // Home is per-profile now (it hides this profile's disabled add-ons), so drop the memoized
         // board on every apply. Cheap: rebuildBoardRows recomputes the same rows and re-publishes,
