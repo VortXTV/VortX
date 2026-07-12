@@ -763,8 +763,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     ///  - the item started (`didStart`) and the transport is actually running (`.playing` with an advancing
     ///    clock); a pause or a buffering stall RESETS the window rather than counting toward it.
     ///  - NO video frame was EVER produced for this item: `videoFrameEverProduced` latches permanently on the
-    ///    first frame seen by either signal in `hasProducedPicture`, so a session that ever showed a picture
-    ///    can never demote through this path (a mid-play video freeze is the stall watchdog's job, not ours).
+    ///    first frame seen by ANY signal in `hasProducedPicture` (layer readiness, live frame rate, frame
+    ///    tap), so a session that ever showed a picture can never demote through this path (a mid-play video
+    ///    freeze is the stall watchdog's job, not ours). The fire edge additionally re-checks
+    ///    `playerLayer.isReadyForDisplay` and stands down if the layer holds a displayable frame.
     /// The demote log carries the presentationSize evidence. NOTE presentationSize is corroborating output
     /// only, not a veto: ozdek's file misreported 3840x2160 as a NON-zero 1280x720 while producing nothing,
     /// so a zero-size check alone would miss the confirmed case.
@@ -782,23 +784,41 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
         if audioOverBlackSince == 0 { audioOverBlackSince = clock; return }
         guard clock - audioOverBlackSince >= audioOverBlackWindowSeconds else { return }
+        // IRREVERSIBLE edge, so corroborate ONE more time against Apple's own layer signal right before the
+        // call: AVPlayerLayer.isReadyForDisplay is the documented "this layer has a displayable frame". The
+        // per-tick proxies can false-NEGATIVE (currentVideoFrameRate needs a stabilization run; the video
+        // output is poll-based and can be delivery-suspended), and a false demote is expensive (true DV +
+        // Atmos lost for the whole title), so the demote may only fire while the layer itself reports NO
+        // displayable frame, or no layer is attached at all.
+        if playerLayer?.isReadyForDisplay == true {
+            videoFrameEverProduced = true
+            audioOverBlackSince = 0
+            return
+        }
         audioOverBlackFired = true
+        // Respect an earlier fatal FIRST, before any logging: a genuine item .failed can land inside the
+        // window, and the [dv] trail is triage-critical, so the watchdog must never log a demote claim for
+        // a fallback that .failed actually caused.
+        guard !fatalErrorEmitted else { return }
+        fatalErrorEmitted = true
         let size = item?.presentationSize ?? .zero
         DiagnosticsLog.log("dv", "audio-over-black watchdog: \(Int(audioOverBlackWindowSeconds))s of advancing clock with ZERO video frames (presentationSize=\(Int(size.width))x\(Int(size.height)) pos=\(Int(position))s) -> endFileError demote to libmpv HDR10")
         VXProbe.log("dv", "audio-over-black demote: no frame in \(Int(audioOverBlackWindowSeconds))s presentationSize=\(Int(size.width))x\(Int(size.height))")
-        guard !fatalErrorEmitted else { return }
-        fatalErrorEmitted = true
         emit(MPVProperty.endFileError, "Dolby Vision video produced no picture (audio over a black screen)")
     }
 
-    /// Whether the CURRENT item has demonstrably rendered a video frame. Two independent signals, either one
+    /// Whether the CURRENT item has demonstrably rendered a video frame. Three independent signals, any one
     /// latches the watchdog off for the rest of the item:
-    ///  1. Any AVPlayerItemTrack reporting `currentVideoFrameRate > 0` -- the render pipeline's own live
+    ///  1. `AVPlayerLayer.isReadyForDisplay` -- Apple's documented "the layer has a frame to show". Checked
+    ///     first (authoritative and cheapest); nil when no layer host has attached yet, so it can never
+    ///     latch on absence alone.
+    ///  2. Any AVPlayerItemTrack reporting `currentVideoFrameRate > 0` -- the render pipeline's own live
     ///     frame-rate report, which is 0.0 for audio tracks and for a video track producing nothing.
-    ///  2. The trickplay frame tap (`videoOutput`) holding a decoded pixel buffer for the current clock.
-    ///     Secondary because AVFoundation may suspend an unpolled output's delivery (a false NEGATIVE, never
-    ///     a false positive) -- the two signals only ever err toward "keep waiting", not toward demoting.
+    ///  3. The trickplay frame tap (`videoOutput`) holding a decoded pixel buffer for the current clock.
+    ///     Last because AVFoundation may suspend an unpolled output's delivery (a false NEGATIVE, never
+    ///     a false positive) -- all three signals only ever err toward "keep waiting", not toward demoting.
     private func hasProducedPicture(atClock seconds: Double) -> Bool {
+        if playerLayer?.isReadyForDisplay == true { return true }
         if let tracks = item?.tracks, tracks.contains(where: { $0.currentVideoFrameRate > 0 }) { return true }
         if let output = videoOutput,
            output.hasNewPixelBuffer(forItemTime: CMTime(seconds: seconds, preferredTimescale: 600)) {

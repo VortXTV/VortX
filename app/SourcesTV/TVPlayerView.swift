@@ -2128,11 +2128,10 @@ struct TVPlayerView: View {
         // episode IN PLACE, curURL moved off the launch url, so the flip alone would play the WRONG stream.
         // Re-point mpv at the ACTIVE stream once its controller exists. The deferral is MANDATORY: the mpv
         // controller only becomes coordinator.player on the NEXT SwiftUI render. The (cu != url) gate avoids a
-        // redundant double load when nothing was switched. resumeSeconds is set first so maybeResume restores
-        // the live position (not the stale switch-time offset); appliedResume is re-cleared inside the task so
-        // the resume lands on the switched stream, not the launch one.
+        // redundant double load when nothing was switched. resumeSeconds was already set above so maybeResume
+        // restores the live position (not the stale switch-time offset); appliedResume is re-cleared inside the
+        // task so the resume lands on the switched stream, not the launch one.
         if let cu = curURL, cu != url {
-            resumeSeconds = reconcileResume
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
                 // curURL == cu is load-bearing: if the viewer picks another source during the 400ms settle,
@@ -3187,6 +3186,13 @@ struct TVPlayerView: View {
         inFlightSeekTarget = nil   // any pending seek belonged to the PREVIOUS episode; new media ticks are authoritative
         watchedZoneSince = nil     // the watched-zone dwell belonged to the previous episode too
         suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
+        // An AVPlayer -> libmpv demote (audio-over-black watchdog, a .failed, a remux classify fail) is
+        // PER-TITLE, not per-session: this view is ONE continuous instance across a whole binge, and
+        // without this reset a single demote on episode 1 silently pins every later episode to libmpv
+        // HDR10. The next episode gets a fresh shot at true DV/Atmos on AVPlayer. WITHIN one title the
+        // demote stays sticky exactly as before (nothing else resets this flag mid-title), so a failing
+        // file can never ping-pong between the engines.
+        avEngineFailed = false
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
         // source still fails over automatically instead of dead-ending an unattended binge on "choose another
