@@ -25,7 +25,12 @@ struct SettingsView: View {
     // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
     @State private var showDiagExport = false
     @State private var diagExport: (url: String, qr: Image)?
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
+    // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
+    @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
+    @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
+    @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
@@ -106,6 +111,7 @@ struct SettingsView: View {
                     streamsSection
                     communitySection
                     serverSection
+                    tabBarSection
                     appearanceSection
                     audioSubtitleSection
                     subtitleSection
@@ -574,6 +580,27 @@ struct SettingsView: View {
         return StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"
     }
 
+    // MARK: Tab bar
+
+    /// Which tabs show in the tab bar (#117), generalizing the old "Show Live TV tab" toggle into a
+    /// per-tab choice (SAME TabBarPrefs keys the iOS/Mac shell binds). Home / Add-ons / Settings have
+    /// no toggle: the shell must always keep its landing anchor and the way back to this screen.
+    /// RootTabView heals the selection to Home when the active tab is hidden.
+    private var tabBarSection: some View {
+        section("Tab Bar") {
+            choiceRow(String(localized: "Discover tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideDiscoverTab ? "0" : "1" }, set: { hideDiscoverTab = ($0 == "0") }))
+            choiceRow(String(localized: "Live TV tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
+            choiceRow(String(localized: "Library tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLibraryTab ? "0" : "1" }, set: { hideLibraryTab = ($0 == "0") }))
+            choiceRow(String(localized: "Search tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideSearchTab ? "0" : "1" }, set: { hideSearchTab = ($0 == "0") }))
+            Text("Choose which tabs appear in the tab bar. Home, Add-ons, and Settings always stay. If the tab you are on is hidden, you land on Home.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
     // MARK: Appearance (accent + chrome)
 
     /// "App language" (the empty tag = follow the app UI language) + every shipped language, for the Trailer
@@ -603,11 +630,6 @@ struct SettingsView: View {
                     showLangRestart = true
                 }))
             Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-
-            choiceRow(String(localized: "Show Live TV tab"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
-            Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],

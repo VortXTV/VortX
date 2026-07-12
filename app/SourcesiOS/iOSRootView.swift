@@ -110,9 +110,15 @@ struct iOSRootView: View {
     @ObservedObject private var downloads = DownloadStore.shared
     #endif
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
-    /// Hide the Live TV tab for users who do not use it (Settings toggle). The Live screen is not mounted
-    /// and the tab is dropped from the bar; selection falls back to Home if it was on Live.
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    /// Per-tab bar visibility (#117): hide Live / Discover / Library / Search from the bar (Settings >
+    /// Tab bar). Home, Add-ons, and Settings are not hideable, so the shell always keeps its landing
+    /// anchor and the way back to this setting. Live keeps its extra behavior (the screen is not even
+    /// mounted while hidden); its value is seeded from the legacy stremiox.hideLiveTab toggle in init.
+    /// Selection heals to Home whenever the active tab is hidden (the onChange observers below).
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false
+    @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
+    @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
+    @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     /// Merge Discover + Search into one surface (Settings toggle, default OFF, reversible). When ON the
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
@@ -125,6 +131,12 @@ struct iOSRootView: View {
     /// `presenter.request == nil`; on touch / Mac the player presents from within the shell, so this is
     /// the equivalent "no player cover is presented" guard.
     @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
+
+    /// Seed the per-tab Live key from the legacy stremiox.hideLiveTab toggle before the first
+    /// @AppStorage read, so a user who had hidden Live keeps it hidden across the #117 generalization.
+    init() {
+        TabBarPrefs.migrateLegacyLiveKey()
+    }
 
     /// Whether a tab's screen should be mounted: only after its first selection (#24). The active tab
     /// is always mounted (covers the initial Home and any programmatic switch before onChange lands).
@@ -209,6 +221,17 @@ struct iOSRootView: View {
         }
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
+        }
+        // Same healing for the other hideable tabs (#117): hiding the ACTIVE tab lands on Home, so the
+        // bar can never point at a screen it no longer shows (the tvOS RootTabView twin does the same).
+        .onChange(of: hideDiscoverTab) { hidden in
+            if hidden, tab == .discover { tab = .home }
+        }
+        .onChange(of: hideLibraryTab) { hidden in
+            if hidden, tab == .library { tab = .home }
+        }
+        .onChange(of: hideSearchTab) { hidden in
+            if hidden, tab == .search { tab = .home }
         }
         .onChange(of: mergeDiscoverSearch) { merged in
             // Search folds into Discover: if the bar was pointing at the now-hidden Search tab, land on Discover.
@@ -307,14 +330,25 @@ struct iOSRootView: View {
     /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
     /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
     /// surface fill separates it from the content, and it respects the safe-area bottom inset.
-    /// Tabs shown in the bar; the Live tab is dropped when the user hides it in Settings.
+    /// Tabs shown in the bar; any tab the user hid in Settings > Tab bar is dropped (#117).
     private var visibleTabs: [Tab] {
         Tab.allCases.filter {
-            if hideLiveTab, $0 == .live { return false }
+            if hiddenTabs.contains($0) { return false }
             // Merged mode folds Search into Discover, so drop the standalone Search tab.
             if mergeDiscoverSearch, $0 == .search { return false }
             return true
         }
+    }
+
+    /// The tabs hidden by the per-tab Settings toggles (#117). Only the four hideable tabs can appear
+    /// here; Home / Add-ons / Settings have no toggle, so the bar always keeps its anchors.
+    private var hiddenTabs: Set<Tab> {
+        var hidden: Set<Tab> = []
+        if hideLiveTab { hidden.insert(.live) }
+        if hideDiscoverTab { hidden.insert(.discover) }
+        if hideLibraryTab { hidden.insert(.library) }
+        if hideSearchTab { hidden.insert(.search) }
+        return hidden
     }
 
     private var customTabBar: some View {
@@ -1561,7 +1595,7 @@ struct iOSDiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
+    @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false   // also hide Live types from the Discover type filter (#117 per-tab key)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared
