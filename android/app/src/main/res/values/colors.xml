@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Adaptive-icon + splash background: the near-black, violet-tinted brand surface (matches the
+         Compose dark theme Background in ui/theme/Theme.kt). -->
+    <color name="ic_launcher_background">#0E0B14</color>
+</resources>

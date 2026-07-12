@@ -9,9 +9,13 @@
 
     <application
         android:allowBackup="true"
-        android:label="StremioX"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:enableOnBackInvokedCallback="true"
         android:supportsRtl="true"
-        android:theme="@style/Theme.StremioX">
+        android:theme="@style/Theme.VortX.Starting">
         <activity
             android:name=".MainActivity"
             android:exported="true"

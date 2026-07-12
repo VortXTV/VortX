@@ -1,5 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Minimal framework theme to host Compose; no AppCompat/Material-Components dependency. -->
-    <style name="Theme.StremioX" parent="@android:style/Theme.Material.NoActionBar" />
+    <!-- The real app theme that hosts Compose. Minimal framework parent; no AppCompat / Material
+         Components dependency (Compose draws the UI). This is what installSplashScreen() swaps to once
+         the app window is ready (postSplashScreenTheme below). -->
+    <style name="Theme.VortX" parent="@android:style/Theme.Material.NoActionBar" />
+
+    <!-- Launch (splash) theme, applied to the application in the manifest. Parent Theme.SplashScreen
+         comes from androidx.core:core-splashscreen, which backports the Android 12 SplashScreen API to
+         minSdk 26 so there is one splash code path across versions. -->
+    <style name="Theme.VortX.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/ic_launcher_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.VortX</item>
+    </style>
 </resources>

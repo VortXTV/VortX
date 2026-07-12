@@ -1,15 +1,22 @@
 name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
-# workflow is the build feedback loop: it builds the debug APK and uploads it as an artifact.
-# The shared engine (stremio-core-kotlin), the libmpv player, and the Compose UI matching tvOS/iOS
-# are added incrementally on top of this verified skeleton.
+# workflow IS the build feedback loop. It builds BOTH product flavors on every push/PR that touches
+# android/ or core/ (the engine .so is cross-compiled from core/), verifies each flavor produced an
+# APK, and enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the
+# GPLv3 libmpv native libs.
 
 on:
   push:
     branches: [main]
     paths:
       - "android/**"
+      - "core/**"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "core/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -31,10 +38,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
+      # No gradle-version here: the committed wrapper (android/gradle/wrapper/gradle-wrapper.properties)
+      # is the single Gradle-version truth. setup-gradle is kept only for its build cache; the build
+      # runs via ./gradlew below.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: "8.9"
 
       # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
       # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
@@ -60,17 +68,53 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "^3" --locked
 
-      - name: Build debug APK
+      # Build BOTH flavors. lint.abortOnError = true (app/build.gradle.kts) still gates each assemble.
+      - name: Build debug APKs (full + play)
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
 
-      # assembleDebug builds every flavor, and the full/play flavor split moved the outputs from
-      # apk/debug/ to apk/<flavor>/debug/ -- glob both so the artifact carries the sideload `full`
-      # APK and the `play` APK. error (not warn) so a path drift fails the job instead of silently
-      # uploading nothing.
-      - name: Upload APK artifact
+      # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant
+      # must fail the job, not pass with a missing artifact).
+      - name: Verify per-flavor APK presence
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          full=(android/app/build/outputs/apk/full/debug/*.apk)
+          play=(android/app/build/outputs/apk/play/debug/*.apk)
+          if [ ${#full[@]} -eq 0 ]; then echo "::error::full-flavor debug APK missing"; exit 1; fi
+          if [ ${#play[@]} -eq 0 ]; then echo "::error::play-flavor debug APK missing"; exit 1; fi
+          echo "full APK(s): ${full[*]}"
+          echo "play APK(s): ${play[*]}"
+
+      # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
+      # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs
+      # from the same AAR are scanned too. Any hit fails the build.
+      - name: GPL scan (play flavor must not contain libmpv)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gpl_pattern='lib(mpv|player|avcodec|avformat|avutil)\.so'
+          fail=0
+          for apk in android/app/build/outputs/apk/play/debug/*.apk; do
+            if unzip -l "$apk" | grep -Eq "$gpl_pattern"; then
+              echo "::error::GPL native lib found in play APK: $apk"
+              unzip -l "$apk" | grep -E "$gpl_pattern" || true
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "play flavor is clean of libmpv/ffmpeg GPL native libs"
+
+      - name: Upload full-flavor APK
         uses: actions/upload-artifact@v7
         with:
-          name: VortX-Android-debug
-          path: android/app/build/outputs/apk/*/debug/*.apk
+          name: VortX-Android-full-debug
+          path: android/app/build/outputs/apk/full/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload play-flavor APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: VortX-Android-play-debug
+          path: android/app/build/outputs/apk/play/debug/*.apk
           if-no-files-found: error

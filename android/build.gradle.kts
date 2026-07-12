@@ -1,9 +1,9 @@
-// Root build file. Plugin versions declared here, applied per-module. Kotlin 2.0+ is required for
-// the standalone Compose compiler plugin (org.jetbrains.kotlin.plugin.compose); Kotlin 2.2+ is
-// required to read dev.jdtech.mpv:libmpv:1.0.0, whose .kotlin_module metadata is 2.2.0 (a 2.0.x
-// compiler can only read metadata up to 2.1 and fails :app:compileFullDebugKotlin on it).
+// Root build file. Plugin versions live in gradle/libs.versions.toml (the version catalog); this file
+// only declares them (apply false) so each module applies what it needs. See the catalog header for
+// the Kotlin-floor / Compose-BOM coupling rules. Kotlin 2.2+ is required both for the standalone
+// Compose compiler plugin and to read dev.jdtech.mpv:libmpv:1.0.0's Kotlin 2.2.0 module metadata.
 plugins {
-    id("com.android.application") version "8.5.2" apply false
-    id("org.jetbrains.kotlin.android") version "2.2.10" apply false
-    id("org.jetbrains.kotlin.plugin.compose") version "2.2.10" apply false
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.kotlin.compose) apply false
 }
