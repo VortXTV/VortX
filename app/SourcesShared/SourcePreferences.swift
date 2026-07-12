@@ -62,6 +62,12 @@ protocol SourcePrefsReading {
     var includeRegex: NSRegularExpression? { get }
     var excludeTerms: [String] { get }
     var includeTerms: [String] { get }
+    /// Smart Source Selection (Lane A): parsed Prefer terms (a ranking BOOST, never a filter), the Avoid
+    /// behavior ("hide" = today's exact drop, "rank" = sink but keep visible), and the auto-pick-my-best
+    /// routing flag. All read via the frozen Snapshot so the off-main rank never races the singleton.
+    var preferTerms: [String] { get }
+    var avoidBehavior: String { get }
+    var autoPickBest: Bool { get }
     var safetyMode: String { get }
     var instantOnly: Bool { get }
     var hideDeadTorrents: Bool { get }
@@ -99,6 +105,13 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
     static let defaultSortKey        = "stremiox.streaming.defaultSourceSort"
     static let regexKey              = "stremiox.streaming.keywordsAreRegex"
+    // Smart Source Selection (Lane A). NEW keys use the vortx.* namespace (the 0.4 rename lands the older
+    // stremiox.* keys via a separate dual-read directive; these fresh keys are born vortx.* directly, no
+    // migration). Global (not per-profile): they are not part of Profiles.PlaybackPrefs, so a profile
+    // switch leaves them as the viewer set them.
+    static let preferKey             = "vortx.streaming.preferKeywords"
+    static let avoidBehaviorKey      = "vortx.streaming.avoidBehavior"
+    static let autoPickBestKey       = "vortx.streaming.autoPickBest"
 
     /// Documented per-profile stream-filter defaults, in ONE place. `init()` / `reload()` seed the
     /// string-valued props from these (an absent flat key already reads as the same intrinsic zero /
@@ -120,6 +133,12 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let defaultHideUnknownResolution = false
     static let defaultPreferredAudioOnly    = false
     static let defaultUseAddonOrder         = false
+    // Smart Source Selection (Lane A) defaults. `avoidBehavior` defaults to "hide" so out of the box the
+    // Avoid words behave EXACTLY as today's exclude-keyword drop; the viewer opts into "rank" to keep
+    // avoided sources visible but demoted. Prefer is empty and auto-pick is off by default.
+    static let defaultPreferKeywords        = ""
+    static let defaultAvoidBehavior         = "hide"
+    static let defaultAutoPickBest          = false
     /// A fresh install's source-type priority: the declared `SourceType` order (Debrid, Usenet,
     /// Torrent, Direct), which is exactly the order `readOrder()` fills in for any missing type.
     static let defaultTypeOrder: [SourceType] = SourceType.allCases
@@ -166,6 +185,25 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// recompiles in its hot loop.
     private(set) var excludeRegex: NSRegularExpression?
     private(set) var includeRegex: NSRegularExpression?
+    /// Smart Source Selection (Lane A) - Prefer words: comma-separated terms that BOOST a matching source
+    /// within its tier (a ranking nudge, never a filter, so it can never empty a list). Always matched as
+    /// substrings (comma-separated), independent of the Hide/Require regex toggle. Empty = no boost.
+    @Published var preferKeywords: String {
+        didSet { UserDefaults.standard.set(preferKeywords, forKey: Self.preferKey); StreamRanking.invalidateCaches() }
+    }
+    /// Smart Source Selection (Lane A) - what "Avoid" (the Hide words / exclude terms) does. "hide" (default)
+    /// DROPS a matching source exactly as today's exclude-keyword filter; "rank" keeps it VISIBLE but sinks
+    /// its score far below the tier spread. CAM/TS and other junkClass sources stay HARD-hidden by the Safety
+    /// filter in BOTH modes regardless of this setting.
+    @Published var avoidBehavior: String {
+        didSet { UserDefaults.standard.set(avoidBehavior, forKey: Self.avoidBehaviorKey); StreamRanking.invalidateCaches() }
+    }
+    /// Smart Source Selection (Lane A) - Auto-pick my best source: when on, the detail Play action plays the
+    /// single best ranked source straight away (the existing settle + `StreamRanking.best` auto-pick) instead
+    /// of surfacing the source list; a secondary/long-press still opens the full list. Off by default.
+    @Published var autoPickBest: Bool {
+        didSet { UserDefaults.standard.set(autoPickBest, forKey: Self.autoPickBestKey) }
+    }
     /// "off" (default), "balanced" (drop CAM/TS/SCR junk), or "strict" (also drop implausible-for-resolution
     /// fakes). Reuses the existing junk classifiers.
     @Published var safetyMode: String {
@@ -228,8 +266,12 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     }
 
     /// True when none of the opt-in filters are engaged, so the ranking can take its no-op fast path.
+    /// Prefer terms count as "active" too: even though they only BOOST (never filter), keeping the fast
+    /// path off when any exist means the ranker always applies the prefer nudge (Lane A). Avoid terms in
+    /// "rank" mode still register through `keywordFilterActive` (they are exclude terms), so they too keep
+    /// the fast path off, which is what the rank-mode scoring needs.
     var noFiltersActive: Bool {
-        !keywordFilterActive && safetyMode == "off"
+        !keywordFilterActive && preferTerms.isEmpty && safetyMode == "off"
             && !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0
             && minResolution == 0 && !hideUnknownResolution && !preferredAudioOnly && maxFileSizeGB == 0
     }
@@ -260,6 +302,10 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
          String(maxFileSizeGB),
          hdrOnly ? "1" : "0",
          excludeAV1 ? "1" : "0",
+         // Smart Source Selection (Lane A): the Prefer words and the Avoid behavior both change RANK order,
+         // and the auto-pick flag changes which source Play lands on, so all three must invalidate the
+         // detail memo when they change (per the off-main race + memo contract).
+         preferKeywords, avoidBehavior, autoPickBest ? "1" : "0",
          // Preferred audio languages live in TrackPreferences (a separate UserDefaults key), but the ranker's
          // score() reads them via languageScore -> a -5000 foreign-audio demotion that reorders results. Fold them
          // in so the detail memo invalidates when the viewer changes preferred audio language.
@@ -269,6 +315,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// Parsed, lowercased, non-empty exclude / include terms (substring mode).
     var excludeTerms: [String] { Self.terms(excludeKeywords) }
     var includeTerms: [String] { Self.terms(includeKeywords) }
+    /// Parsed, lowercased, non-empty Prefer terms (Lane A). Always substring mode (the Prefer boost never
+    /// uses regex), so it mirrors excludeTerms/includeTerms exactly.
+    var preferTerms: [String] { Self.terms(preferKeywords) }
     private static func terms(_ csv: String) -> [String] {
         csv.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
     }
@@ -308,6 +357,11 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
         defaultSourceSort = UserDefaults.standard.string(forKey: Self.defaultSortKey) ?? "best"
         keywordsAreRegex = UserDefaults.standard.bool(forKey: Self.regexKey)
+        // Smart Source Selection (Lane A). Absent keys read as the documented defaults ("" / "hide" / false),
+        // so a fresh install reproduces today's exact behavior (empty Prefer, Avoid hides, no auto-pick).
+        preferKeywords = UserDefaults.standard.string(forKey: Self.preferKey) ?? Self.defaultPreferKeywords
+        avoidBehavior  = UserDefaults.standard.string(forKey: Self.avoidBehaviorKey) ?? Self.defaultAvoidBehavior
+        autoPickBest   = UserDefaults.standard.object(forKey: Self.autoPickBestKey) as? Bool ?? Self.defaultAutoPickBest
         rebuildKeywordRegexes()   // didSet does not fire for initial assignment, so seed the compiled forms
     }
 
@@ -357,6 +411,15 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if preferredAudioOnly != prefAudio { preferredAudioOnly = prefAudio }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
+        // Smart Source Selection (Lane A). Global, not per-profile, so a profile switch never rewrites these
+        // flat keys; the guarded re-read only re-syncs the in-memory value if a full settings-backup restore
+        // changed the key underneath us. Guarded so an unchanged value never churns @Published.
+        let prefer = d.string(forKey: Self.preferKey) ?? Self.defaultPreferKeywords
+        if preferKeywords != prefer { preferKeywords = prefer }
+        let avoid = d.string(forKey: Self.avoidBehaviorKey) ?? Self.defaultAvoidBehavior
+        if avoidBehavior != avoid { avoidBehavior = avoid }
+        let autoPick = d.object(forKey: Self.autoPickBestKey) as? Bool ?? Self.defaultAutoPickBest
+        if autoPickBest != autoPick { autoPickBest = autoPick }
     }
 
     /// Dominant-tier score added to a stream so its source type is the primary sort key.
@@ -413,6 +476,9 @@ extension SourcePreferences {
         let includeRegex: NSRegularExpression?
         let excludeTerms: [String]
         let includeTerms: [String]
+        let preferTerms: [String]
+        let avoidBehavior: String
+        let autoPickBest: Bool
         let safetyMode: String
         let instantOnly: Bool
         let hideDeadTorrents: Bool
@@ -440,7 +506,8 @@ extension SourcePreferences {
     func snapshot() -> Snapshot {
         Snapshot(useAddonOrder: useAddonOrder, typeOrder: typeOrder, noFiltersActive: noFiltersActive,
                  keywordsAreRegex: keywordsAreRegex, excludeRegex: excludeRegex, includeRegex: includeRegex,
-                 excludeTerms: excludeTerms, includeTerms: includeTerms, safetyMode: safetyMode,
+                 excludeTerms: excludeTerms, includeTerms: includeTerms, preferTerms: preferTerms,
+                 avoidBehavior: avoidBehavior, autoPickBest: autoPickBest, safetyMode: safetyMode,
                  instantOnly: instantOnly, hideDeadTorrents: hideDeadTorrents, excludeAV1: excludeAV1,
                  hdrOnly: hdrOnly, maxResolution: maxResolution, minResolution: minResolution,
                  hideUnknownResolution: hideUnknownResolution, preferredAudioOnly: preferredAudioOnly,

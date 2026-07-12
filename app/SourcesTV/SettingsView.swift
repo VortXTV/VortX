@@ -724,6 +724,11 @@ struct SettingsView: View {
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .focusSection()
+            // Smart Source Selection (Lane A): the shared chip panel (Prefer / Only / Avoid + Avoid behavior +
+            // Auto-pick + live preview), binding directly to the SourcePreferences singleton like the rest of
+            // this section.
+            SourceFilterChipsView(prefs: sourcePrefs)
+                .focusSection()
             Toggle(isOn: $sourcePrefs.useAddonOrder) {
                 Text("Use add-on ranking order")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)

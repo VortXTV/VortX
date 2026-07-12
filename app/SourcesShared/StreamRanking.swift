@@ -265,6 +265,13 @@ enum StreamRanking {
         // so cache and the source-type order still win first. Untagged releases (most
         // English originals) are never penalised.
         score += languageScore(text)
+        // Smart Source Selection (Lane A): the Prefer boost and, in "rank" mode, the Avoid demotion. Read
+        // through SourcePreferences.reading so the off-main rank uses the frozen Snapshot (race contract).
+        // Prefer +8000 lifts a matching source decisively WITHIN its tier (same magnitude as the cache
+        // bonus). Avoid -20000 sinks a matching source well past the quality spread yet stays above the
+        // -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole point of "rank").
+        // Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
+        score += chipScoreOffset(text)
         // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (~4300), so
         // a cached stream always beats an uncached one of the same source type, which is the
         // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
@@ -296,6 +303,32 @@ enum StreamRanking {
         // junk exists the least-bad junk still wins.
         if junkClass(text) != nil { score -= 100_000 }
         return score
+    }
+
+    /// Smart Source Selection (Lane A) score offset for a stream's quality text: a Prefer-term boost plus,
+    /// when Avoid behavior is "rank", an Avoid-term demotion. Both magnitudes are chosen against the same
+    /// ladder the cache/junk bonuses use (see `computeScore`): +8000 is a within-tier lift, -20000 sinks a
+    /// source below the quality spread but keeps it above the -100000 junk floor so it stays visible.
+    static func chipScoreOffset(_ text: String) -> Int {
+        let prefs = SourcePreferences.reading
+        var offset = 0
+        if !prefs.preferTerms.isEmpty, prefs.preferTerms.contains(where: { text.contains($0) }) {
+            offset += 8000
+        }
+        if prefs.avoidBehavior == "rank", avoidMatches(text, prefs) {
+            offset -= 20_000
+        }
+        return offset
+    }
+
+    /// Whether the stream text matches the viewer's Avoid (Hide / exclude) terms, honoring regex vs
+    /// substring mode the same way `passesUserFilters` does. Used only by the "rank" Avoid path.
+    private static func avoidMatches(_ text: String, _ prefs: SourcePrefsReading) -> Bool {
+        if prefs.keywordsAreRegex {
+            if let rx = prefs.excludeRegex { return prefs.matches(rx, text) }
+            return false
+        }
+        return prefs.excludeTerms.contains(where: { text.contains($0) })
     }
 
     /// `pattern` matched only at delimiter boundaries: no alphanumeric on either side, so "ts"
@@ -600,14 +633,19 @@ enum StreamRanking {
             if isAdultContent(text) || junkClass(text) != nil { return false }
         }
         if prefs.noFiltersActive { return true }
+        // Smart Source Selection (Lane A): the Require (include / "Only") terms are ALWAYS a hard require in
+        // both Avoid modes. The Hide (exclude / "Avoid") terms only DROP here when avoidBehavior == "hide"
+        // (today's exact behavior); in "rank" mode they stop dropping and instead sink the score in
+        // computeScore, so the avoided source stays visible but demoted.
+        let avoidRanks = prefs.avoidBehavior == "rank"
         if prefs.keywordsAreRegex {
             // Power-user regex mode: Hide = drop on match, Require = drop on no-match. An invalid pattern
             // compiled to nil, so it imposes no constraint (fail-open).
-            if let rx = prefs.excludeRegex, prefs.matches(rx, text) { return false }
+            if !avoidRanks, let rx = prefs.excludeRegex, prefs.matches(rx, text) { return false }
             if let rx = prefs.includeRegex, !prefs.matches(rx, text) { return false }
         } else {
             let exclude = prefs.excludeTerms, include = prefs.includeTerms
-            if exclude.contains(where: { text.contains($0) }) { return false }
+            if !avoidRanks, exclude.contains(where: { text.contains($0) }) { return false }
             if !include.isEmpty, !include.contains(where: { text.contains($0) }) { return false }
         }
         switch prefs.safetyMode {
@@ -958,10 +996,16 @@ enum StreamRanking {
     /// the engine (structured stream metadata + async I/O), see [[vortx-engine-needs]] #2 and #4. They are
     /// deliberately NOT faked here.
     static func pickReason(_ s: CoreStream) -> String? {
+        let prefs = SourcePreferences.reading
         let t = qualityText(s)
         var why: [String] = []
         if isCached(s, t) { why.append("instant from cache") }
-        if SourcePreferences.reading.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
+        if prefs.typeOrder.first == sourceType(s, t) { why.append("your preferred source type") }
+        // Smart Source Selection (Lane A): surface WHY the chips nudged this source, using the actual term
+        // that matched so the reason is concrete. Prefer applies in both modes; "ranked down" only in "rank".
+        if let term = prefs.preferTerms.first(where: { t.contains($0) }) { why.append("preferred: \(term)") }
+        if prefs.avoidBehavior == "rank", !prefs.keywordsAreRegex,
+           let term = prefs.excludeTerms.first(where: { t.contains($0) }) { why.append("ranked down: \(term)") }
         guard !why.isEmpty else { return nil }
         return why.joined(separator: " · ")
     }

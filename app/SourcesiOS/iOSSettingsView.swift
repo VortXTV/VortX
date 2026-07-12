@@ -747,6 +747,12 @@ struct iOSSettingsView: View {
                 Label("Apply a quality preset", systemImage: "wand.and.stars")
             }
             .tint(Theme.Palette.accent)
+            // Smart Source Selection (Lane A): the chip panel (Prefer / Only / Avoid + Avoid behavior +
+            // Auto-pick + live preview) binds directly to the SourcePreferences singleton, the same
+            // direct-singleton pattern the rest of this section uses.
+            SourceFilterChipsView(prefs: sourcePrefs)
+                .listRowInsets(EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md,
+                                          bottom: Theme.Space.sm, trailing: Theme.Space.md))
             Toggle("Use add-on ranking order", isOn: $sourcePrefs.useAddonOrder)
                 .tint(Theme.Palette.accent)
 
