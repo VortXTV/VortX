@@ -4,6 +4,7 @@
 /cloudflare-ratings/
 /cloudflare-poster/
 /cloudflare-erdb/
+/cloudflare-iptv/
 
 # --- build artifacts & deps (reconstructed by scripts/build-web.sh) ---
 web/

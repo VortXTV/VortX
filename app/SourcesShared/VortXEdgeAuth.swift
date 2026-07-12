@@ -48,7 +48,7 @@ enum VortXEdgeAuth {
     private static let gatedHosts: Set<String> = [
         "skip.vortx.tv", "trickplay.vortx.tv", "ratings.vortx.tv", "poster.vortx.tv", "erdb.vortx.tv",
         "trailer.vortx.tv", "catalogs.vortx.tv", "config.vortx.tv", "subtitles.vortx.tv", "add.vortx.tv",
-        "sources.vortx.tv", "watch.vortx.tv",
+        "sources.vortx.tv", "watch.vortx.tv", "iptv.vortx.tv",
     ]
 
     /// The runtime de-mask key, assembled from two scattered fragments so it is not a single findable
