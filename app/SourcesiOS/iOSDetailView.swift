@@ -477,6 +477,10 @@ struct iOSDetailView: View {
         .navigationTitle(meta?.name ?? title)
         .inlineNavigationTitle()
         .toolbar(.hidden, for: .navigationBar)
+        // Hiding the bar also drops UIKit's edge-swipe back on this pushed page (the recognizer's
+        // built-in delegate refuses to begin without a visible bar), so re-arm it explicitly. The
+        // in-hero back disc is the visible affordance; the swipe is the muscle-memory one (#125).
+        .background(RestoreSwipeBack().frame(width: 0, height: 0).allowsHitTesting(false))
         #endif
         // macOS has no toolbar back button (toolbar removed), so supply an in-content Back + Esc / Cmd-[.
         .macBackAffordance()
@@ -2228,6 +2232,10 @@ struct iOSDetailView: View {
         }
         // Cap the live hero ZStack's own width to the viewport (same fix as iOSDetailView.hero).
         .frame(maxWidth: .infinity, alignment: .leading)
+        // The same circular back / overflow chrome the VOD hero wears (#125): the nav bar is hidden on
+        // this pushed page too (see body), so without the back disc a live channel / sport event had NO
+        // back affordance at all, and the Live tab's only escape was relaunching the app.
+        .overlay(alignment: .topLeading) { heroChrome }
         epgStrip
         liveSourceSection
     }
@@ -4190,3 +4198,53 @@ private struct iOSLibraryChip: View {
         .buttonStyle(ChipButtonStyle(selected: saved))
     }
 }
+
+#if os(iOS)
+/// Re-arms UINavigationController's interactive edge-swipe back on a pushed detail whose system nav
+/// bar is hidden (`.toolbar(.hidden, for: .navigationBar)`, the cinematic full-bleed hero): with the
+/// bar hidden UIKit's built-in gesture delegate refuses to begin the pop, which left the chrome-less
+/// live/sport detail with no swipe escape (#125). A zero-size hosted probe reaches the enclosing
+/// navigation controller once it joins the UIKit hierarchy and points the recognizer at a shared
+/// delegate that allows the pop whenever a page is actually pushed.
+private struct RestoreSwipeBack: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Probe { Probe() }
+    func updateUIViewController(_ probe: Probe, context: Context) {}
+
+    final class Probe: UIViewController {
+        // Re-arm at both attach points: didMove(toParent:) fires when SwiftUI hosts the probe (the
+        // navigation controller may not be reachable yet on the first push), viewWillAppear when the
+        // page is definitely on the stack. Both are idempotent assignments, so double-firing is free.
+        override func didMove(toParent parent: UIViewController?) {
+            super.didMove(toParent: parent)
+            rearm()
+        }
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            rearm()
+        }
+        private func rearm() {
+            guard let pop = navigationController?.interactivePopGestureRecognizer else { return }
+            pop.isEnabled = true
+            // Hand the recognizer a LONG-LIVED shared delegate, never this soon-to-pop controller:
+            // the recognizer only holds its delegate weakly, so a per-page delegate would dangle
+            // after the pop and leave an ungated recognizer swallowing edge drags at root.
+            pop.delegate = SwipeBackGate.shared
+        }
+    }
+}
+
+/// The one delegate for every re-armed pop recognizer: allow the interactive pop only while its own
+/// navigation controller (recovered from the recognizer's view, since each tab's NavigationStack has
+/// its own) has a page pushed. At root the gesture stays inert; grabbing it there wedges the stack.
+private final class SwipeBackGate: NSObject, UIGestureRecognizerDelegate {
+    static let shared = SwipeBackGate()
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        var responder: UIResponder? = gestureRecognizer.view
+        while let r = responder {
+            if let nav = r as? UINavigationController { return nav.viewControllers.count > 1 }
+            responder = r.next
+        }
+        return false
+    }
+}
+#endif

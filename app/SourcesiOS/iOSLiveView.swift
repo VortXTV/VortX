@@ -17,6 +17,7 @@ struct iOSLiveView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
+                Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Live tab -> scroll here
                 if core.liveBoardRows.isEmpty {
                     emptyState
                 } else {
@@ -30,6 +31,8 @@ struct iOSLiveView: View {
                     .padding(.vertical, Theme.Space.md)
                 }
             }
+            // Re-tapping the active Live tab scrolls back to the top anchor, like every other tab.
+            .scrollToTopOnBump(TabScrollKeys.live)
             .background(Theme.Palette.canvas.ignoresSafeArea())
             // navigationTitle bridges into the single shared window toolbar on macOS where every mounted
             // tab stamps its own title, crashing NSToolbar on duplicate inserts. So it is iOS-only.
@@ -46,6 +49,10 @@ struct iOSLiveView: View {
             .onAppear { core.ensureLiveCatalogsLoaded() }
             .onChange(of: core.addons.count) { _ in core.ensureLiveCatalogsLoaded() }
         }
+        // Re-tapping the active Live tab pops any pushed channel/event detail back to root (#125): the
+        // shell bumps TabScrollKeys.live like every tab, but nothing here observed it, so a pushed live
+        // detail (whose nav bar is hidden) left the tab with no way back short of relaunching the app.
+        .popToRootOnBump(TabScrollKeys.live, path: $path)
     }
 
     /// Open the channel's detail page (which engages the Live branch via its `type`). Unlike the
