@@ -302,9 +302,10 @@ final class ScrubThumbnailsStore: ObservableObject {
         let hasNewCoverage = sessionFrames.count > lastUploadedCount          // nothing new since our last push
         let throttleElapsed = lastUploadUptime == 0 || now - lastUploadUptime >= minUploadIntervalS
         let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
-        // Predict the Worker's coverage verdict from the RAW capture cadence + session frame count (coverage is
-        // invariant under the client's decimation). A sub-floor sheet is answered below_coverage_threshold and
-        // discarded, so firing it every ~60s is a wasted POST that also logs a misleading "-> failed" (the whole
+        // Predict the Worker's coverage verdict from the RAW capture cadence + session frame count (uploadCanStore
+        // also accounts for the decimation buildAndUpload applies, which only raises coverage). A sub-floor sheet
+        // is answered below_coverage_threshold and discarded, so firing it every ~60s is a wasted POST that also
+        // logs a misleading "-> failed" (the whole
         // "15+ failed, contributes zero" field signal on #76). Fail-open when the bucket is unknown so a
         // provisional-duration debrid MKV still uploads exactly as before; this only skips the doomed uploads.
         let coverageReady = CommunityTrickplay.uploadCanStore(
@@ -358,11 +359,20 @@ final class ScrubThumbnailsStore: ObservableObject {
         let bucket = communityDurationBucket, height = communitySrcHeight
         VXProbe.log("tp", "pushUpload FIRING key=\(key) imdb=\(imdb) frames=\(frames.count)")
         Task.detached(priority: .utility) { [weak self] in
-            let ok = await CommunityTrickplay.buildAndUpload(
+            let outcome = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,
                 durationBucket: bucket, srcHeight: height,
                 intervalS: Self.captureInterval, frames: frames)
-            VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(ok ? "stored" : "failed")")
+            // Honest result: a 200 the Worker consciously declined (below_coverage_threshold, a keep-fuller race
+            // with another contributor, a remote frameBounds drop) is "rejected(reason)", NOT "failed". Reserve
+            // "failed" for a real transport error, a non-200, or a local build failure that never POSTed.
+            let resultLabel: String
+            switch outcome {
+            case .stored: resultLabel = "stored"
+            case .rejected(let reason): resultLabel = "rejected(\(reason))"
+            case .failed: resultLabel = "failed"
+            }
+            VXProbe.log("tp", "upload key=\(key) frames=\(frames.count) -> \(resultLabel)")
             await MainActor.run { self?.uploadInFlight = false }
         }
     }

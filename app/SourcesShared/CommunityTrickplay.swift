@@ -63,9 +63,14 @@ enum CommunityTrickplay {
     static let minServeCoverage = 0.02
 
     /// Coverage of a would-be upload, computed identically to the Worker's `decision.ts` computeCoverage:
-    /// clamp[0,1]( frame_count / max(1, round(durationBucket / interval_s)) ). Coverage is invariant under the
-    /// client's decimation (frame_count shrinks as interval grows), so the RAW capture cadence + session frame
-    /// count predict the uploaded sheet's coverage exactly. Guarded like the Worker (0 on any non-positive input).
+    /// clamp[0,1]( frame_count / max(1, round(durationBucket / interval_s)) ) for the GIVEN frame_count/interval.
+    /// A prediction from the RAW capture cadence + session frame count is a conservative estimate, NOT an exact
+    /// match to what the Worker stores: when the session outgrows one sheet's tile budget, buildAndUpload
+    /// decimates before POSTing, and decimation changes BOTH terms (fewer frames over a longer interval) with
+    /// independent rounding, so the stored coverage can land either side of the raw estimate. uploadCanStore
+    /// therefore does not rely on the raw number alone; it also evaluates the exact decimated frame_count/interval
+    /// buildAndUpload will POST, so it never skips a sheet the Worker would keep. Guarded like the Worker (0 on any
+    /// non-positive input).
     static func coverage(frameCount: Int, intervalS: Double, durationBucket: Int) -> Double {
         guard frameCount > 0, intervalS > 0, durationBucket > 0 else { return 0 }
         let expected = max(1, Int((Double(durationBucket) / intervalS).rounded()))
@@ -79,7 +84,25 @@ enum CommunityTrickplay {
     /// sub-floor uploads that were being fired ~every 60s and logged as a misleading "-> failed".
     static func uploadCanStore(frameCount: Int, intervalS: Double, durationBucket: Int) -> Bool {
         guard durationBucket > 0, intervalS > 0, frameCount > 0 else { return true }
-        return coverage(frameCount: frameCount, intervalS: intervalS, durationBucket: durationBucket) >= minServeCoverage
+        // Raw prediction: the sheet exactly as captured (no decimation).
+        if coverage(frameCount: frameCount, intervalS: intervalS, durationBucket: durationBucket) >= minServeCoverage {
+            return true
+        }
+        // Decimated prediction: when the session holds more frames than one sheet's tile budget, buildAndUpload
+        // does NOT post the raw numbers; it strides the frames down and posts a smaller frame_count over a
+        // proportionally larger interval. Because the coverage numerator rounds UP (ceil), the decimated sheet can
+        // clear the floor the raw numbers miss, so predicting from the raw numbers alone would wrongly skip a
+        // storable sheet. Mirror buildAndUpload's EXACT stride math (budget = min(count, maxTiles);
+        // stride = ceil(count / budget); kept = ceil(count / stride); interval *= stride) reading the same live
+        // `maxTiles` snapshot it reads, so the predicted sheet matches the POSTed one. Below this, both raw and
+        // decimated are sub-floor => the Worker rejects either => skipping is correct.
+        let maxTiles = max(1, RemoteConfig.snapshot.trickplayMaxTilesValue)
+        guard frameCount > maxTiles else { return false }
+        let budget = min(frameCount, maxTiles)
+        let stride = Int(ceil(Double(frameCount) / Double(budget)))
+        let decimatedCount = Int(ceil(Double(frameCount) / Double(stride)))
+        let decimatedInterval = intervalS * Double(stride)
+        return coverage(frameCount: decimatedCount, intervalS: decimatedInterval, durationBucket: durationBucket) >= minServeCoverage
     }
 
     /// sha1("{imdb}:{season|0}:{episode|0}:{durationBucket}") as lowercase hex. nil when the imdb id is not a
@@ -249,8 +272,20 @@ enum CommunityTrickplay {
         let jpeg: Data
     }
 
+    /// The outcome of an upload attempt, so the caller can log honestly instead of collapsing everything that is
+    /// not `stored` into "failed": `stored` (the Worker kept a NEW set), `rejected` (a 200 the Worker consciously
+    /// declined, e.g. below_coverage_threshold or a keep-fuller race, carrying the Worker's reason), or `failed`
+    /// (a real transport error, a non-200, or a local build failure that never POSTed).
+    enum UploadOutcome {
+        case stored
+        case rejected(String)
+        case failed
+    }
+
     /// Build a sprite-sheet + WEBVTT index from the device's captured frames and POST it (first-writer-wins).
-    /// Runs entirely off the main actor. Returns true only if the server stored a NEW set. Never throws.
+    /// Runs entirely off the main actor. Returns `.stored` only if the server stored a NEW set, `.rejected(reason)`
+    /// for a 200 the Worker declined, and `.failed` for a transport/non-200 error or a local build failure that
+    /// never POSTed. Never throws.
     ///
     /// `intervalS` is the capture cadence the local pipeline uses (~10s). Frames are sorted by time, packed
     /// left-to-right / top-to-bottom into a grid, and each tile is downscaled to ~480x270 (16:9) so the
@@ -265,8 +300,8 @@ enum CommunityTrickplay {
         srcHeight: Int,
         intervalS: Double,
         frames: [CapturedFrame]
-    ) async -> Bool {
-        guard isEnabled else { return false }
+    ) async -> UploadOutcome {
+        guard isEnabled else { return .failed }
         let sorted = frames.sorted { $0.time < $1.time }
         // Store even a tiny capture (>=1 frame); the owner asked that even ~5s of coverage be kept + served.
         // Frame bounds come from the RemoteConfig `trickplay.minFrames`/`maxFrames` dials (clamped min 1..10,
@@ -279,7 +314,7 @@ enum CommunityTrickplay {
         let minFrames = max(2, frameBounds.min)
         guard sorted.count >= minFrames, sorted.count <= frameBounds.max else {
             VXProbe.log("tp", "buildAndUpload skipped: sorted=\(sorted.count) below buildable floor \(minFrames) (need >=2 tiles)")
-            return false
+            return .failed
         }
 
         // Bound one sheet to a 3 MB-safe tile budget. A long watch produces far more 480x270 tiles than fit
@@ -333,7 +368,7 @@ enum CommunityTrickplay {
         }
         guard let picked else {
             VXProbe.log("tp", "buildAndUpload could not build a >=2-tile sheet under 3MB (compose/encode failure at floor, sorted=\(sorted.count)) -> dropped")
-            return false
+            return .failed
         }
 
         let vtt = buildVTT(frameCount: picked.count, cols: picked.cols, tileW: tileW, tileH: tileH, intervalS: picked.interval)
@@ -403,11 +438,13 @@ enum CommunityTrickplay {
         return String(format: "%02d:%02d:%02d.%03d", h, m, s, ms)
     }
 
-    /// POST the multipart body. Returns true only on `{ ok:true, stored:true }`. Never throws.
-    private static func post(key: String, sprite: Data, vtt: String, meta: [String: Any]) async -> Bool {
+    /// POST the multipart body. `.stored` only on `{ ok:true, stored:true }`; a 200 the Worker declined is
+    /// `.rejected(reason)` (the Worker's `reason`, e.g. below_coverage_threshold or a keep-fuller race); a
+    /// transport error, a non-200, or a body we cannot build is `.failed`. Never throws.
+    private static func post(key: String, sprite: Data, vtt: String, meta: [String: Any]) async -> UploadOutcome {
         guard let url = URL(string: "\(baseURL)/tp/\(key)"),
               let metaJSON = try? JSONSerialization.data(withJSONObject: meta),
-              let metaString = String(data: metaJSON, encoding: .utf8) else { return false }
+              let metaString = String(data: metaJSON, encoding: .utf8) else { return .failed }
 
         let boundary = "vortx-tp-\(UUID().uuidString)"
         var body = Data()
@@ -450,12 +487,17 @@ enum CommunityTrickplay {
             let bodyStr = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)B>"
             let bodyHead = String(bodyStr.prefix(200))
             VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=\(code) ok=\(ok ? "true" : "false") stored=\(stored ? "true" : "false") body=\(bodyHead)")
-            guard code == 200 else { return false }
-            return stored
+            guard code == 200 else { return .failed }
+            if stored { return .stored }
+            // 200 but not stored: the Worker accepted the request and consciously declined it. Surface its `reason`
+            // (below_coverage_threshold, a keep-fuller race, a frameBounds drop) so the caller logs "rejected", not
+            // "failed". Fall back to a generic label if the Worker omitted a machine reason.
+            let reason = (obj?["reason"] as? String) ?? "declined"
+            return .rejected(reason)
         } catch {
             let errHead = String(String(describing: error).prefix(200))
             VXProbe.log("tp", "POST \(url.absoluteString) httpStatus=err ok=false stored=false body=\(errHead)")
-            return false
+            return .failed
         }
     }
 }
