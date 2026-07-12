@@ -54,6 +54,34 @@ enum CommunityTrickplay {
         return Int(floor(duration / 10) * 10)
     }
 
+    // MARK: - Coverage floor (mirrors the Worker, so a doomed upload is never POSTed)
+
+    /// The Worker's serve floor (vortx-trickplay `decision.ts` MIN_SERVE_COVERAGE): a POST whose coverage is
+    /// below this is answered `{stored:false, reason:"below_coverage_threshold"}` and discarded, so it is a
+    /// wasted round-trip (and, on a shared household IP, eats the per-IP POST budget). Kept in sync with
+    /// decision.ts; 0.02 == "play ~6 min of even a 3h film and it stores".
+    static let minServeCoverage = 0.02
+
+    /// Coverage of a would-be upload, computed identically to the Worker's `decision.ts` computeCoverage:
+    /// clamp[0,1]( frame_count / max(1, round(durationBucket / interval_s)) ). Coverage is invariant under the
+    /// client's decimation (frame_count shrinks as interval grows), so the RAW capture cadence + session frame
+    /// count predict the uploaded sheet's coverage exactly. Guarded like the Worker (0 on any non-positive input).
+    static func coverage(frameCount: Int, intervalS: Double, durationBucket: Int) -> Double {
+        guard frameCount > 0, intervalS > 0, durationBucket > 0 else { return 0 }
+        let expected = max(1, Int((Double(durationBucket) / intervalS).rounded()))
+        return min(1, max(0, Double(frameCount) / Double(expected)))
+    }
+
+    /// Whether the client should spend a POST on this capture. Returns false ONLY when we can positively
+    /// predict the Worker will reject it as below_coverage_threshold; when the duration/interval is unknown we
+    /// CANNOT predict, so we fail-open (allow, today's behavior) and let the Worker decide. This never
+    /// suppresses a legitimate upload (e.g. a debrid MKV whose bucket is provisional); it only skips the
+    /// sub-floor uploads that were being fired ~every 60s and logged as a misleading "-> failed".
+    static func uploadCanStore(frameCount: Int, intervalS: Double, durationBucket: Int) -> Bool {
+        guard durationBucket > 0, intervalS > 0, frameCount > 0 else { return true }
+        return coverage(frameCount: frameCount, intervalS: intervalS, durationBucket: durationBucket) >= minServeCoverage
+    }
+
     /// sha1("{imdb}:{season|0}:{episode|0}:{durationBucket}") as lowercase hex. nil when the imdb id is not a
     /// real `tt…` id (ad-hoc paste-a-link plays have no shareable identity, so they never touch the service).
     static func contentKey(imdbId: String, season: Int?, episode: Int?, duration: Double) -> String? {

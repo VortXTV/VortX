@@ -302,10 +302,17 @@ final class ScrubThumbnailsStore: ObservableObject {
         let hasNewCoverage = sessionFrames.count > lastUploadedCount          // nothing new since our last push
         let throttleElapsed = lastUploadUptime == 0 || now - lastUploadUptime >= minUploadIntervalS
         let enoughToBuild = sessionFrames.count >= minBuildableFrames   // sheet builder floors at 2 tiles
+        // Predict the Worker's coverage verdict from the RAW capture cadence + session frame count (coverage is
+        // invariant under the client's decimation). A sub-floor sheet is answered below_coverage_threshold and
+        // discarded, so firing it every ~60s is a wasted POST that also logs a misleading "-> failed" (the whole
+        // "15+ failed, contributes zero" field signal on #76). Fail-open when the bucket is unknown so a
+        // provisional-duration debrid MKV still uploads exactly as before; this only skips the doomed uploads.
+        let coverageReady = CommunityTrickplay.uploadCanStore(
+            frameCount: sessionFrames.count, intervalS: Self.captureInterval, durationBucket: communityDurationBucket)
         let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && throttleElapsed
-            && enoughToBuild && !uploadInFlight && communityImdb != nil
+            && enoughToBuild && coverageReady && !uploadInFlight && communityImdb != nil
         let sincePushS = lastUploadUptime == 0 ? -1 : Int(now - lastUploadUptime)
-        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) sincePushS=\(sincePushS) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") throttleElapsed=\(throttleElapsed ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") inFlight=\(uploadInFlight ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
+        VXProbe.log("tp", "upload-gate frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) sincePushS=\(sincePushS) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") imdb=\(communityImdb ?? "nil") beatsStored=\(beatsStored ? "true" : "false") hasNewCoverage=\(hasNewCoverage ? "true" : "false") throttleElapsed=\(throttleElapsed ? "true" : "false") enoughToBuild=\(enoughToBuild ? "true" : "false") coverageReady=\(coverageReady ? "true" : "false") inFlight=\(uploadInFlight ? "true" : "false") -> \(willUpload ? "UPLOAD" : "skip")")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
@@ -329,8 +336,12 @@ final class ScrubThumbnailsStore: ObservableObject {
         let hasFrames = sessionFrames.count >= 2   // sheet builder floors at 2 tiles; a lone frame is unbuildable
         let grewSinceUpload = sessionFrames.count > lastUploadedCount
         let beatsStored = sessionFrames.count > communityExistingFrameCount
-        let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && communityImdb != nil
-        VXProbe.log("tp", "teardown-flush frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") hasFrames=\(hasFrames ? "true" : "false") grewSinceUpload=\(grewSinceUpload ? "true" : "false") beatsStored=\(beatsStored ? "true" : "false") -> \(willFlush ? "FLUSH" : "skip")")
+        // Same coverage pre-gate as the progressive path: a below-floor final set would be discarded server-side,
+        // so skip the doomed flush (and its misleading "-> failed"). Fail-open on an unknown bucket.
+        let coverageReady = CommunityTrickplay.uploadCanStore(
+            frameCount: sessionFrames.count, intervalS: Self.captureInterval, durationBucket: communityDurationBucket)
+        let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && coverageReady && communityImdb != nil
+        VXProbe.log("tp", "teardown-flush frames=\(sessionFrames.count) existing=\(communityExistingFrameCount) lastUploaded=\(lastUploadedCount) enabled=\(enabled ? "true" : "false") hasKey=\(hasKey ? "true" : "false") hasFrames=\(hasFrames ? "true" : "false") grewSinceUpload=\(grewSinceUpload ? "true" : "false") beatsStored=\(beatsStored ? "true" : "false") coverageReady=\(coverageReady ? "true" : "false") -> \(willFlush ? "FLUSH" : "skip")")
         guard willFlush, let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
     }
