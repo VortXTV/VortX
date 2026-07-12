@@ -185,10 +185,14 @@ struct iOSRootView: View {
                 // NavigationStack would otherwise stamp its own — tiling "StremioX" once per screen.
                 // Only the visible tab contributes its wordmark (#46 regression).
                 iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
-                if isMounted(.discover) { iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0) }
+                // Hidden tabs UNMOUNT, mirroring Live's long-standing gate (#117): a tab hidden in
+                // Settings > Tab bar stops its background work (hero rotation, catalog refresh)
+                // instead of idling at opacity 0. Safe because no route can land on a hidden tab
+                // (the per-toggle healers + the macOS searchDestination rule fall back to Home).
+                if !hideDiscoverTab, isMounted(.discover) { iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0) }
                 if !hideLiveTab, isMounted(.live) { iOSLiveView().opacity(tab == .live ? 1 : 0) }
-                if isMounted(.library) { iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0) }
-                if !mergeDiscoverSearch, isMounted(.search) { iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0) }
+                if !hideLibraryTab, isMounted(.library) { iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0) }
+                if !mergeDiscoverSearch, !hideSearchTab, isMounted(.search) { iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0) }
                 if isMounted(.addons) { AddonsView().opacity(tab == .addons ? 1 : 0) }
                 if isMounted(.settings) { iOSSettingsView().opacity(tab == .settings ? 1 : 0) }
             }
@@ -234,8 +238,10 @@ struct iOSRootView: View {
             if hidden, tab == .search { tab = .home }
         }
         .onChange(of: mergeDiscoverSearch) { merged in
-            // Search folds into Discover: if the bar was pointing at the now-hidden Search tab, land on Discover.
-            if merged, tab == .search { tab = .discover }
+            // Search folds into Discover: if the bar was pointing at the now-dropped Search tab, land
+            // on Discover, unless Discover itself is hidden in Settings > Tab bar (#117 rule: never
+            // route to a hidden tab, fall back to Home like every other healer).
+            if merged, tab == .search { tab = hideDiscoverTab ? .home : .discover }
         }
         .onAppear {
             updates.startMonitoring()   // launch check + hourly re-check while open
@@ -245,14 +251,18 @@ struct iOSRootView: View {
         // Scene level and can't set this @State directly. The raw value mirrors Tab's order.
         .onReceive(NotificationCenter.default.publisher(for: MacCommands.tabRequest)) { note in
             guard let raw = note.userInfo?["tab"] as? Int, let dest = Tab(rawValue: raw) else { return }
-            // ⌘F lands the cursor in the persistent top-bar search field. In merged mode the
-            // standalone Search tab does not exist, so route to Discover (submit searches there).
+            // ⌘F lands the cursor in the persistent top-bar search field. The destination follows
+            // the #117 rule: never route to a hidden tab, fall back to Home. `searchDestination`
+            // resolves the merge fold (Discover when merged, else Search) BEFORE the hidden check,
+            // so a hidden destination can never resurface with no tab selected in the bar.
             if dest == .search {
                 macSearchFocused = true
-                tab = mergeDiscoverSearch ? .discover : .search
+                tab = searchDestination
                 return
             }
-            tab = dest
+            // Same rule for every other Go-menu destination: a tab hidden in Settings > Tab bar is
+            // never routed to; fall back to Home instead of resurrecting a hidden screen.
+            tab = hiddenTabs.contains(dest) ? .home : dest
         }
         #endif
         // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
@@ -317,13 +327,29 @@ struct iOSRootView: View {
         }
     }
 
+    /// Where a search request lands (#117 rule: never route to a hidden tab, fall back to Home).
+    /// Resolve the natural destination FIRST (merged mode folds Search into Discover, so merge on
+    /// means Discover, else Search), then apply the hidden state: if the user hid THAT tab in
+    /// Settings > Tab bar, land on Home, the same fallback every per-toggle healer uses. This covers
+    /// all four hideSearchTab x mergeDiscoverSearch / hideDiscoverTab combinations: merge off routes
+    /// to Search (Home when Search is hidden; hiding Discover is irrelevant), merge on routes to
+    /// Discover (Home when Discover is hidden; the Search toggle is irrelevant, the tab is folded).
+    private var searchDestination: Tab {
+        let dest: Tab = mergeDiscoverSearch ? .discover : .search
+        return hiddenTabs.contains(dest) ? .home : dest
+    }
+
     /// Submit the top-bar query into the engine search flow: hand it to `MacSearchBridge` (consumed by
     /// the Search tab, or Discover in merged mode, possibly mounting for the first time) and switch there.
     private func submitMacSearch() {
         let q = macQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
-        MacSearchBridge.shared.pending = q
-        tab = mergeDiscoverSearch ? .discover : .search
+        // Never route to a hidden tab; fall back to Home (#117). Only queue the pending query when a
+        // search surface will actually consume it, so a submit with the destination hidden cannot
+        // leave a stale query that fires on a much later visit.
+        let dest = searchDestination
+        if dest != .home { MacSearchBridge.shared.pending = q }
+        tab = dest
     }
     #endif
 
