@@ -283,6 +283,22 @@ final class TorBoxSearchSource: ObservableObject {
         }
     }
 
+    /// Empty the PUBLISHED results (and the shown-key, so a later refresh for the same title
+    /// re-publishes from cache instead of being deduped into staying empty) WITHOUT touching the
+    /// session cache, the in-flight bookkeeping, or the scraper-cooldown state - those protect the
+    /// TorBox allowance for the whole session and must survive a clear. For an owner that reuses ONE
+    /// instance across titles (the batch-download coordinator #119, unlike the per-view @StateObjects
+    /// that die with their screen): the result pool is PER-TITLE, and a title that cannot query the
+    /// index (no imdb id / no key) must see it EMPTY, never a predecessor title's results - `refresh`
+    /// early-returns on those gates without clearing, so the owner clears explicitly. A still-in-flight
+    /// fetch is left running ON PURPOSE: cancelling it would strand `inFlightKey` and drop a 429
+    /// cooldown signal, while letting it finish only fills the session cache (the `shownKey` guard
+    /// already blocks a stale publish).
+    func clearResults() {
+        shownKey = nil
+        if !streams.isEmpty { streams = [] }
+    }
+
     /// Merge the fetched search streams into `groups` as one extra group, deduped against the streams
     /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns `groups`
     /// unchanged when there is nothing to add — so a no-key / empty-result path is a pure pass-through.

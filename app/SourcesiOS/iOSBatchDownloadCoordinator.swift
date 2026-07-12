@@ -228,9 +228,27 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// show-level on appear, exactly this shape). Both calls are fire-and-forget: results land async
     /// and are picked up by the per-iteration merge in `resolveAndQueue`, the same async-contribution
     /// pattern the pages use.
+    ///
+    /// INVARIANT: contributor pools are PER-SERIES; a series that cannot query them must see them
+    /// EMPTY, never a predecessor's results. The manual pages get this for free (fresh per-view
+    /// @StateObjects die with their screen), but the coordinator reuses two instances across the
+    /// whole batch, and BOTH refresh methods early-return on a nil id WITHOUT clearing their
+    /// published streams (TorBox guards the tt prefix + key before touching state; Singularity only
+    /// clears when its GATE closes, not on a nil content id with the gate open). Without the explicit
+    /// reset below, a tmdb:/kitsu:-only series (nil imdb id) batched after an imdb-keyed one would
+    /// merge the PREVIOUS show's streams into its pool, and a stale row could WIN ranking: another
+    /// title's file downloading under this series' episode label. clearResults() empties only the
+    /// published results, leaving the TorBox session cache + scraper-cooldown state and the
+    /// Singularity result bank intact (those protect the APIs session-wide, which is why the
+    /// instances are cleared rather than recreated).
     private func refreshContributorsIfNeeded(for job: Job) {
         guard job.seriesId != contributorSeriesKey else { return }
         contributorSeriesKey = job.seriesId
+        // Reset FIRST, unconditionally: this also closes the valid-id window where the previous
+        // series' streams linger until the new series' own fetch lands (Singularity does not clear
+        // on a content-id change until its fetch returns).
+        torboxSearch.clearResults()
+        sourceIndex.clearResults()
         torboxSearch.refresh(imdbId: job.seriesImdbId)
         sourceIndex.refresh(contentID: SourceIndexClient.contentID(imdbId: job.seriesImdbId),
                             isSignedIn: VortXSyncManager.shared.isSignedIn)
