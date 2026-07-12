@@ -264,6 +264,17 @@ final class ProfileStore: ObservableObject {
     /// Make `profile` active: applies its theme immediately and reports the account work left.
     @discardableResult
     func select(_ profile: UserProfile) -> SwitchOutcome {
+        // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile. The
+        // flat keys are, by the documented invariant, the ACTIVE profile's state, but the 13 stream
+        // filters bind straight to the SourcePreferences singleton on both settings screens, so a
+        // viewer's filter edits can exist ONLY in the flat keys while the roster still carries nil
+        // (every pre-b176 roster does: the filter fields entered PlaybackPrefs with no re-seed).
+        // Without this capture, the resetUnset apply below would overwrite those live values with
+        // defaults PERMANENTLY, even when re-picking the SAME profile from the launch picker, and the
+        // wipe would sync account-wide. capturePlayback's equality guard keeps this a no-op when the
+        // roster already matches, and it safely does nothing when there is no active profile
+        // (remove()'s select-after-removal: the removed profile is already gone from the roster).
+        capturePlayback()
         let beforeAccount = active.map(keychainAccount(for:))
         activeID = profile.id
         pickedThisLaunch = true
@@ -513,7 +524,15 @@ final class ProfileStore: ObservableObject {
     /// carrying them over (the b176 / #117 data-correctness gap). On a sync fold (`adoptRemoteRoster`,
     /// `reloadFromDefaults`, `mergeInRoster`, tombstone prune: default `false`) an unset field is left
     /// untouched, so a peer's nil can never wipe the active device's LIVE keys at pull time; only a
-    /// later real switch applies. syncDown never calls `select`, so the invariant holds.
+    /// later real switch applies.
+    ///
+    /// One sync-reachable switch DOES exist and is intended: syncDown -> applyProfileEdits ->
+    /// remove(the ACTIVE profile) -> select(first), when the dashboard deletes the profile this
+    /// device is on. That is a genuine forced switch to a SURVIVING profile, not a fold: select's
+    /// leading capturePlayback no-ops (the deleted profile is already out of the roster, so `active`
+    /// is nil and nothing of it leaks into the survivor), the survivor's OWN stored prefs are
+    /// applied, and defaults land only on fields the survivor itself never recorded. No surviving
+    /// profile's data is touched; the only state discarded is the deleted profile's, by design.
     private func applyPlayback(_ profile: UserProfile, resetUnset: Bool = false) {
         let d = UserDefaults.standard
         // Per-profile add-on visibility: flatten this profile's disabled set into the key the off-main
