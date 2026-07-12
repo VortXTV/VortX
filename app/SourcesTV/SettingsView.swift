@@ -786,7 +786,11 @@ struct SettingsView: View {
             choiceRow(String(localized: "Minimum quality"),
                       [("0", String(localized: "Off")), ("720", "720p"), ("1080", "1080p"), ("2160", "4K")],
                       selection: Binding(get: { String(sourcePrefs.minResolution) }, set: { sourcePrefs.minResolution = Int($0) ?? 0 }))
-            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown; Minimum quality hides sources below the floor (sources with no stated resolution are kept). Hide dead torrents drops sources with no seeders.")
+            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule (SAME SourcePreferences
+            // property the iOS/Mac toggle binds).
+            choiceRow(String(localized: "Hide unknown quality"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.hideUnknownResolution ? "1" : "0" }, set: { sourcePrefs.hideUnknownResolution = ($0 == "1") }))
+            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown; Minimum quality hides sources below the floor (sources with no stated resolution are kept unless Hide unknown quality is on). Hide dead torrents drops sources with no seeders.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             // Pinned sources: long-press a source on any title to pin it; this clears them all. Shown only

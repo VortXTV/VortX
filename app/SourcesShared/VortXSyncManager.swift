@@ -531,6 +531,7 @@ final class VortXSyncManager: ObservableObject {
                 if let v = pb.maxResolution { playback["maxResolution"] = v }
                 if let v = pb.maxFileSizeGB { playback["maxFileSizeGB"] = v }
                 if let v = pb.minResolution { playback["minResolution"] = v }
+                if let v = pb.hideUnknownResolution { playback["hideUnknownResolution"] = v }
                 settings["playback"] = playback
             }
             return ["id": p.id.uuidString, "name": p.name, "locked": p.pin != nil, "main": p.isOwner,

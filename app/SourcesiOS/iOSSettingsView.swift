@@ -806,6 +806,9 @@ struct iOSSettingsView: View {
                 Text("1080p").tag(1080)
                 Text("4K").tag(2160)
             }
+            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule, for viewers who
+            // want only sources that state their quality.
+            Toggle("Hide unknown quality", isOn: $sourcePrefs.hideUnknownResolution).tint(Theme.Palette.accent)
             Picker("Max file size", selection: $sourcePrefs.maxFileSizeGB) {
                 Text("Unlimited").tag(0.0)
                 Text("2 GB").tag(2.0)
@@ -832,7 +835,7 @@ struct iOSSettingsView: View {
                     Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                 }
                 Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
-                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept.")
+                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept unless Hide unknown quality is on.")
             }
         }
     }
