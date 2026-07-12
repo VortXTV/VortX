@@ -54,6 +54,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var invalidated = false
     private var connections: [ObjectIdentifier: NWConnection] = [:]
+    /// Single-flight for the two concurrent startup /media.m3u8 fetches (#76). The master advertises two
+    /// variants on the SAME media.m3u8 URI, so CoreMedia opens both at startup; if the two HELD requests poll
+    /// the remux 100ms apart they can capture a DIFFERENT segment count for the same URI, which CoreMedia
+    /// rejects with -12927. The first held request builds ONE body when the startup gate opens and stores it
+    /// here; every other held request answers those identical bytes. Reloads after startup build fresh so the
+    /// EVENT playlist still grows.
+    private let mediaGateLock = NSLock()
+    private var startupMediaBody: Data?
 
     /// Build the remux stream + local server for a DV MKV URL. Returns nil when the listener cannot bind
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
@@ -76,6 +84,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// Begin remuxing. Call once, after the asset is (about to be) mounted.
     func start() { stream.start() }
+
+    /// Whether the mount is still HEALTHY: the init segment has published AND the remux buffer has not failed.
+    /// The engine's one-shot healthy-mount retry (#76) reads this to tell "a CoreMedia startup hiccup on a live
+    /// mount" (retry a fresh item) from "the remux itself died" (demote). Same two signals serveMedia gates on.
+    var isMountHealthy: Bool {
+        stream.hlsSnapshot().initData != nil && stream.buffer.status().failure == nil
+    }
 
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
@@ -290,8 +305,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         fbInf += ",CODECS=\"\(codecs)\""
         if sig.fps > 0 { fbInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
         let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia.m3u8\n"
-        DiagnosticsLog.log("dv", "hls master served (2 variants)")
-        respond(connection, body: Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")
+        let body = Data(playlist.utf8)
+        DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=2 \(body.count)B")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
     /// Segments the FIRST media-playlist answer waits for, so AVPlayer's startup buffer math never sees a
@@ -303,6 +319,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// math has something to chew on; later reloads answer immediately with whatever exists.
     private func serveMedia(_ connection: NWConnection) {
         struct Ready { let segments: [VortXMKVRemuxStream.HLSSegment]; let ended: Bool }
+        // Was the startup gate already open on the FIRST probe? If not, this is a HELD startup request (one of
+        // the two concurrent per-variant fetches of the same URI) and must share ONE body with its sibling so
+        // the two never disagree on segment count (-12927). A request that finds the gate already open is a
+        // post-startup reload and builds fresh below so the EVENT playlist keeps growing.
+        let gateOpenOnEntry: Bool = {
+            let snap = stream.hlsSnapshot()
+            return snap.initData != nil && !snap.segments.isEmpty
+                && (snap.segments.count >= Self.minStartupSegments || snap.ended)
+        }()
         let ready = waitFor(seconds: Self.resourceWaitSeconds) { () -> Ready? in
             let snap = stream.hlsSnapshot()
             guard snap.initData != nil, !snap.segments.isEmpty,
@@ -321,6 +346,30 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        // Single-flight the held startup answers (#76): the first held request builds ONE body when the gate
+        // opens and stores it; the concurrent sibling answers those identical bytes. Reloads build fresh.
+        let singleFlight = !gateOpenOnEntry
+        let body: Data
+        if singleFlight {
+            mediaGateLock.lock()
+            if let cached = startupMediaBody {
+                body = cached
+            } else {
+                body = Self.buildMediaBody(segments: ready.segments, ended: ready.ended)
+                startupMediaBody = body
+            }
+            mediaGateLock.unlock()
+        } else {
+            body = Self.buildMediaBody(segments: ready.segments, ended: ready.ended)
+        }
+        DiagnosticsLog.log("dv", "hls resp /media.m3u8 segs=\(ready.segments.count) ended=\(ready.ended) \(body.count)B\(singleFlight ? " [startup single-flight]" : "")")
+        respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+    }
+
+    /// Build the EVENT media playlist bytes for a given closed-segment set. Pure and deterministic: the same
+    /// (segments, ended) always yields byte-identical output, so two requests that share one snapshot cannot
+    /// disagree. Playback starts at the beginning; entries are only ever appended (MEDIA-SEQUENCE stays 0).
+    private static func buildMediaBody(segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool) -> Data {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
@@ -329,14 +378,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             "#EXT-X-PLAYLIST-TYPE:EVENT",
             "#EXT-X-MAP:URI=\"init.mp4\"",
         ]
-        for seg in ready.segments {
+        for seg in segments {
             lines.append(String(format: "#EXTINF:%.3f,", seg.duration))
             lines.append("seg\(seg.index).m4s")
         }
-        if ready.ended { lines.append("#EXT-X-ENDLIST") }
+        if ended { lines.append("#EXT-X-ENDLIST") }
         lines.append("")
-        respond(connection, body: Data(lines.joined(separator: "\n").utf8),
-                contentType: "application/vnd.apple.mpegurl")
+        return Data(lines.joined(separator: "\n").utf8)
     }
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
@@ -346,6 +394,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        DiagnosticsLog.log("dv", "hls resp /init.mp4 \(initData.count)B")
         respond(connection, body: initData, contentType: "video/mp4")
     }
 
@@ -369,6 +418,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        DiagnosticsLog.log("dv", "hls resp /seg\(index).m4s \(seg.byteLength)B")
         let head = "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: \(seg.byteLength)\r\nConnection: close\r\n\r\n"
         connection.send(content: Data(head.utf8), completion: .contentProcessed { [weak self] error in
             guard let self, error == nil else { connection.cancel(); return }

@@ -46,6 +46,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// notification can BOTH fire for one failure; a duplicate event lands after the chrome has already
     /// demoted to libmpv and used to punch through into its retry/error path (the DV "error screen").
     private var fatalErrorEmitted = false
+    /// One-shot per mount for the healthy-mount retry (#76). A DV mount whose remux is provably healthy (init
+    /// published, buffer not failed) can still fail its AVPlayerItem 4-5ms after /init.mp4 is fetched (a
+    /// CoreMedia startup hiccup on the loopback HLS origin). The chrome retries ONE fresh item on the same mount
+    /// before demoting; this flag makes that retry happen at most once, resetting only on the next loadFile.
+    private var healthyMountRetried = false
     // AUDIO-OVER-BLACK watchdog state (#76 residual, native DV lane only; see checkAudioOverBlackWatchdog).
     // `videoFrameEverProduced` latches TRUE on the first observed video frame and permanently disarms the
     // watchdog for this item, so it can never fire on a session that ever showed a picture. `audioOverBlackSince`
@@ -125,7 +130,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool) {
         teardownObservers()
         teardownRemux()
-        isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
+        isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false; healthyMountRetried = false
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []
         disableExternalSubtitle()   // a new title starts with no external overlay sub
@@ -224,6 +229,39 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // Drive the current status now: the KVO below uses [.initial, .new], but an item that is already
         // readyToPlay at attach time still benefits from an explicit kick so play() is never skipped.
         if newItem.status != .unknown { handleStatus(newItem) }
+    }
+
+    /// One-shot healthy-mount retry (#76). Field logs show the served /media.m3u8 answered and /init.mp4
+    /// fetched, then the AVPlayerItem fails 4-5ms later on a mount whose remux is provably HEALTHY (init
+    /// published, buffer not failed). That 5ms window is a CoreMedia startup hiccup on the loopback HLS origin,
+    /// not a dead stream, so the chrome (which owns the demote decision) asks for ONE fresh AVPlayerItem on the
+    /// SAME mount before demoting to libmpv. Idempotent per mount (`healthyMountRetried` resets only on the next
+    /// loadFile), so a genuinely broken mount fails the fresh item too and then demotes normally. Returns true
+    /// iff a retry was issued, in which case the caller swallows this failure instead of demoting.
+    func retryFreshItemOnHealthyMount() -> Bool {
+        guard let server = remuxHLSServer, server.isMountHealthy, !healthyMountRetried,
+              let mountURL = (item?.asset as? AVURLAsset)?.url else { return false }
+        healthyMountRetried = true
+        DiagnosticsLog.log("dv", "healthy-mount retry (#76): item failed but remux healthy (init published, buffer OK) -> one fresh AVPlayerItem on 127.0.0.1:\(server.port)")
+        VXProbe.log("dv", "AVPlayer .failed on a HEALTHY remux mount -> ONE fresh-item retry (same mount) before any demote")
+        teardownObservers()
+        // Fresh item = fresh per-item state; the mount (remux thread + local HLS server) stays up. Clear
+        // fatalErrorEmitted so a SECOND failure can still emit endFileError and demote (bounded by the one-shot
+        // flag above); the audio-over-black / first-frame latches reset for the new item too.
+        isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
+        videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
+        let freshItem = AVPlayerItem(asset: AVURLAsset(url: mountURL))
+        item = freshItem
+        freshItem.preferredForwardBufferDuration = 30   // same loopback forward-buffer cap as the initial mount
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ])
+        freshItem.add(output)
+        videoOutput = output
+        player.replaceCurrentItem(with: freshItem)
+        observe(freshItem)
+        if freshItem.status != .unknown { handleStatus(freshItem) }
+        return true
     }
 
     func play() { player.rate = requestedRate }   // rate > 0 starts playback at the chosen speed
