@@ -64,9 +64,13 @@ jobs:
         working-directory: android
         run: gradle assembleDebug --no-daemon --stacktrace
 
+      # assembleDebug builds every flavor, and the full/play flavor split moved the outputs from
+      # apk/debug/ to apk/<flavor>/debug/ -- glob both so the artifact carries the sideload `full`
+      # APK and the `play` APK. error (not warn) so a path drift fails the job instead of silently
+      # uploading nothing.
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
           name: VortX-Android-debug
-          path: android/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: warn
+          path: android/app/build/outputs/apk/*/debug/*.apk
+          if-no-files-found: error
