@@ -237,6 +237,9 @@ struct RootTabView: View {
         // Offline chip (#120): a quiet bottom capsule while the device has no network path. Pure
         // signal (never focusable, never navigates); it clears on its own when connectivity returns,
         // and online tabs stay reachable for cached browsing.
+        // STRUCTURE-DEPENDENT: the chip hides with the shell only because it lives INSIDE
+        // RootTabView, which RootView wraps in the shell-opacity gate (shellVisible); hoisting it to
+        // RootView's ZStack would strand a visible chip over the profile picker / player.
         .overlay(alignment: .bottom) { offlineBanner }
         .animation(.easeOut(duration: 0.25), value: connectivity.isOffline)
         // Offline-at-LAUNCH routing (#120): the monitor's FIRST verdict (and only that one) may move

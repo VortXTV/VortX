@@ -199,6 +199,10 @@ struct iOSRootView: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             // Offline strip above the update banner: both are shell-wide top inserts, so they stack
             // rather than fight over the one safe-area slot.
+            // ORDER-DEPENDENT: this inset must stay applied BEFORE the shell-opacity modifier below
+            // (i.e. inside the shell-opacity subtree) so both banners hide with the shell while the
+            // profile picker is owed; hoisting it past .opacity(shellVisible) would strand a visible
+            // banner floating over the picker.
             VStack(spacing: 0) {
                 offlineBanner
                 updateBanner
@@ -1145,12 +1149,24 @@ struct iOSLibraryView: View {
         // Quiet the ambient hero while this tab is hidden (mounted but opacity 0, so onDisappear never
         // fires); re-arm on return. Reseeds below are gated the same way so re-emits can't re-arm it.
         .onChange(of: isActive) { active in
+            #if !os(tvOS)
+            // Offline launch routing handoff (#120), already-mounted case: hidden tabs stay mounted
+            // forever (opacity-switched, #24), so a Library visited earlier in the session gets NO
+            // fresh onAppear when the shell routes back to it; without this, the staged push would be
+            // swallowed silently and the flag stranded true. The onAppear consume below still covers
+            // the fresh first mount; the flag flips false on whichever consumes first, so the push
+            // can never fire twice.
+            if active, Self.pendingDownloadsPush {
+                Self.pendingDownloadsPush = false
+                path.append(LibraryRoute.downloads)
+            }
+            #endif
             if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
         }
         .onAppear {
             #if !os(tvOS)
-            // Offline launch routing handoff (#120): land directly on the Downloads screen when the
-            // shell staged it (the app opened offline and a completed download exists to play).
+            // Offline launch routing handoff (#120), fresh-mount case: land directly on the Downloads
+            // screen when the shell staged it (the app opened offline and a completed download exists).
             if Self.pendingDownloadsPush {
                 Self.pendingDownloadsPush = false
                 path.append(LibraryRoute.downloads)
