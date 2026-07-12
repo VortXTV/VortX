@@ -111,6 +111,9 @@ enum PlayerEngineRouter {
         // but ONLY for a container AVFoundation can demux (MP4/MOV/M4V or HLS). DV in an MKV must stay on
         // libmpv: AVFoundation has no Matroska demuxer, so routing it to AVPlayer would just fail over to
         // libmpv anyway (tone-mapped). The AVPlayer->libmpv .failed fallback in the chrome is the backstop.
+        // The container is known here but the HEVC SAMPLE ENTRY is not (that needs the bytes), so an MP4 whose
+        // entry is the AVPlayer-incompatible hev1/dvhe form still routes here; AVPlayerEngineController's
+        // post-attach repair (#76) then re-mounts it through the remux lane (hvc1/dvh1) instead of black.
         if isDolbyVision, isAVPlayerContainer(url) { return .avfoundation }
 
         // (3b) Dolby Vision in a container AVFoundation CANNOT demux (chiefly MKV, or an extensionless debrid

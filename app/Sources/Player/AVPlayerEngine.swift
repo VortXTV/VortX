@@ -121,6 +121,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// with only the remux-gated post-ready request, a native DV MP4/MOV/HLS routed here never switched the
     /// panel at all (a raw AVPlayerLayer gets no AVKit auto-switching).
     var contentIsDolbyVision = false
+    // Last-load params, retained so the post-attach hev1/dvhe repair (#76) can re-mount the SAME source through
+    // the remux lane. A native DV MP4/MOV with an hev1/dvhe sample entry reaches readyToPlay and renders black
+    // over decoded audio (AVFoundation needs the hvc1/dvh1 out-of-band form); re-loading it with `forceRemux`
+    // set routes it into the container-agnostic MKV->fMP4 remux, which rewrites the sample entry to hvc1/dvh1.
+    private var lastLoadURL: URL?
+    private var lastLoadHeaders: [String: String]?
+    private var lastLoadLive = false
+    /// Forces the next loadFile onto the remux lane regardless of the router's container gate (which rejects
+    /// mp4/mov). Consumed (reset to false) inside loadFile; set only by the hev1/dvhe post-attach repair.
+    private var forceRemux = false
+    /// One-shot per load: guards the post-attach hev1/dvhe repair so a single incompatible sample entry triggers
+    /// at most one remux re-mount (or one libmpv demote). Reset on every loadFile.
+    private var incompatibleEntryHandled = false
     // Dedicated serial queue for the resource-loader delegate callbacks, so the blocking buffer reads never
     // run on the main thread.
     private let remuxLoaderQueue = DispatchQueue(label: "vortx.dvremux.delegate")
@@ -131,6 +144,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         teardownObservers()
         teardownRemux()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false; healthyMountRetried = false
+        incompatibleEntryHandled = false
+        lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []
         disableExternalSubtitle()   // a new title starts with no external overlay sub
@@ -149,7 +164,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // stays compiled behind VortXRemuxHLSServer.deliveryEnabled for instant rollback. Everything below
         // (KVO, track selection, trickplay tap) is identical; only the asset's source differs.
         let newAsset: AVURLAsset
-        let wantsRemux = PlayerEngineRouter.shouldDVRemux(url: url)
+        // `forceRemux` (set by the hev1/dvhe post-attach repair) overrides the router's container gate, which
+        // rejects mp4/mov: an AVPlayer-incompatible DV MP4 still routes into the container-agnostic remux lane.
+        // Consumed here so it applies to exactly this load.
+        let wantsRemux = forceRemux || PlayerEngineRouter.shouldDVRemux(url: url)
+        forceRemux = false
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers) {
             remuxHLSServer = mounted.server
@@ -748,13 +767,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// track's sample-entry fourcc, coded dimensions, natural size, enabled flag, and which sample
     /// description extension atoms (dvcC/dvvC/hvcC/...) are present. This is the data that separates "the
     /// file's DV carriage is one tvOS cannot decode" (audio over black, wrong presentationSize) from any
-    /// app-side cause, without changing playback behavior in any way. Fail-soft: any load error just logs.
+    /// app-side cause. b176 (#76): it also ACTS on an AVPlayer-incompatible hev1/dvhe entry on the native DV
+    /// lane, routing it through the remux lane (or to libmpv HDR10) instead of leaving it black. Fail-soft:
+    /// any load error just logs.
     private func logDVVideoTrackDiagnostics(_ item: AVPlayerItem) {
         let asset = item.asset
         Task { @MainActor in
             let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
             if tracks.isEmpty {
-                DiagnosticsLog.log("dv", "readyToPlay with ZERO video tracks (audio-only mount)")
+                // Neutral: an HLS asset (every healthy remux play) reports no AVAssetTrack objects here, so this
+                // is NOT an error and NOTHING keys logic off it. The native-lane repair below reads real tracks.
+                DiagnosticsLog.log("dv", "item reports no track objects (normal for HLS)")
                 return
             }
             for track in tracks {
@@ -780,8 +803,43 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                         atoms = dict.keys.sorted().joined(separator: ",")
                     }
                     DiagnosticsLog.log("dv", "video track id=\(track.trackID) fourcc=\(fourcc) coded=\(dims.width)x\(dims.height) natural=\(Int(natural.width))x\(Int(natural.height)) enabled=\(enabled) atoms=[\(atoms)]")
+                    // #76: hev1/dvhe carry parameter sets IN-BAND; AVFoundation decodes DV/HEVC only from the
+                    // out-of-band hvc1/dvh1 form, so a native DV MP4/MOV with this entry reaches readyToPlay and
+                    // renders BLACK over decoded audio. Route it through the remux lane (which rewrites the sample
+                    // entry to hvc1/dvh1) immediately, rather than sitting on black until the audio-over-black
+                    // watchdog. Native DV lane only (the remux output is already hvc1/dvh1); one-shot per load.
+                    if !isRemuxMounted, contentIsDolbyVision, !incompatibleEntryHandled,
+                       fourcc == "hev1" || fourcc == "dvhe" {
+                        incompatibleEntryHandled = true
+                        repairIncompatibleDVSampleEntry(fourcc)
+                        return
+                    }
                 }
             }
+        }
+    }
+
+    /// Post-attach hev1/dvhe repair (#76). AVFoundation cannot decode a Dolby Vision HEVC track whose sample
+    /// entry is hev1/dvhe (in-band parameter sets): it reaches readyToPlay and plays audio over a black picture.
+    /// The remux lane re-opens the SAME source with libav (container-agnostic: MP4 demuxes as readily as MKV)
+    /// and re-muxes to fMP4 with an hvc1/dvh1 sample entry, so re-mount THIS url through it for true DV. When the
+    /// remux lane is off for this display, demote straight to libmpv HDR10 (honest) instead of waiting for the
+    /// audio-over-black watchdog. Runs on the main actor (the diagnostics Task hops there before calling this).
+    @MainActor
+    private func repairIncompatibleDVSampleEntry(_ fourcc: String) {
+        guard let url = lastLoadURL else { return }
+        if VortXRemuxHLSServer.deliveryEnabled,
+           PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable) {
+            DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable (black over audio) -> re-mounting \(url.host ?? "?") through the remux lane for hvc1 repair")
+            VXProbe.log("dv", "native DV \(fourcc) -> remux re-mount (hvc1/dvh1 repair)")
+            forceRemux = true
+            loadFile(url, headers: lastLoadHeaders, live: lastLoadLive)
+        } else {
+            guard !fatalErrorEmitted else { return }
+            fatalErrorEmitted = true
+            DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable and the remux lane is off -> demoting to libmpv HDR10")
+            VXProbe.log("dv", "native DV \(fourcc) -> libmpv HDR10 (remux lane off)")
+            emit(MPVProperty.endFileError, "Dolby Vision sample entry not decodable (\(fourcc))")
         }
     }
 
