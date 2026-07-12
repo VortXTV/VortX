@@ -226,9 +226,23 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // previously never set preferredDisplayCriteria at all). fps/size are unknown pre-attach; the
         // readyToPlay request below re-asserts with the real values. Fail-soft: a refused/ignored request
         // changes nothing about playback, and reset() on stop() restores the default mode.
-        if isRemuxMounted || contentIsDolbyVision {
+        if isRemuxMounted {
+            // REMUX lane: DEFER the panel switch to the point classify confirms a DECODABLE DV profile (#76).
+            // The remux stream knows the profile ~1.5-6s in; VortXRemuxHLSServer.serveMaster fires the switch
+            // once the DV signaling is published and BEFORE the media playlist / first segment (still ahead of
+            // the video mount, per Tech Talk 503 ordering). Firing it here on mount cycled the panel twice per
+            // hop whenever classify then rejected a non-DV / undecodable source. Neither switch NOR reset here:
+            // a reject 404s the playlist and demotes to libmpv (which resets on stop), and a same-DV back-to-back
+            // play keeps the panel steady instead of reset-then-reswitch. Matches the old behavior of never
+            // resetting on the remux path, just deferring the request.
+            DiagnosticsLog.log("dv", "Dolby Vision display switch deferred to classify (remux lane)")
+        } else if contentIsDolbyVision {
+            // NATIVE DV lane (DV-flagged MP4/MOV/HLS on raw AVPlayer): the profile is NOT knowable before the
+            // item demuxes, so keep the pre-attach switch on the text-parse DV flag. The readyToPlay re-assert
+            // below corrects fps/size. An hev1/dvhe entry is re-routed to the remux lane post-attach (#76), so a
+            // genuinely undecodable native DV file does not linger switched.
             HDRDisplayMode.request(.dolbyVision, fps: 0, width: 0, height: 0, in: nil)
-            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (remux=\(isRemuxMounted) dvFlag=\(contentIsDolbyVision))")
+            DiagnosticsLog.log("dv", "requested Dolby Vision display mode pre-attach (native DV lane, dvFlag=true)")
         } else {
             // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
             // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.

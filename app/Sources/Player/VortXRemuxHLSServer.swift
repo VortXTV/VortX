@@ -269,6 +269,31 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             close(connection, status: "404 Not Found")
             return
         }
+        #if os(tvOS)
+        // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published DV signaling (a
+        // decodable DV profile), and BEFORE the media playlist / any segment (the real video mount). This
+        // replaces the old pre-attach switch in loadFile, which fired on mount for every remux candidate and
+        // cycled the panel twice per hop whenever classify then rejected a non-DV / undecodable source (that
+        // path 404s the guard above and never reaches this line, so it never switches). The native (non-remux)
+        // DV lane still switches pre-attach because AVPlayer cannot report the profile before it demuxes.
+        // `request` is @MainActor and a no-op on iOS/macOS; only a signaling that actually advertises DV (a
+        // dvh1 P5 videoCodec or a SUPPLEMENTAL-CODECS P8.x) switches (a plain-HEVC HDR10 remux does not). Fire
+        // synchronously (bounded semaphore) so setSwitchSettled(false) lands before the settle-wait below, which
+        // is what closes the master-parse race the wait exists for.
+        let sigIsDV = sig.supplementalCodec != nil || sig.videoCodec.lowercased().hasPrefix("dvh1")
+        if sigIsDV {
+            let switched = DispatchSemaphore(value: 0)
+            let dvFps = sig.fps, dvWidth = sig.width, dvHeight = sig.height
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {   // request() is @MainActor; this closure runs on the main queue
+                    HDRDisplayMode.request(.dolbyVision, fps: dvFps, width: dvWidth, height: dvHeight, in: nil)
+                }
+                switched.signal()
+            }
+            _ = switched.wait(timeout: .now() + 2)   // bounded: a wedged main must not hang the serve task
+            DiagnosticsLog.log("dv", "remux classify confirmed DV -> requested Dolby Vision display mode before mount (fps=\(String(format: "%.3f", sig.fps)) \(sig.width)x\(sig.height))")
+        }
+        #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
         // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
         // is provably HDR, and that choice is session-persistent, so a master fetched mid-switch can pin the
