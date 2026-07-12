@@ -2365,25 +2365,38 @@ struct iOSDetailView: View {
                 // Always render the season chips (even single-season): they host the per-season /
                 // whole-series Mark-Watched menu (long-press), the same as tvOS.
                 if !seasons.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: Theme.Space.sm) {
-                            ForEach(seasons, id: \.self) { s in
-                                Button { season = s } label: { Text(seasonLabel(s)) }
-                                    .buttonStyle(ChipButtonStyle(selected: season == s))
-                                    .contextMenu {
-                                        seasonWatchedMenu(s)
-                                        #if !os(tvOS)
-                                        // #119: download ANY season straight from its chip, without
-                                        // first switching the visible season.
-                                        Divider()
-                                        Button { startBatchDownload(episodesInSeason(s)) } label: {
-                                            Label("Download \(seasonLabel(s))", systemImage: "arrow.down.circle")
-                                        }
-                                        #endif
-                                    }
-                            }
+                    HStack(spacing: Theme.Space.sm) {
+                        #if !os(tvOS)
+                        // #119: persistent running count while multi-selecting, pinned OUTSIDE the
+                        // scrolling chips (it must not scroll away on a long season row) so a pick
+                        // made on another season stays visible after switching.
+                        if selectingEpisodes, !selectedEpisodeIds.isEmpty {
+                            Text(selectionCountLabel(videos))
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.accent)
+                                .fixedSize()
                         }
-                        .padding(.vertical, Theme.Space.xs)
+                        #endif
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: Theme.Space.sm) {
+                                ForEach(seasons, id: \.self) { s in
+                                    Button { season = s } label: { Text(seasonLabel(s)) }
+                                        .buttonStyle(ChipButtonStyle(selected: season == s))
+                                        .contextMenu {
+                                            seasonWatchedMenu(s)
+                                            #if !os(tvOS)
+                                            // #119: download ANY season straight from its chip, without
+                                            // first switching the visible season.
+                                            Divider()
+                                            Button { startBatchDownload(episodesInSeason(s)) } label: {
+                                                Label("Download \(seasonLabel(s))", systemImage: "arrow.down.circle")
+                                            }
+                                            #endif
+                                        }
+                                }
+                            }
+                            .padding(.vertical, Theme.Space.xs)
+                        }
                     }
                 }
 
@@ -2571,15 +2584,24 @@ struct iOSDetailView: View {
         .buttonStyle(ChipButtonStyle())
     }
 
-    /// Inline batch feedback for THIS series: the walk's live "S1E5 · 3 of 8" line with a Stop action,
-    /// then the end-of-batch summary (queued / already downloaded / skipped) until dismissed.
+    /// Inline batch feedback for THIS series only. When this series' episode is the one resolving
+    /// right now, the live "S1E5 · 3 of 8" line (per-series counters); when this series is queued
+    /// behind another show's batch, a generic waiting line with ITS OWN count, never the other show's
+    /// episode label; then the end-of-batch summary (queued / already downloaded / skipped) until
+    /// dismissed.
     @ViewBuilder private var batchStatusLine: some View {
-        if batch.runningSeriesIds.contains(id), let status = batch.statusText {
+        if batch.runningSeriesIds.contains(id) {
             HStack(spacing: Theme.Space.sm) {
                 ProgressView().controlSize(.small)
-                Text("Finding sources · \(status)")
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
+                if batch.currentSeriesId == id, let status = batch.statusText {
+                    Text("Finding sources · \(status)")
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                } else {
+                    Text("Batch downloading · \(batch.remainingBySeries[id] ?? 0) waiting")
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
                 Spacer(minLength: 0)
                 Button("Stop") { batch.cancel() }
                     .font(Theme.Typography.label)
@@ -2607,9 +2629,28 @@ struct iOSDetailView: View {
         }
     }
 
+    /// How many distinct seasons the current selection spans (0 when nothing is selected). Selection
+    /// deliberately survives a season switch, so the Download label + count indicator must say when a
+    /// pick reaches beyond the visible season instead of silently including invisible episodes.
+    private func selectedSeasonSpan(_ videos: [CoreVideo]) -> Int {
+        Set(videos.filter { selectedEpisodeIds.contains($0.id) }.map { $0.season ?? 1 }).count
+    }
+
+    /// "N selected" (plus the season span when it crosses seasons), shown beside the season chips
+    /// while selecting so the running pick stays visible even after switching seasons.
+    private func selectionCountLabel(_ videos: [CoreVideo]) -> String {
+        let count = selectedEpisodeIds.count
+        let span = selectedSeasonSpan(videos)
+        guard span > 1 else { return String(localized: "\(count) selected") }
+        return String(localized: "\(count) selected · \(span) seasons")
+    }
+
     /// The multi-select action bar: Select Season adds the visible season's episodes to the pick,
     /// Download hands the selection (in airing order, across seasons) to the coordinator, Cancel exits.
+    /// The Download label calls out a cross-season pick ("Download 7 · 2 seasons") so episodes selected
+    /// on a season no longer on screen are never queued silently.
     @ViewBuilder private func episodeSelectionBar(_ videos: [CoreVideo]) -> some View {
+        let span = selectedSeasonSpan(videos)
         FlowLayout(spacing: Theme.Space.sm) {
             Button { selectedEpisodeIds.formUnion(episodes(videos).map(\.id)) } label: {
                 Label("Select \(seasonLabel(season))", systemImage: "checklist")
@@ -2621,7 +2662,9 @@ struct iOSDetailView: View {
                 selectingEpisodes = false
                 selectedEpisodeIds = []
             } label: {
-                Label("Download \(selectedEpisodeIds.count)", systemImage: "arrow.down.circle")
+                Label(span > 1 ? "Download \(selectedEpisodeIds.count) · \(span) seasons"
+                               : "Download \(selectedEpisodeIds.count)",
+                      systemImage: "arrow.down.circle")
             }
             .buttonStyle(ChipButtonStyle(selected: true))
             .disabled(selectedEpisodeIds.isEmpty)
@@ -2633,13 +2676,15 @@ struct iOSDetailView: View {
     }
 
     /// Hand an ordered episode list to the batch coordinator with the SAME ranking context a manual
-    /// best-download captures right now (quality continuity, source pin, confirmed debrid cache), so
-    /// every episode's auto-pick matches what "download best" would have chosen by hand.
+    /// best-download captures right now (quality continuity, source pin, confirmed debrid cache, and
+    /// the show's imdb id so the coordinator can refresh the TorBox-search / Singularity contributors
+    /// exactly as the episode page would), so every episode's auto-pick matches a by-hand best-download.
     private func startBatchDownload(_ vids: [CoreVideo]) {
         guard let m = meta, !vids.isEmpty else { return }
         BatchDownloadCoordinator.shared.enqueue(
-            seriesId: m.id, seriesName: m.name, fallbackPoster: m.poster, episodes: vids,
-            continuity: rememberedQuality, pin: sourcePin, cachedHashes: debridCache.cachedHashes)
+            seriesId: m.id, seriesName: m.name, seriesImdbId: ratingsImdbID, fallbackPoster: m.poster,
+            episodes: vids, continuity: rememberedQuality, pin: sourcePin,
+            cachedHashes: debridCache.cachedHashes)
     }
     #endif
 
