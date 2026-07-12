@@ -778,6 +778,12 @@ struct SettingsView: View {
                       selection: Binding(get: { sourcePrefs.hdrOnly ? "1" : "0" }, set: { sourcePrefs.hdrOnly = ($0 == "1") }))
             choiceRow(String(localized: "Hide AV1 sources"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { sourcePrefs.excludeAV1 ? "1" : "0" }, set: { sourcePrefs.excludeAV1 = ($0 == "1") }))
+            // #117 (c): best-effort audio-language filter (SAME SourcePreferences property the iOS/Mac
+            // toggle binds), honest about its limits in the caption below.
+            choiceRow(String(localized: "Preferred audio only"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { sourcePrefs.preferredAudioOnly ? "1" : "0" }, set: { sourcePrefs.preferredAudioOnly = ($0 == "1") }))
+            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Max quality"),
                       [("0", String(localized: "Unlimited")), ("4000", "4K"), ("1080", "1080p"), ("720", "720p")],
                       selection: Binding(get: { String(sourcePrefs.maxResolution) }, set: { sourcePrefs.maxResolution = Int($0) ?? 0 }))

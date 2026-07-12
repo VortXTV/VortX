@@ -792,6 +792,10 @@ struct iOSSettingsView: View {
             Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
             Toggle("HDR sources only", isOn: $sourcePrefs.hdrOnly).tint(Theme.Palette.accent)
             Toggle("Hide AV1 sources", isOn: $sourcePrefs.excludeAV1).tint(Theme.Palette.accent)
+            // #117 (c): best-effort audio-language filter, honest about its limits in the footnote below.
+            Toggle("Preferred audio languages only", isOn: $sourcePrefs.preferredAudioOnly).tint(Theme.Palette.accent)
+            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
+                .font(.footnote).foregroundStyle(.secondary)
             Picker("Max quality", selection: $sourcePrefs.maxResolution) {
                 Text("Unlimited").tag(0)
                 Text("4K").tag(4000)

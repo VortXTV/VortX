@@ -70,6 +70,7 @@ protocol SourcePrefsReading {
     var maxResolution: Int { get }
     var minResolution: Int { get }
     var hideUnknownResolution: Bool { get }
+    var preferredAudioOnly: Bool { get }
     var maxFileSizeGB: Double { get }
     func tierWeight(for type: SourceType) -> Int
     func matches(_ regex: NSRegularExpression, _ text: String) -> Bool
@@ -90,6 +91,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let maxResolutionKey      = "stremiox.streaming.maxResolution"
     static let minResolutionKey      = "stremiox.streaming.minResolution"
     static let hideUnknownResKey     = "stremiox.streaming.hideUnknownResolution"
+    static let preferredAudioKey     = "stremiox.streaming.preferredAudioOnly"
     static let maxFileSizeKey        = "stremiox.streaming.maxFileSizeGB"
     static let hdrOnlyKey            = "stremiox.streaming.hdrOnly"
     static let excludeAV1Key         = "stremiox.streaming.excludeAV1"
@@ -169,6 +171,14 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     @Published var hideUnknownResolution: Bool {
         didSet { UserDefaults.standard.set(hideUnknownResolution, forKey: Self.hideUnknownResKey) }
     }
+    /// Best-effort audio-language filter (#117): hide a source only when its parsed language signals
+    /// POSITIVELY identify a foreign-audio release (the same conservative detection as the ranking's
+    /// foreign-audio demotion, `StreamRanking.languageScore`). A source that states no language, carries
+    /// the viewer's language, or is multi-language is ALWAYS kept, so this can never empty a list just
+    /// because add-ons do not tag languages. Off by default.
+    @Published var preferredAudioOnly: Bool {
+        didSet { UserDefaults.standard.set(preferredAudioOnly, forKey: Self.preferredAudioKey) }
+    }
     /// Cap the file size of shown sources in GB (0 = unlimited). Only drops a source whose ADVERTISED
     /// size exceeds the cap, so sources with no stated size (many cached / debrid links) are kept.
     /// Off (0) by default. Pairs with `maxResolution` for "1080p but not a 20 GB file".
@@ -193,7 +203,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     var noFiltersActive: Bool {
         !keywordFilterActive && safetyMode == "off"
             && !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0
-            && minResolution == 0 && !hideUnknownResolution && maxFileSizeGB == 0
+            && minResolution == 0 && !hideUnknownResolution && !preferredAudioOnly && maxFileSizeGB == 0
     }
 
     /// Whether the Hide / Require fields impose any filter, accounting for regex vs substring mode.
@@ -218,6 +228,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
          String(maxResolution),
          String(minResolution),
          hideUnknownResolution ? "1" : "0",
+         preferredAudioOnly ? "1" : "0",
          String(maxFileSizeGB),
          hdrOnly ? "1" : "0",
          excludeAV1 ? "1" : "0",
@@ -263,6 +274,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         maxResolution   = UserDefaults.standard.integer(forKey: Self.maxResolutionKey)
         minResolution   = UserDefaults.standard.integer(forKey: Self.minResolutionKey)
         hideUnknownResolution = UserDefaults.standard.bool(forKey: Self.hideUnknownResKey)
+        preferredAudioOnly = UserDefaults.standard.bool(forKey: Self.preferredAudioKey)
         maxFileSizeGB   = UserDefaults.standard.double(forKey: Self.maxFileSizeKey)
         hdrOnly         = UserDefaults.standard.bool(forKey: Self.hdrOnlyKey)
         excludeAV1      = UserDefaults.standard.bool(forKey: Self.excludeAV1Key)
@@ -313,6 +325,8 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if minResolution != minRes { minResolution = minRes }
         let hideUnknown = d.bool(forKey: Self.hideUnknownResKey)
         if hideUnknownResolution != hideUnknown { hideUnknownResolution = hideUnknown }
+        let prefAudio = d.bool(forKey: Self.preferredAudioKey)
+        if preferredAudioOnly != prefAudio { preferredAudioOnly = prefAudio }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
     }
@@ -379,6 +393,7 @@ extension SourcePreferences {
         let maxResolution: Int
         let minResolution: Int
         let hideUnknownResolution: Bool
+        let preferredAudioOnly: Bool
         let maxFileSizeGB: Double
 
         /// Same logic as `SourcePreferences.tierWeight`, over the snapshotted `typeOrder`.
@@ -400,7 +415,8 @@ extension SourcePreferences {
                  excludeTerms: excludeTerms, includeTerms: includeTerms, safetyMode: safetyMode,
                  instantOnly: instantOnly, hideDeadTorrents: hideDeadTorrents, excludeAV1: excludeAV1,
                  hdrOnly: hdrOnly, maxResolution: maxResolution, minResolution: minResolution,
-                 hideUnknownResolution: hideUnknownResolution, maxFileSizeGB: maxFileSizeGB)
+                 hideUnknownResolution: hideUnknownResolution, preferredAudioOnly: preferredAudioOnly,
+                 maxFileSizeGB: maxFileSizeGB)
     }
 
     /// The off-main override for the ranker. When installed (by `SourceListModel`'s detached rank via

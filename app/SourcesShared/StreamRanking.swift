@@ -625,6 +625,11 @@ enum StreamRanking {
         if prefs.minResolution > 0, let res = knownResolution(text),
            res < prefs.minResolution { return false }   // floor KNOWN resolutions; unlabelled sources are kept (#117)
         if prefs.hideUnknownResolution, knownResolution(text) == nil { return false }  // no recognizable resolution token (#117)
+        // Best-effort audio-language filter (#117): drop ONLY when the parse POSITIVELY identifies a
+        // single foreign-audio release (languageScore's conservative -5000 case). A release with no
+        // language stated, the viewer's language, or multiple languages scores 0 and is always kept,
+        // so untagged add-on output can never be emptied by this toggle.
+        if prefs.preferredAudioOnly, languageScore(text) < 0 { return false }
         if prefs.maxFileSizeGB > 0 {                                                          // cap advertised file size
             let gb = sizeGB(text) > 0 ? sizeGB(text) : sizeMB(text) / 1024
             if gb > 0, gb > prefs.maxFileSizeGB { return false }                              // unknown-size sources pass
