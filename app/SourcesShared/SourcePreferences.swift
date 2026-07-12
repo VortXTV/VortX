@@ -28,9 +28,9 @@ enum SourceType: String, CaseIterable, Codable {
 
 /// One-tap source presets that set the quality caps + source-type order together, so a viewer can pick a
 /// taste ("biggest/best files" vs "save data") without tuning each control. Applying one writes the same
-/// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and the
-/// source-type order it sets is captured per-profile by the Settings `onChange(of: typeOrder)` exactly like a
-/// manual reorder. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
+/// `@Published` knobs the Settings controls bind to, so their `didSet`s persist + invalidate caches, and every
+/// knob it sets is captured per-profile by the Settings `onChange(of: rankingSignature)` trigger exactly like a
+/// manual edit. Presets leave the keyword/regex filters and safety mode alone (those are user-owned).
 enum SourcePreset: String, CaseIterable, Identifiable {
     case bestQuality, balanced, dataSaver
     var id: String { rawValue }

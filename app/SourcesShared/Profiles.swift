@@ -607,8 +607,8 @@ final class ProfileStore: ObservableObject {
         // SourcePreferences singleton is re-synced (reload()) only on an actual profile SWITCH
         // (select / adoptRemoteRoster), NOT here. applyPlayback also runs from the capture path
         // (capturePlayback -> update -> applyPlayback), where SourcePreferences is already the
-        // source of truth; reloading there would re-fire its @Published didSet and the
-        // SettingsView .onChange(typeOrder) observer, echoing back into capturePlayback.
+        // source of truth; reloading there would re-fire its @Published didSet and the Settings
+        // screens' .onChange(rankingSignature) capture observer, echoing back into capturePlayback.
         StreamRanking.invalidateCaches()
         // Home is per-profile now (it hides this profile's disabled add-ons), so drop the memoized
         // board on every apply. Cheap: rebuildBoardRows recomputes the same rows and re-publishes,
