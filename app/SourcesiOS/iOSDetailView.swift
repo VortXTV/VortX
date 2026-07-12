@@ -4228,6 +4228,9 @@ private struct RestoreSwipeBack: UIViewControllerRepresentable {
             // Hand the recognizer a LONG-LIVED shared delegate, never this soon-to-pop controller:
             // the recognizer only holds its delegate weakly, so a per-page delegate would dangle
             // after the pop and leave an ungated recognizer swallowing edge drags at root.
+            // Note: swapping the delegate also bypasses the system's hidesBackButton refusal. Fine
+            // today (no .navigationBarBackButtonHidden exists in the app); a future intentionally
+            // trapped flow must extend SwipeBackGate to keep refusing there.
             pop.delegate = SwipeBackGate.shared
         }
     }
@@ -4241,7 +4244,11 @@ private final class SwipeBackGate: NSObject, UIGestureRecognizerDelegate {
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         var responder: UIResponder? = gestureRecognizer.view
         while let r = responder {
-            if let nav = r as? UINavigationController { return nav.viewControllers.count > 1 }
+            // Refuse while a push/pop is already animating (transitionCoordinator non-nil): beginning an
+            // interactive pop mid-transition is the classic pop-while-pushing stack corruption.
+            if let nav = r as? UINavigationController {
+                return nav.viewControllers.count > 1 && nav.transitionCoordinator == nil
+            }
             responder = r.next
         }
         return false
