@@ -901,29 +901,72 @@ struct DetailView: View {
     @ViewBuilder private func trailerChip(_ m: CoreMetaItem) -> some View {
         if hasFullTrailer(m) {
             Button {
-                Task { @MainActor in
-                    // DEVICE-DIRECT FIRST: resolve the YouTube stream on the user's own IP (InnerTube from
-                    // the app; a residential IP gets the full streamingData, incl. adaptive 1080p+). A direct
-                    // (non-YouTube) trailer stream still short-circuits everything (no resolver needed).
-                    if directTrailerURL(m) == nil,
-                       let yt = await preferredTrailerYouTubeID(m),
-                       let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
-                        NSLog("[yt-direct] tvOS trailer button: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
-                        // FIX I applies here too: isTrailer keeps a dead link off the engine's content streams.
-                        presenter.request = PlaybackRequest(url: resolved.videoURL, title: "\(m.name) Trailer",
-                                                            isTrailer: true, audioSidecarURL: resolved.audioURL)
-                        return
-                    }
-                    guard let url = await resolveFullTrailerURL(m) else { return }
-                    NSLog("[yt-direct] tvOS trailer button: fallback-worker")
-                    // FIX I: tag this as a trailer so a dead /yt route shows "Trailer unavailable" instead
-                    // of failing over to the engine's content streams (which would play the actual/random movie).
-                    presenter.request = PlaybackRequest(url: url, title: "\(m.name) Trailer", isTrailer: true)
-                }
+                Task { @MainActor in await playFullTrailerInApp(m) }
             } label: {
                 Label("Trailer", systemImage: "film")
             }
             .buttonStyle(ChipButtonStyle())
+            // #95 SECONDARY action (long-press): hand the trailer straight to the YouTube app. The
+            // PRIMARY tap stays in-app playback; this is for viewers who prefer the YouTube app (its
+            // account language/captions) or whose in-app path is failing. Only offered when the meta
+            // actually carries a YouTube id (a direct-only trailer has nothing to open over there).
+            .contextMenu {
+                if m.trailerYouTubeID?.isEmpty == false {
+                    Button {
+                        Task { @MainActor in await openTrailerInYouTubeApp(m) }
+                    } label: {
+                        Label("Open in YouTube", systemImage: "arrow.up.forward.app")
+                    }
+                }
+            }
+        }
+    }
+
+    /// #95 PRIMARY path (chip tap): play the FULL trailer in-app, exactly the pre-#95 chip behavior,
+    /// but every request now carries `trailerYouTubeID` so a dead load can be rescued by the YouTube
+    /// app inside TVPlayerView instead of dead-ending on "Trailer unavailable".
+    @MainActor private func playFullTrailerInApp(_ m: CoreMetaItem) async {
+        // #95: the YouTube id the player hands to the YouTube app if the in-app load dies. The D11
+        // language-preferred pick when the YouTube path resolves one; the meta's default id when a
+        // direct (non-YouTube) stream short-circuits the resolve below.
+        var rescueID = m.trailerYouTubeID.flatMap { $0.isEmpty ? nil : $0 }
+        // DEVICE-DIRECT FIRST: resolve the YouTube stream on the user's own IP (InnerTube from
+        // the app; a residential IP gets the full streamingData, incl. adaptive 1080p+). A direct
+        // (non-YouTube) trailer stream still short-circuits everything (no resolver needed).
+        if directTrailerURL(m) == nil, let yt = await preferredTrailerYouTubeID(m) {
+            rescueID = yt
+            if let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
+                NSLog("[yt-direct] tvOS trailer button: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+                // FIX I applies here too: isTrailer keeps a dead link off the engine's content streams.
+                presenter.request = PlaybackRequest(url: resolved.videoURL, title: "\(m.name) Trailer",
+                                                    isTrailer: true, trailerYouTubeID: yt,
+                                                    audioSidecarURL: resolved.audioURL)
+                return
+            }
+        }
+        guard let url = await resolveFullTrailerURL(m) else { return }
+        NSLog("[yt-direct] tvOS trailer button: fallback-worker")
+        // FIX I: tag this as a trailer so a dead /yt route shows "Trailer unavailable" instead
+        // of failing over to the engine's content streams (which would play the actual/random movie).
+        presenter.request = PlaybackRequest(url: url, title: "\(m.name) Trailer", isTrailer: true,
+                                            trailerYouTubeID: rescueID)
+    }
+
+    /// #95 SECONDARY action (chip long-press): open the trailer in the YouTube app with the SAME D11
+    /// language-preferred id the in-app path plays, so the user's trailer-language preference carries
+    /// over. `UIApplication.open` itself reports failure when no YouTube app is installed (no
+    /// canOpenURL, no plist allowlist); on that failure this falls back to the normal in-app playback
+    /// (whose own dead-end still ends at the "Trailer unavailable" note), so the action never
+    /// silently does nothing.
+    @MainActor private func openTrailerInYouTubeApp(_ m: CoreMetaItem) async {
+        guard let yt = await preferredTrailerYouTubeID(m) else { return }
+        YouTubeAppOpener.openTrailer(youTubeID: yt) { opened in
+            if opened {
+                DiagnosticsLog.log("trailer", "tvOS trailer served by the YouTube app (chip long-press) id=\(yt)")
+            } else {
+                DiagnosticsLog.log("trailer", "YouTube app unavailable (chip long-press); falling back to in-app playback id=\(yt)")
+                Task { @MainActor in await playFullTrailerInApp(m) }
+            }
         }
     }
 
@@ -1925,14 +1968,17 @@ struct CoreStreamList: View {
            let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
             NSLog("[yt-direct] tvOS trailer row: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
             presenter.request = PlaybackRequest(url: resolved.videoURL, title: name,
-                                                isTrailer: true, audioSidecarURL: resolved.audioURL)
+                                                isTrailer: true, trailerYouTubeID: yt,
+                                                audioSidecarURL: resolved.audioURL)
             return
         }
         // Device-direct missed: the worker URL WITH the language hint (the plain `playableURL` appends none).
         guard let url = stream.youTubeTrailerWorkerURL(languageCode: TMDBClient.trailerLanguageBaseCode)
                 ?? stream.playableURL else { return }
         NSLog("[yt-direct] tvOS trailer row: fallback-worker")
-        presenter.request = PlaybackRequest(url: url, title: name, isTrailer: true)
+        // #95: the id rides along so a dead /yt route is rescued by the YouTube app before the note.
+        presenter.request = PlaybackRequest(url: url, title: name, isTrailer: true,
+                                            trailerYouTubeID: stream.youTubeTrailerID)
     }
 
     /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in

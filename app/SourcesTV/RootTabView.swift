@@ -29,6 +29,11 @@ struct PlaybackRequest: Identifiable {
     /// trailer fails to load, the player must NOT fall back to the engine's content streams (that would
     /// substitute the actual/random movie for the dead trailer); it shows the error overlay and stops.
     var isTrailer: Bool = false
+    /// #95: the YouTube id behind a trailer request (the D11 language-preferred pick when one resolved,
+    /// else the meta's default id), so a dead in-app trailer can be RESCUED by handing it to the YouTube
+    /// app instead of dead-ending on "Trailer unavailable". nil for a direct (non-YouTube) trailer stream
+    /// whose meta carries no YouTube id, and for every content play.
+    var trailerYouTubeID: String? = nil
     /// When this request plays a NATIVELY-resolved debrid link, its provenance so the play-record can store
     /// enough to reresolve a fresh link on a later Continue-Watching resume. nil for torrent/direct/trailer.
     var debridRef: DebridPlaybackRef? = nil
@@ -93,6 +98,7 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
+                             trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              onClose: { presenter.request = nil })

@@ -17,6 +17,7 @@ struct TVPlayerView: View {
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var forceMPV: Bool = false                 // last-resort escape hatch: skip AVPlayer routing, mount libmpv directly
     var isTrailer: Bool = false                // FIX I: a trailer clip, not a content stream → never fail over to engine streams
+    var trailerYouTubeID: String? = nil        // #95: the trailer's YouTube id, so a dead in-app trailer is handed to the YouTube app before "Trailer unavailable"
     var audioSidecarURL: URL? = nil            // yt-direct adaptive pair: external audio mpv mounts with the video-only url (forces libmpv)
     var debridRef: DebridPlaybackRef? = nil    // native-debrid provenance of the launching link, for CW reresolve of an expired link
     /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
@@ -196,6 +197,7 @@ struct TVPlayerView: View {
     // best-ranked UNTRIED source instead of dropping the viewer at the error overlay.
     @State private var exhaustedURLs: Set<URL> = []    // sources already given up on for this video
     @State private var sourceHops = 0                  // automatic source switches so far for this video
+    @State private var triedYouTubeAppRescue = false   // #95: the YouTube-app trailer hand-off fires at most once per playback
     private let maxSourceHops = 4                      // a fully-dead title still errors out, just later
     // Whether the CURRENTLY loading source was explicitly chosen by the user (seeded from
     // `startedFromExplicitPick`, updated on every in-player source/quality pick and auto-hop). An explicit
@@ -1719,6 +1721,26 @@ struct TVPlayerView: View {
         // Instead show the load-error overlay ("Trailer unavailable") and stop. Return true so the caller
         // treats the failure as handled and does not also paint its own (content-stream) error message.
         if isTrailer {
+            // #95: before dead-ending, hand the trailer to the YouTube app (the SAME id the in-app path
+            // played, so the user's trailer-language preference carries over). Attempted at most once per
+            // playback (a stall watchdog can re-fire this guard); only when the open fails (no YouTube app
+            // installed) or no YouTube id exists does the "Trailer unavailable" note show. On a successful
+            // hand-off the dead player is torn down through leavePlayback() (stop() before dismiss, the
+            // straddle rule), so returning from the YouTube app lands on the detail page, not a dead player.
+            if let yt = trailerYouTubeID, !triedYouTubeAppRescue {
+                triedYouTubeAppRescue = true
+                YouTubeAppOpener.openTrailer(youTubeID: yt) { opened in
+                    if opened {
+                        DiagnosticsLog.log("player", "trailer served by the YouTube app (in-app load failed: \(reason)) id=\(yt)")
+                        leavePlayback()
+                    } else {
+                        DiagnosticsLog.log("player", "trailer load failed (\(reason)); YouTube app unavailable, showing the note")
+                        loadErrorMsg = "Trailer unavailable."
+                        withAnimation { loadFailed = true }
+                    }
+                }
+                return true
+            }
             DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
             loadErrorMsg = "Trailer unavailable."
             withAnimation { loadFailed = true }
