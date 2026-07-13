@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- The real app theme that hosts Compose. Minimal framework parent; no AppCompat / Material
-         Components dependency (Compose draws the UI). This is what installSplashScreen() swaps to once
-         the app window is ready (postSplashScreenTheme below). -->
+    <!-- Minimal framework theme to host Compose; no AppCompat/Material-Components dependency. -->
     <style name="Theme.VortX" parent="@android:style/Theme.Material.NoActionBar" />
 
-    <!-- Launch (splash) theme, applied to the application in the manifest. Parent Theme.SplashScreen
-         comes from androidx.core:core-splashscreen, which backports the Android 12 SplashScreen API to
-         minSdk 26 so there is one splash code path across versions. -->
-    <style name="Theme.VortX.Starting" parent="Theme.SplashScreen">
-        <item name="windowSplashScreenBackground">@color/ic_launcher_background</item>
-        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+    <!-- Cold-start splash via the AndroidX SplashScreen API (S01, ANDROID-PLAN.md §0 translation
+         table): brand gold mark (ic_vortx_mark, the fixed brand gradient, never the live accent) on
+         warm obsidian canvas, per DESIGN-SYSTEM.md §2 "Splash". Framework-drawn on API 31+; the
+         compat library paints the same background+icon itself on 26-30, so minSdk 26 gets a uniform
+         result either way. MainActivity.installSplashScreen() wires the exit transition and honors
+         reduced motion; postSplashScreenTheme hands off to the real app theme once that fires. -->
+    <style name="Theme.VortX.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/vortx_canvas</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_vortx_mark</item>
         <item name="postSplashScreenTheme">@style/Theme.VortX</item>
     </style>
 </resources>

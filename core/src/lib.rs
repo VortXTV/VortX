@@ -156,12 +156,23 @@ pub(crate) fn init_runtime(storage_dir: String, cache_dir: String, sink: EventSi
     outcome.unwrap_or(false)
 }
 
-/// Dispatch an already-parsed action JSON string. Shared by the C ABI and JNI. No-op if not
-/// initialized or the JSON is invalid (parse errors are swallowed, matching the FFI contract).
+/// Dispatch an already-parsed action JSON string. Shared by the C ABI and JNI.
+///
+/// A malformed or unmatched action (e.g. an `ActionLoad` variant whose `args` doesn't match its
+/// required shape) fails `serde_json` deserialization of the WHOLE envelope -- there is no partial
+/// dispatch, so a bad envelope is otherwise a silent no-op: no `NewState`, no error, nothing reaches
+/// `Runtime::dispatch` at all. That used to be swallowed unconditionally; it is exactly how the board
+/// Load bug (missing required `Selected{type,extra}` args) went undetected. Still a no-op on failure
+/// (the FFI contract), but now logged via `serde_path_to_error` so the field+error path is visible in
+/// `adb logcat -s StremioXEngine` (Android) instead of vanishing.
 pub(crate) fn dispatch_json(json: &str) {
-    let dto: ActionDto = match serde_json::from_str(json) {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let dto: ActionDto = match serde_path_to_error::deserialize(&mut deserializer) {
         Ok(dto) => dto,
-        Err(_) => return,
+        Err(error) => {
+            log::error!("dispatch_json: unparseable action envelope, dropped silently: path={} error={} json={}", error.path(), error, json);
+            return;
+        }
     };
     if let Ok(guard) = RUNTIME.read() {
         if let Some(runtime) = guard.as_ref() {
@@ -169,6 +180,8 @@ pub(crate) fn dispatch_json(json: &str) {
                 field: dto.field,
                 action: dto.action,
             });
+        } else {
+            log::error!("dispatch_json: runtime not initialized, dropped action for field={:?}", dto.field);
         }
     }
 }
@@ -178,7 +191,10 @@ pub(crate) fn dispatch_json(json: &str) {
 pub(crate) fn get_state_json(field_json: &str) -> String {
     let field: TvosModelField = match serde_json::from_str(field_json) {
         Ok(field) => field,
-        Err(_) => return "null".to_owned(),
+        Err(error) => {
+            log::error!("get_state_json: unknown/unparseable field {:?}: {}", field_json, error);
+            return "null".to_owned();
+        }
     };
     match RUNTIME.read() {
         Ok(guard) => match guard.as_ref() {

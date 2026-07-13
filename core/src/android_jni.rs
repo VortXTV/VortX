@@ -1,11 +1,11 @@
-//! Android JNI surface for the VortX core, the Kotlin/Rust bridge over **stremio-core**.
+//! Android JNI surface for the StremioX core, the Kotlin ⇄ Rust bridge over **stremio-core**.
 //!
 //! This is the Android analogue of the Apple C ABI in `lib.rs`. It exposes the *same* engine, the
 //! *same* JSON contract (serde), and the *same* lifecycle, but to Kotlin via the `jni` crate instead
 //! of to Swift via a C ABI. Compiled only for `target_os = "android"` (the crate ships a `cdylib`
 //! crate-type so this links into `libstremiox_core.so`); the Apple staticlib build never sees it.
 //!
-//! Kotlin entry points (all on `com.vortx.android.engine.StremioCoreNative`):
+//! Kotlin entry points (all on `com.stremiox.android.engine.StremioXCore`):
 //!   - `nativeInit(storageDir, cacheDir, listener)` -> `boolean`
 //!         Hydrate buckets, build the Runtime, start the event loop. `listener` is a Kotlin object
 //!         implementing `EventListener { fun onEvent(json: ByteArray) }`; the Rust event loop calls
@@ -65,28 +65,38 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
     JNI_VERSION_1_6
 }
 
-/// `StremioCoreNative.nativeSchemaVersion(): Int`
+/// `StremioXCore.nativeSchemaVersion(): Int`
 #[no_mangle]
-pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion(
+pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeSchemaVersion(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
     SCHEMA_VERSION as jint
 }
 
-/// `StremioCoreNative.nativeInit(storageDir: String, cacheDir: String, listener: EventListener): Boolean`
+/// `StremioXCore.nativeInit(storageDir: String, cacheDir: String, listener: EventListener): Boolean`
 ///
 /// Stores the listener as a global ref, builds the host event sink (attach-thread + call `onEvent`),
 /// and delegates to the shared `init_runtime`. Idempotent: a second call while already initialized
 /// returns `true` without rebuilding (matches the Apple contract).
 #[no_mangle]
-pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeInit<'local>(
+pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeInit<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     storage_dir: JString<'local>,
     cache_dir: JString<'local>,
     listener: JObject<'local>,
 ) -> jboolean {
+    // Install the logcat backend once, under the same "StremioXEngine" tag the Kotlin side already
+    // logs under (`EngineStremioRepository.TAG`), so `adb logcat -s StremioXEngine` captures both
+    // sides of the FFI boundary. `nativeInit` is idempotent (see the doc comment above); re-running
+    // `init` on a second call is harmless (android_logger no-ops if already installed).
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Debug)
+            .with_tag("StremioXEngine"),
+    );
+
     let storage_dir: String = match env.get_string(&storage_dir) {
         Ok(value) => value.into(),
         Err(_) => return JNI_FALSE,
@@ -118,9 +128,9 @@ pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeIni
     }
 }
 
-/// `StremioCoreNative.nativeDispatch(actionJson: String)`
+/// `StremioXCore.nativeDispatch(actionJson: String)`
 #[no_mangle]
-pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch<'local>(
+pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeDispatch<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     action_json: JString<'local>,
@@ -132,12 +142,12 @@ pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeDis
     crate::dispatch_json(&json);
 }
 
-/// `StremioCoreNative.nativeGetState(fieldJson: String): String`
+/// `StremioXCore.nativeGetState(fieldJson: String): String`
 ///
 /// Returns a Java `String` of the serialized field, or `"null"` on any error. Never returns a JVM
 /// null reference (callers can always parse the result).
 #[no_mangle]
-pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeGetState<'local>(
+pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeGetState<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     field_json: JString<'local>,
