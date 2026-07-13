@@ -13,5 +13,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "StremioX"
+// The version catalog at gradle/libs.versions.toml is auto-discovered by Gradle as `libs`.
+rootProject.name = "VortX"
 include(":app")

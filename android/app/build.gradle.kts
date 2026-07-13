@@ -1,22 +1,34 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
-    namespace = "com.stremiox.android"
-    // Media3 1.7+ must be built against SDK 35, so compileSdk moves 34 -> 35. AGP 8.5.2 supports it.
-    // targetSdk stays at 34: bumping the runtime target is a separate behavioral change, not needed
-    // to adopt the player. minSdk stays 26 (already above Media3 1.9's floor of 23).
+    namespace = "com.vortx.android"
+    // compileSdk / targetSdk 36 (Android 16). AGP 8.10 (see the version catalog) is the floor that
+    // supports API 36 natively, so the old `android.suppressUnsupportedCompileSdk` workaround is gone.
+    // minSdk stays 26 (Android 8.0), already above Media3's floor.
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.stremiox.android"
+        applicationId = "com.vortx.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "0.3.0"
+
+        // Ship EXACTLY the two ABIs cargo-ndk cross-compiles the engine .so for (see androidAbis in
+        // the appended cargoNdkBuild block below). This is a hard coupling, not a size optimization:
+        // the libmpv AAR (`full` flavor) also carries a 32-bit armeabi-v7a slice, but cargo-ndk builds
+        // libstremiox_core.so ONLY for arm64-v8a + x86_64. Without this filter, an armeabi-v7a device
+        // could install a `full` APK whose armeabi-v7a slice has the player .so (libmpv/libplayer) but
+        // NOT the engine .so, a silent-degrade: the player loads, the engine fails its System.loadLibrary
+        // and the whole app falls back to preview data. Pinning abiFilters to the engine's ABI set makes
+        // "player .so present without engine .so for the same ABI" unrepresentable.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -33,15 +45,16 @@ android {
     //   - `play`  = a lean Play-Store/Google-TV-bound build with NO GPL native libs (ExoPlayer only).
     //               It exists so a future Play listing stays clean of GPL/LGPL codec bits; it is NOT
     //               "the real player" -- libmpv-primary `full` is the product.
-    // The flavor split is the licensing boundary ONLY. Keep the applicationId identical so sideload
-    // update continuity + account migration are unaffected (the com.stremiox.android namespace is a
-    // hard invariant); flavors differ only by which player native libs are packaged.
+    // The flavor split is the licensing boundary ONLY. Both flavors keep the SAME applicationId
+    // (com.vortx.android) so one sideload updates in place; they differ only by which player native
+    // libs are packaged. The id was com.stremiox.android before this branch; renaming it is safe
+    // because no Android build has ever shipped, so there is no install base to migrate.
     flavorDimensions += "distribution"
     productFlavors {
         create("full") {
             dimension = "distribution"
             // No applicationIdSuffix: the sideloaded `full` build keeps the canonical
-            // com.stremiox.android id so it updates existing sideloads in place.
+            // com.vortx.android id so it updates existing sideloads in place.
         }
         create("play") {
             dimension = "distribution"
@@ -56,6 +69,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Fail the build on a lint error. abortOnError is AGP's default; pin it explicitly so a future
+    // edit cannot silently turn the gate off. The Android CI (android.yml) relies on this: a lint
+    // regression fails the job instead of shipping.
+    lint {
+        abortOnError = true
+    }
 }
 
 kotlin {
@@ -65,13 +85,20 @@ kotlin {
 }
 
 dependencies {
-    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.activity:activity-compose:1.9.2")
-    implementation("androidx.core:core-ktx:1.13.1")
+    // All versions come from gradle/libs.versions.toml (the version catalog). See its header for the
+    // Kotlin-floor / Compose-BOM coupling rules.
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.core.ktx)
+
+    // SplashScreen compat (androidx.core:core-splashscreen). Backports the Android 12 SplashScreen API
+    // to minSdk 26 so the branded launch screen + reduced-motion handling (see MainActivity) is one
+    // code path across versions.
+    implementation(libs.androidx.core.splashscreen)
 
     // EncryptedSharedPreferences, so debrid API keys (credentials) are stored AES-encrypted at rest,
     // never in plain SharedPreferences. This is the Android analogue of the Apple Keychain the debrid
@@ -79,45 +106,45 @@ dependencies {
     // published line of the artifact; it resolves from mavenCentral() (already in settings.gradle.kts)
     // and pulls Tink transitively. DebridKeys reads it reflectively and falls back to plain prefs if
     // the artifact is ever absent, so the boundary never hard-fails the build.
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation(libs.androidx.security.crypto)
 
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.kotlinx.coroutines.android)
 
-    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version.
-    // 1.9.4 is the current stable line (released after 1.8.x); minSdk 23, built against compileSdk 35.
+    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version (pinned
+    // once in the catalog as `media3`).
     //   - exoplayer:      the player + DefaultRenderersFactory (its built-in DV -> HEVC/AVC/AV1
     //                     fallback is what we rely on; no hand-rolled codec selection).
     //   - exoplayer-hls:  HLS support, the format the in-process streaming server emits for torrents.
     //   - ui:             PlayerView (we drive it as a SurfaceView, never TextureView).
     //   - session:        MediaSession so background/notification/remote transport controls work.
-    val media3 = "1.9.4"
-    implementation("androidx.media3:media3-exoplayer:$media3")
-    implementation("androidx.media3:media3-exoplayer-hls:$media3")
-    implementation("androidx.media3:media3-ui:$media3")
-    implementation("androidx.media3:media3-session:$media3")
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.exoplayer.hls)
+    implementation(libs.media3.ui)
+    implementation(libs.media3.session)
 
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME
     // 0.41.0 line the Apple MPVKit-GPL build runs), ffmpeg 8.1 (--enable-gpl --enable-version3,
     // mediacodec + jni hwaccel), libplacebo 7.360.1 (the gpu-next renderer), dav1d 1.5.3. It also
     // ships a `dev.jdtech.mpv.MPVLib` JNI class that loads "mpv" + "player" via System.loadLibrary;
-    // our thin com.stremiox.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
+    // our thin com.vortx.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
     // holds the option set ported from the Apple player.
     //
     // LICENSING: the mpv/ffmpeg native code is GPLv3 (ffmpeg built --enable-gpl --enable-version3),
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
-    // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
-    "fullImplementation"("dev.jdtech.mpv:libmpv:1.0.0")
+    // distribution model. The play-flavor CI GPL-scan (android.yml) fails the build if libmpv.so ever
+    // leaks into a play APK. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
+    "fullImplementation"(libs.libmpv)
 
-    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation(libs.compose.ui.tooling)
 
     // kotlinx-coroutines-android (already pulled above for ViewModel/Flow) backs the engine seam's
-    // event->coroutine bridge in com.stremiox.android.engine. org.json (the engine JSON parser used
+    // event->coroutine bridge in com.vortx.android.engine. org.json (the engine JSON parser used
     // by EngineState/EngineActions) ships with the Android platform, so no extra JSON dependency.
 }
 
@@ -131,7 +158,8 @@ dependencies {
 // The native library is produced by `cargo ndk` (https://github.com/bbqsrc/cargo-ndk, v3.x). The Rust
 // side lives in core/ with crate-type = ["staticlib", "cdylib"]; the cdylib + the
 // #[cfg(target_os = "android")] JNI surface (core/src/android_jni.rs) compile to the .so loaded by
-// StremioXCore.System.loadLibrary("stremiox_core").
+// StremioCoreNative.System.loadLibrary("stremiox_core"). The .so name stays stremiox_core (the shared
+// core/ crate lib name, also linked by the Apple staticlib); only the JNI symbol path moved to vortx.
 //
 // Honest status: this is the build wiring (scaffold). It runs cargo-ndk when the Rust + NDK toolchain
 // is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).
