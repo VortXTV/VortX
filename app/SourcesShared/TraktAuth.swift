@@ -18,15 +18,24 @@ import Foundation
 actor TraktAuth {
     static let shared = TraktAuth()
 
-    // MARK: - Configuration (TODO: register a Trakt app and fill these in)
+    // MARK: - Configuration (build-time credentials; empty ships a dormant, invisible feature)
 
-    /// Trakt application client id, from https://trakt.tv/oauth/applications.
-    /// TODO: replace with the real client id (or inject from an `.xcconfig`/env secret at build time).
-    static let clientID = ""
-    /// Trakt application client secret.
-    /// TODO: replace with the real client secret. Do NOT commit a real secret to source control;
-    /// prefer a build-time secret the way `ApiKeys` keeps user keys in the Keychain.
-    static let clientSecret = ""
+    /// Trakt application client id (https://trakt.tv/oauth/applications), read at runtime from the
+    /// Info.plist `TraktClientId` key, which Xcode substitutes from the `$(TRAKT_CLIENT_ID)` build
+    /// setting (gitignored Config/ExternalSync.xcconfig or a CI secret; EMPTY default). Falls back to
+    /// "" when absent, so a fresh/public build has no credentials and `isConfigured` stays false.
+    static let clientID = TraktAuth.infoValue("TraktClientId")
+    /// Trakt application client secret, same seam as `clientID` (Info.plist `TraktClientSecret` <-
+    /// `$(TRAKT_CLIENT_SECRET)`). Never committed; the repo is public.
+    static let clientSecret = TraktAuth.infoValue("TraktClientSecret")
+
+    /// Read an Info.plist string, trimmed, with a "" fallback. `$(VAR)` substitution leaves the key
+    /// as an empty string (not the literal token) when the build setting is empty, so a blank value
+    /// reads as "" here. Never crashes.
+    private static func infoValue(_ key: String) -> String {
+        ((Bundle.main.object(forInfoDictionaryKey: key) as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     /// API base for OAuth endpoints. Trakt serves OAuth off the same host as the data API.
     static let apiBase = "https://api.trakt.tv"
@@ -56,6 +65,29 @@ actor TraktAuth {
         Keychain.set(nil, for: accessAccount)
         Keychain.set(nil, for: refreshAccount)
         Keychain.set(nil, for: expiryAccount)
+    }
+
+    /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
+    /// a Trakt connection made on one device follows the account to the rest. Writes the three Keychain
+    /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what `store` persists
+    /// and `syncUp` mirrors). Ignores an empty access/refresh pair so a partial doc never clears a live
+    /// local session. Idempotent: adopting the same tokens twice is a harmless overwrite.
+    func adoptTokens(access: String, refresh: String, expiryUnix: Int) {
+        guard !access.isEmpty, !refresh.isEmpty else { return }
+        Keychain.set(access, for: accessAccount)
+        Keychain.set(refresh, for: refreshAccount)
+        Keychain.set(String(expiryUnix), for: expiryAccount)
+    }
+
+    /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
+    /// when not signed in. Read-only mirror of `currentToken`; the sync manager sends these only when a
+    /// local session exists and NEVER deletes them from the doc when absent (mirrors the debrid guard).
+    func syncableTokens() -> (access: String, refresh: String, expiryUnix: Int)? {
+        guard let access = Keychain.string(accessAccount), !access.isEmpty,
+              let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
+              let expiryString = Keychain.string(expiryAccount), let expiry = Int(expiryString)
+        else { return nil }
+        return (access, refresh, expiry)
     }
 
     // MARK: - Step 1: request a device code

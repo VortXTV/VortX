@@ -10,6 +10,7 @@ struct HomeView: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
@@ -93,6 +94,11 @@ struct HomeView: View {
                         // Hidden when there's no TMDB key, no history to seed from, or no results.
                         if !topPicks.items.isEmpty {
                             TopPicksRow(items: topPicks.items, focusModel: focusModel)
+                        }
+                        // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id).
+                        // Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
+                        if !traktRails.items.isEmpty {
+                            TraktWatchlistRow(items: traktRails.items, focusModel: focusModel)
                         }
                         // "Upcoming Episodes": the next-airing episode of each series in the library within
                         // the next 45 days, soonest first (see ReleaseCalendarModel). Hidden when there is
@@ -209,6 +215,7 @@ struct HomeView: View {
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
+        traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
@@ -715,6 +722,37 @@ struct TopPicksRow: View {
         FocusedHero(id: item.id, type: item.type, title: item.name,
                     backdrop: item.poster, metaLine: item.type.capitalized,
                     overview: nil, genreLine: nil)
+    }
+}
+
+/// The Trakt watchlist as a Home rail. Structurally identical to `TopPicksRow` (MetaPreview cards that
+/// open the normal detail page by imdb id); only the header differs. Zero engine writes.
+struct TraktWatchlistRow: View {
+    let items: [MetaPreview]
+    var focusModel: FocusedItemModel? = nil
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: String(localized: "From Trakt"), title: String(localized: "Trakt Watchlist"))
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   isWatched: watchedIndex.ids.contains(item.id),
+                                   menu: .catalog,
+                                   onFocus: focusModel.map { model in
+                                       { model.focus(FocusedHero(id: item.id, type: item.type, title: item.name,
+                                                                 backdrop: item.poster, metaLine: item.type.capitalized,
+                                                                 overview: nil, genreLine: nil)) }
+                                   })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

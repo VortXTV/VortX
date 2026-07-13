@@ -783,6 +783,11 @@ struct PlayerScreen: View {
                     reconnecting = false; loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
+                    // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
+                    // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
+                    // creds. Duration is often still 0 at first frame, so this starts at 0% and later ticks /
+                    // the stop carry the real percentage.
+                    if let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration) }
                     // Lock Screen / Control Center transport. Relative mpv seek so the skip always works off
                     // the LIVE position (a captured currentTime would be stale in these long-lived targets).
                     NowPlayingCenter.wireCommands(
@@ -901,6 +906,13 @@ struct PlayerScreen: View {
                 // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
                 // paused, so without this the now-playing rate would stay stuck at "playing").
                 NowPlayingCenter.update(title: curTitle, elapsed: currentTime, duration: duration, paused: b)
+                // External sync (Trakt) live scrobble pause/resume. Scrobble ONLY: this handler persists
+                // nothing else (no resume-point write). Additive + fail-soft + gated inside the coordinator;
+                // a no-op with empty creds. SIMKL has no live scrobble, so it is skipped by capability.
+                if let m = curMeta {
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                }
             }
         case MPVProperty.trackList:
             refreshTracks()
@@ -940,6 +952,10 @@ struct PlayerScreen: View {
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
             if !markedWatched, !effectivelyLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
+            // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op
+            // with empty creds. Fired for the finishing episode before any in-place advance opens a new session.
+            if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
@@ -3743,6 +3759,10 @@ struct PlayerScreen: View {
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
             if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
         }
+        // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
+        // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
+        // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
+        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
         // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
         // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.

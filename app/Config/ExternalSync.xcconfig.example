@@ -1,0 +1,27 @@
+// External sync provider credentials (Trakt, SIMKL). TEMPLATE ONLY.
+//
+// The repo is PUBLIC, so the real client id/secret values must NEVER be committed. This tracked
+// *.example file documents the seam; the owner (or CI) provides the real values one of two ways:
+//
+//   1. Local dev: copy this file to app/Config/ExternalSync.xcconfig (gitignored) and fill it in,
+//      then pass its values through to the build (e.g. an xcodebuild override, or a wrapper that
+//      exports them). Do NOT wire it via project.yml `configFiles`: a fresh clone / CI checkout is
+//      missing the gitignored file and xcodegen would then fail. This mirrors the VortXEdge secret
+//      precedent (empty default in project.yml settings.base + Info.plist $(VAR) substitution).
+//
+//   2. CI: inject each value at build time as an xcodebuild setting from a GitHub repo secret, e.g.
+//        xcodebuild ... TRAKT_CLIENT_ID=xxxx TRAKT_CLIENT_SECRET=yyyy \
+//                       SIMKL_CLIENT_ID=zzzz SIMKL_CLIENT_SECRET=wwww
+//
+// project.yml defaults every one of these to EMPTY under settings.base, so a build with no override
+// ships with blank credentials. Blank credentials make the whole External Services feature a hidden
+// no-op (TraktAuth.isConfigured / SIMKLAuth.isConfigured are false): the Settings section is
+// invisible and no external network call is ever made. That dormant state is the shippable beta.
+
+// Trakt application (https://trakt.tv/oauth/applications). Device-code OAuth flow.
+TRAKT_CLIENT_ID =
+TRAKT_CLIENT_SECRET =
+
+// SIMKL application (https://simkl.com/settings/developer/). PIN/device flow.
+SIMKL_CLIENT_ID =
+SIMKL_CLIENT_SECRET =

@@ -9,6 +9,19 @@
 	     (workers run in OBSERVE mode). The repo is public; do not hardcode a value here. -->
 	<key>VortXEdgeSecret</key>
 	<string>$(VORTX_EDGE_SECRET)</string>
+	<!-- External sync provider credentials (Trakt Lane C, SIMKL Lane D). Xcode substitutes each
+	     $(VAR) from the build setting (gitignored Config/ExternalSync.xcconfig or a CI secret; empty
+	     default in project.yml settings.base). TraktAuth / SIMKLAuth read these at runtime via
+	     Bundle.main.object(forInfoDictionaryKey:) with a "" fallback. Empty = isConfigured false =
+	     the whole External Services feature is a hidden no-op. The repo is public; never hardcode. -->
+	<key>TraktClientId</key>
+	<string>$(TRAKT_CLIENT_ID)</string>
+	<key>TraktClientSecret</key>
+	<string>$(TRAKT_CLIENT_SECRET)</string>
+	<key>SIMKLClientId</key>
+	<string>$(SIMKL_CLIENT_ID)</string>
+	<key>SIMKLClientSecret</key>
+	<string>$(SIMKL_CLIENT_SECRET)</string>
 	<!-- Base Info.plist (Xcode merges its generated keys on top). Allow plain-http connections: the
 	     native client's URLSession reaches the embedded streaming server at http://127.0.0.1:11470
 	     (cleartext loopback) to create torrents, AND add-ons commonly serve POSTER images over plain

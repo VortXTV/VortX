@@ -784,6 +784,20 @@ final class VortXSyncManager: ObservableObject {
         if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
         if debrid.isConfigured(.premiumize) { keys["premiumize"] = debrid.key(for: .premiumize) }
         if debrid.isConfigured(.torBox)     { keys["torBox"]     = debrid.key(for: .torBox) }
+        // External sync provider tokens (Trakt Lane C, SIMKL Lane D) ride the SAME encrypted apiKeys
+        // channel so a connection made on one device follows the account. They live in the Keychain, which
+        // SettingsBackup deliberately excludes, so this mirror is the only carrier. Set only when connected
+        // locally; NEVER remove a key that is absent locally (another device authored it) - the same
+        // asymmetric read-merge guard as the debrid keys above.
+        if let t = await TraktAuth.shared.syncableTokens() {
+            keys["traktAccess"] = t.access
+            keys["traktRefresh"] = t.refresh
+            keys["traktExpiry"] = String(t.expiryUnix)
+        }
+        if let s = await SIMKLAuth.shared.syncableTokens() {
+            keys["simklAccess"] = s.access
+            keys["simklExpiry"] = String(s.expiryUnix)
+        }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
         // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
         // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
@@ -889,6 +903,18 @@ final class VortXSyncManager: ObservableObject {
             // AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the body
             // in its own suppression to keep reload()'s writes from re-arming a self-echo push.
             Task { @MainActor in Self.shared.withRemoteApplySuppressed { DebridCoordinator.shared.reload() } }
+            // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
+            // another device. Apply only when present so a doc without them never clears a locally-connected
+            // session (mirrors the debrid guard just above; never delete on absence). adoptTokens writes the
+            // Keychain via an actor, so it hops out of this synchronous suppressed region in a Task.
+            if let a = keys["traktAccess"], let r = keys["traktRefresh"], !a.isEmpty, !r.isEmpty {
+                let expiry = Int(keys["traktExpiry"] ?? "") ?? 0
+                Task { await TraktAuth.shared.adoptTokens(access: a, refresh: r, expiryUnix: expiry) }
+            }
+            if let a = keys["simklAccess"], !a.isEmpty {
+                let expiry = Int(keys["simklExpiry"] ?? "") ?? 0
+                Task { await SIMKLAuth.shared.adoptTokens(access: a, expiryUnix: expiry) }
+            }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
