@@ -11,6 +11,7 @@ struct HomeView: View {
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
+    @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
@@ -99,6 +100,11 @@ struct HomeView: View {
                         // Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
                         if !traktRails.items.isEmpty {
                             TraktWatchlistRow(items: traktRails.items, focusModel: focusModel)
+                        }
+                        // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby
+                        // servers, imdb-keyed cards that open the normal detail page. Hidden with no server.
+                        ForEach(mediaServerRails.rails) { rail in
+                            StreamingRow(title: rail.title, items: rail.items, focusModel: focusModel)
                         }
                         // "Upcoming Episodes": the next-airing episode of each series in the library within
                         // the next 45 days, soonest first (see ReleaseCalendarModel). Hidden when there is
@@ -218,6 +224,7 @@ struct HomeView: View {
     private func refreshTopPicks() {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
+        mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
