@@ -466,8 +466,53 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
     /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
     func setAudioDelay(_ seconds: Double) {}
-    /// Re-apply the user's subtitle appearance (size / colour / background) to the live overlay.
-    func applySubtitleStyle() { subtitleOverlay?.applyStyle() }
+    /// Re-apply the user's subtitle appearance (size / colour / background). The VortX-owned external-cue
+    /// overlay gets full styling; AVPlayer-NATIVE (embedded / HLS legible) tracks get best-effort styling via
+    /// `AVTextStyleRule` (coarser than libass, but honours the same size / colour / background choices).
+    func applySubtitleStyle() {
+        subtitleOverlay?.applyStyle()
+        applyEmbeddedSubtitleTextStyle()
+    }
+
+    /// Best-effort styling for AVPlayer-native subtitle tracks (P5, #76). AVFoundation exposes only a coarse
+    /// text-markup surface (relative font size + fg/bg colour) via `AVTextStyleRule`, far short of libass, and
+    /// only for text-based legible tracks, so this is honest best-effort, not full parity. Reads the SAME
+    /// `SubtitleStyle` keys the libmpv path uses. Fail-soft: a nil rule just leaves the system default styling.
+    private func applyEmbeddedSubtitleTextStyle() {
+        guard let item = player.currentItem else { return }
+        var attrs: [String: Any] = [:]
+        if let fg = Self.argbComponents(fromHex: SubtitleStyle.colorHex) {
+            attrs[kCMTextMarkupAttribute_ForegroundColorARGB as String] = fg
+        }
+        attrs[kCMTextMarkupAttribute_CharacterBackgroundColorARGB as String] =
+            Self.backgroundARGB(SubtitleStyle.backgroundId)
+        // Named base sizes (40 / 55 / 72 / 92 libass px on a ~720 canvas) mapped to a percentage of video
+        // height: Medium ~= 5%, scaling linearly, so the Smaller/Larger steps visibly change AVPlayer subs too.
+        let pct = max(2.0, min(12.0, Double(SubtitleStyle.fontSize) / 11.0))
+        attrs[kCMTextMarkupAttribute_BaseFontSizePercentageRelativeToVideoHeight as String] = pct
+        item.textStyleRules = AVTextStyleRule(textMarkupAttributes: attrs).map { [$0] }
+    }
+
+    /// Parse a `#RRGGBB` hex string into the [alpha, red, green, blue] 0...1 component array
+    /// `kCMTextMarkupAttribute_ForegroundColorARGB` expects (opaque alpha). nil on a malformed string.
+    private static func argbComponents(fromHex hex: String) -> [Double]? {
+        let s = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard s.count == 6, let value = UInt32(s, radix: 16) else { return nil }
+        let r = Double((value >> 16) & 0xFF) / 255
+        let g = Double((value >> 8) & 0xFF) / 255
+        let b = Double(value & 0xFF) / 255
+        return [1.0, r, g, b]
+    }
+
+    /// The [alpha, red, green, blue] background colour for the named background style (mirrors the libmpv
+    /// `sub-back-color`): outline = transparent, shaded = ~50% black, box = opaque black.
+    private static func backgroundARGB(_ id: String) -> [Double] {
+        switch id {
+        case "shaded": return [0.5, 0, 0, 0]
+        case "box":    return [1.0, 0, 0, 0]
+        default:       return [0.0, 0, 0, 0]   // outline only: transparent background
+        }
+    }
     /// The current external-subtitle delay in seconds, so the sync-capture path can pool the learned offset.
     func currentSubDelaySeconds() -> Double { subtitleRenderer.offset }
 
@@ -990,6 +1035,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             subGroup = sg
             audioTracks = ag.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
             subTracks = sg.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
+            applyEmbeddedSubtitleTextStyle()   // P5: style native legible tracks from the start (best-effort)
             emit(MPVProperty.trackList, nil)
         }
     }
