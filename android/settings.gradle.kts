@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "StremioX"
+rootProject.name = "VortX"
 include(":app")
