@@ -3481,6 +3481,11 @@ struct PlayerScreen: View {
             rs.append(Row(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rs
         case .audioSettings:
+            // AVPlayer manages audio delay + output routing itself: setAudioDelay / setAudioOutputMode are
+            // no-ops on that engine, so hide the inert controls rather than show rows that do nothing (#76).
+            if isAVPlayerActive {
+                return [Row(label: String(localized: "Audio is managed automatically"), isHeader: true)]
+            }
             let now = String(format: "%+.1fs", audioDelay)
             var rs = [Row(label: String(localized: "Sync"), isHeader: true),
                       Row(label: String(localized: "Earlier  −0.1s"), detail: now) { adjustAudioDelay(-0.1) },
@@ -3552,17 +3557,20 @@ struct PlayerScreen: View {
                 }
             }
         case .playerSettings:
-            let hw = coordinator.player?.hardwareDecoding ?? true
-            var rows: [Row] = [
-                Row(label: "Decoder", isHeader: true),
-                Row(label: "Hardware", detail: "recommended", selected: hw) {
+            var rows: [Row] = []
+            // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
+            // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
+            if !isAVPlayerActive {
+                let hw = coordinator.player?.hardwareDecoding ?? true
+                rows.append(Row(label: "Decoder", isHeader: true))
+                rows.append(Row(label: "Hardware", detail: "recommended", selected: hw) {
                     coordinator.player?.setHardwareDecoding(true)
-                },
-                Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
+                })
+                rows.append(Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
                     coordinator.player?.setHardwareDecoding(false)
-                },
-                Row(label: "Playback Info", detail: "›") { openPanel(.info) },
-            ]
+                })
+            }
+            rows.append(Row(label: "Playback Info", detail: "›") { openPanel(.info) })
             // Skip-segment submit (G): a discoverable overflow entry to the in-player editor, pre-filled with
             // the current position, so a user who wants to contribute an intro/outro timestamp finds it without
             // hunting the top-bar icon. Any tt####### title qualifies (keyless submit via skip.vortx.tv).

@@ -1226,9 +1226,18 @@ struct TVPlayerView: View {
         switch panelKind {
         case .audio:
             var rows = groupedTrackRows(audioTracks) { id in optimisticSelect(type: "audio", id: id); coordinator.player?.setAudioTrack(id); refreshTracksSoon() }
-            rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
+            // Audio Sync is libmpv-only (setAudioDelay is a no-op on AVPlayer, which offers no track offset), so
+            // hide the drill-in when the AVFoundation engine is active (#76). Track selection itself works on both.
+            if !isAVPlayerActive {
+                rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
+            }
             return rows
         case .audioSettings:
+            // Reached only on libmpv (the drill-in above is hidden on AVPlayer); guard anyway so a stale
+            // navigation never shows inert controls.
+            if isAVPlayerActive {
+                return [OptionRow(label: String(localized: "Audio is managed automatically"), isHeader: true)]
+            }
             let now = String(format: "%+.1fs", audioDelay)
             var rows = [OptionRow(label: String(localized: "Sync"), isHeader: true),
                         OptionRow(label: String(localized: "Earlier  −0.1s"), detail: now) { adjustAudioDelay(-0.1) },
@@ -1595,14 +1604,18 @@ struct TVPlayerView: View {
                 }
             }
         }
-        rows.append(OptionRow(label: "Decoder", isHeader: true))
-        let hw = coordinator.player?.hardwareDecoding ?? true
-        rows.append(OptionRow(label: "Hardware  ·  default", isSelected: hw) {
-            coordinator.player?.setHardwareDecoding(true)
-        })
-        rows.append(OptionRow(label: "Software  ·  if video misbehaves", isSelected: !hw) {
-            coordinator.player?.setHardwareDecoding(false)
-        })
+        // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
+        // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
+        if !isAVPlayerActive {
+            rows.append(OptionRow(label: "Decoder", isHeader: true))
+            let hw = coordinator.player?.hardwareDecoding ?? true
+            rows.append(OptionRow(label: "Hardware  ·  default", isSelected: hw) {
+                coordinator.player?.setHardwareDecoding(true)
+            })
+            rows.append(OptionRow(label: "Software  ·  if video misbehaves", isSelected: !hw) {
+                coordinator.player?.setHardwareDecoding(false)
+            })
+        }
         rows.append(OptionRow(label: "Info", isHeader: true))
         rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
                               isSelected: showStats) {
