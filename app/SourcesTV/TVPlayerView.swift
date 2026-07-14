@@ -817,7 +817,7 @@ struct TVPlayerView: View {
             // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op with
             // empty creds. Fired for the finishing episode before any in-place advance opens a new session.
-            if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
+            if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
             autoAdvance()                                // episode finished → play next, else exit
         default: break
         }
