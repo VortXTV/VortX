@@ -95,6 +95,40 @@ func chipOffset(text: String, prefer: [String], exclude: [String], avoidBehavior
     return offset
 }
 
+// MARK: - Parse-boundary clamp mirrors (mirror of StreamRanking.sizeGB / seederCount)
+
+/// Full-match extractor standing in for StreamRanking.firstMatch for the size/seeder patterns (both of which
+/// strip the unit off the FULL match rather than reading a capture group).
+func mirrorFirstMatch(_ text: String, _ pattern: String) -> String? {
+    guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let ns = text as NSString
+    guard let m = re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) else { return nil }
+    return ns.substring(with: m.range)
+}
+
+/// Mirror of StreamRanking.sizeGB INCLUDING its parse-boundary clamp (min(parsed, 100_000)). Must stay in
+/// lockstep with the shipped function: the clamp is what stops an unbounded Double from adversarial text
+/// (e.g. "9999...9 GB" ~= 1e26) from trapping the `Int(...)` size-tiebreak conversion in computeScore.
+func mirrorSizeGB(_ t: String) -> Double {
+    guard let m = mirrorFirstMatch(t.lowercased(), #"(\d+(?:\.\d+)?)\s*g(i)?b"#) else { return 0 }
+    let digits = m.replacingOccurrences(of: "gib", with: "").replacingOccurrences(of: "gb", with: "")
+        .trimmingCharacters(in: .whitespaces)
+    return min(Double(digits) ?? 0, 100_000)
+}
+
+/// Mirror of StreamRanking.seederCount INCLUDING its parse-boundary clamp (min(parsed, 1_000_000)). Must stay
+/// in lockstep with the shipped function: the clamp is what stops a 19-digit-but-valid Int from trapping the
+/// `seeders * 8` multiply in computeScore. nil is still returned above Int.max, exactly as shipped.
+func mirrorSeederCount(_ text: String) -> Int? {
+    let patterns = [#"👤[:\s]*([0-9]+)"#, #"(?<![a-z0-9])seed(er)?s?\s*:\s*([0-9]+)"#]
+    for pattern in patterns {
+        if let m = mirrorFirstMatch(text, pattern) {
+            return Int(m.filter(\.isNumber)).map { min($0, 1_000_000) }
+        }
+    }
+    return nil
+}
+
 // MARK: - Tiny assertion harness
 
 var failures = 0
@@ -210,6 +244,35 @@ do {
     check(passesFilters(text: avoided, include: [], exclude: exclude,
                         avoidBehavior: "rank", safetyOn: false, kids: false),
           "Non-Kids profile keeps the same Avoid word visible in rank mode")
+}
+
+// 7. Overflow safety (CEO-reported integer traps): absurd size / seeder figures from adversarial add-on text
+//    must rank WITHOUT trapping and land in the SAME score bucket as their clamped-realistic equivalents.
+do {
+    // --- Size trap (computeScore line ~299: Int(min(sizeGB * 0.15, 12))) ---
+    // Without the parse-boundary clamp, Double(digits) ~= 1e26 and Int(1e26 * 0.15) TRAPS (out of Int range).
+    let absurdSize = "movie 2160p remux 99999999999999999999999999 gb"
+    let realisticBig = "movie 2160p remux 90 gb"   // any real >80 GB release already pins the +12 ceiling
+    check(Double("99999999999999999999999999")! > Double(Int.max),
+          "the adversarial size really exceeds Int range (justifies the clamp)")
+    check(mirrorSizeGB(absurdSize) == 100_000, "sizeGB clamps the adversarial figure to the 100k GB ceiling")
+    let absurdSizeLift = Int(min(mirrorSizeGB(absurdSize) * 0.15, 12))   // the exact computeScore expression
+    let realSizeLift = Int(min(mirrorSizeGB(realisticBig) * 0.15, 12))
+    check(absurdSizeLift == 12, "absurd GB resolves into the +12 size-tiebreak ceiling (no trap)")
+    check(absurdSizeLift == realSizeLift, "absurd GB lands in the same size bucket as a real >80 GB release")
+
+    // --- Seeder trap (computeScore line ~350: min(seeders * 8, seederTiebreakCap)) ---
+    // A 19-digit count UNDER Int.max parses to a valid huge Int; without the clamp `seeders * 8` TRAPS.
+    let bigSeed = "1234567890123456789"   // 19 digits, < Int.max, but * 8 overflows
+    let absurdSeedText = "movie 1080p webrip 👤 \(bigSeed)"
+    let realisticSeedText = "movie 1080p webrip 👤 50000"   // any hot swarm (>= 23) already pins the cap
+    check(Int(bigSeed)! < Int.max && Int(bigSeed)! > RankConst.seederTiebreakCap,
+          "the 19-digit count is a valid Int whose * 8 would overflow (justifies the clamp)")
+    check(mirrorSeederCount(absurdSeedText) == 1_000_000, "seederCount clamps the 19-digit count to the 1M ceiling")
+    let absurdSeedLift = min(mirrorSeederCount(absurdSeedText)! * 8, RankConst.seederTiebreakCap)
+    let realSeedLift = min(mirrorSeederCount(realisticSeedText)! * 8, RankConst.seederTiebreakCap)
+    check(absurdSeedLift == RankConst.seederTiebreakCap, "absurd seeder count resolves into the capped tiebreak (no trap)")
+    check(absurdSeedLift == realSeedLift, "absurd seeder count lands in the same tiebreak bucket as a hot real swarm")
 }
 
 if failures == 0 {
