@@ -1505,7 +1505,7 @@ final class CoreBridge: ObservableObject {
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
         guard let metaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
                                  ?? metaItems.first)?["request"] else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op — meta request missing; engine progress will not re-point")
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (meta request missing); engine progress will not re-point")
             return false
         }
         // The add-on base for the stream request: the preload-carried base first, else any resident stream
@@ -1514,7 +1514,7 @@ final class CoreBridge: ObservableObject {
         let residentBase = (object["streams"] as? [[String: Any]])?
             .compactMap { ($0["request"] as? [String: Any])?["base"] as? String }.first
         guard let effectiveBase = base ?? residentBase ?? (metaRequest as? [String: Any])?["base"] as? String else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op — no add-on base; engine progress will not re-point")
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (no add-on base); engine progress will not re-point")
             return false
         }
         // extra: [] matches the shape loadMeta dispatches for a stream path (the engine accepts an empty extra).
