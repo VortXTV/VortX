@@ -798,6 +798,12 @@ final class VortXSyncManager: ObservableObject {
             keys["simklAccess"] = s.access
             keys["simklExpiry"] = String(s.expiryUnix)
         }
+        // Media servers (Plex / Jellyfin / Emby, lane E) ride the SAME encrypted apiKeys channel as ONE JSON
+        // blob so a server connected on one device follows the account. Tokens are Keychain-only; the blob
+        // carries them only when the per-device sync-logins toggle is ON (syncBlob reads UserDefaults + the
+        // Keychain directly, so this is safe off the main actor). Set only when locally non-empty; NEVER remove
+        // it on absence (another device authored it) - the same asymmetric read-merge guard as the debrid keys.
+        if let blob = MediaServerStore.shared.syncBlob() { keys["vortx.mediaServers"] = blob }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
         // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
         // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
@@ -914,6 +920,13 @@ final class VortXSyncManager: ObservableObject {
             if let a = keys["simklAccess"], !a.isEmpty {
                 let expiry = Int(keys["simklExpiry"] ?? "") ?? 0
                 Task { await SIMKLAuth.shared.adoptTokens(access: a, expiryUnix: expiry) }
+            }
+            // Media servers (lane E): adopt a server connected on another device. applySyncBlob union-merges by
+            // id, honors removal tombstones, and writes a synced token to the Keychain only when the local slot
+            // is empty (Keychain stays authoritative). Apply only when present so a doc without it never clears
+            // a locally-connected server (the same never-delete-on-absence guard as the tokens above).
+            if let blob = keys["vortx.mediaServers"] {
+                Task { @MainActor in MediaServerStore.shared.applySyncBlob(blob) }
             }
             restored = true
         }

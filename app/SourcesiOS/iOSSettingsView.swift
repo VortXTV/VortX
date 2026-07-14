@@ -412,6 +412,7 @@ struct iOSSettingsView: View {
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
             NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
+            NavigationLink("Media servers (Plex, Jellyfin, Emby)") { MediaServersSettingsView() }
         }
     }
 

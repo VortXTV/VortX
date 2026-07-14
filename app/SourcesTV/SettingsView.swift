@@ -279,6 +279,10 @@ struct SettingsView: View {
                     Label("Live TV (IPTV playlists)", systemImage: "tv")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { MediaServersSettingsView() } label: {
+                    Label("Media servers (Plex, Jellyfin, Emby)", systemImage: "externaldrive.connected.to.line.below")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()
