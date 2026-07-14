@@ -46,7 +46,9 @@ struct SourceFilterChipsView: View {
             Text("Smart source selection")
                 .font(Theme.Typography.cardTitle)
                 .foregroundStyle(Theme.Palette.textPrimary)
-            Text("Tap a chip to prefer, require, or avoid a kind of source. Type words to prefer or avoid them by name. CAM and fake-quality sources stay hidden by the Safety filter no matter what.")
+            Text(prefs.safetyMode == "off"
+                 ? String(localized: "Tap a chip to prefer, require, or avoid a kind of source. Type words to prefer or avoid them by name. CAM and fake-quality sources always rank last; turn on the Safety filter below to hide them entirely.")
+                 : String(localized: "Tap a chip to prefer, require, or avoid a kind of source. Type words to prefer or avoid them by name. CAM and fake-quality sources stay hidden by the Safety filter."))
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
 
@@ -129,6 +131,14 @@ struct SourceFilterChipsView: View {
                  : String(localized: "Comma-separated words matched in the source name. Prefer boosts, Only requires, Avoid uses the behavior below."))
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+            // Prefer + "Rank it down" are RANKING nudges, so they do nothing while Use add-on ranking order is
+            // on (the list keeps the add-on's own order). Only (require) and Avoid = Hide still filter. State
+            // it so the Prefer lane is not a silent no-op.
+            if prefs.useAddonOrder {
+                Text("Prefer and Rank it down don't reorder while Use add-on ranking order is on. Only and Avoid = Hide still apply.")
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.warn)
+            }
         }
     }
 
@@ -166,11 +176,27 @@ struct SourceFilterChipsView: View {
                 behaviorChip(String(localized: "Hide it"), value: "hide")
                 behaviorChip(String(localized: "Rank it down"), value: "rank")
             }
-            Text(prefs.avoidBehavior == "rank"
-                 ? String(localized: "Avoided sources stay in the list but sink to the bottom. CAM and fake-quality sources are still hidden by the Safety filter.")
-                 : String(localized: "Avoided sources are hidden from the list (today's behavior). CAM and fake-quality sources are always hidden by the Safety filter."))
+            Text(avoidBehaviorCaption)
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+        }
+    }
+
+    /// The Avoid-behavior caption, honest about BOTH the chosen behavior AND whether the Safety filter is
+    /// actually on (it defaults to off, so CAM / fake-quality sources are not hidden until the viewer turns
+    /// it on; they only rank last). Split out so neither settings surface hits a tvOS type-checker blowup on
+    /// a nested ternary.
+    private var avoidBehaviorCaption: String {
+        let safetyOn = prefs.safetyMode != "off"
+        switch (prefs.avoidBehavior == "rank", safetyOn) {
+        case (true, true):
+            return String(localized: "Avoided sources stay in the list but sink to the bottom. CAM and fake-quality sources are hidden by the Safety filter.")
+        case (true, false):
+            return String(localized: "Avoided sources stay in the list but sink to the bottom. CAM and fake-quality sources also rank last; turn on the Safety filter to hide them.")
+        case (false, true):
+            return String(localized: "Avoided sources are hidden from the list. CAM and fake-quality sources are hidden by the Safety filter.")
+        case (false, false):
+            return String(localized: "Avoided sources are hidden from the list. CAM and fake-quality sources rank last; turn on the Safety filter to hide them too.")
         }
     }
 
@@ -205,7 +231,7 @@ struct SourceFilterChipsView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
             }
             .tint(Theme.Palette.accent)
-            Text("Play the top-ranked source straight away instead of opening the source list. Long-press (or the Sources button) still opens the full list.")
+            Text("Play the top-ranked source straight away instead of opening the source list. Back out of the player any time to see the full source list.")
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
         }
