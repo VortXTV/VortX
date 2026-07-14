@@ -39,7 +39,7 @@ struct StremioTVApp: App {
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()
-        NSLog("[StremioX] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
+        NSLog("%@", "[StremioX] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
 
     var body: some Scene {
