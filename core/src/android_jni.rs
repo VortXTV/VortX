@@ -5,7 +5,7 @@
 //! of to Swift via a C ABI. Compiled only for `target_os = "android"` (the crate ships a `cdylib`
 //! crate-type so this links into `libstremiox_core.so`); the Apple staticlib build never sees it.
 //!
-//! Kotlin entry points (all on `com.stremiox.android.engine.StremioXCore`):
+//! Kotlin entry points (all on `com.vortx.android.engine.StremioCoreNative`):
 //!   - `nativeInit(storageDir, cacheDir, listener)` -> `boolean`
 //!         Hydrate buckets, build the Runtime, start the event loop. `listener` is a Kotlin object
 //!         implementing `EventListener { fun onEvent(json: ByteArray) }`; the Rust event loop calls
@@ -65,22 +65,22 @@ pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) 
     JNI_VERSION_1_6
 }
 
-/// `StremioXCore.nativeSchemaVersion(): Int`
+/// `StremioCoreNative.nativeSchemaVersion(): Int`
 #[no_mangle]
-pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeSchemaVersion(
+pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
     SCHEMA_VERSION as jint
 }
 
-/// `StremioXCore.nativeInit(storageDir: String, cacheDir: String, listener: EventListener): Boolean`
+/// `StremioCoreNative.nativeInit(storageDir: String, cacheDir: String, listener: EventListener): Boolean`
 ///
 /// Stores the listener as a global ref, builds the host event sink (attach-thread + call `onEvent`),
 /// and delegates to the shared `init_runtime`. Idempotent: a second call while already initialized
 /// returns `true` without rebuilding (matches the Apple contract).
 #[no_mangle]
-pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeInit<'local>(
+pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeInit<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     storage_dir: JString<'local>,
@@ -128,9 +128,9 @@ pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeInit<
     }
 }
 
-/// `StremioXCore.nativeDispatch(actionJson: String)`
+/// `StremioCoreNative.nativeDispatch(actionJson: String)`
 #[no_mangle]
-pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeDispatch<'local>(
+pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     action_json: JString<'local>,
@@ -142,12 +142,12 @@ pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeDispa
     crate::dispatch_json(&json);
 }
 
-/// `StremioXCore.nativeGetState(fieldJson: String): String`
+/// `StremioCoreNative.nativeGetState(fieldJson: String): String`
 ///
 /// Returns a Java `String` of the serialized field, or `"null"` on any error. Never returns a JVM
 /// null reference (callers can always parse the result).
 #[no_mangle]
-pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeGetState<'local>(
+pub extern "system" fn Java_com_vortx_android_engine_StremioCoreNative_nativeGetState<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     field_json: JString<'local>,

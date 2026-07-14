@@ -5,14 +5,14 @@ plugins {
 }
 
 android {
-    namespace = "com.stremiox.android"
+    namespace = "com.vortx.android"
     // compileSdk 36 (Android 16) requires AGP >= 8.10.0 (root build.gradle.kts / the version catalog
     // carry that pin). targetSdk now tracks compileSdk (S01: Android-16-baseline session) -- both at
     // 36. minSdk stays 26 (already above Media3 1.9's floor of 23; covers phones and Android TV).
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.stremiox.android"
+        applicationId = "com.vortx.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
         versionCode = 1
@@ -44,14 +44,14 @@ android {
     //               It exists so a future Play listing stays clean of GPL/LGPL codec bits; it is NOT
     //               "the real player" -- libmpv-primary `full` is the product.
     // The flavor split is the licensing boundary ONLY. Keep the applicationId identical so sideload
-    // update continuity + account migration are unaffected (the com.stremiox.android namespace is a
+    // update continuity + account migration are unaffected (the com.vortx.android namespace is a
     // hard invariant); flavors differ only by which player native libs are packaged.
     flavorDimensions += "distribution"
     productFlavors {
         create("full") {
             dimension = "distribution"
             // No applicationIdSuffix: the sideloaded `full` build keeps the canonical
-            // com.stremiox.android id so it updates existing sideloads in place.
+            // com.vortx.android id so it updates existing sideloads in place.
         }
         create("play") {
             dimension = "distribution"
@@ -144,7 +144,7 @@ dependencies {
     // 0.41.0 line the Apple MPVKit-GPL build runs), ffmpeg 8.1 (--enable-gpl --enable-version3,
     // mediacodec + jni hwaccel), libplacebo 7.360.1 (the gpu-next renderer), dav1d 1.5.3. It also
     // ships a `dev.jdtech.mpv.MPVLib` JNI class that loads "mpv" + "player" via System.loadLibrary;
-    // our thin com.stremiox.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
+    // our thin com.vortx.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
     // holds the option set ported from the Apple player.
     //
     // LICENSING: the mpv/ffmpeg native code is GPLv3 (ffmpeg built --enable-gpl --enable-version3),
@@ -156,7 +156,7 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
 
     // kotlinx-coroutines-android (already pulled above for ViewModel/Flow) backs the engine seam's
-    // event->coroutine bridge in com.stremiox.android.engine. org.json (the engine JSON parser used
+    // event->coroutine bridge in com.vortx.android.engine. org.json (the engine JSON parser used
     // by EngineState/EngineActions) ships with the Android platform, so no extra JSON dependency.
 
     // Coil (S03): real poster/backdrop art in PosterCard's `art` slot. coil-compose ships the
@@ -177,7 +177,7 @@ dependencies {
 // The native library is produced by `cargo ndk` (https://github.com/bbqsrc/cargo-ndk, v3.x). The Rust
 // side lives in core/ with crate-type = ["staticlib", "cdylib"]; the cdylib + the
 // #[cfg(target_os = "android")] JNI surface (core/src/android_jni.rs) compile to the .so loaded by
-// StremioXCore.System.loadLibrary("stremiox_core").
+// StremioCoreNative.System.loadLibrary("stremiox_core").
 //
 // Honest status: this is the build wiring (scaffold). It runs cargo-ndk when the Rust + NDK toolchain
 // is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).

@@ -36,10 +36,14 @@ interaction, VortX idiom for look).
   Android TV").
 
 ### Hard invariants (violating any of these fails review)
-1. **`applicationId = "com.stremiox.android"` never changes**, in either flavor. Sideload update
-   continuity depends on it. Internal identifiers stay `stremiox*` (the JNI symbol names in
-   `core/src/android_jni.rs` derive from the exact package + class name — renaming either side breaks
-   the dynamic link). Rebranding is **user-facing only**: app label, icons, splash, strings, docs.
+1. **`applicationId = "com.vortx.android"` in both flavors.** The package, namespace, and the Kotlin
+   engine class (`com.vortx.android.engine.StremioCoreNative`) all carry the VortX identity; the JNI
+   symbol names in `core/src/android_jni.rs` derive from that exact package + class, so the two sides
+   move together — renaming either alone breaks the dynamic link. (The original plan froze
+   `com.stremiox.android` for sideload update continuity; that argument was void — there is no Android
+   install base to keep continuous — so the id was moved to `com.vortx.android` at integration.) The
+   only frozen identifier is the shared core crate's cdylib name `stremiox_core` (`libstremiox_core.so`),
+   which is independent of the app package.
 2. **Two flavors, one dimension (`distribution`), licensing boundary only:**
    - `full` = the sideloaded VortX release. libmpv is the **primary** player, Media3/ExoPlayer is the
      DV/Atmos fallback. GPL native libs allowed. Ships first (mirrors the Apple sideload-IPA model).
