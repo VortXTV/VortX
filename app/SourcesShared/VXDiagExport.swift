@@ -231,10 +231,37 @@ final class VXDiagExport {
             section += "(server log empty or unavailable)\n"
         } else {
             section += "--- stremio-server.log (last \(tail.count) lines) ---\n"
-            section += tail.joined(separator: "\n")
+            section += tail.map(scrubURLs).joined(separator: "\n")
             section += "\n"
         }
         return Data(section.utf8)
+    }
+
+    /// Reduces every http(s) URL embedded in a server log line to `scheme://host/path`, dropping the query
+    /// string and fragment entirely, mirroring the redaction `MPVMetalViewController.loadFile` applies to
+    /// its own `mpvLog` line (`"\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"`): debrid
+    /// and direct-CDN URLs carry API tokens / signed queries that must not leave the device in the exported
+    /// log tail. Adapted here (rather than reused directly) because that call site redacts one known URL
+    /// value, while this one has to find and replace URLs embedded anywhere inside a free-text log line.
+    /// Fails soft: a line with no URL, or a matched substring that fails to parse as a URL, passes through
+    /// unchanged.
+    private static let urlPattern = try? NSRegularExpression(pattern: #"https?://[^\s"'<>()\[\]]+"#)
+
+    private static func scrubURLs(_ line: String) -> String {
+        guard let urlPattern else { return line }
+        let nsLine = line as NSString
+        let matches = urlPattern.matches(in: line, range: NSRange(location: 0, length: nsLine.length))
+        guard !matches.isEmpty else { return line }
+
+        var result = line
+        // Replace back-to-front so each earlier match's NSRange (computed against the original line) still
+        // lines up with `result`: only text AFTER the current match has been touched by prior iterations.
+        for match in matches.reversed() {
+            let raw = nsLine.substring(with: match.range)
+            guard let url = URL(string: raw), let range = Range(match.range, in: result) else { continue }
+            result.replaceSubrange(range, with: "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)")
+        }
+        return result
     }
 
     /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
