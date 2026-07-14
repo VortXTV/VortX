@@ -122,13 +122,13 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters, engine
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
-            case .chapters: 12
+            case .chapters: 12; case .engine: 13
             }
         }
         var title: String {
@@ -138,7 +138,7 @@ struct PlayerScreen: View {
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
-            case .chapters: "Chapters"
+            case .chapters: "Chapters"; case .engine: "Player Engine"
             }
         }
         /// Panels where picking a row is an unambiguous one-shot choice (a track, quality, source, or
@@ -147,7 +147,7 @@ struct PlayerScreen: View {
         /// colour steppers, output mode, player settings, sleep) and the browse panels (info, episodes).
         var dismissesAfterPick: Bool {
             switch self {
-            case .subtitles, .audio, .quality, .sources, .chapters: true
+            case .subtitles, .audio, .quality, .sources, .chapters, .engine: true
             default: false
             }
         }
@@ -464,6 +464,12 @@ struct PlayerScreen: View {
     }
 
     #if os(iOS) || os(macOS)
+    /// User-invoked mid-title engine override (P3, #76). nil = automatic (the latch/route decides); true = the
+    /// viewer forced AVPlayer; false = the viewer forced libmpv. Supersedes the latch so `playerSurface`
+    /// re-renders the other engine on the SAME view; `avEngineFailed` still wins (a failed manual AVPlayer pick
+    /// falls back to libmpv, no loop).
+    @State private var manualEngineAVPlayer: Bool?
+
     /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: HLS is already
     /// handled in `body` (the minimal HLSPlayerView), and now a **Dolby Vision** stream in an AVPlayer-playable
     /// container (MP4/MOV/M4V) auto-routes here for true DV passthrough (libmpv only tone-maps DV to SDR). The
@@ -471,7 +477,21 @@ struct PlayerScreen: View {
     /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
         if avEngineFailed { return false }   // an AVPlayer load failure fell back to libmpv for this stream
+        if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
         return engineLatch ?? routedToAVPlayer
+    }
+
+    /// Whether AVPlayer is even an option for THIS stream, gating the "AVPlayer" row in the engine picker.
+    /// Mirrors the router's hard exclusions: a yt-direct sidecar pair and a torrent / loopback URL always stay
+    /// on libmpv. Forcing `.avfoundation` through the router answers "would the router ever pick AVPlayer here".
+    private var canUseAVPlayerEngine: Bool {
+        if audioSidecarURL != nil { return false }
+        let loopback = url.host == "127.0.0.1" || url.host == "localhost"
+        if loopback { return false }
+        let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
+        return PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: isDV,
+                                         override: .avfoundation,
+                                         dvDisplayCapable: DVDisplaySupport.isCapable) == .avfoundation
     }
 
     /// The raw routing computation. Consulted once to seed `engineLatch` (and for the first renders before
@@ -1814,6 +1834,48 @@ struct PlayerScreen: View {
                 loadIntoPlayer(cu, headers: curHeaders, live: isLive)
             }
         }
+    }
+
+    /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
+    /// user-driven switch: tears the live engine down synchronously (straddle invariant) BEFORE flipping the
+    /// manual override so `playerSurface` re-renders the other engine on the SAME view, carries the live
+    /// position, and re-arms the one-shot latches so tracks / size / resume re-apply on the fresh mount. Speed
+    /// and subtitle sync are re-applied once the new engine's controller mounts. Track choices re-derive from
+    /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
+    /// design; matching is by lang/title). No-op when already on the requested engine.
+    private func switchPlayerEngine(toAVPlayer: Bool) {
+        guard toAVPlayer != isAVPlayerActive else { close(); return }
+        srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        let resume = hasStartedPlaying ? currentTime : (resumeSeconds > 5 ? resumeSeconds : 0)
+        coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        manualEngineAVPlayer = toAVPlayer
+        avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
+        avDemotedAt = Date()               // grace window swallows a stale event from the outgoing engine
+        // Treat the new mount as a fresh load (mirrors demoteAVPlayerToMPV).
+        appliedSize = false; appliedVolume = false; appliedAutoTracks = false
+        hasStartedPlaying = false; isSeekable = true
+        buffering = true; loadFailed = false; loadErrorMsg = ""
+        srcProbeLoadStart = Date()
+        startLoadTimeout()
+        if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
+        if resume > 5 { nudgeResume(to: resume) }
+        // The fresh mount auto-loads the LAUNCH url; re-point at the ACTIVE source if this session switched.
+        if let cu = curURL, cu != url {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+                loadIntoPlayer(cu, headers: curHeaders, live: isLive)
+            }
+        }
+        // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+            if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
+            if subDelay != 0 { coordinator.player?.setSubDelay(subDelay) }
+        }
+        close()   // dismiss the settings sheet so the video is visible during the swap
     }
 
     /// AVPlayer-only START watchdog (see `avStartWatchdogSeconds`). If AVFoundation is the active engine and no
@@ -3571,6 +3633,14 @@ struct PlayerScreen: View {
                 })
             }
             rows.append(Row(label: "Playback Info", detail: "›") { openPanel(.info) })
+            #if os(iOS) || os(macOS)
+            // Player engine picker (P3, #76): only when AVPlayer is a real option for this stream (DV / HLS /
+            // debrid; never torrents or a yt-direct sidecar pair). Flips libmpv <-> AVPlayer mid-title.
+            if canUseAVPlayerEngine {
+                rows.append(Row(label: "Player engine",
+                                detail: isAVPlayerActive ? "AVPlayer  ›" : "VortX Player  ›") { openPanel(.engine) })
+            }
+            #endif
             // Skip-segment submit (G): a discoverable overflow entry to the in-player editor, pre-filled with
             // the current position, so a user who wants to contribute an intro/outro timestamp finds it without
             // hunting the top-bar icon. Any tt####### title qualifies (keyless submit via skip.vortx.tv).
@@ -3594,6 +3664,23 @@ struct PlayerScreen: View {
                 })
             }
             return rows
+        case .engine:
+            #if os(iOS) || os(macOS)
+            // Player Engine picker (P3, #76): flip libmpv <-> AVPlayer mid-title. The AVPlayer row appears only
+            // when it is a valid engine for this stream (canUseAVPlayerEngine).
+            let onAV = isAVPlayerActive
+            var rs: [Row] = [Row(label: "VortX Player", detail: "all formats, styled subtitles", selected: !onAV) {
+                switchPlayerEngine(toAVPlayer: false)
+            }]
+            if canUseAVPlayerEngine {
+                rs.append(Row(label: "AVPlayer", detail: "Dolby Vision, HLS", selected: onAV) {
+                    switchPlayerEngine(toAVPlayer: true)
+                })
+            }
+            return rs
+            #else
+            return []
+            #endif
         }
     }
 

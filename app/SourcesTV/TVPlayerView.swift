@@ -163,6 +163,12 @@ struct TVPlayerView: View {
     /// [dv] route lines and cost main-thread time under 4K memory pressure (#76 b163 stutter). Every new
     /// stream mints a new PlaybackRequest that rebuilds this view via `.id(req.id)`, resetting the latch.
     @State private var engineLatch: Bool?
+    /// User-invoked mid-title engine override (P3, #76). nil = automatic (the latch/route decides); true =
+    /// the viewer forced AVPlayer; false = the viewer forced libmpv. Set by `switchPlayerEngine`, it supersedes
+    /// the latch so `playerSurface` re-renders the other engine on the SAME view. `avEngineFailed` still wins
+    /// over a manual AVPlayer pick (a failed manual switch falls back to libmpv, no loop), and a fresh
+    /// PlaybackRequest resets it via `.id(req.id)` like the latch.
+    @State private var manualEngineAVPlayer: Bool?
     // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
     // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
     @State private var engineNote: String?
@@ -280,7 +286,7 @@ struct TVPlayerView: View {
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, skipEditor }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -480,7 +486,22 @@ struct TVPlayerView: View {
     /// (`avEngineFailed`) stays OUTSIDE the latch so an AVPlayer failure still falls back to libmpv in place.
     private var useAVPlayerEngine: Bool {
         if forceMPV || avEngineFailed { return false }   // escape hatch / an AVPlayer load failure fell back to libmpv
+        if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
         return engineLatch ?? routedToAVPlayer
+    }
+
+    /// Whether AVPlayer is even an option for THIS stream, gating the "AVPlayer" row in the engine picker.
+    /// Mirrors the router's hard exclusions: a yt-direct sidecar pair, a torrent / loopback URL, and any
+    /// container AVFoundation cannot demux all stay on libmpv. Forcing `.avfoundation` through the router
+    /// answers "would the router ever pick AVPlayer here", so the picker never offers a dead choice.
+    private var canUseAVPlayerEngine: Bool {
+        if audioSidecarURL != nil { return false }
+        let loopback = url.host == "127.0.0.1" || url.host == "localhost"
+        if torrent || loopback { return false }
+        let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
+        return PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
+                                         override: .avfoundation,
+                                         dvDisplayCapable: DVDisplaySupport.isCapable) == .avfoundation
     }
 
     /// The raw routing computation, mirroring PlayerScreen.routedToAVPlayer. Consulted only for the pre-onAppear
@@ -794,6 +815,7 @@ struct TVPlayerView: View {
                 switch panelKind {                       // Back from a settings sub-panel returns to its list
                 case .audioSettings:    openPanel(.audio)
                 case .subtitleSettings: openPanel(.subtitles)
+                case .engine:           openPanel(.playerSettings)
                 default:                closePanel()
                 }
             case .upArrow: moveOption(-1)
@@ -1343,6 +1365,8 @@ struct TVPlayerView: View {
             return rows
         case .playerSettings:
             return playerSettingsRows()
+        case .engine:
+            return engineRows()
         case .skipEditor:
             return skipEditorRows()
         case .episodes:
@@ -1616,6 +1640,16 @@ struct TVPlayerView: View {
                 coordinator.player?.setHardwareDecoding(false)
             })
         }
+        // Player engine picker (P3, #76): reachable only when AVPlayer is a real option for this stream (DV /
+        // HLS / debrid; never torrents or a yt-direct sidecar pair). Lets the viewer flip libmpv <-> AVPlayer
+        // mid-title for true Dolby Vision (AVPlayer) or wider format / libass subtitle support (libmpv).
+        if canUseAVPlayerEngine {
+            rows.append(OptionRow(label: "Playback", isHeader: true))
+            rows.append(OptionRow(label: "Player engine",
+                                  detail: isAVPlayerActive ? "AVPlayer  ·  ›" : "VortX Player  ·  ›") {
+                openPanel(.engine)
+            })
+        }
         rows.append(OptionRow(label: "Info", isHeader: true))
         rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
                               isSelected: showStats) {
@@ -1627,6 +1661,22 @@ struct TVPlayerView: View {
                                                            : "Stream link  ·  QR for your phone") {
                 withAnimation { showOptions = false }
                 showStreamQR = true
+            })
+        }
+        return rows
+    }
+
+    /// The Player Engine picker rows (P3, #76): flip libmpv <-> AVPlayer mid-title. The AVPlayer row appears
+    /// only when it is a valid engine for this stream (guarded by the caller via `canUseAVPlayerEngine`).
+    private func engineRows() -> [OptionRow] {
+        let onAV = isAVPlayerActive
+        var rows: [OptionRow] = []
+        rows.append(OptionRow(label: "VortX Player  ·  all formats, styled subtitles", isSelected: !onAV) {
+            switchPlayerEngine(toAVPlayer: false)
+        })
+        if canUseAVPlayerEngine {
+            rows.append(OptionRow(label: "AVPlayer  ·  Dolby Vision, HLS", isSelected: onAV) {
+                switchPlayerEngine(toAVPlayer: true)
             })
         }
         return rows
@@ -1881,6 +1931,7 @@ struct TVPlayerView: View {
         case .sources:          return "Sources"
         case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
+        case .engine:           return "Player Engine"
         case .skipEditor:       return "Edit Skip Segment"
         }
     }
@@ -2218,6 +2269,50 @@ struct TVPlayerView: View {
             }
         }
         return true
+    }
+
+    /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
+    /// user-driven switch: tears the live engine down synchronously (straddle invariant) BEFORE flipping the
+    /// manual override so `playerSurface` re-renders the other engine on the SAME view, carries the live
+    /// position, and re-arms the one-shot latches so tracks / size / resume re-apply on the fresh mount. Speed
+    /// and subtitle sync are re-applied once the new engine's controller mounts. Track choices re-derive from
+    /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
+    /// design; matching is by lang/title). No-op when already on the requested engine.
+    private func switchPlayerEngine(toAVPlayer: Bool) {
+        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        DiagnosticsLog.log("player", "user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        // Capture the live position BEFORE the reset below zeroes hasStartedPlaying (mirrors demote).
+        let reconcileResume = hasStartedPlaying ? currentTime : resumeSeconds
+        coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        manualEngineAVPlayer = toAVPlayer
+        avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false
+        appliedAutoTracks = false; loadErrorMsg = ""
+        inFlightSeekTarget = nil
+        resumeSeconds = reconcileResume
+        suppressedResumeFloor = nil
+        startLoadTimeout()
+        if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
+        // The fresh mount auto-loads the immutable LAUNCH url; re-point at the ACTIVE source if this session
+        // switched source/episode in place (same deferred re-point demoteAVPlayerToMPV uses; the mpv/AVPlayer
+        // controller only becomes coordinator.player on the NEXT SwiftUI render).
+        if let cu = curURL, cu != url {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled, curURL == cu else { return }
+                appliedResume = false
+                loadIntoPlayer(cu, headers: curHeaders, live: curIsLive)
+            }
+        }
+        // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+            if abs(playSpeed - 1.0) > 0.01 { coordinator.player?.setSpeed(playSpeed) }
+            if subDelay != 0 { coordinator.player?.setSubDelay(subDelay) }
+        }
+        withAnimation { showOptions = false }
     }
 
     /// Show a brief player toast and auto-clear it. Used to surface the AVPlayer->libmpv fallback reason.
