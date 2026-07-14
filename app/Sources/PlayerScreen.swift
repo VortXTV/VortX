@@ -932,9 +932,22 @@ struct PlayerScreen: View {
                 if !appliedInitialResume, d > 0 {
                     appliedInitialResume = true
                     if resumeSeconds > 5, resumeSeconds < d - 10 {   // resume where we left off
-                        coordinator.player?.seek(to: resumeSeconds)
-                        currentTime = resumeSeconds
-                        lastReported = resumeSeconds
+                        // FORWARD-ONLY DV REMUX on the LAUNCH lane: routing sends a DV remux candidate straight to
+                        // AVPlayer, and the engine drops a pre-start resume seek on a remux mount (AVPlayerEngine
+                        // readyToPlay), so a seek here lands in not-yet-produced bytes, no frame arrives, and the
+                        // start watchdog demotes the true-DV session to libmpv. Suppress the doomed seek, arm the
+                        // save floor from the stored position, and tell the viewer once. The floor-gated persist
+                        // lanes then protect the account resume until playback genuinely passes it. Mirrors tvOS
+                        // maybeResume (the switch lane already arms this way in switchPlayerEngine).
+                        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
+                            suppressedResumeFloor = resumeSeconds
+                            lastReported = resumeSeconds
+                            showEngineNotice("Dolby Vision stream starts from the beginning; resume for these comes in a later update.")
+                        } else {
+                            coordinator.player?.seek(to: resumeSeconds)
+                            currentTime = resumeSeconds
+                            lastReported = resumeSeconds
+                        }
                     }
                 }
                 refreshSkipSegments()
@@ -1852,7 +1865,14 @@ struct PlayerScreen: View {
         // currentTime ticks near 0 on the fresh mount, so an exit inside the window would otherwise flush a low
         // position over the account resume. reportProgress self-clears the floor once the restored playhead
         // passes it. Pre-start / non-remux demotes are unaffected (floor is nil, currentTime wins).
-        let resume = max(hasStartedPlaying ? currentTime : 0, suppressedResumeFloor ?? 0)
+        // Pre-start demote (a remux mount that never produced a frame): currentTime is ~0, so fall back to the
+        // launch offset like tvOS (TVPlayerView demoteAVPlayerToMPV) instead of 0, so mpv reloads at the user's
+        // real position rather than restarting a half-watched title. Once started, carry the higher of the live
+        // position and the floor. The floor is derived from resumeSeconds on the launch/switch remux lanes, so
+        // max() keeps whichever is authoritative.
+        let resume = hasStartedPlaying
+            ? max(currentTime, suppressedResumeFloor ?? 0)
+            : max(resumeSeconds, suppressedResumeFloor ?? 0)
         if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
             showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
         }
