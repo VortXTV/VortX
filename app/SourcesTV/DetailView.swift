@@ -1805,7 +1805,12 @@ struct CoreStreamList: View {
             guard SourcePreferences.shared.autoPickBest, meta?.type == "series", !didAutoPick else { return }
             let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
             var firstBestAt: Date?
-            for _ in 0 ..< 120 {                                   // ~30s ceiling (250 ms steps)
+            var step = 0
+            // Honor cancellation: SwiftUI cancels this .task when the page pops, so the loop must BAIL the
+            // instant that happens instead of spinning up to 120 main-actor iterations during the pop
+            // animation and firing playBest onto a dismissed view (the ac4e3f1 cancel-fire class).
+            while !Task.isCancelled, step < 120 {                   // ~30s ceiling (250 ms steps)
+                step += 1
                 if presenter.request != nil || didAutoPick { return }   // a manual pick / re-entry: stand down
                 let progress = core.streamLoadProgress()
                 if sourceList.best != nil, firstBestAt == nil { firstBestAt = Date() }
@@ -1814,11 +1819,15 @@ struct CoreStreamList: View {
                     sourceList.groups, loaded: progress.loaded, total: progress.total,
                     secondsSinceFirstPlayable: elapsed, rememberedQuality: remembered)
                 if let best = sourceList.best, settled {
+                    // Re-check right before firing: the view may have popped (task cancelled) or a manual pick
+                    // landed during this iteration, so never route playBest onto a dismissed page.
+                    guard !Task.isCancelled, presenter.request == nil, !didAutoPick else { return }
                     didAutoPick = true
                     playBest(best, in: sourceList.groups)
                     return
                 }
-                try? await Task.sleep(for: .milliseconds(250))
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }   // cancelled during the sleep (page popped): stop, do not fire
             }
         }
         // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
