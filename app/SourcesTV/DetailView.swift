@@ -1397,10 +1397,38 @@ struct CoreEpisodeStreams: View {
     var episodes: [CoreVideo] = []
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
+    @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (binge-advance refresh)
+
+    // The episode this page currently SHOWS. Seeded from the pushed `video`, but re-pointed on player dismissal
+    // when continuous play advanced past it: this page stays mounted behind the player (no onAppear re-fires), so
+    // without this it froze on the launch episode forever (symptom 1) and its Watch-Now built a PlaybackMeta for
+    // the wrong episode (symptom 3's identity half). Every label, the backdrop, and the PlaybackMeta handed to
+    // CoreStreamList derive from `currentVideo`, so the page shows and plays the binge-advanced episode. This is
+    // the pushed-page twin of the CoreSeasonedEpisodes #7 return-to-episode signal, which only covered the grid.
+    @State private var currentVideo: CoreVideo
+
+    init(meta: CoreMetaItem, video: CoreVideo, season: Int, episodes: [CoreVideo] = []) {
+        self.meta = meta
+        self.video = video
+        self.season = season
+        self.episodes = episodes
+        _currentVideo = State(initialValue: video)
+    }
+
+    /// The engine's CURRENT resume episode id for this series (advances as continuous play moves through
+    /// episodes): the account-level engine library for the main profile, the per-profile overlay otherwise.
+    /// Same source the grid's #7 signal reads. With fix 2 the engine's `state.videoId` is trustworthy input.
+    private var resumeVideoId: String? {
+        profiles.activeUsesEngineHistory ? core.metaDetails?.libraryItem?.state.videoId : profiles.watch[meta.id]?.videoId
+    }
+
+    /// The season the page shows: follows `currentVideo` so a cross-season binge advance re-labels correctly.
+    private var shownSeason: Int { currentVideo.season ?? season }
 
     var body: some View {
         ZStack {
-            FullBleedBackdrop(url: video.thumbnail ?? meta.background ?? meta.poster)
+            FullBleedBackdrop(url: currentVideo.thumbnail ?? meta.background ?? meta.poster)
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Spacer().frame(height: 400)   // let the episode still own the top of the screen
@@ -1414,7 +1442,7 @@ struct CoreEpisodeStreams: View {
                             .lineLimit(2).minimumScaleFactor(0.7)
                             .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
                         episodeMetaRow
-                        if let overview = video.overview, !overview.isEmpty {
+                        if let overview = currentVideo.overview, !overview.isEmpty {
                             Text(overview)
                                 .font(Theme.Typography.body)
                                 .foregroundStyle(Theme.Palette.textSecondary)
@@ -1422,10 +1450,10 @@ struct CoreEpisodeStreams: View {
                                 .frame(maxWidth: 1000, alignment: .leading)
                         }
                     }
-                    CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
-                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: meta.type,
+                    CoreStreamList(title: "\(meta.name) · S\(shownSeason)·E\(currentVideo.episode ?? 0)",
+                                   meta: PlaybackMeta(libraryId: meta.id, videoId: currentVideo.id, type: meta.type,
                                                       name: meta.name, poster: meta.poster,
-                                                      season: video.season, episode: video.episode),
+                                                      season: currentVideo.season, episode: currentVideo.episode),
                                    episodes: episodes,
                                    imdbId: {
                                        if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
@@ -1437,14 +1465,25 @@ struct CoreEpisodeStreams: View {
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .onAppear { core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id) }
+        .onAppear { core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: currentVideo.id) }
+        // Binge-advance refresh: when the player closes, continuous play may have advanced past the episode this
+        // page launched from. Follow the engine's resume episode so the page (title, backdrop, meta, and the
+        // Watch-Now PlaybackMeta) shows the CURRENT episode, and re-point meta_details at it so a second Watch-Now
+        // resolves + plays THAT episode's streams. Guarded on a real move to a known episode, so a no-op close
+        // (paused, same episode) leaves the page untouched.
+        .onChange(of: presenter.request == nil) {
+            guard presenter.request == nil, let id = resumeVideoId, id != currentVideo.id,
+                  let moved = episodes.first(where: { $0.id == id }) else { return }
+            currentVideo = moved
+            core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: moved.id)
+        }
     }
 
     /// Season/episode, air date, then the show-level facts (runtime, rating, genres) for context.
     private var episodeMetaRow: some View {
         HStack(spacing: Theme.Space.md) {
-            Text("S\(season) · E\(video.episode ?? 0)")
-            if let released = video.released, released.count >= 10 { Text(String(released.prefix(10))) }
+            Text("S\(shownSeason) · E\(currentVideo.episode ?? 0)")
+            if let released = currentVideo.released, released.count >= 10 { Text(String(released.prefix(10))) }
             if let rt = meta.runtime { Text(rt) }
             if let imdb = meta.imdbRating {
                 HStack(spacing: 6) {
@@ -1460,8 +1499,8 @@ struct CoreEpisodeStreams: View {
     }
 
     private var episodeTitle: String {
-        let t = video.title ?? ""
-        return t.isEmpty ? "Episode \(video.episode ?? 0)" : t
+        let t = currentVideo.title ?? ""
+        return t.isEmpty ? "Episode \(currentVideo.episode ?? 0)" : t
     }
 }
 
@@ -1624,7 +1663,12 @@ struct CoreStreamList: View {
         // published-array reads: the assembly (merges + tombstones + direct-links filter) AND the rank
         // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is a few
         // cheap reads behind an equality guard, safe from body.
-        sourceList.setContext(metaId: meta?.libraryId ?? "", streamId: nil, continuity: remembered, pin: sourcePin)
+        // SCOPE TO THIS EPISODE (binge-desync fix, symptom 3's stream half): on a series episode page pass the
+        // episode's own id so the list only ever assembles + plays THIS episode's stream groups, never whatever
+        // episode the engine's meta_details last resolved (a binge-advanced later episode). Mirrors iOS, which
+        // already passes `streamId: video.id`. Movies and live carry no episode id → nil → unscoped, unchanged.
+        let episodeStreamId = meta?.type == "series" ? meta?.videoId : nil
+        sourceList.setContext(metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin)
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
@@ -1647,7 +1691,11 @@ struct CoreStreamList: View {
         let shownRows = rows
         let visibleCount = visible.reduce(0) { $0 + $1.streams.count }   // total in the filtered view, for "Show more"
         let hasMore = visibleCount > shownRows.count
-        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
+        // Scope the readiness gate to THIS episode too (binge-desync fix): the unscoped progress counts every
+        // episode's add-ons that ever loaded into meta_details, so a stale page would read "ready" off the
+        // binge-advanced episode's counts and one press would resolve against streams that are not this
+        // episode's. Scoped, Watch-Now waits on THIS episode's add-ons (worst case it shows "Finding best…").
+        let addons = episodeStreamId.map { core.streamLoadProgress(forStreamId: $0) } ?? core.streamLoadProgress()
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
