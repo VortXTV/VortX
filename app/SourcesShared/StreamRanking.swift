@@ -7,6 +7,16 @@ import Foundation
 /// from the stream's name + description + filename, where add-ons put their tags. Deliberately simple:
 /// seeders matter mainly for raw torrents, which a debrid user rarely lands on.
 enum StreamRanking {
+    // MARK: - Tier-step budget
+
+    /// The within-tier seeder tiebreak cap, held BELOW the headroom left under the 15000 source-type
+    /// tier step after the other within-tier lifts: 15000 - prefer(2500) - cache(8000) - max quality
+    /// spread(~4300) = 200. Capping at 190 keeps a preferred, cached, top-quality torrent with a hot
+    /// swarm (the corner case) strictly inside its source-type tier, so this last within-tier bonus can
+    /// never be what pushes the sum past the step and lets a lower tier leapfrog a higher one. min()
+    /// against it stays monotonic in seeders, so relative swarm-health order within the tier is preserved.
+    static let seederTiebreakCap = 190
+
     // MARK: - Caches
 
     /// `String.range(of:options:.regularExpression)` recompiles the ICU pattern on EVERY call,
@@ -291,9 +301,11 @@ enum StreamRanking {
         // providers without ever crossing a quality or tier boundary.
         score += providerOffset(for: provider(text))
         // Raw torrents live or die by swarm health; cached/debrid streams don't care. A dead
-        // swarm sinks within its tier, a hot one earns a capped tiebreak bonus.
+        // swarm sinks within its tier, a hot one earns a capped tiebreak bonus. The cap is held
+        // below the tier-step headroom (see seederTiebreakCap) so a preferred + cached + top-quality
+        // hot-swarm torrent still cannot cross its source-type tier step.
         if type == .torrent, let seeders = seederCount(text) {
-            score += seeders == 0 ? -800 : min(seeders * 8, 400)
+            score += seeders == 0 ? -800 : min(seeders * 8, seederTiebreakCap)
         }
         // Fake-quality guard: a file far too small for the resolution it claims is mislabelled
         // (Comet and other raw-passthrough add-ons surface these; a 50 MB "4K" has been seen
