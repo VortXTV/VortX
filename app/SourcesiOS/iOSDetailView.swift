@@ -390,13 +390,19 @@ struct iOSDetailView: View {
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
     private func heroBandHeight(viewport: CGFloat) -> CGFloat {
         #if os(macOS)
-        // The Mac detail hero is now near-fullscreen so the page stops reading as empty (owner ask): the
-        // cinematic banner takes ~72% of the window height, leaving a real (but smaller) region below for the
-        // pinned-hero scroll model (see `macDetailBody`) so the episode / source list still gets an
-        // independent scroll area. Floor keeps a short window usable; cap stops an enormous display from
-        // pushing the banner past the point where the scroll region vanishes.
+        // The Mac detail hero reads near-fullscreen so the page stops looking empty (owner ask): on a TALL
+        // window the cinematic banner takes ~72% of the height. But because `macDetailBody` PINS this band
+        // (only the region beneath it scrolls, and it is the only way to reach the action row, synopsis,
+        // credits and the episode / source list), the band must never eat the whole window. So we always
+        // reserve a usable inner-scroll region: cap the band at `viewport - reservedForContent` so at least
+        // ~320pt survives below it, even at the app's minimum 600pt window height (StremioXiOSApp.swift:176),
+        // where the band shrinks to ~280pt instead of the old immovable 560pt banner that left a ~40pt slot.
+        // For any window taller than ~1143pt the 0.72 fraction is the smaller term, so tall windows still
+        // read near-fullscreen; the 1000 cap stops an enormous display pushing the banner past that point.
         guard viewport > 0 else { return 620 }
-        return min(1000, max(560, viewport * 0.72))
+        let reservedForContent: CGFloat = 320
+        let band = min(1000, min(viewport * 0.72, viewport - reservedForContent))
+        return max(280, band)
         #else
         guard viewport > 0 else { return 420 }
         return max(360, viewport * 0.60)
