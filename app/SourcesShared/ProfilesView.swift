@@ -63,8 +63,8 @@ struct ProfilePickerView: View {
     @State private var pinTarget: UserProfile?
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
-    #if os(macOS)
-    /// Measured width of the macOS picker's horizontal scroll viewport, used to pin the card row's
+    #if !os(tvOS)
+    /// Measured width of the picker's horizontal scroll viewport (iOS + macOS), used to pin the card row's
     /// minWidth so a short row centers instead of sitting hard-left (see the picker body below).
     @State private var pickerRowWidth: CGFloat = 0
     #endif
@@ -102,12 +102,19 @@ struct ProfilePickerView: View {
                         .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
                 })
                 #else
+                // iOS: the horizontal scroll is the systemic S1b fix so 3+ cards do not clip both phone
+                // edges. S12: use the SAME measured-minWidth centering as macOS so a short row (1-2 profiles)
+                // sits balanced instead of hard-left with trailing dead space; it still scrolls identically
+                // once the cards exceed the measured viewport width (the intrinsic row width then wins).
                 ScrollView(.horizontal, showsIndicators: false) {
-                    // iOS: the horizontal scroll is the systemic S1b fix so 3+ cards do not clip both phone
-                    // edges. The row sits leading and scrolls; no flexible-width centering frame (it would be
-                    // a no-op along the scroll axis anyway).
                     profileCards
+                        .frame(minWidth: pickerRowWidth, alignment: .center)
                 }
+                .background(GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { pickerRowWidth = proxy.size.width }
+                        .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
+                })
                 #endif
             }
             .padding(Theme.Space.screenInset)

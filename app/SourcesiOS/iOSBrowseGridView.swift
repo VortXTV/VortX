@@ -208,8 +208,8 @@ struct iOSDiscoverCard: View {
                 .font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.Palette.accent.opacity(list.accentOpacity))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(Theme.Space.md)
             VStack(alignment: .leading, spacing: 2) {
-                Text(LocalizedStringKey(list.title)).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                Text(LocalizedStringKey(list.subtitle)).font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
+                Text(LocalizedStringKey(list.title)).font(Theme.Typography.cardTitle).foregroundStyle(.white)
+                Text(LocalizedStringKey(list.subtitle)).font(Theme.Typography.eyebrow).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
             }
             .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
             .padding(Theme.Space.md)
@@ -339,7 +339,7 @@ struct iOSGenreTile: View {
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {
                 Image(systemName: genre.symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
-                Text(LocalizedStringKey(genre.title)).font(.system(size: 15, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+                Text(LocalizedStringKey(genre.title)).font(Theme.Typography.label).foregroundStyle(.white).lineLimit(1)
             }
             .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
             .padding(10)
@@ -366,7 +366,7 @@ struct iOSDecadeTile: View {
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {
                 Image(systemName: decade.symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
-                Text(decade.title).font(.system(size: 15, weight: .bold)).foregroundStyle(.white).lineLimit(1)
+                Text(decade.title).font(Theme.Typography.label).foregroundStyle(.white).lineLimit(1)
             }
             .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
             .padding(10)

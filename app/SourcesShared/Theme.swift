@@ -118,17 +118,18 @@ enum Theme {
     /// browse, detail, player, and Settings screens all declare it; tvOS screens already did, which
     /// is why text size worked there but not on iOS/Mac (#48).
     enum Typography {
+        // `scaled` only applies the user's LIVE App Text Size multiplier; the per-role BASE size is
+        // chosen per platform below. tvOS keeps its 10-foot ramp verbatim. iOS / macOS (viewed at
+        // arm's length) use a distinct base ramp with real hierarchy: the earlier approach multiplied
+        // the tvOS ramp by a flat 0.62, which INVERTED the mid-ramp (cardTitle 22*0.62=14 fell BELOW
+        // body 24*0.62=15) and crushed section/card/label/eyebrow into a near-uniform mush. A per-role
+        // table restores the ratio (hero 40, screenTitle 32, sectionTitle 22, cardTitle 17, body 15,
+        // label 13, eyebrow 11). The live textScale still multiplies whichever base applies, so the
+        // App Text Size setting scales everything exactly as before.
         private static func scaled(_ size: CGFloat) -> CGFloat {
-            // Base sizes are tvOS 10-foot dimensions. On phone / iPad / Mac, viewed at arm's length,
-            // those render far too large, so scale the base down to 62% before applying the user's
-            // live textScale. tvOS keeps the full base. (Root cause of the "text too big" report.)
-            #if os(tvOS)
-            let base = size
-            #else
-            let base = size * 0.62
-            #endif
-            return (base * CGFloat(ThemeManager.shared.textScale)).rounded()
+            (size * CGFloat(ThemeManager.shared.textScale)).rounded()
         }
+        #if os(tvOS)
         static var hero: Font        { .system(size: scaled(64), weight: .heavy, design: .serif) }
         static var wordmark: Font    { .system(size: scaled(38), weight: .bold, design: .serif) }
         static var screenTitle: Font { .system(size: scaled(52), weight: .heavy) }
@@ -137,6 +138,18 @@ enum Theme {
         static var body: Font        { .system(size: scaled(24), weight: .regular) }
         static var label: Font       { .system(size: scaled(20), weight: .medium) }
         static var eyebrow: Font     { .system(size: scaled(15), weight: .bold) }
+        #else
+        // iOS / macOS arm's-length ramp (S1). wordmark is unused in the app; 24 preserves its former
+        // proportion (0.62*38) since it was not part of the inversion bug.
+        static var hero: Font        { .system(size: scaled(40), weight: .heavy, design: .serif) }
+        static var wordmark: Font    { .system(size: scaled(24), weight: .bold, design: .serif) }
+        static var screenTitle: Font { .system(size: scaled(32), weight: .heavy) }
+        static var sectionTitle: Font { .system(size: scaled(22), weight: .semibold) }
+        static var cardTitle: Font   { .system(size: scaled(17), weight: .semibold) }
+        static var body: Font        { .system(size: scaled(15), weight: .regular) }
+        static var label: Font       { .system(size: scaled(13), weight: .medium) }
+        static var eyebrow: Font     { .system(size: scaled(11), weight: .bold) }
+        #endif
     }
 }
 

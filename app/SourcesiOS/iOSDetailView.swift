@@ -1250,10 +1250,11 @@ struct iOSDetailView: View {
                 Button {
                     withAnimation(.easeOut(duration: 0.25)) { castExpanded.toggle() }
                 } label: {
+                    // S9: same header component as Episodes / Sources / More Like This; the disclosure
+                    // chevron rides at the trailing edge of the standardized header row (mirrors the way
+                    // Episodes keeps its download menu in the header HStack).
                     HStack(spacing: Theme.Space.xs) {
-                        Text("Cast & Crew")
-                            .font(Theme.Typography.label)
-                            .foregroundStyle(Theme.Palette.textPrimary)
+                        iOSRailHeader(title: "Cast & Crew")
                         Image(systemName: "chevron.down")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(Theme.Palette.textTertiary)
@@ -2889,9 +2890,8 @@ struct iOSDetailView: View {
     @ViewBuilder private var whereToWatchSection: some View {
         if let avail = watchAvail, !avail.providers.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                Text("Where to Watch")
-                    .font(Theme.Typography.sectionTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
+                // S9: standardized header component (title-only; no natural kicker here).
+                iOSRailHeader(title: "Where to Watch")
                     .padding(.horizontal, Theme.Space.md)
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: Theme.Space.md) {
@@ -3547,13 +3547,18 @@ struct iOSEpisodeStreams: View {
 
 /// Section header: a small ember eyebrow over the section title (mirrors tvOS RailHeader).
 private struct iOSRailHeader: View {
-    let eyebrow: String
+    // Optional so every detail section can share this component (S9): sections with a natural kicker
+    // (Episodes "N episodes", More Like This "Similar Series", Sources) pass one; sections without one
+    // (Cast & Crew, Where to Watch) omit it and render title-only, rather than fabricating filler copy.
+    var eyebrow: String? = nil
     let title: String
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(eyebrow.uppercased())
-                .font(Theme.Typography.eyebrow).tracking(1.5)
-                .foregroundStyle(Theme.Palette.accent)
+            if let eyebrow {
+                Text(eyebrow.uppercased())
+                    .font(Theme.Typography.eyebrow).tracking(1.5)
+                    .foregroundStyle(Theme.Palette.accent)
+            }
             Text(title)
                 .font(Theme.Typography.sectionTitle)
                 .foregroundStyle(Theme.Palette.textPrimary)
