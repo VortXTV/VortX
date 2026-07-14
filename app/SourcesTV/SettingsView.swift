@@ -779,17 +779,12 @@ struct SettingsView: View {
             }
             choiceRow(String(localized: "Safety filter"), [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
             Text(sourcePrefs.keywordsAreRegex
-                 ? "Hides CAM and fake-quality sources. Hide / Require words are case-insensitive regex patterns (an invalid pattern is ignored)."
-                 : "Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
+                 ? "Hides CAM and fake-quality sources. Match words as regex treats the Only / Avoid words in Smart source selection as case-insensitive regex patterns (an invalid pattern is ignored)."
+                 : "Hides CAM and fake-quality sources. Turn on Match words as regex to treat the Only / Avoid words in Smart source selection as full patterns.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            HStack(spacing: Theme.Space.md) {
-                Text("Hide words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                TextField("none", text: $sourcePrefs.excludeKeywords)
-            }
-            HStack(spacing: Theme.Space.md) {
-                Text("Require words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                TextField("none", text: $sourcePrefs.includeKeywords)
-            }
+            // Hide / Require word fields moved to the Smart source selection chip panel above (Avoid / Only
+            // words, same keys); the regex toggle stays because it governs those word fields and the panel
+            // does not cover it.
             Toggle(isOn: $sourcePrefs.keywordsAreRegex) {
                 Text("Match words as regex")
                     .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
@@ -803,22 +798,10 @@ struct SettingsView: View {
             Text("Hides sources larger than the cap (e.g. 1080p but not a 20 GB file). Sources with no stated size are kept.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            // Instant / dead-torrent / HDR / AV1 / max-quality filters (SAME SourcePreferences properties the
-            // iOS/Mac view binds), ported to the focus-driven choiceRow style.
-            choiceRow(String(localized: "Instant sources only"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.instantOnly ? "1" : "0" }, set: { sourcePrefs.instantOnly = ($0 == "1") }))
-            choiceRow(String(localized: "Hide dead torrents"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.hideDeadTorrents ? "1" : "0" }, set: { sourcePrefs.hideDeadTorrents = ($0 == "1") }))
-            choiceRow(String(localized: "HDR sources only"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.hdrOnly ? "1" : "0" }, set: { sourcePrefs.hdrOnly = ($0 == "1") }))
-            choiceRow(String(localized: "Hide AV1 sources"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.excludeAV1 ? "1" : "0" }, set: { sourcePrefs.excludeAV1 = ($0 == "1") }))
-            // #117 (c): best-effort audio-language filter (SAME SourcePreferences property the iOS/Mac
-            // toggle binds), honest about its limits in the caption below.
-            choiceRow(String(localized: "Preferred audio only"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.preferredAudioOnly ? "1" : "0" }, set: { sourcePrefs.preferredAudioOnly = ($0 == "1") }))
-            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            // Instant sources / Hide dead torrents / HDR only / Hide AV1 / Preferred audio only / Hide unknown
+            // quality moved to the Smart source selection chip panel above (Cached / Dead swarms / HDR-DV /
+            // AV1 / My audio / Stated quality chips, same SourcePreferences keys). The resolution caps below
+            // stay because the chip panel does not cover them.
             choiceRow(String(localized: "Max quality"),
                       [("0", String(localized: "Unlimited")), ("4000", "4K"), ("1080", "1080p"), ("720", "720p")],
                       selection: Binding(get: { String(sourcePrefs.maxResolution) }, set: { sourcePrefs.maxResolution = Int($0) ?? 0 }))
@@ -827,11 +810,7 @@ struct SettingsView: View {
             choiceRow(String(localized: "Minimum quality"),
                       [("0", String(localized: "Off")), ("720", "720p"), ("1080", "1080p"), ("2160", "4K")],
                       selection: Binding(get: { String(sourcePrefs.minResolution) }, set: { sourcePrefs.minResolution = Int($0) ?? 0 }))
-            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule (SAME SourcePreferences
-            // property the iOS/Mac toggle binds).
-            choiceRow(String(localized: "Hide unknown quality"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { sourcePrefs.hideUnknownResolution ? "1" : "0" }, set: { sourcePrefs.hideUnknownResolution = ($0 == "1") }))
-            Text("Instant hides torrents that are not cached on your debrid service. Max quality caps the resolution shown; Minimum quality hides sources below the floor (sources with no stated resolution are kept unless Hide unknown quality is on). Hide dead torrents drops sources with no seeders.")
+            Text("Max quality caps the resolution shown; Minimum quality hides sources below the floor. Sources with no stated resolution are kept unless the Stated quality chip is on.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             // Compact source rows (#117): display-only (SAME vortx.streams.compactLabels key iOS/Mac binds).
