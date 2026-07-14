@@ -2362,28 +2362,42 @@ private struct CastMemberCard: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        Button {} label: {
-            VStack(spacing: Theme.Space.sm) {
-                photo
-                    .scaleEffect(focused ? 1.08 : 1)
-                    .shadow(color: .black.opacity(focused ? 0.5 : 0), radius: focused ? 14 : 0, y: 6)
-                    .animation(.easeOut(duration: 0.18), value: focused)
-                Text(member.name)
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
-                    .lineLimit(2).multilineTextAlignment(.center)
-                if let role = member.character, !role.isEmpty {
-                    Text(role)
-                        .font(Theme.Typography.eyebrow)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .lineLimit(2).multilineTextAlignment(.center)
-                }
-            }
-            .frame(width: 180)
+        // A real TMDB person id (> 0) opens the Person page; the meta name-only fallback carries a synthetic
+        // NEGATIVE id (railCastMembers) with no TMDB person to look up, so it stays a focusable-but-inert card
+        // exactly as before. Both stay focusable so the rail never blocks downward focus travel (see above).
+        if member.id > 0 {
+            NavigationLink {
+                PersonView(personID: member.id, name: member.name, profileURL: member.profileURL)
+            } label: { cardBody }
+            .buttonStyle(.plain)
+            .focused($focused)
+            .accessibilityElement(children: .combine)
+        } else {
+            Button {} label: { cardBody }
+            .buttonStyle(.plain)
+            .focused($focused)
+            .accessibilityElement(children: .combine)
         }
-        .buttonStyle(.plain)
-        .focused($focused)
-        .accessibilityElement(children: .combine)
+    }
+
+    private var cardBody: some View {
+        VStack(spacing: Theme.Space.sm) {
+            photo
+                .scaleEffect(focused ? 1.08 : 1)
+                .shadow(color: .black.opacity(focused ? 0.5 : 0), radius: focused ? 14 : 0, y: 6)
+                .animation(.easeOut(duration: 0.18), value: focused)
+            Text(member.name)
+                .font(Theme.Typography.label)
+                .foregroundStyle(focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
+                .lineLimit(2).multilineTextAlignment(.center)
+            if let role = member.character, !role.isEmpty {
+                Text(role)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(2).multilineTextAlignment(.center)
+            }
+        }
+        .frame(width: 180)
     }
 
     private var photo: some View {

@@ -1297,28 +1297,44 @@ struct iOSDetailView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.md) {
                     ForEach(railCastMembers) { member in
-                        VStack(spacing: Theme.Space.xs) {
-                            castPhoto(member)
-                            Text(member.name)
-                                .font(Theme.Typography.label)
-                                .foregroundStyle(Theme.Palette.textSecondary)
-                                .lineLimit(2)
-                                .multilineTextAlignment(.center)
-                            if let role = member.character, !role.isEmpty {
-                                Text(role)
-                                    .font(Theme.Typography.eyebrow)
-                                    .foregroundStyle(Theme.Palette.textTertiary)
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.center)
-                            }
+                        // A real TMDB person id (> 0) opens the Person page; the meta name-only fallback
+                        // (railCastMembers' synthetic NEGATIVE id) has no TMDB person to look up, so it stays
+                        // a plain non-tappable tile exactly as before.
+                        if member.id > 0 {
+                            NavigationLink {
+                                PersonView(personID: member.id, name: member.name, profileURL: member.profileURL)
+                            } label: { castMemberTile(member) }
+                            .buttonStyle(.plain)
+                        } else {
+                            castMemberTile(member)
                         }
-                        .frame(width: 92)
-                        .accessibilityElement(children: .combine)
                     }
                 }
                 .padding(.vertical, 2)
             }
         }
+    }
+
+    /// One cast rail tile: headshot, actor name, character beneath. Extracted so a tappable (real person id)
+    /// and the non-tappable fallback share identical layout.
+    private func castMemberTile(_ member: TMDBClient.CastMember) -> some View {
+        VStack(spacing: Theme.Space.xs) {
+            castPhoto(member)
+            Text(member.name)
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+            if let role = member.character, !role.isEmpty {
+                Text(role)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(width: 92)
+        .accessibilityElement(children: .combine)
     }
 
     /// One cast headshot: the TMDB profile photo in a circle, else an initials disc so the rail keeps

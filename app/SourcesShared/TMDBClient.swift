@@ -955,6 +955,68 @@ enum TMDBClient {
         return CreditsResult(cast: members, overview: overview)
     }
 
+    // MARK: - Person (bio + filmography for the cast/person page)
+
+    /// A cast member's biographical detail for the Person page header: name, a biography paragraph, birthday
+    /// and birthplace, a larger headshot, and the department TMDB best-knows them for ("Acting", "Directing").
+    /// Resolved from a TMDB person id through the SAME keyless edge path every other call here uses (no user
+    /// key required). Fail-soft: nil on a non-positive id, no match, no data, or any error.
+    struct PersonDetail: Hashable {
+        let name: String
+        let biography: String?
+        let birthday: String?          // already prettified by `prettyDate` ("Mar 1, 1970")
+        let placeOfBirth: String?
+        let profileURL: String?        // w342 headshot, nil when TMDB has none
+        let knownForDepartment: String?
+    }
+
+    /// Full person record via /3/person/{id}. `id` is a TMDB person id (the one `CastMember` carries). Nil on
+    /// a non-positive id (the detail page's synthetic fallback cast has no TMDB person to look up), no match,
+    /// or any error. Routes through the keyless, edge-cached `get()` choke point, so keyless users still get it.
+    static func person(id: Int) async -> PersonDetail? {
+        guard id > 0 else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/person/\(id)?api_key=\(key)"),
+              let name = obj["name"] as? String, !name.isEmpty else { return nil }
+        let bio = (obj["biography"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let profile = (obj["profile_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
+        let dept = (obj["known_for_department"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let place = (obj["place_of_birth"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return PersonDetail(name: name, biography: bio,
+                            birthday: prettyDate(obj["birthday"] as? String),
+                            placeOfBirth: place, profileURL: profile, knownForDepartment: dept)
+    }
+
+    /// A person's filmography via /3/person/{id}/combined_credits, mapped onto the same `MetaPreview` cards the
+    /// hub rails use: id = "tmdb:<id>", type from `media_type`, name from title/name, poster from poster_path.
+    /// Deduped by id; entries with no poster or no title are dropped; sorted most-popular first, then newest.
+    /// Fail-soft: [] on a non-positive id or any error, matching this file's fail-soft contract.
+    static func personCredits(id: Int) async -> [MetaPreview] {
+        guard id > 0 else { return [] }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let obj = await get("/person/\(id)/combined_credits?api_key=\(key)"),
+              let cast = obj["cast"] as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        let ranked: [(preview: MetaPreview, popularity: Double, date: String)] = cast.compactMap { entry in
+            guard let tid = entry["id"] as? Int else { return nil }
+            let media = (entry["media_type"] as? String) ?? "movie"
+            guard media == "movie" || media == "tv" else { return nil }
+            guard let name = ((entry["title"] as? String) ?? (entry["name"] as? String)), !name.isEmpty,
+                  let posterPath = entry["poster_path"] as? String, !posterPath.isEmpty else { return nil }
+            let cid = "tmdb:\(tid)"
+            guard seen.insert(cid).inserted else { return nil }
+            let popularity = (entry["popularity"] as? Double) ?? 0
+            let date = ((entry["release_date"] as? String) ?? (entry["first_air_date"] as? String)) ?? ""
+            let preview = MetaPreview(id: cid, type: media == "tv" ? "series" : "movie", name: name,
+                                      poster: "https://image.tmdb.org/t/p/w342\(posterPath)",
+                                      posterShape: "poster", popularity: popularity)
+            return (preview, popularity, date)
+        }
+        return ranked.sorted { a, b in
+            a.popularity != b.popularity ? a.popularity > b.popularity : a.date > b.date
+        }.map(\.preview)
+    }
+
     /// VortX's keyless catalog edge: a cached, app-gated TMDB proxy that injects OUR key server-side, so
     /// users with no TMDB key still get the hub. Path here mirrors TMDB's /3 namespace. Sourced from the
     /// RemoteConfig `endpoints.catalogs` dial (validated https + *.vortx.tv host, else baked default), so the
