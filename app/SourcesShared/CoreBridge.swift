@@ -1517,13 +1517,25 @@ final class CoreBridge: ObservableObject {
             DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (no add-on base); engine progress will not re-point")
             return false
         }
+        // A stream the engine cannot deserialise (e.g. a usenet/nzb source that only carried name+description,
+        // no url / ytId / infoHash / sources / externalUrl) would be dropped engine-side while the caller still
+        // opens the attribution gate for videoId (a FALSE re-point confirmation). Degrade to nil exactly like
+        // the missing-base path: no-op here, the caller sets enginePlayerVideoId = nil, and the gated writers
+        // skip the wrong-episode engine write until the resident-scrape poll re-points.
+        let raw = rawStreamDict(stream)
+        let hasSource = raw["url"] != nil || raw["ytId"] != nil || raw["infoHash"] != nil
+            || raw["sources"] != nil || raw["externalUrl"] != nil
+        guard hasSource else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (stream has no source-bearing key); engine progress will not re-point")
+            return false
+        }
         // extra: [] matches the shape loadMeta dispatches for a stream path (the engine accepts an empty extra).
         let streamRequest: [String: Any] = [
             "base": effectiveBase,
             "path": ["resource": "stream", "type": "series", "id": videoId, "extra": []],
         ]
         let selected: [String: Any] = [
-            "stream": rawStreamDict(stream),
+            "stream": raw,
             "streamRequest": streamRequest,
             "metaRequest": metaRequest,
             "subtitlesPath": NSNull(),
