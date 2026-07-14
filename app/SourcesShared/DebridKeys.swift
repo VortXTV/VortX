@@ -64,11 +64,12 @@ final class DebridKeys: ObservableObject {
         }
         // Rebuild the debrid resolvers so a CHANGED key takes effect: the coordinator's lazy
         // `if resolvers.isEmpty { reload() }` only warms on first use, so it would otherwise keep
-        // using the OLD key (resolvers is non-empty). DebridCoordinator is @MainActor; setKey may run
-        // off the main actor (e.g. the sync apply path), so hop on.
-        Task { @MainActor in
-            DebridCoordinator.shared.reload()
-            VortXSyncManager.shared.requestSyncSoon()
+        // using the OLD key (resolvers is non-empty). DebridCoordinator is now an `actor`, so hop onto
+        // it to reload (off-main), then hop to the main actor for the sync nudge (VortXSyncManager is
+        // @MainActor).
+        Task {
+            await DebridCoordinator.shared.reload()
+            await MainActor.run { VortXSyncManager.shared.requestSyncSoon() }
         }
     }
 

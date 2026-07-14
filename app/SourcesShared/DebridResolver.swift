@@ -926,8 +926,15 @@ enum DebridHTTP {
 /// Builds resolvers from the user's stored keys and drives cache-check + playback resolution. TorBox is
 /// wired now; Real-Debrid (add-then-poll, no instant cache-check), AllDebrid, and Premiumize slot in as
 /// further `DebridResolving` conformers. Owned by the stream/play layer; reads `DebridKeys.shared`.
-@MainActor
-final class DebridCoordinator {
+///
+/// ISOLATION: this is an `actor`, NOT `@MainActor`. Its only state (`resolvers`, `torboxUsenet`) is mutated
+/// in `reload()` and read in the async resolve/cache-check methods, so the actor's own serial executor keeps
+/// those accesses race-free WITHOUT pinning them to the main thread. This matters for `cacheCheck`: the
+/// per-provider probes are already off-main (the resolvers are actors), but under the old `@MainActor` the
+/// O(services x hashes) merge loop AND every `await` continuation resumed on the main actor, so a cacheCheck
+/// over a large source list (thousands of hashes) hitched the UI thread. As an actor the merge and the
+/// resumptions run on a background executor; nothing here is UI state, so nothing needs the main actor.
+actor DebridCoordinator {
     static let shared = DebridCoordinator()
 
     private var resolvers: [DebridService: any DebridResolving] = [:]

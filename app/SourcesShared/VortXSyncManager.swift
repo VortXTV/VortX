@@ -899,10 +899,10 @@ final class VortXSyncManager: ObservableObject {
             if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
             // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
             // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
-            // path explicitly). @MainActor hop because the coordinator is main-actor isolated. This runs
-            // AFTER the outer withRemoteApplySuppressed window has cleared isApplyingRemote, so wrap the body
-            // in its own suppression to keep reload()'s writes from re-arming a self-echo push.
-            Task { @MainActor in Self.shared.withRemoteApplySuppressed { DebridCoordinator.shared.reload() } }
+            // path explicitly). DebridCoordinator is now an `actor`, so the reload hops onto it off-main.
+            // No withRemoteApplySuppressed wrapper is needed: reload() only rebuilds resolver instances from
+            // the Keychain and writes no sync-doc / @Published state, so it can never re-arm a self-echo push.
+            Task { await DebridCoordinator.shared.reload() }
             // External sync provider tokens (Trakt Lane C, SIMKL Lane D): adopt a connection authored on
             // another device. Apply only when present so a doc without them never clears a locally-connected
             // session (mirrors the debrid guard just above; never delete on absence). adoptTokens writes the
