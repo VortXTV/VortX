@@ -9,13 +9,17 @@ import Foundation
 enum StreamRanking {
     // MARK: - Tier-step budget
 
-    /// The within-tier seeder tiebreak cap, held BELOW the headroom left under the 15000 source-type
-    /// tier step after the other within-tier lifts: 15000 - prefer(2500) - cache(8000) - max quality
-    /// spread(~4300) = 200. Capping at 190 keeps a preferred, cached, top-quality torrent with a hot
-    /// swarm (the corner case) strictly inside its source-type tier, so this last within-tier bonus can
-    /// never be what pushes the sum past the step and lets a lower tier leapfrog a higher one. min()
-    /// against it stays monotonic in seeders, so relative swarm-health order within the tier is preserved.
-    static let seederTiebreakCap = 190
+    /// The within-tier seeder tiebreak cap, held STRICTLY below the headroom left under the 15000
+    /// source-type tier step after the other within-tier lifts: 15000 - prefer(2500) - cache(8000) -
+    /// max quality spread(4313) = 187, so any cap <= 186 keeps the sum strictly under 15000. The max
+    /// quality spread is the EXACT worst case from computeScore: resolution 4000 (2160/4K/UHD, no 8K
+    /// token) + remux 230 + DV 45 + size 12 + Atmos 26 = 4313 (providerOffset is 0, languageScore is
+    /// never positive). Capping at 180 keeps a preferred, cached, top-quality torrent with a hot swarm
+    /// (the corner case) at most at 14813 + 180 = 14993 < 15000, strictly inside its source-type tier,
+    /// so this last within-tier bonus can never be what pushes the sum past the step and lets a lower
+    /// tier leapfrog a higher one, and leaves a 6-point margin under the 186 ceiling. min() against it
+    /// stays monotonic in seeders, so relative swarm-health order within the tier is preserved.
+    static let seederTiebreakCap = 180
 
     // MARK: - Caches
 
@@ -94,7 +98,7 @@ enum StreamRanking {
     }
 
     /// A user-pinned source floats above everything else. The bonus dwarfs the entire score range (the
-    /// quality spread is ~4300, cached is +8000, the source-type tier gap is 15000) so a matching stream
+    /// quality spread is 4313, cached is +8000, the source-type tier gap is 15000) so a matching stream
     /// wins the one-press auto-pick and tops the list - yet it is still only a *score*, so the player's
     /// invisible failover hops straight off it if it turns out to be dead. See `SourcePinStore.matches`.
     static func pinBonus(_ s: CoreStream, addon: String, pin: ResolvedPin?) -> Int {
@@ -308,13 +312,13 @@ enum StreamRanking {
         // Smart Source Selection (Lane A): the Prefer boost and, in "rank" mode, the Avoid demotion. Read
         // through SourcePreferences.reading so the off-main rank uses the frozen Snapshot (race contract).
         // Prefer +2500 lifts a matching source WITHIN its tier but is sized so prefer + cache (+8000) + the
-        // max quality spread (~4300) stays UNDER the 15000 source-type tier step, so a preferred-and-cached
+        // max quality spread (4313) stays UNDER the 15000 source-type tier step, so a preferred-and-cached
         // lower-tier source can never leapfrog a higher tier (the anti-regression invariant that source-type
         // order is the top-level key). Avoid -20000 sinks a matching source well past the quality spread yet
         // stays above the -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole
         // point of "rank"). Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
         score += chipScoreOffset(text)
-        // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (~4300), so
+        // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (4313), so
         // a cached stream always beats an uncached one of the same source type, which is the
         // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
         // the user's source-type order is the top-level key, so someone who ranks Torrent or
@@ -352,7 +356,7 @@ enum StreamRanking {
     /// Smart Source Selection (Lane A) score offset for a stream's quality text: a Prefer-term boost plus,
     /// when Avoid behavior is "rank", an Avoid-term demotion. Both magnitudes are chosen against the same
     /// ladder the cache/junk bonuses use (see `computeScore`): +2500 is a within-tier lift small enough that
-    /// prefer + cache (+8000) + the max quality spread (~4300) stays under the 15000 tier step (so a
+    /// prefer + cache (+8000) + the max quality spread (4313) stays under the 15000 tier step (so a
     /// preferred-and-cached source never crosses its source-type tier); -20000 sinks a source below the
     /// quality spread but keeps it above the -100000 junk floor so it stays visible.
     static func chipScoreOffset(_ text: String) -> Int {

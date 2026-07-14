@@ -30,8 +30,8 @@ enum RankConst {
     static let avoidSink = -20_000     // StreamRanking.chipScoreOffset avoid demotion in "rank" mode
     static let cacheBonus = 8000       // StreamRanking.computeScore cached-hit lift (+8000)
     static let tierStep = 15_000       // SourcePreferences tier-weight spacing (source-type = top-level key)
-    static let maxQualitySpread = 4300 // documented max within-tier quality spread in computeScore
-    static let seederTiebreakCap = 190 // StreamRanking.seederTiebreakCap max torrent swarm-health lift
+    static let maxQualitySpread = 4313 // EXACT max within-tier quality spread in computeScore: resolution 4000 + remux 230 + DV 45 + size 12 + Atmos 26
+    static let seederTiebreakCap = 180 // StreamRanking.seederTiebreakCap max torrent swarm-health lift (<= 186 headroom)
     static let junkFloor = -100_000    // StreamRanking.computeScore junkClass drop
     // A tiny stand-in "quality spread" so we can assert an avoided source stays ABOVE the junk floor
     // (visible, just demoted) rather than being pushed into junk territory.
