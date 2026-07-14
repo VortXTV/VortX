@@ -231,7 +231,7 @@ enum CoreLoadable<T: Decodable>: Decodable {
         // terminal (.err, which streamLoadProgress already counts as settled) and log the
         // surprise so an engine tag rename is visible instead of silent.
         default:
-            NSLog("[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
+            NSLog("%@", "[core] CoreLoadable unknown tag '\(tag)' — treating as terminal (.err)")
             self = .err
         }
     }

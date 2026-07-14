@@ -156,7 +156,7 @@ enum NodeServer {
             let want = min(rlim_t(OPEN_MAX), lim.rlim_max)
             if lim.rlim_cur < want {
                 lim.rlim_cur = want
-                if setrlimit(RLIMIT_NOFILE, &lim) == 0 { NSLog("StremioX: RLIMIT_NOFILE raised to \(want)") }
+                if setrlimit(RLIMIT_NOFILE, &lim) == 0 { NSLog("%@", "StremioX: RLIMIT_NOFILE raised to \(want)") }
             }
         }
 
@@ -457,7 +457,7 @@ enum NodeServer {
         // (The log was already tail-kept + BOOT-stamped at the top of this function, so its mtime is fresh
         // from boot start; nothing to rewrite here.)
 
-        NSLog("StremioX: starting node streaming server (HOME=\(caches), log=\(logPath))")
+        NSLog("%@", "StremioX: starting node streaming server (HOME=\(caches), log=\(logPath))")
         var argv: [UnsafeMutablePointer<CChar>?] =
             [strdup("node"), strdup("-r"), strdup(preloadPath), strdup(scriptPath), nil]
         // strdup mallocs each argv entry; node_start returns when the runtime exits, so free
@@ -465,7 +465,7 @@ enum NodeServer {
         defer { argv.forEach { if let p = $0 { free(p) } } }
         let rc = node_start(4, &argv)
         exitCode = rc
-        NSLog("StremioX: node server exited rc=\(rc)")
+        NSLog("%@", "StremioX: node server exited rc=\(rc)")
         // Mirror the exit into the EXPORTABLE diagnostics log. node_start returning is terminal (nodejs-mobile
         // cannot restart in-process), yet the plain NSLog above was invisible in the log the owner actually
         // sends, so a server death read as an unexplained "everything went Offline". This line lands in the
@@ -497,7 +497,7 @@ enum NodeServer {
             NSLog("StremioX: 11470 still held by a dying instance, waiting")
             Thread.sleep(forTimeInterval: 0.25)
         }
-        NSLog("StremioX: 11470 not freed within \(timeout)s; node may fall back to 11471+ (latch will follow it)")
+        NSLog("%@", "StremioX: 11470 not freed within \(timeout)s; node may fall back to 11471+ (latch will follow it)")
     }
 
     /// JSON-encode a string for safe embedding in the preload JS literal.

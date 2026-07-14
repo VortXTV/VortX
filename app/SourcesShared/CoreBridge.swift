@@ -413,7 +413,7 @@ final class CoreBridge: ObservableObject {
             installedCount += 1
         }
         if installedCount > 0 {
-            NSLog("[CoreBridge] hydrated \(installedCount) account-owned add-on(s) into the engine (no Stremio session needed)")
+            NSLog("%@", "[CoreBridge] hydrated \(installedCount) account-owned add-on(s) into the engine (no Stremio session needed)")
         }
     }
 
@@ -496,7 +496,7 @@ final class CoreBridge: ObservableObject {
                 // When there is NO usable token (genuinely logged out), the doc hydration is the whole
                 // recovery — never call switchAccount with an empty token.
                 if hasStremioToken, let key {
-                    NSLog("[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
                     self.switchAccount(token: key)
                 } else {
                     NSLog("[CoreBridge] degraded session with no Stremio token — recovered from the VortX account doc")
@@ -1669,7 +1669,7 @@ final class CoreBridge: ObservableObject {
         do {
             return try Self.decoder.decode(T.self, from: data)
         } catch {
-            NSLog("[CoreBridge] decode \(field) failed: \(error)")
+            NSLog("%@", "[CoreBridge] decode \(field) failed: \(error)")
             return nil
         }
     }

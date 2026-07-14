@@ -124,7 +124,7 @@ enum StremioServer {
         for port in 11470...11474 where port != embeddedPort {
             if await respondsAsServer("http://127.0.0.1:\(port)/settings") {
                 NodeServer.latch(port: port)
-                NSLog("StremioX: embedded server discovered on :\(port); latched")
+                NSLog("%@", "StremioX: embedded server discovered on :\(port); latched")
                 return true
             }
         }

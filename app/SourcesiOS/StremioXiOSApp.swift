@@ -66,7 +66,7 @@ struct StremioXiOSApp: App {
         // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
         Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
         CoreBridge.shared.start()
-        NSLog("[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
+        NSLog("%@", "[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
 
     var body: some Scene {
