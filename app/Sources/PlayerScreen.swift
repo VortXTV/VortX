@@ -344,6 +344,11 @@ struct PlayerScreen: View {
     /// yanked a playing stream into the other engine minutes in (the mid-playback "auto-switch to DV" report).
     /// Engine choice happens ONLY at start; the sole later transition is the failure demotion (avEngineFailed).
     @State private var engineLatch: Bool?
+    /// Quality signature of what is playing RIGHT NOW (iOS port of TVPlayerView.curHint). Seeded from the
+    /// launch signature (`recordQualityText`) and re-set in `switchStream` to the switched-to stream, so the
+    /// DV gate (`activeAVPlayerWouldRemux`) and the DV display-mode plumbing (`contentIsDolbyVision`) judge the
+    /// ACTIVE source after an in-player source switch across DV-ness, not the immutable launch source.
+    @State private var curHint: String?
     /// Set when the AVPlayer engine failed and we demoted to libmpv. Error events from the dismounting
     /// AVPlayer engine can still land shortly after the swap; anything inside this grace window is stale and
     /// must not burn the fresh mpv load's retry budget (or paint the error overlay over a recovering play).
@@ -512,7 +517,7 @@ struct PlayerScreen: View {
     /// condition AVPlayerEngine.loadFile's shouldDVRemux evaluates, without the @MainActor wrapper.
     private var activeAVPlayerWouldRemux: Bool {
         let activeURL = curURL ?? url
-        let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
+        let isDV = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
         return isDV
             && PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
             && PlayerEngineRouter.isDVRemuxCandidate(activeURL)
@@ -688,6 +693,7 @@ struct PlayerScreen: View {
             }
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            if curHint == nil { curHint = recordQualityText }   // seed the "playing now" signature from the launch stream
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
@@ -1413,7 +1419,7 @@ struct PlayerScreen: View {
         // Tell the libmpv lane whether this stream is Dolby Vision (same flag the engine router uses) so a DV
         // file that lands on libmpv drives the display into DV mode instead of HDR10 (tvOS effect; harmless on
         // iOS/macOS, which have no display-mode switch).
-        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(recordQualityText ?? "")
+        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
         coordinator.player?.loadFile(p.url, headers: p.headers, live: live, audioSidecar: sidecar)
     }
 
@@ -1841,10 +1847,12 @@ struct PlayerScreen: View {
         avDemotedAt = Date()
         // Demoting off a forward-only remux that started at 0 (its resume seek was dropped): the real position
         // lives in suppressedResumeFloor, so carry the higher of the live position and the floor into the mpv
-        // re-load (mpv CAN seek). Clear the floor: mpv restores the real point, so the save guard is no longer
-        // needed. Pre-start / non-remux demotes are unaffected (floor is nil, currentTime wins).
+        // re-load (mpv CAN seek). KEEP the floor across the demote: mpv's resume restore is DEFERRED (nudgeResume
+        // fires after a short sleep, plus a ~400ms re-point reload when the source had switched), and in that gap
+        // currentTime ticks near 0 on the fresh mount, so an exit inside the window would otherwise flush a low
+        // position over the account resume. reportProgress self-clears the floor once the restored playhead
+        // passes it. Pre-start / non-remux demotes are unaffected (floor is nil, currentTime wins).
         let resume = max(hasStartedPlaying ? currentTime : 0, suppressedResumeFloor ?? 0)
-        suppressedResumeFloor = nil
         if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
             showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
         }
@@ -2071,6 +2079,7 @@ struct PlayerScreen: View {
         curURL = newURL
         curHeaders = stream.requestHeaders
         curIsTorrent = stream.isTorrent
+        curHint = StreamRanking.signature(stream)   // keep the "playing now" signature in step for the DV gate + engine picker
         // `explicitPick` (a real source-row / quality tap) is DISTINCT from `userInitiated` (which resets the
         // failover budget for any fresh load, including episode auto-advance). Only a real source pick honors
         // the same source on a start-timeout; an auto-advanced episode or an auto-hop stays non-explicit so it
@@ -2199,7 +2208,7 @@ struct PlayerScreen: View {
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
         guard let loadEpisode, !switchingEpisode else { return }
         switchingEpisode = true
-        if duration > 0, currentTime > 0 { onProgress(currentTime, duration) }   // flush the outgoing episode
+        if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
         Task {
@@ -2344,12 +2353,12 @@ struct PlayerScreen: View {
             }
             if canNextEpisode {
                 iconButton("forward.end.fill", label: "Next episode") {
-                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                    if duration > 0 { reportProgress(currentTime) }   // flush before advancing (floor-guarded)
                     goToNextEpisode()
                 }
             } else if hasNext {
                 iconButton("forward.end.fill", label: "Next episode") {
-                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                    if duration > 0 { reportProgress(currentTime) }   // flush before advancing (floor-guarded)
                     onNext()
                 }
             }
@@ -2471,7 +2480,7 @@ struct PlayerScreen: View {
         let target = remuxClampedTarget(min(max(currentTime + delta, 0), max(duration - 1, 0)))
         coordinator.player?.seek(to: target)
         currentTime = target
-        if duration > 0 { onSeek(target, duration); lastReported = target }
+        reportSeek(target)
         scheduleHide()
     }
 
@@ -2513,7 +2522,7 @@ struct PlayerScreen: View {
                                 let target = remuxClampedTarget(scrubTarget)   // P2: cap forward scrub at the remux edge
                                 currentTime = target
                                 coordinator.player?.seek(to: target)
-                                if duration > 0 { onSeek(target, duration); lastReported = target }
+                                reportSeek(target)
                                 scrubThumbnails.clear()
                                 scheduleHide()
                             }
@@ -4041,6 +4050,21 @@ struct PlayerScreen: View {
             suppressedResumeFloor = nil
         }
         onProgress(position, duration)
+    }
+
+    /// Persist a user-initiated seek (skip buttons, macOS arrow keys, slider commit) to the presenter, which
+    /// writes it to BOTH the engine library and the account. Mirrors `reportProgress`' resume-floor guard for
+    /// the onSeek lane (and the tvOS scrub-commit gate): a forward seek off the remux restart-at-0 must not
+    /// overwrite the real account resume until the playhead has actually passed the floor. The floor clears
+    /// once passed. Backward / non-suppressed seeks pass straight through.
+    private func reportSeek(_ target: Double) {
+        guard duration > 0 else { return }
+        if let floor = suppressedResumeFloor {
+            if target < floor { return }
+            suppressedResumeFloor = nil
+        }
+        onSeek(target, duration)
+        lastReported = target
     }
 
     /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it

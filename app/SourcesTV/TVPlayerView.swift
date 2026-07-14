@@ -2321,9 +2321,11 @@ struct TVPlayerView: View {
         // Carry the HIGHER of the live position and any suppressed resume floor: demoting off a forward-only
         // remux that started at 0 (its resume seek was dropped) holds the REAL position only in
         // suppressedResumeFloor, so currentTime alone would rewind the mpv re-open to ~0. mpv CAN seek, so
-        // clear the floor after: mpv restores the real point and the save guard is no longer needed.
+        // maybeResume seeks the mpv re-open to this reconciled point. KEEP the floor across the demote: the mpv
+        // resume is DEFERRED to the duration event, and in that gap currentTime ticks near 0 on the fresh mount,
+        // so an exit inside the window would otherwise flush a low position over the account resume. saveProgress
+        // self-clears the floor once the restored playhead passes it.
         let reconcileResume: Double? = hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : (resumeSeconds ?? suppressedResumeFloor)   // capture BEFORE the reset below zeroes hasStartedPlaying
-        suppressedResumeFloor = nil
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
         // Carry the live position into the mpv re-load UNCONDITIONALLY (maybeResume reads resumeSeconds once
