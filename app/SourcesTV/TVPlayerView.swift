@@ -496,8 +496,8 @@ struct TVPlayerView: View {
             LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
             hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
-            // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
-            // which captures nothing). Independent of the engine-teardown rules below.
+            // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
+            // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
             saveProgress(at: currentTime, thenSyncEngine: true)   // exit flush: save, THEN pull the engine's library fresh (no-op for live)
             // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
@@ -615,7 +615,8 @@ struct TVPlayerView: View {
     }
 
     /// Whether the active player engine is AVFoundation (so the chrome can hide the rows AVPlayer has no
-    /// equivalent for: external add-on subtitles, trickplay frame capture).
+    /// equivalent for: audio sync (setAudioDelay), audio output mode, and the hardware-decoding toggle).
+    /// External add-on subtitles and trickplay frame capture DO work on AVPlayer, so those rows stay shown.
     private var isAVPlayerActive: Bool { coordinator.player is AVPlayerEngineController }
 
     // MARK: - Property handling (shared by both engines via the MPVProperty event bus)

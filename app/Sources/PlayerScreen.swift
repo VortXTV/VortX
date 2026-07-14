@@ -461,31 +461,17 @@ struct PlayerScreen: View {
     // Playback-info overlay rows, refreshed while the Info panel is open.
     @State private var infoRows: [(String, String)] = []
 
-    // iOS bare-HLS AVPlayer reported the item .failed (dead link / bad codec): route to libmpv (mpvBody) instead
-    // of spinning forever on the buffering overlay.
-    @State private var hlsFailed = false
-
     var body: some View {
         Group {
-            #if os(iOS)
-            // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
-            // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
-            // server can transcode HLS); tvOS routes HLS in TVPlayerView.
-            if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url), !hlsFailed {
-                HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
-                              onProgress: onProgress, onClose: onClose,
-                              onLoadFailed: { hlsFailed = true })   // dead HLS link -> fall back to libmpv (mpvBody)
-                    .ignoresSafeArea()
-                    .statusBarHidden(true)
-            } else {
-                mpvBody
-            }
-            #else
-            // macOS (#46): the AVPlayer engine now sits behind the SAME full chrome (playerSurface mounts
-            // AVPlayerEngineView for Dolby Vision / the "Prefer AVPlayer" override, else libmpv), so the Mac no
-            // longer drops to a bare AVKit player without the episode list / quality / sources panels.
+            // ONE full-chrome player for every stream on every platform (Gap 1). Adaptive-HLS (.m3u8) on iOS
+            // used to mount the bare `HLSPlayerView` (no track selection / episode nav / skip pill / trickplay /
+            // subtitle add-ons / speed / chapters / engine switch); it now flows through `mpvBody` -> the same
+            // `playerSurface` the rest of the app uses, where `PlayerEngineRouter` routes HLS to the full-chrome
+            // `AVPlayerEngineView` (native ABR + AirPlay + PiP) and a dead HLS link demotes to libmpv in place via
+            // the engine's endFileError path (see handleProperty), matching the old bare-path onLoadFailed. macOS
+            // keeps HLS on libmpv (the router's HLS rule is iOS/tvOS only; its node server transcodes HLS) and
+            // tvOS routes HLS in TVPlayerView, both unchanged.
             mpvBody
-            #endif
         }
         // Ambient-hero gate: the browse UI (and any mounted in-hero trailer clip) stays alive UNDER this
         // fullscreen player, so signal "a player is up" for as long as this screen is mounted - the hero
@@ -502,9 +488,10 @@ struct PlayerScreen: View {
     /// falls back to libmpv, no loop).
     @State private var manualEngineAVPlayer: Bool?
 
-    /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: HLS is already
-    /// handled in `body` (the minimal HLSPlayerView), and now a **Dolby Vision** stream in an AVPlayer-playable
-    /// container (MP4/MOV/M4V) auto-routes here for true DV passthrough (libmpv only tone-maps DV to SDR). The
+    /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: remote HLS routes
+    /// here for native ABR + AirPlay + PiP (Gap 1: through the full chrome now, not the old bare HLSPlayerView),
+    /// and a **Dolby Vision** stream in an AVPlayer-playable container (MP4/MOV/M4V) auto-routes here for true DV
+    /// passthrough (libmpv only tone-maps DV to SDR). The
     /// override (Always libmpv / Prefer AVPlayer) still wins. On an AVPlayer load failure we fall back to libmpv
     /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
@@ -583,7 +570,12 @@ struct PlayerScreen: View {
         #if os(iOS) || os(macOS)
         if useAVPlayerEngine {
             AVPlayerEngineView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers)
+                // Pass the launching stream's Dolby Vision flag (same plumbing as mpvSurface and the tvOS
+                // surface). Without it the first iOS/macOS native-DV MP4/MOV mount never armed the DV
+                // watchdogs (audio-over-black, hev1/dvhe repair, DV diagnostics) that key off
+                // contentIsDolbyVision; source switches were already covered via loadIntoPlayer.
+                .play(initialPlayback.url, headers: initialPlayback.headers,
+                      isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
                 .live(initialIsLive)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
                 .ignoresSafeArea()
