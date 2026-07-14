@@ -42,6 +42,12 @@ app/Resources/node-darwin-arm64
 #     value locally here + as a CI GitHub repo secret. See app/SourcesShared/VortXEdgeAuth.swift.
 app/Config/VortXEdge.xcconfig
 
+# --- external sync provider credentials (Trakt / SIMKL client id + secret) ---
+#     Same rule as the edge secret: the repo is PUBLIC, so the real values must NEVER be committed.
+#     Only the tracked ExternalSync.xcconfig.example template ships. Owner provisions the real values
+#     locally here (or as CI GitHub repo secrets). See app/Config/ExternalSync.xcconfig.example.
+app/Config/ExternalSync.xcconfig
+
 # --- tooling / misc ---
 .DS_Store
 .playwright-mcp/

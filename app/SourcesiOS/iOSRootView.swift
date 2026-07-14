@@ -613,6 +613,7 @@ struct iOSHomeView: View {
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
@@ -775,6 +776,16 @@ struct iOSHomeView: View {
                     if !topPicks.items.isEmpty {
                         homeRail(PosterRail(title: String(localized: "Top Picks for you"),
                                             items: topPicks.items.map {
+                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                         poster: $0.poster, progress: 0)
+                                            },
+                                            onTap: handleTap))
+                    }
+                    // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id via
+                    // handleTap). Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
+                    if !traktRails.items.isEmpty {
+                        homeRail(PosterRail(title: String(localized: "Trakt Watchlist"),
+                                            items: traktRails.items.map {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
                                             },
@@ -989,6 +1000,8 @@ struct iOSHomeView: View {
         // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
         // tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshReleaseCalendar() }
+        // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
+        .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
         .onDisappear { hero.stop() }
     }
 
@@ -1020,6 +1033,7 @@ struct iOSHomeView: View {
         let cw = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         let library = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
+        traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived

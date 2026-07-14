@@ -95,17 +95,27 @@ final class WatchedIndex: ObservableObject {
         // in the window before the resweep re-triggers rebuild via ctx events, and the generation
         // guard drops these passes' publishes.
         let expectedUID = CoreBridge.shared.currentUID()
+        // Trakt shadow (additive-read, opt-in): union the tt ids watched on Trakt into the badge set. Empty
+        // when the import toggle is off. Kick a throttled refresh so a stale cache re-pulls; the pull calls
+        // back into `externalShadowChanged` (one more rebuild) when it changes something. NEVER an engine write.
+        TraktSyncEngine.shared.refreshIfStale()
+        let shadow = TraktSyncEngine.shared.shadowWatchedIDs()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let first = Self.bucketWatchedIDs(expectedUID: expectedUID)
-            DispatchQueue.main.async { self?.publish(live.union(first), ifCurrent: gen) }
+            DispatchQueue.main.async { self?.publish(live.union(first).union(shadow), ifCurrent: gen) }
             // Resweep: the engine persists the bucket as an async effect AFTER the NewState emit,
             // so the first pass can read the pre-mark file. One trailing re-read settles it.
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.resweepDelay) { [weak self] in
                 let second = Self.bucketWatchedIDs(expectedUID: expectedUID)
-                DispatchQueue.main.async { self?.publish(live.union(second), ifCurrent: gen) }
+                DispatchQueue.main.async { self?.publish(live.union(second).union(shadow), ifCurrent: gen) }
             }
         }
     }
+
+    /// The Trakt shadow cache changed (a fresh pull, or the import toggle flipped): rebuild so the unioned
+    /// badge set reflects it without waiting for an engine event. Main-queue safe; the rebuild throttle
+    /// already coalesces bursts.
+    func externalShadowChanged() { rebuild() }
 
     /// Publish on main, dropping stale generations and no-op sets (identical set republishes nothing,
     /// so rails do not re-evaluate on the routine resweep).

@@ -146,6 +146,11 @@ struct TVPlayerView: View {
     /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// A per-playback token for external-sync sessions. TVPlayerView is fresh per playback, so a rewatch of
+    /// the same title carries a new token and scrobbles again; the same-title recovery reloads (switchStream
+    /// hop, AVPlayer->libmpv demote, retry) keep it unchanged so the coordinator's once-latches survive and a
+    /// completion recorded before the reload is never re-sent as a duplicate history record.
+    @State private var playbackSessionID = UUID().uuidString
     @State private var appliedVolume = false   // D5: the persisted default-volume apply runs once per load (re-armed on source switch/reload)
     // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
@@ -540,6 +545,13 @@ struct TVPlayerView: View {
             if let b = data as? Bool {
                 isPaused = b
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
+                // External sync (Trakt) live scrobble pause/resume, ADDED ALONGSIDE the existing persistence
+                // below (which is unchanged). Fail-soft + gated inside the coordinator; a no-op with empty
+                // creds. SIMKL has no live scrobble, so it is skipped by capability.
+                if !isCurrentLiveStream, let m = curMeta {
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                }
                 if b {
                     saveProgress(at: currentTime)   // persist on pause
                     // Keep the ENGINE's library copy in step too (same floor rule as the 20s tick).
@@ -584,6 +596,11 @@ struct TVPlayerView: View {
                             linkSavedAt: ref != nil ? Date() : nil),
                             profileID: ProfileStore.shared.activeID)
                     }
+                    // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
+                    // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
+                    // creds. Duration is often still 0 at first frame, so this starts at 0% and the stop carries
+                    // the real percentage.
+                    if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     // Add-on subtitles were fetched only from the `duration` event, which a debrid direct-HTTP
@@ -738,6 +755,10 @@ struct TVPlayerView: View {
         case MPVProperty.endFileEof:
             if handleLiveStreamEOF() { break }
             if !markedWatched, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
+            // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op with
+            // empty creds. Fired for the finishing episode before any in-place advance opens a new session.
+            if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
             autoAdvance()                                // episode finished → play next, else exit
         default: break
         }
@@ -3485,6 +3506,11 @@ struct TVPlayerView: View {
     /// engine is leaked.
     private func leavePlayback() {
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit (Back / close / terminal
+        // auto-advance). Additive + fail-soft + gated + once-latched inside the coordinator; a no-op with
+        // empty creds. Near the end this records the watch (deduped against the 90%/EOF record); mid-title it
+        // saves a resume/pause point (live scrobble only).
+        if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
         // Force the OLD engine to halt decode + network and BEGIN teardown synchronously, right now, instead
         // of leaving it to whenever SwiftUI gets around to dismantle*. This is THE debrid crash fix: a debrid

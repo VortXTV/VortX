@@ -1154,6 +1154,11 @@ final class CoreBridge: ObservableObject {
     /// flips live instead of waiting for a library sync. Relies on meta_details being loaded (it is,
     /// since playback is launched from the detail screen).
     func markPlaybackWatched(_ meta: PlaybackMeta) {
+        // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
+        // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
+        // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
+        // never touches an engine libraryItem field, honoring the poison invariant.
+        ScrobbleCoordinator.shared.watched(meta)
         guard ProfileStore.shared.activeUsesEngineHistory else {
             ProfileStore.shared.markWatched(meta: meta)   // overlay profile: private history only
             return
@@ -1292,6 +1297,15 @@ final class CoreBridge: ObservableObject {
     /// Library tab or Continue Watching is in no catalog, so this hands the engine
     /// its own full meta JSON instead (a superset of the preview it expects).
     func addDetailToLibrary() {
+        // External sync (Trakt/SIMKL): mirror a detail-page library ADD to each connected provider's
+        // watchlist. Whole-title intent (movie or show). Additive + fail-soft + gated inside the coordinator
+        // (owner profile only, watchlist toggle on); a no-op with empty creds. Built from the open detail
+        // meta, so this covers both iOS and tvOS (both route their add button here).
+        if let meta = metaDetails?.meta {
+            ScrobbleCoordinator.shared.addedToLibrary(
+                PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: meta.type,
+                             name: meta.name, poster: meta.poster, season: nil, episode: nil))
+        }
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: save to the profile's private overlay, never the account library.
             if let meta = metaDetails?.meta {
@@ -1320,6 +1334,19 @@ final class CoreBridge: ObservableObject {
             }
         }
         NSLog("[CoreBridge] AddToLibrary found no ready meta in meta_details")
+    }
+
+    /// Remove the open detail-page title from the library, mirroring the removal to each connected external
+    /// provider's watchlist FIRST. The shared chokepoint both detail surfaces (iOS + tvOS) call for their
+    /// "remove from library" action, so the watchlist mirror stays out of `removeFromLibrary(id:)` itself
+    /// (which is also the Continue-Watching dismiss, not a watchlist intent). Fail-soft + gated + a no-op
+    /// with empty creds inside the coordinator.
+    func removeDetailFromLibrary() {
+        guard let meta = metaDetails?.meta else { return }
+        ScrobbleCoordinator.shared.removedFromLibrary(
+            PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: meta.type,
+                         name: meta.name, poster: meta.poster, season: nil, episode: nil))
+        removeFromLibrary(id: meta.id)
     }
 
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id

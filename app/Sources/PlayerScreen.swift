@@ -362,6 +362,11 @@ struct PlayerScreen: View {
     /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// A per-playback token for external-sync sessions: fresh per view instance (so a rewatch of the same
+    /// title scrobbles again) and re-minted on a genuine episode advance. A same-title recovery reload
+    /// (source hop / demote / retry) keeps it unchanged, so the scrobble coordinator's once-latches survive
+    /// and a completion recorded before the reload is never re-sent.
+    @State private var playbackSessionID = UUID().uuidString
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
     @State private var isSeekable = true
@@ -783,6 +788,12 @@ struct PlayerScreen: View {
                     reconnecting = false; loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
+                    // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
+                    // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
+                    // creds. Live content is excluded (no scrobble meaning), mirroring the stop hooks. Duration
+                    // is often still 0 at first frame, so this starts at 0% and later ticks / the stop carry
+                    // the real percentage.
+                    if let m = curMeta, !effectivelyLive { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
                     // Lock Screen / Control Center transport. Relative mpv seek so the skip always works off
                     // the LIVE position (a captured currentTime would be stale in these long-lived targets).
                     NowPlayingCenter.wireCommands(
@@ -901,6 +912,14 @@ struct PlayerScreen: View {
                 // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
                 // paused, so without this the now-playing rate would stay stuck at "playing").
                 NowPlayingCenter.update(title: curTitle, elapsed: currentTime, duration: duration, paused: b)
+                // External sync (Trakt) live scrobble pause/resume. Scrobble ONLY: this handler persists
+                // nothing else (no resume-point write). Additive + fail-soft + gated inside the coordinator;
+                // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
+                // SIMKL has no live scrobble, so it is skipped by capability.
+                if let m = curMeta, !effectivelyLive {
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                }
             }
         case MPVProperty.trackList:
             refreshTracks()
@@ -940,6 +959,10 @@ struct PlayerScreen: View {
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
             if !markedWatched, !effectivelyLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
+            // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op
+            // with empty creds. Fired for the finishing episode before any in-place advance opens a new session.
+            if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
@@ -2078,6 +2101,12 @@ struct PlayerScreen: View {
             upNextSuppressed = false   // re-arm the Up Next band for the new episode
             appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
             lastReported = -1
+            // External sync (Trakt/SIMKL): a genuine episode advance is a new playback session, so re-mint
+            // the token and open the new episode's scrobble START here (the same-title recovery reloads that
+            // also flip hasStartedPlaying keep the old token and never reach this block). The first-frame
+            // hook re-fires with the same key + token and is deduped by the coordinator's start latch.
+            playbackSessionID = UUID().uuidString
+            ScrobbleCoordinator.shared.playbackStarted(es.meta, position: es.resume, duration: 0, sessionToken: playbackSessionID)
             switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume)
         }
     }
@@ -3743,6 +3772,10 @@ struct PlayerScreen: View {
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
             if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
         }
+        // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
+        // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
+        // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
+        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
         // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
         // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.

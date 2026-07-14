@@ -2229,7 +2229,7 @@ struct LibraryChip: View {
         let saved = core.detailInLibrary
         Button {
             if saved {
-                if let id = core.metaDetails?.meta?.id { core.removeFromLibrary(id: id) }
+                core.removeDetailFromLibrary()   // removes from library + mirrors to external watchlists
             } else {
                 core.addDetailToLibrary()
             }

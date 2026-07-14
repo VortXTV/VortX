@@ -131,6 +131,15 @@ packages:
 settings:
   base:
     VORTX_EDGE_SECRET: ""
+    # External sync provider credentials (Trakt Lane C, SIMKL Lane D). EMPTY by default so a fresh
+    # clone / CI always builds; the Info.plist TraktClientId/SIMKLClientId keys substitute these, and
+    # TraktAuth/SIMKLAuth fall back to "" when absent (isConfigured=false => the whole feature is a
+    # hidden no-op with zero external network). The real values are injected at build time from the
+    # gitignored Config/ExternalSync.xcconfig or CI secrets; the repo is public, never hardcode them.
+    TRAKT_CLIENT_ID: ""
+    TRAKT_CLIENT_SECRET: ""
+    SIMKL_CLIENT_ID: ""
+    SIMKL_CLIENT_SECRET: ""
 targets:
   VortX:
     type: application
