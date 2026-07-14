@@ -1065,10 +1065,18 @@ struct SettingsView: View {
             Text("A backup saves your profiles, theme, and player preferences so they travel with you and survive a future major update. On iPhone, iPad, and Mac you can save that to a file today.")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
-            Text("On Apple TV a scan-with-your-phone backup is coming: Backup will show a QR code, you scan it with your phone, and your settings save to your VortX account. Restore shows another code to bring them right back. Until then, signing in restores your library, add-ons, and watch history here.")
+            Text("On Apple TV it is scan-with-your-phone: Back up shows a QR you scan on a device signed in to VortX to save this Apple TV's data to your account, and Restore shows a code to bring it back onto a fresh install.")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
                 .padding(.top, Theme.Space.xs)
+            NavigationLink { BackupExportView() } label: {
+                Label("Back up", systemImage: "arrow.up.circle")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            NavigationLink { BackupImportView() } label: {
+                Label("Restore", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
             Text("Export Library, which saves a profile's titles and watch progress to a file, lives on iPhone, iPad, and Mac (Apple TV has no file picker). On Apple TV your library and history follow you through your VortX account.")
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
