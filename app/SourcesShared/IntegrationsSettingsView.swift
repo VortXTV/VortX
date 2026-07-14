@@ -6,7 +6,9 @@ import SwiftUI
 ///   1. Stremio: bring your Stremio add-ons and library in (StremioConnectCard, reuses LinkLoginView).
 ///   2. Trakt: scrobble + watchlist (existing card, via ExternalServicesSettingsView).
 ///   3. SIMKL: mark-watched + plan-to-watch (existing card, via ExternalServicesSettingsView).
-///   4. Nuvio: placeholder for the upcoming import (WS6 fills it; graceful stub, no dead button).
+///   4. Nuvio: bring the Stremio-compatible add-on(s) you use in Nuvio in (NuvioConnectCard, opens
+///      NuvioImportView). Nuvio has no account/sync service of its own, so unlike Stremio there is
+///      nothing to sign into; the card just opens the paste-URL importer.
 ///
 /// Cross-platform (iPhone / iPad / Mac / Apple TV): hosted here in SourcesShared and pushed from both the
 /// iOS and tvOS settings screens, so both surfaces get the same section by construction (settings parity).
@@ -25,8 +27,8 @@ struct IntegrationsSettingsView: View {
                 // 2 + 3. Trakt then SIMKL, reused as-is (each still dormant until its build creds exist).
                 ExternalServicesSettingsView()
 
-                // 4. Nuvio placeholder: clearly marked, informative, and inert (WS6 wires the real import).
-                NuvioPlaceholderCard()
+                // 4. Nuvio: opens the paste-URL importer (WS6).
+                NuvioConnectCard()
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
@@ -36,25 +38,27 @@ struct IntegrationsSettingsView: View {
     }
 }
 
-/// Graceful stub for the upcoming Nuvio import. No action yet: it states what is coming instead of
-/// offering a button that does nothing, so it never reads as a broken control.
-private struct NuvioPlaceholderCard: View {
+/// "Nuvio" card for the Integrations screen: opens `NuvioImportView`, the paste-URL import for bringing a
+/// Nuvio user's Stremio-compatible add-on(s) into VortX. Styled to match the Stremio/Trakt/SIMKL cards
+/// (surface1, rounded, same title/body type). Unlike those three, Nuvio has no account or sign-in state to
+/// reflect here (see NuvioImportView's header comment for why), so this is a plain NavigationLink card
+/// rather than an inline connect/disconnect control, matching the AddonsView "Discover add-ons" link.
+private struct NuvioConnectCard: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            HStack(spacing: Theme.Space.sm) {
-                Text("Nuvio").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                Text("Coming soon")
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .padding(.horizontal, Theme.Space.sm)
-                    .padding(.vertical, 4)
-                    .background(Theme.Palette.surface2, in: Capsule())
+        NavigationLink { NuvioImportView() } label: {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.sm) {
+                    Text("Nuvio").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    Spacer()
+                    Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+                }
+                Text("Bring the Stremio-compatible add-on you use in Nuvio into VortX. This is optional and separate from your VortX account.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             }
-            Text("Import your Nuvio catalogs and sources into VortX. This is on the way; there is nothing to set up yet.")
-                .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+            .padding(Theme.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
-        .padding(Theme.Space.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .buttonStyle(.plain)
     }
 }
