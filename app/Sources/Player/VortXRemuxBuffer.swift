@@ -66,11 +66,21 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// window.
     private let windowFloorBytes: Int = max(VortXRemuxBuffer.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024
 
-    /// Producer-lead budget on top of the re-read floor. This is the slack the remux thread is allowed to run
-    /// ahead of the reader before `append` blocks. Without it the producer (a stream-copy that muxes as fast as
-    /// the debrid link delivers) would race to the full remuxed size whenever AVPlayer throttles or the user
-    /// pauses, and jetsam the memory-constrained Apple TV. Resident RAM is thus bounded to (floor + this).
-    private static let producerLeadBytes = 64 * 1024 * 1024
+    // --- F3 two-stage producer lead (ONE-LINE REVERT: delete `engineReady` + `markEngineReady` and set the
+    // ceiling in `append` back to `windowFloorBytes + producerLeadFull`). The producer-lead budget is the slack
+    // the remux thread may run ahead of the reader before `append` blocks; without it a stream-copy that muxes
+    // as fast as the debrid link delivers races to the full remuxed size whenever AVPlayer throttles, jetsaming
+    // the memory-constrained Apple TV. Resident RAM is bounded to (floor + lead). We run a REDUCED lead until
+    // the engine reports first-frame readiness, so the pre-first-frame window cannot stack the full 64 MiB lead
+    // into the shared jetsam budget at the exact moment mpv may be re-opening the same 4K stream on a demote;
+    // once ready, the full lead restores steady-state headroom. The reduced lead (16 MiB) still comfortably
+    // exceeds the few 1s segments needed to reach readyToPlay and stays above the 32 MiB open-segment cap, so
+    // it never stalls the publish pipeline. ---
+    private static let producerLeadPreReady = 16 * 1024 * 1024   // F3: reduced lead before first-frame readiness
+    private static let producerLeadFull      = 64 * 1024 * 1024   // F3: full lead once the engine is ready
+    /// Set once via `markEngineReady()` when AVPlayerEngine reports readyToPlay/first frame; guarded by
+    /// `condition`. Selects the producer lead in `append` (reduced before, full after).
+    private var engineReady = false
 
     /// Bytes currently held in `storage` (delivered floor plus producer lead). Caller holds the lock.
     private var residentCount: Int { storage.count }
@@ -86,7 +96,8 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     func append(_ bytes: UnsafePointer<UInt8>, count: Int) {
         guard count > 0 else { return }
         condition.lock()
-        let ceiling = windowFloorBytes + Self.producerLeadBytes
+        // F3 two-stage lead: reduced until the engine reports readiness, then full.
+        let ceiling = windowFloorBytes + (engineReady ? Self.producerLeadFull : Self.producerLeadPreReady)
         while residentCount >= ceiling && !isFinished {
             condition.wait(until: Date().addingTimeInterval(0.25))
         }
@@ -97,6 +108,18 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         storage.append(bytes, count: count)
         producedCount += count
         condition.signal()
+        condition.unlock()
+    }
+
+    /// F3: mark that the playback engine has reached first-frame readiness, so `append` switches from the
+    /// reduced pre-ready producer lead to the full lead. Thread-safe; called from the AVPlayerEngine readyToPlay
+    /// path via the remux server/loader. Signals so a producer parked on the lower ceiling wakes and may run on.
+    func markEngineReady() {
+        condition.lock()
+        if !engineReady {
+            engineReady = true
+            condition.signal()
+        }
         condition.unlock()
     }
 
