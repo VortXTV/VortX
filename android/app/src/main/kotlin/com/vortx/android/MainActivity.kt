@@ -31,7 +31,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // Edge-to-edge is enforced app-wide (ANDROID-PLAN.md S01 scope; DESIGN-SYSTEM.md chrome
-        // recedes behind content). StremioXTheme forces the dark scheme regardless of the system
+        // recedes behind content). VortXTheme forces the dark scheme regardless of the system
         // setting (ui/theme/Theme.kt), so both system bars get light icons unconditionally instead of
         // the OS's light/dark auto-resolution, which would otherwise mismatch a light system theme.
         // The Compose shell consumes the resulting insets via Scaffold's contentPadding (StremioXApp).
