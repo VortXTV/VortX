@@ -10,6 +10,10 @@ import SwiftUI
 /// is empty (and hidden by the Home views) until a real Trakt connection exists. Fully fail-soft.
 @MainActor
 final class TraktRailsModel: ObservableObject {
+    /// Posted on Trakt disconnect/sign-out so every mounted Home rail (iOS + tvOS keep their own
+    /// per-view `TraktRailsModel`) clears immediately instead of lingering up to the refresh interval.
+    static let disconnectedNote = Notification.Name("vortx.trakt.disconnected")
+
     /// The watchlist cards to render, resolved + capped. Empty hides the rail.
     @Published private(set) var items: [MetaPreview] = []
 

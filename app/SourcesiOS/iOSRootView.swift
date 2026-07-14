@@ -1000,6 +1000,8 @@ struct iOSHomeView: View {
         // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
         // tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshReleaseCalendar() }
+        // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
+        .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
         .onDisappear { hero.stop() }
     }
 

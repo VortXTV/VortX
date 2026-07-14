@@ -40,9 +40,25 @@ final class TraktSyncEngine {
     /// so `WatchedIndex.rebuild` can union it inline. Gated on the toggle here so a single call site in
     /// WatchedIndex stays clean.
     func shadowWatchedIDs() -> Set<String> {
-        guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched) else { return [] }
+        guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return [] }
         lock.lock(); defer { lock.unlock() }
         return watchedTT
+    }
+
+    // MARK: - Disconnect
+
+    /// Wipe ALL local Trakt shadow state (memory + disk): the watched shadow cache AND the pending push
+    /// queue. Called on disconnect / sign-out so (1) the imported watched badges drop immediately and
+    /// (2) a queued push can never drain into the NEXT account that signs in on this device
+    /// (cross-account contamination). The caller notifies `WatchedIndex` so the read path rebuilds.
+    func reset() {
+        lock.lock()
+        watchedTT = []
+        pendingPushes = []
+        lastRefresh = nil
+        lock.unlock()
+        Self.saveWatched([])
+        Self.saveQueue([])
     }
 
     // MARK: - Refresh (sign-in + foreground, throttled)

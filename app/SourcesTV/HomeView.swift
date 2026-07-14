@@ -209,6 +209,8 @@ struct HomeView: View {
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
         .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
+        // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
+        .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
     }
 
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.

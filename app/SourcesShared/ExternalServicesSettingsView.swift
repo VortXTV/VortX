@@ -151,7 +151,14 @@ private struct TraktConnectCard: View {
     private func disconnect() {
         Task {
             await TraktAuth.shared.signOut()
-            await MainActor.run { connected = false; code = nil; qr = nil }
+            // Wipe local shadow state so the imported watched badges drop now and no queued push can drain
+            // into the next account that connects on this device (cross-account contamination).
+            TraktSyncEngine.shared.reset()
+            await MainActor.run {
+                connected = false; code = nil; qr = nil
+                WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
+                NotificationCenter.default.post(name: TraktRailsModel.disconnectedNote, object: nil)   // clear the Home watchlist rail now
+            }
         }
     }
 }
