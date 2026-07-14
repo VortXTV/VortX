@@ -93,6 +93,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// to synthesize a finite VOD duration, since the live HLS delivery keeps AVPlayerItem.duration INDEFINITE.
     var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
 
+    /// The source MKV chapter markers (start seconds + title). The engine reads these for the Chapters panel /
+    /// scrubber ticks on the DV remux lane, since the local HLS delivery carries no chapter metadata (Gap 3).
+    var chapters: [(start: Double, title: String)] { stream.chapters }
+
     /// Whether the mount is still HEALTHY: the init segment has published AND the remux buffer has not failed.
     /// The engine's one-shot healthy-mount retry (#76) reads this to tell "a CoreMedia startup hiccup on a live
     /// mount" (retry a fresh item) from "the remux itself died" (demote). Same two signals serveMedia gates on.
