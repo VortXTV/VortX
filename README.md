@@ -19,7 +19,7 @@
 
 # VortX
 
-The native streaming client for Apple devices, **formerly StremioX**. Fully native apps for Apple TV, iPhone, iPad, and Mac, built on stremio-core and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
+VortX is the native streaming app for Apple TV, iPhone, iPad, and Mac, **formerly StremioX**. Fully native apps built on the stremio-core engine and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
 
 > **StremioX is now VortX, as of v0.3.5.** The app takes its new name, gold-on-obsidian icon, and animated intro starting with this release. It is an in-place update, so your library, add-ons, watch history, and settings are exactly where you left them, signed into the same account. The repository and docs follow next, along with a website, a subreddit, and a Discord. A later update will move VortX to a fresh identity all the way down; when that lands your library and history still return on sign-in, but local settings could start fresh, which is why this release adds **Backup & Restore**.
 
@@ -47,7 +47,7 @@ Three layers, so your setup always follows you:
 
 Stremio is a great engine and a great protocol, and VortX is built on it. But the Apple apps fell behind. Stremio's Apple TV, iPhone, and iPad builds stopped getting updates and went stale while the platform moved on, and the Apple TV option stayed feature limited. Apple users, and Apple TV users especially, were left on an old build.
 
-VortX picks that up and carries it forward. It is the modern, native, actively developed Stremio client for Apple devices, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best Stremio experience on Apple hardware, and the foundation for the best one anywhere. It builds _on_ Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
+VortX picks that up and carries it forward. It is a modern, native, actively developed streaming app for Apple TV, iPhone, iPad, and Mac, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best native experience on Apple hardware, and the foundation for the best one anywhere. It builds _on_ Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
 
 One thing worth being straight about: I didn't hand-write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own devices, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was genuinely good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo. A small but growing group of community contributors has since pitched in too (see Credits).
 

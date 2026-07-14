@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "VortX web client (web.vortx.tv). A direct/debrid/HLS-first Stremio client that talks to the Stremio add-on protocol and Cinemeta straight from the browser. No streaming server, no native shell.",
+  "description": "VortX web client (web.vortx.tv). A direct/debrid/HLS-first web client that talks to the Stremio add-on protocol and Cinemeta straight from the browser. No streaming server, no native shell.",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
