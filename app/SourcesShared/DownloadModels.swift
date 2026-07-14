@@ -81,6 +81,12 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// Human-readable failure reason when `state == .failed`; nil otherwise.
     var errorText: String?
 
+    /// Honest note that this record is a batch auto-retry (#119): set when a batch-queued episode's first
+    /// source failed and the coordinator swapped in the next-best source for it. Surfaces in the row
+    /// subtitle so the user sees the episode was retried, not silently swapped. nil for every normal record.
+    /// Optional + defaulted, so an index written before this field decodes it as nil (Codable-compatible).
+    var retryNote: String?
+
     /// The live `URLSessionTask.taskIdentifier` of the transfer filling this record, persisted so a
     /// relaunch can map a still-running background task (byte-download OR HLS asset) back to its record
     /// and re-wire pause/cancel to the real task. `taskIdentifier` is stable for the life of a task on a
@@ -98,7 +104,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
          isTorrent: Bool, headers: [String: String]?, remoteURL: String, localFilename: String,
          hlsRelativePath: String? = nil,
          bytesTotal: Int64 = 0, bytesDone: Int64 = 0, state: DownloadState = .queued,
-         addedAt: Date = Date(), errorText: String? = nil, taskIdentifier: Int? = nil) {
+         addedAt: Date = Date(), errorText: String? = nil, retryNote: String? = nil, taskIdentifier: Int? = nil) {
         self.id = id
         self.contentId = contentId
         self.videoId = videoId
@@ -119,6 +125,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         self.state = state
         self.addedAt = addedAt
         self.errorText = errorText
+        self.retryNote = retryNote
         self.taskIdentifier = taskIdentifier
     }
 
