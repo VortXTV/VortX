@@ -390,8 +390,13 @@ struct iOSDetailView: View {
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
     private func heroBandHeight(viewport: CGFloat) -> CGFloat {
         #if os(macOS)
-        guard viewport > 0 else { return 560 }
-        return min(760, max(560, viewport * 0.58))
+        // The Mac detail hero is now near-fullscreen so the page stops reading as empty (owner ask): the
+        // cinematic banner takes ~72% of the window height, leaving a real (but smaller) region below for the
+        // pinned-hero scroll model (see `macDetailBody`) so the episode / source list still gets an
+        // independent scroll area. Floor keeps a short window usable; cap stops an enormous display from
+        // pushing the banner past the point where the scroll region vanishes.
+        guard viewport > 0 else { return 620 }
+        return min(1000, max(560, viewport * 0.72))
         #else
         guard viewport > 0 else { return 420 }
         return max(360, viewport * 0.60)
@@ -418,6 +423,23 @@ struct iOSDetailView: View {
         // overflow, which is why this only bit iOS.
         GeometryReader { geo in
             ScrollViewReader { proxy in
+                #if os(macOS)
+                // macOS pinned-hero scroll model: for a VOD / series page, the cinematic banner is a FIXED
+                // layer and only the content beneath (action row, synopsis, credits, and the episode / source
+                // list) scrolls, as its own independent region. This is a fixed hero LAYER + an inner
+                // ScrollView, NEVER a scroll section-header pin (that mechanism triggered the
+                // NSToolbar/section-header crash class banned in architecture.md). Live keeps the single
+                // scroll (its backdrop is a short fixed band, not a near-fullscreen hero).
+                if LiveTypes.contains(type) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: Theme.Space.lg) { livePage }
+                            .padding(.bottom, Theme.Space.xl)
+                            .frame(width: geo.size.width, alignment: .leading)
+                    }
+                } else {
+                    macDetailBody(geo: geo, proxy: proxy)
+                }
+                #else
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
                         // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
@@ -449,6 +471,7 @@ struct iOSDetailView: View {
                     .padding(.bottom, Theme.Space.xl)
                     .frame(width: geo.size.width, alignment: .leading)
                 }
+                #endif
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
@@ -753,71 +776,121 @@ struct iOSDetailView: View {
         // a bottom-aligned ZStack made a tall column (long synopsis + wrapped buttons) push the fixed-height
         // backdrop down until it sat behind the buttons with the title stranded on black above, the
         // "backdrop is so far down / layout is messy" report. A fixed banner keeps the art pinned to the top.
-        let band = heroBandHeight(viewport: height)
-        return VStack(alignment: .leading, spacing: Theme.Space.md) {
-            ZStack(alignment: .bottomLeading) {
-                backdrop(height: band)
-                    // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
-                    // shows. Mounted ONLY for VOD with a resolved YouTube id and when motion is allowed; the
-                    // still backdrop underneath is the permanent fallback. Live channels never get a trailer.
-                    .overlay { heroTrailerClip(height: band) }
-                    // Edge-to-edge cinematic hero: the art bleeds UP under the status bar / notch so there is no
-                    // canvas-colored strip above it on a notched iPhone. Only the backdrop art (and its trailer
-                    // overlay) ignores the top safe area; heroChrome stays an overlay on the ZStack below, which
-                    // still respects the inset, so the back / overflow discs clear the notch.
-                    .ignoresSafeArea(edges: .top)
-                VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                    titleOrLogo
-                    metaRow
-                    ratingsRow
-                    financialsRow
-                    releaseDatesRow
-                    // #9: a clamped synopsis reads WITH the ratings block on the hero art; the full
-                    // description still flows below the action row for anyone who wants all of it.
-                    if let synopsis = heroOverview {
-                        Text(synopsis)
-                            .font(Theme.Typography.body)
-                            .foregroundStyle(Theme.Palette.textSecondary)
-                            .lineLimit(3).truncationMode(.tail)
-                            .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
-                            .padding(.top, 2)
-                    }
-                }
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.bottom, Theme.Space.lg)
-                .frame(width: width, alignment: .leading)
-            }
-            // Circular translucent chrome: back chevron top-left, overflow top-right. Overlaid on the ZStack
-            // (NOT the backdrop) so it keeps the safe-area inset the backdrop now ignores; its own top padding
-            // then insets the discs below the status bar / notch, so the hero reads like a cinematic media app.
-            .overlay(alignment: .topLeading) { heroChrome }
-            .frame(width: width, alignment: .leading)
+        //
+        // Split into `heroBanner` (the cinematic art + title/meta overlay + chrome) and `heroBelow` (actions,
+        // full synopsis, credits, language chips) so the macOS pinned-hero scroll model (`macDetailBody`) can
+        // pin the banner while the below-content + episode/source list scroll independently beneath it. On
+        // iOS/iPadOS the two are composed back into the exact single scrolling column as before.
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            heroBanner(width: width, height: height)
+            heroBelow(width: width, scrollToSources: scrollToSources)
+        }
+        .frame(width: width, alignment: .leading)
+    }
 
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
-                // Branch on the SAME authoritative signal the body uses (episodeList vs sourceSection), not the
-                // raw hub-guess `type`: a hub tile the hub mis-typed as "movie" that resolves to a series/
-                // collection meta would otherwise show movie Play actions contradicting an episodic body (#102).
-                if !isEpisodic {
-                    watchNow(scrollToSources: scrollToSources)
-                } else {
-                    seriesHeroActions
+    #if os(macOS)
+    /// macOS pinned-hero layout (item 4): the cinematic banner is a FIXED top layer and only the content
+    /// below it (action row, full synopsis, credits, and the episode / source list) scrolls in its own
+    /// independent inner ScrollView. Deliberately a fixed hero layer + inner ScrollView, NOT a scroll
+    /// section-header pin, which is banned (it triggered the NSToolbar/section-header crash class). The
+    /// hero "Sources" action still scrolls the inner region to the source anchor via the shared proxy.
+    @ViewBuilder private func macDetailBody(geo: GeometryProxy, proxy: ScrollViewProxy) -> some View {
+        VStack(spacing: 0) {
+            heroBanner(width: geo.size.width, height: geo.size.height)
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    heroBelow(width: geo.size.width) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
+                    // #9: cap the source-heavy content to a readable column and center it on a wide window.
+                    Group {
+                        if isEpisodic {
+                            episodeList
+                        } else {
+                            sourceSection.id(Self.sourcesAnchor)
+                        }
+                    }
+                    .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
+                    .frame(maxWidth: .infinity)
+                    whereToWatchSection
+                    moreLikeThisSection
                 }
-                // H2: only show the full description below when it is meaningfully longer than the hero's
-                // 3-line excerpt, so a short synopsis is not printed twice on the same screen.
-                if showsFullDescriptionBelow, let overview = heroOverview {
-                    Text(overview)
+                .padding(.bottom, Theme.Space.xl)
+                .frame(width: geo.size.width, alignment: .leading)
+            }
+        }
+    }
+    #endif
+
+    /// The pinnable cinematic banner: full-bleed backdrop (with the ambient trailer clip) plus the
+    /// title / meta / ratings / clamped-synopsis overlay and the circular back/overflow chrome. On macOS
+    /// this is the FIXED layer of the pinned-hero scroll model; on iOS it is the top of the single column.
+    private func heroBanner(width: CGFloat, height: CGFloat) -> some View {
+        let band = heroBandHeight(viewport: height)
+        return ZStack(alignment: .bottomLeading) {
+            backdrop(height: band)
+                // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
+                // shows. Mounted ONLY for VOD with a resolved YouTube id and when motion is allowed; the
+                // still backdrop underneath is the permanent fallback. Live channels never get a trailer.
+                .overlay { heroTrailerClip(height: band) }
+                // Edge-to-edge cinematic hero: the art bleeds UP under the status bar / notch so there is no
+                // canvas-colored strip above it on a notched iPhone. Only the backdrop art (and its trailer
+                // overlay) ignores the top safe area; heroChrome stays an overlay on the ZStack below, which
+                // still respects the inset, so the back / overflow discs clear the notch.
+                .ignoresSafeArea(edges: .top)
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                titleOrLogo
+                metaRow
+                ratingsRow
+                financialsRow
+                releaseDatesRow
+                // #9: a clamped synopsis reads WITH the ratings block on the hero art; the full
+                // description still flows below the action row for anyone who wants all of it.
+                if let synopsis = heroOverview {
+                    Text(synopsis)
                         .font(Theme.Typography.body)
                         .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineSpacing(2)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(3).truncationMode(.tail)
                         .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+                        .padding(.top, 2)
                 }
-                creditsRows
-                languageChips
             }
             .padding(.horizontal, Theme.Space.md)
+            .padding(.bottom, Theme.Space.lg)
             .frame(width: width, alignment: .leading)
         }
+        // Circular translucent chrome: back chevron top-left, overflow top-right. Overlaid on the ZStack
+        // (NOT the backdrop) so it keeps the safe-area inset the backdrop now ignores; its own top padding
+        // then insets the discs below the status bar / notch, so the hero reads like a cinematic media app.
+        .overlay(alignment: .topLeading) { heroChrome }
+        .frame(width: width, alignment: .leading)
+    }
+
+    /// The scrollable remainder of the hero: the action row (Watch Now / series actions), the full
+    /// synopsis, cast/crew, and language chips. On macOS this scrolls (with the episode/source list) under
+    /// the pinned banner; on iOS it is the lower half of the single hero column.
+    private func heroBelow(width: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // Branch on the SAME authoritative signal the body uses (episodeList vs sourceSection), not the
+            // raw hub-guess `type`: a hub tile the hub mis-typed as "movie" that resolves to a series/
+            // collection meta would otherwise show movie Play actions contradicting an episodic body (#102).
+            if !isEpisodic {
+                watchNow(scrollToSources: scrollToSources)
+            } else {
+                seriesHeroActions
+            }
+            // H2: only show the full description below when it is meaningfully longer than the hero's
+            // 3-line excerpt, so a short synopsis is not printed twice on the same screen.
+            if showsFullDescriptionBelow, let overview = heroOverview {
+                Text(overview)
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+            }
+            creditsRows
+            languageChips
+        }
+        .padding(.horizontal, Theme.Space.md)
         .frame(width: width, alignment: .leading)
     }
 
