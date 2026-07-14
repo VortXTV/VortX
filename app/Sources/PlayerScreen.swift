@@ -234,6 +234,11 @@ struct PlayerScreen: View {
     @State private var macSleepActivity: NSObjectProtocol?
     /// macOS player keyDown monitor for Space/Left/Right; see installMacKeyMonitor.
     @State private var macKeyMonitor: Any?
+    /// Tracks whether the player's window is in native macOS fullscreen, so the toolbar glyph flips
+    /// between enter/exit. Kept in sync by NSWindow's will-enter / will-exit fullscreen notifications.
+    @State private var macIsFullScreen = false
+    /// Observers for the fullscreen-state notifications, torn down on disappear.
+    @State private var macFullScreenObservers: [NSObjectProtocol] = []
     #endif
     @State private var panel: Panel?
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
@@ -614,6 +619,13 @@ struct PlayerScreen: View {
             Button { leavePlayback() } label: { EmptyView() }
                 .keyboardShortcut(.cancelAction)
                 .hidden()
+            // Fullscreen: Ctrl-Cmd-F, the standard macOS fullscreen shortcut. A MODIFIED key equivalent, so
+            // (unlike the unmodified Space/arrows) it reaches this hidden SwiftUI button rather than being
+            // swallowed by the Metal NSView's keyDown: — the same pattern the Esc/Cmd-[ handlers rely on, so
+            // this never has to touch the installMacKeyMonitor NSEvent monitor.
+            Button { toggleMacFullScreen() } label: { EmptyView() }
+                .keyboardShortcut("f", modifiers: [.command, .control])
+                .hidden()
             // Space/Left/Right are handled by an NSEvent keyDown monitor (installMacKeyMonitor), not
             // SwiftUI .keyboardShortcut: AppKit gives unmodified arrows+Space to the Metal NSView's
             // keyDown:, so hidden-button shortcuts never fired. The Esc/.cancelAction handler above stays.
@@ -673,6 +685,7 @@ struct PlayerScreen: View {
             macSleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled,
                                                                      reason: "StremioX video playback")
             installMacKeyMonitor()
+            observeMacFullScreen()
             #endif
         }
         .onDisappear {
@@ -694,6 +707,7 @@ struct PlayerScreen: View {
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
             removeMacKeyMonitor()
+            unobserveMacFullScreen()
             #endif
         }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -2237,6 +2251,16 @@ struct PlayerScreen: View {
                                        : "arrow.up.left.and.arrow.down.right", label: "Toggle fullscreen") {
                 forcedLandscape.toggle()
                 coordinator.player?.setOrientation(landscape: forcedLandscape)
+                scheduleHide()
+            }
+            #endif
+            #if os(macOS)
+            // Real in-app fullscreen toggle (item 5): drive the window into native macOS fullscreen so the
+            // video goes truly edge-to-edge. Discoverable button here + the standard Ctrl-Cmd-F shortcut
+            // (the hidden handler lives in mpvBody). The glyph flips to match the current window state.
+            iconButton(macIsFullScreen ? "arrow.down.right.and.arrow.up.left"
+                                       : "arrow.up.left.and.arrow.down.right", label: "Toggle fullscreen") {
+                toggleMacFullScreen()
                 scheduleHide()
             }
             #endif
@@ -3819,6 +3843,36 @@ struct PlayerScreen: View {
 
     private func removeMacKeyMonitor() {
         if let m = macKeyMonitor { NSEvent.removeMonitor(m); macKeyMonitor = nil }
+    }
+
+    /// The window hosting the player. The Mac player is rendered at the app window's root via
+    /// MacRootPlayerOverlay, so the key window (falling back to the main window) is that window.
+    private var macPlayerWindow: NSWindow? { NSApp.keyWindow ?? NSApp.mainWindow }
+
+    /// Toggle native macOS fullscreen for the player window (item 5). Truly edge-to-edge: the window's
+    /// content is already black + `.ignoresSafeArea()`, and MacRootPlayerOverlay paints a full-bleed black
+    /// backdrop behind the player so no window background bleeds through at any edge in fullscreen.
+    private func toggleMacFullScreen() {
+        macPlayerWindow?.toggleFullScreen(nil)
+    }
+
+    /// Keep `macIsFullScreen` in sync with the window so the toolbar glyph reflects the real state, whether
+    /// fullscreen was toggled from our button, the shortcut, or the system green button / menu item.
+    private func observeMacFullScreen() {
+        macIsFullScreen = macPlayerWindow?.styleMask.contains(.fullScreen) ?? false
+        let nc = NotificationCenter.default
+        let enter = nc.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: nil, queue: .main) { _ in
+            macIsFullScreen = true
+        }
+        let exit = nc.addObserver(forName: NSWindow.didExitFullScreenNotification, object: nil, queue: .main) { _ in
+            macIsFullScreen = false
+        }
+        macFullScreenObservers = [enter, exit]
+    }
+
+    private func unobserveMacFullScreen() {
+        for token in macFullScreenObservers { NotificationCenter.default.removeObserver(token) }
+        macFullScreenObservers = []
     }
     #endif
 
