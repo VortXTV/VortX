@@ -19,6 +19,10 @@ enum StreamRanking {
     /// so this last within-tier bonus can never be what pushes the sum past the step and lets a lower
     /// tier leapfrog a higher one, and leaves a 6-point margin under the 186 ceiling. min() against it
     /// stays monotonic in seeders, so relative swarm-health order within the tier is preserved.
+    ///
+    /// Overflow safety: the seeder and size figures that feed this tier arithmetic are clamped at their PARSE
+    /// boundaries (seederCount caps at 1,000,000; sizeGB caps at 100,000 GB), so `seeders * 8` and `Int(sizeGB * 0.15)`
+    /// cannot overflow or trap from adversarial add-on text, and every realistic value scores exactly as before.
     static let seederTiebreakCap = 180
 
     // MARK: - Caches
@@ -289,7 +293,10 @@ enum StreamRanking {
         // otherwise-equal streams (same resolution, source, and features) toward the bigger, higher-
         // bitrate file. It used to score up to +600 and could lift a big WEB-DL over a smaller remux
         // (the #68 bug); source type and features now sit strictly above it.
-        score += min(Int(sizeGB(text) * 0.15), 12)
+        // Compute the size tiebreak in Double and clamp BEFORE converting to Int, so the conversion can never
+        // trap even if sizeGB's parse-boundary ceiling ever moved; the cap of 12 is reached at ~80 GB, so all
+        // realistic sizes score identically to the old min(Int(...), 12).
+        score += Int(min(sizeGB(text) * 0.15, 12))
         // Audio quality ladder (object-based > lossless > lossy), additive with the video range above.
         if text.contains("atmos") { score += 26 }
         else if text.contains("dts:x") || text.contains("dtsx") || text.contains("dts-x") { score += 24 }
@@ -561,7 +568,11 @@ enum StreamRanking {
         let patterns = [#"👤[:\s]*([0-9]+)"#, #"(?<![a-z0-9])seed(er)?s?\s*:\s*([0-9]+)"#]
         for pattern in patterns {
             if let m = firstMatch(text, pattern) {
-                return Int(m.filter(\.isNumber))
+                // Clamp at the PARSE boundary: no real swarm exceeds ~1M peers, and the raw value
+                // feeds `seeders * 8` at line 350, which TRAPS on overflow for a 19-digit count from
+                // adversarial add-on text. The clamp only changes absurd counts; every realistic
+                // value (< 1M) is returned unchanged, and nil is still returned above Int.max.
+                return Int(m.filter(\.isNumber)).map { min($0, 1_000_000) }
             }
         }
         return nil
@@ -669,7 +680,11 @@ enum StreamRanking {
             .replacingOccurrences(of: "gib", with: "")
             .replacingOccurrences(of: "gb", with: "")
             .trimmingCharacters(in: .whitespaces)
-        return Double(digits) ?? 0
+        // Clamp at the PARSE boundary: an unbounded Double from adversarial text (e.g. "99999999999999999999 GB"
+        // yields ~1e20) TRAPS the `Int(...)` initializer at line 292 and any downstream Int conversion. No
+        // legitimate release exceeds ~1 TB, so 100k GB is a generous ceiling; every realistic size passes through
+        // unchanged. This one clamp also protects the sizeForSort (575) and implausibleForResolution (529, 740) callers.
+        return min(Double(digits) ?? 0, 100_000)
     }
 
     /// Matches the Real-Debrid service name plus the bracketed/delimited "RD"/"RD+" tags add-ons
