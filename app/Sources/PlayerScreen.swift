@@ -1376,7 +1376,7 @@ struct PlayerScreen: View {
         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
             videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
             season: m.season, episode: m.episode, name: m.name,
-            poster: m.poster, type: m.type, qualityText: recordQualityText,
+            poster: m.poster, type: m.type, qualityText: curHint ?? recordQualityText,
             bingeGroup: curBingeState ?? recordBingeGroup,
             torrent: curIsTorrent, savedAt: Date(), headers: curHeaders,
             debridService: ref?.service.rawValue, infoHash: ref?.infoHash,
