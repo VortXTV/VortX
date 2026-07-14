@@ -2,10 +2,10 @@ import Foundation
 
 /// Codable models for the Trakt.tv API (https://trakt.docs.apiary.io).
 ///
-/// SCAFFOLD: this layer is self-contained (Foundation + Keychain only) and is NOT wired into the UI
-/// yet. `TraktAuth` runs the OAuth device-code flow; `TraktService` exposes the typed calls. These
-/// models cover exactly what those two need: the device-code/token envelopes, the small `ids`/`item`
-/// shapes that scrobble and sync take, and the scrobble/sync response envelopes.
+/// This layer is self-contained (Foundation + Keychain only). `TraktAuth` runs the OAuth device-code
+/// flow; `TraktService` exposes the typed calls. These models cover exactly what those two need: the
+/// device-code/token envelopes, the small `ids`/`item` shapes that scrobble and sync take, and the
+/// scrobble/sync response envelopes.
 ///
 /// Every type is `Sendable` so it can cross the actor boundary in `TraktService`. Field names follow
 /// the wire format (snake_case) via explicit `CodingKeys`, keeping Swift call sites camelCase.
@@ -87,10 +87,17 @@ struct TraktToken: Codable, Sendable, Equatable {
     /// Absolute expiry instant (issue time + lifetime).
     var expiresAt: Date { Date(timeIntervalSince1970: TimeInterval(createdAt + expiresIn)) }
 
-    /// True when the access token is within `leeway` seconds of expiring (or already expired). The
-    /// default 24h leeway means the app refreshes a day early rather than mid-playback.
-    func isExpired(leeway: TimeInterval = 86_400) -> Bool {
-        Date().addingTimeInterval(leeway) >= expiresAt
+    /// Conservative refresh margin: half the token's lifetime, capped at 30 minutes. Trakt cut the
+    /// access-token lifetime to 24h in 2025, so a leeway equal to (or near) the lifetime would make
+    /// EVERY `isExpired()` read true and fire a refresh POST on every `validToken()` call, storming
+    /// Trakt's 1-POST/sec limit and, because Trakt ROTATES the refresh token, racing concurrent
+    /// refreshes into a self-signout. Half-life capped at 30 min refreshes early without that storm.
+    var defaultLeeway: TimeInterval { min(1_800, Double(max(expiresIn, 0)) / 2) }
+
+    /// True when the access token is within `leeway` seconds of expiring (or already expired). `leeway`
+    /// defaults to `defaultLeeway` (<= 30 min) so a fresh 24h token is NOT treated as already expired.
+    func isExpired(leeway: TimeInterval? = nil) -> Bool {
+        Date().addingTimeInterval(leeway ?? defaultLeeway) >= expiresAt
     }
 }
 

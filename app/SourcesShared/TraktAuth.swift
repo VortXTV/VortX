@@ -2,8 +2,7 @@ import Foundation
 
 /// Trakt.tv OAuth device-code flow plus Keychain-backed token storage.
 ///
-/// SCAFFOLD: not wired into the UI yet (see `TraktService` for the call-site notes). The flow is the
-/// standard Trakt device path (https://trakt.docs.apiary.io/reference/authentication-devices):
+/// The flow is the standard Trakt device path (https://trakt.docs.apiary.io/reference/authentication-devices):
 ///
 ///   1. `requestDeviceCode()` -> show `userCode` + `verificationURL` to the user.
 ///   2. `pollForToken(deviceCode:)` -> loop on `POST /oauth/device/token` at the server-given
@@ -51,8 +50,27 @@ actor TraktAuth {
 
     private let session: URLSession
 
+    /// The single in-flight refresh, if one is running. Concurrent `validToken()` callers (scrobbleStart,
+    /// TraktSyncEngine.pullWatched, a rail fetch) await THIS task instead of each firing their own refresh
+    /// POST. Trakt rotates the refresh token on every refresh, so two independent refreshes would race:
+    /// the loser 401s on an already-spent refresh token and would drop the whole session. Single-flight
+    /// collapses them into one, so only one rotation happens and everyone gets the same fresh token.
+    private var inFlightRefresh: Task<TraktToken, Error>?
+
+    /// Injected at app startup (by `VortXSyncManager`): returns the freshest cross-device Trakt token
+    /// triple from the synced `doc.apiKeys` mirror, or nil. Lets the refresh-401 path re-adopt a token a
+    /// SIBLING device rotated and pushed, instead of signing this device out. A seam (not a direct import)
+    /// so `TraktAuth` stays free of a `VortXSyncManager` dependency.
+    private var syncedTokenProvider: (@Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?)?
+
     init(session: URLSession = .shared) {
         self.session = session
+    }
+
+    /// Wire the cross-device synced-token lookup used by the refresh-401 recovery path (T-2). Called once
+    /// at startup from `VortXSyncManager`; a nil provider simply disables cross-device recovery.
+    func setSyncedTokenProvider(_ provider: @escaping @Sendable () async -> (access: String, refresh: String, expiryUnix: Int)?) {
+        syncedTokenProvider = provider
     }
 
     // MARK: - Public state
@@ -186,9 +204,33 @@ actor TraktAuth {
         return token.accessToken
     }
 
-    /// Exchange the refresh token for a fresh set via `POST /oauth/token`. Stores and returns it.
+    /// Exchange the refresh token for a fresh set via `POST /oauth/token`, SINGLE-FLIGHT: if a refresh is
+    /// already running, await it instead of starting a second one (Trakt rotates the refresh token, so a
+    /// second concurrent refresh would spend an already-rotated token and 401). Stores and returns the set.
     @discardableResult
     func refresh(using refreshToken: String) async throws -> TraktToken {
+        // Join an in-flight refresh rather than starting a competing one.
+        if let existing = inFlightRefresh {
+            return try await existing.value
+        }
+        // A refresh that completed moments ago (whose defer already cleared `inFlightRefresh`) may have
+        // stored a fresh token. A caller that just missed the in-flight window must not refresh again with
+        // the now-rotated refresh token, so re-check synchronously (no await) before starting a new one.
+        if let fresh = currentToken(), !fresh.isExpired() {
+            return fresh
+        }
+        let task = Task<TraktToken, Error> { [weak self] in
+            guard let self else { throw TraktAuthError.notSignedIn }
+            return try await self.performRefresh(using: refreshToken)
+        }
+        inFlightRefresh = task
+        defer { inFlightRefresh = nil }
+        return try await task.value
+    }
+
+    /// The actual `POST /oauth/token` refresh network call. Only ever invoked from inside the single-flight
+    /// `refresh(using:)`, so at most one runs at a time.
+    private func performRefresh(using refreshToken: String) async throws -> TraktToken {
         try ensureConfigured()
         struct Body: Encodable {
             let refresh_token: String
@@ -209,13 +251,40 @@ actor TraktAuth {
         let request = try makeRequest(path: "/oauth/token", method: "POST", body: body, authorized: false)
         let (data, status) = try await send(request)
         guard status == 200 else {
-            // A rejected refresh token means the session is dead; clear it so the UI can re-prompt.
+            // A rejected refresh token USUALLY means the session is dead, but a concurrent winner (this
+            // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
+            // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
+            if status == 401, let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
+                return recovered
+            }
             if status == 401 { signOut() }
             throw TraktAuthError.server(status: status)
         }
         let token = try decode(TraktToken.self, from: data)
         store(token)
         return token
+    }
+
+    /// A refresh POST got a 401. Before signing out, look for a fresher token a concurrent winner already
+    /// minted: (T-1c) re-read the Keychain in case a local refresh rotated it, then (T-2) consult the
+    /// cross-device synced mirror in case a SIBLING device rotated and pushed one. Returns the token to
+    /// adopt, or nil when nothing fresher exists (the caller then signs out).
+    private func recoverAfterRefreshFailure(deadRefreshToken: String) async -> TraktToken? {
+        // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
+        // changes the refresh token, so a stored refresh token different from the one we just spent means a
+        // winner already stored a live set; adopt it rather than wiping the session.
+        if let local = currentToken(), local.refreshToken != deadRefreshToken, !local.isExpired() {
+            return local
+        }
+        // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
+        // synced refresh token different from the one we spent is that sibling's fresher set; adopt it into
+        // the Keychain and use it. Same-token or absent means nothing fresher exists remotely.
+        if let synced = await syncedTokenProvider?(),
+           !synced.access.isEmpty, !synced.refresh.isEmpty, synced.refresh != deadRefreshToken {
+            adoptTokens(access: synced.access, refresh: synced.refresh, expiryUnix: synced.expiryUnix)
+            return currentToken()
+        }
+        return nil
     }
 
     // MARK: - Keychain persistence
