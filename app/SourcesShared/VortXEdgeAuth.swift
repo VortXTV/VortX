@@ -37,6 +37,29 @@ enum VortXEdgeAuth {
     private static let sigHeader = "X-VX-Sig"
     private static let kidHeader = "X-VX-Kid"
 
+    /// Query-param names for the header-less signing variant (`signedURL`). These MUST match the workers'
+    /// shared `edge_auth.ts` (`SIG_QUERY_TS` / `SIG_QUERY_SIG` / `SIG_QUERY_KID`), which read a query signature
+    /// for GETs that cannot carry `X-VX-*` headers (an `AsyncImage` / `<img>` load).
+    private static let tsQuery = "vts"
+    private static let sigQuery = "vsig"
+    private static let kidQuery = "vkid"
+
+    /// MEMO CACHE for `signedURL` (D15). `signedURL` bakes a per-SECOND `vts` into the URL, so calling it
+    /// from a SwiftUI view body (the only caller, `ResolvedTitleLogo`) would mint a DIFFERENT URL every wall-
+    /// clock second the body re-evaluates. `AsyncImage(url:)` treats a changed URL as a new resource: the
+    /// phase resets (the logo visibly flashes back to the title-text fallback) and the bytes are re-fetched,
+    /// because `URLCache` keys on the full URL and every new `vts` is a permanent miss. Hero/detail views
+    /// re-render constantly (focus moves, scroll, progress ticks), so without memoization an ERDB logo would
+    /// flicker and refetch forever. We cache the signed URL per (method, raw URL) and reuse it until it is
+    /// halfway to the worker's acceptance window, then re-sign lazily. The poster/erdb workers (and the
+    /// shared `edge_auth.ts`) accept `|now - ts| <= 300s` (`SIG_SKEW_SECONDS`), so a 150s reuse keeps every
+    /// served URL comfortably fresh (max age 150s « 300s) while the URL stays STABLE across renders and only
+    /// rotates rarely. The lock makes the cache safe even though today's sole caller is main-actor-bound.
+    private static let signedURLReuse: TimeInterval = 150   // half the 300s worker skew window
+    private static let signedURLCacheCap = 512              // bound growth across a long browse session
+    private static let signedURLLock = NSLock()
+    private static var signedURLCache: [String: (signed: URL, at: TimeInterval)] = [:]
+
     /// Current signing key id. Rotation is a TWO-part change provisioned together: (1) a NEW masked
     /// `VortXEdgeSecret` in Info.plist (via `maskedValue(for:)`) AND (2) this new kid, plus the matching
     /// new id -> secret entry on the workers BEFORE the build ships; revoke the old id after a grace window.
@@ -90,20 +113,85 @@ enum VortXEdgeAuth {
 
         let method = (request.httpMethod ?? "GET").uppercased()
         let ts = String(Int(Date().timeIntervalSince1970))
-        // Sign over the PERCENT-ENCODED path so it canonicalizes identically to the workers, which verify
-        // against `url.pathname` (percent-encoded in the Workers runtime). `URL.path` is percent-DECODED, so
-        // any future gated route with an encodable char (space, colon, non-ASCII) would otherwise sign a
-        // decoded path here and mismatch the worker's encoded one. ASCII paths are unaffected.
-        let signedPath = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
-        let message = "\(method)\n\(signedPath)\n\(ts)"
-
-        let key = SymmetricKey(data: Data(secret.utf8))
-        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
-        let sig = mac.map { String(format: "%02x", $0) }.joined()
+        let sig = hexSignature(method: method, signedPath: signedPath(of: url), ts: ts)
 
         request.setValue(ts, forHTTPHeaderField: tsHeader)
         request.setValue(keyId, forHTTPHeaderField: kidHeader)
         request.setValue(sig, forHTTPHeaderField: sigHeader)
+    }
+
+    /// Return a QUERY-signed copy of `url` for header-less asset loads: `AsyncImage(url:)` and other `<img>`/
+    /// `<video>`-style GETs that cannot attach `X-VX-*` headers. Appends `vts` / `vkid` / `vsig`, where `vsig`
+    /// is the SAME `HMAC-SHA256(key, METHOD\npath\nts)` the header path computes, so a worker verifies a
+    /// query-signed image GET exactly as it verifies a header-signed API call (see `edge_auth.ts`
+    /// `sigMatchesAny` + the `SIG_QUERY_*` params). The signature covers only METHOD + path + ts, so the three
+    /// appended query params are outside the signed message and never invalidate it.
+    ///
+    /// FAIL-OPEN by contract. Returns the URL UNCHANGED (unsigned) for a non-gated host, an unprovisioned
+    /// build (empty secret), or any URL we cannot decompose. Enforcement flips one worker at a time, so an
+    /// unsigned URL must degrade to a normal (observe-mode) load, never a broken image. Never throws/crashes.
+    ///
+    /// Prefer `sign(_:)` (header signing) whenever the caller controls a `URLRequest`: headers are not part of
+    /// the `URLCache` key, whereas a per-second `vts` in the URL would change the cache key every second and
+    /// defeat byte caches. `signedURL` is for the `AsyncImage` case, which cannot set headers.
+    static func signedURL(_ url: URL, method: String = "GET") -> URL {
+        guard let host = url.host, gatedHosts.contains(host), !secret.isEmpty,
+              var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+
+        let m = method.uppercased()
+        let now = Date().timeIntervalSince1970
+        // MEMO: reuse the previously-signed URL for this (method, raw URL) while it is still well inside the
+        // worker skew window, so repeated body re-evaluations get a STABLE URL (no AsyncImage churn / cache
+        // bust). The raw (unsigned) absolute string is the cache key; the idempotent strip below means a raw
+        // URL never carries our signing params, so this key is stable per logo.
+        let cacheKey = m + "\n" + url.absoluteString
+        signedURLLock.lock()
+        if let hit = signedURLCache[cacheKey], now - hit.at < signedURLReuse {
+            let cached = hit.signed
+            signedURLLock.unlock()
+            return cached
+        }
+        signedURLLock.unlock()
+
+        let ts = String(Int(now))
+        let sig = hexSignature(method: m, signedPath: comps.percentEncodedPath, ts: ts)
+
+        // Idempotent: strip any prior signing params before re-appending, so re-signing an already-signed URL
+        // never accumulates duplicates.
+        var items = (comps.queryItems ?? []).filter { $0.name != tsQuery && $0.name != sigQuery && $0.name != kidQuery }
+        items.append(URLQueryItem(name: tsQuery, value: ts))
+        items.append(URLQueryItem(name: kidQuery, value: keyId))
+        items.append(URLQueryItem(name: sigQuery, value: sig))
+        comps.queryItems = items
+        let signed = comps.url ?? url
+
+        signedURLLock.lock()
+        // Bound the cache: when full, drop entries already past the reuse horizon (they would re-sign anyway).
+        if signedURLCache.count >= signedURLCacheCap {
+            for (k, v) in signedURLCache where now - v.at >= signedURLReuse { signedURLCache.removeValue(forKey: k) }
+        }
+        signedURLCache[cacheKey] = (signed, now)
+        signedURLLock.unlock()
+        return signed
+    }
+
+    /// The canonical signed path: the PERCENT-ENCODED path so it matches the workers, which verify against
+    /// `url.pathname` (percent-encoded in the Workers runtime). `URL.path` is percent-DECODED, so any gated
+    /// route with an encodable char (space, colon, non-ASCII) would otherwise sign a decoded path and mismatch
+    /// the worker's encoded one. ASCII paths are unaffected.
+    private static func signedPath(of url: URL) -> String {
+        URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
+    }
+
+    /// Lowercase-hex `HMAC-SHA256(key, METHOD\npath\nts)`. `key` = UTF-8 bytes of the 64-char hex secret STRING
+    /// (NOT hex-decoded), matching the workers. With an empty secret this is an (empty-key) HMAC; the header
+    /// path stamps it regardless (identical wire shape in observe + enforce), while `signedURL` fails open
+    /// before ever reaching here.
+    private static func hexSignature(method: String, signedPath: String, ts: String) -> String {
+        let message = "\(method)\n\(signedPath)\n\(ts)"
+        let key = SymmetricKey(data: Data(secret.utf8))
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(message.utf8), using: key)
+        return mac.map { String(format: "%02x", $0) }.joined()
     }
 
     /// One-off helper to compute the MASKED Info.plist value from a raw 64-hex secret, so provisioning never

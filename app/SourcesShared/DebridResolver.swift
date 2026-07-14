@@ -926,8 +926,15 @@ enum DebridHTTP {
 /// Builds resolvers from the user's stored keys and drives cache-check + playback resolution. TorBox is
 /// wired now; Real-Debrid (add-then-poll, no instant cache-check), AllDebrid, and Premiumize slot in as
 /// further `DebridResolving` conformers. Owned by the stream/play layer; reads `DebridKeys.shared`.
-@MainActor
-final class DebridCoordinator {
+///
+/// ISOLATION: this is an `actor`, NOT `@MainActor`. Its only state (`resolvers`, `torboxUsenet`) is mutated
+/// in `reload(keys:)` / `warmIfNeeded()` and read in the async resolve/cache-check methods, so the actor's own serial executor keeps
+/// those accesses race-free WITHOUT pinning them to the main thread. This matters for `cacheCheck`: the
+/// per-provider probes are already off-main (the resolvers are actors), but under the old `@MainActor` the
+/// O(services x hashes) merge loop AND every `await` continuation resumed on the main actor, so a cacheCheck
+/// over a large source list (thousands of hashes) hitched the UI thread. As an actor the merge and the
+/// resumptions run on a background executor; nothing here is UI state, so nothing needs the main actor.
+actor DebridCoordinator {
     static let shared = DebridCoordinator()
 
     private var resolvers: [DebridService: any DebridResolving] = [:]
@@ -936,29 +943,56 @@ final class DebridCoordinator {
     /// not the infohash/magnet the `DebridResolving` protocol takes. nil = no TorBox key = usenet inert.
     private var torboxUsenet: TorBoxUsenetResolver?
 
-    /// (Re)build resolvers from the current keys. Call after a key changes.
-    func reload(from keys: DebridKeys = .shared) {
+    /// Whether the resolvers have been built at least once (from `reload(keys:)` or the lazy warm). A no-key
+    /// user leaves `resolvers` empty, so `resolvers.isEmpty` alone cannot tell "never warmed" from "warmed,
+    /// no keys" and would re-hop to the main actor on every resolve. This flag makes the lazy warm hop AT
+    /// MOST ONCE until a key change explicitly reloads, preserving the cheap no-key fast path.
+    private var didWarm = false
+
+    /// (Re)build resolvers from a Sendable key SNAPSHOT. Call after a key changes.
+    ///
+    /// RACE-SAFETY: takes a `[DebridService: String]` value, NOT the `DebridKeys` reference. `DebridKeys.keys`
+    /// is a plain `@Published` dictionary mutated on the MAIN actor (per-keystroke `setKey`, and the
+    /// sync-apply path). Reading that dictionary from THIS actor's background executor while main mutates it
+    /// is a concurrent Dictionary read/write == undefined behavior. So every caller captures a snapshot on
+    /// the main actor and hands us the value; we only ever touch the immutable copy.
+    func reload(keys: [DebridService: String]) {
         resolvers.removeAll()
         torboxUsenet = nil
-        if keys.isConfigured(.torBox) {
-            resolvers[.torBox] = TorBoxResolver(apiKey: keys.key(for: .torBox))
-            torboxUsenet = TorBoxUsenetResolver(apiKey: keys.key(for: .torBox))
+        func keyFor(_ s: DebridService) -> String? {
+            guard let k = keys[s], !k.isEmpty else { return nil }
+            return k
         }
-        if keys.isConfigured(.realDebrid) { resolvers[.realDebrid] = RealDebridResolver(apiKey: keys.key(for: .realDebrid)) }
-        if keys.isConfigured(.allDebrid) { resolvers[.allDebrid] = AllDebridResolver(apiKey: keys.key(for: .allDebrid)) }
-        if keys.isConfigured(.premiumize) { resolvers[.premiumize] = PremiumizeResolver(apiKey: keys.key(for: .premiumize)) }
+        if let k = keyFor(.torBox) {
+            resolvers[.torBox] = TorBoxResolver(apiKey: k)
+            torboxUsenet = TorBoxUsenetResolver(apiKey: k)
+        }
+        if let k = keyFor(.realDebrid) { resolvers[.realDebrid] = RealDebridResolver(apiKey: k) }
+        if let k = keyFor(.allDebrid) { resolvers[.allDebrid] = AllDebridResolver(apiKey: k) }
+        if let k = keyFor(.premiumize) { resolvers[.premiumize] = PremiumizeResolver(apiKey: k) }
+        didWarm = true
+    }
+
+    /// Lazy first-use warm: build the resolvers from a fresh main-actor snapshot IF they have not been built
+    /// yet. Replaces the old synchronous `if resolvers.isEmpty { reload() }` warm, which read `DebridKeys`
+    /// off-main (the race). Hopping to the main actor for the snapshot keeps the read serialized with the
+    /// key writers; the `reload` that follows only touches actor-isolated state on this executor.
+    private func warmIfNeeded() async {
+        guard !didWarm else { return }
+        let snapshot = await MainActor.run { DebridKeys.shared.snapshot }
+        // Re-check under the actor: a concurrent warm (or an explicit reload) may have run across the await.
+        guard !didWarm else { return }
+        reload(keys: snapshot)
     }
 
     /// True when a usenet resolve is possible (a TorBox key is configured). Gates both the usenet play
     /// path and the usenet cache-check; with no TorBox key everything usenet behaves exactly as before.
     var hasUsenetResolver: Bool {
-        if resolvers.isEmpty { reload() }
-        return torboxUsenet != nil
+        get async { await warmIfNeeded(); return torboxUsenet != nil }
     }
 
     var hasAnyResolver: Bool {
-        if resolvers.isEmpty { reload() }
-        return !resolvers.isEmpty
+        get async { await warmIfNeeded(); return !resolvers.isEmpty }
     }
 
     /// Which provider has each hash cached (first configured provider that reports it), with the files.
@@ -966,7 +1000,7 @@ final class DebridCoordinator {
     /// then merges in a deterministic `DebridService.allCases` priority order so the chosen provider for a
     /// hash is stable. Previously this looped providers sequentially AND in nondeterministic dict order.
     func cacheCheck(hashes: [String]) async -> [String: (service: DebridService, files: [DebridFile])] {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         guard !resolvers.isEmpty, !hashes.isEmpty else { return [:] }
         let maps: [DebridService: [String: [DebridFile]]] = await withTaskGroup(
             of: (DebridService, [String: [DebridFile]]).self
@@ -991,7 +1025,7 @@ final class DebridCoordinator {
     /// Resolve a torrent to a direct stream URL via the given (or first available) provider.
     func resolve(service: DebridService? = nil, infoHash: String, magnet: String,
                  fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         let resolver = pick(service)
         guard let resolver else { throw DebridError.noKey }
         return try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
@@ -1002,7 +1036,7 @@ final class DebridCoordinator {
     func resolveWithIds(service: DebridService? = nil, infoHash: String, magnet: String,
                         fileIdx: Int?, episode: DebridEpisode?)
         async throws -> (result: (url: URL, torrentId: Int?, fileId: Int?), service: DebridService) {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         guard let resolver = pick(service) else { throw DebridError.noKey }
         let r = try await resolver.resolveWithIds(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
         return (r, resolver.service)
@@ -1014,7 +1048,7 @@ final class DebridCoordinator {
     /// refresh an expired debrid link without the slow full add-on re-resolve.
     func reresolve(service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?)
         async throws -> URL {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         guard let resolver = resolvers[service] else { throw DebridError.noKey }
         return try await resolver.reresolveLink(infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx)
     }
@@ -1030,7 +1064,7 @@ final class DebridCoordinator {
     /// `.noKey` when no TorBox key is configured, so the bounded resolve below collapses it to `nil`.
     /// `knownHash` = the stream's authoritative NZB md5 when its emitter carried one (nil otherwise).
     func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
         return try await usenet.resolve(nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude, fileIdx: fileIdx, episode: episode)
     }
@@ -1039,7 +1073,7 @@ final class DebridCoordinator {
     /// no-op) when no TorBox key is configured. Keys are the lowercased md5 identifiers, matching
     /// `TorBoxUsenetResolver.identifier(forNzbURL:)`.
     func usenetCacheCheck(nzbMD5s: [String]) async -> Set<String> {
-        if resolvers.isEmpty { reload() }
+        await warmIfNeeded()
         guard let usenet = torboxUsenet, !nzbMD5s.isEmpty else { return [] }
         let map = (try? await usenet.checkCache(hashes: nzbMD5s)) ?? [:]
         return Set(map.filter { !$0.value.isEmpty }.keys)
@@ -1075,10 +1109,10 @@ extension DebridCoordinator {
     /// path unchanged. It is FAIL-SOFT by construction: every non-success (no key, not a raw torrent, any
     /// `DebridError`, a throw, or the timeout) returns `nil`, so the user is never left unable to play.
     ///
-    /// NO-KEY BYTE-IDENTICAL GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns
-    /// `nil` on the very first line with ZERO `await` and zero provider contact, so the caller runs exactly
-    /// the code it ran before this feature existed. The same immediate `nil` applies to any non-raw-torrent
-    /// stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
+    /// NO-KEY GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns `nil`
+    /// immediately with no network and no provider contact (only the at-most-once lazy warm hop), so the
+    /// caller runs exactly the code it ran before this feature existed. The same immediate `nil` applies to
+    /// any non-raw-torrent stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
     ///
     /// - Parameters:
     ///   - stream: the stream the user is about to play.
@@ -1100,16 +1134,18 @@ extension DebridCoordinator {
     /// The same bounded, fail-soft resolve as `resolvedPlaybackURL`, but returning the full
     /// `DebridPlaybackRef` (URL + provider + reresolve ids) so the play-record can persist enough to
     /// later refresh an expired link. `resolvedPlaybackURL` is a thin `?.url` wrapper over this, so every
-    /// guarantee (raw-torrent-only, no-key zero-await nil, timeout → nil) is identical.
+    /// guarantee (raw-torrent-only, no-key immediate nil (no network, only the at-most-once lazy warm hop),
+    /// timeout → nil) is identical.
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
         // USENET first: a stream with an `.nzb` link (and no direct `url`) resolves through the TorBox
         // usenet backend, gated on a TorBox key. With no TorBox key `hasUsenetResolver` is false, so this
-        // returns nil on the first line (zero await) — a usenet row then behaves exactly as today (no
-        // playable link). NOT a torrent: the minted URL is a plain direct stream (no infoHash carried).
+        // returns nil here with no network (only the at-most-once lazy warm hop), so a usenet row behaves
+        // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
+        // infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
-            guard hasUsenetResolver else { return nil }
+            guard await hasUsenetResolver else { return nil }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
@@ -1142,8 +1178,9 @@ extension DebridCoordinator {
         // Raw torrent only: a stream WITH a `url` is already a direct/debrid link; one with neither url nor
         // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
-        // No-key fast path: zero await, zero behaviour change. This is the byte-identical guarantee.
-        guard hasAnyResolver else {
+        // No-key fast path: no network, zero behaviour change (only the at-most-once lazy warm hop). This is
+        // the byte-identical guarantee.
+        guard await hasAnyResolver else {
             DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) NO-KEY (no resolver configured) -> nil, embedded path")
             return nil
         }
@@ -1239,9 +1276,13 @@ extension DebridCoordinator {
                               cachedHashes: Set<String>, cachedUsenetURLs: Set<String> = [],
                               labeledBest: CoreStream? = nil,
                               max: Int = 4) async -> (ref: DebridPlaybackRef, stream: CoreStream)? {
-        // Zero-await no-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this
-        // returns nil before any provider contact, so the caller's fallback runs its unchanged path.
-        guard hasAnyResolver || hasUsenetResolver else { return nil }
+        // No-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this returns nil
+        // before any provider contact (only the at-most-once lazy warm hop), so the caller's fallback runs
+        // its unchanged path. Evaluate both awaited flags first: `await` cannot live in `||`'s autoclosure,
+        // and both are cheap (idempotent warm), so eager evaluation is fine.
+        let hasTorrentResolver = await hasAnyResolver
+        let hasUsenet = await hasUsenetResolver
+        guard hasTorrentResolver || hasUsenet else { return nil }
         guard !cachedHashes.isEmpty || !cachedUsenetURLs.isEmpty else { return nil }
 
         // Keep only the confirmed-cached, resolvable candidates, in the caller's rank order. A raw torrent

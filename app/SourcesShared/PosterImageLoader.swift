@@ -189,6 +189,12 @@ enum PosterImageLoader {
         do {
             var req = URLRequest(url: url)
             req.cachePolicy = .returnCacheDataElseLoad   // poster art is immutable; prefer the (now large) disk cache
+            // Sign via HEADERS (not a query signature) for our gated art hosts (poster.vortx.tv / erdb.vortx.tv):
+            // this path owns the URLRequest, and headers are NOT part of the URLCache key, so the large disk
+            // cache above stays warm. A query-signed URL would carry a per-second `vts` and change the cache key
+            // every second, reintroducing the "re-fetch every poster" thrash this loader exists to fix. No-op
+            // (fail-open) for any non-gated host (tmdb / metahub / add-on art) and for an unprovisioned build.
+            VortXEdgeAuth.sign(&req)
             let (data, _) = try await session.data(for: req)
             VXProbe.log("poster", "fetch OK host=\(probeHost(raw)) bytes=\(data.count)")
             if Task.isCancelled {

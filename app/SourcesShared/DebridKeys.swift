@@ -52,6 +52,20 @@ final class DebridKeys: ObservableObject {
     func key(for service: DebridService) -> String { keys[service.rawValue] ?? "" }
     func isConfigured(_ service: DebridService) -> Bool { !key(for: service).isEmpty }
 
+    /// A Sendable, by-value snapshot of the current keys, keyed by `DebridService`. Hand THIS to
+    /// `DebridCoordinator.reload(keys:)` instead of the `DebridKeys` reference: the coordinator is an actor
+    /// running off the main thread, and `keys` is a plain `@Published` dictionary mutated on the main actor,
+    /// so letting the actor read `keys` directly is a concurrent Dictionary read/write. Capture the snapshot
+    /// on the main actor (where every writer lives) and pass the immutable copy across the isolation boundary.
+    var snapshot: [DebridService: String] {
+        var out: [DebridService: String] = [:]
+        for service in DebridService.allCases {
+            let k = key(for: service)
+            if !k.isEmpty { out[service] = k }
+        }
+        return out
+    }
+
     /// Persist (or clear, on empty) a service's key in the Keychain and nudge the E2E sync.
     func setKey(_ value: String, for service: DebridService) {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,14 +76,18 @@ final class DebridKeys: ObservableObject {
             keys[service.rawValue] = trimmed
             Keychain.set(trimmed, for: service.keychainAccount)
         }
-        // Rebuild the debrid resolvers so a CHANGED key takes effect: the coordinator's lazy
-        // `if resolvers.isEmpty { reload() }` only warms on first use, so it would otherwise keep
-        // using the OLD key (resolvers is non-empty). DebridCoordinator is @MainActor; setKey may run
-        // off the main actor (e.g. the sync apply path), so hop on.
-        Task { @MainActor in
-            DebridCoordinator.shared.reload()
-            VortXSyncManager.shared.requestSyncSoon()
-        }
+        // Rebuild the debrid resolvers so a CHANGED key takes effect: the coordinator's lazy warm only
+        // builds on first use, so it would otherwise keep using the OLD key (resolvers already non-empty).
+        // Capture the fresh key snapshot HERE, synchronously on this writer's context (serialized with the
+        // `keys` mutation just above), then hand the immutable value to the actor: the actor never reads the
+        // `@Published` dictionary itself (that would race the main-actor writers).
+        let snapshot = self.snapshot
+        Task { await DebridCoordinator.shared.reload(keys: snapshot) }
+        // Nudge the E2E sync SEPARATELY, not chained behind the actor hop. Keeping it a distinct main-actor
+        // task preserves the old enqueue timing: on the sync-apply path the nudge lands while
+        // `withRemoteApplySuppressed` is still active, so `requestSyncSoon`'s guard swallows the self-echo.
+        // Ordering vs the debounced push is irrelevant (the push reads keys at send time).
+        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
     }
 
     /// A SecureField binding that persists on edit (same UX as the metadata-key fields).
