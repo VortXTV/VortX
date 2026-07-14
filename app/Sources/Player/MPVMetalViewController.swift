@@ -586,10 +586,30 @@ final class MPVMetalViewController: PlatformViewController {
         // raw spdif WEDGES the AO open and freezes the WHOLE player (#78/#101 "passthrough freezes the video"),
         // even on a real receiver - and with the avfoundation AO now decoding while the system negotiates the
         // HDMI/eARC format (incl Atmos) to the receiver, app-side bitstream is both unnecessary and unsafe. So
-        // never arm spdif on tvOS. iOS keeps it, gated off stereo-only / AirPods routes that can't take it.
+        // never arm spdif on tvOS by default. iOS keeps it, gated off stereo-only / AirPods routes that can't
+        // take it.
         #if !os(tvOS)
         if !routeIsStereoOnly, !routeIsAirPods, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
+        }
+        #else
+        // tvOS bitstream EXPERIMENT (Atmos survival on the libmpv fallback lane; see
+        // AudioOutputMode.tvosSpdifExperimentEnabled for the full gate rationale). Whenever a DV title lands
+        // on this lane (a demoted remux, a torrent), decoding E-AC-3 to PCM strips the JOC (Atmos) metadata:
+        // the receiver shows "Dolby Audio"/PCM, never Atmos. DOUBLE-gated so the fleet default is EXACTLY
+        // today's decode path: the user's explicit Passthrough pick AND the tvosSpdif defaults/RemoteConfig
+        // flag, on a route that can take a bitstream (never built-in speakers / AirPlay / Bluetooth), and
+        // never for the muted hero-preview instance. When armed, the AO list is pinned to avfoundation ALONE:
+        // the #78/#101 freeze was audiounit + spdif, and that pair must never re-arise via AO fallback. If
+        // the avfoundation AO refuses the compressed format, mpv falls back to decoding the same track to
+        // PCM (the documented spdif fallback; also asserted by AudioOutputMode.detail), i.e. the worst case
+        // is exactly today's behavior.
+        if !startMuted, !routeIsStereoOnly, !routeIsAirPods,
+           AudioOutputMode.current == .passthrough, AudioOutputMode.tvosSpdifExperimentEnabled,
+           let spdif = AudioOutputMode.current.spdifCodecs {
+            checkError(mpv_set_option_string(mpv, "ao", "avfoundation"))   // never audiounit with spdif armed
+            checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
+            DiagnosticsLog.log("player", "tvOS bitstream experiment ARMED: audio-spdif=\(spdif), ao pinned to avfoundation (Passthrough + tvosSpdif flag, multichannel route)")
         }
         #endif
         // AO-open failure handling, route-aware. On a stereo-only route (TV built-in / AirPlay) the

@@ -35,6 +35,24 @@ enum AudioOutputMode: String, CaseIterable {
         self == .passthrough ? "ac3,dts,eac3,truehd,dts-hd" : nil
     }
 
+    /// tvOS bitstream EXPERIMENT gate (Atmos survival on the libmpv fallback lane). App-side spdif on tvOS
+    /// historically WEDGED the audiounit AO open and froze the whole player (#78/#101), so Passthrough is
+    /// deliberately ignored there today and a DV demote lands on decoded multichannel PCM: the receiver loses
+    /// the E-AC-3 JOC (Atmos) bitstream even when it could take it. The avfoundation AO (MPVKit n8.1.2) opens
+    /// the route the way AVPlayer does, which MAY accept a compressed format cleanly, but there is no Atmos
+    /// receiver in the build loop to prove it, so arming is DOUBLE-gated: the user's explicit Passthrough pick
+    /// AND this flag (an explicit UserDefaults value wins for local testing, else the RemoteConfig `tvosSpdif`
+    /// feature, default FALSE). Fleet default stays exactly today's decode path until the owner device-verifies;
+    /// a bad outcome is one RemoteConfig flip (or Settings pick) away from off. iOS is untouched (its spdif
+    /// gating already works); macOS keeps mpv's native coreaudio negotiation.
+    static let tvosSpdifKey = "stremiox.tvosSpdif"
+    static var tvosSpdifExperimentEnabled: Bool {
+        if UserDefaults.standard.object(forKey: tvosSpdifKey) != nil {
+            return UserDefaults.standard.bool(forKey: tvosSpdifKey)
+        }
+        return RemoteConfig.snapshot.isFeatureOn("tvosSpdif", default: false)
+    }
+
     var label: String {
         switch self {
         case .auto: return "Auto"

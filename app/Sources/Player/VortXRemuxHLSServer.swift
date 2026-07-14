@@ -104,6 +104,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.hlsSnapshot().initData != nil && stream.buffer.status().failure == nil
     }
 
+    /// Monotonic mount-progress counters for the chrome's progress-aware start watchdog. Thread-safe passthrough.
+    var mountProgress: VortXMKVRemuxStream.MountProgress { stream.mountProgress() }
+
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
         stateLock.lock()

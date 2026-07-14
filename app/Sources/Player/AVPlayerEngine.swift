@@ -125,6 +125,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
 
+    /// Progress counters for the mounted DV remux (either delivery), or nil when no remux is mounted. The
+    /// chrome's PROGRESS-AWARE start watchdog polls this ~1 Hz to tell a slow-but-alive 4K source (counters
+    /// still moving -> extend the start window) from a TRUE stall (nothing moved for the whole stall window
+    /// -> demote to libmpv). Cheap: two lock hops per read, no allocation beyond the tiny struct.
+    var remuxMountProgress: VortXMKVRemuxStream.MountProgress? {
+        if let server = remuxHLSServer { return server.mountProgress }
+        if let loader = remuxLoader { return loader.mountProgress }
+        return nil
+    }
+
     /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
     /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
     /// the mount frameless and demote the whole true-DV session to libmpv. Prefer the item's seekable ranges

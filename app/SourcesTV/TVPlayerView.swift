@@ -208,8 +208,22 @@ struct TVPlayerView: View {
     // frame is classify (3.8-8.2s observed) + the startup-segment publish + fetch/decode, so the flat 10s
     // clips a healthy DV remux mount. ONLY the remux lane waits this long; a non-remux AVPlayer no-frame still
     // demotes on the short deadline, and the .failed instant-demote path is untouched (a real "Cannot Open"
-    // still bails in ~1s). Bounded: at worst 10 extra seconds of spinner before demoting a genuinely dead mount.
+    // still bails in ~1s). NO LONGER a demote wall: the remux watchdog is PROGRESS-AWARE (see
+    // startAVStartWatchdog), so this is now only the point past which it starts logging hold decisions.
     private let avRemuxStartWatchdogSeconds: Double = 20
+    // Progress-aware remux demote thresholds (the 0.3.13 field fix: a heavy 4K DV title that was still
+    // steadily downloading produced its first frame AFTER a fixed 20s wall, so the watchdog demoted a
+    // perfectly healthy true-DV session to HDR10 + PCM). Demote only on a TRUE stall: NOTHING moved (no new
+    // muxed bytes, no new segment, no classify/init flip) for avRemuxStallDemoteSeconds; a slowly-but-surely
+    // producing mount is left alone up to a generous hard ceiling that bounds the spinner for the pathological
+    // "always trickling yet never framing" mount. A genuinely dead source is still caught FASTER than the old
+    // wall in most cases: the remux fails its open/read within its own 10s rw_timeout (+1 warm retry) and the
+    // HLS 404 -> AVPlayer .failed path demotes in ~1s, independent of this watchdog.
+    private let avRemuxStallDemoteSeconds: Double = 15
+    private let avRemuxStartHardCeilingSeconds: Double = 120
+    /// When the AVPlayer start watchdog was armed for the current mount; drives the [dv] time-to-first-frame
+    /// line when the timePos handler disarms it. Cleared (one-shot) by that handler.
+    @State private var avWatchdogArmedAt: Date?
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -585,7 +599,8 @@ struct TVPlayerView: View {
         // With the engineLatch this fires only on the pre-onAppear renders plus the single seed, so the
         // exported log gets the route trail once per stream instead of once per body pass (#76 b163 flood).
         // AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv here means HDR10 tone-map.
-        let routeLine = "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(PlayerEngineRouter.isDVRemuxCandidate(url)) container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
+        let candidacy = PlayerEngineRouter.dvRemuxCandidacy(url)
+        let routeLine = "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(candidacy.candidate) [\(candidacy.reason)] container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
         VXProbe.log("dv", routeLine)
         // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag even with probe
         // logging off. Deduped, so the handful of pre-latch evaluations write one line.
@@ -655,6 +670,14 @@ struct TVPlayerView: View {
                 if d > 0, !hasStartedPlaying {            // playback actually began
                     hasStartedPlaying = true; loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
+                    // [dv] time-to-first-frame for the watchdog trail (one-shot: armedAt self-clears). Only
+                    // the remux lane logs it; the mpv lane / plain AVPlayer starts are not the diag target.
+                    if let armed = avWatchdogArmedAt {
+                        avWatchdogArmedAt = nil
+                        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
+                            DiagnosticsLog.log("dv", String(format: "remux first frame in %.1fs (start watchdog disarmed)", Date().timeIntervalSince(armed)))
+                        }
+                    }
                     autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
                     applyDefaultVolume()            // D5: start at the user's saved "Default volume" (the launch mount begins at 100%)
                     // Honest badge (message-only): a Dolby Vision title on the libmpv lane (a DV torrent, or
@@ -2599,30 +2622,77 @@ struct TVPlayerView: View {
         // T16: key the HLS exemption off the CURRENTLY-playing stream, not the immutable launch url, so an
         // in-place switch to an HLS source is exempted and a switch away from one re-arms the watchdog.
         if PlayerEngineRouter.isHLS(curURL ?? url) { return }
+        avWatchdogArmedAt = Date()
         avStartWatchdog = Task { @MainActor in
-            // The AVPlayer no-frame safety net (#76 b165/b166/b170). Historically this lane first-framed 0% of
-            // the time on 4K debrid DV MKVs because the local HLS master was rejected outright (-1002, the
-            // VIDEO-RANGE single-variant filter, now fixed in VortXRemuxHLSServer with a range-unlabeled
-            // lifeboat variant). With the master accepted a healthy DV remux DOES reach readyToPlay, but only
-            // after classify (3.8-8.2s) + the startup-segment publish, so the remux lane gets
-            // avRemuxStartWatchdogSeconds of headroom while everything else keeps the short
-            // avStartWatchdogSeconds. Read the mount BEFORE the sleep: the mount happens synchronously in
-            // loadFile, so isRemuxMounted is already true at arm time. A genuinely stuck mount still demotes to
-            // the fast libmpv HDR10 path (bounded, remux-only), and the .failed instant-demote path is
-            // untouched, so a real "Cannot Open" still bails in ~1s. A working remux cancels this via the
-            // timePos handler well inside the window.
+            // The AVPlayer no-frame safety net (#76 b165/b166/b170, PROGRESS-AWARE since the 0.3.13 field
+            // diag). Historically this lane first-framed 0% of the time on 4K debrid DV MKVs because the
+            // local HLS master was rejected outright (-1002, the VIDEO-RANGE single-variant filter, now fixed
+            // in VortXRemuxHLSServer with a range-unlabeled lifeboat variant). With the master accepted a
+            // healthy DV remux DOES reach readyToPlay, but only after classify (3.8-8.2s) + the
+            // startup-segment publish, and on a heavy/slow 4K source that whole chain can legitimately exceed
+            // ANY fixed wall (the 0.3.13 device diag: still-downloading titles demoted at 20s, losing true DV
+            // AND Atmos in one flip). So the remux lane no longer demotes on elapsed time alone: it polls the
+            // mount's monotonic progress counters (muxed bytes, published segments, classify/init flips) at
+            // ~1 Hz and only demotes on a TRUE stall (nothing moved for avRemuxStallDemoteSeconds) or at a
+            // generous hard ceiling (avRemuxStartHardCeilingSeconds) that bounds the spinner for a mount that
+            // trickles forever without framing. Read the mount BEFORE the first sleep: the mount happens
+            // synchronously in loadFile, so isRemuxMounted is already true at arm time. Everything else keeps
+            // the short fixed avStartWatchdogSeconds exactly as before, and the .failed instant-demote path is
+            // untouched (a real "Cannot Open" still bails in ~1s). A working remux cancels this via the
+            // timePos handler.
             let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
-            let deadline = remuxMounted ? avRemuxStartWatchdogSeconds : avStartWatchdogSeconds
-            try? await Task.sleep(for: .seconds(deadline))
-            guard !Task.isCancelled, !hasStartedPlaying else { return }
-            guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(deadline))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
-            if remuxMounted {
-                // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
-                // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
-                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(deadline))s -> libmpv HDR10")
+            if !remuxMounted {
+                try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+                guard !Task.isCancelled, !hasStartedPlaying else { return }
+                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+                DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=false), falling back to libmpv")
+                demoteAVPlayerToMPV()
+                return
             }
-            demoteAVPlayerToMPV()
+            let armed = Date()
+            var lastProgressAt = armed
+            var last = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress
+            var lastHoldLogAt = armed
+            while true {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, !hasStartedPlaying else { return }
+                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+                let now = Date()
+                if let cur = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress {
+                    // Progress = any monotonic counter moved since the last poll. A FAILED mount never counts
+                    // as progress; its demote belongs to the HLS-404 -> .failed path, and if that somehow
+                    // never fires the stall window below still bounds it.
+                    let progressed = last.map { prev in
+                        cur.producedBytes > prev.producedBytes
+                            || cur.segmentCount > prev.segmentCount
+                            || (cur.initPublished && !prev.initPublished)
+                            || (cur.signalingPublished && !prev.signalingPublished)
+                            || (cur.ended && !prev.ended)
+                    } ?? true
+                    if progressed, !cur.failed { lastProgressAt = now }
+                    last = cur
+                }
+                let elapsed = now.timeIntervalSince(armed)
+                let stalled = now.timeIntervalSince(lastProgressAt)
+                let state = "produced=\(last?.producedBytes ?? -1)B segs=\(last?.segmentCount ?? -1) init=\(last?.initPublished ?? false) classify=\(last?.signalingPublished ?? false) failed=\(last?.failed ?? false)"
+                if stalled >= avRemuxStallDemoteSeconds || elapsed >= avRemuxStartHardCeilingSeconds {
+                    let why = stalled >= avRemuxStallDemoteSeconds
+                        ? "TRUE STALL, no remux progress for \(Int(stalled))s"
+                        : "hard ceiling \(Int(avRemuxStartHardCeilingSeconds))s with no playable frame"
+                    DiagnosticsLog.log("player", "AVPlayer start watchdog demoting (remux mounted=true, \(why), elapsed=\(Int(elapsed))s, \(state)), falling back to libmpv")
+                    // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV
+                    // + Atmos session into HDR10 + multichannel PCM, so name it explicitly.
+                    DiagnosticsLog.log("dv", "remux demoted: \(why) -> libmpv HDR10")
+                    demoteAVPlayerToMPV()
+                    return
+                }
+                // Past the old fixed wall and still holding: say WHY (progress is flowing), every ~10s, so
+                // the next device log shows extend-vs-demote decisions instead of a silent gap.
+                if elapsed >= avRemuxStartWatchdogSeconds, now.timeIntervalSince(lastHoldLogAt) >= 10 {
+                    lastHoldLogAt = now
+                    DiagnosticsLog.log("dv", "start watchdog holding: remux progressing (elapsed=\(Int(elapsed))s, quiet=\(Int(stalled))s, \(state))")
+                }
+            }
         }
     }
 

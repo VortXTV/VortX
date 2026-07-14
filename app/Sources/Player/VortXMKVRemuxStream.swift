@@ -163,6 +163,35 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
     }
 
+    /// Monotonic mount-progress counters for the chrome's PROGRESS-AWARE start watchdog. Every field only
+    /// ever moves forward (bytes/segments grow, stage flags flip once), so a ~1 Hz poller can tell a
+    /// slow-but-alive 4K source (something moved since the last poll -> extend the start window) from a TRUE
+    /// stall (nothing moved across the whole stall window -> demote). Thread-safe; cheap (two lock hops).
+    struct MountProgress: Equatable {
+        let producedBytes: Int       // muxed output bytes; grows for as long as source bytes keep arriving
+        let segmentCount: Int        // closed HLS segments published (0 on the legacy loader delivery)
+        let initPublished: Bool      // ftyp+moov indexed and served (false on the legacy loader delivery)
+        let signalingPublished: Bool // classify finished (master-playlist signaling exists)
+        let ended: Bool              // trailer written (the whole source remuxed)
+        let failed: Bool             // remux failed; the HLS 404 -> AVPlayer .failed path owns that demote
+    }
+
+    /// Current mount progress. See `MountProgress`.
+    func mountProgress() -> MountProgress {
+        let snap = hlsSnapshot()
+        let st = buffer.status()
+        return MountProgress(producedBytes: st.produced,
+                             segmentCount: snap.segments.count,
+                             initPublished: snap.initData != nil,
+                             signalingPublished: snap.signaling != nil,
+                             ended: snap.ended,
+                             failed: st.failure != nil)
+    }
+
+    /// When this stream was created (== the AVPlayer mount instant for either delivery). Anchors the
+    /// time-to-init / time-to-first-segment diagnostics so the next device log carries startup timing.
+    private let mountedAt = Date()
+
     // Init-segment head scan state (remux thread only). Accumulates ONLY the leading top-level box headers until
     // the `moov` box is LOCATED; the init CONTENT (ftyp+moov, any size) is then read straight from the produced
     // buffer (`hlsFinalizeInit`), so the scan is size-agnostic and never has to hold the whole moov. The moov's
@@ -1190,7 +1219,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init
         hlsHeadDone = true; hlsHeadBuf = []
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))")
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
     }
 
     /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so
@@ -1289,6 +1318,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                        byteLength: endByte - segStartByte, duration: duration))
         hlsLock.unlock()
         hlsSegmentStartByte = endByte
+        // Startup-timing breadcrumbs for the progress-aware start watchdog trail: the media playlist's first
+        // answer is HELD until minStartupSegments (2) exist, so these two lines put the exact time-to-serve
+        // in every device log (the demote-vs-extend decision is judged against them). One-shot each.
+        if idx <= 1 {
+            let elapsed = String(format: "%.1f", Date().timeIntervalSince(mountedAt))
+            let media = String(format: "%.2f", duration)
+            DiagnosticsLog.log("dv", "hls media segment \(idx) published +\(elapsed)s after mount (\(endByte - segStartByte)B, \(media)s media)\(idx == 1 ? " -> startup playlist gate open" : "")")
+        }
     }
 
     /// Build the master-playlist signaling from the FINAL output streams (post extradata repair + DOVI
