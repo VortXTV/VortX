@@ -411,6 +411,7 @@ struct iOSSettingsView: View {
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
+            NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
         }
     }
 

@@ -275,6 +275,10 @@ struct SettingsView: View {
                     Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { IPTVSettingsView() } label: {
+                    Label("Live TV (IPTV playlists)", systemImage: "tv")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()
