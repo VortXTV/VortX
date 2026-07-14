@@ -531,6 +531,11 @@ final class CollectionsHubModel: ObservableObject {
     private func loadDecadeCovers() {
         if let cached = Self.cachedDecadeCovers() { decadeCovers = cached }
         if Self.decadeCacheIsFresh() { return }
+        // Back off after an all-empty fetch: the /cover edge route may not be deployed yet, and without
+        // this every hub load() (fires on each appearance / region change) would re-run the ~10-request
+        // signed batch against a failing endpoint. The short window lets a genuine relaunch retry soon
+        // while a render inside it does not hammer.
+        if Self.decadeCoverInFailureBackoff() { return }
         guard decadeTask == nil else { return }
         decadeGen += 1; let myGen = decadeGen
         let thisTask = Task { [weak self] in
@@ -543,12 +548,18 @@ final class CollectionsHubModel: ObservableObject {
                 }
                 for await (title, url) in group { if let url { out[title] = url } }
             }
-            guard let self, !Task.isCancelled, !out.isEmpty else {
+            guard let self, !Task.isCancelled else {
                 if self?.decadeGen == myGen { self?.decadeTask = nil }
                 return
             }
             if self.decadeGen == myGen { self.decadeTask = nil }
-            self.decadeCovers = out       // keep the prior cache on an all-empty fetch (don't blank the tiles)
+            guard !out.isEmpty else {
+                // Route down or a transient failure: keep the prior cache (don't blank the tiles) and
+                // stamp the failure-backoff so we don't re-fire the batch on every load() until it elapses.
+                Self.stampDecadeCoverFailure()
+                return
+            }
+            self.decadeCovers = out
             Self.cacheDecadeCovers(out)
         }
         decadeTask = thisTask
@@ -556,10 +567,16 @@ final class CollectionsHubModel: ObservableObject {
 
     private static func decadeCacheKey() -> String { "vortx.collections.decadeCovers" }
     private static func decadeCacheAtKey() -> String { "vortx.collections.decadeCoversAt" }
+    private static func decadeCoverFailedAtKey() -> String { "vortx.collections.decadeCoversFailedAt" }
+    /// Failure-backoff window for an all-empty /cover fetch. Short enough that a genuine relaunch retries
+    /// soon (so the tiles fill once the edge route deploys), long enough that repeated hub renders within a
+    /// session do not re-fire the ~10-request signed batch against a still-failing endpoint.
+    private static let decadeCoverFailureBackoff: TimeInterval = 30 * 60
 
     private static func cacheDecadeCovers(_ map: [String: String]) {
         UserDefaults.standard.set(map, forKey: decadeCacheKey())
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: decadeCacheAtKey())
+        UserDefaults.standard.removeObject(forKey: decadeCoverFailedAtKey())   // success clears any prior backoff
     }
     private static func cachedDecadeCovers() -> [String: String]? {
         guard let raw = UserDefaults.standard.dictionary(forKey: decadeCacheKey()) as? [String: String], !raw.isEmpty else { return nil }
@@ -569,6 +586,14 @@ final class CollectionsHubModel: ObservableObject {
         let at = UserDefaults.standard.double(forKey: decadeCacheAtKey())
         guard at > 0 else { return false }
         return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
+    }
+    private static func stampDecadeCoverFailure() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: decadeCoverFailedAtKey())
+    }
+    private static func decadeCoverInFailureBackoff() -> Bool {
+        let at = UserDefaults.standard.double(forKey: decadeCoverFailedAtKey())
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < decadeCoverFailureBackoff
     }
 
     // MARK: provider cache (UserDefaults, region-keyed, cadence-throttled)
