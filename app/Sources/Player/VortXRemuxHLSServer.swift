@@ -89,6 +89,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
     func markEngineReady() { stream.buffer.markEngineReady() }
 
+    /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
+    /// to synthesize a finite VOD duration, since the live HLS delivery keeps AVPlayerItem.duration INDEFINITE.
+    var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
+
     /// Whether the mount is still HEALTHY: the init segment has published AND the remux buffer has not failed.
     /// The engine's one-shot healthy-mount retry (#76) reads this to tell "a CoreMedia startup hiccup on a live
     /// mount" (retry a fresh item) from "the remux itself died" (demote). Same two signals serveMedia gates on.

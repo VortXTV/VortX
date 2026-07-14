@@ -122,13 +122,13 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters, engine
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
-            case .chapters: 12
+            case .chapters: 12; case .engine: 13
             }
         }
         var title: String {
@@ -138,7 +138,7 @@ struct PlayerScreen: View {
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
-            case .chapters: "Chapters"
+            case .chapters: "Chapters"; case .engine: "Player Engine"
             }
         }
         /// Panels where picking a row is an unambiguous one-shot choice (a track, quality, source, or
@@ -147,7 +147,7 @@ struct PlayerScreen: View {
         /// colour steppers, output mode, player settings, sleep) and the browse panels (info, episodes).
         var dismissesAfterPick: Bool {
             switch self {
-            case .subtitles, .audio, .quality, .sources, .chapters: true
+            case .subtitles, .audio, .quality, .sources, .chapters, .engine: true
             default: false
             }
         }
@@ -285,6 +285,14 @@ struct PlayerScreen: View {
     // One-shot latch: the tmdb->tt resolve for the add-on/pooled query id has been kicked off this load. Reset
     // wherever autoAddonSubTried resets, so a reload can retry a failed resolve exactly once. Mirror of TVPlayerView.
     @State private var addonSubsResolveTried = false
+    // An explicit in-session subtitle pick captured before an engine switch (#76, mandated check 8), re-applied
+    // on the new engine's first trackList instead of the preference-derived auto pick. Consumed in
+    // autoSelectTracks; only read while userPickedSubtitle is true. Mirror of TVPlayerView.
+    @State private var pendingSubtitleReapply: SubtitleChoice?
+    // A DV-remux switch that starts at 0 (forward-only, the resume seek is dropped) keeps the REAL resume
+    // point here, so the periodic / exit progress writes refuse to REGRESS the account resume below it. Clears
+    // once the playhead passes it. iOS port of TVPlayerView.suppressedResumeFloor.
+    @State private var suppressedResumeFloor: Double?
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var showShare = false             // system share sheet
     @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
@@ -346,6 +354,11 @@ struct PlayerScreen: View {
     /// yanked a playing stream into the other engine minutes in (the mid-playback "auto-switch to DV" report).
     /// Engine choice happens ONLY at start; the sole later transition is the failure demotion (avEngineFailed).
     @State private var engineLatch: Bool?
+    /// Quality signature of what is playing RIGHT NOW (iOS port of TVPlayerView.curHint). Seeded from the
+    /// launch signature (`recordQualityText`) and re-set in `switchStream` to the switched-to stream, so the
+    /// DV gate (`activeAVPlayerWouldRemux`) and the DV display-mode plumbing (`contentIsDolbyVision`) judge the
+    /// ACTIVE source after an in-player source switch across DV-ness, not the immutable launch source.
+    @State private var curHint: String?
     /// Set when the AVPlayer engine failed and we demoted to libmpv. Error events from the dismounting
     /// AVPlayer engine can still land shortly after the swap; anything inside this grace window is stale and
     /// must not burn the fresh mpv load's retry budget (or paint the error overlay over a recovering play).
@@ -483,6 +496,12 @@ struct PlayerScreen: View {
     }
 
     #if os(iOS) || os(macOS)
+    /// User-invoked mid-title engine override (P3, #76). nil = automatic (the latch/route decides); true = the
+    /// viewer forced AVPlayer; false = the viewer forced libmpv. Supersedes the latch so `playerSurface`
+    /// re-renders the other engine on the SAME view; `avEngineFailed` still wins (a failed manual AVPlayer pick
+    /// falls back to libmpv, no loop).
+    @State private var manualEngineAVPlayer: Bool?
+
     /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: HLS is already
     /// handled in `body` (the minimal HLSPlayerView), and now a **Dolby Vision** stream in an AVPlayer-playable
     /// container (MP4/MOV/M4V) auto-routes here for true DV passthrough (libmpv only tone-maps DV to SDR). The
@@ -490,7 +509,37 @@ struct PlayerScreen: View {
     /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
         if avEngineFailed { return false }   // an AVPlayer load failure fell back to libmpv for this stream
+        if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
         return engineLatch ?? routedToAVPlayer
+    }
+
+    /// Whether AVPlayer can actually PLAY the ACTIVE stream, gating the "AVPlayer" row in the engine picker.
+    /// The old form forced `.avfoundation` through the router, which returns AVPlayer for ANY non-torrent URL
+    /// (the override bypasses every container rule), so it offered AVPlayer for a plain non-DV MKV/AVI/TS,
+    /// then a pick mounted the DV remux on non-DV content (shouldDVRemux checks container only), classify
+    /// rejected, and demote-bounced the position to 0. Gate on real playability instead: an AVPlayer-native
+    /// container (mp4/mov/m4v/HLS) OR a Dolby Vision title the remux lane can carry. And gate on the ACTIVE
+    /// source (curURL), not the immutable LAUNCH url, so an in-player switch to a torrent no longer offers a
+    /// dead AVPlayer row that would feed a loopback torrent URL into AVPlayer.
+    private var canUseAVPlayerEngine: Bool {
+        if audioSidecarURL != nil { return false }
+        let activeURL = curURL ?? url
+        let loopback = activeURL.host == "127.0.0.1" || activeURL.host == "localhost"
+        if curIsTorrent || loopback { return false }
+        return PlayerEngineRouter.isAVPlayerContainer(activeURL) || activeAVPlayerWouldRemux
+    }
+
+    /// True when routing the ACTIVE source to AVPlayer would mount the forward-only DV remux (a Dolby Vision
+    /// title in a container AVFoundation cannot demux, with the remux lane enabled for this display). Drives
+    /// both the engine-picker gate and the resume-floor suppression on a switch INTO such a mount. Uses the
+    /// router's non-isolated Auto-path predicates (dvRemuxEnabled + isDVRemuxCandidate), i.e. the exact
+    /// condition AVPlayerEngine.loadFile's shouldDVRemux evaluates, without the @MainActor wrapper.
+    private var activeAVPlayerWouldRemux: Bool {
+        let activeURL = curURL ?? url
+        let isDV = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
+        return isDV
+            && PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
+            && PlayerEngineRouter.isDVRemuxCandidate(activeURL)
     }
 
     /// The raw routing computation. Consulted once to seed `engineLatch` (and for the first renders before
@@ -514,9 +563,11 @@ struct PlayerScreen: View {
     #endif
 
     /// Whether the active player engine is AVFoundation. Mirrors tvOS's runtime check (the mounted controller's
-    /// type), so the chrome can hide the rows AVPlayer has no equivalent for: external add-on subtitles and the
-    /// subtitle-sync nudge (its setSubDelay is a no-op on AVPlayer). Falls back to the routing decision before
-    /// the controller mounts so the gate is correct even on the first render.
+    /// type), so the chrome can hide the rows AVPlayer has no equivalent for: audio sync (setAudioDelay), audio
+    /// output mode, and the hardware-decoding toggle. External add-on subtitles and the subtitle-sync nudge now
+    /// work on BOTH engines (AVPlayer renders external cues itself + honours setSubDelay as an overlay offset),
+    /// so those rows are shown. Falls back to the routing decision before the controller mounts so the gate is
+    /// correct even on the first render.
     private var isAVPlayerActive: Bool {
         if coordinator.player is AVPlayerEngineController { return true }
         #if os(iOS) || os(macOS)
@@ -668,6 +719,7 @@ struct PlayerScreen: View {
             }
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            if curHint == nil { curHint = recordQualityText }   // seed the "playing now" signature from the launch stream
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
@@ -863,7 +915,7 @@ struct PlayerScreen: View {
                     // bogus offset (or drop a fake Continue-Watching entry).
                     if !effectivelyLive, duration > 0, d - lastReported >= 5 {   // push progress ~every 5s
                         lastReported = d
-                        onProgress(d, duration)
+                        reportProgress(d)
                     }
                     // ~60s in → the user is really watching this: auto-add to the Library (D8) and send the
                     // anonymized fleet watch ping (D9), each once per playback. Both are idempotent + gated
@@ -908,9 +960,22 @@ struct PlayerScreen: View {
                 if !appliedInitialResume, d > 0 {
                     appliedInitialResume = true
                     if resumeSeconds > 5, resumeSeconds < d - 10 {   // resume where we left off
-                        coordinator.player?.seek(to: resumeSeconds)
-                        currentTime = resumeSeconds
-                        lastReported = resumeSeconds
+                        // FORWARD-ONLY DV REMUX on the LAUNCH lane: routing sends a DV remux candidate straight to
+                        // AVPlayer, and the engine drops a pre-start resume seek on a remux mount (AVPlayerEngine
+                        // readyToPlay), so a seek here lands in not-yet-produced bytes, no frame arrives, and the
+                        // start watchdog demotes the true-DV session to libmpv. Suppress the doomed seek, arm the
+                        // save floor from the stored position, and tell the viewer once. The floor-gated persist
+                        // lanes then protect the account resume until playback genuinely passes it. Mirrors tvOS
+                        // maybeResume (the switch lane already arms this way in switchPlayerEngine).
+                        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
+                            suppressedResumeFloor = resumeSeconds
+                            lastReported = resumeSeconds
+                            showEngineNotice("Dolby Vision stream starts from the beginning; resume for these comes in a later update.")
+                        } else {
+                            coordinator.player?.seek(to: resumeSeconds)
+                            currentTime = resumeSeconds
+                            lastReported = resumeSeconds
+                        }
                     }
                 }
                 refreshSkipSegments()
@@ -945,8 +1010,9 @@ struct PlayerScreen: View {
                 // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
                 // SIMKL has no live scrobble, so it is skipped by capability.
                 if let m = curMeta, !effectivelyLive {
-                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
-                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                    let pos = max(currentTime, suppressedResumeFloor ?? 0)
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
                 }
             }
         case MPVProperty.trackList:
@@ -954,6 +1020,10 @@ struct PlayerScreen: View {
             let summary = coordinator.player?.mediaSummary()
             videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
+            // Gap A (#76): on AVPlayer, chapters() is [] at readyToPlay (loadChapters is async) and the engine
+            // re-emits trackList precisely once they resolve, so re-pull skip candidates + chapter marks here.
+            // On libmpv chapters() is already synchronous at duration, so this is a cheap no-op re-run there.
+            refreshSkipSegments()
             if !appliedAutoTracks, !audioTracks.isEmpty || !subtitleTracks.isEmpty {
                 appliedAutoTracks = true
                 autoSelectTracks()
@@ -990,7 +1060,7 @@ struct PlayerScreen: View {
             // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op
             // with empty creds. Fired for the finishing episode before any in-place advance opens a new session.
-            if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
+            if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
@@ -1338,7 +1408,7 @@ struct PlayerScreen: View {
         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
             videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
             season: m.season, episode: m.episode, name: m.name,
-            poster: m.poster, type: m.type, qualityText: recordQualityText,
+            poster: m.poster, type: m.type, qualityText: curHint ?? recordQualityText,
             bingeGroup: curBingeState ?? recordBingeGroup,
             torrent: curIsTorrent, savedAt: Date(), headers: curHeaders,
             debridService: ref?.service.rawValue, infoHash: ref?.infoHash,
@@ -1394,7 +1464,7 @@ struct PlayerScreen: View {
         // Tell the libmpv lane whether this stream is Dolby Vision (same flag the engine router uses) so a DV
         // file that lands on libmpv drives the display into DV mode instead of HDR10 (tvOS effect; harmless on
         // iOS/macOS, which have no display-mode switch).
-        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(recordQualityText ?? "")
+        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
         coordinator.player?.loadFile(p.url, headers: p.headers, live: live, audioSidecar: sidecar)
     }
 
@@ -1824,7 +1894,21 @@ struct PlayerScreen: View {
         coordinator.player?.stop()
         avEngineFailed = true
         avDemotedAt = Date()
-        let resume = hasStartedPlaying ? currentTime : 0
+        // Demoting off a forward-only remux that started at 0 (its resume seek was dropped): the real position
+        // lives in suppressedResumeFloor, so carry the higher of the live position and the floor into the mpv
+        // re-load (mpv CAN seek). KEEP the floor across the demote: mpv's resume restore is DEFERRED (nudgeResume
+        // fires after a short sleep, plus a ~400ms re-point reload when the source had switched), and in that gap
+        // currentTime ticks near 0 on the fresh mount, so an exit inside the window would otherwise flush a low
+        // position over the account resume. reportProgress self-clears the floor once the restored playhead
+        // passes it. Pre-start / non-remux demotes are unaffected (floor is nil, currentTime wins).
+        // Pre-start demote (a remux mount that never produced a frame): currentTime is ~0, so fall back to the
+        // launch offset like tvOS (TVPlayerView demoteAVPlayerToMPV) instead of 0, so mpv reloads at the user's
+        // real position rather than restarting a half-watched title. Once started, carry the higher of the live
+        // position and the floor. The floor is derived from resumeSeconds on the launch/switch remux lanes, so
+        // max() keeps whichever is authoritative.
+        let resume = hasStartedPlaying
+            ? max(currentTime, suppressedResumeFloor ?? 0)
+            : max(resumeSeconds, suppressedResumeFloor ?? 0)
         if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
             showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
         }
@@ -1843,6 +1927,72 @@ struct PlayerScreen: View {
                 loadIntoPlayer(cu, headers: curHeaders, live: isLive)
             }
         }
+    }
+
+    /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
+    /// user-driven switch: tears the live engine down synchronously (straddle invariant) BEFORE flipping the
+    /// manual override so `playerSurface` re-renders the other engine on the SAME view, carries the live
+    /// position, and re-arms the one-shot latches so tracks / size / resume re-apply on the fresh mount. Speed
+    /// and subtitle sync are re-applied once the new engine's controller mounts. Track choices re-derive from
+    /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
+    /// design; matching is by lang/title). No-op when already on the requested engine.
+    private func switchPlayerEngine(toAVPlayer: Bool) {
+        guard toAVPlayer != isAVPlayerActive else { close(); return }
+        // Re-validate against the ACTIVE source before committing: the picker row is gated by
+        // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
+        // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.
+        if toAVPlayer, !canUseAVPlayerEngine {
+            showEngineNotice("This source can only play on the built-in (libmpv) engine.")
+            close(); return
+        }
+        srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        let resume = hasStartedPlaying ? currentTime : (resumeSeconds > 5 ? resumeSeconds : 0)
+        // Whether the AVPlayer mount we're switching INTO will be the forward-only DV remux: it can't honor a
+        // resume seek, so it starts at 0. Capture the real position as a save floor (mirrors tvOS maybeResume)
+        // so the periodic / exit saves don't regress the account resume below where the viewer actually was.
+        let targetIsRemux = toAVPlayer && activeAVPlayerWouldRemux
+        // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
+        // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
+        manualEngineAVPlayer = toAVPlayer
+        avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
+        avDemotedAt = Date()               // grace window swallows a stale event from the outgoing engine
+        // Treat the new mount as a fresh load (mirrors demoteAVPlayerToMPV). The new engine loads no external
+        // subtitles yet, so drop the added-set tracking so the picker is honest and reapply can re-add cleanly.
+        appliedSize = false; appliedVolume = false; appliedAutoTracks = false
+        addedSubURLs = []; addedPooledIDs = []
+        hasStartedPlaying = false; isSeekable = true
+        buffering = true; loadFailed = false; loadErrorMsg = ""
+        srcProbeLoadStart = Date()
+        startLoadTimeout()
+        if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
+        if targetIsRemux {
+            // Forward-only remux: the resume seek would be dropped and playback restarts at 0. Skip the doomed
+            // nudge, keep the real position as a save floor (below), and tell the viewer once.
+            suppressedResumeFloor = resume > 5 ? resume : nil
+            if resume > 5 { showEngineNotice("Dolby Vision stream starts from the beginning; resume for these comes in a later update.") }
+        } else {
+            suppressedResumeFloor = nil
+            if resume > 5 { nudgeResume(to: resume) }
+        }
+        // The fresh mount auto-loads the LAUNCH url; re-point at the ACTIVE source if this session switched.
+        if let cu = curURL, cu != url {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+                loadIntoPlayer(cu, headers: curHeaders, live: isLive)
+            }
+        }
+        // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+            if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
+            if subDelay != 0 { coordinator.player?.setSubDelay(subDelay) }
+        }
+        close()   // dismiss the settings sheet so the video is visible during the swap
     }
 
     /// AVPlayer-only START watchdog (see `avStartWatchdogSeconds`). If AVFoundation is the active engine and no
@@ -1985,6 +2135,7 @@ struct PlayerScreen: View {
         curURL = newURL
         curHeaders = stream.requestHeaders
         curIsTorrent = stream.isTorrent
+        curHint = StreamRanking.signature(stream)   // keep the "playing now" signature in step for the DV gate + engine picker
         // `explicitPick` (a real source-row / quality tap) is DISTINCT from `userInitiated` (which resets the
         // failover budget for any fresh load, including episode auto-advance). Only a real source pick honors
         // the same source on a start-timeout; an auto-advanced episode or an auto-hop stays non-explicit so it
@@ -2006,6 +2157,7 @@ struct PlayerScreen: View {
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         configureCommunityTrickplayProvisional()
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false   // re-apply saved volume to the new engine
+        pendingSubtitleReapply = nil; suppressedResumeFloor = nil   // a real source change: drop any pending switch-scoped subtitle/resume state
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
@@ -2112,7 +2264,7 @@ struct PlayerScreen: View {
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
         guard let loadEpisode, !switchingEpisode else { return }
         switchingEpisode = true
-        if duration > 0, currentTime > 0 { onProgress(currentTime, duration) }   // flush the outgoing episode
+        if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
         Task {
@@ -2258,12 +2410,12 @@ struct PlayerScreen: View {
             }
             if canNextEpisode {
                 iconButton("forward.end.fill", label: "Next episode") {
-                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                    if duration > 0 { reportProgress(currentTime) }   // flush before advancing (floor-guarded)
                     goToNextEpisode()
                 }
             } else if hasNext {
                 iconButton("forward.end.fill", label: "Next episode") {
-                    if duration > 0 { onProgress(currentTime, duration) }   // flush before advancing
+                    if duration > 0 { reportProgress(currentTime) }   // flush before advancing (floor-guarded)
                     onNext()
                 }
             }
@@ -2380,11 +2532,22 @@ struct PlayerScreen: View {
 
     /// Seek relative to the play head, clamped to the timeline, and report it. Shared by the on-screen skip
     /// buttons and the macOS keyboard shortcuts.
+    /// P2 (#76): the AUTHORITATIVE forward-only remux clamp lives at the engine chokepoint
+    /// (AVPlayerEngineController.seek(to:) caps every seek at producedEdgeSeconds). This helper keeps the
+    /// REPORTED position (onSeek / lastReported) in step with what the engine will actually honor, so the
+    /// scrubber and saved progress don't claim a position past the produced edge. bufferedTime is the
+    /// player-buffered edge, a conservative stand-in. Backward seeks / non-remux sessions pass through unchanged.
+    private func remuxClampedTarget(_ target: Double) -> Double {
+        guard (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true,
+              bufferedTime > currentTime, target > bufferedTime else { return target }
+        return bufferedTime
+    }
+
     private func seekBy(_ delta: Double) {
-        let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
+        let target = remuxClampedTarget(min(max(currentTime + delta, 0), max(duration - 1, 0)))
         coordinator.player?.seek(to: target)
         currentTime = target
-        if duration > 0 { onSeek(target, duration); lastReported = target }
+        reportSeek(target)
         scheduleHide()
     }
 
@@ -2423,9 +2586,10 @@ struct PlayerScreen: View {
                                 scrubTarget = currentTime; hideTask?.cancel()
                                 hoverPreviewTime = nil; hoverPreviewRatio = nil
                             } else {
-                                currentTime = scrubTarget
-                                coordinator.player?.seek(to: scrubTarget)
-                                if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
+                                let target = remuxClampedTarget(scrubTarget)   // P2: cap forward scrub at the remux edge
+                                currentTime = target
+                                coordinator.player?.seek(to: target)
+                                reportSeek(target)
                                 scrubThumbnails.clear()
                                 scheduleHide()
                             }
@@ -3511,6 +3675,11 @@ struct PlayerScreen: View {
             rs.append(Row(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rs
         case .audioSettings:
+            // AVPlayer manages audio delay + output routing itself: setAudioDelay / setAudioOutputMode are
+            // no-ops on that engine, so hide the inert controls rather than show rows that do nothing (#76).
+            if isAVPlayerActive {
+                return [Row(label: String(localized: "Audio is managed automatically"), isHeader: true)]
+            }
             let now = String(format: "%+.1fs", audioDelay)
             var rs = [Row(label: String(localized: "Sync"), isHeader: true),
                       Row(label: String(localized: "Earlier  −0.1s"), detail: now) { adjustAudioDelay(-0.1) },
@@ -3582,17 +3751,28 @@ struct PlayerScreen: View {
                 }
             }
         case .playerSettings:
-            let hw = coordinator.player?.hardwareDecoding ?? true
-            var rows: [Row] = [
-                Row(label: "Decoder", isHeader: true),
-                Row(label: "Hardware", detail: "recommended", selected: hw) {
+            var rows: [Row] = []
+            // Decoder toggle is libmpv-only: AVPlayer always decodes in hardware and setHardwareDecoding is a
+            // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
+            if !isAVPlayerActive {
+                let hw = coordinator.player?.hardwareDecoding ?? true
+                rows.append(Row(label: "Decoder", isHeader: true))
+                rows.append(Row(label: "Hardware", detail: "recommended", selected: hw) {
                     coordinator.player?.setHardwareDecoding(true)
-                },
-                Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
+                })
+                rows.append(Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
                     coordinator.player?.setHardwareDecoding(false)
-                },
-                Row(label: "Playback Info", detail: "›") { openPanel(.info) },
-            ]
+                })
+            }
+            rows.append(Row(label: "Playback Info", detail: "›") { openPanel(.info) })
+            #if os(iOS) || os(macOS)
+            // Player engine picker (P3, #76): only when AVPlayer is a real option for this stream (DV / HLS /
+            // debrid; never torrents or a yt-direct sidecar pair). Flips libmpv <-> AVPlayer mid-title.
+            if canUseAVPlayerEngine {
+                rows.append(Row(label: "Player engine",
+                                detail: isAVPlayerActive ? "AVPlayer  ›" : "VortX Player  ›") { openPanel(.engine) })
+            }
+            #endif
             // Skip-segment submit (G): a discoverable overflow entry to the in-player editor, pre-filled with
             // the current position, so a user who wants to contribute an intro/outro timestamp finds it without
             // hunting the top-bar icon. Any tt####### title qualifies (keyless submit via skip.vortx.tv).
@@ -3616,6 +3796,23 @@ struct PlayerScreen: View {
                 })
             }
             return rows
+        case .engine:
+            #if os(iOS) || os(macOS)
+            // Player Engine picker (P3, #76): flip libmpv <-> AVPlayer mid-title. The AVPlayer row appears only
+            // when it is a valid engine for this stream (canUseAVPlayerEngine).
+            let onAV = isAVPlayerActive
+            var rs: [Row] = [Row(label: "VortX Player", detail: "all formats, styled subtitles", selected: !onAV) {
+                switchPlayerEngine(toAVPlayer: false)
+            }]
+            if canUseAVPlayerEngine {
+                rs.append(Row(label: "AVPlayer", detail: "Dolby Vision, HLS", selected: onAV) {
+                    switchPlayerEngine(toAVPlayer: true)
+                })
+            }
+            return rs
+            #else
+            return []
+            #endif
         }
     }
 
@@ -3811,7 +4008,7 @@ struct PlayerScreen: View {
         avStartWatchdog?.cancel()
         #endif
         if !effectivelyLive, duration > 0 {
-            onProgress(currentTime, duration)
+            reportProgress(currentTime)
             // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The
             // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
             // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
@@ -3821,7 +4018,7 @@ struct PlayerScreen: View {
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
         // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
-        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
+        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
         // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
         // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.
@@ -3953,14 +4150,90 @@ struct PlayerScreen: View {
     private func autoSelectTracks() {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
         if let a = pick.audio { coordinator.player?.setAudioTrack(a) }
-        if let s = pick.subtitle { coordinator.player?.setSubtitleTrack(s) }   // -1 = off
+        // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
+        // the switch. Re-apply it here instead of the preference-derived auto pick, which would otherwise
+        // override an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when
+        // there was no explicit pick.
+        if userPickedSubtitle {
+            if let choice = pendingSubtitleReapply { reapplySubtitleChoice(choice); pendingSubtitleReapply = nil }
+            // else: an explicit pick with no snapshot to restore; leave the engine's current selection, never
+            // auto-override it.
+        } else if let s = pick.subtitle {
+            coordinator.player?.setSubtitleTrack(s)   // -1 = off
+        }
         VXProbe.log("subs", "auto-select sub=\(pick.subtitle.map(String.init) ?? "none") audio=\(pick.audio.map(String.init) ?? "none")")
         contributeContainerLanguagesIfNeeded()   // pool the file's REAL track langs (provenance "container")
         refreshSoon()
         // The container had no track in the preferred language chain (subs stayed off): try the add-on list.
         // Either completion point can land first (tracks vs the add-on fetch), so both call this; the guards
-        // + the one-shot latch inside make the double call safe.
+        // + the one-shot latch inside make the double call safe. No-op when userPickedSubtitle is set (an
+        // explicit pick, incl. one just re-applied above, hard-stops the async add-on auto path).
         autoSelectAddonSubtitleIfNeeded()
+    }
+
+    /// Push a resume/progress position to the presenter, refusing to REGRESS the stored resume below a
+    /// suppressed-resume floor. A DV-remux switch that starts at 0 (forward-only, the resume seek is dropped)
+    /// keeps the real resume point only in `suppressedResumeFloor`; without this the periodic saves and the
+    /// exit flush would overwrite the account resume with the restarted-low position. The floor clears once
+    /// the playhead passes it (the viewer caught up) or on the next source/episode load.
+    private func reportProgress(_ position: Double) {
+        if let floor = suppressedResumeFloor {
+            if position < floor { return }
+            suppressedResumeFloor = nil
+        }
+        onProgress(position, duration)
+    }
+
+    /// Persist a user-initiated seek (skip buttons, macOS arrow keys, slider commit) to the presenter, which
+    /// writes it to BOTH the engine library and the account. Mirrors `reportProgress`' resume-floor guard for
+    /// the onSeek lane (and the tvOS scrub-commit gate): a forward seek off the remux restart-at-0 must not
+    /// overwrite the real account resume until the playhead has actually passed the floor. The floor clears
+    /// once passed. Backward / non-suppressed seeks pass straight through.
+    private func reportSeek(_ target: Double) {
+        guard duration > 0 else { return }
+        if let floor = suppressedResumeFloor {
+            if target < floor { return }
+            suppressedResumeFloor = nil
+        }
+        onSeek(target, duration)
+        lastReported = target
+    }
+
+    /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it
+    /// (mandated check 8). Off when no track is selected; otherwise an add-on / pooled external sub (matched
+    /// back by language against the added set) or an embedded track (by lang/title).
+    private func captureSubtitleChoice() -> SubtitleChoice {
+        guard let sel = subtitleTracks.first(where: { $0.selected }) else { return .off }
+        let selLang = sel.lang.lowercased()
+        if let ext = addonSubs.first(where: { addedSubURLs.contains($0.url) && $0.lang.lowercased() == selLang }) {
+            return .external(url: ext.url, title: ext.addonName, lang: ext.lang)
+        }
+        if let p = pooledSubs.first(where: { addedPooledIDs.contains($0.id) && $0.lang.lowercased() == selLang }) {
+            return .pooled(id: p.id)
+        }
+        return .embedded(lang: sel.lang, title: sel.title)
+    }
+
+    /// Re-apply a captured subtitle choice on the NEW engine after a switch. Track id spaces differ per engine,
+    /// so an embedded pick matches by lang/title (Off if it can't be found, never a different auto pick), and
+    /// an external / pooled pick is re-added by URL / pool id (both engines auto-select the added track).
+    private func reapplySubtitleChoice(_ choice: SubtitleChoice) {
+        switch choice {
+        case .off:
+            coordinator.player?.setSubtitleTrack(-1)
+        case let .embedded(lang, title):
+            let l = lang.lowercased(), t = title.lowercased()
+            let match = subtitleTracks.first { $0.lang.lowercased() == l && $0.title.lowercased() == t }
+                     ?? subtitleTracks.first { $0.lang.lowercased() == l }
+            coordinator.player?.setSubtitleTrack(match?.id ?? -1)
+        case let .external(urlStr, title, lang):
+            coordinator.player?.addExternalSubtitle(url: urlStr, title: title, lang: lang) { ok in
+                if ok { addedSubURLs.insert(urlStr) }
+            }
+        case let .pooled(id):
+            if let sub = pooledSubs.first(where: { $0.id == id }) { selectPooledSubtitle(sub, auto: true) }
+        }
+        VXProbe.log("subs", "re-applied explicit pick across engine switch: \(choice)")
     }
 
     /// Contribute the file's REAL audio + subtitle track languages to the community language index with

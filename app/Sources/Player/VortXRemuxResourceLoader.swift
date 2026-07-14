@@ -61,6 +61,10 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
     func markEngineReady() { stream.buffer.markEngineReady() }
 
+    /// The source MKV runtime in seconds (0 until parsed / when unknown). The engine reads it at readyToPlay
+    /// to synthesize a finite VOD duration when the remux delivery keeps AVPlayerItem.duration INDEFINITE.
+    var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
+
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
         invalidateLock.lock()

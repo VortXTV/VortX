@@ -28,10 +28,14 @@ import UIKit
 /// This conforms to `PlayerEngine` and emits events; rendering is owned by a sibling AVPlayerLayer host that
 /// calls `attachLayer`, while this object owns playback + state only. Embedded track selection (audio +
 /// subtitles via `AVMediaSelectionGroup`), `mediaSummary`, and `playbackStats` are real; chapters load from
-/// asset metadata when present. Subtitle styling, A/V delay, external add-on subtitles, and trickplay frame
-/// capture have no AVFoundation equivalent and stay no-ops, so the chrome hides those rows when this engine is
-/// active. The plain `HLSPlayerView.AVPlayerModel` still serves the bare iOS HLS path that does not need the
-/// full chrome.
+/// asset metadata when present. External add-on / community subtitles ARE real here: AVFoundation cannot
+/// side-load an SRT, so VortX downloads + parses the file and draws the cues over the AVPlayerLayer itself
+/// (`subtitleOverlay`), with `setSubDelay` as a live offset and `applySubtitleStyle` styling that overlay.
+/// Trickplay frame capture is real too (`AVPlayerItemVideoOutput`, tone-mapped to SDR). The genuine no-ops
+/// are the controls with no AVFoundation equivalent: audio delay (`setAudioDelay`), audio output mode
+/// (`setAudioOutputMode`, the system negotiates routing), and the hardware-decoding toggle
+/// (`setHardwareDecoding`, always hardware); the chrome hides those rows when this engine is active. The
+/// plain `HLSPlayerView.AVPlayerModel` still serves the bare iOS HLS path that does not need the full chrome.
 @MainActor
 final class AVPlayerEngineController: NSObject, PlayerEngine {
     let player = AVPlayer()
@@ -115,6 +119,28 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
     /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
+
+    /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
+    /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
+    /// the mount frameless and demote the whole true-DV session to libmpv. Prefer the item's seekable ranges
+    /// (the HLS EVENT playlist advertises produced media there); fall back to the loaded (player-buffered)
+    /// edge for the legacy loader delivery. 0 means "unknown / no produced edge yet" (callers do not clamp).
+    var producedEdgeSeconds: Double {
+        guard let item else { return 0 }
+        var edge = 0.0
+        for value in item.seekableTimeRanges {
+            let r = value.timeRangeValue
+            let end = (r.start + r.duration).seconds
+            if end.isFinite { edge = max(edge, end) }
+        }
+        if edge > 0 { return edge }
+        for value in item.loadedTimeRanges {
+            let r = value.timeRangeValue
+            let end = (r.start + r.duration).seconds
+            if end.isFinite { edge = max(edge, end) }
+        }
+        return edge
+    }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
@@ -309,7 +335,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else { pendingSeek = seconds; return }
         let dur = item?.duration.seconds ?? 0
-        let clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
+        var clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
+        // FORWARD-ONLY DV REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
+        // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
+        // / Control Center seek, chapter jumps, skip-pill / auto-skip) instead of each chrome clamping on its
+        // own. A seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
+        // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). Backward
+        // seeks and non-remux items are unaffected (min() only lowers the ceiling; a 0 edge is "unknown", skip).
+        if isRemuxMounted {
+            let edge = producedEdgeSeconds
+            if edge > 0, clamped > edge { clamped = edge }
+        }
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
         emit(MPVProperty.timePos, clamped)
         updateSubtitleOverlay(atClock: clamped)   // re-check the cue now; the observer is only ~4 Hz
@@ -459,9 +495,56 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         subtitleRenderer.offset = seconds
         if externalSubActive { updateSubtitleOverlay(atClock: player.currentTime().seconds) }
     }
+    /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
+    /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
     func setAudioDelay(_ seconds: Double) {}
-    /// Re-apply the user's subtitle appearance (size / colour / background) to the live overlay.
-    func applySubtitleStyle() { subtitleOverlay?.applyStyle() }
+    /// Re-apply the user's subtitle appearance (size / colour / background). The VortX-owned external-cue
+    /// overlay gets full styling; AVPlayer-NATIVE (embedded / HLS legible) tracks get best-effort styling via
+    /// `AVTextStyleRule` (coarser than libass, but honours the same size / colour / background choices).
+    func applySubtitleStyle() {
+        subtitleOverlay?.applyStyle()
+        applyEmbeddedSubtitleTextStyle()
+    }
+
+    /// Best-effort styling for AVPlayer-native subtitle tracks (P5, #76). AVFoundation exposes only a coarse
+    /// text-markup surface (relative font size + fg/bg colour) via `AVTextStyleRule`, far short of libass, and
+    /// only for text-based legible tracks, so this is honest best-effort, not full parity. Reads the SAME
+    /// `SubtitleStyle` keys the libmpv path uses. Fail-soft: a nil rule just leaves the system default styling.
+    private func applyEmbeddedSubtitleTextStyle() {
+        guard let item = player.currentItem else { return }
+        var attrs: [String: Any] = [:]
+        if let fg = Self.argbComponents(fromHex: SubtitleStyle.colorHex) {
+            attrs[kCMTextMarkupAttribute_ForegroundColorARGB as String] = fg
+        }
+        attrs[kCMTextMarkupAttribute_CharacterBackgroundColorARGB as String] =
+            Self.backgroundARGB(SubtitleStyle.backgroundId)
+        // Named base sizes (40 / 55 / 72 / 92 libass px on a ~720 canvas) mapped to a percentage of video
+        // height: Medium ~= 5%, scaling linearly, so the Smaller/Larger steps visibly change AVPlayer subs too.
+        let pct = max(2.0, min(12.0, Double(SubtitleStyle.fontSize) / 11.0))
+        attrs[kCMTextMarkupAttribute_BaseFontSizePercentageRelativeToVideoHeight as String] = pct
+        item.textStyleRules = AVTextStyleRule(textMarkupAttributes: attrs).map { [$0] }
+    }
+
+    /// Parse a `#RRGGBB` hex string into the [alpha, red, green, blue] 0...1 component array
+    /// `kCMTextMarkupAttribute_ForegroundColorARGB` expects (opaque alpha). nil on a malformed string.
+    private static func argbComponents(fromHex hex: String) -> [Double]? {
+        let s = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard s.count == 6, let value = UInt32(s, radix: 16) else { return nil }
+        let r = Double((value >> 16) & 0xFF) / 255
+        let g = Double((value >> 8) & 0xFF) / 255
+        let b = Double(value & 0xFF) / 255
+        return [1.0, r, g, b]
+    }
+
+    /// The [alpha, red, green, blue] background colour for the named background style (mirrors the libmpv
+    /// `sub-back-color`): outline = transparent, shaded = ~50% black, box = opaque black.
+    private static func backgroundARGB(_ id: String) -> [Double] {
+        switch id {
+        case "shaded": return [0.5, 0, 0, 0]
+        case "box":    return [1.0, 0, 0, 0]
+        default:       return [0.0, 0, 0, 0]   // outline only: transparent background
+        }
+    }
     /// The current external-subtitle delay in seconds, so the sync-capture path can pool the learned offset.
     func currentSubDelaySeconds() -> Double { subtitleRenderer.offset }
 
@@ -712,8 +795,26 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             remuxHLSServer?.markEngineReady()
             remuxLoader?.markEngineReady()
             let dur = item.duration.seconds
-            let seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
-            if seekable { emit(MPVProperty.duration, dur) }
+            var seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
+            var emittedDuration = dur
+            // DV-REMUX KNOWN DURATION: a remux mount serves a mid-production fMP4 EVENT playlist with no
+            // EXT-X-ENDLIST, so AVPlayerItem.duration reads INDEFINITE at readyToPlay for the whole session
+            // even though the source MKV runtime is known. Left uncorrected the chrome treats the entire DV
+            // play as a live stream: it never arms the launch resume floor, and disables its periodic/exit
+            // saves, reportSeek, scrubber range, skip clamps and mark-watched. Synthesize the demuxer-reported
+            // runtime instead so the session behaves as the VOD it is (progress persists, the playhead scrubs
+            // within the buffered edge per the forward-only clamp). Non-remux items keep AVPlayer's own value
+            // byte for byte; the libmpv path never reaches here. Forward-only pre-start seeks are still dropped
+            // below via the isRemuxMounted guard, so a synthesized seekable=true cannot resume into dead bytes.
+            if !seekable, isRemuxMounted {
+                let known = remuxHLSServer?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds ?? 0
+                if known > 0 {
+                    emittedDuration = known
+                    seekable = true
+                    DiagnosticsLog.log("dv", "synthesized remux duration \(Int(known))s (item.duration indefinite)")
+                }
+            }
+            if seekable { emit(MPVProperty.duration, emittedDuration) }
             emit(MPVProperty.seekable, seekable)
             emit(MPVProperty.trackList, nil)   // chrome re-pulls via tracks()
             loadSelectionGroups()              // async; re-emits track-list once the groups resolve
@@ -984,6 +1085,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             subGroup = sg
             audioTracks = ag.map { Self.mpvTracks(from: $0, type: "audio", item: item) } ?? []
             subTracks = sg.map { Self.mpvTracks(from: $0, type: "sub", item: item) } ?? []
+            applyEmbeddedSubtitleTextStyle()   // P5: style native legible tracks from the start (best-effort)
             emit(MPVProperty.trackList, nil)
         }
     }
