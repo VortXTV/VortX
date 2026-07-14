@@ -243,6 +243,15 @@ struct TVPlayerView: View {
     // Current episode (changes when switching via Next/Prev/Episodes or auto-advance). Seeded from
     // the passed url/title/meta in onAppear so the first load is unchanged.
     @State private var curURL: URL?
+    /// True when the current source is a direct play from one of the user's connected media servers (its host
+    /// matches a stored server url). Used to show the honest "can't direct-play, no transcode in this version"
+    /// error instead of the generic source-failure copy (Phase 1 has no transcode negotiation).
+    private var curIsMediaServer: Bool {
+        guard let host = curURL?.host?.lowercased() else { return false }
+        return MediaServerStore.shared.servers.contains { rec in
+            rec.urls.contains { (URL(string: $0)?.host?.lowercased()) == host }
+        }
+    }
     @State private var curHeaders: [String: String]?   // the playing stream's required HTTP headers
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
@@ -2535,7 +2544,11 @@ struct TVPlayerView: View {
             // manual pick: its stored debrid link expires, so a hard failure must fall through to the failover
             // hop + fresh-sources wait below (get the viewer watching) rather than dead-ending on the overlay.
             if currentPickWasExplicit && !currentPlaybackIsResume {
-                if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                if loadErrorMsg.isEmpty {
+                    loadErrorMsg = curIsMediaServer
+                        ? "This file's format can't direct-play on this device yet. Server transcoding isn't supported in this version."
+                        : "This source didn't load. Choose another source."
+                }
                 withAnimation { loadFailed = true }
                 return
             }

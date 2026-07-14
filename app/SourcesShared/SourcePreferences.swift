@@ -1,7 +1,9 @@
 import Foundation
 
-/// The four source categories the ranking system recognises.
+/// The source categories the ranking system recognises. `mediaServer` is FIRST so `allCases` (the fresh-install
+/// default order) puts your own servers at the top, which is what a person who connects one expects.
 enum SourceType: String, CaseIterable, Codable {
+    case mediaServer = "mediaServer"
     case debrid  = "debrid"
     case usenet  = "usenet"
     case torrent = "torrent"
@@ -9,6 +11,7 @@ enum SourceType: String, CaseIterable, Codable {
 
     var label: String {
         switch self {
+        case .mediaServer: return "My Servers"
         case .debrid:  return "Debrid"
         case .usenet:  return "Usenet"
         case .torrent: return "Torrent"
@@ -18,6 +21,7 @@ enum SourceType: String, CaseIterable, Codable {
 
     var detail: String {
         switch self {
+        case .mediaServer: return "Direct play from your Plex, Jellyfin, and Emby servers"
         case .debrid:  return "Real-Debrid, AllDebrid, Premiumize, TorBox, Debrid-Link"
         case .usenet:  return "NZB / Usenet sources"
         case .torrent: return "BitTorrent info-hash streams"
@@ -149,7 +153,10 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
 
     // Max possible quality score is ~13,800 (4K + cached + remux + HDR + atmos + file-size cap).
     // A 15,000-point tier gap means the preferred type ALWAYS beats a lower type regardless of quality.
-    fileprivate static let tierWeights = [45_000, 30_000, 15_000, 0]
+    // FIVE slots now (media servers is the added top tier): the 15k step is preserved, so the ladder
+    // invariant (cache +8000 clears the ~5,800 quality spread but stays under the step; junk -100,000 sinks
+    // below the ~73.8k legit ceiling) still holds. See architecture.md "StreamRanking weight relationships".
+    fileprivate static let tierWeights = [60_000, 45_000, 30_000, 15_000, 0]
 
     @Published var typeOrder: [SourceType] {
         didSet {
@@ -370,6 +377,11 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     private static func readOrder() -> [SourceType] {
         let saved = UserDefaults.standard.string(forKey: orderKey) ?? ""
         var order = saved.split(separator: ",").compactMap { SourceType(rawValue: String($0)) }
+        // Media servers migrate to the FRONT when a stored order predates the tier (your own copy outranks
+        // everything by default). Idempotent: a user who later reorders it away is never re-migrated (the token
+        // is then present). New installs have an empty stored order, so the general append below already fronts
+        // it (mediaServer is the first `allCases`).
+        if !order.isEmpty, !order.contains(.mediaServer) { order.insert(.mediaServer, at: 0) }
         for t in SourceType.allCases where !order.contains(t) { order.append(t) }
         return order
     }
@@ -442,7 +454,7 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// per-preset caps; each assignment goes through the published knobs so the Settings UI, the per-profile
     /// capture, and the ranking caches all update as if the user had set them by hand.
     func apply(_ preset: SourcePreset) {
-        typeOrder = [.debrid, .usenet, .torrent, .direct]
+        typeOrder = [.mediaServer, .debrid, .usenet, .torrent, .direct]
         hideDeadTorrents = true
         // Presets own the quality CAPS, so they also clear any resolution floor: leaving a user's 4K
         // floor under Data Saver's 1080p cap would filter out every labelled source.

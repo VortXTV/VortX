@@ -614,6 +614,7 @@ struct iOSHomeView: View {
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
+    @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
@@ -790,6 +791,16 @@ struct iOSHomeView: View {
                                                          poster: $0.poster, progress: 0)
                                             },
                                             onTap: handleTap, showWatchedBadges: true))
+                    }
+                    // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby
+                    // servers, imdb-keyed cards that open the normal detail page. Hidden with no server.
+                    ForEach(mediaServerRails.rails) { rail in
+                        homeRail(PosterRail(title: rail.title,
+                                            items: rail.items.map {
+                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                         poster: $0.poster, progress: 0)
+                                            },
+                                            onTap: handleTap))
                     }
                     // "Upcoming Episodes": the next-airing episode of each series in the library within the
                     // next 45 days, soonest first (see ReleaseCalendarModel). Each card is the SERIES (so a
@@ -1034,6 +1045,7 @@ struct iOSHomeView: View {
         let library = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
+        mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived

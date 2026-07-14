@@ -1557,6 +1557,9 @@ struct CoreStreamList: View {
     // on + signed in) + HOARD (fire-and-forget descriptor contribution). Fully gated + fail-soft inside
     // `SourceIndexClient`; keyed on this title's content id (imdb, plus :S:E for an episode's PlaybackMeta).
     @StateObject private var sourceIndex = SourceIndexServeSource()
+    // Media servers (Plex/Jellyfin/Emby): resolves this title on the user's connected servers and merges the
+    // direct-play hits as their own tier. Empty (list unchanged) with no server connected (dormant).
+    @StateObject private var mediaServers = MediaServerSource()
     // Stremio account (api.strem.io). NOTE: the source-index SERVE read is gated on the VORTX-SYNC account
     // (VortXSyncManager, the moat-token identity), NOT this one -- see refreshSourceIndex().
     @EnvironmentObject private var account: StremioAccount
@@ -1858,8 +1861,10 @@ struct CoreStreamList: View {
         // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
         // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).
         .onAppear {
-            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
+                            mediaServers: mediaServers, debridCache: debridCache)
             torboxSearch.refresh(imdbId: imdbId)
+            mediaServers.refresh(imdb: imdbId, title: meta?.name)
             refreshSourceIndex()
         }
         .onDisappear { sourceRefreshDebounce?.cancel() }

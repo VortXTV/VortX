@@ -586,6 +586,10 @@ enum StreamRanking {
     /// (weight 0, below raw torrents), which is exactly the "played a torrent over my
     /// debrid" failure.
     static func sourceType(_ s: CoreStream, _ text: String) -> SourceType {
+        // Media-server provenance is the FIRST, structural check: a synthetic Plex/Jellyfin/Emby stream carries
+        // a non-nil `vortxProvider` and belongs to its own top tier, regardless of the text below (its direct
+        // `url` would otherwise fall through to `.direct` at the bottom).
+        if s.vortxProvider != nil { return .mediaServer }
         // Usenet first: a debrid service's usenet results carry the same service code.
         if text.contains("usenet") || text.contains("nzb") || text.contains("easynews")
             || text.contains("📰") { return .usenet }
@@ -715,7 +719,9 @@ enum StreamRanking {
         case "strict":   if junkClass(text) != nil || implausibleForResolution(text) { return false }
         default: break
         }
-        if prefs.instantOnly, !isCached(s, text, debridCachedHashes: debridCachedHashes) { return false }  // only cached / direct or account-cached
+        // Instant-only keeps cached debrid + plain direct links; a media-server direct play from your own box is
+        // instant by definition, so exempt it (its provenance marker) or it would be hidden by this filter.
+        if prefs.instantOnly, s.vortxProvider == nil, !isCached(s, text, debridCachedHashes: debridCachedHashes) { return false }
         if prefs.hideDeadTorrents, sourceType(s, text) == .torrent,
            let seeders = seederCount(text), seeders == 0 { return false }               // explicitly-dead swarm
         if prefs.excludeAV1, boundedMatch(text, "av1") { return false }                 // no Apple AV1 hw decode

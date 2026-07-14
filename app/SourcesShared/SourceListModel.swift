@@ -69,12 +69,14 @@ final class SourceListModel: ObservableObject {
         let streamsEpoch: Int
         let torboxEpoch: Int
         let singularityEpoch: Int
+        let mediaServerEpoch: Int
         let inputsHash: Int
     }
 
     private weak var core: CoreBridge?
     private weak var torbox: TorBoxSearchSource?
     private weak var singularity: SourceIndexServeSource?
+    private weak var mediaServers: MediaServerSource?
     private weak var debridCache: DebridCacheAwareness?
 
     private var context = Context()
@@ -93,7 +95,8 @@ final class SourceListModel: ObservableObject {
     /// a re-appear just nudges a refresh. Subscribes to the SPECIFIC epoch/content publishers (never
     /// CoreBridge.objectWillChange, whose revision storm is exactly what this model exists to absorb).
     func bind(core: CoreBridge, torbox: TorBoxSearchSource,
-              singularity: SourceIndexServeSource, debridCache: DebridCacheAwareness) {
+              singularity: SourceIndexServeSource, mediaServers: MediaServerSource,
+              debridCache: DebridCacheAwareness) {
         guard subscriptions.isEmpty else {
             trigger.send()
             return
@@ -101,6 +104,7 @@ final class SourceListModel: ObservableObject {
         self.core = core
         self.torbox = torbox
         self.singularity = singularity
+        self.mediaServers = mediaServers
         self.debridCache = debridCache
 
         let events: [AnyPublisher<Void, Never>] = [
@@ -108,6 +112,7 @@ final class SourceListModel: ObservableObject {
             core.$addons.map { _ in () }.eraseToAnyPublisher(),            // add-on installed/removed (tombstones)
             torbox.$streams.map { _ in () }.eraseToAnyPublisher(),         // TorBox search results replaced
             singularity.$streams.map { _ in () }.eraseToAnyPublisher(),    // Singularity pool results replaced
+            mediaServers.$groups.map { _ in () }.eraseToAnyPublisher(),    // media-server direct-play groups replaced
             debridCache.$cachedHashes.map { _ in () }.eraseToAnyPublisher(), // cache awareness re-ranks
             trigger.eraseToAnyPublisher(),                                 // context change / manual nudge
         ]
@@ -140,7 +145,7 @@ final class SourceListModel: ObservableObject {
     // MARK: Rebuild (coalesced entry; snapshot on main, assemble off-main, publish once)
 
     private func rebuild() {
-        guard let core, let torbox, let singularity, let debridCache else { return }
+        guard let core, let torbox, let singularity, let mediaServers, let debridCache else { return }
         let ctx = context
         let tombstones = AddonTombstones.all()
         let cachedHashes = debridCache.cachedHashes
@@ -160,6 +165,7 @@ final class SourceListModel: ObservableObject {
         let signature = Signature(streamsEpoch: core.streamsEpoch,
                                   torboxEpoch: torbox.epoch,
                                   singularityEpoch: singularity.epoch,
+                                  mediaServerEpoch: mediaServers.epoch,
                                   inputsHash: hasher.finalize())
         guard signature != publishedSignature, signature != pendingSignature else { return }
         pendingSignature = signature
@@ -170,6 +176,7 @@ final class SourceListModel: ObservableObject {
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
         let torboxStreams = torbox.streams
         let singularityStreams = singularity.streams
+        let mediaServerGroups = mediaServers.groups
         // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
         // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
         // main thread (Settings edits, profile reload()), so reading them from the detached rank below
@@ -186,9 +193,11 @@ final class SourceListModel: ObservableObject {
                 assembled = assembled.filter { !tombstones.contains(AddonTombstones.normalize($0.id)) }
             }
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
-            // Singularity pool, then the direct-links filter so a merged torrent obeys the same rule.
-            assembled = SourceIndexServeSource.merge(singularityStreams,
-                                                     into: TorBoxSearchSource.merge(torboxStreams, into: assembled))
+            // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
+            // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
+            assembled = MediaServerSource.merge(mediaServerGroups,
+                          into: SourceIndexServeSource.merge(singularityStreams,
+                                  into: TorBoxSearchSource.merge(torboxStreams, into: assembled)))
             if ctx.directLinksOnly {
                 assembled = assembled.compactMap { group in
                     let streams = group.streams.filter { !$0.isTorrent }
