@@ -2690,13 +2690,14 @@ struct PosterGrid: View {
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
-    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
-    /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
-    var onReachEnd: (() -> Void)? = nil
     /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
     /// only catalog/discovery surfaces badge (Home catalog rails, Discover grid), exactly as tvOS scopes it;
     /// Continue Watching and the Library grid keep it off (their cards carry progress / their own treatment).
+    /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
     var showWatchedBadges: Bool = false
+    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
+    /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
+    var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
@@ -2778,13 +2779,14 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
-    /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
-    /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
-    var onReachEnd: (() -> Void)? = nil
     /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
     /// only catalog/discovery rails badge, exactly as tvOS scopes it; Continue Watching keeps it off (its
     /// cards carry the resume timecode + progress stripe, not a watched badge).
+    /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
     var showWatchedBadges: Bool = false
+    /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
+    /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
+    var onReachEnd: (() -> Void)? = nil
     #if os(macOS)
     /// macOS keyboard browse: when Home passes its `@FocusState` binding, the rail's cards become
     /// `.focusable()` and join the native focus traversal (arrows move within / between rails, Enter
