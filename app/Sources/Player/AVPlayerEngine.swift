@@ -706,6 +706,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         switch item.status {
         case .readyToPlay:
             isReady = true
+            // F3: the engine has a decodable first frame. Widen the remux producer lead from the reduced
+            // pre-ready value to the full lead now that the pre-first-frame co-resident window (when a demote
+            // may re-open the same 4K stream on libmpv) is past. No-op on a non-remux item.
+            remuxHLSServer?.markEngineReady()
+            remuxLoader?.markEngineReady()
             let dur = item.duration.seconds
             let seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
             if seekable { emit(MPVProperty.duration, dur) }

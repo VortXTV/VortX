@@ -3512,6 +3512,11 @@ struct TVPlayerView: View {
         // saves a resume/pause point (live scrobble only).
         if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
+        // F5: capture whether this session had the DV remux mounted BEFORE stop() nils it. The remux lane and
+        // the embedded node server share one jetsam budget, and on a stalled-CDN demote the remux thread + its
+        // buffer can linger seconds; after teardown we re-assert the TV-safe server cache cap so the server's
+        // footprint is nudged back down. Read via the same cast maybeResume uses.
+        let wasRemuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
         // Force the OLD engine to halt decode + network and BEGIN teardown synchronously, right now, instead
         // of leaving it to whenever SwiftUI gets around to dismantle*. This is THE debrid crash fix: a debrid
         // title holds the FULL remote demuxer read-ahead + a 4K decoder, and without this stop() that engine
@@ -3527,7 +3532,24 @@ struct TVPlayerView: View {
         // (Back / close / terminal auto-advance), never on an in-place source/episode switch, and is
         // additive: it does not touch the stop() teardown above.
         DiskCacheSetting.clearCache()
+        if wasRemuxMounted { Self.replayServerConfigAfterRemux() }
         onClose()
+    }
+
+    /// F5: after a remux-mounted session tears down, re-assert the TV-safe streaming-server cache cap
+    /// (maxAttempts:1, detached) and log the process resident footprint on either side, so a diagnostics
+    /// export shows whether the remux lane's teardown actually returned RAM to the shared jetsam budget.
+    /// Deliberately does NOT call malloc_zone_pressure_relief (excluded pending on-device evaluation).
+    /// Fire-and-forget: applyServerConfig already fails soft, so this never affects the exit path.
+    private static func replayServerConfigAfterRemux() {
+        Task.detached(priority: .utility) {
+            let before = VXProbe.residentMemoryMB()
+            let ok = await StremioServer.applyServerConfig(maxAttempts: 1)
+            let after = VXProbe.residentMemoryMB()
+            let beforeText = before.map { String(format: "%.0f", $0) } ?? "?"
+            let afterText = after.map { String(format: "%.0f", $0) } ?? "?"
+            DiagnosticsLog.log("server", "post-remux server-config replay ok=\(ok) rssMB \(beforeText) -> \(afterText)")
+        }
     }
 
     /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream.

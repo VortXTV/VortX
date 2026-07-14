@@ -52,6 +52,22 @@ enum VXProbe {
 
     /// Empty the rolling diagnostic log (used by a "clear" action or before a fresh capture).
     static func clearLog() { VXProbeFileLog.shared.clear() }
+
+    /// Current process resident memory in MB via mach_task_basic_info, or nil if the kernel call fails.
+    /// Exposed so callers outside the heartbeat (e.g. the F5 post-remux-teardown server-config replay) can log
+    /// the process footprint around a suspected leak edge. Not gated on `enabled`: a caller that already
+    /// decided to log wants a real number.
+    static func residentMemoryMB() -> Double? {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return Double(info.resident_size) / (1024.0 * 1024.0)
+    }
 }
 
 /// Rolling on-disk mirror of the probe log. Every enabled `log`/`event` line is written here (with a
@@ -246,22 +262,13 @@ enum VXProbeHeartbeat {
 
     private static func tick() {
         let uptime = Int(ProcessInfo.processInfo.systemUptime - start0)
-        let mem = residentMemoryMB()
+        let mem = VXProbe.residentMemoryMB()
         let memText = mem.map { String(format: "%.0f", $0) } ?? "?"
-        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB \(VXProbeState.shared.snapshot())")
-    }
-
-    /// Current resident memory in MB via mach_task_basic_info. Returns nil if the kernel call fails,
-    /// so the heartbeat degrades to "mem=?MB" rather than logging a wrong number.
-    private static func residentMemoryMB() -> Double? {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-        guard result == KERN_SUCCESS else { return nil }
-        return Double(info.resident_size) / (1024.0 * 1024.0)
+        // Stamp the embedded streaming server's state (running / exited rc=N / stalled-loop age) into every
+        // heartbeat so a device log shows exactly when the node server died or froze relative to memory and
+        // player state. ServerDiagnostics is nil on builds with no server (the Lite tvOS app), in which case
+        // the server field is omitted.
+        let serverText = ServerDiagnostics.status().map { " server=[\($0)]" } ?? ""
+        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB \(VXProbeState.shared.snapshot())\(serverText)")
     }
 }

@@ -57,6 +57,10 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// Begin remuxing. Call once before / as the asset is mounted.
     func start() { stream.start() }
 
+    /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
+    /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
+    func markEngineReady() { stream.buffer.markEngineReady() }
+
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
         invalidateLock.lock()

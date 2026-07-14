@@ -88,6 +88,9 @@ enum NodeServer {
 
     static func startIfNeeded() {
         guard !started else { return }
+        // Wire the shared diagnostics indirection so the VXProbe heartbeat and the diagnostics export can
+        // surface this server's state without SourcesShared referencing NodeServer directly. Idempotent.
+        ServerDiagnostics.register(status: { statusDescription }, logTail: { logTail($0) })
         guard let serverJs = Bundle.main.path(forResource: "server", ofType: "js") else {
             NSLog("StremioX: server.js not found in bundle, streaming server disabled")
             return
@@ -352,6 +355,11 @@ enum NodeServer {
         let rc = node_start(4, &argv)
         exitCode = rc
         NSLog("StremioX: node server exited rc=\(rc)")
+        // Mirror the exit into the EXPORTABLE diagnostics log. node_start returning is terminal (nodejs-mobile
+        // cannot restart in-process), yet the plain NSLog above was invisible in the log the owner actually
+        // sends, so a server death read as an unexplained "everything went Offline". This line lands in the
+        // export file so the cause is right there.
+        DiagnosticsLog.log("server", "node exited rc=\(rc) (server cannot restart in-process; relaunch required)")
     }
 
     /// tvOS/iOS cannot see or kill a stale previous instance holding 11470 (no lsof/kill in the sandbox,

@@ -85,6 +85,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Begin remuxing. Call once, after the asset is (about to be) mounted.
     func start() { stream.start() }
 
+    /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
+    /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.
+    func markEngineReady() { stream.buffer.markEngineReady() }
+
     /// Whether the mount is still HEALTHY: the init segment has published AND the remux buffer has not failed.
     /// The engine's one-shot healthy-mount retry (#76) reads this to tell "a CoreMedia startup hiccup on a live
     /// mount" (retry a fresh item) from "the remux itself died" (demote). Same two signals serveMedia gates on.

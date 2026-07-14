@@ -155,6 +155,11 @@ targets:
       # (Foundation-only, like DiagnosticsLog) and off by default, so include just this one file so
       # the web-host target still builds without pulling the rest of SourcesShared.
       - path: SourcesShared/VXProbe.swift
+      # The heartbeat in VXProbe now stamps the streaming server's state via ServerDiagnostics (the
+      # cross-target indirection so shared code needs no concrete NodeServer type). Foundation-only and
+      # self-contained like the two files above, so include just this one so the web-host target still
+      # builds without pulling the rest of SourcesShared.
+      - path: SourcesShared/ServerDiagnostics.swift
       - Resources/Assets.xcassets
       - path: Resources/server.js
         buildPhase: resources
