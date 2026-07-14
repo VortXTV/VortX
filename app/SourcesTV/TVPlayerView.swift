@@ -723,10 +723,17 @@ struct TVPlayerView: View {
                 if !isCurrentLiveStream, lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
                     lastSaved = d
                     saveProgress(at: d)
+                    // Attribution gate (binge-desync fix): this ~20s periodic tick is the highest-frequency
+                    // engine writer, so it must honor the same identity gate as the pause-persist (:641) and
+                    // exit-flush (:504) sites. Only write to the engine Player when it is loaded for the
+                    // episode curMeta names; after a binge advance whose re-point could not be confirmed, a
+                    // missed re-point degrades to no engine write (the account write from saveProgress still
+                    // lands) rather than clobbering the previous episode's position with a fresh mtime.
                     // Same floor as saveProgress: a remux replay that restarted at 0 (suppressed resume) must
                     // not regress the ENGINE library's resume point either, until playback passes it.
-                    if suppressedResumeFloor == nil || d >= (suppressedResumeFloor ?? 0) {
-                        core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
+                    if enginePlayerVideoId == curMeta?.videoId,
+                       suppressedResumeFloor == nil || d >= (suppressedResumeFloor ?? 0) {
+                        core.reportProgress(timeSeconds: d, durationSeconds: duration)   // engine progress
                     }
                 }
                 // ~90% in → flip the watched marker live. DWELL-GATED: a single tick past 90% is not
@@ -3985,7 +3992,10 @@ struct TVPlayerView: View {
         // the new position at the exit flush, and an engine-side push (watched toggle, sync) in between
         // resurrected the pre-scrub position. Report the committed position immediately; the account
         // write keeps its pause/20s/exit cadence (network saves are unordered, so fewer is safer there).
-        if !isCurrentLiveStream, duration > 0,
+        // Attribution gate (binge-desync fix): same identity guard as the tick (:728) and exit flush
+        // (:504). A scrub committed during a failed-repoint binge episode must not write the wrong
+        // episode's position to the engine with a fresh mtime.
+        if !isCurrentLiveStream, duration > 0, enginePlayerVideoId == curMeta?.videoId,
            suppressedResumeFloor == nil || scrubTarget >= (suppressedResumeFloor ?? 0) {
             core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration)
         }
