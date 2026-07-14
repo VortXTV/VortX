@@ -718,6 +718,10 @@ struct TVPlayerView: View {
             let s = coordinator.player?.mediaSummary()
             videoWidth = s?.width ?? 0; videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
+            // Gap A (#76): on AVPlayer, chapters() is [] at readyToPlay (loadChapters is async) and the engine
+            // re-emits trackList once they resolve, so re-pull skip candidates + scrubber chapter marks here.
+            // On libmpv chapters() is already synchronous at duration, so this is a cheap no-op re-run there.
+            refreshSkipSegments()
             if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
                 appliedAutoTracks = true
                 let langs = subtitleTracks.map { langName($0.lang) }.joined(separator: ",")
