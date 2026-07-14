@@ -39,12 +39,10 @@ actor SIMKLService {
         try await write(path: "/sync/add-to-list", items: items)
     }
 
-    /// Remove items from the tracked lists (`POST /sync/history/remove`, which SIMKL applies across the
-    /// user's lists). Best-effort: SIMKL has no dedicated plan-to-watch remove endpoint.
-    @discardableResult
-    func removeFromWatchlist(_ items: SIMKLSyncItems) async throws -> Int {
-        try await write(path: "/sync/history/remove", items: items)
-    }
+    // NOTE: there is deliberately NO watchlist-remove call here. SIMKL has no plan-to-watch remove
+    // endpoint, and `/sync/history/remove` deletes WATCH HISTORY (a show payload wipes every episode +
+    // its status), so a library-remove must never route to it. The provider's `removeFromWatchlist`
+    // is a no-op instead (see `SIMKLProvider`).
 
     // MARK: - HTTP plumbing
 
@@ -114,10 +112,12 @@ struct SIMKLProvider: ExternalScrobbleProvider {
         _ = try? await SIMKLService.shared.addToWatchlist(items)
     }
 
-    func removeFromWatchlist(_ ref: ExternalMediaRef) async {
-        guard let items = watchlistItems(ref, includeStatus: false) else { return }
-        _ = try? await SIMKLService.shared.removeFromWatchlist(items)
-    }
+    // A library-remove is a NO-OP on SIMKL. SIMKL exposes no plan-to-watch remove endpoint, and the only
+    // "remove" it offers (`/sync/history/remove`) deletes the user's WATCH HISTORY for the title (a show
+    // payload removes every episode + status, with no undo). Silently destroying watch history from a
+    // watchlist-remove intent is never acceptable, so removing a title from the VortX library leaves the
+    // SIMKL plan-to-watch entry in place rather than risk that.
+    func removeFromWatchlist(_ ref: ExternalMediaRef) async {}
 
     // MARK: Mapping neutral ref -> SIMKL wire types
 
@@ -140,14 +140,13 @@ struct SIMKLProvider: ExternalScrobbleProvider {
         return SIMKLSyncItems(movies: [SIMKLMovie(ids: ids(ref), title: ref.title, year: ref.year)])
     }
 
-    /// Watchlist payload: the WHOLE title (movie or show). `includeStatus` sets `to:"plantowatch"` on the
-    /// add path; the remove path omits it.
-    private func watchlistItems(_ ref: ExternalMediaRef, includeStatus: Bool = true) -> SIMKLSyncItems? {
+    /// Watchlist add payload: the WHOLE title (movie or show) tagged `to:"plantowatch"`. Only the add
+    /// path uses this; a library-remove is a no-op on SIMKL (see `removeFromWatchlist`).
+    private func watchlistItems(_ ref: ExternalMediaRef) -> SIMKLSyncItems? {
         guard ref.hasUsableID else { return nil }
-        let status = includeStatus ? "plantowatch" : nil
         if ref.isSeries {
-            return SIMKLSyncItems(shows: [SIMKLShow(ids: ids(ref), title: ref.title, year: ref.year, to: status)])
+            return SIMKLSyncItems(shows: [SIMKLShow(ids: ids(ref), title: ref.title, year: ref.year, to: "plantowatch")])
         }
-        return SIMKLSyncItems(movies: [SIMKLMovie(ids: ids(ref), title: ref.title, year: ref.year, to: status)])
+        return SIMKLSyncItems(movies: [SIMKLMovie(ids: ids(ref), title: ref.title, year: ref.year, to: "plantowatch")])
     }
 }
