@@ -143,6 +143,17 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         condition.lock()
         if failureMessage == nil { failureMessage = message }
         isFinished = true
+        // F2: release the resident window (up to floor + producer lead, ~128 MiB) at the DEMOTE EDGE, not at
+        // remux-thread exit. On a stalled-CDN demote the remux thread can linger 10-20s in a blocked read
+        // while mpv re-opens the same 4K stream; freeing here returns that RAM to the shared jetsam budget
+        // immediately so the two lanes never stack a second copy. Advancing storageBase to producedCount keeps
+        // every read path consistent WITHOUT touching the freed bytes: read() checks failureMessage FIRST and
+        // returns the failure before indexing storage, and any offset below the new storageBase also returns
+        // the failure; append()/overwrite() are gated by isFinished / the [storageBase, producedCount) bound
+        // and bail. producedCount is left intact so status()/snapshotPrefix() math stays correct. Idempotent:
+        // a second fail() (e.g. cancel() after a real failure) just re-clears an already-empty buffer.
+        storage = Data()
+        storageBase = producedCount
         condition.broadcast()
         condition.unlock()
     }
