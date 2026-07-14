@@ -53,6 +53,21 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
 
+    /// F1: stable heap cell the INPUT context's `interrupt_callback` polls to abort a blocking network
+    /// open/read/reconnect-sleep the instant cancel() fires. Without it a demote on a STALLED CDN leaves the
+    /// remux thread (and its up-to-128 MiB buffer) parked in avformat_open_input / av_read_frame for the full
+    /// rw_timeout (10s) x the reconnect retries, 10-20s AFTER demoteAVPlayerToMPV, exactly while mpv re-opens
+    /// the same 4K stream and both lanes stack into the one Apple TV jetsam budget. A raw `Int32` (not the
+    /// ManagedAtomicFlag) because the `@convention(c)` callback captures nothing and must read plain memory
+    /// through the opaque pointer with no Swift-runtime calls. It MUST outlive the C callback: allocated here,
+    /// set by cancel(), freed ONLY in deinit, which cannot run until the last reference drops and the remux
+    /// thread (which strong-captures self for run()'s lifetime) has exited. Single-word reads/writes.
+    private let interruptFlag: UnsafeMutablePointer<Int32> = {
+        let p = UnsafeMutablePointer<Int32>.allocate(capacity: 1)
+        p.initialize(to: 0)
+        return p
+    }()
+
     /// AVIO write scratch: libav wants an aligned malloc'd buffer it owns for the AVIO context. The callback's
     /// opaque is an UNRETAINED pointer to `self`, kept alive for the whole session by the remux thread's strong
     /// capture (see `start()`), so the C callback never touches a freed object.
@@ -184,20 +199,47 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// call more than once and from any thread. Does NOT block; teardown completes on the remux thread.
     func cancel() {
         cancelledFlag.set()
+        // F1: trip the INPUT context's interrupt flag too, so a thread blocked inside avformat_open_input /
+        // av_read_frame / a reconnect sleep on a stalled CDN aborts in milliseconds (AVERROR_EXIT) instead of
+        // waiting out rw_timeout x reconnects. Set-after cancelledFlag so isCancelled is already true when the
+        // interrupt lands. Never freed here: only in deinit, after the thread has exited (see interruptFlag).
+        interruptFlag.pointee = 1
         // Wake any buffer reader blocked in AVPlayer's loader so it stops waiting on bytes that won't come.
         buffer.fail("cancelled")
     }
 
     var isCancelled: Bool { cancelledFlag.get() }
 
+    deinit {
+        // Safe to free the interrupt cell only now: deinit cannot run until the last reference to self drops,
+        // and the remux thread strong-captures self for the whole of run(), so the C interrupt callback can no
+        // longer be executing. Ordered after every AVFormatContext teardown (all inside run()).
+        interruptFlag.deinitialize(count: 1)
+        interruptFlag.deallocate()
+    }
+
     // MARK: - Remux loop (background thread)
+
+    /// Allocate an input AVFormatContext with the F1 interrupt callback installed, so a blocking network
+    /// open/read/reconnect aborts promptly once cancel() trips `interruptFlag`. Returns nil if libav cannot
+    /// allocate. Used for BOTH the cold open and the warm retry: avformat_open_input frees and NULLs the
+    /// context on a failed open, so the retry must allocate a fresh one.
+    private func makeInterruptibleInputContext() -> UnsafeMutablePointer<AVFormatContext>? {
+        guard let ctx = avformat_alloc_context() else { return nil }
+        ctx.pointee.interrupt_callback.callback = vortxRemuxInterruptCallback
+        ctx.pointee.interrupt_callback.opaque = UnsafeMutableRawPointer(interruptFlag)
+        return ctx
+    }
 
     private func run() {
         var info = SourceInfo()
 
         // Open the source. libav's protocol layer handles http/https directly; pass request headers (debrid
         // links sometimes need auth / a UA) through the demuxer options as a CRLF-joined "headers" string.
-        var ifmt: UnsafeMutablePointer<AVFormatContext>? = nil
+        // F1: pre-allocate the context so its interrupt_callback is set BEFORE the (blocking) open, letting
+        // cancel() abort a stalled open in milliseconds.
+        var ifmt: UnsafeMutablePointer<AVFormatContext>? = makeInterruptibleInputContext()
+        guard ifmt != nil else { buffer.fail("avformat_alloc_context failed"); return }
         var openOpts: OpaquePointer? = nil    // AVDictionary*
         if let headers, !headers.isEmpty {
             let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
@@ -239,6 +281,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             av_dict_set(&retryOpts, "probesize", "5000000", 0)
             av_dict_set(&retryOpts, "analyzeduration", "2000000", 0)
             Self.applyDebridHTTPResilience(&retryOpts)
+            // The failed cold open freed and NULLed ifmt; allocate a fresh interruptible context for the retry.
+            ifmt = makeInterruptibleInputContext()
+            guard ifmt != nil else { av_dict_free(&retryOpts); buffer.fail("avformat_alloc_context failed (retry)"); return }
             openRc = avformat_open_input(&ifmt, input, nil, &retryOpts)
             av_dict_free(&retryOpts)
             if openRc == 0 { VXProbe.log("dv", "probe open retry SUCCEEDED (warm debrid)") }
@@ -1876,6 +1921,15 @@ private let AVERROR_EXIT_CONST: Int32 = -1414092869   // AVERROR_EXIT
 /// AVERROR(ETIMEDOUT) = -(ETIMEDOUT) = -60 on Darwin (what rw_timeout expiry returns). The Swift importer does
 /// not surface the AVERROR macro, so hardcode the observed value to gate the cold-debrid open retry.
 private let AVERROR_ETIMEDOUT_CONST: Int32 = -60
+
+/// F1 interrupt callback for the remux INPUT context. libav polls this while blocked in a network
+/// open/read/reconnect-sleep; a non-zero return aborts that operation with AVERROR_EXIT within milliseconds.
+/// `opaque` is the stream's stable `interruptFlag` (an Int32 set to 1 by cancel()). Top-level and
+/// non-capturing so it converts to a plain C function pointer and touches only plain memory (no Swift runtime).
+private func vortxRemuxInterruptCallback(_ opaque: UnsafeMutableRawPointer?) -> Int32 {
+    guard let opaque else { return 0 }
+    return opaque.assumingMemoryBound(to: Int32.self).pointee
+}
 
 /// AVERROR_HTTP_BAD_REQUEST = -FFERRTAG(0xF8,'4','0','0') = -808465656: a transient HTTP 400 a still-warming
 /// debrid CDN can answer the first open with. The Swift importer does not surface the FFERRTAG macro, so
