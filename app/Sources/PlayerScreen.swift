@@ -982,8 +982,9 @@ struct PlayerScreen: View {
                 // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
                 // SIMKL has no live scrobble, so it is skipped by capability.
                 if let m = curMeta, !effectivelyLive {
-                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
-                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                    let pos = max(currentTime, suppressedResumeFloor ?? 0)
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
                 }
             }
         case MPVProperty.trackList:
@@ -3971,7 +3972,7 @@ struct PlayerScreen: View {
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
         // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
-        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
+        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
         // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
         // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.

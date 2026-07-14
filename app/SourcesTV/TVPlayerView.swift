@@ -594,8 +594,9 @@ struct TVPlayerView: View {
                 // below (which is unchanged). Fail-soft + gated inside the coordinator; a no-op with empty
                 // creds. SIMKL has no live scrobble, so it is skipped by capability.
                 if !isCurrentLiveStream, let m = curMeta {
-                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
-                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
+                    let pos = max(currentTime, suppressedResumeFloor ?? 0)
+                    if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
+                    else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
                 }
                 if b {
                     saveProgress(at: currentTime)   // persist on pause
@@ -3728,7 +3729,7 @@ struct TVPlayerView: View {
         // auto-advance). Additive + fail-soft + gated + once-latched inside the coordinator; a no-op with
         // empty creds. Near the end this records the watch (deduped against the 90%/EOF record); mid-title it
         // saves a resume/pause point (live scrobble only).
-        if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: currentTime, duration: duration) }
+        if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
         // F5: capture whether this session had the DV remux mounted BEFORE stop() nils it. The remux lane and
         // the embedded node server share one jetsam budget, and on a stalled-CDN demote the remux thread + its
