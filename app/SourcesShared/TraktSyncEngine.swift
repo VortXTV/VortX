@@ -101,6 +101,10 @@ final class TraktSyncEngine {
     /// Pull GET /sync/watched/{movies,shows} and fold the tt ids into the shadow cache. Reuses `TraktAuth`
     /// for a live bearer so `TraktService` stays untouched. Fail-soft: a failed leg contributes nothing.
     private func pullWatched() async {
+        // Import is opt-in: when the toggle is off, `shadowWatchedIDs()` returns empty anyway, so pulling
+        // (and hitting the Trakt read endpoints + refreshing a token) would be pure waste. Skip the network
+        // entirely until the user turns import on. The push/drain side is gated by its own toggles upstream.
+        guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return }
         lock.lock(); let gen = generation; lock.unlock()
         var next = Set<String>()
         for type in ["movies", "shows"] {

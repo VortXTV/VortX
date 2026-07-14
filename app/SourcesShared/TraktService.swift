@@ -2,9 +2,9 @@ import Foundation
 
 /// Typed async client for the authenticated Trakt.tv data endpoints used by VortX.
 ///
-/// SCAFFOLD: this is the service layer only. It is NOT wired into the player or library yet; see the
-/// "Wiring notes" at the bottom of this file for the exact call sites. It depends on `TraktAuth` for a
-/// live bearer token and on the `TraktModels` types, nothing else (Foundation + Keychain).
+/// This is the service layer. It is wired into playback + library through `ExternalScrobbleProvider`
+/// (the Trakt provider) and `ScrobbleCoordinator`, and into the rails via `TraktRailsModel`. It depends on
+/// `TraktAuth` for a live bearer token and on the `TraktModels` types, nothing else (Foundation + Keychain).
 ///
 /// Endpoints covered (https://trakt.docs.apiary.io):
 ///   - Scrobble:  POST /scrobble/start, /scrobble/pause, /scrobble/stop   (player progress -> Trakt)
@@ -233,7 +233,7 @@ enum TraktServiceError: LocalizedError, Sendable, Equatable {
     }
 }
 
-// MARK: - Wiring notes (not wired this pass; do this when integrating)
+// MARK: - Wiring notes (where this is integrated)
 //
 // 1. Player progress -> scrobble. In the libmpv player core (`Sources/Player/`), where playback
 //    state transitions are already observed (the same place that feeds Continue Watching /
