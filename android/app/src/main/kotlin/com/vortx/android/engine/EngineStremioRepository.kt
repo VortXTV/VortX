@@ -34,6 +34,7 @@ import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
@@ -237,13 +238,15 @@ class EngineStremioRepository(
 
     /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
     /// [homeUpdates]): waits until at least one board row has content, then snapshots.
-    override suspend fun home(): Result<List<Catalog>> = runCatching {
+    // withContext(Dispatchers.Default): the loadFieldUntil dispatch/getState + homeSnapshot()/parse
+    // must run off the caller's (Main) context -- JNI + org.json never on the UI thread.
+    override suspend fun home(): Result<List<Catalog>> = withContext(Dispatchers.Default) { runCatching {
         StremioCoreNative.dispatch(EngineActions.loadBoard())
         loadFieldUntil(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS)) {
             EngineState.parseCatalogs(it).isNotEmpty()
         }
         homeSnapshot()
-    }
+    } }
 
     /// The continuous Home stream (see [CatalogRepository.homeUpdates]). Emits a snapshot immediately,
     /// then again on every board/ctx/Continue-Watching NewState -- rails appear incrementally as each
@@ -289,7 +292,9 @@ class EngineStremioRepository(
                 send(homeSnapshot())
             }
         }
-    }.distinctUntilChanged().conflate()
+        // flowOn so the channelFlow producer -- every homeSnapshot()/getState()/parse below -- runs on
+        // Dispatchers.Default, never the collector's (Main) context: JNI + org.json off the UI thread.
+    }.distinctUntilChanged().conflate().flowOn(Dispatchers.Default)
 
     private fun dispatchHomeLoad() {
         StremioCoreNative.dispatch(EngineActions.loadBoard())
@@ -309,7 +314,9 @@ class EngineStremioRepository(
                 if (fields.any { it in CTX_UPDATE_FIELDS }) send(Unit)
             }
         }
-    }.conflate()
+        // flowOn Default: keep the changedFields collection + fan-out off the collector's (Main) context,
+        // consistent with homeUpdates -- collectors re-read the engine on each tick, so never on Main.
+    }.conflate().flowOn(Dispatchers.Default)
 
     /// Parse the CURRENT engine state into Home rails: titled board rows (real "<add-on> · <catalog>"
     /// names from the installed manifests) with Continue Watching prepended (id = "continue" is the
@@ -337,7 +344,7 @@ class EngineStremioRepository(
         }
     }
 
-    override suspend fun discover(requestJson: String?): Result<DiscoverResult> = runCatching {
+    override suspend fun discover(requestJson: String?): Result<DiscoverResult> = withContext(Dispatchers.Default) { runCatching {
         // Discover is one selectable rail in the engine (a CatalogWithFilters: the selected catalog's
         // flat pages, not the board's list-of-rails). [requestJson] null = the engine's own default
         // selection (first load); non-null = a verbatim echo of a chip's own `request` -- see
@@ -348,14 +355,14 @@ class EngineStremioRepository(
         val dispatchAction = if (requestJson != null) EngineActions.loadDiscoverSelect(requestJson) else EngineActions.loadDiscover()
         val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, dispatchAction) { EngineState.discoverCatalogSettled(it) }
         discoverResultFrom(state)
-    }
+    } }
 
-    override suspend fun discoverNextPage(): Result<DiscoverResult> = runCatching {
+    override suspend fun discoverNextPage(): Result<DiscoverResult> = withContext(Dispatchers.Default) { runCatching {
         val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscoverNextPage()) {
             EngineState.discoverCatalogSettled(it)
         }
         discoverResultFrom(state)
-    }
+    } }
 
     /// Parse a `discover` field snapshot into the [DiscoverResult] the ViewModel renders: the selected
     /// catalog's items (flattened from [EngineState.parseCatalogWithFilters]'s one-row shape) plus the
@@ -367,7 +374,7 @@ class EngineStremioRepository(
         return DiscoverResult(items = rows.firstOrNull()?.items.orEmpty(), filters = EngineState.parseDiscoverFilters(discoverStateJson))
     }
 
-    override suspend fun library(requestJson: String?): Result<LibraryResult> = runCatching {
+    override suspend fun library(requestJson: String?): Result<LibraryResult> = withContext(Dispatchers.Default) { runCatching {
         // Library is DERIVED from the persisted ctx.library bucket (no add-on HTTP), so the immediate
         // post-dispatch snapshot is already the real answer -- ready = always, no event wait. A
         // genuinely empty library must return [] instantly, not ride a timeout. [requestJson] null =
@@ -377,7 +384,7 @@ class EngineStremioRepository(
         val dispatchAction = if (requestJson != null) EngineActions.loadLibrarySelect(requestJson) else EngineActions.loadLibrary()
         val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
         LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
-    }
+    } }
 
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
         // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is
@@ -463,7 +470,7 @@ class EngineStremioRepository(
         }.getOrNull()
     }
 
-    override suspend fun search(query: String): Result<List<MetaItem>> = runCatching {
+    override suspend fun search(query: String): Result<List<MetaItem>> = withContext(Dispatchers.Default) { runCatching {
         if (query.isBlank()) return@runCatching emptyList()
         StremioCoreNative.dispatch(EngineActions.searchLoad(query))
         // search is a CatalogsWithExtra (rails); flatten the rails to a flat result list for the UI.
@@ -473,9 +480,9 @@ class EngineStremioRepository(
             EngineState.parseCatalogs(it).any { row -> row.items.isNotEmpty() }
         }
         EngineState.parseCatalogs(state).flatMap { it.items }
-    }
+    } }
 
-    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = runCatching {
+    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         // Ready = the meta actually parsed (first Ready Loadable in metaItems). The immediate
         // post-Load state is Loading, so a single-event await would leak a not-ready miss to the UI
         // (the "meta_details not ready" string the S03 device round saw rendered raw).
@@ -484,9 +491,9 @@ class EngineStremioRepository(
         }
         EngineState.parseMetaDetail(state)
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
-    }
+    } }
 
-    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = runCatching {
+    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
         //
@@ -504,7 +511,7 @@ class EngineStremioRepository(
             EngineState.parseStreamGroups(it).isNotEmpty()
         }
         EngineState.parseStreamGroups(state)
-    }
+    } }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
@@ -593,8 +600,11 @@ class EngineStremioRepository(
     /// synchronous `meta_details` snapshot [currentMetaDetail] already uses after every S05 mutation --
     /// safe to call on every [ctxUpdates] tick without re-triggering the add-on stream fan-out. Null if
     /// nothing is currently loaded for [id] (a different title's meta_details, or none yet).
-    override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? =
+    // withContext(Dispatchers.Default): called on every ctxUpdates tick, so its getState + parse
+    // (via currentMetaDetail) must stay off the collector's (Main) context.
+    override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = withContext(Dispatchers.Default) {
         currentMetaDetail()?.takeIf { it.id == id }
+    }
 
     // ---- AuthRepository ----
 
