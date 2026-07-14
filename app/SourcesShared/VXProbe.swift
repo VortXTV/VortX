@@ -248,7 +248,12 @@ enum VXProbeHeartbeat {
         let uptime = Int(ProcessInfo.processInfo.systemUptime - start0)
         let mem = residentMemoryMB()
         let memText = mem.map { String(format: "%.0f", $0) } ?? "?"
-        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB \(VXProbeState.shared.snapshot())")
+        // Stamp the embedded streaming server's state (running / exited rc=N / stalled-loop age) into every
+        // heartbeat so a device log shows exactly when the node server died or froze relative to memory and
+        // player state. ServerDiagnostics is nil on builds with no server (the Lite tvOS app), in which case
+        // the server field is omitted.
+        let serverText = ServerDiagnostics.status().map { " server=[\($0)]" } ?? ""
+        VXProbe.log("heartbeat", "up=\(uptime)s mem=\(memText)MB \(VXProbeState.shared.snapshot())\(serverText)")
     }
 
     /// Current resident memory in MB via mach_task_basic_info. Returns nil if the kernel call fails,

@@ -194,7 +194,8 @@ final class VXDiagExport {
     /// Write the current diagnostic log as a text/plain attachment, then close. Any read failure yields an
     /// empty body rather than an error so the phone still gets a (harmless) file.
     private func serve(_ connection: NWConnection) {
-        let body = (try? Data(contentsOf: VXProbe.logFileURL)) ?? Data("(diagnostic log is empty)\n".utf8)
+        var body = (try? Data(contentsOf: VXProbe.logFileURL)) ?? Data("(diagnostic log is empty)\n".utf8)
+        body.append(Self.serverSection())
         let head = """
         HTTP/1.1 200 OK\r
         Content-Type: text/plain; charset=utf-8\r
@@ -216,6 +217,25 @@ final class VXDiagExport {
     }
 
     // MARK: - Helpers
+
+    /// The embedded streaming-server section appended to every diagnostics export (F4): the server's current
+    /// one-line status plus a bounded tail (~100 lines) of its OWN log (`stremio-server.log`). The rolling
+    /// probe log alone never carried the node's log, so a server death/stall was invisible in the file the
+    /// owner actually sends. Target-safe via ServerDiagnostics: on a build with no server (the Lite tvOS app)
+    /// the provider is nil and this returns an empty section. Never throws.
+    private static func serverSection() -> Data {
+        guard let status = ServerDiagnostics.status() else { return Data() }
+        let tail = ServerDiagnostics.logTail(100)
+        var section = "\n\n===== streaming server =====\nstatus: \(status)\n"
+        if tail.isEmpty {
+            section += "(server log empty or unavailable)\n"
+        } else {
+            section += "--- stremio-server.log (last \(tail.count) lines) ---\n"
+            section += tail.joined(separator: "\n")
+            section += "\n"
+        }
+        return Data(section.utf8)
+    }
 
     /// The device's LAN IPv4 for the Wi-Fi interface (`en0`), or nil when not on Wi-Fi. Uses getifaddrs so
     /// no extra entitlement is needed; falls back to the first non-loopback IPv4 if `en0` is not present.
@@ -284,7 +304,8 @@ extension VXDiagExport {
         let dest = destDir.appendingPathComponent("vortx-diag.log")
         // Copy the current log (overwriting any stale copy). If the source is missing/empty, still write a
         // placeholder so the reveal is not a dead file.
-        let data = (try? Data(contentsOf: src)) ?? Data("(diagnostic log is empty)\n".utf8)
+        var data = (try? Data(contentsOf: src)) ?? Data("(diagnostic log is empty)\n".utf8)
+        data.append(Self.serverSection())   // F4: fold in the streaming server's status + log tail
         do {
             try data.write(to: dest, options: .atomic)
             NSWorkspace.shared.activateFileViewerSelecting([dest])

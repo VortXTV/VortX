@@ -151,6 +151,9 @@ enum NodeServer {
     /// Spawn the node server once. Idempotent. No-op if the node binary or server.js is missing,
     /// or if the app is already shutting down (so a late call can't resurrect a killed server).
     static func startIfNeeded() {
+        // Wire the shared diagnostics indirection so the VXProbe heartbeat + the diagnostics export can
+        // surface this server's state without SourcesShared referencing a concrete NodeServer. Idempotent.
+        ServerDiagnostics.register(status: { statusDescription }, logTail: { logTail($0) })
         queue.async {
             guard !started, !shutdownRequested else { return }
             guard let nodeBin = Bundle.main.path(forResource: "node-darwin-arm64", ofType: nil) else {
@@ -399,6 +402,9 @@ enum NodeServer {
                 guard !shutdownRequested else { return }
                 exitCode = p.terminationStatus
                 NSLog("StremioX: node server exited rc=\(p.terminationStatus)")
+                // Mirror the unexpected exit into the EXPORTABLE diagnostics log so a server death is visible
+                // in the file the owner actually sends, not just the unified log.
+                DiagnosticsLog.log("server", "node child exited rc=\(p.terminationStatus) (unexpected; relaunch to restart)")
             }
         }
 
