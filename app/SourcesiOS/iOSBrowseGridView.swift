@@ -416,7 +416,7 @@ struct iOSCategoryBrowse: View {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     }
                 } else {
-                    PosterGrid(items: items, onTap: open, menu: .catalog, onReachEnd: { Task { await loadNext() } })
+                    PosterGrid(items: items, onTap: open, menu: .catalog, showWatchedBadges: true, onReachEnd: { Task { await loadNext() } })
                 }
             }
             .padding(.bottom, Theme.Space.md)
