@@ -65,6 +65,10 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// to synthesize a finite VOD duration when the remux delivery keeps AVPlayerItem.duration INDEFINITE.
     var sourceDurationSeconds: Double { stream.sourceDurationSeconds }
 
+    /// The source MKV chapter markers (start seconds + title) for the engine's Chapters panel on the DV remux
+    /// lane; the remux delivery carries no chapter metadata of its own (Gap 3, AVPlayer parity).
+    var chapters: [(start: Double, title: String)] { stream.chapters }
+
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
         invalidateLock.lock()

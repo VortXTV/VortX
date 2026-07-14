@@ -147,6 +147,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The source MKV runtime in seconds (0 when the demuxer could not report one). Thread-safe.
     var sourceDurationSeconds: Double { hlsLock.lock(); defer { hlsLock.unlock() }; return _sourceDurationSeconds }
 
+    // Source chapter markers (start seconds + title), read once from the libav chapter list at
+    // find_stream_info time. Published under hlsLock (written once on the remux thread, read from the player
+    // thread), exactly like _sourceDurationSeconds. Empty for a source with no chapters. The forward-only
+    // fMP4/HLS delivery carries no chapter metadata of its own, so the engine reads these to give the AVPlayer
+    // DV lane the same Chapters panel + scrubber ticks libmpv shows for the same MKV. See AVPlayerEngine.loadChapters.
+    private var _chapters: [(start: Double, title: String)] = []
+
+    /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
+    var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
+
     /// Consistent snapshot of the published HLS index for the local server.
     func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
         hlsLock.lock(); defer { hlsLock.unlock() }
@@ -323,6 +333,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsLock.lock(); _sourceDurationSeconds = secs; hlsLock.unlock()
             VXProbe.log("dv", "remux source duration \(String(format: "%.1f", secs))s")
         }
+
+        // Source chapter markers (AVPlayer parity, Gap 3): libav populates AVFormatContext.chapters from the
+        // MKV ChapterAtom list. Read them in the SAME open window as duration so, whenever the engine has a
+        // finite duration to synthesize, it also has the chapters. The forward-only HLS delivery carries none.
+        readSourceChapters(inCtx)
 
         // Output context: fragmented MP4, NO file (custom IO).
         var ofmt: UnsafeMutablePointer<AVFormatContext>? = nil
@@ -1420,6 +1435,33 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// spec default "eng" for a track with no Language element, and MP4 often yields "und", so this rarely
     /// returns "" in practice; what matters for the pick is that all untagged tracks in ONE file share the same
     /// substituted value, so the language key stays a no-op among them (it never spuriously splits them).
+    /// Read the source's libav chapter list (start seconds + title) and publish it under hlsLock (Gap 3,
+    /// AVPlayer DV parity). `AVChapter.start` is in the chapter's own `time_base`, so convert to seconds; the
+    /// title comes from the chapter metadata dictionary ("title"). No-op for a source without chapters, and
+    /// fail-soft on any malformed entry (a bad time_base / negative start is skipped, never fatal).
+    private func readSourceChapters(_ inCtx: UnsafeMutablePointer<AVFormatContext>) {
+        let count = Int(inCtx.pointee.nb_chapters)
+        guard count > 0, let list = inCtx.pointee.chapters else { return }
+        var out: [(start: Double, title: String)] = []
+        for i in 0..<count {
+            guard let chapter = list[i] else { continue }
+            let tb = chapter.pointee.time_base
+            guard tb.den != 0 else { continue }
+            let start = Double(chapter.pointee.start) * Double(tb.num) / Double(tb.den)
+            guard start.isFinite, start >= 0 else { continue }
+            var title = ""
+            if let entry = av_dict_get(chapter.pointee.metadata, "title", nil, 0),
+               let value = entry.pointee.value {
+                title = String(cString: value)
+            }
+            out.append((start: start, title: title))
+        }
+        out.sort { $0.start < $1.start }
+        guard !out.isEmpty else { return }
+        hlsLock.lock(); _chapters = out; hlsLock.unlock()
+        VXProbe.log("dv", "remux source chapters: \(out.count)")
+    }
+
     private static func streamLanguage(_ stream: UnsafeMutablePointer<AVStream>) -> String {
         guard let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
               let value = entry.pointee.value else { return "" }
