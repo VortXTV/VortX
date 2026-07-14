@@ -81,6 +81,7 @@ final class PlayerPresenter: ObservableObject {
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var core: CoreBridge   // tear down the engine Player on a genuine player exit
     @State private var splashDone = false
 
     var body: some View {
@@ -107,7 +108,11 @@ struct RootView: View {
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              startFromZero: req.startFromZero,
-                             onClose: { presenter.request = nil })
+                             // Tear down the engine Player on a genuine exit so a stale Player from this session
+                             // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
+                             // the single user-exit choke point (leavePlayback routes through it); a request-id
+                             // rebuild fires onDisappear, not onClose, so an in-session source switch is untouched.
+                             onClose: { core.unloadEnginePlayer(); presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }
             // The launch splash sits above everything for its ~2 seconds. It has no

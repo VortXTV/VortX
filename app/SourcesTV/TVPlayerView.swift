@@ -270,6 +270,14 @@ struct TVPlayerView: View {
     @State private var curHeaders: [String: String]?   // the playing stream's required HTTP headers
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
+    // The episode id the engine Player is ACTUALLY loaded for. Progress attribution (the engine's TimeChanged)
+    // keys on the engine Player's own stream request, so writing progress while this disagrees with `curMeta`
+    // lands it on the wrong episode. Seeded at launch to the launch episode (the detail page loaded the engine
+    // Player for it); re-pointed on every binge advance the moment the engine re-point succeeds, cleared to nil
+    // when a re-point could not be confirmed. The periodic tick + exit flush gate on `== curMeta?.videoId`, so a
+    // missed re-point degrades to "no engine write" (the correct-identity account write still lands and
+    // syncLibraryNow pulls it) instead of a wrong-episode write that clobbers it on mtime.
+    @State private var enginePlayerVideoId: String?
     // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
     @State private var preloaded: PreloadedEpisode?
     @State private var preloadingID: String?
@@ -401,6 +409,9 @@ struct TVPlayerView: View {
             core.setPlayerActive(true)
             if curURL == nil {   // seed from initial request
                 curURL = url; curTitle = title; curMeta = meta
+                // The detail page loaded the engine Player for THIS launch episode, so progress attributes
+                // correctly from the first tick. Binge advances re-point both this and curMeta in lockstep.
+                enginePlayerVideoId = meta?.videoId
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
                 currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
                 currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
@@ -487,7 +498,11 @@ struct TVPlayerView: View {
             // R9: same floor guard the periodic (:562) and saveProgress paths use. A suppressed DV-remux resume
             // restarted playback at 0, so this final flush must not regress the ENGINE resume point below where
             // the viewer actually was. saveProgress(at:) just above already cleared the floor if playback passed it.
-            if !isCurrentLiveStream, suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
+            // Attribution gate (binge-desync fix): only write to the engine Player when it is loaded for the
+            // episode curMeta names. After a binge advance whose engine re-point could not be confirmed, this
+            // skips the wrong-episode flush; the correct-identity account write (saveProgress above) still lands.
+            if !isCurrentLiveStream, enginePlayerVideoId == curMeta?.videoId,
+               suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
                 core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
             }
             // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
@@ -623,7 +638,8 @@ struct TVPlayerView: View {
                     // watched/unwatched toggle, a sync) then resurrected that stale position over
                     // the newer account value (the "unmarked watched, an old scrub position came
                     // back" report). Engine dispatches are ordered, so this can never race backward.
-                    if !isCurrentLiveStream, suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
+                    if !isCurrentLiveStream, enginePlayerVideoId == curMeta?.videoId,
+                       suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
                         core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)
                     }
                 }
@@ -3554,6 +3570,14 @@ struct TVPlayerView: View {
             // the player/DetailView reads.
             Task { @MainActor in
                 core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+                // Re-point the engine Player to THIS episode SYNCHRONOUSLY, before playback starts, so every
+                // progress tick + watched mark attributes to the right episode from the first tick (binge-desync
+                // fix, symptom 2). The plain loadEnginePlayer polls meta_details for up to 15s and silently
+                // no-ops if the add-on refetch is slow, un-advancing state.videoId that MarkVideoAsWatched moved.
+                // This builds the request from the known episode id + the preload's add-on base, no wait. On
+                // success the attribution gate follows; on failure it clears to nil so the engine write is
+                // skipped (the account write still lands) rather than misattributed.
+                enginePlayerVideoId = core.loadEnginePlayer(for: pre.stream, videoId: v.id, base: pre.addonBase) ? v.id : nil
                 resumeSeconds = await account.resumeOffset(for: newMeta)
                 loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                 startLoadTimeout()
@@ -3563,11 +3587,13 @@ struct TVPlayerView: View {
                 // the 0..<60 loop would instead block a legitimate next switch for up to 15s. Mirrors the
                 // fallback branch, which clears switchingEpisode inside its own Task.
                 switchingEpisode = false
-                // Hand the stream to the engine Player once its meta_details catches up, so
-                // Continue Watching keeps tracking; harmless if it never matches.
+                // Belt-and-braces fallback (kept): once the engine's OWN streams for this episode land, re-point
+                // off the resident stream too (idempotent, confirms the gate). Covers a synchronous re-point that
+                // could not build a request (missing base / meta), so CW still catches up when the add-ons answer.
                 for _ in 0..<60 {
                     if !core.streamGroups(forStreamId: v.id).isEmpty {
                         core.loadEnginePlayer(for: pre.stream)
+                        enginePlayerVideoId = v.id
                         break
                     }
                     try? await Task.sleep(for: .milliseconds(250))
@@ -3604,6 +3630,9 @@ struct TVPlayerView: View {
                     // untouched instead of cold-recreating it. Mirrors switchStream's different-hash guard.
                     if let oldHash = leavingHash, oldHash != s.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
                     core.loadEnginePlayer(for: s)
+                    // This resolve waited for THIS episode's own streams, so the resident-scrape load above is
+                    // correctly attributed: point the progress-attribution gate at it (binge-desync fix).
+                    enginePlayerVideoId = v.id
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
                     curIsLive = isLiveMeta(newMeta) && !s.isTorrent
@@ -3629,7 +3658,7 @@ struct TVPlayerView: View {
     /// The next episode's best stream, resolved in the background mid-episode. Fetched over the
     /// add-on HTTP protocol directly so the engine's `meta_details` (which the screen behind the
     /// player still shows) is never disturbed.
-    private struct PreloadedEpisode { let episodeID: String; let stream: CoreStream; let signature: String; let bingeGroup: String? }
+    private struct PreloadedEpisode { let episodeID: String; let stream: CoreStream; let signature: String; let bingeGroup: String?; let addonBase: String? }
 
     /// Kick off the preload once per episode, triggered when playback crosses the halfway mark.
     private func preloadNextIfNeeded() {
@@ -3664,8 +3693,11 @@ struct TVPlayerView: View {
             // @State writes go back on the main actor (the fetch + rank above intentionally ran off-main).
             await MainActor.run {
                 if let best {
+                    // The add-on base `best` came from, carried so the synchronous engine re-point on advance can
+                    // build this episode's stream request without waiting for the engine's own add-ons to answer.
+                    let bestBase = groups.first { $0.streams.contains(best) }?.id
                     preloaded = PreloadedEpisode(episodeID: next.id, stream: best, signature: StreamRanking.signature(best),
-                                                 bingeGroup: best.behaviorHints?.bingeGroup)
+                                                 bingeGroup: best.behaviorHints?.bingeGroup, addonBase: bestBase)
                     plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(next.id, privacy: .public)")
                 } else {
                     plog.info("preload found nothing for \(next.id, privacy: .public)")
