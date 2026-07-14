@@ -12,6 +12,12 @@ actor SIMKLService {
     private let auth: SIMKLAuth
     private let session: URLSession
 
+    /// S-3: the next instant a data POST is allowed to fire. Each `write` RESERVES a slot before sleeping
+    /// (advancing this by `minPostInterval`), so concurrent callers queue into distinct 1-second slots and
+    /// a burst can never exceed SIMKL's 1-POST/sec limit even if a future caller batches writes.
+    private var nextPostSlot: Date?
+    private static let minPostInterval: TimeInterval = 1.0
+
     init(auth: SIMKLAuth, session: URLSession = .shared) {
         self.auth = auth
         self.session = session
@@ -48,18 +54,37 @@ actor SIMKLService {
 
     private func write(path: String, items: SIMKLSyncItems) async throws -> Int {
         let token = try await auth.validToken()
-        guard let url = URL(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
+        try await rateGate()
+        guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
+        // SIMKL requires client_id / app-name / app-version on EVERY request (S-4).
+        components.queryItems = SIMKLAuth.requiredQueryItems
+        guard let url = components.url else { throw SIMKLError.badURL }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
+        request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")   // S-5
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONEncoder().encode(items)
         let (_, status) = try await perform(request)
         try expectSuccess(status)
         return status
+    }
+
+    /// S-3 serial 1-POST/sec gate. RESERVE-then-sleep: reading `nextPostSlot`, computing this call's slot,
+    /// and advancing `nextPostSlot` all happen synchronously in one actor turn (no await between), so two
+    /// concurrent writes reserve DISTINCT slots rather than both reading the same stale timestamp and
+    /// firing together. The reserved wait is then slept off before the request goes out.
+    private func rateGate() async throws {
+        let now = Date()
+        let slot = (nextPostSlot.map { $0 > now ? $0 : now }) ?? now
+        nextPostSlot = slot.addingTimeInterval(Self.minPostInterval)
+        let wait = slot.timeIntervalSince(now)
+        if wait > 0 {
+            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        }
     }
 
     private func perform(_ request: URLRequest) async throws -> (Data, Int) {
