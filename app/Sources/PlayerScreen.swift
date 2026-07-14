@@ -2340,8 +2340,17 @@ struct PlayerScreen: View {
 
     /// Seek relative to the play head, clamped to the timeline, and report it. Shared by the on-screen skip
     /// buttons and the macOS keyboard shortcuts.
+    /// P2 (#76): cap a forward seek target at the produced edge (`bufferedTime`) on a forward-only DV remux
+    /// mount. Seeking past it lands in not-yet-produced bytes, no frame arrives, and the start/stall watchdog
+    /// demotes the whole true-DV session to libmpv. Backward seeks and non-remux sessions pass through unchanged.
+    private func remuxClampedTarget(_ target: Double) -> Double {
+        guard (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true,
+              bufferedTime > currentTime, target > bufferedTime else { return target }
+        return bufferedTime
+    }
+
     private func seekBy(_ delta: Double) {
-        let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
+        let target = remuxClampedTarget(min(max(currentTime + delta, 0), max(duration - 1, 0)))
         coordinator.player?.seek(to: target)
         currentTime = target
         if duration > 0 { onSeek(target, duration); lastReported = target }
@@ -2383,9 +2392,10 @@ struct PlayerScreen: View {
                                 scrubTarget = currentTime; hideTask?.cancel()
                                 hoverPreviewTime = nil; hoverPreviewRatio = nil
                             } else {
-                                currentTime = scrubTarget
-                                coordinator.player?.seek(to: scrubTarget)
-                                if duration > 0 { onSeek(scrubTarget, duration); lastReported = scrubTarget }
+                                let target = remuxClampedTarget(scrubTarget)   // P2: cap forward scrub at the remux edge
+                                currentTime = target
+                                coordinator.player?.seek(to: target)
+                                if duration > 0 { onSeek(target, duration); lastReported = target }
                                 scrubThumbnails.clear()
                                 scheduleHide()
                             }

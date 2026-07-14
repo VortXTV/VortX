@@ -3673,7 +3673,15 @@ struct TVPlayerView: View {
         // — and the viewer's real progress is wiped (the "scrubbed fast, exited, progress and episode
         // selection gone" report). Landing 5s short shows the actual ending and lets natural playback
         // reach EOF with all the finished semantics intact; a short clip keeps the plain full-range clamp.
-        let scrubCeiling = duration > 30 ? duration - 5 : duration
+        var scrubCeiling = duration > 30 ? duration - 5 : duration
+        // P2 (#76): a forward-only DV remux mount only holds bytes up to the produced edge (bufferedTime). A
+        // scrub past it lands in not-yet-produced bytes, no frame arrives, and the start/stall watchdog demotes
+        // the whole true-DV session to libmpv (losing DV + Atmos for the play). Cap forward scrubs at the
+        // buffered edge on a remux mount so a fast scrub can't knock a healthy DV title off its engine.
+        // Backward scrubs and non-remux sessions are unaffected (min() only lowers the upper bound).
+        if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true, bufferedTime > currentTime {
+            scrubCeiling = min(scrubCeiling, bufferedTime)
+        }
         scrubTarget = min(scrubCeiling, max(0, scrubTarget + Double(dir) * scrubStep))
         scrubThumbnails.show(time: scrubTarget)
         flashControls()
