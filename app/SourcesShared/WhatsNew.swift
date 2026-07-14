@@ -5,7 +5,7 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.3.13"
+    static let version = "0.3.14"
     static let highlights: [String] = [
         "A visual refresh on iPhone and Mac. Titles, section headers, and card captions now have proper size hierarchy again (a scaling quirk had been flattening the type so everything read at nearly one size), posters carry a resting shadow and lift on hover or press so lists feel less flat, and spacing, headers, and the accent color are used more consistently across Home, Discover, title pages, and Settings. iPhone, iPad, and Mac.",
         "Binge-watching on Apple TV no longer loses track of which episode you are on. After a run of auto-played episodes, backing out to the title page now shows the episode you actually reached, Watch Now plays that episode (with its own subtitles, not a previous episode's), and each episode you finished is correctly marked watched. Previously the page could stay stuck on the episode you started from, and playing from that stale page could pair one episode's video with another episode's subtitle. The fix keeps the player, the engine, and the detail page pointed at the same episode throughout a binge. Apple TV.",
