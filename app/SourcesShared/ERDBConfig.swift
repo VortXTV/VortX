@@ -156,7 +156,11 @@ struct ResolvedTitleLogo<TitleText: View>: View {
 
     var body: some View {
         Group {
-            if let logoURL, !logoURL.isEmpty, let url = URL(string: logoURL) {
+            if let logoURL, !logoURL.isEmpty, let rawURL = URL(string: logoURL) {
+                // AsyncImage cannot attach headers, so a rating-baked ERDB logo (erdb.vortx.tv, a gated host)
+                // is signed via query params (`vts`/`vkid`/`vsig`) instead. Fails open: a fanart.tv / metahub /
+                // add-on logo (non-gated host) or an unprovisioned build is returned unchanged and loads normally.
+                let url = VortXEdgeAuth.signedURL(rawURL)
                 AsyncImage(url: url) { phase in
                     if case .success(let img) = phase {
                         img.resizable().aspectRatio(contentMode: .fit)
