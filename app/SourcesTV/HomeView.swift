@@ -6,6 +6,7 @@ struct HomeView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
     @StateObject private var focusModel = FocusedItemModel()
@@ -165,7 +166,7 @@ struct HomeView: View {
                             }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
-                            if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
+                            if account.isSignedIn || vortxSync.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
                         }
                     }
                     .padding(.top, Theme.Space.sm)

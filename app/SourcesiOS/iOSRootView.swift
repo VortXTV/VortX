@@ -618,6 +618,7 @@ struct iOSHomeView: View {
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -925,7 +926,7 @@ struct iOSHomeView: View {
             // macOS sign-in lives in Settings -> Account ("VortX account & sync").
             #if os(iOS)
             .toolbar {
-                if !account.isSignedIn {
+                if !(account.isSignedIn || vortxSync.isSignedIn) {
                     ToolbarItem(placement: .primaryAction) {
                         Button("Sign In") { showSignIn = true }
                     }
@@ -1095,7 +1096,7 @@ struct iOSHomeView: View {
         // Route through the shared compat empty state for one consistent layout (#44). Signed-out gets
         // a primary Sign In CTA (the in-house PrimaryActionStyle, not the stock .borderedProminent — #42);
         // signed-in is the bare loading line while catalogs hydrate.
-        if account.isSignedIn {
+        if account.isSignedIn || vortxSync.isSignedIn {
             ContentUnavailableViewCompat(title: "Loading your catalogs…", systemImage: "popcorn",
                 message: "Your add-ons' rows fill in as the engine hydrates.")
                 .frame(minHeight: 420)
@@ -1759,6 +1760,7 @@ struct iOSDiscoverView: View {
     var isActive: Bool = true
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false   // also hide Live types from the Discover type filter (#117 per-tab key)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -1837,7 +1839,7 @@ struct iOSDiscoverView: View {
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
                         }, onTap: handleTap, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
-                    } else if account.isSignedIn {
+                    } else if account.isSignedIn || vortxSync.isSignedIn {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 100)
                     } else {
                         ContentUnavailableViewCompat(title: "Discover", systemImage: "safari",

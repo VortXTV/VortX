@@ -6,6 +6,7 @@ struct LibraryView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
@@ -44,7 +45,7 @@ struct LibraryView: View {
                                 } else {
                                     grid(library.catalog)
                                 }
-                            } else if account.isSignedIn {
+                            } else if account.isSignedIn || vortxSync.isSignedIn {
                                 BigSpinner()
                                     .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                             } else {

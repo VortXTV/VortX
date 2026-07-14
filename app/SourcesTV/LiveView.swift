@@ -15,6 +15,7 @@ struct LiveView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @StateObject private var focusModel = FocusedItemModel()
 
     var body: some View {
@@ -29,7 +30,7 @@ struct LiveView: View {
                             ForEach(core.liveBoardRows) { row in
                                 CoreChannelRowView(row: row, focusModel: focusModel)
                             }
-                        } else if account.isSignedIn {
+                        } else if account.isSignedIn || vortxSync.isSignedIn {
                             emptyState
                         } else {
                             CoreEmptyState.signedOut

@@ -8,6 +8,7 @@ struct SearchView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore
     @State private var showOpenLink = false
     @State private var query = ""
@@ -18,7 +19,7 @@ struct SearchView: View {
 
     var body: some View {
         Group {
-            if account.isSignedIn { results } else { CoreEmptyState.signedOut }
+            if account.isSignedIn || vortxSync.isSignedIn { results } else { CoreEmptyState.signedOut }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
     }

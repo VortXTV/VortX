@@ -6,6 +6,7 @@ struct DiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false   // also hide Live types from the Discover type filter (#117 per-tab key)
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
@@ -37,7 +38,7 @@ struct DiscoverView: View {
                             catalogChips(discover.selectable.catalogs)
                             genreChips(discover.selectable.extra)
                             grid(discover.items)
-                        } else if account.isSignedIn {
+                        } else if account.isSignedIn || vortxSync.isSignedIn {
                             BigSpinner()
                                 .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                         } else {

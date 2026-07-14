@@ -107,6 +107,7 @@ final class AddonHealthStore: ObservableObject {
 /// or remove a non-default add-on here. Changes sync to your account and to the official apps.
 struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
+    @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks add-on management even with no Stremio account connected
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
@@ -131,7 +132,7 @@ struct AddonsView: View {
                     // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
                     let _ = orderObserver.revision
                     Text("Add-ons").screenTitleStyle()
-                    if !account.isSignedIn {
+                    if !(account.isSignedIn || vortxSync.isSignedIn) {
                         hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
                     } else {
                         installSection
