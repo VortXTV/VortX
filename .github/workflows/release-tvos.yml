@@ -228,21 +228,33 @@ jobs:
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath app/build/ci CODE_SIGNING_ALLOWED=NO \
-            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Build tvOS (Lite)
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTVLite \
             -configuration Release -destination 'generic/platform=tvOS' \
             -derivedDataPath app/build/ci-lite CODE_SIGNING_ALLOWED=NO \
-            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Build iOS
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath app/build/ci-ios CODE_SIGNING_ALLOWED=NO \
-            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Build macOS
         run: |
@@ -254,7 +266,11 @@ jobs:
             -configuration Release -destination 'platform=macOS,arch=arm64' \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO \
-            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Package the IPAs
         run: |
