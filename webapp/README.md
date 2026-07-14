@@ -1,6 +1,6 @@
 # VortX web (web.vortx.tv)
 
-A browser client for VortX, the native Stremio streaming client. This is the web counterpart to the
+A browser client for VortX, the native streaming app. This is the web counterpart to the
 Apple apps, the Android app, and the Tauri desktop shell: same product, same engine concepts, but it
 runs entirely in the browser with no native shell and no streaming server.
 
