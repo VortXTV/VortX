@@ -380,6 +380,15 @@ struct PlayerScreen: View {
     // The active stream (changes on a manual source switch or an automatic failover hop), seeded from
     // the launch url/headers in onAppear so the first load is unchanged.
     @State private var curURL: URL?
+    /// True when the current source is a direct play from one of the user's connected media servers (its host
+    /// matches a stored server url). Used to show the honest "can't direct-play, no transcode in this version"
+    /// error instead of the generic source-failure copy (Phase 1 has no transcode negotiation).
+    private var curIsMediaServer: Bool {
+        guard let host = curURL?.host?.lowercased() else { return false }
+        return MediaServerStore.shared.servers.contains { rec in
+            rec.urls.contains { (URL(string: $0)?.host?.lowercased()) == host }
+        }
+    }
     @State private var curHeaders: [String: String]?
     @State private var curIsTorrent = false
     @State private var torrentWarmupsUsed = 0          // bounded torrent peer-discovery warm-up rounds
@@ -1432,7 +1441,11 @@ struct PlayerScreen: View {
             // A Continue-Watching RESUME is not a manual pick: its stored debrid link expires, so a hard failure
             // must fall through to the failover hop + fresh-sources wait below rather than dead-ending here.
             if currentPickWasExplicit && !currentPlaybackIsResume {
-                if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                if loadErrorMsg.isEmpty {
+                    loadErrorMsg = curIsMediaServer
+                        ? "This file's format can't direct-play on this device yet. Server transcoding isn't supported in this version."
+                        : "This source didn't load. Choose another source."
+                }
                 srcProbe("OVERLAY SET: explicit pick failed after \(maxAutoRetries) retries -> loadFailed msg=\(loadErrorMsg)")
                 withAnimation { loadFailed = true }
                 return
