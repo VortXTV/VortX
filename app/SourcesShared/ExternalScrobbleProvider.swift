@@ -86,8 +86,9 @@ protocol ExternalScrobbleProvider: Sendable {
 // MARK: - Per-provider toggle keys (shared with the settings view)
 
 /// The @AppStorage / UserDefaults keys for the per-provider on/off toggles. Kept here so both the
-/// providers and `ExternalServicesSettingsView` reference the exact same strings. All default to ON
-/// (a missing key reads as enabled), matching the settings defaults.
+/// providers and `ExternalServicesSettingsView` reference the exact same strings. Each key's default is
+/// passed at the call site (see `isOn`): the scrobble/watchlist toggles default ON, but `traktImportWatched`
+/// defaults OFF, matching each toggle's @AppStorage default in the settings view.
 enum ExternalSyncToggle {
     static let traktScrobble = "vortx.trakt.scrobble"
     static let traktWatchlist = "vortx.trakt.watchlist"
@@ -95,13 +96,15 @@ enum ExternalSyncToggle {
     static let simklWatchlist = "vortx.simkl.watchlist"
     /// Show titles watched on Trakt (pulled into the local shadow cache) as watched in VortX rails.
     /// Default OFF: importing another service's history into the read path is opt-in, and it NEVER
-    /// writes any engine libraryItem (additive-read only).
+    /// writes any engine libraryItem (additive-read only). Callers MUST read it with `default: false`.
     static let traktImportWatched = "vortx.trakt.importWatched"
 
-    /// A toggle's value, defaulting to `true` when the user has never set it (the feature ships enabled
-    /// once a provider is connected). Thread-safe (UserDefaults is).
-    static func isOn(_ key: String) -> Bool {
-        UserDefaults.standard.object(forKey: key) == nil ? true : UserDefaults.standard.bool(forKey: key)
+    /// A toggle's value, returning `defaultOn` when the user has never set it. `defaultOn` MUST match the
+    /// key's @AppStorage default in the settings view (ON for scrobble/watchlist, OFF for importWatched),
+    /// so a never-touched switch and its runtime read agree. Thread-safe (UserDefaults is).
+    static func isOn(_ key: String, default defaultOn: Bool = true) -> Bool {
+        guard UserDefaults.standard.object(forKey: key) != nil else { return defaultOn }
+        return UserDefaults.standard.bool(forKey: key)
     }
 }
 
@@ -153,25 +156,28 @@ struct TraktProvider: ExternalScrobbleProvider {
         // watch in history, so the coordinator passes progress 100 on the definitive-watch path.
         guard let item = scrobbleItem(ref) else { return }
         do { _ = try await TraktService.shared.scrobbleStop(item: item, progress: 100) }
-        catch { enqueue(ref, .watched) }
+        catch { enqueueIfTransient(ref, .watched, error) }
     }
 
     func addToWatchlist(_ ref: ExternalMediaRef) async {
         guard let items = titleItems(ref) else { return }
         do { _ = try await TraktService.shared.addToWatchlist(items) }
-        catch { enqueue(ref, .watchlistAdd) }
+        catch { enqueueIfTransient(ref, .watchlistAdd, error) }
     }
 
     func removeFromWatchlist(_ ref: ExternalMediaRef) async {
         guard let items = titleItems(ref) else { return }
         do { _ = try await TraktService.shared.removeFromWatchlist(items) }
-        catch { enqueue(ref, .watchlistRemove) }
+        catch { enqueueIfTransient(ref, .watchlistRemove, error) }
     }
 
-    /// Queue a failed push for offline retry (the live scrobble start/pause/stop are ephemeral and NOT
-    /// queued; only durable watchlist + watched intents are). A `.ignored` (too-little-watched) result is
-    /// a legitimate skip, not an outage, so it is not re-queued.
-    private func enqueue(_ ref: ExternalMediaRef, _ kind: TraktSyncEngine.PendingPush.Kind) {
+    /// Queue a failed push for offline retry, but ONLY for TRANSIENT failures (offline / rate-limit /
+    /// server / transport). A terminal outcome is dropped so the queue never carries a push that can never
+    /// succeed: `.ignored` (too little watched, HTTP 422) is a legitimate skip, and `.unauthorized` (HTTP
+    /// 401) needs a reconnect, not a blind replay that would 401 forever (and could drain into the next
+    /// account). The live scrobble start/pause/stop are ephemeral and never reach here.
+    private func enqueueIfTransient(_ ref: ExternalMediaRef, _ kind: TraktSyncEngine.PendingPush.Kind, _ error: Error) {
+        if let e = error as? TraktServiceError, e == .ignored || e == .unauthorized { return }
         TraktSyncEngine.shared.enqueue(TraktSyncEngine.PendingPush(
             kind: kind, isSeries: ref.isSeries, imdb: ref.imdb, tmdb: ref.tmdb,
             season: ref.season, episode: ref.episode))
