@@ -13,11 +13,19 @@ import Foundation
 ///   2. Provider signed-in: `provider.isConnected()` (configured + connected), checked in the fan-out.
 ///   3. Per-provider toggle: `provider.scrobbleEnabled` / `watchlistEnabled` (the @AppStorage switches).
 ///
-/// ONCE-LATCHES (per item+session, mirroring the players' `markedWatched`): the watch record fires from
-/// BOTH the 90% marker and the EOF path (and the shared `markPlaybackWatched` chokepoint), so a single
-/// `completed` latch makes the definitive watch record fire EXACTLY once per session; `startSent` makes
-/// the scrobble start fire once; `stopSent` makes the sub-completion resume-save stop fire once. SIMKL,
-/// which has no live scrobble, only ever sees the completion op, so it can never spam `/sync/history`.
+/// ONCE-LATCHES (per playback session, mirroring the players' `markedWatched`): the watch record fires
+/// from BOTH the 90% marker and the EOF path (and the shared `markPlaybackWatched` chokepoint), so a single
+/// `completed` latch makes the definitive watch record fire EXACTLY once per session; `startSent` makes the
+/// scrobble start fire once (it gates the start dispatch); `stopSent` makes the sub-completion resume-save
+/// stop fire once. SIMKL, which has no live scrobble, only ever sees the completion op, so it can never
+/// spam `/sync/history`.
+///
+/// A session is (item key + playback token). `playbackStarted` resets the latches ONLY when the item OR
+/// the token changes, so a same-title recovery re-entry (a stall failover, an AVPlayer->libmpv demote, a
+/// same-source retry, a retry reload) re-fires `playbackStarted` with the SAME key + token and the latches
+/// SURVIVE: a completion already recorded can never fire a second (duplicate) history record. A genuine
+/// rewatch arrives with a fresh per-playback token from the player, so it opens a new session and scrobbles
+/// again.
 ///
 /// libraryItem POISON invariant: nothing here touches any engine `libraryItem` field. External state
 /// lives only on the providers' own HTTP endpoints; the watch record is a provider history/scrobble call,
@@ -36,6 +44,11 @@ final class ScrobbleCoordinator {
     private let lock = NSLock()
     /// The active session's item key. A different key on any entry opens a fresh session.
     private var currentKey = ""
+    /// The active playback's token (a per-playback id the player supplies at `playbackStarted`). A NEW
+    /// token on the SAME key (a genuine rewatch in a fresh player instance) opens a new session; an
+    /// UNCHANGED token on the same key (a same-title recovery reload) does not, so a recovery re-entry
+    /// after the watch was already recorded can never send a duplicate history record.
+    private var sessionToken = ""
     private var startSent = false
     private var stopSent = false
     private var completed = false
@@ -48,15 +61,24 @@ final class ScrobbleCoordinator {
 
     // MARK: - Player transitions (called from the player's main-actor handlers)
 
-    /// Playback started (first frame) or an episode began. Opens a FRESH session for this item (resets
-    /// every latch) and sends the live scrobble start. When duration is not known yet, progress is 0 and
-    /// the real percentage is deferred to later ticks / the stop.
-    func playbackStarted(_ meta: PlaybackMeta, position: Double, duration: Double) {
+    /// Playback started (first frame) or an episode began. Opens a FRESH session (resets every latch and
+    /// sends the live scrobble start) ONLY when the item or the playback `token` changed; a same-title
+    /// recovery re-entry (same key + token) keeps the latches so a completion recorded before the reload
+    /// is not re-sent. `token` is the player's per-playback id (a genuine rewatch supplies a fresh one).
+    /// When duration is not known yet, progress is 0 and the real percentage is deferred to later ticks /
+    /// the stop.
+    func playbackStarted(_ meta: PlaybackMeta, position: Double, duration: Double, sessionToken token: String) {
         guard passesOwnerGate() else { return }
         lock.lock()
-        currentKey = sessionKey(meta)
-        startSent = true; stopSent = false; completed = false
+        let key = sessionKey(meta)
+        if key != currentKey || token != sessionToken {
+            currentKey = key; sessionToken = token
+            startSent = false; stopSent = false; completed = false
+        }
+        let sendStart = !startSent
+        startSent = true
         lock.unlock()
+        guard sendStart else { return }   // same-session re-entry: the start already fired, do not repeat it
         dispatch(meta, progress: percent(position, duration)) { ref, provider in
             guard provider.capabilities.liveScrobble, provider.scrobbleEnabled else { return }
             await provider.scrobbleStart(ref)
@@ -179,19 +201,29 @@ final class ScrobbleCoordinator {
     /// A ref with no usable id (kitsu-only / pasted magnet) is dropped. Fully fail-soft.
     private func dispatch(_ meta: PlaybackMeta, progress: Double,
                           _ op: @escaping @Sendable (ExternalMediaRef, ExternalScrobbleProvider) async -> Void) {
+        // DORMANCY (no-keys build): bail synchronously, before spawning any task or resolving any id, when
+        // NEITHER provider is configured. `makeRef` can do up to two HTTP lookups to turn a tmdb: id into a
+        // tt id, so without this a tmdb-catalog play on the shipped credential-less build would emit resolver
+        // traffic. `isConfigured` is a synchronous constant check.
+        guard TraktAuth.isConfigured || SIMKLAuth.isConfigured else { return }
         // Snapshot the plain value fields on the caller thread (PlaybackMeta is a Sendable-safe value).
         let isSeries = meta.type == "series"
         let libraryId = meta.libraryId
         let season = meta.season, episode = meta.episode
         let title = meta.name
         Task.detached(priority: .utility) {
+            // Resolve ids only once at least one provider is actually CONNECTED (configured AND signed in):
+            // a configured-but-signed-out provider must not trigger `makeRef`'s network lookups on a routine
+            // catalog play. Collect the connected providers here so `op` runs against exactly those.
+            var connected: [ExternalScrobbleProvider] = []
+            for provider in ExternalScrobbleRegistry.providers where await provider.isConnected() {
+                connected.append(provider)
+            }
+            guard !connected.isEmpty else { return }
             guard let ref = await Self.makeRef(libraryId: libraryId, isSeries: isSeries,
                                                season: season, episode: episode,
                                                title: title, progress: progress) else { return }
-            for provider in ExternalScrobbleRegistry.providers {
-                guard await provider.isConnected() else { continue }
-                await op(ref, provider)
-            }
+            for provider in connected { await op(ref, provider) }
         }
     }
 

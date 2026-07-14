@@ -362,6 +362,11 @@ struct PlayerScreen: View {
     /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// A per-playback token for external-sync sessions: fresh per view instance (so a rewatch of the same
+    /// title scrobbles again) and re-minted on a genuine episode advance. A same-title recovery reload
+    /// (source hop / demote / retry) keeps it unchanged, so the scrobble coordinator's once-latches survive
+    /// and a completion recorded before the reload is never re-sent.
+    @State private var playbackSessionID = UUID().uuidString
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
     @State private var isSeekable = true
@@ -785,9 +790,10 @@ struct PlayerScreen: View {
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
                     // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
                     // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
-                    // creds. Duration is often still 0 at first frame, so this starts at 0% and later ticks /
-                    // the stop carry the real percentage.
-                    if let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration) }
+                    // creds. Live content is excluded (no scrobble meaning), mirroring the stop hooks. Duration
+                    // is often still 0 at first frame, so this starts at 0% and later ticks / the stop carry
+                    // the real percentage.
+                    if let m = curMeta, !effectivelyLive { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
                     // Lock Screen / Control Center transport. Relative mpv seek so the skip always works off
                     // the LIVE position (a captured currentTime would be stale in these long-lived targets).
                     NowPlayingCenter.wireCommands(
@@ -908,8 +914,9 @@ struct PlayerScreen: View {
                 NowPlayingCenter.update(title: curTitle, elapsed: currentTime, duration: duration, paused: b)
                 // External sync (Trakt) live scrobble pause/resume. Scrobble ONLY: this handler persists
                 // nothing else (no resume-point write). Additive + fail-soft + gated inside the coordinator;
-                // a no-op with empty creds. SIMKL has no live scrobble, so it is skipped by capability.
-                if let m = curMeta {
+                // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
+                // SIMKL has no live scrobble, so it is skipped by capability.
+                if let m = curMeta, !effectivelyLive {
                     if b { ScrobbleCoordinator.shared.playbackPaused(m, position: currentTime, duration: duration) }
                     else { ScrobbleCoordinator.shared.playbackResumed(m, position: currentTime, duration: duration) }
                 }
@@ -2094,6 +2101,12 @@ struct PlayerScreen: View {
             upNextSuppressed = false   // re-arm the Up Next band for the new episode
             appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
             lastReported = -1
+            // External sync (Trakt/SIMKL): a genuine episode advance is a new playback session, so re-mint
+            // the token and open the new episode's scrobble START here (the same-title recovery reloads that
+            // also flip hasStartedPlaying keep the old token and never reach this block). The first-frame
+            // hook re-fires with the same key + token and is deduped by the coordinator's start latch.
+            playbackSessionID = UUID().uuidString
+            ScrobbleCoordinator.shared.playbackStarted(es.meta, position: es.resume, duration: 0, sessionToken: playbackSessionID)
             switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume)
         }
     }

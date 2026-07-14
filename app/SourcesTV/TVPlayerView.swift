@@ -146,6 +146,11 @@ struct TVPlayerView: View {
     /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    /// A per-playback token for external-sync sessions. TVPlayerView is fresh per playback, so a rewatch of
+    /// the same title carries a new token and scrobbles again; the same-title recovery reloads (switchStream
+    /// hop, AVPlayer->libmpv demote, retry) keep it unchanged so the coordinator's once-latches survive and a
+    /// completion recorded before the reload is never re-sent as a duplicate history record.
+    @State private var playbackSessionID = UUID().uuidString
     @State private var appliedVolume = false   // D5: the persisted default-volume apply runs once per load (re-armed on source switch/reload)
     // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
@@ -595,7 +600,7 @@ struct TVPlayerView: View {
                     // the coordinator (owner profile only, provider connected, toggle on); a no-op with empty
                     // creds. Duration is often still 0 at first frame, so this starts at 0% and the stop carries
                     // the real percentage.
-                    if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration) }
+                    if !isCurrentLiveStream, let m = curMeta { ScrobbleCoordinator.shared.playbackStarted(m, position: d, duration: duration, sessionToken: playbackSessionID) }
                     fetchPooledSubtitles()          // community-subtitle pool (P2/P3), fail-soft + gated
                     uploadEmbeddedSubtitlesIfNeeded()   // best-effort pooling of the file's own text tracks (P4)
                     // Add-on subtitles were fetched only from the `duration` event, which a debrid direct-HTTP
