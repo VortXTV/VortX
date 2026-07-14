@@ -170,11 +170,17 @@ pub(crate) fn dispatch_json(json: &str) {
     let dto: ActionDto = match serde_path_to_error::deserialize(&mut deserializer) {
         Ok(dto) => dto,
         Err(error) => {
-            // Log the serde path + error ONLY, never the raw `json`: a malformed Authenticate
-            // envelope carries a plaintext email/password, so the payload must never reach the log
-            // sink (logcat/console). The path (e.g. `action.args.password`) + serde message are
-            // enough to locate the shape mismatch without echoing the credential.
-            log::error!("dispatch_json: unparseable action envelope, dropped silently: path={} error={}", error.path(), error);
+            // Log the serde path + error CATEGORY only, never the raw `json` NOR the error's Display:
+            // a malformed Authenticate envelope carries a plaintext email/password, and serde's own
+            // `invalid type`/`invalid value` messages echo the offending value inline, so neither the
+            // payload nor the Display may reach the log sink (logcat/console). The path (e.g.
+            // `action.args.password`) plus the category (Syntax / Data / Eof) locate the shape mismatch
+            // without echoing any value content.
+            log::error!(
+                "dispatch_json: unparseable action envelope, dropped silently: path={} category={:?}",
+                error.path(),
+                error.inner().classify(),
+            );
             return;
         }
     };
