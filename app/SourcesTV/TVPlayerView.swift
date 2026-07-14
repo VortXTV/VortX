@@ -3782,11 +3782,12 @@ struct TVPlayerView: View {
         // selection gone" report). Landing 5s short shows the actual ending and lets natural playback
         // reach EOF with all the finished semantics intact; a short clip keeps the plain full-range clamp.
         var scrubCeiling = duration > 30 ? duration - 5 : duration
-        // P2 (#76): a forward-only DV remux mount only holds bytes up to the produced edge (bufferedTime). A
-        // scrub past it lands in not-yet-produced bytes, no frame arrives, and the start/stall watchdog demotes
-        // the whole true-DV session to libmpv (losing DV + Atmos for the play). Cap forward scrubs at the
-        // buffered edge on a remux mount so a fast scrub can't knock a healthy DV title off its engine.
-        // Backward scrubs and non-remux sessions are unaffected (min() only lowers the upper bound).
+        // P2 (#76): the AUTHORITATIVE forward-only remux clamp now lives at the engine chokepoint
+        // (AVPlayerEngineController.seek(to:) caps every seek at producedEdgeSeconds), so a commit past the
+        // produced bytes can no longer strand the mount. This per-surface cap is kept ONLY to keep the visible
+        // scrub PREVIEW (the thumbnail + scrubTarget) from overshooting the buffered band; the actual seek is
+        // clamped by the engine regardless. bufferedTime is the player-buffered (loadedTimeRanges) edge, a
+        // conservative stand-in for the produced edge. Backward scrubs / non-remux sessions are unaffected.
         if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true, bufferedTime > currentTime {
             scrubCeiling = min(scrubCeiling, bufferedTime)
         }

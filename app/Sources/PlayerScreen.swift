@@ -2402,9 +2402,11 @@ struct PlayerScreen: View {
 
     /// Seek relative to the play head, clamped to the timeline, and report it. Shared by the on-screen skip
     /// buttons and the macOS keyboard shortcuts.
-    /// P2 (#76): cap a forward seek target at the produced edge (`bufferedTime`) on a forward-only DV remux
-    /// mount. Seeking past it lands in not-yet-produced bytes, no frame arrives, and the start/stall watchdog
-    /// demotes the whole true-DV session to libmpv. Backward seeks and non-remux sessions pass through unchanged.
+    /// P2 (#76): the AUTHORITATIVE forward-only remux clamp lives at the engine chokepoint
+    /// (AVPlayerEngineController.seek(to:) caps every seek at producedEdgeSeconds). This helper keeps the
+    /// REPORTED position (onSeek / lastReported) in step with what the engine will actually honor, so the
+    /// scrubber and saved progress don't claim a position past the produced edge. bufferedTime is the
+    /// player-buffered edge, a conservative stand-in. Backward seeks / non-remux sessions pass through unchanged.
     private func remuxClampedTarget(_ target: Double) -> Double {
         guard (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true,
               bufferedTime > currentTime, target > bufferedTime else { return target }

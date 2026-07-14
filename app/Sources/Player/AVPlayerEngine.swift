@@ -119,6 +119,28 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
     /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
+
+    /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
+    /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
+    /// the mount frameless and demote the whole true-DV session to libmpv. Prefer the item's seekable ranges
+    /// (the HLS EVENT playlist advertises produced media there); fall back to the loaded (player-buffered)
+    /// edge for the legacy loader delivery. 0 means "unknown / no produced edge yet" (callers do not clamp).
+    var producedEdgeSeconds: Double {
+        guard let item else { return 0 }
+        var edge = 0.0
+        for value in item.seekableTimeRanges {
+            let r = value.timeRangeValue
+            let end = (r.start + r.duration).seconds
+            if end.isFinite { edge = max(edge, end) }
+        }
+        if edge > 0 { return edge }
+        for value in item.loadedTimeRanges {
+            let r = value.timeRangeValue
+            let end = (r.start + r.duration).seconds
+            if end.isFinite { edge = max(edge, end) }
+        }
+        return edge
+    }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
@@ -313,7 +335,17 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // resume seek issued right after loadFile, which AVPlayer would otherwise drop).
         guard isReady else { pendingSeek = seconds; return }
         let dur = item?.duration.seconds ?? 0
-        let clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
+        var clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
+        // FORWARD-ONLY DV REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
+        // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
+        // / Control Center seek, chapter jumps, skip-pill / auto-skip) instead of each chrome clamping on its
+        // own — a seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
+        // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). Backward
+        // seeks and non-remux items are unaffected (min() only lowers the ceiling; a 0 edge is "unknown", skip).
+        if isRemuxMounted {
+            let edge = producedEdgeSeconds
+            if edge > 0, clamped > edge { clamped = edge }
+        }
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
         emit(MPVProperty.timePos, clamped)
         updateSubtitleOverlay(atClock: clamped)   // re-check the cue now; the observer is only ~4 Hz
