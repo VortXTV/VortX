@@ -309,7 +309,7 @@ final class FeaturedHeroModel: ObservableObject {
         guard Self.enrichmentCache[item.id] == nil, !enriching.contains(item.id) else { return }
         let candidates = Self.metaURLs(for: item)
         guard !candidates.isEmpty else {
-            NSLog("[Hero] no meta candidates for \(item.name) (id=\(item.id), type=\(item.type)) — id scheme not covered by Cinemeta or any installed meta add-on")
+            NSLog("%@", "[Hero] no meta candidates for \(item.name) (id=\(item.id), type=\(item.type)) — id scheme not covered by Cinemeta or any installed meta add-on")
             return
         }
         enriching.insert(item.id)
@@ -324,7 +324,7 @@ final class FeaturedHeroModel: ObservableObject {
                       let meta = decoded.meta,
                       meta.description != nil || meta.background != nil || meta.logo != nil else { continue }
                 let enriched = item.enriched(with: meta)
-                NSLog("[Hero] enriched \(item.name): rating=\(enriched.imdbRating ?? "-") year=\(enriched.releaseInfo ?? "-") runtime=\(enriched.runtime ?? "-") genres=\(enriched.genres.count) via \(url.host ?? "?")")
+                NSLog("%@", "[Hero] enriched \(item.name): rating=\(enriched.imdbRating ?? "-") year=\(enriched.releaseInfo ?? "-") runtime=\(enriched.runtime ?? "-") genres=\(enriched.genres.count) via \(url.host ?? "?")")
                 await MainActor.run {
                     Self.cacheEnrichment(enriched, for: item.id)
                     self?.enriching.remove(item.id)
@@ -337,7 +337,7 @@ final class FeaturedHeroModel: ObservableObject {
             }
             // No candidate resolved (every fetch failed / timed out / returned an empty meta) — free the
             // id to retry later, and log it so a persistently-bare hero is diagnosable on-device.
-            NSLog("[Hero] enrich FAILED for \(item.name) (id=\(item.id)) — all \(candidates.count) candidate fetch(es) failed/empty")
+            NSLog("%@", "[Hero] enrich FAILED for \(item.name) (id=\(item.id)) — all \(candidates.count) candidate fetch(es) failed/empty")
             await MainActor.run { self?.enriching.remove(item.id) }
         }
     }
