@@ -286,31 +286,42 @@ enum NodeServer {
         })();
         var __rb={busy:false,last:0,attempts:0};
         function __doRebind(reason){
-          if(__rb.busy) return;
+          if(__rb.busy){ w('[rebind]',['skip (rebind busy)']); return; }
           var now=Date.now();
           if(now-__rb.last<60000){ w('[rebind]',['skip (60s cooldown) '+reason]); return; }
           if(__rb.attempts>=3){ try{fs.writeFileSync(STUCKF,String(now))}catch(e){}; w('[rebind]',['gave up after 3 attempts this resume; wrote stuck marker']); return; }
           if(__servers.length===0){ w('[rebind]',['no captured listeners to rebind']); return; }
           __rb.busy=true; __rb.last=now; __rb.attempts++;
+          // Belt-and-suspenders: if neither a 'listening' nor an 'error' event ever fires (listen wedged),
+          // never leave busy latched or every later __doRebind short-circuits forever. Clear it after 15s so
+          // the next trigger can retry.
+          setTimeout(function(){ if(__rb.busy){ __rb.busy=false; w('[rebind]',['busy watchdog cleared']); } },15000);
           w('[rebind]',['rebinding '+__servers.length+' listener(s) attempt '+__rb.attempts+' ('+reason+')']);
           var pending=__servers.length;
           __servers.forEach(function(s){
             var a=s.__args||[];
+            var settle=function(){ if(--pending<=0) __rb.busy=false; };
+            // listen() reports failure ASYNC as an 'error' event (EADDRINUSE, the 11471 lesson) and success as
+            // a 'listening' event; a try/catch alone would miss both. Bind BOTH before listen so the port-latch
+            // rewrite + stuck-marker clear happen ONLY on a CONFIRMED bind, never optimistically (a failed
+            // re-listen must not delete the honest stuck marker).
+            var onErr=function(e){ w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]); settle(); };
+            var onListen=function(){
+              s.removeListener('error',onErr);   // drop the paired error handler so it cannot accumulate per cycle
+              w('[rebind]',['relistened on '+JSON.stringify(a)]);
+              try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
+              try{ fs.unlinkSync(STUCKF); }catch(e){}
+              settle();
+            };
             try{
-              s.close(function(){
-                try{
-                  // Attach the listen error handler BEFORE re-listening: listen() reports EADDRINUSE as an
-                  // async 'error' event, not a throw (the 11471 lesson), so a try/catch alone would miss it.
-                  s.once('error',function(e){ w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]); });
-                  s.listen.apply(s,a);
-                  w('[rebind]',['relistened on '+JSON.stringify(a)]);
-                  // Keep the Swift port latch truthful, and clear the stuck marker on a successful re-listen.
-                  try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
-                  try{ fs.unlinkSync(STUCKF); }catch(e){}
-                }catch(e){ w('[rebind-err]',[String(e)]); }
-                if(--pending<=0) __rb.busy=false;
-              });
-            }catch(e){ w('[rebind-err]',[String(e)]); if(--pending<=0) __rb.busy=false; }
+              // Drain bookkeeping ONLY: node fires close(cb) after ALL open connections drain, so re-listening
+              // INSIDE it wedges recovery whenever a connection is still open. close() nulls the listening handle
+              // synchronously, so listen() called immediately re-binds while the close is still draining.
+              s.close(function(){});
+              s.once('error',onErr);
+              s.once('listening',onListen);
+              s.listen.apply(s,a);
+            }catch(e){ w('[rebind-err]',[String(e)]); settle(); }
           });
         }
         function __selfCheck(reason){
@@ -321,12 +332,23 @@ enum NodeServer {
             __rb.attempts=0; try{fs.unlinkSync(STUCKF)}catch(e){}; res.resume();
           });
           req.on('error',function(e){
+            // Our own timeout handler below calls req.destroy(), and node synthesizes a follow-up 'error' with
+            // code ECONNRESET ('socket hang up') for that self-initiated close (node v18 socketCloseListener,
+            // no suppression for a self-destroy). Swallow it: a timeout is busy-but-alive (logged below), NEVER
+            // a reason to rebind. This is the 425cdec regression the old watchdog fell into.
+            if(req.__vxTimedOut) return;
             var c=e&&e.code;
-            if(c==='ECONNREFUSED'||c==='ECONNRESET'){ w('[rebind]',['loopback '+c+' on :'+(boundPort||11470)+' -> '+reason]); __doRebind(reason); }
+            // ECONNREFUSED is the ONLY unambiguous proof the listener is unbound. ECONNRESET is intentionally
+            // NOT a trigger: node emits it for the self-destroy above, and libuv also accept-and-closes (reset)
+            // under fd exhaustion while the server is alive-but-starved (see lines 146-152). If a device soak
+            // ever shows a genuine RST-flavored teardown, add a consecutive-RESET-across-events counter, never
+            // a single-shot RESET.
+            if(c==='ECONNREFUSED'){ w('[rebind]',['loopback '+c+' on :'+(boundPort||11470)+' -> '+reason]); __doRebind(reason); }
             else { w('[rebind]',['self-check '+c+'; busy-but-alive, not rebinding']); }
           });
           // A timeout means the listener accepted but is slow (busy under torrent load): leave it strictly alone.
-          req.on('timeout',function(){ try{req.destroy()}catch(_){}; w('[rebind]',['self-check timeout; busy-but-alive, not rebinding']); });
+          // Flag it BEFORE destroy so the ECONNRESET that destroy synthesizes is recognized and ignored above.
+          req.on('timeout',function(){ req.__vxTimedOut=true; try{req.destroy()}catch(_){}; w('[rebind]',['self-check timeout; busy-but-alive, not rebinding']); });
         }
 
         // Event-loop heartbeat: the decisive instrument for the "server froze / went
