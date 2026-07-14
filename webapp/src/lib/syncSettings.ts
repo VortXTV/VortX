@@ -187,7 +187,8 @@ export function mergeWebappSettingsIntoProfile(existing: unknown, s: Settings): 
       includeKeywords: s.requireWords,
       // maxQuality already holds the app's Max-quality tag (4K = 4000; 1080/720/0 unchanged), so this
       // round-trips to the app's `maxResolution` (iOSSettingsView Picker .tag(4000)) without translation.
-      maxResolution: s.maxQuality,
+      // legacy local 2160 = 4K, normalized on write.
+      maxResolution: s.maxQuality === 2160 ? 4000 : s.maxQuality,
       // #117 floor/quality-filter twins, using the EXACT doc field names the app reads (Profiles.swift
       // playbackPrefs) and writes (VortXSyncManager), so a web edit round-trips to Apple devices and the
       // dashboard. minResolution encodes 4K as 2160 (the app's Minimum-quality tag), NOT 4000.
