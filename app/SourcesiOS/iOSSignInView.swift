@@ -1,25 +1,34 @@
 import SwiftUI
 
-/// Touch sign-in for a Stremio account, on the StremioX design system (see Theme.swift).
-/// QR/link login is the default so passwords are entered on Stremio's own web flow; a password
-/// form remains available as a fallback. Either path seeds the engine (add-ons + library) the
-/// moment the account reports signed-in, so Home's rails populate without a cold relaunch.
+/// Touch sign-in on the VortX design system (see Theme.swift). VortX-account sign-in is the PRIMARY path
+/// (QR pairing, or a typed email/password form) so you sign into the account that OWNS your add-ons, library,
+/// and cross-device sync. Connecting a Stremio account (its QR/link flow, or a password) stays available as a
+/// secondary "bring your Stremio library" step. Mirrors tvOS LoginView, adapted for touch. Either Stremio
+/// path seeds the engine the moment the account reports signed-in; the VortX paths hydrate via adopt() and
+/// only need the sheet to close on success.
 struct iOSSignInView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
+    // The shared VortX account manager (the same singleton the app root injects). Observed here so the sheet
+    // can dismiss itself the moment a typed VortX sign-in flips isSignedIn; the QR joiner dismisses itself.
+    @ObservedObject private var vortxSync = VortXSyncManager.shared
     @Environment(\.dismiss) private var dismiss
 
-    @State private var mode: Mode = .link
+    @State private var mode: Mode = .vortx
     @State private var email = ""
     @State private var password = ""
     @State private var busy = false
+    // Pushes the typed VortX account form (the shared SyncSettingsView). A flag, not a Mode case, so the form
+    // is a real pushed screen (its own ScrollView, a back button) instead of nesting inside this ScrollView.
+    @State private var showVortXEmail = false
     // The sign-in handoff below MUST run exactly once. `@Published` re-publishes on every assignment
     // (true→true included), so without this latch the handler's own work re-fired `$isSignedIn` and
     // re-entered itself in an unbounded main-thread loop — the iOS/iPad "stuck on Signing in, dead
     // buttons, phone lags, then crashes" hang. (macOS has no main-thread watchdog so it rode it out.)
     @State private var didHandleSignIn = false
 
-    private enum Mode { case link, password }
+    // .vortx leads (QR joiner + a typed-form push); the Stremio link/password paths are the fallback.
+    private enum Mode { case vortx, stremioLink, stremioPassword }
 
     var body: some View {
         NavigationStack {
@@ -42,12 +51,8 @@ struct iOSSignInView: View {
                         #endif
                         wordmark
                         intro
-                        if mode == .link {
-                            LinkLoginView(account: account)
-                        } else {
-                            passwordCard
-                        }
-                        modeToggle
+                        surface
+                        secondaryActions
                         footnote
                     }
                     .frame(maxWidth: .infinity)
@@ -62,6 +67,12 @@ struct iOSSignInView: View {
             .inlineNavigationTitle()
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
             #endif
+            // Typed VortX account path: the shared SyncSettingsView (sign in / create / recover), reused
+            // AS-IS and pushed as its own screen so its ScrollView never nests inside this one. On success it
+            // flips VortXSyncManager.isSignedIn and the .onChange below closes the sheet. SyncSettingsView
+            // reads VortXSyncManager from the environment, which this sheet already inherits (same as the
+            // account / core objects it already uses).
+            .navigationDestination(isPresented: $showVortXEmail) { SyncSettingsView() }
         }
         // One place handles success for BOTH paths (password + QR/link): seed the engine with the
         // freshly written authKey, then dismiss. CoreBridge booted signed-out at launch, so without
@@ -88,6 +99,14 @@ struct iOSSignInView: View {
             }
             dismiss()
         }
+        // VortX typed-path success: SyncSettingsView signs the VortX account in and adopt() has already
+        // hydrated add-ons + library (the app-root onChange re-runs the degraded-engine check), so here we
+        // only close the sheet. Scoped to showVortXEmail so the QR joiner's own checkmark-then-dismiss is
+        // never preempted. .onChange fires only on a real transition, so an already-signed-in open (someone
+        // who opened this sheet just to add Stremio) never spuriously dismisses.
+        .onChange(of: vortxSync.isSignedIn) { signedIn in
+            if signedIn && showVortXEmail { dismiss() }
+        }
     }
 
     // MARK: Brand
@@ -98,13 +117,70 @@ struct iOSSignInView: View {
     }
 
     private var intro: some View {
-        Text(mode == .link
-             ? "Scan the QR code, or enter the code at link.stremio.com on another device to sign in."
-             : "Sign in to your Stremio account to pull in your add-ons and library.")
+        Text(introText)
             .font(Theme.Typography.body)
             .foregroundStyle(Theme.Palette.textSecondary)
             .multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var introText: String {
+        switch mode {
+        case .vortx:
+            return "Sign in to your VortX account to sync your add-ons, library, and settings across devices."
+        case .stremioLink:
+            return "Scan the QR code, or enter the code at link.stremio.com on another device to sign in."
+        case .stremioPassword:
+            return "Sign in to your Stremio account to pull in your add-ons and library."
+        }
+    }
+
+    // MARK: Sign-in surface (VortX primary, Stremio fallback)
+
+    /// The active credential surface. VortX (QR pairing) leads, mirroring tvOS LoginView; the typed VortX
+    /// form is reached via `secondaryActions` (pushed SyncSettingsView). Stremio link/password are secondary.
+    @ViewBuilder private var surface: some View {
+        switch mode {
+        case .vortx:
+            // The joiner runs VortXSyncManager.qrStart/qrPoll and dismisses this sheet itself on success
+            // (its own checkmark-then-dismiss), exactly as on tvOS.
+            VortXAccountJoinerView(onSignedIn: { dismiss() })
+                .frame(maxWidth: 460)
+        case .stremioLink:
+            LinkLoginView(account: account)
+        case .stremioPassword:
+            passwordCard
+        }
+    }
+
+    /// Path switches under the active surface, mirroring tvOS LoginView.secondaryActions. Clearing
+    /// account.signInError on each switch keeps a stale Stremio error from bleeding across paths.
+    @ViewBuilder private var secondaryActions: some View {
+        switch mode {
+        case .vortx:
+            VStack(spacing: Theme.Space.sm) {
+                Button { showVortXEmail = true } label: { Text("Use email and password") }
+                    .buttonStyle(ChipButtonStyle())
+                Button { account.signInError = nil; mode = .stremioLink } label: {
+                    Text("Connect a Stremio account instead")
+                }
+                .buttonStyle(ChipButtonStyle())
+            }
+        case .stremioLink:
+            VStack(spacing: Theme.Space.sm) {
+                Button { account.signInError = nil; mode = .stremioPassword } label: { Text("Use password instead") }
+                    .buttonStyle(ChipButtonStyle())
+                Button { account.signInError = nil; mode = .vortx } label: { Text("Sign in to VortX instead") }
+                    .buttonStyle(ChipButtonStyle())
+            }
+        case .stremioPassword:
+            VStack(spacing: Theme.Space.sm) {
+                Button { account.signInError = nil; mode = .stremioLink } label: { Text("Use QR code instead") }
+                    .buttonStyle(ChipButtonStyle())
+                Button { account.signInError = nil; mode = .vortx } label: { Text("Sign in to VortX instead") }
+                    .buttonStyle(ChipButtonStyle())
+            }
+        }
     }
 
     // MARK: Password fallback
@@ -157,17 +233,7 @@ struct iOSSignInView: View {
                         in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
     }
 
-    // MARK: Mode toggle + footnote
-
-    private var modeToggle: some View {
-        Button {
-            account.signInError = nil
-            mode = (mode == .link) ? .password : .link
-        } label: {
-            Text(mode == .link ? "Use password instead" : "Use QR code instead")
-        }
-        .buttonStyle(ChipButtonStyle())
-    }
+    // MARK: Footnote
 
     private var footnote: some View {
         Text("Signing in pulls your add-ons and library into the app. Your account stays on this device.")
