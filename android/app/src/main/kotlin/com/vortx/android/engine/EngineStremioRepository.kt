@@ -397,9 +397,9 @@ class EngineStremioRepository(
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
     }
 
-    override suspend fun installedAddons(): Result<List<InstalledAddon>> = runCatching {
+    override suspend fun installedAddons(): Result<List<InstalledAddon>> = withContext(Dispatchers.Default) { runCatching {
         EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
-    }
+    } }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
         val normalized = normalizeAddonUrl(url)
@@ -562,10 +562,10 @@ class EngineStremioRepository(
     private fun currentMetaDetail(): MetaDetail? =
         EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()))
 
-    override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = runCatching {
+    override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-    }
+    } }
 
     override suspend fun setVideoWatched(
         type: MediaType,
@@ -574,27 +574,27 @@ class EngineStremioRepository(
         season: Int?,
         episode: Int?,
         isWatched: Boolean,
-    ): Result<MetaDetail> = runCatching {
+    ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-    }
+    } }
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
-        runCatching {
+        withContext(Dispatchers.Default) { runCatching {
             StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
-        }
+        } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
-        runCatching {
+        withContext(Dispatchers.Default) { runCatching {
             StremioCoreNative.dispatch(EngineActions.addToLibrary(id, type.id, name, poster))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
-        }
+        } }
 
-    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = runCatching {
+    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
-    }
+    } }
 
     /// A pure local re-read (see [CatalogRepository.peekMeta]): no dispatch at all, just the same
     /// synchronous `meta_details` snapshot [currentMetaDetail] already uses after every S05 mutation --
@@ -633,7 +633,10 @@ class EngineStremioRepository(
         if (awaitOutcome is AuthWait.Failed) throw IllegalStateException(awaitOutcome.message)
         // Whether we won the race on ctx, timed out (a dropped/coalesced event -- current state is
         // best, the same fallback [loadField] uses), the actual signed-in-ness is the real check.
-        refreshAuthState()
+        // withContext(Dispatchers.Default): [refreshAuthState]'s ctx getState (JNI) + parseAuthState
+        // runs here on signIn's (Main) context -- move it off, matching the file's idiom. [start]'s
+        // restore call stays synchronous by design; the event-listener call already uses [engineScope].
+        withContext(Dispatchers.Default) { refreshAuthState() }
         if (_authState.value !is AuthState.SignedIn) {
             throw IllegalStateException("Sign-in failed. Check your connection and try again.")
         }
