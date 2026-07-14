@@ -33,22 +33,34 @@ enum MediaServerKind: String, Sendable, CaseIterable {
 /// `baseURL` is the server root the user pastes, e.g. `https://jelly.example.com` or `http://192.168.1.10:8096`.
 struct MediaServerConfig: Sendable, Equatable {
     let kind: MediaServerKind
-    let baseURL: String   // server root, no trailing path; scheme required
-    let apiKey: String    // Jellyfin/Emby API key (or Plex token)
+    let baseURL: String   // server root, no trailing path; scheme required (primary = urls.first)
+    let apiKey: String    // Jellyfin/Emby API key (or Plex per-server access token)
     let userId: String    // the Jellyfin user whose library to search (empty = server-wide where allowed)
+    /// Stable server identity (group ids, keychain accounts, sync merge key). Stamped on every hit so the
+    /// source list can badge + dedup across configs. Defaulted so the groundwork's 4-arg init still compiles.
+    let id: UUID
+    /// User-facing badge ("Living Room Plex"), used as the hit's `serverName` and the source group's label.
+    let displayName: String
+    /// Ordered connection candidates. Plex returns several (local / remote / relay); Jellyfin & Emby have one.
+    /// The provider tries them in order; `baseURL` is the primary (urls.first) for the single-URL path.
+    let urls: [String]
 
-    init(kind: MediaServerKind, baseURL: String, apiKey: String, userId: String) {
+    init(kind: MediaServerKind, baseURL: String, apiKey: String, userId: String,
+         id: UUID = UUID(), displayName: String = "", urls: [String] = []) {
         self.kind = kind
         self.baseURL = baseURL
         self.apiKey = apiKey
         self.userId = userId
+        self.id = id
+        self.displayName = displayName.isEmpty ? (URL(string: baseURL)?.host ?? kind.rawValue) : displayName
+        self.urls = urls.isEmpty ? [baseURL] : urls
     }
 }
 
 /// A matched media-server item with its resolved direct-play URL. The `streamURL` is the static
 /// direct-play endpoint (`?static=true`), i.e. the original file streamed without transcoding.
 struct MediaServerHit: Sendable, Equatable {
-    /// Which server this hit came from (so the future UI can label / dedup across configs).
+    /// Which server this hit came from (so the UI can label / dedup across configs).
     let kind: MediaServerKind
     let itemId: String
     let name: String
@@ -60,6 +72,13 @@ struct MediaServerHit: Sendable, Equatable {
     let resolution: Int?
     /// The playable direct-play URL (static stream of the original file).
     let streamURL: URL
+    /// The originating server's stable id + display name (badging + source group identity).
+    let serverId: UUID
+    let serverName: String
+    /// File size in bytes, when the server reports it (feeds the ranking size cap + display).
+    let sizeBytes: Int64?
+    /// The source file name, when the server reports it (feeds the quality parser: remux / HDR / codec tags).
+    let fileName: String?
 }
 
 enum MediaServerError: Error, Equatable {
@@ -130,20 +149,29 @@ enum MediaServerResolve {
 /// `MediaSources` entry. NOTE: spec-derived + compile-verified, NOT live-verified (needs a real Jellyfin server);
 /// inert until the play-path wiring calls it.
 actor JellyfinProvider: MediaServerProviding {
-    nonisolated let kind: MediaServerKind = .jellyfin
+    /// Jellyfin AND Emby share this REST surface (same `/Items` query, `AnyProviderIdEquals`, `/Videos/{id}/
+    /// stream?static=true`, and `X-Emby-Token` auth), so ONE actor serves both: the coordinator builds it for
+    /// `.jellyfin` and `.emby` alike and `kind` is taken from the config. This is the plan's "Jellyfin-family
+    /// core" without a near-empty second file.
+    nonisolated let kind: MediaServerKind
     private let base: String
     private let apiKey: String
     private let userId: String
+    private let serverId: UUID
+    private let serverName: String
     private let session: URLSession
 
     /// Builds nil from an unusable config so the coordinator can skip it. (The base is pre-normalized.)
     init?(config: MediaServerConfig) {
-        guard config.kind == .jellyfin,
+        guard config.kind == .jellyfin || config.kind == .emby,
               let base = MediaServerResolve.normalizedBase(config.baseURL),
               !config.apiKey.isEmpty else { return nil }
+        self.kind = config.kind
         self.base = base
         self.apiKey = config.apiKey
         self.userId = config.userId.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.serverId = config.id
+        self.serverName = config.displayName
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 15
         cfg.timeoutIntervalForResource = 30
@@ -169,19 +197,38 @@ actor JellyfinProvider: MediaServerProviding {
             case providerIds = "ProviderIds", mediaSources = "MediaSources"
         }
 
-        /// IMDb id from ProviderIds, regardless of the key's casing ("Imdb" is canonical; be lenient).
-        var imdbId: String? {
+        /// A provider id by key, case-insensitively ("Imdb"/"Tmdb" are canonical; be lenient).
+        func providerId(_ key: String) -> String? {
             guard let ids = providerIds else { return nil }
-            for (k, v) in ids where k.lowercased() == "imdb" { return v }
+            for (k, v) in ids where k.lowercased() == key.lowercased() { return v }
             return nil
         }
+        var imdbId: String? { providerId("imdb") }
+    }
+
+    /// Parse a VortX detail id into a Jellyfin `AnyProviderIdEquals` value + a client-side verifier. Supports
+    /// imdb (`tt...`) and tmdb (`tmdb:123`). The verifier re-checks the returned item client-side because the
+    /// `AnyProviderIdEquals` server filter has a known whole-library bug (never trust the server filter alone).
+    private static func providerQuery(for id: String) -> (equals: String, verify: @Sendable (Item) -> Bool)? {
+        let s = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("tt") { return ("imdb.\(s)", { $0.providerId("imdb") == s }) }
+        if s.hasPrefix("tmdb:") {
+            let n = String(s.dropFirst("tmdb:".count))
+            guard !n.isEmpty else { return nil }
+            return ("tmdb.\(n)", { $0.providerId("tmdb") == n })
+        }
+        return nil
     }
 
     private struct MediaSource: Decodable {
         let id: String?
         let container: String?
+        let path: String?
+        let size: Int64?
         let mediaStreams: [MediaStream]?
-        enum CodingKeys: String, CodingKey { case id = "Id", container = "Container", mediaStreams = "MediaStreams" }
+        enum CodingKeys: String, CodingKey {
+            case id = "Id", container = "Container", path = "Path", size = "Size", mediaStreams = "MediaStreams"
+        }
     }
     private struct MediaStream: Decodable {
         let type: String?   // "Video", "Audio", "Subtitle"
@@ -191,32 +238,33 @@ actor JellyfinProvider: MediaServerProviding {
 
     // MARK: Lookup
 
+    /// Find by a VortX provider id (imdb `tt...` or tmdb `tmdb:123`). The name is kept for the protocol; both
+    /// schemes are supported so a tmdb-only detail page still resolves against a tmdb-tagged library.
     func findByImdb(_ ttId: String, season: Int?, episode: Int?) async throws -> MediaServerHit? {
-        let tt = ttId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard tt.hasPrefix("tt") else { return nil }
+        guard let q = Self.providerQuery(for: ttId) else { return nil }
 
-        // Movie / standalone: query Movie+Episode by the imdb id and keep only the real match.
+        // Movie / standalone: query Movie+Episode by the provider id and keep only the real match.
         if season == nil || episode == nil {
             let items = try await queryItems([
                 URLQueryItem(name: "Recursive", value: "true"),
                 URLQueryItem(name: "IncludeItemTypes", value: "Movie,Episode"),
                 URLQueryItem(name: "Fields", value: "ProviderIds,Path,MediaSources"),
-                URLQueryItem(name: "AnyProviderIdEquals", value: "imdb.\(tt)"),
+                URLQueryItem(name: "AnyProviderIdEquals", value: q.equals),
                 URLQueryItem(name: "Limit", value: "50"),
             ])
-            guard let match = items.first(where: { $0.imdbId == tt }) else { return nil }
+            guard let match = items.first(where: q.verify) else { return nil }
             return try hit(for: match)
         }
 
-        // Series: resolve the SERIES by its imdb id, then its SxEy episode child.
+        // Series: resolve the SERIES by its provider id, then its SxEy episode child.
         let seriesItems = try await queryItems([
             URLQueryItem(name: "Recursive", value: "true"),
             URLQueryItem(name: "IncludeItemTypes", value: "Series"),
             URLQueryItem(name: "Fields", value: "ProviderIds"),
-            URLQueryItem(name: "AnyProviderIdEquals", value: "imdb.\(tt)"),
+            URLQueryItem(name: "AnyProviderIdEquals", value: q.equals),
             URLQueryItem(name: "Limit", value: "50"),
         ])
-        guard let series = seriesItems.first(where: { $0.imdbId == tt }) else { return nil }
+        guard let series = seriesItems.first(where: q.verify) else { return nil }
         // `self.` disambiguates the episode(inSeries:season:episode:) method from the `episode` Int? param.
         return try await self.episode(inSeries: series.id, season: season!, episode: episode!)
     }
@@ -283,8 +331,11 @@ actor JellyfinProvider: MediaServerProviding {
             throw MediaServerError.providerError("bad stream url")
         }
         let coarseType = (item.type?.lowercased() == "episode") ? "episode" : "movie"
+        // File name from the source Path (last component), so the quality parser sees remux / HDR / codec tags.
+        let fileName = source?.path.map { ($0 as NSString).lastPathComponent }
         return MediaServerHit(kind: kind, itemId: item.id, name: item.name ?? item.id, type: coarseType,
-                              container: container, resolution: resolution, streamURL: url)
+                              container: container, resolution: resolution, streamURL: url,
+                              serverId: serverId, serverName: serverName, sizeBytes: source?.size, fileName: fileName)
     }
 
     /// `GET /Videos/{itemId}/stream?static=true[&mediaSourceId=][&container=]&api_key=` — static direct play.
@@ -347,11 +398,9 @@ final class MediaServerCoordinator {
     func reload(configs: [MediaServerConfig]) {
         providers = configs.compactMap { config in
             switch config.kind {
-            case .jellyfin: return JellyfinProvider(config: config)
-            // TODO: Emby (shares this API, parameterize host header)
-            case .emby: return nil
-            // TODO: Plex (plex.tv auth + different API)
-            case .plex: return nil
+            // Jellyfin AND Emby share the same REST surface + X-Emby-Token auth, so one actor serves both.
+            case .jellyfin, .emby: return JellyfinProvider(config: config)
+            case .plex: return PlexProvider(config: config)
             }
         }
     }

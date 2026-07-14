@@ -167,7 +167,8 @@ final class MediaServerStore: ObservableObject {
     func configs() -> [MediaServerConfig] {
         servers.compactMap { record in
             guard let tok = token(for: record.id), !tok.isEmpty, let base = record.urls.first else { return nil }
-            return MediaServerConfig(kind: record.kind, baseURL: base, apiKey: tok, userId: record.userId)
+            return MediaServerConfig(kind: record.kind, baseURL: base, apiKey: tok, userId: record.userId,
+                                     id: record.id, displayName: record.name, urls: record.urls)
         }
     }
 
