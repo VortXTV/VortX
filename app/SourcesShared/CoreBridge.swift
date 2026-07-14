@@ -1488,6 +1488,80 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
     }
 
+    /// Re-point the engine Player to a KNOWN episode id SYNCHRONOUSLY, without waiting for that episode's
+    /// stream add-ons to re-answer into `meta_details`. The plain `loadEnginePlayer(for:)` scrapes the resident
+    /// stream groups for the `streamRequest`, so during a binge auto-advance (the next episode's streams have
+    /// not landed yet) it either grabs the PREVIOUS episode's request or no-ops on a slow add-on. The engine
+    /// keys `TimeChanged`'s video_id off `selected.stream_request.path.id`, so a stale request means every
+    /// progress tick and watched mark lands on the wrong episode (or un-advances the one MarkVideoAsWatched just
+    /// moved). This overload CONSTRUCTS the stream request from `videoId` (+ the add-on `base` carried from the
+    /// preload) and serialises the already-resolved `stream`, so the engine attributes to THIS episode from the
+    /// first tick. The meta request is still read from the resident `meta_details` (series-stable across a binge).
+    /// Returns true when the Player was dispatched; the caller uses that to set its progress-attribution gate.
+    @discardableResult
+    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?) -> Bool {
+        guard let data = stateData("meta_details"),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let metaItems = object["metaItems"] as? [[String: Any]] ?? []
+        guard let metaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
+                                 ?? metaItems.first)?["request"] else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (meta request missing); engine progress will not re-point")
+            return false
+        }
+        // The add-on base for the stream request: the preload-carried base first, else any resident stream
+        // group's base, else the meta's own base. The base does not drive video_id attribution (path.id does),
+        // but the engine's Player wants a well-formed ResourceRequest, so give it the truest base available.
+        let residentBase = (object["streams"] as? [[String: Any]])?
+            .compactMap { ($0["request"] as? [String: Any])?["base"] as? String }.first
+        guard let effectiveBase = base ?? residentBase ?? (metaRequest as? [String: Any])?["base"] as? String else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (no add-on base); engine progress will not re-point")
+            return false
+        }
+        // A stream the engine cannot deserialise (e.g. a usenet/nzb source that only carried name+description,
+        // no url / ytId / infoHash / sources / externalUrl) would be dropped engine-side while the caller still
+        // opens the attribution gate for videoId (a FALSE re-point confirmation). Degrade to nil exactly like
+        // the missing-base path: no-op here, the caller sets enginePlayerVideoId = nil, and the gated writers
+        // skip the wrong-episode engine write until the resident-scrape poll re-points.
+        let raw = rawStreamDict(stream)
+        let hasSource = raw["url"] != nil || raw["ytId"] != nil || raw["infoHash"] != nil
+            || raw["sources"] != nil || raw["externalUrl"] != nil
+        guard hasSource else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (stream has no source-bearing key); engine progress will not re-point")
+            return false
+        }
+        // extra: [] matches the shape loadMeta dispatches for a stream path (the engine accepts an empty extra).
+        let streamRequest: [String: Any] = [
+            "base": effectiveBase,
+            "path": ["resource": "stream", "type": "series", "id": videoId, "extra": []],
+        ]
+        let selected: [String: Any] = [
+            "stream": raw,
+            "streamRequest": streamRequest,
+            "metaRequest": metaRequest,
+            "subtitlesPath": NSNull(),
+        ]
+        dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
+        return true
+    }
+
+    /// Serialise a resolved `CoreStream` back to the engine's raw stream shape. `StreamSource` is untagged +
+    /// flattened, so the source fields (url / ytId / infoHash / fileIdx / sources / externalUrl) sit at the top
+    /// level exactly as they were decoded; re-emitting the same keys round-trips into the engine's `Stream`.
+    /// The library item keys on the META, not the specific stream (see `loadEnginePlayer(for:)`), so this only
+    /// needs to deserialise as a valid Stream, which any single source field satisfies.
+    private func rawStreamDict(_ s: CoreStream) -> [String: Any] {
+        var raw: [String: Any] = [:]
+        if let url = s.url { raw["url"] = url }
+        if let yt = s.ytId { raw["ytId"] = yt }
+        if let hash = s.infoHash { raw["infoHash"] = hash }
+        if let idx = s.fileIdx { raw["fileIdx"] = idx }
+        if let sources = s.sources { raw["sources"] = sources }
+        if let ext = s.externalUrl { raw["externalUrl"] = ext }
+        if let name = s.name { raw["name"] = name }
+        if let desc = s.description { raw["description"] = desc }
+        return raw
+    }
+
     /// Tear down the engine Player so a stale Player from a previous title cannot absorb the next title's
     /// TimeChanged ticks (downloads, paste-a-link, and direct CW resume play without loading their own
     /// Player). Call ONLY from a player cover's onClose, never a load path. Mirrors `unloadMeta`.
