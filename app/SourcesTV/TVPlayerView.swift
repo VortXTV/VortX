@@ -380,6 +380,10 @@ struct TVPlayerView: View {
         }
         .onAppear {
             VXProbeState.shared.setRoute("player")
+            // #130 mitigation: hold a short background assertion while a loopback (torrent) stream plays, so a
+            // quick app-switch away does not immediately suspend us and tear down the server listener. No-op
+            // for direct/debrid URLs; the in-node rebind is the real recovery for the long-background case.
+            LoopbackPlaybackAssertion.begin(for: url)
             // Mark the engine player-active so CoreBridge skips the library-branch In-Library re-decode of
             // the meta_details payload while the player is up (the detail page is not on screen). Cleared in
             // onDisappear. Depth-counted so a nested mount cannot clear it early.
@@ -463,6 +467,7 @@ struct TVPlayerView: View {
         }
         .onDisappear {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
+            LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
             hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
