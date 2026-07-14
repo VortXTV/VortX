@@ -77,11 +77,20 @@ final class TraktSyncEngine {
         if refreshing { lock.unlock(); return }
         if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
         refreshing = true
+        let gen = generation
         lock.unlock()
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
-                self.lock.lock(); self.refreshing = false; self.lastRefresh = Date(); self.lock.unlock()
+                self.lock.lock()
+                self.refreshing = false
+                // Only stamp lastRefresh when no disconnect/reset happened mid-refresh. A reset bumps
+                // generation and nulls lastRefresh; re-stamping it here would make refreshIfStale early-
+                // return for up to refreshInterval, silently delaying the reconnected account's first
+                // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
+                // pull immediately.
+                if self.generation == gen { self.lastRefresh = Date() }
+                self.lock.unlock()
             }
             guard await TraktAuth.shared.isSignedIn else { return }
             await self.drainQueue()
@@ -176,7 +185,15 @@ final class TraktSyncEngine {
         // NEXT account that signs in on this device (the cross-account contamination reset() prevents).
         // Drop the stale result; the live (empty) queue stands.
         guard generation == gen else { lock.unlock(); return }
-        pendingPushes = stillFailing
+        // Merge, do not overwrite: enqueue() may have appended pushes while our sends were awaiting
+        // (a watched-mark made mid-drain). Overwriting pendingPushes with stillFailing alone would
+        // silently drop those for a still-connected provider. Keep the survivors, then append anything
+        // added since the drained snapshot, deduped and capped as enqueue() does.
+        let appendedDuringDrain = pendingPushes.filter { !queue.contains($0) }
+        var merged = stillFailing
+        for push in appendedDuringDrain where !merged.contains(push) { merged.append(push) }
+        if merged.count > Self.queueCap { merged.removeFirst(merged.count - Self.queueCap) }
+        pendingPushes = merged
         let snapshot = pendingPushes
         lock.unlock()
         Self.saveQueue(snapshot)
