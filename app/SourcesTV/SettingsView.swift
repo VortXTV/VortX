@@ -95,7 +95,7 @@ struct SettingsView: View {
     @AppStorage("stremiox.notifyNewEpisodes") private var notifyNewEpisodes = true
     /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
     /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
-    private enum AccountFocus: Hashable { case vortx, logOut, importStremio }
+    private enum AccountFocus: Hashable { case vortx, importStremio }
     @FocusState private var accountFocus: AccountFocus?
 
     var body: some View {
@@ -223,41 +223,47 @@ struct SettingsView: View {
             // Log Out button below) is left-aligned and full-width, so the spatial focus engine's
             // downward beam stays in-column and never skips a row.
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                // Lead with the VortX account (the app's own E2E account + sync); the Stremio account sits beneath.
-                NavigationLink { SyncSettingsView() } label: {
-                    Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .focused($accountFocus, equals: .vortx)
-                if account.isSignedIn {
-                    // Identity is a non-focusable info row; Log Out is its OWN full-width row directly
-                    // BELOW it, in the same left-aligned column as every other account row. The old layout
-                    // stranded Log Out far-right after a Spacer(), so the spatial focus engine's downward
-                    // beam from the left-aligned rows missed it and the owner could not reach it on tvOS.
-                    // Stacking it in-column makes it a deterministic D-pad target (down lands on it, then
-                    // continues to the rows below). The .focusSection() on the enclosing VStack stays.
+                // LEAD with the VortX account: the app's own identity, shown prominently at the very top.
+                // Its state is `vortxSync` (api.vortx.tv), NOT the Stremio `account`. Stremio, Trakt, and
+                // SIMKL are optional and now live behind the Integrations screen.
+                if vortxSync.isSignedIn, let vx = vortxSync.account {
+                    // Identity is a non-focusable info row; the account/sync row below is the focus target.
                     HStack(spacing: Theme.Space.md) {
                         Image(systemName: "person.crop.circle.fill")
                             .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(account.email ?? "Signed in").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                            Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
+                            Text(vx.email).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                            Text("VortX · @\(vx.username) · end-to-end encrypted sync")
                                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                         }
                         Spacer(minLength: 0)
                     }
-                    Button { account.signOut(); core.logOut() } label: {
-                        Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                    NavigationLink { SyncSettingsView() } label: {
+                        Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
                     }
-                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .focused($accountFocus, equals: .logOut)
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .focused($accountFocus, equals: .vortx)
                 } else {
+                    Text("Sign in to VortX to sync your profiles, settings, and library across your devices.")
+                        .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    // LoginView is VortX-primary (its QR joiner defaults to the VortX account), so it is
+                    // labelled and routed as the VortX sign-in, correcting the old "Sign in to your Stremio
+                    // account" mislabel that opened this same VortX-primary screen.
                     NavigationLink { LoginView(account: account) } label: {
-                        Label("Sign in to your Stremio account", systemImage: "person.crop.circle")
+                        Label("Sign in to VortX", systemImage: "person.crop.circle")
                     }
                     .buttonStyle(PrimaryActionStyle())
+                    .focused($accountFocus, equals: .vortx)
+                    NavigationLink { SyncSettingsView() } label: {
+                        Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
                 }
+                // Optional imports and services that enrich VortX (Stremio, Trakt, SIMKL, Nuvio).
+                NavigationLink { IntegrationsSettingsView() } label: {
+                    Label("Integrations", systemImage: "square.stack.3d.up")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { StremioImportView() } label: {
                     Label("Import from Stremio", systemImage: "square.and.arrow.down.on.square")
                 }

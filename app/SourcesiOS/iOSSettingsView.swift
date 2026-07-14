@@ -390,23 +390,24 @@ struct iOSSettingsView: View {
 
     @ViewBuilder private var accountSection: some View {
         Section("Account") {
-            // Lead with the VortX account (the app's own end-to-end-encrypted account + sync); the Stremio
-            // account is shown beneath it as a connected source.
-            NavigationLink("VortX account & sync") { SyncSettingsView() }
-            if account.isSignedIn {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(account.email ?? String(localized: "Signed in"))
-                    Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
+            // LEAD with the VortX account: it is the app's own identity, shown prominently at the top.
+            // Stremio, Trakt, and SIMKL are optional and now live behind the Integrations screen.
+            VStack(alignment: .leading, spacing: 4) {
+                Text(vortxSync.isSignedIn ? (vortxSync.account?.email ?? String(localized: "Signed in")) : String(localized: "Not signed in"))
+                    .font(.headline)
+                if vortxSync.isSignedIn, let vx = vortxSync.account {
+                    Text("VortX · @\(vx.username) · end-to-end encrypted sync")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Sign in to VortX to sync your profiles, settings, and library across your devices.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Button("Log Out", role: .destructive) {
-                    account.signOut()
-                    core.logOut()
-                }
-            } else {
-                Button("Sign in to your Stremio account") { showSignIn = true }
             }
+            NavigationLink("VortX account & sync") { SyncSettingsView() }
+            // Optional imports and services that enrich VortX (Stremio, Trakt, SIMKL, Nuvio).
+            NavigationLink("Integrations") { IntegrationsSettingsView() }
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }

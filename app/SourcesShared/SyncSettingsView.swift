@@ -31,11 +31,9 @@ struct SyncSettingsView: View {
                 } else {
                     signedOut
                 }
-                // External sync providers (Trakt, SIMKL). Independent of the VortX account, so it is
-                // mounted here for BOTH signed-in and signed-out states, and hosted from this shared view
-                // so iOS and tvOS get it by construction (settings parity). Renders nothing until a
-                // provider's build credentials are present (dormant with empty creds).
-                ExternalServicesSettingsView()
+                // This screen is now VortX-account-only. The external sync providers (Trakt, SIMKL) moved
+                // to the Integrations screen (IntegrationsSettingsView), alongside the Stremio connect card,
+                // since they enrich VortX rather than belonging to the VortX account itself.
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
