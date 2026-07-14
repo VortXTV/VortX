@@ -63,7 +63,7 @@ def main() -> None:
     source = {
         "name": "VortX",
         "identifier": "tv.vortx.altstore",
-        "subtitle": "Native Apple Stremio client on stremio-core + libmpv.",
+        "subtitle": "Native streaming app for Apple, on stremio-core + libmpv.",
         "iconURL": ICON,
         "website": "https://vortx.tv",
         "tintColor": "C8A24B",
@@ -73,7 +73,7 @@ def main() -> None:
             "developerName": "Mamaclapper",
             "subtitle": "Stream movies and shows on iPhone, iPad, Apple TV, and Mac.",
             "localizedDescription": (
-                "VortX is a native, open-source Stremio client for Apple devices, built on the "
+                "VortX is a native, open-source streaming app for Apple devices, built on the "
                 "official stremio-core engine and the libmpv player. Multi-profile (free), HDR and "
                 "Dolby Vision tone-mapping, skip intro/outro, stream ranking, in-app add-ons, in-app "
                 "debrid keys, and more. Sideload-friendly: this source delivers one-tap updates so you "
