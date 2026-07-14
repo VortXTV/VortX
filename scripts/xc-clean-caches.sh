@@ -25,13 +25,15 @@ freed=0
 for r in "${ROOTS[@]}"; do
   [ -e "$r" ] || continue
   # Remove the derived-data dir that holds each compilation cache (any dir name).
+  # -mmin +30 guard: never touch a cache written in the last 30 min, so an
+  # in-progress build (which writes its cache continuously) is always safe.
   while IFS= read -r cc; do
     [ -n "$cc" ] || continue
     dd=$(dirname "$cc")
     rm -rf "$dd" 2>/dev/null && freed=$((freed + 1))
-  done < <(find "$r" -type d -name "CompilationCache.noindex" 2>/dev/null)
-  # Loose module caches too.
-  find "$r" -type d -name "ModuleCache.noindex" -exec rm -rf {} + 2>/dev/null
+  done < <(find "$r" -type d -name "CompilationCache.noindex" -mmin +30 2>/dev/null)
+  # Loose module caches too (same age guard).
+  find "$r" -type d -name "ModuleCache.noindex" -mmin +30 -exec rm -rf {} + 2>/dev/null
 done
 
 echo "xc-clean-caches: swept $freed Xcode cache dir(s)"
