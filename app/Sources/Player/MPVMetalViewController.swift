@@ -164,6 +164,28 @@ final class MPVMetalViewController: PlatformViewController {
         super.viewDidLayout()
         layoutDrawable()
     }
+
+    /// macOS: `viewDidLoad` runs BEFORE the view is attached to a window, so `view.window` is nil there and
+    /// the Metal layer's `contentsScale` was seeded from `NSScreen.main` (a guess) with no drawable pinned to
+    /// a real backing yet. For the full-window main player that is fine (it mounts straight into the window),
+    /// but an EMBEDDED instance (the ambient Home/Detail hero trailer clip, which is the ONLY non-full-window
+    /// libmpv surface on Mac) mounted inside a scrolling SwiftUI container could be left with a stale
+    /// contentsScale / an unsized drawable and never present a frame - the "hero trailer autoplay is broken on
+    /// macOS" report (works on iPhone/tvOS). `viewDidAppear` fires once the view is in the window hierarchy, so
+    /// re-sync the backing scale to the ACTUAL window and re-pin the drawable there so the embedded clip
+    /// renders. Idempotent (a no-op when scale + size are already current). iOS/tvOS use the UIKit path and
+    /// are untouched.
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard let window = view.window else { return }
+        let scale = window.backingScaleFactor
+        if metalLayer.contentsScale != scale {
+            metalLayer.contentsScale = scale
+            // Force layoutDrawable to re-pin the drawable against the corrected backing scale.
+            lastLaidOutSize = .zero
+        }
+        layoutDrawable()
+    }
     #endif
 
     /// Pin the Metal drawable to the current bounds on every layout (the platform layout callbacks

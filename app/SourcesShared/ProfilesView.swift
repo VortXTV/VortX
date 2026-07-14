@@ -63,6 +63,11 @@ struct ProfilePickerView: View {
     @State private var pinTarget: UserProfile?
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
+    #if os(macOS)
+    /// Measured width of the macOS picker's horizontal scroll viewport, used to pin the card row's
+    /// minWidth so a short row centers instead of sitting hard-left (see the picker body below).
+    @State private var pickerRowWidth: CGFloat = 0
+    #endif
 
     var body: some View {
         ZStack {
@@ -73,13 +78,48 @@ struct ProfilePickerView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                 // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
                 // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
+                // macOS: the picker presents as a `.sheet`, which sizes to content; a horizontal ScrollView
+                // has no intrinsic width, so the sheet collapsed to ~one card and clipped the second avatar
+                // at the right edge (the Mac "Who's watching? cuts off the second avatar" report). The
+                // explicit `.frame` below gives the sheet a real width so a few cards fit, and this same
+                // horizontal ScrollView still scrolls when N avatars exceed it.
                 #if os(tvOS)
                 profileCards
+                #elseif os(macOS)
+                // Center the row when it is narrower than the viewport so a couple of avatars sit balanced
+                // rather than pinned hard-left with trailing dead space. A flexible `maxWidth: .infinity`
+                // frame is a NO-OP along a horizontal ScrollView's unbounded scroll axis (it collapses to the
+                // row's ideal width), so real centering needs the actual viewport width: measure it via a
+                // background GeometryReader and pin the row's minWidth to it. When the avatars exceed that
+                // width the row's intrinsic width wins and it scrolls, as before.
+                ScrollView(.horizontal, showsIndicators: false) {
+                    profileCards
+                        .frame(minWidth: pickerRowWidth, alignment: .center)
+                }
+                .background(GeometryReader { proxy in
+                    Color.clear
+                        .onAppear { pickerRowWidth = proxy.size.width }
+                        .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
+                })
                 #else
-                ScrollView(.horizontal, showsIndicators: false) { profileCards }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    // iOS: the horizontal scroll is the systemic S1b fix so 3+ cards do not clip both phone
+                    // edges. The row sits leading and scrolls; no flexible-width centering frame (it would be
+                    // a no-op along the scroll axis anyway).
+                    profileCards
+                }
                 #endif
             }
             .padding(Theme.Space.screenInset)
+            // macOS sheet sizing: without a concrete width the sheet adopts the horizontal ScrollView's
+            // tiny ideal width and clipped the avatars. Open wide enough for ~3 cards (230pt each + xl gaps),
+            // capped so a big display never blows the sheet up; the ScrollView carries any overflow.
+            // idealWidth stays UNDER the app's 900pt minimum window width (StremioXiOSApp.swift:176) because
+            // AppKit does not clamp a sheet to its parent window: a 940pt ideal overhung both edges of a
+            // minimum-width window. 860 still fits 3 cards (690pt) plus gaps and insets.
+            #if os(macOS)
+            .frame(minWidth: 760, idealWidth: 860, maxWidth: 1100, minHeight: 520, idealHeight: 600)
+            #endif
             // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
             // remote, focus will not enter an overlay while anything beneath stays focusable).
             .disabled(pinTarget != nil)

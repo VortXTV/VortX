@@ -133,9 +133,18 @@ struct MacRootPlayerOverlay: ViewModifier {
                 .opacity(host.content == nil ? 1 : 0)
                 .disabled(host.content != nil)
             if let player = host.content {
-                player
-                    .ignoresSafeArea()
-                    .background(MacPlayerChromeHider())
+                // Full-bleed black base UNDER the player, spanning every edge including the safe-area /
+                // titlebar strip. In native fullscreen the window's (light) background otherwise bled
+                // through wherever the player did not paint - the "white gap bottom-left" report. A black
+                // backdrop across the whole window makes the surface read edge-to-edge no matter what the
+                // player view's own bounds are, so nothing but video (or letterbox black) ever shows.
+                ZStack {
+                    Color.black.ignoresSafeArea(.all)
+                    player
+                        .ignoresSafeArea(.all)
+                }
+                .ignoresSafeArea(.all)
+                .background(MacPlayerChromeHider())
             }
         }
     }

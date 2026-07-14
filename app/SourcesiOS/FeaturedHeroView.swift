@@ -1,6 +1,8 @@
 import SwiftUI
 #if canImport(UIKit)
 import UIKit   // UIScreen / UIDevice for the screen-proportional hero band height
+#elseif canImport(AppKit)
+import AppKit  // NSApplication / NSScreen for the window-proportional macOS hero band height
 #endif
 
 /// The ambient featured hero shown at the top of Home, Library, and Discover — the touch/Mac twin of
@@ -58,7 +60,22 @@ struct FeaturedHeroView: View {
     /// a huge window never becomes all hero.
     static var heroHeight: CGFloat {
         #if os(macOS)
-        return 520
+        // The Home billboard must COMMAND the window (owner ask: a fixed 520 band read as a small strip in
+        // a tall Mac window, leaving the page looking empty). Size off the HOSTING window's content height so
+        // the hero takes ~56% of the visible window, with a floor so a short window still shows a real
+        // billboard and a cap so an enormous display never turns the whole page into hero.
+        // Prefer `mainWindow`: a macOS sheet (the Who's-watching picker and other covers present as sheets on
+        // Mac, ProfilesView.swift) becomes KEY while up but never MAIN, so keying off keyWindow made the ~7s
+        // hero rotation recompute the band from the ~600pt sheet and snap the whole browse column to the 520
+        // floor and back. mainWindow is the app window under the sheet, so it stays stable. Fall back to
+        // keyWindow, then the first visible NON-sheet window, then the main screen's visible height (menu-bar
+        // excluded) before any window resolves (launch / splash).
+        let windowHeight = NSApplication.shared.mainWindow?.contentLayoutRect.height
+            ?? NSApplication.shared.keyWindow?.contentLayoutRect.height
+            ?? NSApplication.shared.windows.first(where: { $0.isVisible && !$0.isSheet })?.contentLayoutRect.height
+            ?? NSScreen.main?.visibleFrame.height
+            ?? 900
+        return min(900, max(520, windowHeight * 0.56))
         #else
         // Size off the app WINDOW, not the physical screen: in iPad Split View / Slide Over the window is
         // shorter/narrower than UIScreen.main, so keying the band off the whole screen would let the

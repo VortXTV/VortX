@@ -234,6 +234,16 @@ struct PlayerScreen: View {
     @State private var macSleepActivity: NSObjectProtocol?
     /// macOS player keyDown monitor for Space/Left/Right; see installMacKeyMonitor.
     @State private var macKeyMonitor: Any?
+    /// Tracks whether the player's window is in native macOS fullscreen, so the toolbar glyph flips
+    /// between enter/exit. Kept in sync by NSWindow's will-enter / will-exit fullscreen notifications.
+    @State private var macIsFullScreen = false
+    /// Observers for the fullscreen-state notifications, torn down on disappear.
+    @State private var macFullScreenObservers: [NSObjectProtocol] = []
+    /// Whether the player's window was ALREADY in native fullscreen when the player opened. If so the app
+    /// was fullscreen for browsing (the user's own choice) and we leave it that way on teardown; if not, a
+    /// fullscreen the PLAYER itself entered is dropped on close so the viewer lands back in windowed browse.
+    /// See `exitPlayerFullScreenIfNeeded` (item 6).
+    @State private var macWasFullScreenAtOpen = false
     #endif
     @State private var panel: Panel?
     @State private var panelRows: [Row] = []   // cached so a 4×/s clock tick doesn't re-rank a thousand sources
@@ -614,6 +624,13 @@ struct PlayerScreen: View {
             Button { leavePlayback() } label: { EmptyView() }
                 .keyboardShortcut(.cancelAction)
                 .hidden()
+            // Fullscreen: Ctrl-Cmd-F, the standard macOS fullscreen shortcut. A MODIFIED key equivalent, so
+            // (unlike the unmodified Space/arrows) it reaches this hidden SwiftUI button rather than being
+            // swallowed by the Metal NSView's keyDown:, the same pattern the Esc/Cmd-[ handlers rely on, so
+            // this never has to touch the installMacKeyMonitor NSEvent monitor.
+            Button { toggleMacFullScreen() } label: { EmptyView() }
+                .keyboardShortcut("f", modifiers: [.command, .control])
+                .hidden()
             // Space/Left/Right are handled by an NSEvent keyDown monitor (installMacKeyMonitor), not
             // SwiftUI .keyboardShortcut: AppKit gives unmodified arrows+Space to the Metal NSView's
             // keyDown:, so hidden-button shortcuts never fired. The Esc/.cancelAction handler above stays.
@@ -673,6 +690,7 @@ struct PlayerScreen: View {
             macSleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleDisplaySleepDisabled,
                                                                      reason: "StremioX video playback")
             installMacKeyMonitor()
+            observeMacFullScreen()
             #endif
         }
         .onDisappear {
@@ -694,6 +712,7 @@ struct PlayerScreen: View {
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
             removeMacKeyMonitor()
+            unobserveMacFullScreen()
             #endif
         }
         .confirmationDialog("Play in another app", isPresented: $showExternalChooser,
@@ -969,6 +988,7 @@ struct PlayerScreen: View {
                 sleepAtEpisodeEnd = false
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
+                exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
@@ -976,6 +996,7 @@ struct PlayerScreen: View {
                 // rolls to the next episode on its own without yanking the viewer out of the credits.
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
+                exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
                 onClose()
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
                 // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
@@ -993,6 +1014,7 @@ struct PlayerScreen: View {
                 if let m = curMeta, !(m.type == "series" && episodes.isEmpty && !hasNext) { core.finishedWatching(libraryId: m.libraryId) }
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
+                exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
                 onClose()
             }
         default: break
@@ -2088,6 +2110,7 @@ struct PlayerScreen: View {
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
                 if autoAdvance {
                     if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the finished episode's engine (no-op for direct/debrid)
+                    exitPlayerFullScreenIfNeeded()   // item 6: land back in windowed browse, not stranded fullscreen
                     onClose()            // nothing playable on auto-advance: leave, don't hang on a spinner
                 }
                 else { loadErrorMsg = "Couldn't load that episode"; withAnimation { loadFailed = true } }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
@@ -2237,6 +2260,16 @@ struct PlayerScreen: View {
                                        : "arrow.up.left.and.arrow.down.right", label: "Toggle fullscreen") {
                 forcedLandscape.toggle()
                 coordinator.player?.setOrientation(landscape: forcedLandscape)
+                scheduleHide()
+            }
+            #endif
+            #if os(macOS)
+            // Real in-app fullscreen toggle (item 5): drive the window into native macOS fullscreen so the
+            // video goes truly edge-to-edge. Discoverable button here + the standard Ctrl-Cmd-F shortcut
+            // (the hidden handler lives in mpvBody). The glyph flips to match the current window state.
+            iconButton(macIsFullScreen ? "arrow.down.right.and.arrow.up.left"
+                                       : "arrow.up.left.and.arrow.down.right", label: "Toggle fullscreen") {
+                toggleMacFullScreen()
                 scheduleHide()
             }
             #endif
@@ -3785,6 +3818,8 @@ struct PlayerScreen: View {
         // guardrail). No-op when the disk cache is off or empty. Genuine-exit path only; additive,
         // does not touch player teardown.
         DiskCacheSetting.clearCache()
+        // If the player put the window into fullscreen, drop back to windowed browse on the way out (item 6).
+        exitPlayerFullScreenIfNeeded()
         onClose()
     }
 
@@ -3820,6 +3855,69 @@ struct PlayerScreen: View {
     private func removeMacKeyMonitor() {
         if let m = macKeyMonitor { NSEvent.removeMonitor(m); macKeyMonitor = nil }
     }
+
+    /// The window hosting the player. The Mac player is rendered at the app window's root via
+    /// MacRootPlayerOverlay, so the key window (falling back to the main window) is that window.
+    private var macPlayerWindow: NSWindow? { NSApp.keyWindow ?? NSApp.mainWindow }
+
+    /// Toggle native macOS fullscreen for the player window (item 5). Truly edge-to-edge: the window's
+    /// content is already black + `.ignoresSafeArea()`, and MacRootPlayerOverlay paints a full-bleed black
+    /// backdrop behind the player so no window background bleeds through at any edge in fullscreen.
+    private func toggleMacFullScreen() {
+        macPlayerWindow?.toggleFullScreen(nil)
+    }
+
+    /// Player-teardown vs fullscreen interplay (item 6). If the PLAYER put the window into native fullscreen
+    /// (the app was NOT already fullscreen when the player opened), drop back out of fullscreen as the player
+    /// closes, so the viewer lands in the normal windowed browse UI instead of a stranded fullscreen window
+    /// whose only fullscreen affordance (the in-player toggle) just vanished with the player chrome. Because
+    /// Esc / ⌘. is the `.cancelAction` close, this also makes Esc do the intuitive thing in a SINGLE press:
+    /// it closes the player AND returns from fullscreen, so the close action and the native "Esc exits
+    /// fullscreen" expectation stop fighting (chosen over a two-press Esc as the simplest correct behavior).
+    /// If the app was ALREADY fullscreen when the player opened, that was the user's own browse choice, so we
+    /// leave the window fullscreen. Called from the genuine-exit chokes (leavePlayback + the terminal EOF /
+    /// auto-advance-out closes), never from onDisappear (a spurious SwiftUI teardown must not yank fullscreen
+    /// mid-play, the same reason the torrent engine is not freed there). No-op on non-macOS.
+    private func exitPlayerFullScreenIfNeeded() {
+        guard !macWasFullScreenAtOpen,
+              macPlayerWindow?.styleMask.contains(.fullScreen) == true else { return }
+        macPlayerWindow?.toggleFullScreen(nil)
+    }
+
+    /// Keep `macIsFullScreen` in sync with the window so the toolbar glyph reflects the real state, whether
+    /// fullscreen was toggled from our button, the shortcut, or the system green button / menu item.
+    private func observeMacFullScreen() {
+        // Re-entry guard mirroring installMacKeyMonitor: SwiftUI can fire onAppear twice with no intervening
+        // onDisappear, and without this the second call would overwrite `macFullScreenObservers`, orphaning
+        // the first observer pair for the process lifetime (they keep writing a defunct view's @State and
+        // unobserveMacFullScreen can no longer remove them).
+        guard macFullScreenObservers.isEmpty else { return }
+        let window = macPlayerWindow
+        let alreadyFullScreen = window?.styleMask.contains(.fullScreen) ?? false
+        macIsFullScreen = alreadyFullScreen
+        macWasFullScreenAtOpen = alreadyFullScreen
+        let nc = NotificationCenter.default
+        // Scope the observers to the player's own window via `object:` so an auxiliary window's fullscreen
+        // transition (a Settings or About window) does not flip the player glyph. When the window is not yet
+        // resolvable (object nil observes all windows), the closure's identity check is the fallback guard.
+        let enter = nc.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { note in
+            guard window == nil || (note.object as? NSWindow) === window else { return }
+            macIsFullScreen = true
+        }
+        let exit = nc.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { note in
+            guard window == nil || (note.object as? NSWindow) === window else { return }
+            macIsFullScreen = false
+        }
+        macFullScreenObservers = [enter, exit]
+    }
+
+    private func unobserveMacFullScreen() {
+        for token in macFullScreenObservers { NotificationCenter.default.removeObserver(token) }
+        macFullScreenObservers = []
+    }
+    #else
+    /// No native window fullscreen off macOS; the genuine-exit chokes call this unconditionally.
+    private func exitPlayerFullScreenIfNeeded() {}
     #endif
 
     private func refreshTracks() {
