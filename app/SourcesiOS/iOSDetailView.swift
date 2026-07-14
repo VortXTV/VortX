@@ -2915,6 +2915,10 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
+    /// Smart Source Selection (Lane A) auto-pick: when `SourcePreferences.autoPickBest` is on, this page
+    /// resolves + plays the best source on appear instead of making the viewer pick from the list. Guarded so
+    /// it fires exactly once per appearance; backing out of the player reveals the full list (the escape hatch).
+    @State private var didAutoPick = false
     /// Owns this episode's source-list assembly + ranking OFF the SwiftUI render path (see
     /// `SourceListModel`): the body reads only the published output, scoped to this episode's stream
     /// id, so CoreBridge bumps while the list is open no longer rebuild it per body eval.
@@ -3011,6 +3015,14 @@ struct iOSEpisodeStreams: View {
             let hasThisEpisodeStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == video.id } ?? false
             if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
                 core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
+            }
+            // Smart Source Selection (Lane A): auto-pick my best source. Fires once per appearance and only
+            // when the viewer opted in; reuses `loadEpisodeStream` (the SAME settle + StreamRanking.best +
+            // resume + torrent-prime resolve the in-player Next/Prev uses), then presents the player, so this
+            // adds no new playback logic. A viewer who backs out of the player lands on the full source list.
+            if SourcePreferences.shared.autoPickBest, !didAutoPick {
+                didAutoPick = true
+                Task { await autoPickAndPlayEpisode() }
             }
         }
         .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel() }
@@ -3236,6 +3248,25 @@ struct iOSEpisodeStreams: View {
         let fallback = labeledBest.playableURL != nil ? labeledBest : candidates.first(where: { $0.playableURL != nil })
         guard let best = fallback, let url = best.playableURL else { return }
         await play(best, url: url, explicit: false)   // auto Watch fallback: may hop normally
+    }
+
+    /// Smart Source Selection (Lane A): resolve this episode's best source and present the player, the
+    /// auto-pick-my-best entry. Reuses `loadEpisodeStream` (full settle gate + `StreamRanking.best` + resume
+    /// + engine/torrent prime), so it introduces no new resolve or playback logic; it only builds the same
+    /// `PlayerLaunch` a manual Watch would and presents it. `wasExplicitPick` stays false (this is an
+    /// auto-pick, so the player keeps its silent-hop-on-timeout behavior). No-op if a cover is already up.
+    private func autoPickAndPlayEpisode() async {
+        guard presentation == nil, !preparing else { return }
+        preparing = true
+        let resolved = await loadEpisodeStream(video.id)
+        preparing = false
+        guard presentation == nil, let e = resolved else { return }   // a cover opened, or nothing resolved
+        presentation = .player(iOSDetailView.PlayerLaunch(
+            url: e.url, title: e.title, headers: e.stream.requestHeaders,
+            resume: e.resume, meta: e.meta,
+            qualityText: StreamRanking.signature(e.stream),
+            bingeGroup: e.stream.behaviorHints?.bingeGroup,
+            isTorrent: e.stream.isTorrent))
     }
 
     #if !os(tvOS)

@@ -73,6 +73,13 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var minResolution: Int? = nil          // 0 = no floor, else 720 / 1080 / 2160 (#117)
         var hideUnknownResolution: Bool? = nil // drop sources with no recognizable resolution (#117)
         var preferredAudioOnly: Bool? = nil    // drop clearly-foreign-audio releases, best effort (#117)
+        // Smart Source Selection (Lane A). Optional so older rosters decode; nil means "leave the flat
+        // vortx.streaming.* keys as they are". Mirrored to those keys in applyPlayback and re-read by
+        // SourcePreferences.reload() on every profile switch, exactly like the filters above, so a Kids
+        // profile keeps its own parent-set Avoid words + Avoid behavior instead of inheriting an adult's.
+        var preferKeywords: String? = nil      // Prefer (boost) words
+        var avoidBehavior: String? = nil       // "hide" (drop) or "rank" (demote-but-visible)
+        var autoPickBest: Bool? = nil          // play the top-ranked source straight away
     }
 
     var hasPin: Bool { !(pin ?? "").isEmpty }
@@ -455,7 +462,10 @@ final class ProfileStore: ObservableObject {
             maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB,
             minResolution: (d["minResolution"] as? Int) ?? base?.minResolution,
             hideUnknownResolution: d["hideUnknownResolution"] as? Bool ?? base?.hideUnknownResolution,
-            preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly)
+            preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly,
+            preferKeywords: d["preferKeywords"] as? String ?? base?.preferKeywords,
+            avoidBehavior: d["avoidBehavior"] as? String ?? base?.avoidBehavior,
+            autoPickBest: d["autoPickBest"] as? Bool ?? base?.autoPickBest)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
@@ -510,7 +520,10 @@ final class ProfileStore: ObservableObject {
             maxFileSizeGB: SourcePreferences.shared.maxFileSizeGB,
             minResolution: SourcePreferences.shared.minResolution,
             hideUnknownResolution: SourcePreferences.shared.hideUnknownResolution,
-            preferredAudioOnly: SourcePreferences.shared.preferredAudioOnly)
+            preferredAudioOnly: SourcePreferences.shared.preferredAudioOnly,
+            preferKeywords: SourcePreferences.shared.preferKeywords,
+            avoidBehavior: SourcePreferences.shared.avoidBehavior,
+            autoPickBest: SourcePreferences.shared.autoPickBest)
     }
 
     /// Write `profile`'s playback preferences into the flat UserDefaults keys that
@@ -602,6 +615,17 @@ final class ProfileStore: ObservableObject {
         else if resetUnset { d.set(SourcePreferences.defaultHideUnknownResolution, forKey: SourcePreferences.hideUnknownResKey) }
         if let v = p?.preferredAudioOnly { d.set(v, forKey: SourcePreferences.preferredAudioKey) }
         else if resetUnset { d.set(SourcePreferences.defaultPreferredAudioOnly, forKey: SourcePreferences.preferredAudioKey) }
+        // Smart Source Selection (Lane A): Prefer words, Avoid behavior, Auto-pick. Per-profile like every
+        // filter above, so a SWITCH captures-before-switch (via capturePlayback) and resolves an unset field
+        // to SourcePreferences' documented default instead of inheriting the previous profile's value. This
+        // is what makes a global avoidBehavior="rank" no longer silently flip a Kids profile's parent-set
+        // Avoid words from hard hides to visible demoted rows (the Lane A blocker).
+        if let v = p?.preferKeywords { d.set(v, forKey: SourcePreferences.preferKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultPreferKeywords, forKey: SourcePreferences.preferKey) }
+        if let v = p?.avoidBehavior { d.set(v, forKey: SourcePreferences.avoidBehaviorKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultAvoidBehavior, forKey: SourcePreferences.avoidBehaviorKey) }
+        if let v = p?.autoPickBest { d.set(v, forKey: SourcePreferences.autoPickBestKey) }
+        else if resetUnset { d.set(SourcePreferences.defaultAutoPickBest, forKey: SourcePreferences.autoPickBestKey) }
         // Stream scores embed the preferred audio language (the language demotion) and source-type
         // tier weights, so any flat-key change here must drop the memoized scores. NOTE: the
         // SourcePreferences singleton is re-synced (reload()) only on an actual profile SWITCH

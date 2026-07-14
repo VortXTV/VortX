@@ -748,6 +748,12 @@ struct iOSSettingsView: View {
                 Label("Apply a quality preset", systemImage: "wand.and.stars")
             }
             .tint(Theme.Palette.accent)
+            // Smart Source Selection (Lane A): the chip panel (Prefer / Only / Avoid + Avoid behavior +
+            // Auto-pick + live preview) binds directly to the SourcePreferences singleton, the same
+            // direct-singleton pattern the rest of this section uses.
+            SourceFilterChipsView(prefs: sourcePrefs)
+                .listRowInsets(EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md,
+                                          bottom: Theme.Space.sm, trailing: Theme.Space.md))
             Toggle("Use add-on ranking order", isOn: $sourcePrefs.useAddonOrder)
                 .tint(Theme.Palette.accent)
 
@@ -789,29 +795,17 @@ struct iOSSettingsView: View {
                 Text("Balanced").tag("balanced")
                 Text("Strict").tag("strict")
             }
-            TextField("Hide words", text: $sourcePrefs.excludeKeywords)
-                .autocorrectionDisabled()
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                #endif
-            TextField("Require words", text: $sourcePrefs.includeKeywords)
-                .autocorrectionDisabled()
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                #endif
+            // Hide / Require word fields moved to the Smart source selection chip panel above (Avoid / Only
+            // words, same keys); the regex toggle stays because it governs those word fields and the panel
+            // does not cover it.
             Toggle("Match words as regex", isOn: $sourcePrefs.keywordsAreRegex).tint(Theme.Palette.accent)
             Text(sourcePrefs.keywordsAreRegex
-                 ? String(localized: "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored.")
-                 : String(localized: "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns."))
+                 ? String(localized: "Only / Avoid words in Smart source selection are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored.")
+                 : String(localized: "Turn on to treat the Only / Avoid words in Smart source selection as full regex patterns instead of comma-separated words."))
                 .font(.footnote).foregroundStyle(.secondary)
-            Toggle("Instant sources only", isOn: $sourcePrefs.instantOnly).tint(Theme.Palette.accent)
-            Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
-            Toggle("HDR sources only", isOn: $sourcePrefs.hdrOnly).tint(Theme.Palette.accent)
-            Toggle("Hide AV1 sources", isOn: $sourcePrefs.excludeAV1).tint(Theme.Palette.accent)
-            // #117 (c): best-effort audio-language filter, honest about its limits in the footnote below.
-            Toggle("Preferred audio languages only", isOn: $sourcePrefs.preferredAudioOnly).tint(Theme.Palette.accent)
-            Text("Best effort: hides a source only when its name clearly advertises a different audio language than your preferred audio languages. Sources that do not state a language, or that carry multiple languages, are always kept.")
-                .font(.footnote).foregroundStyle(.secondary)
+            // Instant sources / Hide dead torrents / HDR only / Hide AV1 / Preferred audio only moved to the
+            // Smart source selection chip panel above (Cached / Dead swarms / HDR-DV / AV1 / My audio chips,
+            // same keys). The resolution + file-size caps below stay because the chip panel does not cover them.
             Picker("Max quality", selection: $sourcePrefs.maxResolution) {
                 Text("Unlimited").tag(0)
                 Text("4K").tag(4000)
@@ -826,9 +820,8 @@ struct iOSSettingsView: View {
                 Text("1080p").tag(1080)
                 Text("4K").tag(2160)
             }
-            // #117 (b): the opt-in companion to the cap/floor's keep-unknown rule, for viewers who
-            // want only sources that state their quality.
-            Toggle("Hide unknown quality", isOn: $sourcePrefs.hideUnknownResolution).tint(Theme.Palette.accent)
+            // Hide unknown quality moved to the Smart source selection chip panel above (Stated quality chip,
+            // same key).
             Picker("Max file size", selection: $sourcePrefs.maxFileSizeGB) {
                 Text("Unlimited").tag(0.0)
                 Text("2 GB").tag(2.0)
@@ -859,8 +852,8 @@ struct iOSSettingsView: View {
                 if !sourcePrefs.useAddonOrder {
                     Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                 }
-                Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
-                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept unless Hide unknown quality is on.")
+                Text("Safety filter hides CAM and fake-quality sources. Prefer / Only / Avoid words live in Smart source selection above.")
+                Text("Minimum quality hides sources below the chosen resolution; sources with no stated resolution are kept unless the Stated quality chip is on.")
             }
         }
     }

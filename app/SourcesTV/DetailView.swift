@@ -1572,6 +1572,9 @@ struct CoreStreamList: View {
     @AppStorage("vortx.streams.compactLabels") private var compactLabels = false
     /// Drives the first-download confirmation dialog; carries the resolve closure to run on confirm.
     @State private var pendingDownload: (() -> Void)?
+    /// Smart Source Selection (Lane A) auto-pick guard. Set once when the auto-pick fires so it never
+    /// re-triggers; a viewer who backs out of the player lands on the full source list (the escape hatch).
+    @State private var didAutoPick = false
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -1791,6 +1794,41 @@ struct CoreStreamList: View {
         .task {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true
+        }
+        // Smart Source Selection (Lane A): auto-pick my best source, scoped to a SERIES episode page (meta
+        // type "series"), which is only ever reached by pushing CoreEpisodeStreams. The inline movie / live
+        // detail list (meta type "movie" / a live type) is deliberately excluded, so opening a movie detail
+        // never auto-starts playback. Waits for the SAME settle gate (`resolveSettled`) the manual Watch uses,
+        // then routes through the EXISTING `playBest` auto-pick. Fires once; a manual pick (presenter.request
+        // set) or backing out cancels/short-circuits it, leaving the full list.
+        .task {
+            guard SourcePreferences.shared.autoPickBest, meta?.type == "series", !didAutoPick else { return }
+            let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
+            var firstBestAt: Date?
+            var step = 0
+            // Honor cancellation: SwiftUI cancels this .task when the page pops, so the loop must BAIL the
+            // instant that happens instead of spinning up to 120 main-actor iterations during the pop
+            // animation and firing playBest onto a dismissed view (the ac4e3f1 cancel-fire class).
+            while !Task.isCancelled, step < 120 {                   // ~30s ceiling (250 ms steps)
+                step += 1
+                if presenter.request != nil || didAutoPick { return }   // a manual pick / re-entry: stand down
+                let progress = core.streamLoadProgress()
+                if sourceList.best != nil, firstBestAt == nil { firstBestAt = Date() }
+                let elapsed = firstBestAt.map { Date().timeIntervalSince($0) } ?? 0
+                let settled = settleTimedOut || StreamRanking.resolveSettled(
+                    sourceList.groups, loaded: progress.loaded, total: progress.total,
+                    secondsSinceFirstPlayable: elapsed, rememberedQuality: remembered)
+                if let best = sourceList.best, settled {
+                    // Re-check right before firing: the view may have popped (task cancelled) or a manual pick
+                    // landed during this iteration, so never route playBest onto a dismissed page.
+                    guard !Task.isCancelled, presenter.request == nil, !didAutoPick else { return }
+                    didAutoPick = true
+                    playBest(best, in: sourceList.groups)
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }   // cancelled during the sleep (page popped): stop, do not fire
+            }
         }
         // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
         // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
