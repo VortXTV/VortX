@@ -133,6 +133,36 @@ enum StreamRanking {
         }?.stream
     }
 
+    /// The full playable candidate list ranked EXACTLY as `best(_:continuity:binge:pin:)` picks its winner
+    /// (score + continuity + binge + pin), best-first, de-duplicated by playable URL. Feeds the batch-download
+    /// auto-retry (#119 remainder): on a failed episode it drops the winning source and queues the NEXT distinct
+    /// source with the identical ranking the batch used. Returns [] when nothing is playable. In the user's
+    /// explicit add-on-order mode the list keeps add-on/list order (the "don't re-rank" choice), matching best().
+    static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
+                                 pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> [CoreStream] {
+        let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
+        let pairs = playablePairs(groups)
+        let ordered: [CoreStream]
+        if SourcePreferences.reading.useAddonOrder {
+            ordered = pairs.map { $0.stream }
+        } else {
+            ordered = pairs.enumerated()
+                .map { (offset: $0.offset,
+                        stream: $0.element.stream,
+                        score: score($0.element.stream, debridCachedHashes: debridCachedHashes)
+                            + continuityBonus($0.element.stream, hint: hint)
+                            + bingeBonus($0.element.stream, group: binge)
+                            + pinBonus($0.element.stream, addon: $0.element.addon, pin: pin)) }
+                .sorted { $0.score != $1.score ? $0.score > $1.score : $0.offset < $1.offset }   // stable within ties
+                .map { $0.stream }
+        }
+        var seenURLs = Set<String>()
+        return ordered.filter { s in
+            guard let u = s.playableURL?.absoluteString else { return false }
+            return seenURLs.insert(u).inserted
+        }
+    }
+
     /// Streams paired with their source group's add-on, the form pin matching needs (a flattened stream
     /// loses which add-on it came from, which the `global`/provider pin keys on).
     private static func playablePairs(_ groups: [CoreStreamSourceGroup]) -> [(addon: String, stream: CoreStream)] {

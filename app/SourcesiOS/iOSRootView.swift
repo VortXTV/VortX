@@ -1376,13 +1376,15 @@ struct DownloadsView: View {
                 return [record.qualityText, size].compactMap { $0 }
             case .downloading:
                 let pct = Int(record.fractionComplete * 100)
-                return [String(localized: "Downloading \(pct)%")]
+                return [String(localized: "Downloading \(pct)%"), record.retryNote].compactMap { $0 }
             case .paused:
-                return [String(localized: "Paused")]
+                return [String(localized: "Paused"), record.retryNote].compactMap { $0 }
             case .failed:
-                return [record.errorText ?? String(localized: "Failed")]
+                // Keep the honest retry note alongside the failure, so a doubly-failed batch episode reads
+                // "Failed · Retried with next-best source", not a bare "Failed" that hides the auto-swap (#119).
+                return [record.errorText ?? String(localized: "Failed"), record.retryNote].compactMap { $0 }
             case .queued:
-                return [String(localized: "Queued")]
+                return [String(localized: "Queued"), record.retryNote].compactMap { $0 }
             }
         }()
         if !parts.isEmpty {
