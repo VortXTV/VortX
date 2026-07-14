@@ -238,6 +238,9 @@ struct iOSDetailView: View {
     // fire-and-forget contribution keyed off the same assembled groups; both are gated + fail-soft inside
     // `SourceIndexClient`, so the source list is unchanged unless the user opted in.
     @StateObject private var sourceIndex = SourceIndexServeSource()
+    // Media servers (Plex/Jellyfin/Emby): resolves this movie on the user's connected servers and merges the
+    // direct-play hits as their own tier. Empty (list unchanged) with no server connected (dormant).
+    @StateObject private var mediaServers = MediaServerSource()
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
     // Batch episode downloads (#119): the coordinator publishes the walk's status/summary; the two
@@ -489,7 +492,8 @@ struct iOSDetailView: View {
         .onAppear {
             // Wire the source-list model to this screen's sources (idempotent; nudges a refresh on
             // re-appear). The model owns assembly + ranking off-main from here on.
-            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
+                            mediaServers: mediaServers, debridCache: debridCache)
             if effectiveType == "series" {
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if core.metaDetails?.meta?.id != id { core.loadMeta(type: effectiveType, id: id) }
@@ -565,9 +569,9 @@ struct iOSDetailView: View {
         // known (gated on a TorBox key inside `refresh`; de-duped by imdb id). Series episodes fetch in
         // their own episode view.
         .onChange(of: core.metaDetails?.meta?.id) { _ in
-            if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); refreshSourceIndex() }
+            if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name); refreshSourceIndex() }
         }
-        .onAppear { if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); refreshSourceIndex() } }
+        .onAppear { if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name); refreshSourceIndex() } }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
@@ -2938,6 +2942,8 @@ struct iOSEpisodeStreams: View {
     // when the toggle is on + signed in) + HOARD (fire-and-forget descriptor contribution). Fully gated +
     // fail-soft inside `SourceIndexClient`; keyed on the episode content id (show:S:E).
     @StateObject private var sourceIndex = SourceIndexServeSource()
+    // Media servers (Plex/Jellyfin/Emby) for THIS episode: direct-play hits resolved by SxEy. Dormant with no server.
+    @StateObject private var mediaServers = MediaServerSource()
 
     /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
@@ -3006,7 +3012,8 @@ struct iOSEpisodeStreams: View {
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {
             // Wire the source-list model to this episode's sources (idempotent; see SourceListModel).
-            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
+                            mediaServers: mediaServers, debridCache: debridCache)
             // Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
             // WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
             // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
@@ -3038,7 +3045,11 @@ struct iOSEpisodeStreams: View {
         // pooled sources for this episode resolve per-user rather than only rendering.
         .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
         // TorBox search-as-a-source for the show (gated on a TorBox key; de-duped by imdb id inside refresh).
-        .onAppear { torboxSearch.refresh(imdbId: showImdbID); refreshSourceIndex() }
+        .onAppear {
+            torboxSearch.refresh(imdbId: showImdbID)
+            mediaServers.refresh(imdb: showImdbID, season: video.season, episode: video.episode, title: meta.name)
+            refreshSourceIndex()
+        }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
