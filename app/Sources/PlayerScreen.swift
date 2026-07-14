@@ -621,7 +621,7 @@ struct PlayerScreen: View {
                 .hidden()
             // Fullscreen: Ctrl-Cmd-F, the standard macOS fullscreen shortcut. A MODIFIED key equivalent, so
             // (unlike the unmodified Space/arrows) it reaches this hidden SwiftUI button rather than being
-            // swallowed by the Metal NSView's keyDown: — the same pattern the Esc/Cmd-[ handlers rely on, so
+            // swallowed by the Metal NSView's keyDown:, the same pattern the Esc/Cmd-[ handlers rely on, so
             // this never has to touch the installMacKeyMonitor NSEvent monitor.
             Button { toggleMacFullScreen() } label: { EmptyView() }
                 .keyboardShortcut("f", modifiers: [.command, .control])
