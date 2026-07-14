@@ -45,6 +45,13 @@ const SUB_FONT_IDS: readonly SubtitleFont[] = ["modern", "classic", "mono"];
 const SUB_COLOR_IDS: readonly SubtitleColor[] = ["white", "yellow", "cyan", "mint"];
 const SUB_EDGE_IDS: readonly SubtitleEdge[] = ["outline", "shadow", "box", "none"];
 const SOURCE_TYPES: readonly SourceType[] = ["debrid", "usenet", "torrent", "direct"];
+// The app's legal Max-quality caps (iOSSettingsView Picker tags): 0 / 720 / 1080 / 4000. 4K is 4000 (NOT
+// 2160) because the app's cap compares against a resolution SCORE where a 2160p token parses to 4000
+// (StreamRanking.resolution); a legacy web build stored the 4K cap as 2160, so read-down normalizes that.
+const MAX_RES_VALUES: readonly number[] = [0, 720, 1080, 4000];
+// The app's legal Minimum-quality floors (iOSSettingsView Picker tags): 0 / 720 / 1080 / 2160. 4K is 2160
+// here (NOT 4000) because the floor compares against a KNOWN raw resolution height, not the score.
+const MIN_RES_VALUES: readonly number[] = [0, 720, 1080, 2160];
 
 /** The MAIN/owner profile id in the synced doc (the profile whose settings mirror the webapp's single
  *  global Settings). The entry flagged `main`, else the first profile. Null when there are no profiles. */
@@ -130,9 +137,12 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
   const inc = str(p.includeKeywords);
   if (inc !== undefined) out.requireWords = inc;
   const maxRes = num(p.maxResolution);
-  if (maxRes !== undefined) out.maxQuality = maxRes;
+  if (maxRes !== undefined) {
+    const cap = maxRes === 2160 ? 4000 : maxRes; // legacy 2160 -> the app's 4000 4K tag
+    if (MAX_RES_VALUES.includes(cap)) out.maxQuality = cap; // ignore anything outside the legal cap set
+  }
   const minRes = num(p.minResolution);
-  if (minRes !== undefined) out.minQuality = minRes;
+  if (minRes !== undefined && MIN_RES_VALUES.includes(minRes)) out.minQuality = minRes; // legal floors only
   const hideUnknownRes = bool(p.hideUnknownResolution);
   if (hideUnknownRes !== undefined) out.hideUnknownResolution = hideUnknownRes;
   const prefAudio = bool(p.preferredAudioOnly);
@@ -175,6 +185,8 @@ export function mergeWebappSettingsIntoProfile(existing: unknown, s: Settings): 
       excludeAV1: s.hideAV1,
       excludeKeywords: s.hideWords,
       includeKeywords: s.requireWords,
+      // maxQuality already holds the app's Max-quality tag (4K = 4000; 1080/720/0 unchanged), so this
+      // round-trips to the app's `maxResolution` (iOSSettingsView Picker .tag(4000)) without translation.
       maxResolution: s.maxQuality,
       // #117 floor/quality-filter twins, using the EXACT doc field names the app reads (Profiles.swift
       // playbackPrefs) and writes (VortXSyncManager), so a web edit round-trips to Apple devices and the

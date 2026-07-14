@@ -57,9 +57,12 @@ const LANGS: { code: string; name: string }[] = [
 ];
 
 const SKIP_STEPS = [10, 15, 30];
+// Max-quality cap. Values match the Apple Max-quality picker EXACTLY (Unlimited/720/1080/4K), where 4K is
+// 4000 (NOT 2160): the app's cap compares against a resolution SCORE where a 2160p token parses to 4000, so
+// storing 4000 lets a web edit round-trip to Apple devices. (Min-quality's 4K floor is 2160 - see below.)
 const MAX_QUALITY_OPTS: { v: number; l: string }[] = [
   { v: 0, l: "Unlimited" },
-  { v: 2160, l: "4K" },
+  { v: 4000, l: "4K" },
   { v: 1080, l: "1080p" },
   { v: 720, l: "720p" },
 ];

@@ -70,6 +70,7 @@ function explicitResolution(t: string): number | null {
     ["1080", 1080],
     ["720", 720],
     ["576", 540],
+    ["540", 540],
     ["480", 480],
   ];
   for (const [token, value] of table) {
