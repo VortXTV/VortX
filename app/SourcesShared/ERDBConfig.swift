@@ -158,8 +158,12 @@ struct ResolvedTitleLogo<TitleText: View>: View {
         Group {
             if let logoURL, !logoURL.isEmpty, let rawURL = URL(string: logoURL) {
                 // AsyncImage cannot attach headers, so a rating-baked ERDB logo (erdb.vortx.tv, a gated host)
-                // is signed via query params (`vts`/`vkid`/`vsig`) instead. Fails open: a fanart.tv / metahub /
-                // add-on logo (non-gated host) or an unprovisioned build is returned unchanged and loads normally.
+                // is signed via query params (`vts`/`vkid`/`vsig`) instead. `signedURL` MEMOIZES per raw URL
+                // (reuse within half the 300s worker window), so this body re-evaluating on focus/scroll/
+                // progress ticks returns the SAME signed URL: AsyncImage keeps its identity (no phase reset,
+                // no flicker) and URLCache stays warm, instead of a new per-second `vts` busting both. Fails
+                // open: a fanart.tv / metahub / add-on logo (non-gated host) or an unprovisioned build is
+                // returned unchanged and loads normally.
                 let url = VortXEdgeAuth.signedURL(rawURL)
                 AsyncImage(url: url) { phase in
                     if case .success(let img) = phase {

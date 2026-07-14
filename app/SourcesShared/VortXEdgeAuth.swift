@@ -44,6 +44,22 @@ enum VortXEdgeAuth {
     private static let sigQuery = "vsig"
     private static let kidQuery = "vkid"
 
+    /// MEMO CACHE for `signedURL` (D15). `signedURL` bakes a per-SECOND `vts` into the URL, so calling it
+    /// from a SwiftUI view body (the only caller, `ResolvedTitleLogo`) would mint a DIFFERENT URL every wall-
+    /// clock second the body re-evaluates. `AsyncImage(url:)` treats a changed URL as a new resource: the
+    /// phase resets (the logo visibly flashes back to the title-text fallback) and the bytes are re-fetched,
+    /// because `URLCache` keys on the full URL and every new `vts` is a permanent miss. Hero/detail views
+    /// re-render constantly (focus moves, scroll, progress ticks), so without memoization an ERDB logo would
+    /// flicker and refetch forever. We cache the signed URL per (method, raw URL) and reuse it until it is
+    /// halfway to the worker's acceptance window, then re-sign lazily. The poster/erdb workers (and the
+    /// shared `edge_auth.ts`) accept `|now - ts| <= 300s` (`SIG_SKEW_SECONDS`), so a 150s reuse keeps every
+    /// served URL comfortably fresh (max age 150s « 300s) while the URL stays STABLE across renders and only
+    /// rotates rarely. The lock makes the cache safe even though today's sole caller is main-actor-bound.
+    private static let signedURLReuse: TimeInterval = 150   // half the 300s worker skew window
+    private static let signedURLCacheCap = 512              // bound growth across a long browse session
+    private static let signedURLLock = NSLock()
+    private static var signedURLCache: [String: (signed: URL, at: TimeInterval)] = [:]
+
     /// Current signing key id. Rotation is a TWO-part change provisioned together: (1) a NEW masked
     /// `VortXEdgeSecret` in Info.plist (via `maskedValue(for:)`) AND (2) this new kid, plus the matching
     /// new id -> secret entry on the workers BEFORE the build ships; revoke the old id after a grace window.
@@ -123,7 +139,21 @@ enum VortXEdgeAuth {
               var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
 
         let m = method.uppercased()
-        let ts = String(Int(Date().timeIntervalSince1970))
+        let now = Date().timeIntervalSince1970
+        // MEMO: reuse the previously-signed URL for this (method, raw URL) while it is still well inside the
+        // worker skew window, so repeated body re-evaluations get a STABLE URL (no AsyncImage churn / cache
+        // bust). The raw (unsigned) absolute string is the cache key; the idempotent strip below means a raw
+        // URL never carries our signing params, so this key is stable per logo.
+        let cacheKey = m + "\n" + url.absoluteString
+        signedURLLock.lock()
+        if let hit = signedURLCache[cacheKey], now - hit.at < signedURLReuse {
+            let cached = hit.signed
+            signedURLLock.unlock()
+            return cached
+        }
+        signedURLLock.unlock()
+
+        let ts = String(Int(now))
         let sig = hexSignature(method: m, signedPath: comps.percentEncodedPath, ts: ts)
 
         // Idempotent: strip any prior signing params before re-appending, so re-signing an already-signed URL
@@ -133,7 +163,16 @@ enum VortXEdgeAuth {
         items.append(URLQueryItem(name: kidQuery, value: keyId))
         items.append(URLQueryItem(name: sigQuery, value: sig))
         comps.queryItems = items
-        return comps.url ?? url
+        let signed = comps.url ?? url
+
+        signedURLLock.lock()
+        // Bound the cache: when full, drop entries already past the reuse horizon (they would re-sign anyway).
+        if signedURLCache.count >= signedURLCacheCap {
+            for (k, v) in signedURLCache where now - v.at >= signedURLReuse { signedURLCache.removeValue(forKey: k) }
+        }
+        signedURLCache[cacheKey] = (signed, now)
+        signedURLLock.unlock()
+        return signed
     }
 
     /// The canonical signed path: the PERCENT-ENCODED path so it matches the workers, which verify against
