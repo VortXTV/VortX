@@ -68,7 +68,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var excludeKeywords: String? = nil
         var includeKeywords: String? = nil
         var keywordsAreRegex: Bool? = nil
-        var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 2160
+        var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 4000 (4K; legacy web docs may carry 2160, healed in fold via gatedMaxResolution)
         var maxFileSizeGB: Double? = nil       // 0 = no cap
         var minResolution: Int? = nil          // 0 = no floor, else 720 / 1080 / 2160 (#117)
         var hideUnknownResolution: Bool? = nil // drop sources with no recognizable resolution (#117)
