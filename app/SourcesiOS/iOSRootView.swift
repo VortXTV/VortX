@@ -474,7 +474,7 @@ struct iOSRootView: View {
         }
     }
 
-    /// Prominent accent bar shown across every tab when a newer release is available and not yet
+    /// Quiet update strip shown across every tab when a newer release is available and not yet
     /// dismissed for that version. Tapping opens the downloads page; the × remembers this version.
     @ViewBuilder private var updateBanner: some View {
         // Suppress while the modal popup is pending so the user isn't nagged twice; the banner is the quiet
