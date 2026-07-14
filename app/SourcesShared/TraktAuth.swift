@@ -47,6 +47,11 @@ actor TraktAuth {
     private let accessAccount = "vortx.trakt.accessToken"
     private let refreshAccount = "vortx.trakt.refreshToken"
     private let expiryAccount = "vortx.trakt.expiresAt"   // unix epoch seconds, stored as a string
+    /// Unix epoch seconds when the token was ISSUED, stored as a string. Fourth slot: it lets
+    /// `currentToken()` rebuild the token with its ORIGINAL lifetime so the 30-minute early-refresh
+    /// leeway actually fires (see `TraktToken.defaultLeeway`). May be absent on installs whose token
+    /// was stored before this slot existed; `currentToken()` degrades gracefully to hard-expiry-only.
+    private let createdAtAccount = "vortx.trakt.createdAt"
 
     private let session: URLSession
 
@@ -83,10 +88,11 @@ actor TraktAuth {
         Keychain.set(nil, for: accessAccount)
         Keychain.set(nil, for: refreshAccount)
         Keychain.set(nil, for: expiryAccount)
+        Keychain.set(nil, for: createdAtAccount)
     }
 
     /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
-    /// a Trakt connection made on one device follows the account to the rest. Writes the three Keychain
+    /// a Trakt connection made on one device follows the account to the rest. Writes the Keychain
     /// slots directly (no network). `expiryUnix` is absolute unix-epoch seconds (what `store` persists
     /// and `syncUp` mirrors). Ignores an empty access/refresh pair so a partial doc never clears a live
     /// local session. Idempotent: adopting the same tokens twice is a harmless overwrite.
@@ -95,6 +101,10 @@ actor TraktAuth {
         Keychain.set(access, for: accessAccount)
         Keychain.set(refresh, for: refreshAccount)
         Keychain.set(String(expiryUnix), for: expiryAccount)
+        // The synced mirror carries no issue time, so stamp adoption time. The rebuilt "lifetime" is
+        // then the REMAINING lifetime at adoption, whose half-life leeway is always strictly less than
+        // the remaining time itself, so a just-adopted token is never instantly read as expired.
+        Keychain.set(String(Int(Date().timeIntervalSince1970)), for: createdAtAccount)
     }
 
     /// The stored token triple for the sync PUSH side (access, refresh, absolute unix expiry), or nil
@@ -254,10 +264,22 @@ actor TraktAuth {
             // A rejected refresh token USUALLY means the session is dead, but a concurrent winner (this
             // device pre single-flight, or a SIBLING device over sync) may already have rotated a NEWER
             // token. Only sign out when no fresher token exists anywhere; otherwise adopt it and keep going.
-            if status == 401, let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
-                return recovered
+            if status == 401 {
+                if let recovered = await recoverAfterRefreshFailure(deadRefreshToken: refreshToken) {
+                    return recovered
+                }
+                // Terminal-wipe guard: the recovery path above SUSPENDS (it awaits the synced-token
+                // provider), so another actor turn (a syncDown `adoptTokens`, a device-code poll storing
+                // a brand-new set) may have landed a live token during that await. Re-check the Keychain
+                // with NO suspension between this read and the wipe: a stored refresh token DIFFERENT
+                // from the one this refresh just spent is that winner's live session, so return it
+                // instead of wiping. Only when the stored set still carries the exact spent refresh
+                // token (or nothing is stored) is the session truly dead.
+                if let stored = currentToken(), stored.refreshToken != refreshToken {
+                    return stored
+                }
+                signOut()
             }
-            if status == 401 { signOut() }
             throw TraktAuthError.server(status: status)
         }
         let token = try decode(TraktToken.self, from: data)
@@ -272,8 +294,10 @@ actor TraktAuth {
     private func recoverAfterRefreshFailure(deadRefreshToken: String) async -> TraktToken? {
         // (T-1c) A local winner rotated the token while this refresh was in flight. A Trakt rotation always
         // changes the refresh token, so a stored refresh token different from the one we just spent means a
-        // winner already stored a live set; adopt it rather than wiping the session.
-        if let local = currentToken(), local.refreshToken != deadRefreshToken, !local.isExpired() {
+        // winner already stored a rotated set; adopt it REGARDLESS of the access token's age (even an aged
+        // set carries a live refresh token the next `validToken()` will spend), rather than wiping the
+        // session over a token that merely needs its own refresh.
+        if let local = currentToken(), local.refreshToken != deadRefreshToken {
             return local
         }
         // (T-2) A sibling device rotated + pushed a newer token over the synced `doc.apiKeys` mirror. A
@@ -289,14 +313,26 @@ actor TraktAuth {
 
     // MARK: - Keychain persistence
 
-    /// The stored token set, reconstructed from the three Keychain entries, or nil if not signed in.
+    /// The stored token set, reconstructed from the Keychain entries, or nil if not signed in.
     private func currentToken() -> TraktToken? {
         guard let access = Keychain.string(accessAccount), !access.isEmpty,
               let refresh = Keychain.string(refreshAccount), !refresh.isEmpty,
               let expiryString = Keychain.string(expiryAccount),
               let expiry = Int(expiryString) else { return nil }
+        // Rebuild with the ORIGINAL issue time when the fourth slot has it, so `expiresIn` is the
+        // original lifetime and `defaultLeeway` gives a real 30-minute early refresh. (A rebuild from
+        // the REMAINING lifetime makes `remaining <= min(1800, remaining/2)` unsatisfiable, so the
+        // early refresh silently never fires and a data call can carry a token that expires in flight.)
+        if let createdAtString = Keychain.string(createdAtAccount),
+           let createdAt = Int(createdAtString), createdAt < expiry {
+            return TraktToken(accessToken: access, refreshToken: refresh,
+                              expiresIn: expiry - createdAt, createdAt: createdAt)
+        }
+        // Migration: a token stored before the createdAt slot existed (or a corrupt slot). Fall back
+        // to createdAt = now, i.e. exactly the pre-slot behavior: the token only reads expired at hard
+        // expiry. Never a false expiry, never a forced signout; the next natural refresh (or adopt)
+        // writes the slot and upgrades the token to the early-refresh path.
         let now = Int(Date().timeIntervalSince1970)
-        // Persist absolute expiry as createdAt=now + remaining lifetime; lifetime sign is derived back.
         return TraktToken(accessToken: access, refreshToken: refresh,
                           expiresIn: expiry - now, createdAt: now)
     }
@@ -305,6 +341,7 @@ actor TraktAuth {
         Keychain.set(token.accessToken, for: accessAccount)
         Keychain.set(token.refreshToken, for: refreshAccount)
         Keychain.set(String(Int(token.expiresAt.timeIntervalSince1970)), for: expiryAccount)
+        Keychain.set(String(token.createdAt), for: createdAtAccount)
     }
 
     // MARK: - HTTP plumbing

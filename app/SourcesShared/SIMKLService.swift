@@ -12,10 +12,13 @@ actor SIMKLService {
     private let auth: SIMKLAuth
     private let session: URLSession
 
-    /// S-3: the next instant a data POST is allowed to fire. Each `write` RESERVES a slot before sleeping
-    /// (advancing this by `minPostInterval`), so concurrent callers queue into distinct 1-second slots and
-    /// a burst can never exceed SIMKL's 1-POST/sec limit even if a future caller batches writes.
-    private var nextPostSlot: Date?
+    /// S-3: the next instant a data POST is allowed to fire, on the MONOTONIC uptime clock. Each `write`
+    /// RESERVES a slot before sleeping (advancing this by `minPostInterval`), so concurrent callers queue
+    /// into distinct 1-second slots and a burst can never exceed SIMKL's 1-POST/sec limit even if a future
+    /// caller batches writes. `DispatchTime` rather than wall-clock `Date`: a large BACKWARD system-clock
+    /// jump would park a `Date` slot in the apparent far future and wedge every SIMKL write until relaunch,
+    /// while the uptime clock never runs backward (forward jumps were always harmless).
+    private var nextPostSlot: DispatchTime?
     private static let minPostInterval: TimeInterval = 1.0
 
     init(auth: SIMKLAuth, session: URLSession = .shared) {
@@ -76,14 +79,15 @@ actor SIMKLService {
     /// S-3 serial 1-POST/sec gate. RESERVE-then-sleep: reading `nextPostSlot`, computing this call's slot,
     /// and advancing `nextPostSlot` all happen synchronously in one actor turn (no await between), so two
     /// concurrent writes reserve DISTINCT slots rather than both reading the same stale timestamp and
-    /// firing together. The reserved wait is then slept off before the request goes out.
+    /// firing together. The reserved wait is then slept off before the request goes out (the actor is
+    /// released during the sleep). Slots live on the monotonic uptime clock, immune to wall-clock jumps.
     private func rateGate() async throws {
-        let now = Date()
+        let now = DispatchTime.now()
         let slot = (nextPostSlot.map { $0 > now ? $0 : now }) ?? now
-        nextPostSlot = slot.addingTimeInterval(Self.minPostInterval)
-        let wait = slot.timeIntervalSince(now)
-        if wait > 0 {
-            try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        nextPostSlot = slot + Self.minPostInterval
+        let waitNanos = slot.uptimeNanoseconds - now.uptimeNanoseconds   // slot >= now by construction
+        if waitNanos > 0 {
+            try await Task.sleep(nanoseconds: waitNanos)
         }
     }
 

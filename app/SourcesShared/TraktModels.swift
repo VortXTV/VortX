@@ -92,6 +92,12 @@ struct TraktToken: Codable, Sendable, Equatable {
     /// EVERY `isExpired()` read true and fire a refresh POST on every `validToken()` call, storming
     /// Trakt's 1-POST/sec limit and, because Trakt ROTATES the refresh token, racing concurrent
     /// refreshes into a self-signout. Half-life capped at 30 min refreshes early without that storm.
+    ///
+    /// CONTRACT: this math only works when `expiresIn` is the token's ORIGINAL lifetime. A token
+    /// rebuilt with its REMAINING lifetime makes "remaining <= min(1_800, remaining / 2)"
+    /// unsatisfiable, so the early refresh silently never fires and the token only reads expired at
+    /// hard expiry. `TraktAuth` therefore persists `createdAt` alongside the absolute expiry and
+    /// rebuilds stored tokens with their original issue time.
     var defaultLeeway: TimeInterval { min(1_800, Double(max(expiresIn, 0)) / 2) }
 
     /// True when the access token is within `leeway` seconds of expiring (or already expired). `leeway`
