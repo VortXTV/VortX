@@ -699,6 +699,13 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     let nzbUrl: String?
     let fileMustInclude: String?
 
+    /// VortX provenance marker: the server UUID string on a synthetic MEDIA-SERVER stream (Plex/Jellyfin/Emby),
+    /// nil on every engine-decoded stream. This is the STRUCTURAL, text-independent classification hook the
+    /// ranker keys on (a media-server stream ranks in its own tier, is exempt from the instant-only filter, and
+    /// gets the honest direct-play error). Optional, so the synthesized `Decodable` uses `decodeIfPresent` and
+    /// engine JSON WITHOUT the key decodes byte-identically; set only by `MediaServerSource`'s synthetic mapping.
+    let vortxProvider: String?
+
     var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
     var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
 
