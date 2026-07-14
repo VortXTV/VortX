@@ -481,24 +481,35 @@ struct iOSRootView: View {
         // fallback for after the popup is dismissed (dismissing it sets dismissedUpdateVersion, so the banner
         // then stays hidden for that build too).
         if let u = updates.available, u.key != dismissedUpdateVersion, updates.prompt == nil {
+            // S10: a quiet surface strip with an accent icon/title, not a full solid-accent fill. The accent
+            // is contractually focus / selection / primary / progress, not a passive-notice background; this
+            // matches the offline strip's treatment (surface fill + bottom hairline) while still reading as
+            // actionable via the accent icon and title.
             HStack(spacing: 10) {
                 Image(systemName: "arrow.down.circle.fill").font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.accent)
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Update available").font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.accent)
                     Text("\(u.name) · tap to get it")
-                        .font(.system(size: 12)).foregroundStyle(Theme.Palette.onAccent.opacity(0.85)).lineLimit(1)
+                        .font(.system(size: 12)).foregroundStyle(Theme.Palette.textSecondary).lineLimit(1)
                 }
                 Spacer(minLength: 8)
                 Button { dismissedUpdateVersion = u.key } label: {
                     Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Theme.Palette.textSecondary)
                         .padding(8).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Dismiss update notice")
             }
-            .foregroundStyle(Theme.Palette.onAccent)
             .padding(.horizontal, 16).padding(.vertical, 10)
-            .background(Theme.Palette.accent)
+            .background {
+                Theme.Palette.surface2
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Theme.Palette.hairline).frame(height: 0.5)
+                    }
+            }
             .contentShape(Rectangle())
             .onTapGesture { openReleasesPage() }
             .accessibilityElement(children: .combine)
@@ -1779,7 +1790,9 @@ struct iOSDiscoverView: View {
                 // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
                 // on the cross axis — it always takes the full viewport width — so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
-                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                // S4: Discover stacks its rails at lg (32) so its vertical rhythm matches Home / Library /
+                // Search; it was the lone surface at md (20), reading as a tighter, inconsistent column.
+                LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                     // In-flow hero: FIRST scrolling child so it leads UNCONDITIONALLY (the model tolerates
                     // an empty pool and re-seeds on addons/revision) and scrolls with the chips/grid. Not a
                     // pinned section header: pinning put it on top on macOS and ate every tap.
@@ -2737,7 +2750,11 @@ struct PosterGrid: View {
                                   progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                                   isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id))
                 }
-                .buttonStyle(.plain)
+                // S3: the shared card treatment (resting depth shadow, Mac pointer-hover lift, designed
+                // press, Reduce-Motion aware) instead of a flat button. scale 1.04 is touch-tuned, gentler
+                // than the tvOS 1.08. This is the same style tvOS poster cards use, so the resting shadow
+                // comes from the style (no separate shadow, which would double it and diverge from tvOS).
+                .buttonStyle(CardFocusStyle(scale: 1.04))
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(item.name)
                 .accessibilityHint("Opens details")
@@ -2819,7 +2836,10 @@ private struct PosterRail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            Text(title).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            // S2: rail headers read as a section tier ABOVE the card titles below them. cardTitle sat at
+            // the same size/weight as a card caption; sectionTitle (via the shared style helper: tracking
+            // + textPrimary) restores the hierarchy for Home / Search / Library rails.
+            Text(title).sectionTitleStyle()
                 .padding(.horizontal, Theme.Space.md)
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -2858,7 +2878,9 @@ private struct PosterRail: View {
                           isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
                           onDetails: onDetails.map { od in { od(item) } })
         }
-        .buttonStyle(.plain)
+        // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
+        // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
+        .buttonStyle(CardFocusStyle(scale: 1.04))
         .id(item.id)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(item.name)
@@ -3112,13 +3134,6 @@ struct PosterCardiOS: View {
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
     private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
-    // The Mac reuses these iOS cards on a wide desktop window, where the iPhone-sized constants render
-    // far too small. Scale them up on macOS only; iPhone/iPad keep the original sizes.
-    #if os(macOS)
-    private static let macScale: CGFloat = 1.5
-    #else
-    private static let macScale: CGFloat = 1.0
-    #endif
     // Card WIDTH comes from the user's Poster Style preset (default `.balanced` = today's 224 / 116). The
     // grid derives its adaptive column width from the SAME preset (iOSPillMetrics.gridPosterWidth), so grid
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
