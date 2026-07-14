@@ -28,6 +28,9 @@ struct TVPlayerView: View {
     /// True when this launch is a Continue-Watching resume: play the exact stored source first, but hop to a
     /// fresh source on a HARD load failure (a stale debrid link) instead of dead-ending like a manual pick.
     var startedFromResume: Bool = false
+    /// "Play from start" (backlog E): start at 0:00 regardless of any saved resume position. Skips the
+    /// engine/account resume lookup below and pins resumeSeconds to 0, leaving the stored resume untouched.
+    var startFromZero: Bool = false
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -418,7 +421,12 @@ struct TVPlayerView: View {
             }
             showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
             UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
-            if let m = curMeta {
+            if startFromZero {
+                // "Play from start": begin at 0:00 without consulting the engine/account resume. The stored
+                // resume point is deliberately left untouched (only WHERE playback begins changes), so a later
+                // Resume still seeks to it. resumeSeconds = 0 makes maybeResume a no-op seek (its r > 5 guard).
+                resumeSeconds = 0; maybeResume()
+            } else if let m = curMeta {
                 if let engineResume = core.engineResumeSeconds(for: m), engineResume > 5 {
                     resumeSeconds = engineResume; maybeResume()       // engine has a real position: use it
                 } else {
@@ -1335,6 +1343,12 @@ struct TVPlayerView: View {
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
+                    // Re-picking the CURRENT episode (an immediate replay of the one that just finished) keeps the
+                    // same ScrobbleCoordinator session key, so without a fresh per-playback token the scrobble start
+                    // is suppressed as a same-session re-entry (startSent still latched) and the replay never
+                    // scrobbles. Mint a new token so the coordinator opens a fresh session. A DIFFERENT episode
+                    // changes the key and resets the latches on its own, so it needs no re-mint here.
+                    if ep.id == curMeta?.videoId { playbackSessionID = UUID().uuidString }
                     play(episode: ep)
                 }
             }

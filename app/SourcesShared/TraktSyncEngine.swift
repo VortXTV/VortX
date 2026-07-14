@@ -28,6 +28,10 @@ final class TraktSyncEngine {
     private var pendingPushes: [PendingPush]
     private var lastRefresh: Date?
     private var refreshing = false
+    /// Bumped by `reset()` (disconnect / sign-out). An in-flight refresh captures it before its network
+    /// awaits and refuses to write back if it changed meanwhile, so a pull/drain that started before a
+    /// disconnect can never resurrect the wiped shadow cache or push queue into the next account.
+    private var generation = 0
 
     private init() {
         watchedTT = Self.loadWatched()
@@ -56,6 +60,7 @@ final class TraktSyncEngine {
         watchedTT = []
         pendingPushes = []
         lastRefresh = nil
+        generation &+= 1   // invalidate any in-flight refresh so it cannot write its pre-reset result back
         lock.unlock()
         Self.saveWatched([])
         Self.saveQueue([])
@@ -72,11 +77,20 @@ final class TraktSyncEngine {
         if refreshing { lock.unlock(); return }
         if let last = lastRefresh, Date().timeIntervalSince(last) < Self.refreshInterval { lock.unlock(); return }
         refreshing = true
+        let gen = generation
         lock.unlock()
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
             defer {
-                self.lock.lock(); self.refreshing = false; self.lastRefresh = Date(); self.lock.unlock()
+                self.lock.lock()
+                self.refreshing = false
+                // Only stamp lastRefresh when no disconnect/reset happened mid-refresh. A reset bumps
+                // generation and nulls lastRefresh; re-stamping it here would make refreshIfStale early-
+                // return for up to refreshInterval, silently delaying the reconnected account's first
+                // watched pull and queue drain. Leaving it nil on a stale generation lets the next call
+                // pull immediately.
+                if self.generation == gen { self.lastRefresh = Date() }
+                self.lock.unlock()
             }
             guard await TraktAuth.shared.isSignedIn else { return }
             await self.drainQueue()
@@ -87,6 +101,7 @@ final class TraktSyncEngine {
     /// Pull GET /sync/watched/{movies,shows} and fold the tt ids into the shadow cache. Reuses `TraktAuth`
     /// for a live bearer so `TraktService` stays untouched. Fail-soft: a failed leg contributes nothing.
     private func pullWatched() async {
+        lock.lock(); let gen = generation; lock.unlock()
         var next = Set<String>()
         for type in ["movies", "shows"] {
             guard let rows = await getWatched(type: type) else { continue }
@@ -99,6 +114,9 @@ final class TraktSyncEngine {
         }
         guard !next.isEmpty else { return }
         lock.lock()
+        // A disconnect while this pull was in flight wiped watchedTT and bumped generation; do NOT write
+        // the pre-reset set back, or the imported badges would resurrect after the user disconnected.
+        guard generation == gen else { lock.unlock(); return }
         let changed = next != watchedTT
         watchedTT = next
         let snapshot = watchedTT
@@ -154,6 +172,7 @@ final class TraktSyncEngine {
     private func drainQueue() async {
         lock.lock()
         let queue = pendingPushes
+        let gen = generation
         lock.unlock()
         guard !queue.isEmpty else { return }
         var stillFailing: [PendingPush] = []
@@ -161,7 +180,20 @@ final class TraktSyncEngine {
             if await send(push) == false { stillFailing.append(push) }
         }
         lock.lock()
-        pendingPushes = stillFailing
+        // A disconnect/reset while we were sending bumps generation and wipes the queue. Writing our
+        // pre-reset survivors back here would resurrect the wiped queue and let a push drain into the
+        // NEXT account that signs in on this device (the cross-account contamination reset() prevents).
+        // Drop the stale result; the live (empty) queue stands.
+        guard generation == gen else { lock.unlock(); return }
+        // Merge, do not overwrite: enqueue() may have appended pushes while our sends were awaiting
+        // (a watched-mark made mid-drain). Overwriting pendingPushes with stillFailing alone would
+        // silently drop those for a still-connected provider. Keep the survivors, then append anything
+        // added since the drained snapshot, deduped and capped as enqueue() does.
+        let appendedDuringDrain = pendingPushes.filter { !queue.contains($0) }
+        var merged = stillFailing
+        for push in appendedDuringDrain where !merged.contains(push) { merged.append(push) }
+        if merged.count > Self.queueCap { merged.removeFirst(merged.count - Self.queueCap) }
+        pendingPushes = merged
         let snapshot = pendingPushes
         lock.unlock()
         Self.saveQueue(snapshot)

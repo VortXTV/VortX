@@ -7,6 +7,20 @@ import Foundation
 /// from the stream's name + description + filename, where add-ons put their tags. Deliberately simple:
 /// seeders matter mainly for raw torrents, which a debrid user rarely lands on.
 enum StreamRanking {
+    // MARK: - Tier-step budget
+
+    /// The within-tier seeder tiebreak cap, held STRICTLY below the headroom left under the 15000
+    /// source-type tier step after the other within-tier lifts: 15000 - prefer(2500) - cache(8000) -
+    /// max quality spread(4313) = 187, so any cap <= 186 keeps the sum strictly under 15000. The max
+    /// quality spread is the EXACT worst case from computeScore: resolution 4000 (2160/4K/UHD, no 8K
+    /// token) + remux 230 + DV 45 + size 12 + Atmos 26 = 4313 (providerOffset is 0, languageScore is
+    /// never positive). Capping at 180 keeps a preferred, cached, top-quality torrent with a hot swarm
+    /// (the corner case) at most at 14813 + 180 = 14993 < 15000, strictly inside its source-type tier,
+    /// so this last within-tier bonus can never be what pushes the sum past the step and lets a lower
+    /// tier leapfrog a higher one, and leaves a 6-point margin under the 186 ceiling. min() against it
+    /// stays monotonic in seeders, so relative swarm-health order within the tier is preserved.
+    static let seederTiebreakCap = 180
+
     // MARK: - Caches
 
     /// `String.range(of:options:.regularExpression)` recompiles the ICU pattern on EVERY call,
@@ -84,7 +98,7 @@ enum StreamRanking {
     }
 
     /// A user-pinned source floats above everything else. The bonus dwarfs the entire score range (the
-    /// quality spread is ~4300, cached is +8000, the source-type tier gap is 15000) so a matching stream
+    /// quality spread is 4313, cached is +8000, the source-type tier gap is 15000) so a matching stream
     /// wins the one-press auto-pick and tops the list - yet it is still only a *score*, so the player's
     /// invisible failover hops straight off it if it turns out to be dead. See `SourcePinStore.matches`.
     static func pinBonus(_ s: CoreStream, addon: String, pin: ResolvedPin?) -> Int {
@@ -121,6 +135,44 @@ enum StreamRanking {
             (score(lhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(lhs.stream, hint: hint) + bingeBonus(lhs.stream, group: binge) + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)) <
             (score(rhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(rhs.stream, hint: hint) + bingeBonus(rhs.stream, group: binge) + pinBonus(rhs.stream, addon: rhs.addon, pin: pin))
         }?.stream
+    }
+
+    /// The full playable candidate list ranked EXACTLY as `best(_:continuity:binge:pin:)` picks its winner
+    /// (score + continuity + binge + pin), best-first, de-duplicated by playable URL. Feeds the batch-download
+    /// auto-retry (#119 remainder): on a failed episode it drops the winning source and queues the NEXT distinct
+    /// source with the identical ranking the batch used. Returns [] when nothing is playable. In the user's
+    /// explicit add-on-order mode the list keeps add-on/list order (the "don't re-rank" choice) but still fronts
+    /// an applicable pin, matching best()'s add-on-order branch, so candidates.first is best()'s winner.
+    static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
+                                 pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> [CoreStream] {
+        let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
+        let pairs = playablePairs(groups)
+        let ordered: [CoreStream]
+        if SourcePreferences.reading.useAddonOrder {
+            // Mirror best()'s add-on-order branch EXACTLY: an applicable pin is the user's explicit
+            // "play THIS", so front the pinned stream ahead of add-on/list order. The URL de-dup below
+            // drops the pinned stream's second appearance, so candidates.first == best()'s winner.
+            if pin != nil, let hit = firstPinned(groups, pin: pin) {
+                ordered = [hit] + pairs.map { $0.stream }
+            } else {
+                ordered = pairs.map { $0.stream }
+            }
+        } else {
+            ordered = pairs.enumerated()
+                .map { (offset: $0.offset,
+                        stream: $0.element.stream,
+                        score: score($0.element.stream, debridCachedHashes: debridCachedHashes)
+                            + continuityBonus($0.element.stream, hint: hint)
+                            + bingeBonus($0.element.stream, group: binge)
+                            + pinBonus($0.element.stream, addon: $0.element.addon, pin: pin)) }
+                .sorted { $0.score != $1.score ? $0.score > $1.score : $0.offset < $1.offset }   // stable within ties
+                .map { $0.stream }
+        }
+        var seenURLs = Set<String>()
+        return ordered.filter { s in
+            guard let u = s.playableURL?.absoluteString else { return false }
+            return seenURLs.insert(u).inserted
+        }
     }
 
     /// Streams paired with their source group's add-on, the form pin matching needs (a flattened stream
@@ -268,13 +320,13 @@ enum StreamRanking {
         // Smart Source Selection (Lane A): the Prefer boost and, in "rank" mode, the Avoid demotion. Read
         // through SourcePreferences.reading so the off-main rank uses the frozen Snapshot (race contract).
         // Prefer +2500 lifts a matching source WITHIN its tier but is sized so prefer + cache (+8000) + the
-        // max quality spread (~4300) stays UNDER the 15000 source-type tier step, so a preferred-and-cached
+        // max quality spread (4313) stays UNDER the 15000 source-type tier step, so a preferred-and-cached
         // lower-tier source can never leapfrog a higher tier (the anti-regression invariant that source-type
         // order is the top-level key). Avoid -20000 sinks a matching source well past the quality spread yet
         // stays above the -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole
         // point of "rank"). Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
         score += chipScoreOffset(text)
-        // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (~4300), so
+        // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (4313), so
         // a cached stream always beats an uncached one of the same source type, which is the
         // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
         // the user's source-type order is the top-level key, so someone who ranks Torrent or
@@ -291,9 +343,11 @@ enum StreamRanking {
         // providers without ever crossing a quality or tier boundary.
         score += providerOffset(for: provider(text))
         // Raw torrents live or die by swarm health; cached/debrid streams don't care. A dead
-        // swarm sinks within its tier, a hot one earns a capped tiebreak bonus.
+        // swarm sinks within its tier, a hot one earns a capped tiebreak bonus. The cap is held
+        // below the tier-step headroom (see seederTiebreakCap) so a preferred + cached + top-quality
+        // hot-swarm torrent still cannot cross its source-type tier step.
         if type == .torrent, let seeders = seederCount(text) {
-            score += seeders == 0 ? -800 : min(seeders * 8, 400)
+            score += seeders == 0 ? -800 : min(seeders * 8, seederTiebreakCap)
         }
         // Fake-quality guard: a file far too small for the resolution it claims is mislabelled
         // (Comet and other raw-passthrough add-ons surface these; a 50 MB "4K" has been seen
@@ -310,7 +364,7 @@ enum StreamRanking {
     /// Smart Source Selection (Lane A) score offset for a stream's quality text: a Prefer-term boost plus,
     /// when Avoid behavior is "rank", an Avoid-term demotion. Both magnitudes are chosen against the same
     /// ladder the cache/junk bonuses use (see `computeScore`): +2500 is a within-tier lift small enough that
-    /// prefer + cache (+8000) + the max quality spread (~4300) stays under the 15000 tier step (so a
+    /// prefer + cache (+8000) + the max quality spread (4313) stays under the 15000 tier step (so a
     /// preferred-and-cached source never crosses its source-type tier); -20000 sinks a source below the
     /// quality spread but keeps it above the -100000 junk floor so it stays visible.
     static func chipScoreOffset(_ text: String) -> Int {

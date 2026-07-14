@@ -58,7 +58,7 @@ struct TVCollectionsHub: View {
             if !visibleDecades.isEmpty {
                 section(title: "Browse by Decade", eyebrow: "Browse by decade") {
                     ForEach(visibleDecades, id: \.self) { d in
-                        NavigationLink { TVCategoryBrowse(target: .decade(d)) } label: { TVDecadeTile(decade: d) }
+                        NavigationLink { TVCategoryBrowse(target: .decade(d)) } label: { TVDecadeTile(decade: d, cover: model.decadeCovers[d.title]) }
                             .buttonStyle(CardFocusStyle())
                     }
                 }
@@ -253,12 +253,16 @@ struct TVGenreTile: View {
 }
 
 /// A browse-by-decade tile: the same ember-tinted card as TVGenreTile with a calendar glyph and the decade
-/// label. No backdrop first cut (the gradient carries it, matching a genre tile with no art).
+/// label. A representative decade poster (resolved + daily-cached by CollectionsHubModel via the /cover edge)
+/// paints behind the scrim when present; an empty/missing cover keeps the plain ember gradient.
 struct TVDecadeTile: View {
     let decade: DecadeSpec
+    /// Representative decade poster URL (CollectionsHubModel.decadeCovers). Nil = the gradient carries the tile.
+    var cover: String? = nil
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            if let cover, !cover.isEmpty { RemoteCover(url: cover) }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: Theme.Space.sm) {
                 Image(systemName: decade.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)

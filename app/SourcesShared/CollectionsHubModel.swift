@@ -229,7 +229,9 @@ enum CollectionsCatalog {
             SubCatalog(id: id, title: title, load: { page in await TMDBClient.listTitles(path: path, region: region, page: page) })
         }
         func discoverSub(_ id: String, _ title: String, media: String, extra: String) -> SubCatalog {
-            SubCatalog(id: id, title: title, load: { page in await TMDBClient.discoverTitles(media: media, extra: extra, region: region, page: page) })
+            // vxday=1: opt this curated Discover-card window into the worker's daily shuffle (#6); harmless no-op
+            // until the worker ships the shuffle. See mergeBuckets for the rationale.
+            SubCatalog(id: id, title: title, load: { page in await TMDBClient.discoverTitles(media: media, extra: extra + "&vxday=1", region: region, page: page) })
         }
         switch list {
         case .trending:
@@ -260,6 +262,11 @@ enum CollectionsCatalog {
     }
 
     private static func mergeBuckets(movie: String?, tv: String?, region: String, page: Int) async -> [MetaPreview] {
+        // Opt these curated discover rows (decade / genre / service windows) into the catalogs worker's daily
+        // shuffle (#6): `vxday=1` is an unknown, harmless no-op until the worker ships the shuffle, then it
+        // reorders the SAME window once per day so a static curated row does not read identically forever.
+        let movie = movie.map { $0 + "&vxday=1" }
+        let tv = tv.map { $0 + "&vxday=1" }
         async let m: [MetaPreview] = { if let e = movie { return await TMDBClient.discoverTitles(media: "movie", extra: e, region: region, page: page) } else { return [] } }()
         async let t: [MetaPreview] = { if let e = tv { return await TMDBClient.discoverTitles(media: "tv", extra: e, region: region, page: page) } else { return [] } }()
         let movies = await m, shows = await t
@@ -316,6 +323,10 @@ final class CollectionsHubModel: ObservableObject {
     /// Discover card -> representative backdrop URL, resolved + cached on the same cadence as the genre tiles.
     /// Empty until resolved; the Discover cards fall back to their gradient for any card not yet present.
     @Published private(set) var discoverBackdrops: [DiscoverList: String] = [:]
+    /// Decade title -> representative poster URL, resolved off the catalogs.vortx.tv /cover edge and cached on
+    /// the same daily cadence. Empty until resolved; the decade tiles fall back to their ember gradient for any
+    /// decade not yet present.
+    @Published private(set) var decadeCovers: [String: String] = [:]
 
     let discover = DiscoverList.allCases
     let genres = CollectionsHubModel.genreList
@@ -325,12 +336,14 @@ final class CollectionsHubModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var genreTask: Task<Void, Never>?
     private var discoverTask: Task<Void, Never>?
+    private var decadeTask: Task<Void, Never>?
     /// Monotonic generation tags: a Task is a value type and cannot be compared by identity, so each load bumps
     /// its tag and captures it; a task only clears its stored handle when its captured tag still matches, so a
     /// task completing after a clear()+restart can tell it is no longer the current handle and leaves it alone.
     private var loadGen = 0
     private var genreGen = 0
     private var discoverGen = 0
+    private var decadeGen = 0
     /// In-flight fetch of the global provider list (warmed only while a selection is active, so a selected
     /// service outside the viewer's region still resolves to a named, logo'd tile).
     private var globalTask: Task<Void, Never>?
@@ -346,9 +359,10 @@ final class CollectionsHubModel: ObservableObject {
     /// exists it is shown immediately and no network call is made; otherwise it fetches and re-caches.
     /// Idempotent for a region per app run.
     func load(region: String = TMDBClient.deviceRegion) {
-        guard Self.isAvailable else { providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil; return }
+        guard Self.isAvailable else { providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; decadeCovers = [:]; loadedRegion = nil; return }
         loadGenreBackdrops(region: region)      // independent cadence-cached resolve (runs even when providers are cache-fresh)
         loadDiscoverBackdrops(region: region)   // same independent cadence-cached resolve for the Discover cards
+        loadDecadeCovers()                      // decade posters off the /cover edge, region-independent, same daily cadence
         // Selection active: keep the global list warm so a selected out-of-region service resolves to a real
         // tile. Empty selection short-circuits before this new path, so AUTO is byte-identical to before.
         if !Self.selectedProviders().isEmpty { warmGlobalProviders() }
@@ -381,8 +395,9 @@ final class CollectionsHubModel: ObservableObject {
         loadTask?.cancel(); loadTask = nil
         genreTask?.cancel(); genreTask = nil
         discoverTask?.cancel(); discoverTask = nil
+        decadeTask?.cancel(); decadeTask = nil
         globalTask?.cancel(); globalTask = nil
-        providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; loadedRegion = nil
+        providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; decadeCovers = [:]; loadedRegion = nil
     }
 
     // MARK: genre backdrops (cadence-cached representative artwork per genre)
@@ -499,6 +514,86 @@ final class CollectionsHubModel: ObservableObject {
         let at = UserDefaults.standard.double(forKey: discoverCacheAtKey(region))
         guard at > 0 else { return false }
         return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
+    }
+
+    // MARK: decade covers (cadence-cached representative POSTER per decade, off the /cover edge)
+
+    /// The representative TMDB discover path for a decade's cover: the decade's popular MOVIES window (mirrors
+    /// decadeSubs' primary "Movies" row, ~:207-209). Handed to the /cover edge as its `list` param.
+    private static func decadeCoverListPath(_ d: DecadeSpec) -> String {
+        "/discover/movie?primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31&sort_by=popularity.desc"
+    }
+
+    /// Resolve a representative poster for each decade tile off catalogs.vortx.tv/cover. Paints instantly from
+    /// the cache, then (if stale) refetches every decade in one 429-safe batch and re-caches. Region-independent
+    /// (a decade is a global window), on the SAME daily cadence as the Discover/genre artwork. Direct mirror of
+    /// `loadDiscoverBackdrops`, so it never blocks the provider / genre loads.
+    private func loadDecadeCovers() {
+        if let cached = Self.cachedDecadeCovers() { decadeCovers = cached }
+        if Self.decadeCacheIsFresh() { return }
+        // Back off after an all-empty fetch: the /cover edge route may not be deployed yet, and without
+        // this every hub load() (fires on each appearance / region change) would re-run the ~10-request
+        // signed batch against a failing endpoint. The short window lets a genuine relaunch retry soon
+        // while a render inside it does not hammer.
+        if Self.decadeCoverInFailureBackoff() { return }
+        guard decadeTask == nil else { return }
+        decadeGen += 1; let myGen = decadeGen
+        let thisTask = Task { [weak self] in
+            var out: [String: String] = [:]
+            await withTaskGroup(of: (String, String?).self) { group in
+                for d in CollectionsHubModel.decadeList {
+                    group.addTask {
+                        (d.title, await TMDBClient.listCover(listPath: CollectionsHubModel.decadeCoverListPath(d)))
+                    }
+                }
+                for await (title, url) in group { if let url { out[title] = url } }
+            }
+            guard let self, !Task.isCancelled else {
+                if self?.decadeGen == myGen { self?.decadeTask = nil }
+                return
+            }
+            if self.decadeGen == myGen { self.decadeTask = nil }
+            guard !out.isEmpty else {
+                // Route down or a transient failure: keep the prior cache (don't blank the tiles) and
+                // stamp the failure-backoff so we don't re-fire the batch on every load() until it elapses.
+                Self.stampDecadeCoverFailure()
+                return
+            }
+            self.decadeCovers = out
+            Self.cacheDecadeCovers(out)
+        }
+        decadeTask = thisTask
+    }
+
+    private static func decadeCacheKey() -> String { "vortx.collections.decadeCovers" }
+    private static func decadeCacheAtKey() -> String { "vortx.collections.decadeCoversAt" }
+    private static func decadeCoverFailedAtKey() -> String { "vortx.collections.decadeCoversFailedAt" }
+    /// Failure-backoff window for an all-empty /cover fetch. Short enough that a genuine relaunch retries
+    /// soon (so the tiles fill once the edge route deploys), long enough that repeated hub renders within a
+    /// session do not re-fire the ~10-request signed batch against a still-failing endpoint.
+    private static let decadeCoverFailureBackoff: TimeInterval = 30 * 60
+
+    private static func cacheDecadeCovers(_ map: [String: String]) {
+        UserDefaults.standard.set(map, forKey: decadeCacheKey())
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: decadeCacheAtKey())
+        UserDefaults.standard.removeObject(forKey: decadeCoverFailedAtKey())   // success clears any prior backoff
+    }
+    private static func cachedDecadeCovers() -> [String: String]? {
+        guard let raw = UserDefaults.standard.dictionary(forKey: decadeCacheKey()) as? [String: String], !raw.isEmpty else { return nil }
+        return raw
+    }
+    private static func decadeCacheIsFresh() -> Bool {
+        let at = UserDefaults.standard.double(forKey: decadeCacheAtKey())
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < HubRefreshCadence.current.interval
+    }
+    private static func stampDecadeCoverFailure() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: decadeCoverFailedAtKey())
+    }
+    private static func decadeCoverInFailureBackoff() -> Bool {
+        let at = UserDefaults.standard.double(forKey: decadeCoverFailedAtKey())
+        guard at > 0 else { return false }
+        return Date().timeIntervalSince1970 - at < decadeCoverFailureBackoff
     }
 
     // MARK: provider cache (UserDefaults, region-keyed, cadence-throttled)

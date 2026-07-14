@@ -68,7 +68,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
         var excludeKeywords: String? = nil
         var includeKeywords: String? = nil
         var keywordsAreRegex: Bool? = nil
-        var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 2160
+        var maxResolution: Int? = nil          // 0 = no cap, else 720 / 1080 / 4000 (4K; legacy web docs may carry 2160, healed in fold via gatedMaxResolution)
         var maxFileSizeGB: Double? = nil       // 0 = no cap
         var minResolution: Int? = nil          // 0 = no floor, else 720 / 1080 / 2160 (#117)
         var hideUnknownResolution: Bool? = nil // drop sources with no recognizable resolution (#117)
@@ -458,14 +458,33 @@ final class ProfileStore: ObservableObject {
             excludeKeywords: d["excludeKeywords"] as? String ?? base?.excludeKeywords,
             includeKeywords: d["includeKeywords"] as? String ?? base?.includeKeywords,
             keywordsAreRegex: d["keywordsAreRegex"] as? Bool ?? base?.keywordsAreRegex,
-            maxResolution: (d["maxResolution"] as? Int) ?? base?.maxResolution,
+            maxResolution: gatedMaxResolution(d["maxResolution"] as? Int) ?? base?.maxResolution,
             maxFileSizeGB: (d["maxFileSizeGB"] as? Double) ?? (d["maxFileSizeGB"] as? Int).map(Double.init) ?? base?.maxFileSizeGB,
-            minResolution: (d["minResolution"] as? Int) ?? base?.minResolution,
+            minResolution: gatedMinResolution(d["minResolution"] as? Int) ?? base?.minResolution,
             hideUnknownResolution: d["hideUnknownResolution"] as? Bool ?? base?.hideUnknownResolution,
             preferredAudioOnly: d["preferredAudioOnly"] as? Bool ?? base?.preferredAudioOnly,
             preferKeywords: d["preferKeywords"] as? String ?? base?.preferKeywords,
             avoidBehavior: d["avoidBehavior"] as? String ?? base?.avoidBehavior,
             autoPickBest: d["autoPickBest"] as? Bool ?? base?.autoPickBest)
+    }
+
+    /// Legacy web/dashboard docs encode a 4K resolution CAP as 2160, but the device ladder uses 4000
+    /// for 4K (StreamRanking.resolution() returns 4000 for a 2160p source), so a raw 2160 cap made
+    /// `resolution(text) > 2160` true for every 4K stream and silently hid ALL 4K on device. Map 2160
+    /// to 4000 and accept only the canonical device cap values; any other value is ignored so the
+    /// per-field base fallback keeps the current setting rather than applying an illegal cap.
+    private static func gatedMaxResolution(_ raw: Int?) -> Int? {
+        guard let raw else { return nil }
+        let mapped = raw == 2160 ? 4000 : raw
+        return [0, 720, 1080, 4000].contains(mapped) ? mapped : nil
+    }
+
+    /// The floor counterpart: the device floor uses 2160 as the 4K sentinel (a 2160p source's
+    /// knownResolution of 4000 clears a 2160 floor), so the canonical floor set stays {0,720,1080,2160}.
+    /// Accept only those; ignore anything else (including a stray 4000) so the base fallback holds.
+    private static func gatedMinResolution(_ raw: Int?) -> Int? {
+        guard let raw else { return nil }
+        return [0, 720, 1080, 2160].contains(raw) ? raw : nil
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.

@@ -30,7 +30,8 @@ enum RankConst {
     static let avoidSink = -20_000     // StreamRanking.chipScoreOffset avoid demotion in "rank" mode
     static let cacheBonus = 8000       // StreamRanking.computeScore cached-hit lift (+8000)
     static let tierStep = 15_000       // SourcePreferences tier-weight spacing (source-type = top-level key)
-    static let maxQualitySpread = 4300 // documented max within-tier quality spread in computeScore
+    static let maxQualitySpread = 4313 // EXACT max within-tier quality spread in computeScore: resolution 4000 + remux 230 + DV 45 + size 12 + Atmos 26
+    static let seederTiebreakCap = 180 // StreamRanking.seederTiebreakCap max torrent swarm-health lift (<= 186 headroom)
     static let junkFloor = -100_000    // StreamRanking.computeScore junkClass drop
     // A tiny stand-in "quality spread" so we can assert an avoided source stays ABOVE the junk floor
     // (visible, just demoted) rather than being pushed into junk territory.
@@ -187,6 +188,15 @@ do {
     // regression this guards against.
     check(8000 + RankConst.cacheBonus > RankConst.tierStep,
           "The pre-fix +8000 prefer boost DID cross the tier step (regression this test locks out)")
+    // The torrent seeder tiebreak is ALSO a within-tier lift and stacks on top of prefer + cache + spread
+    // for a cached raw torrent with a hot swarm. The FULL within-tier sum, seeder cap included, must still
+    // stay under the tier step, or a preferred + cached + hot-swarm torrent could leapfrog the tier above it.
+    let worstCaseWithSeeders = worstCaseWithinTier + RankConst.seederTiebreakCap
+    check(worstCaseWithSeeders < RankConst.tierStep,
+          "Prefer + cache + spread + seeder tiebreak (\(worstCaseWithSeeders)) stays under the 15000 tier step")
+    // And the OLD +400 seeder cap DID push the full sum over (14800 + 400 = 15200 > 15000): the corner this fixes.
+    check(worstCaseWithinTier + 400 > RankConst.tierStep,
+          "The pre-fix +400 seeder cap DID cross the tier step in the cached-torrent corner (regression locked out)")
 }
 
 // 6. Kids profile: Avoid words are a parental hide tool, so they DROP even in "rank" mode (which keeps them

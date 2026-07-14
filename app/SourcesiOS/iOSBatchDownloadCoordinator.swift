@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// Batch offline downloads for series episodes (#119): "download season 2" / "download episodes 5-10"
 /// without starting each one by hand.
@@ -29,9 +30,12 @@ import Foundation
 ///     `.queued` because `download()` upserts before any transfer starts.
 ///
 /// FAIL-SOFT PER EPISODE: an episode whose sources never settle or rank to nothing is recorded as
-/// skipped and the walk CONTINUES; the summary surfaces the skip count + labels at the end. This pass
-/// deliberately does NOT retry alternate sources for a failed episode (follow-up work): the byte
-/// transfer itself can still fail later, and the record then shows `.failed` in DownloadsView as usual.
+/// skipped and the walk CONTINUES; the summary surfaces the skip count + labels at the end. When a
+/// queued episode's byte TRANSFER later fails (#119 remainder), the coordinator arms ONE auto-swap: it
+/// removes the failed download and re-queues the episode's next-best DISTINCT source (the same ranking
+/// the batch used), tagging the new record with an honest retry note. The swap is bounded to one per
+/// episode (the plan is consumed on use), so a dead episode can never loop; a still-failing alternate
+/// simply shows `.failed` with its retry note in DownloadsView.
 ///
 /// INTERRUPTION HONESTY: the pending walk lives in memory only (no background-task assertion), so an
 /// app quit / kill mid-batch silently drops the not-yet-queued episodes. A tiny snapshot (series ids +
@@ -96,6 +100,15 @@ final class BatchDownloadCoordinator: ObservableObject {
 
     private enum Outcome { case queued, noSource, cancelled }
 
+    /// One bounded auto-swap for a batch-queued episode whose byte transfer FAILS (#119 remainder). Carries
+    /// the episode's NEXT-best distinct source (the ranking the batch already computed) plus the context to
+    /// re-queue it. Consumed after a SINGLE swap, so a still-dead episode can never loop: one swap per episode.
+    private struct RetryPlan {
+        let alternate: CoreStream
+        let pm: PlaybackMeta
+        let episode: DebridEpisode?
+    }
+
     // MARK: Published state (drives the inline status line on the detail page)
 
     /// Series ids with episodes waiting or resolving, so a detail page shows a status line only for
@@ -135,9 +148,26 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// per episode (both clients also dedup internally; this keeps the intent explicit).
     private var contributorSeriesKey: String?
 
+    /// Pending one-shot failure swaps, keyed by the DownloadRecord id the batch queued (#119 remainder). An
+    /// entry is registered ONLY when a distinct next-best source exists, and is CONSUMED on the first swap
+    /// (or dropped when the download completes), so a dead episode swaps at most once and never loops.
+    private var retryPlans: [UUID: RetryPlan] = [:]
+    /// Watches DownloadStore for a tracked batch download flipping to `.failed` (the byte transfer failing,
+    /// which happens asynchronously after the walk has moved on) so the swap can fire independent of the walk.
+    private var downloadObserver: AnyCancellable?
+
     var isRunning: Bool { worker != nil }
 
-    private init() { restoreInterruptedSnapshot() }
+    private init() {
+        restoreInterruptedSnapshot()
+        // Watch DownloadStore for a tracked batch download flipping to `.failed`. The sink hops onto the main
+        // actor (this type is @MainActor) via the same Task idiom DownloadManager uses; the handler reads the
+        // committed records itself, so nothing non-Sendable crosses the boundary.
+        downloadObserver = DownloadStore.shared.$records
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.handleBatchDownloadStates() }
+            }
+    }
 
     // MARK: Public API
 
@@ -300,7 +330,61 @@ final class BatchDownloadCoordinator: ObservableObject {
                                                      qualityText: StreamRanking.signature(best))
         // download() can refuse synchronously (an HLS source on a device that can't save HLS, a storage
         // shortfall): that episode was NOT queued, so report it as skipped, not as a success.
-        return DownloadStore.shared.record(id: record.id)?.state == .failed ? .noSource : .queued
+        if DownloadStore.shared.record(id: record.id)?.state == .failed { return .noSource }
+        // #119 remainder: arm ONE auto-swap to the next-best DISTINCT source if this download later fails its
+        // byte transfer. Same ranking the batch just used (rankedCandidates mirrors best()); a nil alternate
+        // (nothing else playable) arms no plan, so that episode simply fails honestly as before.
+        let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
+                                                        debridCachedHashes: job.cachedHashes)
+        if let alternate = candidates.first(where: { $0.playableURL?.absoluteString != best.playableURL?.absoluteString }) {
+            retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
+        }
+        return .queued
+    }
+
+    // MARK: One-shot failure swap (#119 remainder)
+
+    /// React to DownloadStore changes for the batch downloads we armed a swap for: a tracked record that
+    /// flipped to `.failed` gets ONE swap to its next-best source; one that completed (or the user deleted)
+    /// drops its armed plan. Cheap: a no-op unless a swap is armed, and each plan fires at most once.
+    private func handleBatchDownloadStates() {
+        guard !retryPlans.isEmpty else { return }
+        let records = DownloadStore.shared.records
+        for (id, plan) in retryPlans {
+            guard let record = records.first(where: { $0.id == id }) else { retryPlans[id] = nil; continue }
+            switch record.state {
+            case .failed: performRetrySwap(failedRecordID: id, plan: plan)
+            case .completed: retryPlans[id] = nil   // succeeded: the armed swap is no longer needed
+            default: break
+            }
+        }
+    }
+
+    /// The one-shot swap: consume the plan FIRST (so a still-failing alternate can never re-arm and loop),
+    /// then resolve + queue the next-best source, and only AFTER the replacement is queued cancel the failed
+    /// download through DownloadManager (the canonical path that also clears the stashed resume data and the
+    /// HLS asset-task map, which DownloadStore.remove leaves behind). Queue-before-cancel means an app kill in
+    /// the swap window leaves the original failed row on disk to retry from, never a vanished episode.
+    private func performRetrySwap(failedRecordID id: UUID, plan: RetryPlan) {
+        guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: plan.alternate, episode: plan.episode)
+            if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
+            guard let fallback = plan.alternate.playableURL else { return }   // no URL: keep the failed row, do not orphan the episode
+            let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
+                                                         resolvedURL: resolved ?? fallback,
+                                                         sourceName: plan.alternate.name,
+                                                         qualityText: StreamRanking.signature(plan.alternate))
+            // Replacement is queued: now drop the failed download via the canonical DownloadManager path
+            // (cancels the live task, clears taskForRecord / resumeData / cannotCreateFileRetries / the HLS
+            // asset-task map, then removes the record + file). DownloadStore.remove would leak that bookkeeping.
+            DownloadManager.shared.cancel(id: id)
+            // Honest per-episode note (shown in the DownloadsView row) so the swap is never silent.
+            DownloadStore.shared.update(id: record.id) {
+                $0.retryNote = String(localized: "Retried with next-best source (first source failed)")
+            }
+        }
     }
 
     private func finish(cancelled: Bool) {

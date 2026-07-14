@@ -779,7 +779,7 @@ struct iOSHomeView: View {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
                                             },
-                                            onTap: handleTap))
+                                            onTap: handleTap, showWatchedBadges: true))
                     }
                     // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id via
                     // handleTap). Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
@@ -789,7 +789,7 @@ struct iOSHomeView: View {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
                                             },
-                                            onTap: handleTap))
+                                            onTap: handleTap, showWatchedBadges: true))
                     }
                     // "Upcoming Episodes": the next-airing episode of each series in the library within the
                     // next 45 days, soonest first (see ReleaseCalendarModel). Each card is the SERIES (so a
@@ -824,7 +824,7 @@ struct iOSHomeView: View {
                                                              releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
                                                              genres: $0.genres)
                                                 },
-                                                onTap: handleTap,
+                                                onTap: handleTap, showWatchedBadges: true,
                                                 // #95: horizontal infinite scroll for THIS catalog row.
                                                 onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
                                 // Vertical infinite scroll: reaching the last populated catalog row loads the
@@ -847,7 +847,7 @@ struct iOSHomeView: View {
                                                     RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                              poster: $0.poster, progress: 0)
                                                 },
-                                                onTap: handleTap))
+                                                onTap: handleTap, showWatchedBadges: true))
                         }
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
@@ -1376,13 +1376,15 @@ struct DownloadsView: View {
                 return [record.qualityText, size].compactMap { $0 }
             case .downloading:
                 let pct = Int(record.fractionComplete * 100)
-                return [String(localized: "Downloading \(pct)%")]
+                return [String(localized: "Downloading \(pct)%"), record.retryNote].compactMap { $0 }
             case .paused:
-                return [String(localized: "Paused")]
+                return [String(localized: "Paused"), record.retryNote].compactMap { $0 }
             case .failed:
-                return [record.errorText ?? String(localized: "Failed")]
+                // Keep the honest retry note alongside the failure, so a doubly-failed batch episode reads
+                // "Failed · Retried with next-best source", not a bare "Failed" that hides the auto-swap (#119).
+                return [record.errorText ?? String(localized: "Failed"), record.retryNote].compactMap { $0 }
             case .queued:
-                return [String(localized: "Queued")]
+                return [String(localized: "Queued"), record.retryNote].compactMap { $0 }
             }
         }()
         if !parts.isEmpty {
@@ -1649,7 +1651,7 @@ struct iOSSearchView: View {
                                    RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
                                },
                                onTap: { saveToHistory(query); path.append(FeaturedHeroItem.from(rail: $0)) },
-                               menu: .catalog)
+                               menu: .catalog, showWatchedBadges: true)
                 }
             }
         }
@@ -1809,7 +1811,7 @@ struct iOSDiscoverView: View {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, onTap: handleTap, onReachEnd: { core.loadDiscoverNextPage() })
+                        }, onTap: handleTap, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
                     } else if account.isSignedIn {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 100)
                     } else {
@@ -1949,7 +1951,7 @@ struct iOSDiscoverView: View {
                                    RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
                                },
                                onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
-                               menu: .catalog)
+                               menu: .catalog, showWatchedBadges: true)
                 }
             }
         }
@@ -2688,12 +2690,19 @@ struct PosterGrid: View {
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
-    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
+    /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
+    /// only catalog/discovery surfaces badge (Home catalog rails, Discover grid), exactly as tvOS scopes it;
+    /// Continue Watching and the Library grid keep it off (their cards carry progress / their own treatment).
+    /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
+    var showWatchedBadges: Bool = false
+    /// Called when the LAST card appears: the infinite-scroll hook for paginated grids (Discover).
     /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
     @Environment(\.horizontalSizeClass) private var hSize
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
@@ -2713,7 +2722,8 @@ struct PosterGrid: View {
             ForEach(items) { item in
                 Button { onTap(item) } label: {
                     PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
-                                  progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu)
+                                  progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                                  isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id))
                 }
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
@@ -2769,6 +2779,11 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
+    /// #111 (iOS mirror of tvOS): show the per-profile watched check badge + 55% dim on each card. Opt-in so
+    /// only catalog/discovery rails badge, exactly as tvOS scopes it; Continue Watching keeps it off (its
+    /// cards carry the resume timecode + progress stripe, not a watched badge).
+    /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
+    var showWatchedBadges: Bool = false
     /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
     /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
     var onReachEnd: (() -> Void)? = nil
@@ -2780,6 +2795,8 @@ private struct PosterRail: View {
     var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
     #endif
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
     /// Pointer hovering the rail (#3). Never fires on pure-touch iPhone, so the
     /// scroll arrows reveal only on Mac / iPad-with-trackpad, where swiping a long
     /// row is awkward. On touch the row stays swipe-only.
@@ -2826,6 +2843,7 @@ private struct PosterRail: View {
         let base = Button { onTap(item) } label: {
             PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
                           progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                          isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
                           onDetails: onDetails.map { od in { od(item) } })
         }
         .buttonStyle(.plain)
@@ -3062,6 +3080,10 @@ struct PosterCardiOS: View {
     var resumeSeconds: Double? = nil
     /// Which long-press menu to attach (#14). `.none` attaches none.
     var menu: iOSPosterMenu = .none
+    /// Watched state (#111, iOS mirror of the tvOS PosterCard): 55% opacity plus a check badge, exactly the
+    /// tvOS treatment. Data-bearing catalog callers (Home rails + browse grids) pass it from the shared
+    /// per-profile `WatchedIndex` set; the default keeps every other card pixel-identical.
+    var isWatched: Bool = false
     /// Per-card "open details" action, wired into the Continue Watching menu's Details item.
     var onDetails: (() -> Void)? = nil
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
@@ -3126,8 +3148,9 @@ struct PosterCardiOS: View {
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
                     .overlay(alignment: .topTrailing) {
                         // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
-                        // the native overlay to avoid a double badge.
-                        if let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
+                        // the native overlay to avoid a double badge. Also skipped on a watched card, whose
+                        // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
+                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -3152,7 +3175,18 @@ struct PosterCardiOS: View {
                                 .padding(.bottom, 4)
                         }
                     }
-                if progress > 0.01 {
+                    .overlay(alignment: .topTrailing) {
+                        // Watched check badge (#111, exact mirror of tvOS PosterCard's treatment): a filled
+                        // accent checkmark in the topTrailing corner. The whole poster dims to 55% below.
+                        if isWatched {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.title3).foregroundStyle(Theme.Palette.accent)
+                                .padding(6).shadow(radius: 3)
+                                .accessibilityLabel("Watched")
+                        }
+                    }
+                    .opacity(isWatched ? 0.55 : 1)   // mirror tvOS: a watched poster (and its badges) reads at 55%
+                if !isWatched, progress > 0.01 {
                     // A rounded progress track inset from the card edges (a capsule, not a square-cornered
                     // bar flush to the rounded poster) so it reads as an intentional part of the card.
                     GeometryReader { geo in

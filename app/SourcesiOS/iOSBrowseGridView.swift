@@ -80,7 +80,7 @@ struct iOSCollectionsHub: View {
             if !visibleDecades.isEmpty {
                 hubSection(title: "Browse by Decade") {
                     ForEach(visibleDecades, id: \.self) { d in
-                        NavigationLink(value: HubTarget.decade(d)) { iOSDecadeTile(decade: d, width: tileWidth) }.buttonStyle(.plain)
+                        NavigationLink(value: HubTarget.decade(d)) { iOSDecadeTile(decade: d, cover: model.decadeCovers[d.title], width: tileWidth) }.buttonStyle(.plain)
                     }
                 }
             }
@@ -350,13 +350,19 @@ struct iOSGenreTile: View {
 }
 
 /// A browse-by-decade tile: the same ember-tinted card as iOSGenreTile with a calendar glyph and the decade
-/// label. No backdrop (the gradient carries it), so nothing to decode.
+/// label. A representative decade poster (resolved + daily-cached by CollectionsHubModel via the /cover edge)
+/// paints behind the scrim when present; an empty/missing cover keeps the plain ember gradient (nothing to decode).
 struct iOSDecadeTile: View {
     let decade: DecadeSpec
+    /// Representative decade poster URL (CollectionsHubModel.decadeCovers). Nil = the gradient carries the tile.
+    var cover: String? = nil
     var width: CGFloat = iOSPillMetrics.cardWidth
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            if let cover, !cover.isEmpty {
+                iOSTileImage(url: cover, maxPixel: 900, contentMode: .fill) { Color.clear }
+            }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {
                 Image(systemName: decade.symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
@@ -416,7 +422,7 @@ struct iOSCategoryBrowse: View {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     }
                 } else {
-                    PosterGrid(items: items, onTap: open, menu: .catalog, onReachEnd: { Task { await loadNext() } })
+                    PosterGrid(items: items, onTap: open, menu: .catalog, showWatchedBadges: true, onReachEnd: { Task { await loadNext() } })
                 }
             }
             .padding(.bottom, Theme.Space.md)
