@@ -491,8 +491,8 @@ struct PlayerScreen: View {
         // fullscreen player, so signal "a player is up" for as long as this screen is mounted - the hero
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
-        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear() }
-        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear() }
+        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(); LoopbackPlaybackAssertion.begin(for: url) }
+        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
     }
 
     #if os(iOS) || os(macOS)
