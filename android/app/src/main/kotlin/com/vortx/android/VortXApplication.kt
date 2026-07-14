@@ -23,11 +23,15 @@ import com.vortx.android.engine.EngineStremioRepository
 /// `MainActivity`'s manifest entry doesn't cover -- e.g. a system locale/night-mode change, or "Don't
 /// keep activities" on some OEM skins) without the process (and so the JVM statics backing
 /// [com.vortx.android.engine.StremioCoreNative]) ever restarting. If each `onCreate` built its own
-/// `EngineStremioRepository`, only the FIRST one's [com.vortx.android.engine.StremioCoreNative.init]
-/// listener would ever actually be registered natively (the native side is idempotent and no-ops a
-/// second `init` call) -- every subsequent Activity instance would hold a repository whose engine
-/// event flow silently never fires again. Building it once here, keyed to [Application] (which really
-/// does live for the process), makes that impossible: every `MainActivity.onCreate` reads the SAME
+/// `EngineStremioRepository`, the process-wide [com.vortx.android.engine.StremioCoreNative] object's
+/// `initialized` guard would make every [com.vortx.android.engine.StremioCoreNative.init] after the
+/// first return early WITHOUT re-registering the caller's listener -- so only the FIRST repository's
+/// event listener is ever wired to native, and every subsequent Activity instance would hold a
+/// repository whose engine event flow silently never fires again. (The native `nativeInit` itself does
+/// not orphan a re-init: reached a second time it REPLACES the stored listener global ref,
+/// last-writer-wins, and its runtime build is idempotent -- but the Kotlin-side guard means native
+/// never even sees the second call.) Building it once here, keyed to [Application] (which really does
+/// live for the process), makes that impossible: every `MainActivity.onCreate` reads the SAME
 /// instance, whether it's the first launch or the fifth recreation.
 ///
 /// A genuine process death (the OS reclaiming the whole app in the background) restarts this class
