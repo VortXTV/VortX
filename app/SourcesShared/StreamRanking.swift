@@ -141,14 +141,22 @@ enum StreamRanking {
     /// (score + continuity + binge + pin), best-first, de-duplicated by playable URL. Feeds the batch-download
     /// auto-retry (#119 remainder): on a failed episode it drops the winning source and queues the NEXT distinct
     /// source with the identical ranking the batch used. Returns [] when nothing is playable. In the user's
-    /// explicit add-on-order mode the list keeps add-on/list order (the "don't re-rank" choice), matching best().
+    /// explicit add-on-order mode the list keeps add-on/list order (the "don't re-rank" choice) but still fronts
+    /// an applicable pin, matching best()'s add-on-order branch, so candidates.first is best()'s winner.
     static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                                  pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> [CoreStream] {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         let pairs = playablePairs(groups)
         let ordered: [CoreStream]
         if SourcePreferences.reading.useAddonOrder {
-            ordered = pairs.map { $0.stream }
+            // Mirror best()'s add-on-order branch EXACTLY: an applicable pin is the user's explicit
+            // "play THIS", so front the pinned stream ahead of add-on/list order. The URL de-dup below
+            // drops the pinned stream's second appearance, so candidates.first == best()'s winner.
+            if pin != nil, let hit = firstPinned(groups, pin: pin) {
+                ordered = [hit] + pairs.map { $0.stream }
+            } else {
+                ordered = pairs.map { $0.stream }
+            }
         } else {
             ordered = pairs.enumerated()
                 .map { (offset: $0.offset,
