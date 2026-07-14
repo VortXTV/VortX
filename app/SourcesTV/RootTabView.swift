@@ -49,6 +49,11 @@ struct PlaybackRequest: Identifiable {
     /// load failure it MUST hop to a fresh source instead of dead-ending: a stored debrid link expires, and the
     /// resume's job is to get you watching. Distinct from wasExplicitPick, where a manual source-row tap dead-ends.
     var wasResume: Bool = false
+    /// "Play from start" (backlog E): start this playback at 0:00 even when a saved resume position exists,
+    /// WITHOUT re-running source selection. It rides the SAME source-resolution path as Watch Now / Resume
+    /// (so the source is identical, per the play-from-start invariant); only the start position differs. The
+    /// stored resume point is left untouched. TVPlayerView reads it to skip its engine/account resume lookup.
+    var startFromZero: Bool = false
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -101,6 +106,7 @@ struct RootView: View {
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
+                             startFromZero: req.startFromZero,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }

@@ -1681,6 +1681,18 @@ struct CoreStreamList: View {
                     .opacity(watchReady ? 1 : 0.55)
                     .focused($watchFocused)   // FIX H: target of the page's default focus
 
+                    // "Play from start" (backlog E): a secondary chip beside the primary "Resume · 1:03",
+                    // shown only when a saved resume position exists. Plays the SAME best source the primary
+                    // Watch/Resume would (never re-runs source selection, per the play-from-start invariant),
+                    // just from 0:00, and leaves the stored resume point untouched. Mirrors iOS iOSDetailView.
+                    if resumeSeconds != nil {
+                        Button { if watchReady { playBest(best, in: groups, fromStart: true) } } label: {
+                            Label("Play from start", systemImage: "arrow.counterclockwise")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                        .opacity(watchReady ? 1 : 0.55)
+                    }
+
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
                     // 720p / Others), then the flavors inside it (Dolby Vision · Remux, HDR · Atmos, …).
                     Button { showQualityPicker = true } label: {
@@ -2030,11 +2042,11 @@ struct CoreStreamList: View {
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
     /// single-resolve `play(best)`, so the no-key / no-cache path is unchanged. A MANUAL row tap still calls
     /// `play(_:)` directly (`streamRow`), resolving exactly the row the user chose.
-    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup]) {
-        Task { await playBestResolving(best, in: groups) }
+    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false) {
+        Task { await playBestResolving(best, in: groups, fromStart: fromStart) }
     }
 
-    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup]) async {
+    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false) async {
         // EXACT-SOURCE RESUME (owner requirement): if this title was last played through a specific debrid
         // source, resume THAT source directly - reresolve a fresh link for the same file - instead of
         // re-running source selection across every add-on (the "Tried N sources / this source didn't load"
@@ -2057,7 +2069,7 @@ struct CoreStreamList: View {
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
                                                         infoHash: hash, torrentId: entry.debridTorrentId,
                                                         fileId: entry.debridFileId, fileIdx: entry.fileIdx),
-                                                    wasExplicitPick: true, wasResume: true)
+                                                    wasExplicitPick: true, wasResume: true, startFromZero: fromStart)
                 return
             }
         }
@@ -2072,17 +2084,17 @@ struct CoreStreamList: View {
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
-                                                headers: win.stream.requestHeaders)
+                                                headers: win.stream.requestHeaders, startFromZero: fromStart)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
         // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
-        await playResolving(best, explicit: false)
+        await playResolving(best, explicit: false, fromStart: fromStart)
     }
 
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
-    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool) async {
+    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false) async {
         // INSTANT FIRST-PLAY: cache-gate the manual resolve on the account-confirmed sets so only a genuinely
         // cached pick runs the blocking debrid resolve (~1 round trip to the direct link); a not-confirmed pick
         // returns nil with zero network and falls straight through to the embedded path below, which plays in a
@@ -2094,7 +2106,8 @@ struct CoreStreamList: View {
             presenter.request = PlaybackRequest(url: direct, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
-                                                headers: stream.requestHeaders, wasExplicitPick: explicit)
+                                                headers: stream.requestHeaders, wasExplicitPick: explicit,
+                                                startFromZero: fromStart)
             return
         }
         // Today's path, unchanged.
@@ -2104,7 +2117,8 @@ struct CoreStreamList: View {
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
-                                            headers: stream.requestHeaders, wasExplicitPick: explicit)
+                                            headers: stream.requestHeaders, wasExplicitPick: explicit,
+                                            startFromZero: fromStart)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {
