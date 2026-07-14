@@ -24,7 +24,9 @@ enum class MediaType(val label: String, val id: String) {
 }
 
 /// A single catalog entry (movie, series, etc.). [poster] is a URL once the engine is wired; until
-/// then it is null and the UI renders a deterministic brand-tinted placeholder card.
+/// then it is null and the UI renders a deterministic brand-tinted placeholder card. [progress]
+/// (0f..1f, null = not in progress) comes from the library's timeOffset/duration on Continue
+/// Watching items and drives PosterCard's accent progress track.
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -32,6 +34,7 @@ data class MetaItem(
     val poster: String? = null,
     val year: String? = null,
     val description: String? = null,
+    val progress: Float? = null,
 )
 
 /// A named row of items, e.g. "Continue Watching" or an add-on catalog like "Cinemeta - Popular".
@@ -56,19 +59,63 @@ data class Episode(
 /// Full meta detail, mirroring the engine's `meta_details.meta` (`CoreMetaItem`): the cinematic
 /// [background], the metadata row ([imdbRating]/[releaseInfo]/[runtime]/[genres]) the tvOS detail
 /// page leads with, and (for series) the [videos] episode list.
+///
+/// S05 additions (mirroring `CoreMetaDetails`/`CoreMetaItem`): [logo] for the hero logo-or-title
+/// slot, [cast]/[directors]/[writers] credits (read from the same `links` array as [genres], the
+/// engine's own categorized-link convention -- no extra network call), [libraryItem] (the engine's
+/// saved library entry for THIS title, driving Add-to-Library state + resume position), and
+/// [watchedVideoIds] (episode ids the engine's WatchedBitField marks watched, injected by
+/// `TvosModel::meta_details_json` in `core/src/model.rs` since the bitfield itself is
+/// `#[serde(skip_serializing)]` -- see that function's doc comment).
 data class MetaDetail(
     val id: String,
     val type: MediaType,
     val name: String,
     val poster: String? = null,
     val background: String? = null,
+    val logo: String? = null,
     val description: String? = null,
     val releaseInfo: String? = null,
     val runtime: String? = null,
     val imdbRating: String? = null,
     val genres: List<String> = emptyList(),
+    val cast: List<String> = emptyList(),
+    val directors: List<String> = emptyList(),
+    val writers: List<String> = emptyList(),
     val videos: List<Episode> = emptyList(),
+    val libraryItem: LibraryItemInfo? = null,
+    val watchedVideoIds: Set<String> = emptySet(),
 )
+
+/// The engine's saved library entry for the open title (`meta_details.libraryItem`, a `LibraryItem`
+/// mirroring the Apple `CoreCWItem` shape). Drives three things on Detail: whether the Add-to-Library
+/// chip reads "saved" ([removed]/[temp] both false), the movie-level watched dot ([timesWatched] > 0,
+/// matching Apple's `isWatched`), and the series resume target ([videoId]/[timeOffsetMs] against
+/// [MetaDetail.watchedVideoIds], see `DetailViewModel.primaryEpisode`).
+data class LibraryItemInfo(
+    val id: String?,
+    val removed: Boolean,
+    val temp: Boolean,
+    val videoId: String?,
+    val timeOffsetMs: Long,
+    val durationMs: Long,
+    val timesWatched: Int,
+) {
+    /// Present in the library proper (not a bare watched-marker temp entry, not soft-removed).
+    val savedToLibrary: Boolean get() = !removed && !temp
+
+    /// Movie-level watched flag (a movie has no per-video ticks), matching Apple's
+    /// `CoreCWItem.isWatched` (`state.timesWatched > 0`).
+    val isWatched: Boolean get() = timesWatched > 0
+
+    /// 0f..1f watch progress for a title with no episodes (a movie), or null when unknown/zero -- the
+    /// same math as [com.vortx.android.engine.EngineState]'s Continue Watching progress.
+    val progress: Float?
+        get() {
+            if (durationMs <= 0L || timeOffsetMs <= 0L) return null
+            return (timeOffsetMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+        }
+}
 
 /// A single playable source for a title, mirroring the engine's `CoreStream`. The UI shows
 /// [addon] (which add-on returned it), the human [title]/[description] the add-on wrote, and the

@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- minSdk is 26, so every target device supports adaptive icons; the anydpi-v26 variant is the only
-     launcher icon needed (no PNG density fallbacks). -->
+<!-- Adaptive launcher icon (introduced API 26, this project's minSdk, so every install supports it
+     and no legacy raster fallback is needed). Lives in the -v26 qualifier: the VortX-standard
+     location for the sole launcher-icon variant across the Apple/Android surfaces. monochrome
+     enables Android 13+ themed icons; ignored gracefully below API 33. -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@color/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
-    <monochrome android:drawable="@drawable/ic_launcher_monochrome" />
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_vortx_mark" />
+    <monochrome android:drawable="@drawable/ic_vortx_mark_monochrome" />
 </adaptive-icon>

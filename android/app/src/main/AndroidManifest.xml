@@ -8,17 +8,19 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <application
+        android:name=".VortXApplication"
         android:allowBackup="true"
+        android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="@string/app_name"
         android:localeConfig="@xml/locales_config"
         android:enableOnBackInvokedCallback="true"
         android:supportsRtl="true"
-        android:theme="@style/Theme.VortX.Starting">
+        android:theme="@style/Theme.VortX">
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:theme="@style/Theme.VortX.Splash"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

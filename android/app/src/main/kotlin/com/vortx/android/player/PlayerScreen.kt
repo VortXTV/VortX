@@ -36,6 +36,11 @@ import com.vortx.android.model.Playable
 /// DV -> HEVC/AVC/AV1 codec fallback and its DefaultAudioSink negotiates Atmos passthrough; that is why
 /// the router routes those streams there. The DV badge in the chrome is gated on the display advertising
 /// Dolby Vision (see [displaySupportsDolbyVision]), so it never promises DV on a panel that cannot present it.
+// Two opt-in annotations, deliberately: kotlin.OptIn satisfies the Kotlin compiler's own experimental-API
+// check; androidx.annotation.OptIn is the separate one Android Lint's UnsafeOptInUsageError looks for
+// (S01 lint-config baseline surfaced this -- ExoPlayerEngine(context) below, inside an inline `remember`
+// lambda, was flagged even though it's lexically inside this function).
+@androidx.annotation.OptIn(markerClass = [UnstableApi::class])
 @OptIn(UnstableApi::class)
 @Composable
 fun PlayerScreen(

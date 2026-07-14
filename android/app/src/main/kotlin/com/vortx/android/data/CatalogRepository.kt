@@ -1,7 +1,15 @@
 package com.vortx.android.data
 
 import com.vortx.android.model.Catalog
+import com.vortx.android.model.DiscoverFilters
+import com.vortx.android.model.DiscoverResult
+import com.vortx.android.model.DiscoverTypeOption
 import com.vortx.android.model.Episode
+import com.vortx.android.model.InstalledAddon
+import com.vortx.android.model.LibraryFilters
+import com.vortx.android.model.LibraryResult
+import com.vortx.android.model.LibrarySortOption
+import com.vortx.android.model.LibraryTypeOption
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
@@ -9,6 +17,8 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the
 /// real stremio-core-kotlin engine (Rust core over JNI, the same engine the iOS/tvOS apps use) lands
@@ -21,11 +31,74 @@ interface CatalogRepository {
     /// Home rows: Continue Watching first, then the user's add-on catalogs as poster rails.
     suspend fun home(): Result<List<Catalog>>
 
-    /// Discover rows filtered by type (Movie/Series/...), drawn from the installed add-ons.
-    suspend fun discover(type: MediaType): Result<List<Catalog>>
+    /// CONTINUOUS Home rows: emits the current rail set immediately and again every time the engine's
+    /// underlying state changes (each add-on catalog answering, Continue Watching updating, a
+    /// sign-in/sign-out swapping the whole catalog set). The engine is event-driven -- a board load is
+    /// not one response but a stream of partial settlements, one per add-on -- so Home must collect
+    /// this for the screen's lifetime and render incrementally; a one-shot [home] call can only ever
+    /// see whichever instant it sampled (the S03 device round proved that renders empty rails).
+    /// Emissions are conflated + deduplicated; the flow never completes (cancel via scope).
+    ///
+    /// Default = a single [home] emission, so the offline preview impl (and any other one-shot
+    /// implementation) satisfies the contract without change.
+    fun homeUpdates(): Flow<List<Catalog>> = flow { emit(home().getOrThrow()) }
 
-    /// The user's saved Library (bookmarked titles).
-    suspend fun library(): Result<List<MetaItem>>
+    /// CONTINUOUS ctx/library change ticks -- the Group-1 reactivity primitive every other mutable
+    /// surface (Library, Detail's Saved chip, Discover's current selection, the installed-addons list)
+    /// is built on, mirroring [homeUpdates]'s pattern for the same class of bug: Add-to-Library,
+    /// Remove-from-Library, InstallAddon, UninstallAddon, sign-in, and sign-out are all whole-model ctx
+    /// broadcasts (`field = null`) in the engine, so a screen that only reads state ONCE at load time
+    /// (a one-shot suspend call) can never see a change made by a DIFFERENT screen/action -- it renders
+    /// whatever it happened to snapshot at construction time until it is torn down and recreated (an
+    /// app restart) or some UNRELATED interaction (a filter chip tap) happens to force a fresh read.
+    /// That is the exact shape of the device-round bugs: Library not updating after Add-to-Library from
+    /// Detail, Detail's Saved chip not updating after a remove from the Library grid, Discover's
+    /// catalogs not updating after an add-on install/remove or a sign-in. Emits once immediately (so a
+    /// fresh collector always gets an initial tick) and again on every relevant engine change; never
+    /// completes (cancel via the collecting scope).
+    ///
+    /// Default = a single emission, so the offline preview impl (and any future one-shot
+    /// implementation) satisfies the contract without change -- its mutations are already synchronous
+    /// local list edits the caller re-reads directly, so there is nothing to observe.
+    fun ctxUpdates(): Flow<Unit> = flow { emit(Unit) }
+
+    /// Discover: the currently selected catalog's items plus the type/catalog/genre pivot chips
+    /// (S04). [requestJson] is null for the engine's own default selection (first load), or the exact
+    /// `request` JSON echoed back from a [DiscoverFilters] type/catalog/genre option the caller tapped
+    /// -- the request must be re-dispatched byte-for-byte, never reconstructed client-side (that
+    /// reconstruction gap was the "type chips are inert" bug this session fixes).
+    suspend fun discover(requestJson: String? = null): Result<DiscoverResult>
+
+    /// Load the next page of the CURRENTLY selected Discover catalog (infinite scroll / "Load more").
+    suspend fun discoverNextPage(): Result<DiscoverResult>
+
+    /// The user's saved Library (bookmarked titles) plus the type/sort pivot chips (S04). [requestJson]
+    /// is null for the default (all types, last-watched), or a verbatim echo of a [LibraryFilters]
+    /// type/sort option's `request`.
+    suspend fun library(requestJson: String? = null): Result<LibraryResult>
+
+    /// Add a title to the Library (the "Save"/bookmark action from a poster's long-press menu or the
+    /// detail page).
+    suspend fun addToLibrary(item: MetaItem): Result<Unit>
+
+    /// Remove a title from the Library (the Library grid's per-poster "x" control, DESIGN-SYSTEM.md §4
+    /// "Library").
+    suspend fun removeFromLibrary(id: String): Result<Unit>
+
+    /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
+    /// `ctx.profile.addons`.
+    suspend fun installedAddons(): Result<List<InstalledAddon>>
+
+    /// Install (or update-in-place) an add-on from a pasted manifest URL. Fetches + validates the
+    /// manifest first (mirrors Apple `CoreBridge.installAddon`); the [Result.failure] message is
+    /// user-facing.
+    suspend fun installAddon(url: String): Result<Unit>
+
+    /// Remove an installed add-on (the Add-ons screen's per-row "Remove" control). Protected/official
+    /// add-ons are still removable at the repository level; the UI is responsible for hiding the
+    /// control for [InstalledAddon.isProtected] entries, mirroring Apple `AddonsView`'s
+    /// `!addon.isProtected` gate.
+    suspend fun removeAddon(addon: InstalledAddon): Result<Unit>
 
     /// Full-text search across every add-on the user has installed.
     suspend fun search(query: String): Result<List<MetaItem>>
@@ -48,6 +121,46 @@ interface CatalogRepository {
     /// its local HLS URL, unlock a debrid link, or pass an HTTP link straight through. It also folds in
     /// the per-profile resume position. The player only ever receives a concrete URL.
     suspend fun resolve(source: StreamSource): Result<Playable>
+
+    // ---- S05: Detail watched-state + library mutations ----
+    //
+    // Every mutation returns the freshly re-pulled [MetaDetail] so the caller can swap its state in one
+    // step (ticks/progress/library-chip flip live) instead of a separate reload. Default bodies just
+    // re-fetch [meta] unchanged, so an implementation that predates this session (the offline preview,
+    // any future repository that doesn't model mutation) still satisfies the contract with a benign
+    // no-op rather than a compile break; [EngineStremioRepository] overrides every one of these for the
+    // real engine dispatch.
+
+    /// Mark the whole title (movie, or every episode of a series) watched/unwatched.
+    suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = meta(type, id)
+
+    /// Mark one series episode watched/unwatched. [videoId] is the engine `CoreVideo.id`.
+    suspend fun setVideoWatched(
+        type: MediaType,
+        id: String,
+        videoId: String,
+        season: Int?,
+        episode: Int?,
+        isWatched: Boolean,
+    ): Result<MetaDetail> = meta(type, id)
+
+    /// Mark every episode of one season watched/unwatched.
+    suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
+        meta(type, id)
+
+    /// Save the open title to the library.
+    suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
+        meta(type, id)
+
+    /// Remove the open title from the library.
+    suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = meta(type, id)
+
+    /// A pure LOCAL re-read of the currently-loaded title's meta (no re-dispatch of a Load action),
+    /// for [ctxUpdates] consumers that only want to pick up a library/watched-state change made
+    /// elsewhere without re-triggering the add-on network fan-out every tick. Null when nothing is
+    /// currently loaded for [id], or the implementation has no such local snapshot (default: falls back
+    /// to a full [meta] reload, which is still correct, just not the cheap path).
+    suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = meta(type, id).getOrNull()
 }
 
 /// The canonical name for the engine seam. The screens were built against [CatalogRepository]; the
@@ -86,19 +199,94 @@ class PreviewCatalogRepository(
         )
     }
 
-    override suspend fun discover(type: MediaType): Result<List<Catalog>> {
+    /// The type currently "selected" in the preview Discover chips (there is no real engine selectable
+    /// to echo, so this stands in for it across calls in this offline-only implementation).
+    private var previewDiscoverType: MediaType = MediaType.MOVIE
+
+    private fun previewDiscoverFilters(): DiscoverFilters =
+        DiscoverFilters(
+            types = MediaType.entries.map {
+                DiscoverTypeOption(it.label, it == previewDiscoverType, it.id)
+            },
+        )
+
+    override suspend fun discover(requestJson: String?): Result<DiscoverResult> {
         delay(latencyMs)
+        if (requestJson != null) {
+            previewDiscoverType = MediaType.entries.find { it.id == requestJson } ?: previewDiscoverType
+        }
+        val type = previewDiscoverType
         return Result.success(
-            listOf(
-                Catalog("top", "Top ${type.label}", sample(type.label, type, 10)),
-                Catalog("new", "New ${type.label}", sample("New ${type.label}", type, 10)),
-            )
+            DiscoverResult(
+                items = sample("Top ${type.label}", type, 16),
+                filters = previewDiscoverFilters(),
+            ),
         )
     }
 
-    override suspend fun library(): Result<List<MetaItem>> {
+    override suspend fun discoverNextPage(): Result<DiscoverResult> = discover(null)
+
+    private val previewLibrary = mutableListOf<MetaItem>().apply { addAll(sample("Saved", MediaType.MOVIE, 8)) }
+
+    override suspend fun library(requestJson: String?): Result<LibraryResult> {
         delay(latencyMs)
-        return Result.success(sample("Saved", MediaType.MOVIE, 8))
+        return Result.success(
+            LibraryResult(
+                items = previewLibrary.toList(),
+                filters = LibraryFilters(
+                    types = listOf(LibraryTypeOption("All", true, "")),
+                    sorts = listOf(LibrarySortOption("Recent", true, "")),
+                ),
+            ),
+        )
+    }
+
+    override suspend fun addToLibrary(item: MetaItem): Result<Unit> {
+        delay(latencyMs)
+        previewLibrary.removeAll { it.id == item.id }
+        previewLibrary.add(0, item)
+        return Result.success(Unit)
+    }
+
+    override suspend fun removeFromLibrary(id: String): Result<Unit> {
+        delay(latencyMs)
+        previewLibrary.removeAll { it.id == id }
+        return Result.success(Unit)
+    }
+
+    private val previewAddons = mutableListOf(
+        InstalledAddon(
+            transportUrl = "https://v3-cinemeta.strem.io/manifest.json",
+            name = "Cinemeta",
+            isOfficial = true,
+            isProtected = true,
+            providesStreams = false,
+            rawDescriptorJson = "{}",
+        ),
+    )
+
+    override suspend fun installedAddons(): Result<List<InstalledAddon>> {
+        delay(latencyMs)
+        return Result.success(previewAddons.toList())
+    }
+
+    override suspend fun installAddon(url: String): Result<Unit> {
+        delay(latencyMs)
+        if (url.isBlank()) return Result.failure(IllegalArgumentException("Enter a valid add-on URL."))
+        previewAddons.add(
+            InstalledAddon(
+                transportUrl = url,
+                name = url.substringAfterLast('/').ifBlank { url },
+                rawDescriptorJson = "{}",
+            ),
+        )
+        return Result.success(Unit)
+    }
+
+    override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> {
+        delay(latencyMs)
+        previewAddons.removeAll { it.transportUrl == addon.transportUrl }
+        return Result.success(Unit)
     }
 
     override suspend fun search(query: String): Result<List<MetaItem>> {

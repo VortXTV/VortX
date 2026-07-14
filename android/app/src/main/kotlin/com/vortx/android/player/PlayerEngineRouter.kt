@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import android.content.Context
+import androidx.media3.common.util.UnstableApi
 import com.vortx.android.model.Playable
 
 /// Decides which engine plays a given [Playable]: libmpv (`MpvPlayer`, the PRIMARY) for everything, or
@@ -63,6 +64,9 @@ object PlayerEngineRouter {
     ///   - [Engine.EXOPLAYER]: build the ExoPlayer engine directly.
     /// The caller (PlayerScreen) treats the result as an opaque [PlayerEngine]; the chrome stays
     /// engine-agnostic.
+    // androidx.annotation.OptIn (not just kotlin.OptIn) so Android Lint's UnsafeOptInUsageError accepts
+    // this as an opt-in site too -- see the matching note in PlayerScreen.kt (S01 lint-config baseline).
+    @androidx.annotation.OptIn(markerClass = [UnstableApi::class])
     fun engine(
         context: Context,
         playable: Playable,

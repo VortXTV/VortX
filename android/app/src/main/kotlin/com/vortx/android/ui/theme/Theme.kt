@@ -2,56 +2,82 @@ package com.vortx.android.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.CompositionLocalProvider
 
-/// StremioX is a media app used on a couch in a dim room at night, so the UI is dark by intent, not
-/// by default. Neutrals are tinted toward the StremioX violet brand hue (no pure black or white),
-/// with a single vivid accent that carries focus and selection.
-private val Accent = Color(0xFF7B5BFF)        // electric violet, the brand accent
-private val AccentDim = Color(0xFF2A2140)      // accent at low chroma for selected backgrounds
-private val Background = Color(0xFF0E0B14)      // near-black, violet-tinted
-private val Surface = Color(0xFF16121F)
-private val SurfaceVariant = Color(0xFF211B30)
-private val OnAccent = Color(0xFFF6F4FF)
-private val OnBackground = Color(0xFFECE9F2)    // tinted off-white, never #FFF
-private val OnSurfaceVariant = Color(0xFF9A93AD)
-
-private val StremioXDarkColors = darkColorScheme(
-    primary = Accent,
-    onPrimary = OnAccent,
-    primaryContainer = AccentDim,
-    onPrimaryContainer = OnBackground,
-    background = Background,
-    onBackground = OnBackground,
-    surface = Surface,
-    onSurface = OnBackground,
-    surfaceVariant = SurfaceVariant,
-    onSurfaceVariant = OnSurfaceVariant,
-)
-
-/// Hierarchy through scale and weight contrast (>1.25 ratio between steps), not a flat scale.
-private val StremioXType = Typography(
-    headlineLarge = TextStyle(fontWeight = FontWeight.Bold, fontSize = 34.sp, letterSpacing = (-0.5).sp),
-    titleLarge = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 22.sp),
-    titleMedium = TextStyle(fontWeight = FontWeight.SemiBold, fontSize = 17.sp),
-    bodyMedium = TextStyle(fontWeight = FontWeight.Normal, fontSize = 15.sp),
-    labelLarge = TextStyle(fontWeight = FontWeight.Medium, fontSize = 13.sp, letterSpacing = 0.3.sp),
-    labelSmall = TextStyle(fontWeight = FontWeight.Medium, fontSize = 11.sp, letterSpacing = 0.5.sp),
-)
-
+/// The VortX design-system layer (DESIGN-SYSTEM.md §2-3), wired two ways at once:
+///  1. [LocalVortXColors] / [LocalVortXTypeScale] carry the exact token values every VortX-native
+///     component (`ui/components/*`) reads via the [VortXTheme] accessor object below.
+///  2. A mapped M3 [androidx.compose.material3.ColorScheme] + [androidx.compose.material3.Typography]
+///     go into [MaterialTheme] itself, so stock M3 widgets (buttons, text fields, snackbars — anything
+///     a screen reaches for before its own VortX component exists) still inherit VortX colors instead
+///     of the M3 baseline purple.
+///
+/// The app is dark-only by design (DESIGN-SYSTEM.md §1: "the chrome is warm monochrome and recedes" —
+/// there is no light variant to switch to), so [accentId]/[oled] are the only live inputs; there is no
+/// `isSystemInDarkTheme()` branch to a light scheme.
 @Composable
-fun StremioXTheme(content: @Composable () -> Unit) {
-    // The app commits to dark; isSystemInDarkTheme is read so a future light scheme can slot in here.
-    @Suppress("UNUSED_VARIABLE") val systemDark = isSystemInDarkTheme()
-    MaterialTheme(
-        colorScheme = StremioXDarkColors,
-        typography = StremioXType,
-        content = content,
+fun VortXTheme(
+    accentId: String = VortXAccents.default.id,
+    oled: Boolean = false,
+    materialYou: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    @Suppress("UNUSED_VARIABLE") val systemDark = isSystemInDarkTheme() // read, not branched on — see kdoc above
+    val accent = if (materialYou) materialYouAccent() else VortXAccents.byId(accentId)
+    val colors = vortxColors(accent, oled)
+    val typeScale = vortxTypeScale(colors)
+
+    val materialColorScheme = darkColorScheme(
+        primary = colors.accent,
+        onPrimary = colors.onAccent,
+        primaryContainer = colors.accentSoft,
+        onPrimaryContainer = colors.accentBright,
+        secondary = colors.accentBright,
+        onSecondary = colors.onAccent,
+        background = colors.canvas,
+        onBackground = colors.textPrimary,
+        surface = colors.surface1,
+        onSurface = colors.textPrimary,
+        surfaceVariant = colors.surface2,
+        onSurfaceVariant = colors.textSecondary,
+        surfaceContainerHighest = colors.surface3,
+        outline = colors.hairline,
+        outlineVariant = colors.hairline,
+        error = colors.danger,
+        onError = colors.textPrimary,
     )
+
+    CompositionLocalProvider(
+        LocalVortXColors provides colors,
+        LocalVortXTypeScale provides typeScale,
+        LocalReducedMotion provides rememberReducedMotion(),
+    ) {
+        MaterialTheme(
+            colorScheme = materialColorScheme,
+            typography = materialTypography(colors),
+            content = content,
+        )
+    }
+}
+
+/// `VortXTheme.colors` / `.type` — the DESIGN-SYSTEM token accessor, parallel to `MaterialTheme.*`.
+/// Every VortX-native component reads through here rather than `MaterialTheme.colorScheme` directly,
+/// so a component never silently drifts onto an M3 default color the mapping above didn't cover.
+object VortXTheme {
+    val colors: VortXColors
+        @Composable get() = LocalVortXColors.current
+
+    val type: VortXTypeScale
+        @Composable get() = LocalVortXTypeScale.current
+
+    val spacing get() = VortXSpacing
+    val radius get() = VortXRadius
+    val shapes get() = VortXShapes
+    val elevation get() = VortXElevation
+    val motion get() = VortXMotion
+
+    val reducedMotion: Boolean
+        @Composable get() = LocalReducedMotion.current
 }

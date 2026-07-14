@@ -6,9 +6,9 @@ plugins {
 
 android {
     namespace = "com.vortx.android"
-    // compileSdk / targetSdk 36 (Android 16). AGP 8.10 (see the version catalog) is the floor that
-    // supports API 36 natively, so the old `android.suppressUnsupportedCompileSdk` workaround is gone.
-    // minSdk stays 26 (Android 8.0), already above Media3's floor.
+    // compileSdk 36 (Android 16) requires AGP >= 8.10.0 (root build.gradle.kts / the version catalog
+    // carry that pin). targetSdk now tracks compileSdk (S01: Android-16-baseline session) -- both at
+    // 36. minSdk stays 26 (already above Media3 1.9's floor of 23; covers phones and Android TV).
     compileSdk = 36
 
     defaultConfig {
@@ -18,14 +18,12 @@ android {
         versionCode = 1
         versionName = "0.3.0"
 
-        // Ship EXACTLY the two ABIs cargo-ndk cross-compiles the engine .so for (see androidAbis in
-        // the appended cargoNdkBuild block below). This is a hard coupling, not a size optimization:
-        // the libmpv AAR (`full` flavor) also carries a 32-bit armeabi-v7a slice, but cargo-ndk builds
-        // libstremiox_core.so ONLY for arm64-v8a + x86_64. Without this filter, an armeabi-v7a device
-        // could install a `full` APK whose armeabi-v7a slice has the player .so (libmpv/libplayer) but
-        // NOT the engine .so, a silent-degrade: the player loads, the engine fails its System.loadLibrary
-        // and the whole app falls back to preview data. Pinning abiFilters to the engine's ABI set makes
-        // "player .so present without engine .so for the same ABI" unrepresentable.
+        // Package ONLY the ABIs the Rust engine is cross-compiled for (the cargoNdkBuild task's
+        // androidAbis list below). Without this, the libmpv AAR's extra armeabi-v7a/x86 slices made
+        // AGP emit those ABIs too (verified by S03 APK inspection) -- and a 32-bit device would then
+        // install a slice that has mpv but NO libstremiox_core.so, silently degrading the whole app
+        // to preview data. One list, one truth: extend androidAbis + this together if 32-bit support
+        // lands (S15 schedules armeabi-v7a via per-ABI splits for old Fire TV sticks).
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
@@ -45,10 +43,9 @@ android {
     //   - `play`  = a lean Play-Store/Google-TV-bound build with NO GPL native libs (ExoPlayer only).
     //               It exists so a future Play listing stays clean of GPL/LGPL codec bits; it is NOT
     //               "the real player" -- libmpv-primary `full` is the product.
-    // The flavor split is the licensing boundary ONLY. Both flavors keep the SAME applicationId
-    // (com.vortx.android) so one sideload updates in place; they differ only by which player native
-    // libs are packaged. The id was com.stremiox.android before this branch; renaming it is safe
-    // because no Android build has ever shipped, so there is no install base to migrate.
+    // The flavor split is the licensing boundary ONLY. Keep the applicationId identical so sideload
+    // update continuity + account migration are unaffected (the com.vortx.android namespace is a
+    // hard invariant); flavors differ only by which player native libs are packaged.
     flavorDimensions += "distribution"
     productFlavors {
         create("full") {
@@ -68,12 +65,25 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.DEBUG gates the design-system gallery screen (S02: ui/gallery/GalleryScreen.kt)
+        // behind debug builds only, via a Settings row -- no separate launcher activity/manifest entry.
+        buildConfig = true
     }
 
-    // Fail the build on a lint error. abortOnError is AGP's default; pin it explicitly so a future
-    // edit cannot silently turn the gate off. The Android CI (android.yml) relies on this: a lint
-    // regression fails the job instead of shipping.
+    // Baseline lint config (S01 gradle hygiene): keep real errors failing CI, but silence checks that
+    // are structurally noisy for this skeleton rather than actual bugs. Extend this list as new
+    // spurious checks show up; don't reach for abortOnError = false, that would hide real problems too.
     lint {
+        disable += setOf(
+            "MissingTranslation", // localeConfig ships English only for now (S01); see res/xml/locales_config.xml
+            "ExtraTranslation",
+            // The LEANBACK_LAUNCHER intent-filter (AndroidManifest.xml, pre-S01) makes lint want a TV
+            // banner now. ANDROID-PLAN.md §0 "Form factors & packaging" explicitly schedules the TV
+            // banner + the rest of the TV manifest work for S13, not S01 -- don't fail every PR in the
+            // meantime for a deferred, already-planned requirement. Re-enable when S13 adds the banner.
+            "MissingTvBanner",
+        )
+        checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
         abortOnError = true
     }
 }
@@ -85,37 +95,40 @@ kotlin {
 }
 
 dependencies {
-    // All versions come from gradle/libs.versions.toml (the version catalog). See its header for the
-    // Kotlin-floor / Compose-BOM coupling rules.
+    // Every version below is pinned once, in gradle/libs.versions.toml (S01: version catalog
+    // migration) -- see that file's header for why each was chosen. compose-bom pins the whole
+    // androidx.compose.* family, so ui/material3/material-icons-extended below take no version.
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.compose.material.icons.extended)
-    implementation(libs.androidx.activity.compose)
-    implementation(libs.androidx.core.ktx)
+    implementation(libs.activity.compose)
+    implementation(libs.core.ktx)
 
-    // SplashScreen compat (androidx.core:core-splashscreen). Backports the Android 12 SplashScreen API
-    // to minSdk 26 so the branded launch screen + reduced-motion handling (see MainActivity) is one
-    // code path across versions.
-    implementation(libs.androidx.core.splashscreen)
+    // AndroidX SplashScreen API (S01): backs Theme.VortX.Splash (res/values/themes.xml) so the cold
+    // start shows the brand gold mark on warm obsidian instead of a blank window, uniformly from
+    // minSdk 26 up (framework-owned on 31+, compat-drawn identically below it). See MainActivity.
+    implementation(libs.core.splashscreen)
 
     // EncryptedSharedPreferences, so debrid API keys (credentials) are stored AES-encrypted at rest,
     // never in plain SharedPreferences. This is the Android analogue of the Apple Keychain the debrid
-    // keys live in (app/SourcesShared/DebridKeys.swift). security-crypto 1.1.0-alpha06 is the last
-    // published line of the artifact; it resolves from mavenCentral() (already in settings.gradle.kts)
-    // and pulls Tink transitively. DebridKeys reads it reflectively and falls back to plain prefs if
-    // the artifact is ever absent, so the boundary never hard-fails the build.
-    implementation(libs.androidx.security.crypto)
+    // keys live in (app/SourcesShared/DebridKeys.swift). It resolves from mavenCentral() (already in
+    // settings.gradle.kts) and pulls Tink transitively. DebridKeys reads it reflectively and falls
+    // back to plain prefs if the artifact is ever absent, so the boundary never hard-fails the build.
+    // NOTE: Google deprecated this artifact's APIs in 1.1.0 in favor of using Android Keystore
+    // directly; we're staying on it for S01 (out of scope to migrate DebridKeys here), flagged for a
+    // future session.
+    implementation(libs.security.crypto)
 
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
-    implementation(libs.androidx.lifecycle.viewmodel.compose)
-    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.compose)
     implementation(libs.kotlinx.coroutines.android)
 
-    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version (pinned
-    // once in the catalog as `media3`).
+    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version
+    // (libs.versions.toml's single `media3` version, unchanged in S01).
     //   - exoplayer:      the player + DefaultRenderersFactory (its built-in DV -> HEVC/AVC/AV1
     //                     fallback is what we rely on; no hand-rolled codec selection).
     //   - exoplayer-hls:  HLS support, the format the in-process streaming server emits for torrents.
@@ -137,15 +150,21 @@ dependencies {
     // LICENSING: the mpv/ffmpeg native code is GPLv3 (ffmpeg built --enable-gpl --enable-version3),
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
-    // distribution model. The play-flavor CI GPL-scan (android.yml) fails the build if libmpv.so ever
-    // leaks into a play APK. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
-    "fullImplementation"(libs.libmpv)
+    // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
+    "fullImplementation"(libs.mpv.libmpv)
 
     debugImplementation(libs.compose.ui.tooling)
 
     // kotlinx-coroutines-android (already pulled above for ViewModel/Flow) backs the engine seam's
     // event->coroutine bridge in com.vortx.android.engine. org.json (the engine JSON parser used
     // by EngineState/EngineActions) ships with the Android platform, so no extra JSON dependency.
+
+    // Coil (S03): real poster/backdrop art in PosterCard's `art` slot. coil-compose ships the
+    // AsyncImage composable + a default ImageLoader; coil-network-okhttp is Coil3's separated HTTP
+    // engine (required since 3.0 split fetching out of coil-compose). Both flavors need it (posters
+    // aren't GPL-licensed), so this is a plain `implementation`, not flavor-scoped.
+    implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
 }
 
 // =====================================================================================================
@@ -158,8 +177,7 @@ dependencies {
 // The native library is produced by `cargo ndk` (https://github.com/bbqsrc/cargo-ndk, v3.x). The Rust
 // side lives in core/ with crate-type = ["staticlib", "cdylib"]; the cdylib + the
 // #[cfg(target_os = "android")] JNI surface (core/src/android_jni.rs) compile to the .so loaded by
-// StremioCoreNative.System.loadLibrary("stremiox_core"). The .so name stays stremiox_core (the shared
-// core/ crate lib name, also linked by the Apple staticlib); only the JNI symbol path moved to vortx.
+// StremioCoreNative.System.loadLibrary("stremiox_core").
 //
 // Honest status: this is the build wiring (scaffold). It runs cargo-ndk when the Rust + NDK toolchain
 // is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).

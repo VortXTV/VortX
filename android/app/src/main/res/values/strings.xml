@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- App label everywhere the OS shows it (launcher, recents, share sheet, Settings > Apps). -->
     <string name="app_name">VortX</string>
+
+    <!-- Home-tab wordmark: "Vort" in the serif face + the mark as the "X" (DESIGN-SYSTEM.md §2 "The
+         mark"/"Wordmark"). Split so the composable can color only the "X" with the live accent;
+         translatable="false" because the brand name itself is never localized. -->
+    <string name="wordmark_prefix" translatable="false">Vort</string>
+    <string name="wordmark_suffix" translatable="false">X</string>
 </resources>

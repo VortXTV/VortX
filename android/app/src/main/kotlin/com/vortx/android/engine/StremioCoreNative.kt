@@ -7,17 +7,12 @@ package com.vortx.android.engine
 /// engine entry points as `external fun`s. Everything crosses the boundary as JSON (serde on the Rust
 /// side), exactly like the Apple bridge, so there is one engine contract shared by every platform.
 ///
-/// Naming has two independent axes, kept distinct on purpose:
-///   1. The JNI symbol path. The `external fun` names below resolve to
-///      `Java_com_vortx_android_engine_StremioCoreNative_*` in `core/src/android_jni.rs`, derived
-///      verbatim from this package + object name. Renaming either side without the other breaks the
-///      dynamic link, so they move together (they did, in the com.stremiox.android -> com.vortx.android
-///      rename).
-///   2. The loaded library name, `stremiox_core` (see [System.loadLibrary] below). This stays frozen:
-///      it is the `[lib] name` of the shared `core/` crate, and the SAME name backs the Apple
-///      staticlib (`libstremiox_core.a`) that the iOS/tvOS xcframework links. It is NOT part of the
-///      JNI symbol path, so keeping it does not affect the rename, and changing it would break the
-///      Apple link. Do not rename the library to match the package.
+/// The package + class are `com.vortx.android.engine.StremioCoreNative`, and the JNI symbol names in
+/// `core/src/android_jni.rs` are derived from this exact package + class
+/// (`Java_com_vortx_android_engine_StremioCoreNative_*`), so renaming either side breaks the dynamic
+/// link. Do not rename without updating both sides together. The loaded LIBRARY name `stremiox_core`
+/// (below) is a separate thing: it is the shared `core/` crate's cdylib name, frozen across the VortX
+/// rebrand, and is independent of this package/class.
 ///
 /// Lifecycle (mirrors the Apple `stremiox_core_init` contract):
 ///   1. [init] once at app start with the app's files dir (durable storage) and cache dir, plus a

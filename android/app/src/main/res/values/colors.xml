@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Adaptive-icon + splash background: the near-black, violet-tinted brand surface (matches the
-         Compose dark theme Background in ui/theme/Theme.kt). -->
-    <color name="ic_launcher_background">#0E0B14</color>
+    <!-- Fixed brand colors (S01): the app icon and splash keep the brand gold-on-obsidian look
+         regardless of the live accent theme (DESIGN-SYSTEM.md §2 "The mark"/"Splash": "the splash +
+         app icon keep the fixed brand gold"). These are NOT part of the themeable accent system that
+         S02 introduces; do not wire them to MaterialTheme. -->
+    <color name="vortx_canvas">#15120E</color>
 </resources>
