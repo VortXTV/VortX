@@ -339,7 +339,7 @@ final class MPVMetalViewController: PlatformViewController {
             // reports differently under Atmos vs working 5.1) is visible in the device log. Read the
             // intrinsic max BEFORE opting into multichannel content, so it reflects the route itself.
             let intrinsicMaxChannels = session.maximumOutputNumberOfChannels
-            NSLog("[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
+            NSLog("%@", "[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
             // #78: re-assert the route's OWN realized rate as the preferred rate so the AudioUnit opens at a
             // rate the locked Atmos/eARC route actually accepts. This backstops the pre-activation 48 kHz hint
             // above: if the route opened at its native rate (already 48k on eARC, or a different fixed rate),
@@ -365,7 +365,7 @@ final class MPVMetalViewController: PlatformViewController {
             if routeIsMultichannelCapable, intrinsicMaxChannels > 2 {
                 try? session.setPreferredOutputNumberOfChannels(min(intrinsicMaxChannels, 8))
             }
-            NSLog("[#78 audio] realized outputChannels=\(session.outputNumberOfChannels) (multichannelCapable=\(routeIsMultichannelCapable) intrinsicMax=\(intrinsicMaxChannels))")
+            NSLog("%@", "[#78 audio] realized outputChannels=\(session.outputNumberOfChannels) (multichannelCapable=\(routeIsMultichannelCapable) intrinsicMax=\(intrinsicMaxChannels))")
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
         } catch {
@@ -1921,7 +1921,7 @@ final class MPVMetalViewController: PlatformViewController {
                         let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
                         let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
                         let ao = self.getString("current-ao") ?? "?"
-                        NSLog("[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                        NSLog("%@", "[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
                         VXProbe.log("player", "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
                     }
                 case MPV_EVENT_VIDEO_RECONFIG:

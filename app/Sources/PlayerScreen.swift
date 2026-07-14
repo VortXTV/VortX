@@ -1725,7 +1725,7 @@ struct PlayerScreen: View {
         srcProbe("OVERLAY SET (spinner): torrent warm-up round \(torrentWarmupsUsed) hash=\(hash) (NOT error)")
         withAnimation { reconnecting = true }
         torrentStatus = "Starting torrent…"
-        NSLog("[Player] torrent warm-up round \(torrentWarmupsUsed) for \(hash)")
+        NSLog("%@", "[Player] torrent warm-up round \(torrentWarmupsUsed) for \(hash)")
         loadTimeout?.cancel()
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
@@ -2011,7 +2011,7 @@ struct PlayerScreen: View {
             try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             guard coordinator.player is AVPlayerEngineController else { return }   // already on libmpv / torn down
-            NSLog("[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
+            NSLog("%@", "[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
             srcProbe("AV start-watchdog FIRED (\(Int(avStartWatchdogSeconds))s, AVPlayer mounted but no frame) -> silent demote to libmpv")
             demoteAVPlayerToMPV(silent: true)
         }
