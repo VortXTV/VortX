@@ -28,10 +28,14 @@ import UIKit
 /// This conforms to `PlayerEngine` and emits events; rendering is owned by a sibling AVPlayerLayer host that
 /// calls `attachLayer`, while this object owns playback + state only. Embedded track selection (audio +
 /// subtitles via `AVMediaSelectionGroup`), `mediaSummary`, and `playbackStats` are real; chapters load from
-/// asset metadata when present. Subtitle styling, A/V delay, external add-on subtitles, and trickplay frame
-/// capture have no AVFoundation equivalent and stay no-ops, so the chrome hides those rows when this engine is
-/// active. The plain `HLSPlayerView.AVPlayerModel` still serves the bare iOS HLS path that does not need the
-/// full chrome.
+/// asset metadata when present. External add-on / community subtitles ARE real here: AVFoundation cannot
+/// side-load an SRT, so VortX downloads + parses the file and draws the cues over the AVPlayerLayer itself
+/// (`subtitleOverlay`), with `setSubDelay` as a live offset and `applySubtitleStyle` styling that overlay.
+/// Trickplay frame capture is real too (`AVPlayerItemVideoOutput`, tone-mapped to SDR). The genuine no-ops
+/// are the controls with no AVFoundation equivalent: audio delay (`setAudioDelay`), audio output mode
+/// (`setAudioOutputMode`, the system negotiates routing), and the hardware-decoding toggle
+/// (`setHardwareDecoding`, always hardware); the chrome hides those rows when this engine is active. The
+/// plain `HLSPlayerView.AVPlayerModel` still serves the bare iOS HLS path that does not need the full chrome.
 @MainActor
 final class AVPlayerEngineController: NSObject, PlayerEngine {
     let player = AVPlayer()
@@ -459,6 +463,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         subtitleRenderer.offset = seconds
         if externalSubActive { updateSubtitleOverlay(atClock: player.currentTime().seconds) }
     }
+    /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
+    /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
     func setAudioDelay(_ seconds: Double) {}
     /// Re-apply the user's subtitle appearance (size / colour / background) to the live overlay.
     func applySubtitleStyle() { subtitleOverlay?.applyStyle() }

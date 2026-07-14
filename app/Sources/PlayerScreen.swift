@@ -495,9 +495,11 @@ struct PlayerScreen: View {
     #endif
 
     /// Whether the active player engine is AVFoundation. Mirrors tvOS's runtime check (the mounted controller's
-    /// type), so the chrome can hide the rows AVPlayer has no equivalent for: external add-on subtitles and the
-    /// subtitle-sync nudge (its setSubDelay is a no-op on AVPlayer). Falls back to the routing decision before
-    /// the controller mounts so the gate is correct even on the first render.
+    /// type), so the chrome can hide the rows AVPlayer has no equivalent for: audio sync (setAudioDelay), audio
+    /// output mode, and the hardware-decoding toggle. External add-on subtitles and the subtitle-sync nudge now
+    /// work on BOTH engines (AVPlayer renders external cues itself + honours setSubDelay as an overlay offset),
+    /// so those rows are shown. Falls back to the routing decision before the controller mounts so the gate is
+    /// correct even on the first render.
     private var isAVPlayerActive: Bool {
         if coordinator.player is AVPlayerEngineController { return true }
         #if os(iOS) || os(macOS)
