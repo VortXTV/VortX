@@ -751,6 +751,35 @@ enum TMDBClient {
         return bd.map { "https://image.tmdb.org/t/p/w780\($0)" }
     }
 
+    /// A representative POSTER for a decade tile from the VortX catalogs edge: `catalogs.vortx.tv/cover?list=
+    /// <encoded TMDB discover path>&kind=poster`. The edge returns a bare TMDB poster path (its own shuffle /
+    /// caching applies); we prepend the w500 image base. Signed (our gated edge host), fail-soft to nil. The
+    /// decade poster counterpart of `listBackdrop`. Built off the same edge host RemoteConfig points at.
+    static func listCover(listPath: String) async -> String? {
+        guard let base = URL(string: edgeBase), let scheme = base.scheme, let host = base.host else { return nil }
+        var comps = URLComponents()
+        comps.scheme = scheme
+        comps.host = host
+        if let port = base.port { comps.port = port }
+        comps.path = "/cover"
+        comps.queryItems = [URLQueryItem(name: "list", value: listPath), URLQueryItem(name: "kind", value: "poster")]
+        guard let url = comps.url else { return nil }
+        var req = URLRequest(url: url)
+        VortXEdgeAuth.sign(&req)
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        // The edge returns the poster PATH: a JSON object carrying it (path / poster_path / cover), or the bare
+        // path as the response body. Prepend the w500 image base unless it is already an absolute URL.
+        var path: String?
+        if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            path = (obj["path"] as? String) ?? (obj["poster_path"] as? String) ?? (obj["cover"] as? String)
+        } else if let text = String(data: data, encoding: .utf8) {
+            path = text.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        }
+        guard let p = path, !p.isEmpty else { return nil }
+        return p.hasPrefix("http") ? p : "https://image.tmdb.org/t/p/w500\(p)"
+    }
+
     /// ISO `yyyy-MM-dd` for `daysAgo` days before now (0 = today). Bounds the Top-This-Week/Month/Year and
     /// "new"/"upcoming" date windows for the sub-catalog discover queries.
     static func isoDate(daysAgo: Int) -> String {
