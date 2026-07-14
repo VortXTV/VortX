@@ -94,6 +94,16 @@ final class SubtitleCueRenderer {
         if text.first == "\u{FEFF}" { text.removeFirst() }
         text = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
 
+        // ASS / SSA (Gap 5): an external add-on `.ass` subtitle used to fail to load entirely on the AVPlayer
+        // lane (its grammar has no "-->" timing lines, so the SRT/VTT parser returned []). libmpv renders ASS
+        // via libass; the VortX overlay is not libass, so parse the `[Events]` Dialogue lines into plain text
+        // cues (override tags flattened). This is TEXT parity (the subtitle now shows), not full styled parity.
+        let lower = text.lowercased()
+        if lower.contains("[script info]") || (lower.contains("[events]") && lower.contains("dialogue:")) {
+            let assCues = parseASS(text: text)
+            if !assCues.isEmpty { return assCues }
+        }
+
         var cues: [SubtitleCue] = []
         // Split into blocks on blank lines; each block is one cue (optionally with an index / id first line).
         let blocks = text.components(separatedBy: "\n\n")
@@ -116,6 +126,57 @@ final class SubtitleCueRenderer {
             cues.append(SubtitleCue(start: start, end: end, text: cleaned))
         }
         return stripLeakedASSMetadata(from: cues.sorted { $0.start < $1.start })
+    }
+
+    /// Parse ASS / SSA script text into cues (Gap 5). Reads the `[Events]` section: the `Format:` line names the
+    /// field order (Start / End / Text indices, Text always last and may itself contain commas), and each
+    /// `Dialogue:` line is one cue. Styling (`{\...}` override tags, `\N` line breaks) is FLATTENED to plain
+    /// text, since the overlay is not libass. No `[Events]` / no valid Dialogue rows yields [] (the caller then
+    /// falls through to the SRT/VTT parser). Robust to a missing Format line via the standard v4+ defaults.
+    private static func parseASS(text: String) -> [SubtitleCue] {
+        var startIdx = 1, endIdx = 2, textIdx = 9, fieldCount = 10   // ASS v4+ Dialogue defaults
+        var inEvents = false
+        var cues: [SubtitleCue] = []
+        for rawLine in text.components(separatedBy: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {   // section header: [Events] enables Dialogue parsing, any other disables it
+                inEvents = line.lowercased().hasPrefix("[events]")
+                continue
+            }
+            guard inEvents else { continue }
+            if line.lowercased().hasPrefix("format:") {
+                let cols = line.dropFirst("format:".count)
+                    .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                if let s = cols.firstIndex(of: "start") { startIdx = s }
+                if let e = cols.firstIndex(of: "end") { endIdx = e }
+                if let t = cols.firstIndex(of: "text") { textIdx = t }
+                if cols.count > 1 { fieldCount = cols.count }
+                continue
+            }
+            guard line.lowercased().hasPrefix("dialogue:") else { continue }
+            let payload = String(line.dropFirst("dialogue:".count))
+            // Split into at most `fieldCount` fields so the trailing Text field keeps its embedded commas.
+            let fields = payload.split(separator: ",", maxSplits: max(fieldCount - 1, 0),
+                                       omittingEmptySubsequences: false).map(String.init)
+            guard fields.count > textIdx, fields.count > startIdx, fields.count > endIdx else { continue }
+            guard let start = parseTimestamp(fields[startIdx]), let end = parseTimestamp(fields[endIdx]),
+                  end > start else { continue }
+            let cleaned = cleanASSText(fields[textIdx])
+            guard !cleaned.isEmpty else { continue }
+            cues.append(SubtitleCue(start: start, end: end, text: cleaned))
+        }
+        return cues.sorted { $0.start < $1.start }
+    }
+
+    /// Flatten one ASS Dialogue Text field to plain display text: convert `\N` / `\n` hard breaks to newlines
+    /// and `\h` to a space, then reuse `cleanText` to strip `{\...}` override blocks, any inline tags, and HTML
+    /// entities. (`parseTimestamp` already accepts the `H:MM:SS.cc` ASS time form.)
+    private static func cleanASSText(_ input: String) -> String {
+        var out = input
+        out = out.replacingOccurrences(of: "\\N", with: "\n")
+        out = out.replacingOccurrences(of: "\\n", with: "\n")
+        out = out.replacingOccurrences(of: "\\h", with: " ")
+        return cleanText(out)
     }
 
     // MARK: - Leaked ASS metadata repair (issue #76)
@@ -377,21 +438,26 @@ final class SubtitleOverlayView: UIView {
 
     /// Apply the current `SubtitleStyle` (size / colour / background). Re-called live when the user changes it.
     func applyStyle() {
+        let classic = SubtitleStyle.fontId == "classic"
         let color = uiColor(fromHex: SubtitleStyle.colorHex) ?? .white
         label.textColor = color
         // Map mpv's px font sizes (tuned for a 720-ish subtitle canvas) into a reasonable on-screen point size.
         let scaled = CGFloat(SubtitleStyle.fontSize) * fontScale
-        label.font = .systemFont(ofSize: scaled, weight: .semibold)
+        // Font choice (Gap 6): the picker's Modern/Classic used to be a dead control on the AVPlayer overlay
+        // (always systemFont/.semibold). Mirror the libmpv distinction instead: Modern = a lighter weight with a
+        // thin shadow outline (sub-border-size 2 + soft shadow); Classic = a heavier weight and a stronger
+        // border-like shadow (sub-border-size 3). So the Font toggle visibly changes AVPlayer subtitles too.
+        label.font = .systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
         switch SubtitleStyle.backgroundId {
         case "box":
             label.backgroundColor = UIColor.black
-            setShadow(on: false)
+            setShadow(on: false, heavy: classic)
         case "shaded":
             label.backgroundColor = UIColor.black.withAlphaComponent(0.5)
-            setShadow(on: false)
+            setShadow(on: false, heavy: classic)
         default:   // outline: transparent background, rely on a dark shadow for contrast
             label.backgroundColor = .clear
-            setShadow(on: true)
+            setShadow(on: true, heavy: classic)
         }
     }
 
@@ -403,11 +469,11 @@ final class SubtitleOverlayView: UIView {
         #endif
     }
 
-    private func setShadow(on: Bool) {
+    private func setShadow(on: Bool, heavy: Bool = false) {
         label.layer.shadowColor = UIColor.black.cgColor
         label.layer.shadowOpacity = on ? 0.9 : 0
-        label.layer.shadowRadius = on ? 3 : 0
-        label.layer.shadowOffset = CGSize(width: 0, height: 1)
+        label.layer.shadowRadius = on ? (heavy ? 4 : 3) : 0   // Classic carries a wider border-like shadow
+        label.layer.shadowOffset = CGSize(width: 0, height: heavy ? 2 : 1)
         label.layer.masksToBounds = false
     }
 
@@ -476,31 +542,33 @@ final class SubtitleOverlayView: NSView {
     }
 
     func applyStyle() {
+        let classic = SubtitleStyle.fontId == "classic"
         let color = nsColor(fromHex: SubtitleStyle.colorHex) ?? .white
         label.textColor = color
         let scaled = CGFloat(SubtitleStyle.fontSize) * 0.42
-        label.font = .systemFont(ofSize: scaled, weight: .semibold)
+        // Font choice (Gap 6): mirror the libmpv Modern/Classic distinction on the overlay (see the UIKit twin).
+        label.font = .systemFont(ofSize: scaled, weight: classic ? .bold : .semibold)
         switch SubtitleStyle.backgroundId {
         case "box":
             label.drawsBackground = true
             label.backgroundColor = .black
-            setShadow(on: false)
+            setShadow(on: false, heavy: classic)
         case "shaded":
             label.drawsBackground = true
             label.backgroundColor = NSColor.black.withAlphaComponent(0.5)
-            setShadow(on: false)
+            setShadow(on: false, heavy: classic)
         default:
             label.drawsBackground = false
-            setShadow(on: true)
+            setShadow(on: true, heavy: classic)
         }
     }
 
-    private func setShadow(on: Bool) {
+    private func setShadow(on: Bool, heavy: Bool = false) {
         if on {
             let shadow = NSShadow()
             shadow.shadowColor = .black
-            shadow.shadowBlurRadius = 3
-            shadow.shadowOffset = NSSize(width: 0, height: -1)
+            shadow.shadowBlurRadius = heavy ? 4 : 3   // Classic carries a wider border-like shadow
+            shadow.shadowOffset = NSSize(width: 0, height: heavy ? -2 : -1)
             label.shadow = shadow
         } else {
             label.shadow = nil
