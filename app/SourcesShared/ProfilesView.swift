@@ -73,13 +73,29 @@ struct ProfilePickerView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                 // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
                 // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
+                // macOS: the picker presents as a `.sheet`, which sizes to content; a horizontal ScrollView
+                // has no intrinsic width, so the sheet collapsed to ~one card and clipped the second avatar
+                // at the right edge (the Mac "Who's watching? cuts off the second avatar" report). The
+                // explicit `.frame` below gives the sheet a real width so a few cards fit, and this same
+                // horizontal ScrollView still scrolls when N avatars exceed it.
                 #if os(tvOS)
                 profileCards
                 #else
-                ScrollView(.horizontal, showsIndicators: false) { profileCards }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    profileCards
+                        // Center the row when it is narrower than the viewport so 2 avatars sit balanced
+                        // rather than pinned hard-left with the second grazing the edge.
+                        .frame(minWidth: 0, maxWidth: .infinity, alignment: .center)
+                }
                 #endif
             }
             .padding(Theme.Space.screenInset)
+            // macOS sheet sizing: without a concrete width the sheet adopts the horizontal ScrollView's
+            // tiny ideal width and clipped the avatars. Open wide enough for ~3 cards (230pt each + xl gaps),
+            // capped so a big display never blows the sheet up; the ScrollView carries any overflow.
+            #if os(macOS)
+            .frame(minWidth: 760, idealWidth: 940, maxWidth: 1100, minHeight: 520, idealHeight: 600)
+            #endif
             // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
             // remote, focus will not enter an overlay while anything beneath stays focusable).
             .disabled(pinTarget != nil)
