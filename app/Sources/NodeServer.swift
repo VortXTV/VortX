@@ -304,8 +304,9 @@ enum NodeServer {
                   s.once('error',function(e){ w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]); });
                   s.listen.apply(s,a);
                   w('[rebind]',['relistened on '+JSON.stringify(a)]);
-                  // Keep the Swift port latch truthful after a successful re-listen.
+                  // Keep the Swift port latch truthful, and clear the stuck marker on a successful re-listen.
                   try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
+                  try{ fs.unlinkSync(STUCKF); }catch(e){}
                 }catch(e){ w('[rebind-err]',[String(e)]); }
                 if(--pending<=0) __rb.busy=false;
               });
@@ -315,8 +316,9 @@ enum NodeServer {
         function __selfCheck(reason){
           var http; try{ http=require('http'); }catch(e){ return; }
           var req=http.get({host:'127.0.0.1',port:boundPort||11470,path:'/settings',timeout:4000},function(res){
-            // Got an HTTP response: listener is alive (busy-but-alive included). Never rebind; reset attempts.
-            __rb.attempts=0; res.resume();
+            // Got an HTTP response: listener is alive (busy-but-alive included). Never rebind; reset attempts
+            // and clear any stale stuck marker so the status string stops claiming recovery failed.
+            __rb.attempts=0; try{fs.unlinkSync(STUCKF)}catch(e){}; res.resume();
           });
           req.on('error',function(e){
             var c=e&&e.code;
@@ -513,6 +515,12 @@ enum NodeServer {
     static var listenerStuck: Bool { FileManager.default.fileExists(atPath: stuckMarkerPath) }
     /// Drop the one-shot signal the in-node heartbeat consumes to re-listen a dropped listener (#130).
     static func requestRebind() { try? Data().write(to: URL(fileURLWithPath: rebindSignalPath)) }
+    /// Clear both the suspect flag and the stuck marker once the server is confirmed accepting connections,
+    /// so the status string stops claiming recovery is in flight / failed after a later resume heals it.
+    private static func markHealthy() {
+        setListenerSuspect(false)
+        try? FileManager.default.removeItem(atPath: stuckMarkerPath)
+    }
 
     /// Foreground recovery entry point (call from the app's scenePhase `.active` hook). Subsumes the old
     /// drift-latch probe (StremioServer.isOnline, which self-heals a server.js EADDRINUSE port drift), then
@@ -524,18 +532,18 @@ enum NodeServer {
         // Custom/remote servers self-manage; a dead in-process runtime cannot be rebound in-process.
         guard !StremioServer.isCustom, exitCode == nil else { return }
         // The ordinary scan latches a drifted fallback port and returns true if any port answers -> healthy.
-        if await StremioServer.isOnline() { setListenerSuspect(false); return }
+        if await StremioServer.isOnline() { markHealthy(); return }
         // Nothing answered on the whole fallback range. Classify the failure on the current bound port.
         guard await probeRefused() else { return }   // timeout / other -> busy-but-alive, do nothing
         // Confirm the process is still alive (fresh heartbeat tick) before touching anything, and confirm
         // the refusal a second time so a single transient miss never trips a rebind.
-        guard processLikelyAlive(), await probeRefused() else { setListenerSuspect(false); return }
+        guard processLikelyAlive(), await probeRefused() else { markHealthy(); return }
         setListenerSuspect(true)
         DiagnosticsLog.log("server", "loopback refused twice while process alive; requesting listener rebind (#130)")
         requestRebind()
         try? await Task.sleep(nanoseconds: 3_000_000_000)   // let the heartbeat consume the signal + re-listen
         if await StremioServer.isOnline() {
-            setListenerSuspect(false)
+            markHealthy()
             DiagnosticsLog.log("server", "listener rebind confirmed; server accepting connections again (#130)")
         } else {
             // Leave suspect set; a later foreground re-probes, and after 3 in-node attempts the stuck marker
