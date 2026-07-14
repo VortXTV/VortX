@@ -1335,6 +1335,12 @@ struct TVPlayerView: View {
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
+                    // Re-picking the CURRENT episode (an immediate replay of the one that just finished) keeps the
+                    // same ScrobbleCoordinator session key, so without a fresh per-playback token the scrobble start
+                    // is suppressed as a same-session re-entry (startSent still latched) and the replay never
+                    // scrobbles. Mint a new token so the coordinator opens a fresh session. A DIFFERENT episode
+                    // changes the key and resets the latches on its own, so it needs no re-mint here.
+                    if ep.id == curMeta?.videoId { playbackSessionID = UUID().uuidString }
                     play(episode: ep)
                 }
             }
