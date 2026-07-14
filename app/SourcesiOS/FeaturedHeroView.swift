@@ -293,10 +293,11 @@ struct FeaturedHeroView: View {
     // MARK: Overlay (logo-or-title · meta row · synopsis · actions)
 
     private func content(_ hero: FeaturedHeroItem) -> some View {
+        // S5: title, meta, synopsis, actions, dots. The action row no longer splits the text block; the
+        // buttons sit below the copy, matching the detail hero (iOSDetailView heroBelow / heroContent).
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             titleOrLogo(hero)
             metaRow(hero)
-            actionRow(hero)
             if let overview = hero.description, !overview.isEmpty {
                 Text(overview)
                     .font(Theme.Typography.body)
@@ -306,6 +307,7 @@ struct FeaturedHeroView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
             }
+            actionRow(hero)
             pagerDots
         }
     }
