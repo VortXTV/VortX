@@ -186,6 +186,17 @@ final class VortXSyncManager: ObservableObject {
                 self.requestSyncSoon()
             }
         }
+        // T-2: give TraktAuth a cross-device lookup for the refresh-401 recovery path. When a refresh 401s
+        // because a SIBLING device already rotated the (shared) refresh token, TraktAuth consults the freshest
+        // synced doc.apiKeys mirror here and re-adopts that token instead of signing this device out.
+        Task { @MainActor in
+            await TraktAuth.shared.setSyncedTokenProvider {
+                guard let keys = (await VortXSyncManager.shared.pullSyncDoc())?["apiKeys"] as? [String: String],
+                      let access = keys["traktAccess"], let refresh = keys["traktRefresh"],
+                      !access.isEmpty, !refresh.isEmpty else { return nil }
+                return (access, refresh, Int(keys["traktExpiry"] ?? "") ?? 0)
+            }
+        }
     }
 
     // MARK: - Keychain persistence

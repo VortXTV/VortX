@@ -26,6 +26,24 @@ actor SIMKLAuth {
     /// True once a non-empty client id is present. Everything no-ops until then.
     static var isConfigured: Bool { !clientID.isEmpty }
 
+    /// App marketing version (CFBundleShortVersionString), e.g. "0.3.14"; "1" when the plist key is absent
+    /// (mirrors the MediaServerAuth precedent). SIMKL requires an `app-version` on every request.
+    static var appVersion: String {
+        (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1"
+    }
+
+    /// Descriptive User-Agent SIMKL wants on every request. A blank/default UA risks their abuse filters,
+    /// which can suspend the API key (S-5).
+    static var userAgent: String { "VortX/\(appVersion) (Apple tvOS/iOS/macOS; +https://vortx.tv)" }
+
+    /// The `client_id` / `app-name` / `app-version` query items SIMKL requires on EVERY request (S-4).
+    /// Appended alongside whatever query items an endpoint already carries.
+    static var requiredQueryItems: [URLQueryItem] {
+        [URLQueryItem(name: "client_id", value: clientID),
+         URLQueryItem(name: "app-name", value: "VortX"),
+         URLQueryItem(name: "app-version", value: appVersion)]
+    }
+
     private static func infoValue(_ key: String) -> String {
         ((Bundle.main.object(forInfoDictionaryKey: key) as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -88,7 +106,7 @@ actor SIMKLAuth {
     func requestPin() async throws -> SIMKLPin {
         try ensureConfigured()
         guard var components = URLComponents(string: Self.apiBase + "/oauth/pin") else { throw SIMKLError.badURL }
-        components.queryItems = [URLQueryItem(name: "client_id", value: Self.clientID)]
+        components.queryItems = Self.requiredQueryItems
         guard let url = components.url else { throw SIMKLError.badURL }
         let (data, status) = try await send(makeGET(url))
         guard status == 200 else { throw SIMKLError.server(status: status) }
@@ -106,7 +124,7 @@ actor SIMKLAuth {
     func poll(userCode: String) async throws -> PollResult {
         try ensureConfigured()
         guard var components = URLComponents(string: Self.apiBase + "/oauth/pin/\(userCode)") else { throw SIMKLError.badURL }
-        components.queryItems = [URLQueryItem(name: "client_id", value: Self.clientID)]
+        components.queryItems = Self.requiredQueryItems
         guard let url = components.url else { throw SIMKLError.badURL }
         let (data, status) = try await send(makeGET(url))
         guard status == 200 else { throw SIMKLError.server(status: status) }
@@ -151,6 +169,7 @@ actor SIMKLAuth {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(Self.clientID, forHTTPHeaderField: "simkl-api-key")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         return request
     }
 
