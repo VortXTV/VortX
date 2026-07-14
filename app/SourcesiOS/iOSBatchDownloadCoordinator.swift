@@ -361,19 +361,25 @@ final class BatchDownloadCoordinator: ObservableObject {
     }
 
     /// The one-shot swap: consume the plan FIRST (so a still-failing alternate can never re-arm and loop),
-    /// remove the failed download, then resolve + queue the next-best source with an honest retry note.
+    /// then resolve + queue the next-best source, and only AFTER the replacement is queued cancel the failed
+    /// download through DownloadManager (the canonical path that also clears the stashed resume data and the
+    /// HLS asset-task map, which DownloadStore.remove leaves behind). Queue-before-cancel means an app kill in
+    /// the swap window leaves the original failed row on disk to retry from, never a vanished episode.
     private func performRetrySwap(failedRecordID id: UUID, plan: RetryPlan) {
         guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
-        DownloadStore.shared.remove(id: id)                               // drop the failed download (task, record, file)
         Task { @MainActor [weak self] in
             guard let self else { return }
             let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: plan.alternate, episode: plan.episode)
             if resolved == nil, plan.alternate.isTorrent { _ = self.prepareTorrentStream(plan.alternate) }
-            guard let fallback = plan.alternate.playableURL else { return }
+            guard let fallback = plan.alternate.playableURL else { return }   // no URL: keep the failed row, do not orphan the episode
             let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
                                                          resolvedURL: resolved ?? fallback,
                                                          sourceName: plan.alternate.name,
                                                          qualityText: StreamRanking.signature(plan.alternate))
+            // Replacement is queued: now drop the failed download via the canonical DownloadManager path
+            // (cancels the live task, clears taskForRecord / resumeData / cannotCreateFileRetries / the HLS
+            // asset-task map, then removes the record + file). DownloadStore.remove would leak that bookkeeping.
+            DownloadManager.shared.cancel(id: id)
             // Honest per-episode note (shown in the DownloadsView row) so the swap is never silent.
             DownloadStore.shared.update(id: record.id) {
                 $0.retryNote = String(localized: "Retried with next-best source (first source failed)")
