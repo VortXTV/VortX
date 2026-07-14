@@ -557,9 +557,14 @@ enum NodeServer {
         if await StremioServer.isOnline() { markHealthy(); return }
         // Nothing answered on the whole fallback range. Classify the failure on the current bound port.
         guard await probeRefused() else { return }   // timeout / other -> busy-but-alive, do nothing
-        // Confirm the process is still alive (fresh heartbeat tick) before touching anything, and confirm
-        // the refusal a second time so a single transient miss never trips a rebind.
-        guard processLikelyAlive(), await probeRefused() else { markHealthy(); return }
+        // A process that has exited or frozen its loop is not a listener-drop we can rebind in-process; leave
+        // any markers exactly as they are (the exitCode / stalled-loop status branches already describe that
+        // state) and return. Do NOT markHealthy here -- that would delete a legitimately-set stuck marker for
+        // a server that is in no way healthy.
+        guard processLikelyAlive() else { return }
+        // Confirm the refusal a second time so a single transient miss never trips a rebind. Only a probe that
+        // now gets an HTTP response means the first refusal was transient and the listener is genuinely healthy.
+        guard await probeRefused() else { markHealthy(); return }
         setListenerSuspect(true)
         DiagnosticsLog.log("server", "loopback refused twice while process alive; requesting listener rebind (#130)")
         requestRebind()
@@ -587,8 +592,15 @@ enum NodeServer {
             return false   // any response -> listener alive
         } catch let e as URLError {
             switch e.code {
-            case .cannotConnectToHost, .networkConnectionLost:
-                return true    // ECONNREFUSED / ECONNRESET -> listener torn down
+            case .cannotConnectToHost:
+                return true    // ECONNREFUSED -> the listener is genuinely unbound
+            case .networkConnectionLost:
+                // Accept-then-close: under fd exhaustion libuv accepts then closes the connection while the
+                // process is perfectly ALIVE (see the RLIMIT_NOFILE note above), which surfaces here as a lost
+                // connection. That is alive-but-starved, NOT a torn-down listener, so log it distinctly and do
+                // not signal a rebind.
+                DiagnosticsLog.log("server", "loopback connection-lost (alive-but-starved?); not signaling rebind (#130)")
+                return false
             default:
                 return false   // .timedOut and everything else -> leave alone
             }
