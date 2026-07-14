@@ -267,10 +267,12 @@ enum StreamRanking {
         score += languageScore(text)
         // Smart Source Selection (Lane A): the Prefer boost and, in "rank" mode, the Avoid demotion. Read
         // through SourcePreferences.reading so the off-main rank uses the frozen Snapshot (race contract).
-        // Prefer +8000 lifts a matching source decisively WITHIN its tier (same magnitude as the cache
-        // bonus). Avoid -20000 sinks a matching source well past the quality spread yet stays above the
-        // -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole point of "rank").
-        // Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
+        // Prefer +2500 lifts a matching source WITHIN its tier but is sized so prefer + cache (+8000) + the
+        // max quality spread (~4300) stays UNDER the 15000 source-type tier step, so a preferred-and-cached
+        // lower-tier source can never leapfrog a higher tier (the anti-regression invariant that source-type
+        // order is the top-level key). Avoid -20000 sinks a matching source well past the quality spread yet
+        // stays above the -100000 junk floor, so an avoided source is demoted but still VISIBLE (the whole
+        // point of "rank"). Neither touches the HARD junkClass / Kids drops, which remain in passesUserFilters.
         score += chipScoreOffset(text)
         // Cached dominates WITHIN its tier: +8000 clears the maximum quality spread (~4300), so
         // a cached stream always beats an uncached one of the same source type, which is the
@@ -307,13 +309,15 @@ enum StreamRanking {
 
     /// Smart Source Selection (Lane A) score offset for a stream's quality text: a Prefer-term boost plus,
     /// when Avoid behavior is "rank", an Avoid-term demotion. Both magnitudes are chosen against the same
-    /// ladder the cache/junk bonuses use (see `computeScore`): +8000 is a within-tier lift, -20000 sinks a
-    /// source below the quality spread but keeps it above the -100000 junk floor so it stays visible.
+    /// ladder the cache/junk bonuses use (see `computeScore`): +2500 is a within-tier lift small enough that
+    /// prefer + cache (+8000) + the max quality spread (~4300) stays under the 15000 tier step (so a
+    /// preferred-and-cached source never crosses its source-type tier); -20000 sinks a source below the
+    /// quality spread but keeps it above the -100000 junk floor so it stays visible.
     static func chipScoreOffset(_ text: String) -> Int {
         let prefs = SourcePreferences.reading
         var offset = 0
         if !prefs.preferTerms.isEmpty, prefs.preferTerms.contains(where: { text.contains($0) }) {
-            offset += 8000
+            offset += 2500
         }
         if prefs.avoidBehavior == "rank", avoidMatches(text, prefs) {
             offset -= 20_000
