@@ -1109,10 +1109,10 @@ extension DebridCoordinator {
     /// path unchanged. It is FAIL-SOFT by construction: every non-success (no key, not a raw torrent, any
     /// `DebridError`, a throw, or the timeout) returns `nil`, so the user is never left unable to play.
     ///
-    /// NO-KEY BYTE-IDENTICAL GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns
-    /// `nil` on the very first line with ZERO `await` and zero provider contact, so the caller runs exactly
-    /// the code it ran before this feature existed. The same immediate `nil` applies to any non-raw-torrent
-    /// stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
+    /// NO-KEY GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns `nil`
+    /// immediately with no network and no provider contact (only the at-most-once lazy warm hop), so the
+    /// caller runs exactly the code it ran before this feature existed. The same immediate `nil` applies to
+    /// any non-raw-torrent stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
     ///
     /// - Parameters:
     ///   - stream: the stream the user is about to play.
@@ -1134,7 +1134,8 @@ extension DebridCoordinator {
     /// The same bounded, fail-soft resolve as `resolvedPlaybackURL`, but returning the full
     /// `DebridPlaybackRef` (URL + provider + reresolve ids) so the play-record can persist enough to
     /// later refresh an expired link. `resolvedPlaybackURL` is a thin `?.url` wrapper over this, so every
-    /// guarantee (raw-torrent-only, no-key zero-await nil, timeout → nil) is identical.
+    /// guarantee (raw-torrent-only, no-key immediate nil (no network, only the at-most-once lazy warm hop),
+    /// timeout → nil) is identical.
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
