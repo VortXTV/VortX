@@ -263,6 +263,15 @@ final class VortXSyncManager: ObservableObject {
         // is active it would also be opened by scenePhase, but adopting here covers the in-place sign-in
         // flow where the scene never re-activates). Idempotent: startRealtime() no-ops if already live.
         startRealtime()
+        // ONE interactive sign-in must restore everything: hydrate the engine from the account's owned
+        // add-ons + recover the owner library HERE, at the single chokepoint every sign-in entry point
+        // funnels through (password, create, recover, QR joiner), instead of waiting for a background/
+        // foreground cycle to re-run the degraded-engine check. Fire-and-forget because adopt() is
+        // synchronous and hydration is network-bound. Cannot zero anything by construction: hydrate acts
+        // only on a real .doc pull (.failed/.empty do nothing), add-on installs are an install-only
+        // union, and owner-library recovery requires the engine to have POSITIVELY reported an empty
+        // account library first (see hydrateEngineFromOwnedAddons / recoverOwnerLibraryIfEmpty).
+        Task { await self.hydrateEngineFromOwnedAddons() }
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
     }
@@ -378,6 +387,11 @@ final class VortXSyncManager: ObservableObject {
         return pt
     }
 
+    /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and
+    /// "undecryptable/ratchet-refused doc" into one nil, so a caller cannot tell a fresh account from a
+    /// blip and can misroute a failure into a seed/push decision. Kept only for callers not yet migrated;
+    /// everything in this type now goes through pullSyncDocResult() (tri-state .doc/.empty/.failed).
+    @available(*, deprecated, message: "nil conflates 'no backup yet' with 'pull failed'; use pullSyncDocResult() (or a tri-state wrapper like accountHasSyncData/rosterConflictWithAccount) so a network blip is never misread as an empty account")
     func pullSyncDoc() async -> [String: Any]? {
         guard dataKey != nil else { return nil }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
@@ -1298,20 +1312,34 @@ final class VortXSyncManager: ObservableObject {
 
     // MARK: - Reconciliation (no blind last-writer-wins)
 
-    enum SignInReconcile: Equatable { case seededFromDevice, hasAccountData }
+    enum SignInReconcile: Equatable { case seededFromDevice, hasAccountData, unreachable }
 
-    /// True when the account already holds synced data (so a sign-in is a merge/conflict, not a seed).
-    func accountHasSyncData() async -> Bool {
-        guard let doc = await pullSyncDoc() else { return false }
-        return doc["settings"] != nil || doc["apiKeys"] != nil
+    /// Tri-state probe: does the account already hold synced data (so a sign-in is a merge/conflict,
+    /// not a seed)? Built on pullSyncDocResult() instead of the nil-collapsing pullSyncDoc() so "the
+    /// pull FAILED" surfaces as a distinct `.unreachable`: the old Bool collapsed a network blip into
+    /// "no data", which routed reconcileAfterSignIn into `.seededFromDevice`, whose syncUp could push
+    /// this device over an account doc that was never actually read.
+    enum AccountDataProbe: Equatable { case hasData, empty, unreachable }
+    func accountHasSyncData() async -> AccountDataProbe {
+        switch await pullSyncDocResult() {
+        case .doc(let doc): return (doc["settings"] != nil || doc["apiKeys"] != nil) ? .hasData : .empty
+        case .empty: return .empty          // genuinely no backup yet: safe to seed
+        case .failed: return .unreachable   // network/server blip or refused doc: retry, never seed
+        }
     }
 
     /// Call right after a successful sign-in. A fresh (empty) account is seeded from this device; if the
-    /// account already has data, the UI must ASK the user which side to keep (useAccountData vs pushThisDevice).
+    /// account already has data, the UI must ASK the user which side to keep (useAccountData vs
+    /// pushThisDevice); and when the doc cannot be pulled the caller gets `.unreachable`, a distinct
+    /// retry state in which NOTHING is pushed (a blip must never be treated as a fresh account).
     func reconcileAfterSignIn() async -> SignInReconcile {
-        if await accountHasSyncData() { return .hasAccountData }
-        await syncUp()
-        return .seededFromDevice
+        switch await accountHasSyncData() {
+        case .hasData: return .hasAccountData
+        case .unreachable: return .unreachable
+        case .empty:
+            await syncUp()
+            return .seededFromDevice
+        }
     }
 
     /// Conflict resolution: replace this device's profiles + settings with the account's (forced).
@@ -1355,9 +1383,18 @@ final class VortXSyncManager: ObservableObject {
 
     /// Whether this device's live roster differs (by the set of profile ids) from the account's, so the
     /// explicit "Sync now" button can decide between a silent push and the three-way conflict prompt.
-    func rosterConflictWithAccount() async -> Bool {
-        guard let cloudRoster = Self.decodeRoster(fromSettingsBlob: (await pullSyncDoc())?["settings"]) else { return false }
-        return ProfileStore.shared.rosterDiffers(from: cloudRoster)
+    /// Tri-state (pullSyncDocResult, not the nil-collapsing pullSyncDoc): `.unreachable` means the doc
+    /// could not be pulled, so the caller must surface a retry instead of misreading the blip as
+    /// `.noConflict` and silently pushing over a roster it never actually compared against.
+    enum RosterProbe: Equatable { case conflict, noConflict, unreachable }
+    func rosterConflictWithAccount() async -> RosterProbe {
+        switch await pullSyncDocResult() {
+        case .failed: return .unreachable
+        case .empty: return .noConflict   // no doc yet: nothing to conflict with; a push is the seed
+        case .doc(let doc):
+            guard let cloudRoster = Self.decodeRoster(fromSettingsBlob: doc["settings"]) else { return .noConflict }
+            return ProfileStore.shared.rosterDiffers(from: cloudRoster) ? .conflict : .noConflict
+        }
     }
 
     /// Refresh account fields from /me (e.g. two-factor was toggled on the website), so the app's view

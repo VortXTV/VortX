@@ -4,6 +4,7 @@ import SwiftUI
 struct StremioTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
+    @StateObject private var sync = VortXSyncManager.shared
     @StateObject private var presenter = PlayerPresenter()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -95,6 +96,20 @@ struct StremioTVApp: App {
                     // push profiles + settings under a background-task grace window so a just-made library
                     // removal / rewind survives a sideload-update process kill (CW resurrection fix).
                     VortXSyncManager.shared.syncUpOnBackground()
+                }
+            }
+            .onChange(of: sync.isSignedIn) { _, signedIn in
+                // A VortX sign-in from ANY entry point (password sheet, QR joiner) must restore add-ons +
+                // owner library WITHOUT waiting for a background/foreground cycle: adopt() hydrates at the
+                // sign-in chokepoint, and this root-level hook re-runs the degraded-engine check once the
+                // signed-in flag flips, catching an adopt-time pass that raced the engine still booting.
+                // Never-zero guarded inside the manager (a .failed/.empty pull does nothing; install-only
+                // union; library recovery only when the engine POSITIVELY reports an empty account library).
+                guard signedIn else { return }
+                Task {
+                    if CoreBridge.shared.hasNoUserStreamAddon {
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    }
                 }
             }
             .onAppear {

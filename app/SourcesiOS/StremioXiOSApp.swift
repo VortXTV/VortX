@@ -14,6 +14,7 @@ import UIKit
 struct StremioXiOSApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
+    @StateObject private var sync = VortXSyncManager.shared
     @Environment(\.scenePhase) private var scenePhase
     /// Launch splash gate (the brand pinwheel animation), matching Apple TV. Cleared when it finishes;
     /// it covers the engine + embedded-server boot moment on iPhone, iPad, and Mac too.
@@ -100,6 +101,21 @@ struct StremioXiOSApp: App {
                         // push profiles + settings under a background-task grace window so a just-made library
                         // removal / rewind survives a sideload-update process kill (CW resurrection fix).
                         VortXSyncManager.shared.syncUpOnBackground()
+                    }
+                }
+                .onChange(of: sync.isSignedIn) { signedIn in   // iOS 16 single-parameter form
+                    // A VortX sign-in from ANY entry point (password, create, recover, QR approve) must
+                    // restore add-ons + owner library WITHOUT waiting for a background/foreground cycle:
+                    // adopt() hydrates at the sign-in chokepoint, and this root-level hook re-runs the
+                    // degraded-engine check once the signed-in flag flips, catching an adopt-time pass
+                    // that raced the engine still booting. Never-zero guarded inside the manager (a
+                    // .failed/.empty pull does nothing; install-only union; library recovery only when
+                    // the engine POSITIVELY reports an empty account library).
+                    guard signedIn else { return }
+                    Task {
+                        if CoreBridge.shared.hasNoUserStreamAddon {
+                            await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        }
                     }
                 }
                 .onAppear {

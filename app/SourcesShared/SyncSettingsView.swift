@@ -20,6 +20,7 @@ struct SyncSettingsView: View {
     @State private var newRecoveryCode: String?   // shown once, right after creating an account
     @State private var showConflict = false       // account already has data: ask which side to keep
     @State private var syncing = false
+    @State private var syncNote: String?          // signed-in status line: the tri-state retry surface
 
     var body: some View {
         ScrollView {
@@ -45,9 +46,9 @@ struct SyncSettingsView: View {
             // "Merge both" is the recommended/default: it unions the rosters so NO profile is lost.
             // The other two force one side, but even "Use account's data" still keeps local-only
             // profiles (syncDown unions them back), so neither choice can silently delete a profile.
-            Button("Merge both (keep all profiles)") { Task { syncing = true; await sync.mergeBoth(); syncing = false } }
-            Button("Use account's data") { Task { syncing = true; await sync.useAccountData(); syncing = false } }
-            Button("Keep this device") { Task { syncing = true; await sync.pushThisDevice(); syncing = false } }
+            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() } }
+            Button("Use account's data") { resolveConflict { await sync.useAccountData() } }
+            Button("Keep this device") { resolveConflict { await sync.pushThisDevice() } }
         } message: {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.")
         }
@@ -76,6 +77,12 @@ struct SyncSettingsView: View {
                 .disabled(syncing)
             Button("Sign out") { sync.signOut(); reset() }
                 .buttonStyle(ChipButtonStyle(selected: false))
+        }
+
+        // The tri-state retry surface: shown when the account doc could not be reached (a network
+        // blip), so the failure is visible and retryable instead of silently swallowed.
+        if let syncNote {
+            Text(syncNote).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
@@ -147,18 +154,38 @@ struct SyncSettingsView: View {
 
     // MARK: Actions
 
+    /// Run ONE conflict resolution, then re-run the account hydrate as a belt-and-braces pass:
+    /// whichever side won, the engine should hold the account's owned add-ons + owner library
+    /// right away, without waiting for a background/foreground cycle to re-check. Idempotent and
+    /// never-zero guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
+    private func resolveConflict(_ action: @escaping () async -> Void) {
+        Task { @MainActor in
+            syncing = true
+            syncNote = nil
+            await action()
+            await sync.hydrateEngineFromOwnedAddons()
+            syncing = false
+        }
+    }
+
     /// Explicit "Sync now": if the account's roster differs from this device, ASK which to keep
     /// (Merge both / Use account / Keep this device) instead of blind-pushing, so a deliberate push
     /// never silently drops the other side's profiles. When the rosters match there is nothing to ask,
-    /// so it just pushes as before.
+    /// so it just pushes as before. An unreachable account doc is a DISTINCT retry state: it must not
+    /// be misread as "no conflict" and silently pushed over a roster that was never compared.
     private func syncNow() {
         Task { @MainActor in
             syncing = true
-            if await sync.rosterConflictWithAccount() {
+            switch await sync.rosterConflictWithAccount() {
+            case .conflict:
                 syncing = false
                 showConflict = true
-            } else {
+            case .unreachable:
+                syncNote = "Could not reach VortX sync. Check your connection and try again."
+                syncing = false
+            case .noConflict:
                 await sync.pushThisDevice()
+                syncNote = nil
                 syncing = false
             }
         }
@@ -188,8 +215,22 @@ struct SyncSettingsView: View {
         switch result {
         case .ok:
             password = ""; totp = ""; needsTotp = false
-            // Decide pull vs seed vs ask: a fresh account is seeded; one with data prompts which to keep.
-            Task { if await sync.reconcileAfterSignIn() == .hasAccountData { showConflict = true } }
+            // Decide pull vs seed vs ask: a fresh account is seeded; one with data prompts which to
+            // keep; an UNREACHABLE account doc is a distinct retry state (never misread as fresh and
+            // seeded over, the old nil-collapse misroute).
+            Task {
+                switch await sync.reconcileAfterSignIn() {
+                case .hasAccountData: showConflict = true
+                case .seededFromDevice: break
+                case .unreachable:
+                    syncNote = "Signed in, but VortX sync could not be reached. It will retry; you can also use Sync now."
+                }
+                // Belt-and-braces on top of adopt()'s own hydrate: re-run the account hydrate after the
+                // reconcile decision so ONE interactive sign-in restores add-ons + owner library even if
+                // the adopt-time pass raced the doc pull or the engine boot. Idempotent + never-zero
+                // guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
+                await sync.hydrateEngineFromOwnedAddons()
+            }
         case .totpRequired:
             needsTotp = true; message = "Enter your authenticator code."; failed = false
         case .failed(let msg):
@@ -200,6 +241,7 @@ struct SyncSettingsView: View {
     private func reset() {
         email = ""; username = ""; password = ""; totp = ""; recoveryCodeInput = ""
         needsTotp = false; message = nil; failed = false; newRecoveryCode = nil; mode = .signIn
+        syncNote = nil
     }
 
     // MARK: Field helpers (cross-platform)
