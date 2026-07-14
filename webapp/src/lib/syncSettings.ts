@@ -131,6 +131,12 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
   if (inc !== undefined) out.requireWords = inc;
   const maxRes = num(p.maxResolution);
   if (maxRes !== undefined) out.maxQuality = maxRes;
+  const minRes = num(p.minResolution);
+  if (minRes !== undefined) out.minQuality = minRes;
+  const hideUnknownRes = bool(p.hideUnknownResolution);
+  if (hideUnknownRes !== undefined) out.hideUnknownResolution = hideUnknownRes;
+  const prefAudio = bool(p.preferredAudioOnly);
+  if (prefAudio !== undefined) out.preferredAudioOnly = prefAudio;
   const maxGb = num(p.maxFileSizeGB);
   if (maxGb !== undefined) out.maxFileSizeGB = maxGb;
 
@@ -170,6 +176,12 @@ export function mergeWebappSettingsIntoProfile(existing: unknown, s: Settings): 
       excludeKeywords: s.hideWords,
       includeKeywords: s.requireWords,
       maxResolution: s.maxQuality,
+      // #117 floor/quality-filter twins, using the EXACT doc field names the app reads (Profiles.swift
+      // playbackPrefs) and writes (VortXSyncManager), so a web edit round-trips to Apple devices and the
+      // dashboard. minResolution encodes 4K as 2160 (the app's Minimum-quality tag), NOT 4000.
+      minResolution: s.minQuality,
+      hideUnknownResolution: s.hideUnknownResolution,
+      preferredAudioOnly: s.preferredAudioOnly,
       maxFileSizeGB: s.maxFileSizeGB,
     },
   };

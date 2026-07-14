@@ -46,6 +46,9 @@ export interface Settings {
   hdrOnly: boolean; // only HDR / Dolby Vision sources
   hideAV1: boolean; // hide AV1-encoded sources
   maxQuality: number; // resolution cap in p that FILTERS the source list (0 = unlimited)
+  minQuality: number; // resolution FLOOR in p that filters the list (0 = no floor; 720/1080/2160), #117
+  hideUnknownResolution: boolean; // drop sources with no recognizable resolution token, #117
+  preferredAudioOnly: boolean; // best-effort: drop clearly-foreign-audio releases vs `audioLang`, #117
   maxFileSizeGB: number; // file-size cap in GB that filters the list (0 = unlimited)
   // Appearance
   performance: Performance; // 'reduced' trims animations app-wide (a11y / low-power)
@@ -127,6 +130,9 @@ const DEFAULTS: Settings = {
   hdrOnly: false,
   hideAV1: false,
   maxQuality: 0,
+  minQuality: 0,
+  hideUnknownResolution: false,
+  preferredAudioOnly: false,
   maxFileSizeGB: 0,
   performance: "auto",
   subtitleFont: "modern",
