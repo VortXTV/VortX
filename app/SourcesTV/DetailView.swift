@@ -1455,6 +1455,7 @@ struct CoreEpisodeStreams: View {
                                                       name: meta.name, poster: meta.poster,
                                                       season: currentVideo.season, episode: currentVideo.episode),
                                    episodes: episodes,
+                                   episodeStreamId: currentVideo.id,   // scope by episodic context (covers collections/franchise too)
                                    imdbId: {
                                        if let dv = meta.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
                                        return meta.id.hasPrefix("tt") ? meta.id : nil
@@ -1554,6 +1555,11 @@ struct CoreStreamList: View {
     let title: String
     var meta: PlaybackMeta? = nil
     var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
+    /// The episode id to scope stream assembly + the readiness gate to (binge-desync fix, symptom 3). Set by the
+    /// episodic page (CoreEpisodeStreams) so the list only ever assembles + plays THIS episode's groups, never the
+    /// episode the engine's meta_details last resolved. Scoped by episodic CONTEXT, not meta.type, so franchise /
+    /// collection pages (a non-series meta routed to seriesPage) are covered too. nil on movie/live pages -> unscoped.
+    var episodeStreamId: String? = nil
     /// The title's imdb id (tt...) for the TorBox search-as-a-source lookup, when known. nil = no search
     /// contribution (also the no-imdb-id case, e.g. a live channel). The feature is further gated on a
     /// TorBox key inside `TorBoxSearchSource.refresh`.
@@ -1663,11 +1669,12 @@ struct CoreStreamList: View {
         // published-array reads: the assembly (merges + tombstones + direct-links filter) AND the rank
         // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is a few
         // cheap reads behind an equality guard, safe from body.
-        // SCOPE TO THIS EPISODE (binge-desync fix, symptom 3's stream half): on a series episode page pass the
-        // episode's own id so the list only ever assembles + plays THIS episode's stream groups, never whatever
-        // episode the engine's meta_details last resolved (a binge-advanced later episode). Mirrors iOS, which
-        // already passes `streamId: video.id`. Movies and live carry no episode id → nil → unscoped, unchanged.
-        let episodeStreamId = meta?.type == "series" ? meta?.videoId : nil
+        // SCOPE TO THIS EPISODE (binge-desync fix, symptom 3's stream half): the episodic page passes the
+        // episode's own id (episodeStreamId) so the list only ever assembles + plays THIS episode's stream
+        // groups, never whatever episode the engine's meta_details last resolved (a binge-advanced later
+        // episode). Mirrors iOS, which already passes `streamId: video.id`. Scoping by the explicit
+        // episodic-context id, not meta.type, keeps franchise/collection pages (a non-series meta routed to
+        // seriesPage) scoped too. Movies and live pass nil -> unscoped, unchanged.
         sourceList.setContext(metaId: meta?.libraryId ?? "", streamId: episodeStreamId, continuity: remembered, pin: sourcePin)
         let groups = sourceList.groups                               // best source first within each add-on
         let best = sourceList.best

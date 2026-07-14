@@ -52,7 +52,7 @@ final class SourceListModel: ObservableObject {
     /// the coalescer. Never published, so setting it from body cannot re-enter the render.
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
-        var streamId: String?        // nil = all loaded groups (movie/live/tvOS); set = one episode's groups
+        var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
         var prefsSignature = ""      // SourcePreferences.rankingSignature (filter/rank settings)
