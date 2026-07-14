@@ -28,7 +28,6 @@ struct iOSSettingsView: View {
     @State private var serverOnline: Bool?
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
-    @State private var showSignIn = false
     // Diagnostic-log export over the LAN: the sheet flag + the started (url, qr) payload. Identical to the
     // tvOS SettingsView flow (settings parity); the phone scans the QR to download vortx-diag.log.
     @State private var showDiagExport = false
@@ -169,7 +168,6 @@ struct iOSSettingsView: View {
             #if os(iOS)
             .navigationTitle("Settings")
             #endif
-            .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .sheet(isPresented: $showDiagExport, onDismiss: {
                 VXDiagExport.shared.stop()
                 diagExport = nil

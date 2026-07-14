@@ -3,10 +3,10 @@ import SwiftUI
 /// "Integrations" screen: OPTIONAL imports and services that enrich VortX. VortX owns its own account,
 /// add-ons, and library (see SyncSettingsView); nothing here is required, and connecting any of these
 /// never turns VortX into a client of that service. Order, top to bottom:
-///   1. Stremio  — bring your Stremio add-ons and library in (StremioConnectCard, reuses LinkLoginView).
-///   2. Trakt    — scrobble + watchlist (existing card, via ExternalServicesSettingsView).
-///   3. SIMKL    — mark-watched + plan-to-watch (existing card, via ExternalServicesSettingsView).
-///   4. Nuvio    — placeholder for the upcoming import (WS6 fills it; graceful stub, no dead button).
+///   1. Stremio: bring your Stremio add-ons and library in (StremioConnectCard, reuses LinkLoginView).
+///   2. Trakt: scrobble + watchlist (existing card, via ExternalServicesSettingsView).
+///   3. SIMKL: mark-watched + plan-to-watch (existing card, via ExternalServicesSettingsView).
+///   4. Nuvio: placeholder for the upcoming import (WS6 fills it; graceful stub, no dead button).
 ///
 /// Cross-platform (iPhone / iPad / Mac / Apple TV): hosted here in SourcesShared and pushed from both the
 /// iOS and tvOS settings screens, so both surfaces get the same section by construction (settings parity).
