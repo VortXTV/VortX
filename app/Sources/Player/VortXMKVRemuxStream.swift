@@ -147,11 +147,50 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The source MKV runtime in seconds (0 when the demuxer could not report one). Thread-safe.
     var sourceDurationSeconds: Double { hlsLock.lock(); defer { hlsLock.unlock() }; return _sourceDurationSeconds }
 
+    // Source chapter markers (start seconds + title), read once from the libav chapter list at
+    // find_stream_info time. Published under hlsLock (written once on the remux thread, read from the player
+    // thread), exactly like _sourceDurationSeconds. Empty for a source with no chapters. The forward-only
+    // fMP4/HLS delivery carries no chapter metadata of its own, so the engine reads these to give the AVPlayer
+    // DV lane the same Chapters panel + scrubber ticks libmpv shows for the same MKV. See AVPlayerEngine.loadChapters.
+    private var _chapters: [(start: Double, title: String)] = []
+
+    /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
+    var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
+
     /// Consistent snapshot of the published HLS index for the local server.
     func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
         hlsLock.lock(); defer { hlsLock.unlock() }
         return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
     }
+
+    /// Monotonic mount-progress counters for the chrome's PROGRESS-AWARE start watchdog. Every field only
+    /// ever moves forward (bytes/segments grow, stage flags flip once), so a ~1 Hz poller can tell a
+    /// slow-but-alive 4K source (something moved since the last poll -> extend the start window) from a TRUE
+    /// stall (nothing moved across the whole stall window -> demote). Thread-safe; cheap (two lock hops).
+    struct MountProgress: Equatable {
+        let producedBytes: Int       // muxed output bytes; grows for as long as source bytes keep arriving
+        let segmentCount: Int        // closed HLS segments published (0 on the legacy loader delivery)
+        let initPublished: Bool      // ftyp+moov indexed and served (false on the legacy loader delivery)
+        let signalingPublished: Bool // classify finished (master-playlist signaling exists)
+        let ended: Bool              // trailer written (the whole source remuxed)
+        let failed: Bool             // remux failed; the HLS 404 -> AVPlayer .failed path owns that demote
+    }
+
+    /// Current mount progress. See `MountProgress`.
+    func mountProgress() -> MountProgress {
+        let snap = hlsSnapshot()
+        let st = buffer.status()
+        return MountProgress(producedBytes: st.produced,
+                             segmentCount: snap.segments.count,
+                             initPublished: snap.initData != nil,
+                             signalingPublished: snap.signaling != nil,
+                             ended: snap.ended,
+                             failed: st.failure != nil)
+    }
+
+    /// When this stream was created (== the AVPlayer mount instant for either delivery). Anchors the
+    /// time-to-init / time-to-first-segment diagnostics so the next device log carries startup timing.
+    private let mountedAt = Date()
 
     // Init-segment head scan state (remux thread only). Accumulates ONLY the leading top-level box headers until
     // the `moov` box is LOCATED; the init CONTENT (ftyp+moov, any size) is then read straight from the produced
@@ -323,6 +362,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsLock.lock(); _sourceDurationSeconds = secs; hlsLock.unlock()
             VXProbe.log("dv", "remux source duration \(String(format: "%.1f", secs))s")
         }
+
+        // Source chapter markers (AVPlayer parity, Gap 3): libav populates AVFormatContext.chapters from the
+        // MKV ChapterAtom list. Read them in the SAME open window as duration so, whenever the engine has a
+        // finite duration to synthesize, it also has the chapters. The forward-only HLS delivery carries none.
+        readSourceChapters(inCtx)
 
         // Output context: fragmented MP4, NO file (custom IO).
         var ofmt: UnsafeMutablePointer<AVFormatContext>? = nil
@@ -1175,7 +1219,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
         hlsSegmentStartByte = initLen   // segment 0 starts right after the init
         hlsHeadDone = true; hlsHeadBuf = []
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))")
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
     }
 
     /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so
@@ -1274,6 +1318,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                        byteLength: endByte - segStartByte, duration: duration))
         hlsLock.unlock()
         hlsSegmentStartByte = endByte
+        // Startup-timing breadcrumbs for the progress-aware start watchdog trail: the media playlist's first
+        // answer is HELD until minStartupSegments (2) exist, so these two lines put the exact time-to-serve
+        // in every device log (the demote-vs-extend decision is judged against them). One-shot each.
+        if idx <= 1 {
+            let elapsed = String(format: "%.1f", Date().timeIntervalSince(mountedAt))
+            let media = String(format: "%.2f", duration)
+            DiagnosticsLog.log("dv", "hls media segment \(idx) published +\(elapsed)s after mount (\(endByte - segStartByte)B, \(media)s media)\(idx == 1 ? " -> startup playlist gate open" : "")")
+        }
     }
 
     /// Build the master-playlist signaling from the FINAL output streams (post extradata repair + DOVI
@@ -1420,6 +1472,33 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// spec default "eng" for a track with no Language element, and MP4 often yields "und", so this rarely
     /// returns "" in practice; what matters for the pick is that all untagged tracks in ONE file share the same
     /// substituted value, so the language key stays a no-op among them (it never spuriously splits them).
+    /// Read the source's libav chapter list (start seconds + title) and publish it under hlsLock (Gap 3,
+    /// AVPlayer DV parity). `AVChapter.start` is in the chapter's own `time_base`, so convert to seconds; the
+    /// title comes from the chapter metadata dictionary ("title"). No-op for a source without chapters, and
+    /// fail-soft on any malformed entry (a bad time_base / negative start is skipped, never fatal).
+    private func readSourceChapters(_ inCtx: UnsafeMutablePointer<AVFormatContext>) {
+        let count = Int(inCtx.pointee.nb_chapters)
+        guard count > 0, let list = inCtx.pointee.chapters else { return }
+        var out: [(start: Double, title: String)] = []
+        for i in 0..<count {
+            guard let chapter = list[i] else { continue }
+            let tb = chapter.pointee.time_base
+            guard tb.den != 0 else { continue }
+            let start = Double(chapter.pointee.start) * Double(tb.num) / Double(tb.den)
+            guard start.isFinite, start >= 0 else { continue }
+            var title = ""
+            if let entry = av_dict_get(chapter.pointee.metadata, "title", nil, 0),
+               let value = entry.pointee.value {
+                title = String(cString: value)
+            }
+            out.append((start: start, title: title))
+        }
+        out.sort { $0.start < $1.start }
+        guard !out.isEmpty else { return }
+        hlsLock.lock(); _chapters = out; hlsLock.unlock()
+        VXProbe.log("dv", "remux source chapters: \(out.count)")
+    }
+
     private static func streamLanguage(_ stream: UnsafeMutablePointer<AVStream>) -> String {
         guard let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
               let value = entry.pointee.value else { return "" }

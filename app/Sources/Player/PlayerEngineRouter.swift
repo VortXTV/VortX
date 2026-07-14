@@ -179,35 +179,63 @@ enum PlayerEngineRouter {
     /// and a Matroska hint), served over http(s) from a non-loopback host. It must NOT already be an
     /// AVPlayer-native container (those take rule 3 directly) and NOT be a loopback/torrent URL. This is the
     /// container-side gate; the caller has already checked `isDolbyVision` and the loopback/override rules.
-    static func isDVRemuxCandidate(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+    static func isDVRemuxCandidate(_ url: URL) -> Bool { dvRemuxCandidacy(url).candidate }
+
+    /// Extensions that name a REAL media container / manifest. Anything else that `URL.pathExtension` returns
+    /// from a release-name path (the group tail ".H265-AOC", a numeric CDN id, a ".php" endpoint) is noise,
+    /// NOT a container signal. Treating that noise as a container is exactly what pre-rejected a true DV
+    /// WEB-DL from the remux lane (candidate=false -> forced HDR10 tone-map + PCM audio on a DV display).
+    private static let knownContainerExts: Set<String> = [
+        "mp4", "m4v", "mov", "qt", "mkv", "webm", "avi", "ts", "m2ts", "mts",
+        "mpg", "mpeg", "vob", "flv", "wmv", "asf", "ogv", "ogm", "3gp", "3g2",
+        "rm", "rmvb", "divx", "movpkg", "m3u8", "m3u", "mpd", "ism", "ismc",
+    ]
+
+    /// `isDVRemuxCandidate` with the WHY: which signal qualified or disqualified the URL. The chromes log the
+    /// reason on the [dv] route line so a `candidate=false` in a device log is unambiguous (which gate fired)
+    /// instead of needing this file open next to the log.
+    static func dvRemuxCandidacy(_ url: URL) -> (candidate: Bool, reason: String) {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            return (false, "scheme=\(url.scheme ?? "nil") not http(s)")
+        }
         let host = (url.host ?? "").lowercased()
-        if host == "127.0.0.1" || host == "localhost" || host.isEmpty { return false }
-        // A genuine path-level mp4/m4v/mov (or HLS) is AVPlayer-native and never needs the remux. Do NOT gate on
-        // isAVPlayerContainer here: its extensionless mp4-token heuristic wrongly disqualified DV MKVs delivered
-        // as extensionless debrid links carrying a stray ".mp4" token, so they routed to raw AVPlayer AND could
-        // not remux -> dead end. Only a real native path extension vetoes; the Matroska checks below then decide.
+        if host == "127.0.0.1" || host == "localhost" || host.isEmpty { return (false, "loopback/empty host") }
+        // A genuine path-level mp4/m4v/mov (or HLS/DASH manifest) is AVPlayer-native (or an adaptive stream
+        // the remux must never touch) and never needs the remux. Do NOT gate on isAVPlayerContainer here: its
+        // extensionless mp4-token heuristic wrongly disqualified DV MKVs delivered as extensionless debrid
+        // links carrying a stray ".mp4" token, so they routed to raw AVPlayer AND could not remux -> dead end.
+        // Only a real native path extension vetoes; the Matroska checks below then decide.
         let pathExt = url.pathExtension.lowercased()
-        if pathExt == "mp4" || pathExt == "m4v" || pathExt == "mov" || isHLS(url) { return false }
-        if pathExt == "mkv" { return true }
+        if pathExt == "mp4" || pathExt == "m4v" || pathExt == "mov" { return (false, "native container .\(pathExt)") }
+        if isHLS(url) { return (false, "HLS manifest") }
+        if pathExt == "mkv" { return (true, "path extension .mkv") }
         // Scan ONLY the filename + query, not the whole URL, and match container tokens on an extension
         // BOUNDARY (the leading dot plus a trailing delimiter / end-of-string). A bare
         // absoluteString.contains(".ts") used to veto on a stray ".ts" buried in a CDN path id or host, wrongly
         // sending a true DV MKV to the tone-map lane; a boundary match over the filename/query never does.
-        let hint = (url.lastPathComponent + " " + (url.query ?? "")).lowercased()
         // Debrid links often hide the filename in a query param with no path extension: a Matroska token there
         // is a candidate. A path that is a plain mp4/mov/m4v was already excluded above.
-        if hasContainerExtension(hint, ["mkv"]) || hint.contains("matroska") { return true }
-        // Fully extensionless debrid link with NO container hint at all (e.g. TorBox "/download/<id>" with
-        // no filename token): a DV stream that reached here (rule 3b) is one whose text label said DV but the
-        // URL gives no container. The remux stream probes the real container and FAILS FAST (no video mounted)
-        // if it isn't a remuxable DV MKV, so attempting is safe and lets a genuinely-DV-MKV extensionless link
-        // play true DV instead of silently tone-mapping. Only widen for the truly hint-less case, so a link
-        // that DOES carry a non-mkv container token in its filename/query is unaffected.
-        if pathExt.isEmpty, !hasContainerExtension(hint, ["mp4", "m4v", "mov", "webm", "avi", "ts"]) {
-            return true
+        let hint = (url.lastPathComponent + " " + (url.query ?? "")).lowercased()
+        if hasContainerExtension(hint, ["mkv"]) || hint.contains("matroska") {
+            return (true, "matroska token in filename/query")
         }
-        return false
+        // A RECOGNIZED non-Matroska container extension on the path is a trusted signal and vetoes: those
+        // sources demux fine on libmpv and the remux lane was never validated against them.
+        if knownContainerExts.contains(pathExt) { return (false, "non-remux container .\(pathExt)") }
+        // No trustworthy container signal left: the path is extensionless (TorBox "/download/<id>") OR its
+        // "extension" is release-name noise ("Movie.2026.WEB-DL.DV.Atmos.H265-AOC" -> pathExtension
+        // "h265-aoc", the 0.3.14 field case that pre-rejected a true DV WEB-DL into the tone-map lane). A DV
+        // stream that reached here (rule 3b) is one whose text label said DV but whose URL cannot prove a
+        // container either way. The remux stream probes the REAL container bytes and fails fast (before any
+        // video mounts) when it isn't a remuxable DV source, and the chrome's progress-aware start watchdog +
+        // AVPlayer .failed path demote cleanly, so ATTEMPTING is safe; pre-rejecting silently tone-maps a
+        // title the display could have shown in true DV. A real non-mkv container token in the filename/query
+        // still vetoes, so labeled mp4/webm/avi/ts sources are unaffected.
+        if !hasContainerExtension(hint, ["mp4", "m4v", "mov", "webm", "avi", "ts", "m3u8", "mpd"]) {
+            return (true, pathExt.isEmpty ? "extensionless, no container hint (probe-and-fail-fast)"
+                                          : "pseudo-extension .\(pathExt) is not a container, no container hint (probe-and-fail-fast)")
+        }
+        return (false, "non-mkv container token in filename/query")
     }
 
     /// The engine's loadFile asks this to decide whether to mount the in-process MKV -> fMP4 streaming remux

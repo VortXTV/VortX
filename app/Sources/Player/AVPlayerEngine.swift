@@ -34,8 +34,8 @@ import UIKit
 /// Trickplay frame capture is real too (`AVPlayerItemVideoOutput`, tone-mapped to SDR). The genuine no-ops
 /// are the controls with no AVFoundation equivalent: audio delay (`setAudioDelay`), audio output mode
 /// (`setAudioOutputMode`, the system negotiates routing), and the hardware-decoding toggle
-/// (`setHardwareDecoding`, always hardware); the chrome hides those rows when this engine is active. The
-/// plain `HLSPlayerView.AVPlayerModel` still serves the bare iOS HLS path that does not need the full chrome.
+/// (`setHardwareDecoding`, always hardware); the chrome hides those rows when this engine is active. iOS HLS
+/// now flows through this same full-chrome engine (Gap 1), so the bare `HLSPlayerView` path is no longer mounted.
 @MainActor
 final class AVPlayerEngineController: NSObject, PlayerEngine {
     let player = AVPlayer()
@@ -104,6 +104,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     private var externalSubActive = false
     // Asset chapter markers, loaded async once the item is ready (empty when the asset carries none).
     private var loadedChapters: [MPVChapter] = []
+    // Container frame rate for the subtitle release fingerprint (Gap 8), loaded async at readyToPlay from the
+    // video track's nominalFrameRate. 0 until resolved / for HLS (no AVAssetTrack objects); the fingerprint
+    // tolerates 0 and rebuilds. Read synchronously by containerFrameRate(); the async load avoids the
+    // deprecated synchronous AVAssetTrack.nominalFrameRate accessor.
+    private var containerFPS: Double = 0
     // DV-for-MKV streaming remux (Phase 1). When non-nil, this session is playing an MKV that was remuxed
     // in-process to fragmented MP4 and served to AVPlayer over the `vortxremux://` scheme. Held for the whole
     // session so its resource-loader delegate + remux thread stay alive; torn down in stop()/loadFile().
@@ -119,6 +124,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
     /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
+
+    /// Progress counters for the mounted DV remux (either delivery), or nil when no remux is mounted. The
+    /// chrome's PROGRESS-AWARE start watchdog polls this ~1 Hz to tell a slow-but-alive 4K source (counters
+    /// still moving -> extend the start window) from a TRUE stall (nothing moved for the whole stall window
+    /// -> demote to libmpv). Cheap: two lock hops per read, no allocation beyond the tiny struct.
+    var remuxMountProgress: VortXMKVRemuxStream.MountProgress? {
+        if let server = remuxHLSServer { return server.mountProgress }
+        if let loader = remuxLoader { return loader.mountProgress }
+        return nil
+    }
 
     /// The furthest position the forward-only DV remux has actually produced, used to clamp forward seeks at
     /// the one engine chokepoint (`seek(to:)`) so a scrub / nudge / skip past the produced bytes can't strand
@@ -173,7 +188,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         incompatibleEntryHandled = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
-        audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []
+        audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
         disableExternalSubtitle()   // a new title starts with no external overlay sub
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
         // system passes through Atmos (#78) and applies AirPods Spatial Audio (#88). Idempotent with the
@@ -569,6 +584,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         return (Int(size.width), Int(size.height), selectedAudioCodec())
     }
 
+    /// Video frame rate for the community-subtitle release fingerprint (Gap 8). The libmpv engine reads the
+    /// container-declared fps; AVFoundation surfaces the same via the video track's `nominalFrameRate`, loaded
+    /// asynchronously at readyToPlay (see `loadContainerFrameRate`) and cached here. 0 until it resolves (and
+    /// for an HLS asset, which reports no AVAssetTrack objects), which the fingerprint tolerates and rebuilds.
+    func containerFrameRate() -> Double { containerFPS }
+
     /// Live playback stats from AVFoundation's access log (the only per-stream telemetry AVPlayer exposes):
     /// the negotiated + observed bitrates and the indicated resolution. Empty before playback or when the log
     /// has no events yet.
@@ -610,6 +631,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// async pattern of `loadSelectionGroups`.
     private func loadChapters() {
         guard let item = player.currentItem else { return }
+        // DV remux lane (Gap 3): the served fMP4/HLS carries no chapter metadata, but the remux stream read the
+        // source MKV's libav chapter list at open (same window as the source duration, which is already ready
+        // here). Pull those directly; `loadChapterMetadataGroups` on the local HLS playlist would return none.
+        if isRemuxMounted {
+            let remuxChapters = remuxHLSServer?.chapters ?? remuxLoader?.chapters ?? []
+            if !remuxChapters.isEmpty {
+                loadedChapters = remuxChapters
+                    .map { MPVChapter(title: $0.title, start: $0.start) }
+                    .sorted { $0.start < $1.start }
+                emit(MPVProperty.trackList, nil)   // chrome re-pulls chapters() -> panel + scrubber ticks
+            }
+            return
+        }
         let asset = item.asset
         Task { @MainActor in
             let locale = Locale.current
@@ -627,6 +661,55 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             guard player.currentItem === item else { return }
             loadedChapters = chapters.sorted { $0.start < $1.start }
             if !loadedChapters.isEmpty { emit(MPVProperty.trackList, nil) }
+        }
+    }
+
+    /// HDR/DV metadata chip (Gap 7). The chrome lights its "HDR" chip off `MPVProperty.videoParamsSigPeak > 1.0`
+    /// (a libmpv-only signal); AVPlayer exposes no sig-peak, so the chip never lit on the AVPlayer lane. Emit an
+    /// equivalent > 1.0 peak when the content is HDR: DV is HDR by definition (`contentIsDolbyVision`), and a
+    /// native HDR10 / HLG track is detected from its video format description's transfer function. SDR content
+    /// emits nothing, so the chip correctly stays off. Any value > 1.0 works; 4.0 is a representative peak.
+    private func emitDynamicRange(_ item: AVPlayerItem) {
+        if contentIsDolbyVision {
+            emit(MPVProperty.videoParamsSigPeak, 4.0)
+            return
+        }
+        // Native (non-HLS) HDR10 / HLG: probe the video track transfer function off the main thread, then emit.
+        // An HLS asset reports no AVAssetTrack objects, so this is a no-op there (its HDR chip stays off; the
+        // access-log playbackStats still describe the stream). Identity-guarded like loadChapters.
+        let asset = item.asset
+        Task { @MainActor in
+            let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            guard player.currentItem === item else { return }
+            for track in tracks {
+                let descs = (try? await track.load(.formatDescriptions)) ?? []
+                guard player.currentItem === item else { return }
+                for desc in descs {
+                    guard let tf = CMFormatDescriptionGetExtension(
+                        desc, extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String else { continue }
+                    if tf == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
+                        || tf == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) {
+                        self.emit(MPVProperty.videoParamsSigPeak, 4.0)
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    /// Load the video track's nominal frame rate off the main thread and cache it for `containerFrameRate()`
+    /// (Gap 8), using the non-deprecated async `load(.nominalFrameRate)`. No-op for HLS (no AVAssetTrack
+    /// objects) and identity-guarded like loadChapters, so a later load never sees a stale value.
+    private func loadContainerFrameRate(_ item: AVPlayerItem) {
+        let asset = item.asset
+        Task { @MainActor in
+            let tracks = (try? await asset.loadTracks(withMediaType: .video)) ?? []
+            guard player.currentItem === item else { return }
+            for track in tracks {
+                let fps = (try? await track.load(.nominalFrameRate)) ?? 0
+                guard player.currentItem === item else { return }
+                if fps > 0 { containerFPS = Double(fps); return }
+            }
         }
     }
 
@@ -819,6 +902,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             emit(MPVProperty.trackList, nil)   // chrome re-pulls via tracks()
             loadSelectionGroups()              // async; re-emits track-list once the groups resolve
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
+            emitDynamicRange(item)             // Gap 7: light the chrome's HDR chip for DV / HDR10 / HLG content
+            loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
             if let target = pendingSeek, seekable {
                 pendingSeek = nil
                 // FORWARD-ONLY REMUX: never apply a pre-start (resume) seek while the DV remux is mounted.
