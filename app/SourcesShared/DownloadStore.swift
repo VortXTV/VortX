@@ -96,7 +96,7 @@ final class DownloadStore: ObservableObject {
         // CompleteUntilFirstUserAuthentication protection class is applied from init onward (a locked-device
         // completion otherwise trips -3000); log a real create fault so it is diagnosable instead of vanishing.
         do { try Self.ensureDownloadsDirectoryExists() }
-        catch { NSLog("[downloads] could not create Downloads dir at \(dir.path): \(error.localizedDescription)") }
+        catch { NSLog("%@", "[downloads] could not create Downloads dir at \(dir.path): \(error.localizedDescription)") }
     }
 
     /// Mark the directory excluded from iCloud/iTunes backup. Best-effort; a failure here is non-fatal

@@ -256,7 +256,7 @@ enum NodeServer {
     /// costs one `lsof` that returns nothing.
     private static func reclaimStalePort() {
         for pid in listeners(onPort: 11470) where isOurNodeServer(pid) {
-            NSLog("StremioX: reclaiming port 11470 from a stale node server (pid \(pid))")
+            NSLog("%@", "StremioX: reclaiming port 11470 from a stale node server (pid \(pid))")
             kill(pid, SIGTERM)
             let deadline = Date().addingTimeInterval(terminateGrace)
             while pidIsAlive(pid) && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
@@ -381,7 +381,7 @@ enum NodeServer {
         if let bins = ffmpegBinaries() {
             env["FFMPEG_BIN"] = bins.ffmpeg
             env["FFPROBE_BIN"] = bins.ffprobe
-            NSLog("StremioX: ffmpeg for transcoding: \(bins.ffmpeg) (VideoToolbox hw-accel)")
+            NSLog("%@", "StremioX: ffmpeg for transcoding: \(bins.ffmpeg) (VideoToolbox hw-accel)")
         } else {
             NSLog("StremioX: no ffmpeg found; HLS transcoding disabled (install via `brew install ffmpeg`)")
         }
@@ -401,7 +401,7 @@ enum NodeServer {
             queue.async {
                 guard !shutdownRequested else { return }
                 exitCode = p.terminationStatus
-                NSLog("StremioX: node server exited rc=\(p.terminationStatus)")
+                NSLog("%@", "StremioX: node server exited rc=\(p.terminationStatus)")
                 // Mirror the unexpected exit into the EXPORTABLE diagnostics log so a server death is visible
                 // in the file the owner actually sends, not just the unified log.
                 DiagnosticsLog.log("server", "node child exited rc=\(p.terminationStatus) (unexpected; relaunch to restart)")
@@ -409,12 +409,12 @@ enum NodeServer {
         }
 
         do {
-            NSLog("StremioX: starting node streaming server (bin=\(nodeBin), HOME=\(home))")
+            NSLog("%@", "StremioX: starting node streaming server (bin=\(nodeBin), HOME=\(home))")
             try proc.run()
             process = proc
         } catch {
             started = false
-            NSLog("StremioX: failed to launch node server: \(error)")
+            NSLog("%@", "StremioX: failed to launch node server: \(error)")
         }
     }
 

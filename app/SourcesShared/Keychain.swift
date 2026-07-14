@@ -74,7 +74,7 @@ enum Keychain {
             // Atomic writes replace the inode, so re-assert owner-only perms (0600) afterwards.
             try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storeURL.path)
         } catch {
-            NSLog("[Keychain] failed to persist credentials file: \(error)")
+            NSLog("%@", "[Keychain] failed to persist credentials file: \(error)")
         }
     }
 #else
