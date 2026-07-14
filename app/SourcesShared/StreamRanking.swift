@@ -1012,8 +1012,16 @@ enum StreamRanking {
         // Smart Source Selection (Lane A): surface WHY the chips nudged this source, using the actual term
         // that matched so the reason is concrete. Prefer applies in both modes; "ranked down" only in "rank".
         if let term = prefs.preferTerms.first(where: { t.contains($0) }) { why.append("preferred: \(term)") }
-        if prefs.avoidBehavior == "rank", !prefs.keywordsAreRegex,
-           let term = prefs.excludeTerms.first(where: { t.contains($0) }) { why.append("ranked down: \(term)") }
+        // "ranked down" whenever the Avoid demotion actually applied (avoidBehavior == "rank"), derived the
+        // SAME way computeScore's -20000 demotion decides it: substring terms in plain mode, the compiled
+        // excludeRegex in regex mode. The regex badge is generic (a regex match has no single "term").
+        if prefs.avoidBehavior == "rank" {
+            if prefs.keywordsAreRegex {
+                if let rx = prefs.excludeRegex, prefs.matches(rx, t) { why.append("ranked down") }
+            } else if let term = prefs.excludeTerms.first(where: { t.contains($0) }) {
+                why.append("ranked down: \(term)")
+            }
+        }
         guard !why.isEmpty else { return nil }
         return why.joined(separator: " · ")
     }
