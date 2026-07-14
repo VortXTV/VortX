@@ -637,7 +637,11 @@ enum StreamRanking {
         // both Avoid modes. The Hide (exclude / "Avoid") terms only DROP here when avoidBehavior == "hide"
         // (today's exact behavior); in "rank" mode they stop dropping and instead sink the score in
         // computeScore, so the avoided source stays visible but demoted.
-        let avoidRanks = prefs.avoidBehavior == "rank"
+        // On a Kids profile the Avoid words are a PARENTAL hide tool: they always DROP here, never merely
+        // demote, whatever avoidBehavior says, so a parent can hard-hide words for a child even when the
+        // profile (or a synced setting) has Avoid behavior on "rank". Defense in depth over the per-profile
+        // fold: the guard holds even if a "rank" value ever reaches a Kids profile's flat keys.
+        let avoidRanks = prefs.avoidBehavior == "rank" && !kids
         if prefs.keywordsAreRegex {
             // Power-user regex mode: Hide = drop on match, Require = drop on no-match. An invalid pattern
             // compiled to nil, so it imposes no constraint (fail-open).

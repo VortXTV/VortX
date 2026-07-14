@@ -107,8 +107,10 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let regexKey              = "stremiox.streaming.keywordsAreRegex"
     // Smart Source Selection (Lane A). NEW keys use the vortx.* namespace (the 0.4 rename lands the older
     // stremiox.* keys via a separate dual-read directive; these fresh keys are born vortx.* directly, no
-    // migration). Global (not per-profile): they are not part of Profiles.PlaybackPrefs, so a profile
-    // switch leaves them as the viewer set them.
+    // migration). Per-profile: they ARE part of Profiles.PlaybackPrefs (folded in exactly like the 13
+    // sibling stream-filter knobs), so ProfileStore.applyPlayback captures-before-switch and writes these
+    // keys, reload() re-syncs the singleton on a switch, and a Kids profile keeps its own parent-set
+    // Avoid words + Avoid behavior instead of a global setting leaking across profiles.
     static let preferKey             = "vortx.streaming.preferKeywords"
     static let avoidBehaviorKey      = "vortx.streaming.avoidBehavior"
     static let autoPickBestKey       = "vortx.streaming.autoPickBest"
@@ -411,9 +413,10 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         if preferredAudioOnly != prefAudio { preferredAudioOnly = prefAudio }
         let maxGB = d.double(forKey: Self.maxFileSizeKey)
         if maxFileSizeGB != maxGB { maxFileSizeGB = maxGB }
-        // Smart Source Selection (Lane A). Global, not per-profile, so a profile switch never rewrites these
-        // flat keys; the guarded re-read only re-syncs the in-memory value if a full settings-backup restore
-        // changed the key underneath us. Guarded so an unchanged value never churns @Published.
+        // Smart Source Selection (Lane A). Per-profile now (folded into PlaybackPrefs): a profile switch
+        // rewrites these flat keys via applyPlayback, so this guarded re-read re-syncs the singleton's
+        // in-memory @Published values on a switch, exactly like the filters above (and also picks up a
+        // settings-backup restore). Guarded so an unchanged value never churns @Published.
         let prefer = d.string(forKey: Self.preferKey) ?? Self.defaultPreferKeywords
         if preferKeywords != prefer { preferKeywords = prefer }
         let avoid = d.string(forKey: Self.avoidBehaviorKey) ?? Self.defaultAvoidBehavior
