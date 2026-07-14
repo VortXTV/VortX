@@ -55,6 +55,15 @@ enum NodeServer {
         if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if !started { return "Not started (server.js missing from the bundle)" }
         if let code = exitCode { return "Server exited with code \(code). Relaunch the app to restart it." }
+        // #130: never claim a plain "running" while probes are being refused. The in-node rebind gave up
+        // (stuck marker present) -> tell the user to restart; recovery is in flight (suspect set by the
+        // foreground refused-probe path) -> say so honestly. These take precedence over the running state.
+        if listenerStuck {
+            return "Server process running but not accepting connections. Automatic recovery failed. Use Restart below."
+        }
+        if listenerSuspect {
+            return "Server process running but not accepting connections, attempting recovery…"
+        }
         // The preload heartbeat writes the log every ~1s; a much older last-write while the process is
         // still alive means the node event loop has stalled (froze rather than exited). Surface that so
         // Settings can distinguish a wedged loop from a healthy one.
@@ -104,6 +113,11 @@ enum NodeServer {
             ?? NSTemporaryDirectory()
         try? FileManager.default.removeItem(atPath: (portCaches as NSString).appendingPathComponent("stremio-server.port"))
         portLock.lock(); fileLatchedPort = nil; scanLatchedPort = nil; portLock.unlock()
+        // #130: clear last session's rebind signal + stuck marker and reset the suspect flag, so a stale
+        // marker from a previous run can never make statusDescription lie on a fresh boot.
+        try? FileManager.default.removeItem(atPath: (portCaches as NSString).appendingPathComponent("stremio-server.rebind"))
+        try? FileManager.default.removeItem(atPath: (portCaches as NSString).appendingPathComponent("stremio-server.stuck"))
+        setListenerSuspect(false)
         let thread = Thread { runNode(serverJs) }
         thread.name = "stremio-node-server"
         thread.stackSize = 8 * 1024 * 1024   // Node requires a large stack
@@ -204,12 +218,18 @@ enum NodeServer {
         // is rewritten the moment this boot's server binds).
         let portPath = (caches as NSString).appendingPathComponent("stremio-server.port")
         try? FileManager.default.removeItem(atPath: portPath)
+        // #130 recovery signal files (sit next to the port file in the caches dir): REBINDF is a one-shot
+        // signal the Swift foreground probe drops for the in-node heartbeat to consume; STUCKF is written by
+        // the heartbeat once the rebind has given up, so Settings can honestly say "restart the app".
+        let rebindPath = (caches as NSString).appendingPathComponent("stremio-server.rebind")
+        let stuckPath = (caches as NSString).appendingPathComponent("stremio-server.stuck")
         let preloadPath = (caches as NSString).appendingPathComponent("stremiox-preload.js")
         let preload = """
-        const fs=require('fs'),L=\(jsString(logPath)),PORTF=\(jsString(portPath));
+        const fs=require('fs'),L=\(jsString(logPath)),PORTF=\(jsString(portPath)),REBINDF=\(jsString(rebindPath)),STUCKF=\(jsString(stuckPath));
+        let boundPort=11470;   // updated the moment server.js logs its real bound port (below)
         let LFD=null; try{LFD=fs.openSync(L,'a')}catch(e){}
         const w=(t,a)=>{try{var line=new Date().toISOString().slice(11,19)+' '+t+' '+Array.prototype.map.call(a,String).join(' ')+'\\n';if(LFD!==null){fs.writeSync(LFD,line)}else{fs.appendFileSync(L,line)}}catch(e){}};
-        console.log=function(){try{var s=Array.prototype.join.call(arguments,' ');var m=s.match(/EngineFS server started at http:\\/\\/127\\.0\\.0\\.1:(\\d{4,5})/);if(m){try{fs.writeFileSync(PORTF,m[1])}catch(e){}}}catch(e){}w('[log]',arguments)};
+        console.log=function(){try{var s=Array.prototype.join.call(arguments,' ');var m=s.match(/EngineFS server started at http:\\/\\/127\\.0\\.0\\.1:(\\d{4,5})/);if(m){try{fs.writeFileSync(PORTF,m[1])}catch(e){};boundPort=parseInt(m[1],10)||boundPort}}catch(e){}w('[log]',arguments)};
         console.error=function(){w('[err]',arguments)};
         console.warn=function(){w('[warn]',arguments)};
         process.on('uncaughtException',function(e){w('[uncaught]',[e&&e.stack||e])});
@@ -243,12 +263,78 @@ enum NodeServer {
           });
         })();
 
+        // ---- Post-suspension listener rebind (issue #130) ----
+        // iOS/tvOS tears down the bound TCP listener during long app suspension; the node
+        // loop itself SURVIVES (this heartbeat resumes after the freeze), so the server
+        // still "ticks" but its port no longer accepts connections and nothing re-listens
+        // -- alive-by-heartbeat, dead-by-HTTP until a manual restart. Re-listen ONLY when a
+        // loopback connect is REFUSED (ECONNREFUSED/ECONNRESET): a refused connect proves no
+        // client is mid-stream through that listener, so close()+listen() cannot interrupt
+        // playback. A TIMEOUT or ANY http response means busy-but-alive -> do NOTHING. That
+        // gate is exactly what the removed self-ping watchdog lacked (it force-closed 11470
+        // on a false timeout mid-torrent and looped). Triggered ONLY by a wake (heartbeat
+        // lag spike) or the Swift one-shot signal file, never by a periodic self-ping.
+        var __servers=[];
+        (function(){
+          var http; try{ http=require('http'); }catch(e){ return; }
+          var orig=http.createServer;
+          http.createServer=function(){
+            var s=orig.apply(http,arguments); var ol=s.listen;
+            s.listen=function(){ s.__args=Array.prototype.slice.call(arguments).filter(function(a){return typeof a!=='function'}); return ol.apply(s,arguments); };
+            __servers.push(s); return s;
+          };
+        })();
+        var __rb={busy:false,last:0,attempts:0};
+        function __doRebind(reason){
+          if(__rb.busy) return;
+          var now=Date.now();
+          if(now-__rb.last<60000){ w('[rebind]',['skip (60s cooldown) '+reason]); return; }
+          if(__rb.attempts>=3){ try{fs.writeFileSync(STUCKF,String(now))}catch(e){}; w('[rebind]',['gave up after 3 attempts this resume; wrote stuck marker']); return; }
+          if(__servers.length===0){ w('[rebind]',['no captured listeners to rebind']); return; }
+          __rb.busy=true; __rb.last=now; __rb.attempts++;
+          w('[rebind]',['rebinding '+__servers.length+' listener(s) attempt '+__rb.attempts+' ('+reason+')']);
+          var pending=__servers.length;
+          __servers.forEach(function(s){
+            var a=s.__args||[];
+            try{
+              s.close(function(){
+                try{
+                  // Attach the listen error handler BEFORE re-listening: listen() reports EADDRINUSE as an
+                  // async 'error' event, not a throw (the 11471 lesson), so a try/catch alone would miss it.
+                  s.once('error',function(e){ w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]); });
+                  s.listen.apply(s,a);
+                  w('[rebind]',['relistened on '+JSON.stringify(a)]);
+                  // Keep the Swift port latch truthful after a successful re-listen.
+                  try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
+                }catch(e){ w('[rebind-err]',[String(e)]); }
+                if(--pending<=0) __rb.busy=false;
+              });
+            }catch(e){ w('[rebind-err]',[String(e)]); if(--pending<=0) __rb.busy=false; }
+          });
+        }
+        function __selfCheck(reason){
+          var http; try{ http=require('http'); }catch(e){ return; }
+          var req=http.get({host:'127.0.0.1',port:boundPort||11470,path:'/settings',timeout:4000},function(res){
+            // Got an HTTP response: listener is alive (busy-but-alive included). Never rebind; reset attempts.
+            __rb.attempts=0; res.resume();
+          });
+          req.on('error',function(e){
+            var c=e&&e.code;
+            if(c==='ECONNREFUSED'||c==='ECONNRESET'){ w('[rebind]',['loopback '+c+' on :'+(boundPort||11470)+' -> '+reason]); __doRebind(reason); }
+            else { w('[rebind]',['self-check '+c+'; busy-but-alive, not rebinding']); }
+          });
+          // A timeout means the listener accepted but is slow (busy under torrent load): leave it strictly alone.
+          req.on('timeout',function(){ try{req.destroy()}catch(_){}; w('[rebind]',['self-check timeout; busy-but-alive, not rebinding']); });
+        }
+
         // Event-loop heartbeat: the decisive instrument for the "server froze / went
         // offline" symptom. Every second, log the loop lag (how late this tick fired vs
         // the 1s schedule) plus RSS/heap. If the loop FREEZES, these [hb] lines stop dead
         // and the gap + last lag pinpoint the moment; if it's MEMORY, rss climbs before
         // the process dies. Either way the next device run names the cause instead of us
-        // guessing. ~60 lines/min, fine for a short repro.
+        // guessing. ~60 lines/min, fine for a short repro. It also carries the #130 rebind
+        // triggers: a >30s lag spike is the wake-from-suspension event, and REBINDF is the
+        // Swift one-shot signal -- both funnel through the REFUSED-only __selfCheck gate.
         (function(){
           var last = Date.now();
           setInterval(function(){
@@ -256,6 +342,11 @@ enum NodeServer {
               var now = Date.now(), lag = now - last - 1000; last = now;
               var m = process.memoryUsage();
               w('[hb]', ['lag=' + lag + 'ms rss=' + Math.round(m.rss/1048576) + 'MB heap=' + Math.round(m.heapUsed/1048576) + 'MB']);
+              // A lag spike past 30s means the process was frozen (suspended) and just thawed: this is a
+              // fresh resume, so reset the per-resume attempt budget and, after a short settle, self-check.
+              if(lag>30000){ __rb.attempts=0; setTimeout(function(){ __selfCheck('wake-lag='+lag+'ms'); },2000); }
+              // Consume the Swift one-shot rebind signal (its foreground refused-probe path drops it).
+              try{ if(fs.existsSync(REBINDF)){ fs.unlinkSync(REBINDF); __selfCheck('swift-signal'); } }catch(e){}
             } catch(e){}
           }, 1000);
         })();
@@ -296,17 +387,13 @@ enum NodeServer {
           } catch (e) { w('[probe]', ['UDP unavailable: ' + e]); }
         })();
 
-        // (The wake watchdog that used to live here has been removed.) It self-pinged
-        // /settings and, on two failures, force-closed and re-listened the HTTP servers
-        // including port 11470 -- the torrent engine's own server. That close-mid-torrent
-        // showed up as "this source didn't load", and because a re-listen briefly made
-        // the next self-ping fail, it looped forever (the device log was nothing but
-        // "[watchdog] server unreachable, rebinding"). Its whole reason for existing --
-        // "the server is dead after the Apple TV sleeps" -- was really the casting/SSDP
-        // error flood saturating the event loop, which is now fixed at the source with
-        // CASTING_DISABLED above. The server is stable on its own; if a real
-        // post-suspension recovery is ever needed it must NOT force-close 11470 during
-        // playback. The Settings > Restart button covers the manual case.
+        // (History: a periodic self-ping watchdog once lived here and was removed for being
+        // trigger-happy -- its 4s timeout fired falsely during torrent activity and force-
+        // closed 11470 mid-stream in a loop. The real post-suspension recovery it was after
+        // now lives in the heartbeat block above (issue #130), but structurally safe: it is
+        // EVENT-triggered (wake lag spike or Swift signal), never periodic, and gated on a
+        // connection-level REFUSAL only -- never a timeout or an http response -- so it can
+        // only ever re-listen a listener that is already down, never one carrying a stream.)
 
         // Reverse-proxy stremio-web on http://127.0.0.1:11471 so the WKWebView can load the UI
         // from a loopback origin. Loopback is a secure context (Service Workers / WASM / crypto
@@ -394,5 +481,98 @@ enum NodeServer {
         let data = try? JSONSerialization.data(withJSONObject: [s])
         let arr = data.flatMap { String(data: $0, encoding: .utf8) } ?? "[\"\"]"
         return String(arr.dropFirst().dropLast())   // unwrap the [ ... ] → the quoted string
+    }
+
+    // MARK: - #130 post-suspension listener recovery
+    //
+    // iOS/tvOS can tear down the embedded server's bound TCP listener during prolonged app suspension
+    // while the node loop itself survives. On foreground the loop ticks but the port refuses connections
+    // and nothing re-listens (alive-by-heartbeat, dead-by-HTTP) until a manual restart. The in-node
+    // heartbeat owns the actual re-listen (REFUSED-gated, event-triggered); this Swift side probes on
+    // foreground and, when the listener is refusing while the process is demonstrably alive, drops a
+    // one-shot signal file the heartbeat consumes -- then re-probes and records the outcome.
+
+    private static let flagLock = NSLock()
+    private static var _listenerSuspect = false
+    /// True while a foreground refused-probe has requested a rebind that has not yet been confirmed healed.
+    /// Read by statusDescription so Settings never claims a plain "running" while connections are refused.
+    static var listenerSuspect: Bool { flagLock.lock(); defer { flagLock.unlock() }; return _listenerSuspect }
+    private static func setListenerSuspect(_ v: Bool) { flagLock.lock(); _listenerSuspect = v; flagLock.unlock() }
+
+    private static func recoveryCachesDir() -> String {
+        NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first ?? NSTemporaryDirectory()
+    }
+    private static var rebindSignalPath: String {
+        (recoveryCachesDir() as NSString).appendingPathComponent("stremio-server.rebind")
+    }
+    private static var stuckMarkerPath: String {
+        (recoveryCachesDir() as NSString).appendingPathComponent("stremio-server.stuck")
+    }
+    /// True once the in-node rebind has exhausted its 3 attempts for a resume and written the stuck marker.
+    /// statusDescription points the user at Restart when this is set.
+    static var listenerStuck: Bool { FileManager.default.fileExists(atPath: stuckMarkerPath) }
+    /// Drop the one-shot signal the in-node heartbeat consumes to re-listen a dropped listener (#130).
+    static func requestRebind() { try? Data().write(to: URL(fileURLWithPath: rebindSignalPath)) }
+
+    /// Foreground recovery entry point (call from the app's scenePhase `.active` hook). Subsumes the old
+    /// drift-latch probe (StremioServer.isOnline, which self-heals a server.js EADDRINUSE port drift), then
+    /// classifies a persistent failure: a CONNECTION-REFUSED result while the process is alive means the
+    /// listener was torn down, so signal the in-node rebind and re-probe; a TIMEOUT means busy-but-alive and
+    /// is left strictly untouched (never risk a mid-stream close). Cheap and fail-soft; safe to call on every
+    /// foreground.
+    static func recoverIfSuspended() async {
+        // Custom/remote servers self-manage; a dead in-process runtime cannot be rebound in-process.
+        guard !StremioServer.isCustom, exitCode == nil else { return }
+        // The ordinary scan latches a drifted fallback port and returns true if any port answers -> healthy.
+        if await StremioServer.isOnline() { setListenerSuspect(false); return }
+        // Nothing answered on the whole fallback range. Classify the failure on the current bound port.
+        guard await probeRefused() else { return }   // timeout / other -> busy-but-alive, do nothing
+        // Confirm the process is still alive (fresh heartbeat tick) before touching anything, and confirm
+        // the refusal a second time so a single transient miss never trips a rebind.
+        guard processLikelyAlive(), await probeRefused() else { setListenerSuspect(false); return }
+        setListenerSuspect(true)
+        DiagnosticsLog.log("server", "loopback refused twice while process alive; requesting listener rebind (#130)")
+        requestRebind()
+        try? await Task.sleep(nanoseconds: 3_000_000_000)   // let the heartbeat consume the signal + re-listen
+        if await StremioServer.isOnline() {
+            setListenerSuspect(false)
+            DiagnosticsLog.log("server", "listener rebind confirmed; server accepting connections again (#130)")
+        } else {
+            // Leave suspect set; a later foreground re-probes, and after 3 in-node attempts the stuck marker
+            // takes over the status string and points the user at Restart.
+            DiagnosticsLog.log("server", "listener still refused after rebind request (#130)")
+        }
+    }
+
+    /// A single loopback probe of the current bound port that distinguishes a CONNECTION REFUSAL (the
+    /// listener is down) from a timeout (busy-but-alive). Returns true ONLY on a refusal/reset.
+    private static func probeRefused() async -> Bool {
+        let port = StremioServer.embeddedPort
+        guard let url = URL(string: "http://127.0.0.1:\(port)/settings") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            _ = try await URLSession.shared.data(for: req)
+            return false   // any response -> listener alive
+        } catch let e as URLError {
+            switch e.code {
+            case .cannotConnectToHost, .networkConnectionLost:
+                return true    // ECONNREFUSED / ECONNRESET -> listener torn down
+            default:
+                return false   // .timedOut and everything else -> leave alone
+            }
+        } catch {
+            return false
+        }
+    }
+
+    /// Best-effort "is the node process still ticking" check: the exit code is unset AND the heartbeat log
+    /// wrote within the last few seconds. A genuinely frozen loop (no recent tick) is NOT a listener-drop
+    /// case -- only an app restart recovers it -- so we do not signal a rebind for it.
+    private static func processLikelyAlive() -> Bool {
+        guard exitCode == nil else { return false }
+        if let age = lastLogTickAge() { return age < 8 }
+        return true   // no log yet (very early boot) -> assume alive
     }
 }
