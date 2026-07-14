@@ -73,9 +73,10 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     // the memory-constrained Apple TV. Resident RAM is bounded to (floor + lead). We run a REDUCED lead until
     // the engine reports first-frame readiness, so the pre-first-frame window cannot stack the full 64 MiB lead
     // into the shared jetsam budget at the exact moment mpv may be re-opening the same 4K stream on a demote;
-    // once ready, the full lead restores steady-state headroom. The reduced lead (16 MiB) still comfortably
-    // exceeds the few 1s segments needed to reach readyToPlay and stays above the 32 MiB open-segment cap, so
-    // it never stalls the publish pipeline. ---
+    // once ready, the full lead restores steady-state headroom. The 16 MiB reduced lead is not itself the
+    // operative bound against the 32 MiB open-segment cap: it is added on top of windowFloorBytes (at least
+    // 64 MiB), so the pre-ready CEILING stays at least 80 MiB published, comfortably above the 32 MiB
+    // open-segment cap plus init, and the publish pipeline cannot stall. ---
     private static let producerLeadPreReady = 16 * 1024 * 1024   // F3: reduced lead before first-frame readiness
     private static let producerLeadFull      = 64 * 1024 * 1024   // F3: full lead once the engine is ready
     /// Set once via `markEngineReady()` when AVPlayerEngine reports readyToPlay/first frame; guarded by
