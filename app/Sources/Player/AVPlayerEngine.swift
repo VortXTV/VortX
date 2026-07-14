@@ -339,7 +339,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // FORWARD-ONLY DV REMUX (P2, #76): cap the target at the produced edge at the ONE engine chokepoint, so
         // EVERY seek surface is covered (scrubber, hiddenSeek right-nudge, the fwd transport button, Lock Screen
         // / Control Center seek, chapter jumps, skip-pill / auto-skip) instead of each chrome clamping on its
-        // own — a seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
+        // own. A seek past the produced bytes lands in content that does not exist yet, no frame arrives, and
         // the start / stall watchdog demotes the whole true-DV session to libmpv (losing DV + Atmos). Backward
         // seeks and non-remux items are unaffected (min() only lowers the ceiling; a 0 edge is "unknown", skip).
         if isRemuxMounted {

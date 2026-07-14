@@ -2688,7 +2688,7 @@ struct PosterGrid: View {
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
-    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
+    /// Called when the LAST card appears: the infinite-scroll hook for paginated grids (Discover).
     /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live

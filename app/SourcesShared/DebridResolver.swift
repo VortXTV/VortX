@@ -1106,7 +1106,7 @@ extension DebridCoordinator {
                              confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
         // USENET first: a stream with an `.nzb` link (and no direct `url`) resolves through the TorBox
         // usenet backend, gated on a TorBox key. With no TorBox key `hasUsenetResolver` is false, so this
-        // returns nil on the first line (zero await) — a usenet row then behaves exactly as today (no
+        // returns nil on the first line (zero await): a usenet row then behaves exactly as today (no
         // playable link). NOT a torrent: the minted URL is a plain direct stream (no infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
             guard hasUsenetResolver else { return nil }
