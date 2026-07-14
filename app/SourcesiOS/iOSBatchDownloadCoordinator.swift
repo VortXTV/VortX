@@ -370,7 +370,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: plan.alternate, episode: plan.episode)
-            if resolved == nil, plan.alternate.isTorrent { _ = self.prepareTorrentStream(plan.alternate) }
+            if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
             guard let fallback = plan.alternate.playableURL else { return }   // no URL: keep the failed row, do not orphan the episode
             let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
                                                          resolvedURL: resolved ?? fallback,
