@@ -2695,7 +2695,7 @@ struct PosterGrid: View {
     /// Continue Watching and the Library grid keep it off (their cards carry progress / their own treatment).
     /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
     var showWatchedBadges: Bool = false
-    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
+    /// Called when the LAST card appears: the infinite-scroll hook for paginated grids (Discover).
     /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
