@@ -795,8 +795,26 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             remuxHLSServer?.markEngineReady()
             remuxLoader?.markEngineReady()
             let dur = item.duration.seconds
-            let seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
-            if seekable { emit(MPVProperty.duration, dur) }
+            var seekable = dur.isFinite && dur > 0   // an indefinite duration is a live stream
+            var emittedDuration = dur
+            // DV-REMUX KNOWN DURATION: a remux mount serves a mid-production fMP4 EVENT playlist with no
+            // EXT-X-ENDLIST, so AVPlayerItem.duration reads INDEFINITE at readyToPlay for the whole session
+            // even though the source MKV runtime is known. Left uncorrected the chrome treats the entire DV
+            // play as a live stream: it never arms the launch resume floor, and disables its periodic/exit
+            // saves, reportSeek, scrubber range, skip clamps and mark-watched. Synthesize the demuxer-reported
+            // runtime instead so the session behaves as the VOD it is (progress persists, the playhead scrubs
+            // within the buffered edge per the forward-only clamp). Non-remux items keep AVPlayer's own value
+            // byte for byte; the libmpv path never reaches here. Forward-only pre-start seeks are still dropped
+            // below via the isRemuxMounted guard, so a synthesized seekable=true cannot resume into dead bytes.
+            if !seekable, isRemuxMounted {
+                let known = remuxHLSServer?.sourceDurationSeconds ?? remuxLoader?.sourceDurationSeconds ?? 0
+                if known > 0 {
+                    emittedDuration = known
+                    seekable = true
+                    DiagnosticsLog.log("dv", "synthesized remux duration \(Int(known))s (item.duration indefinite)")
+                }
+            }
+            if seekable { emit(MPVProperty.duration, emittedDuration) }
             emit(MPVProperty.seekable, seekable)
             emit(MPVProperty.trackList, nil)   // chrome re-pulls via tracks()
             loadSelectionGroups()              // async; re-emits track-list once the groups resolve

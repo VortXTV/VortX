@@ -138,6 +138,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var _hlsSegments: [HLSSegment] = []
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
+    // Known source runtime, read from the demuxer at find_stream_info time. Published under hlsLock (written
+    // once on the remux thread, read from the player thread). 0 means "unknown / not yet parsed". The HLS
+    // delivery advertises no ENDLIST while producing, so AVPlayerItem.duration stays INDEFINITE mid-play; the
+    // engine reads this value to synthesize the real VOD duration for the chrome. See AVPlayerEngine.readyToPlay.
+    private var _sourceDurationSeconds: Double = 0
+
+    /// The source MKV runtime in seconds (0 when the demuxer could not report one). Thread-safe.
+    var sourceDurationSeconds: Double { hlsLock.lock(); defer { hlsLock.unlock() }; return _sourceDurationSeconds }
 
     /// Consistent snapshot of the published HLS index for the local server.
     func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
@@ -302,6 +310,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             VXProbe.log("dv", "HDR10 FALLBACK: find_stream_info failed rc=\(si)")
             buffer.fail("avformat_find_stream_info failed (\(si))")
             return
+        }
+
+        // Capture the source runtime while the demuxer context is open. AVFormatContext.duration is in
+        // AV_TIME_BASE units (microseconds); a valid file reports a positive value, AV_NOPTS_VALUE (negative)
+        // or 0 means unknown. Publish it so the AVPlayer engine can synthesize a finite VOD duration for the
+        // forward-only HLS remux (whose EVENT playlist advertises no ENDLIST, so AVPlayerItem.duration is
+        // INDEFINITE for the whole session). Harmless on the libmpv path, which never reads it.
+        let rawDurationUsec = inCtx.pointee.duration
+        if rawDurationUsec > 0 {
+            let secs = Double(rawDurationUsec) / 1_000_000.0
+            hlsLock.lock(); _sourceDurationSeconds = secs; hlsLock.unlock()
+            VXProbe.log("dv", "remux source duration \(String(format: "%.1f", secs))s")
         }
 
         // Output context: fragmented MP4, NO file (custom IO).
