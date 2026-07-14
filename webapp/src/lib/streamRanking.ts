@@ -395,12 +395,87 @@ function csvWords(raw: string): string[] {
     .filter(Boolean);
 }
 
+// ---- Preferred-audio filter (#117) --------------------------------------------------------------
+// A conservative, best-effort port of the Apple app's StreamRanking.languageScore: hide a source only
+// when its name CLEARLY advertises a single audio language other than the viewer's preferred audio
+// language. Multi-language releases and sources that state no language are always kept, and burned-in
+// subtitle tags (korsub / vostfr / legendado) are never read as foreign AUDIO. Web carries a single
+// `audioLang`; when it is unset ("") the filter is a no-op, matching the app's empty-preferred guard.
+
+const LANG_TOKENS: Record<string, string[]> = {
+  en: ["english", "🇬🇧", "🇺🇸"],
+  es: ["spanish", "español", "espanol", "castellano", "latino"],
+  fr: ["french", "français", "francais", "truefrench", "vostfr"],
+  de: ["german", "deutsch"],
+  it: ["italian", "italiano"],
+  pt: ["portuguese", "português", "portugues", "dublado", "legendado"],
+  hi: ["hindi", "🇮🇳"],
+  ja: ["japanese", "日本", "日本語"],
+  ko: ["korean", "한국", "korsub"],
+  zh: ["chinese", "mandarin", "cantonese", "中文", "中字", "国语", "粤语", "简体", "繁體"],
+  ar: ["arabic", "العربية"],
+  ru: ["russian", "русск"],
+};
+/** Subtitle-context tokens that indicate burned-in SUBTITLES, not audio; ignored for audio matching. */
+const SUBTITLE_CONTEXT_TOKENS = new Set(["korsub", "vostfr", "legendado"]);
+
+/** Match a token: word-bounded for plain latin/alphanumeric tokens (so "ts" never hits inside a word),
+ *  plain substring for accented/CJK/flag tokens (word boundaries do not apply to non-alphanumerics). */
+function claimsToken(text: string, token: string): boolean {
+  return /^[a-z0-9]+$/.test(token) ? bounded(text, token) : text.includes(token);
+}
+
+function claimsLanguage(text: string, code: string): boolean {
+  return (LANG_TOKENS[code] ?? []).some((tok) => claimsToken(text, tok));
+}
+
+/** Like claimsLanguage but ignores subtitle-context tokens, so a korsub/vostfr/legendado release is
+ *  never mistaken for FOREIGN AUDIO. */
+function claimsAudioLanguage(text: string, code: string): boolean {
+  return (LANG_TOKENS[code] ?? []).some((tok) => !SUBTITLE_CONTEXT_TOKENS.has(tok) && claimsToken(text, tok));
+}
+
+/** Count regional-indicator flag emoji (each flag is a pair of regional-indicator scalars). */
+function flagCount(text: string): number {
+  let n = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x1f1e6 && cp <= 0x1f1ff) n++;
+  }
+  return Math.floor(n / 2);
+}
+
+function isMultiLanguage(text: string): boolean {
+  if (text.includes("multi") || text.includes("dual")) return true;
+  if (Object.keys(LANG_TOKENS).filter((c) => claimsLanguage(text, c)).length >= 2) return true;
+  return flagCount(text) >= 2;
+}
+
+/** The technical-tags region of a label (from the first year/resolution marker to the end), so a foreign
+ *  word inside an English TITLE ("The Italian Job") is not read as foreign audio. Whole text when no
+ *  marker is present (conservative: current behaviour). */
+function technicalTags(text: string): string {
+  const m = text.match(/(?:19|20)\d{2}|2160p?|1080p?|720p?|480p?/);
+  return m && m.index !== undefined ? text.slice(m.index) : text;
+}
+
+/** True when the source clearly advertises a single audio language OTHER than `preferred` (an ISO 639-1
+ *  code). Mirrors languageScore < 0: keep when it carries the preferred language, keep multi-language,
+ *  else drop only when the tags region names a foreign audio language. */
+function claimsForeignAudio(text: string, preferred: string): boolean {
+  if (claimsLanguage(text, preferred)) return false;
+  if (isMultiLanguage(text)) return false;
+  const tags = technicalTags(text);
+  return Object.keys(LANG_TOKENS).some((c) => c !== preferred && claimsAudioLanguage(tags, c));
+}
+
 /** Apply the user's Streams settings (filters) to the raw add-on responses, before ranking/grouping.
  *  Returns groups with the same shape but pruned `streams`. Filters that only make sense for torrents
  *  (dead-torrent, direct-links-only) still run so the surfaced/greyed torrent list honours them too. */
 export function applyStreamFilters(groups: StreamGroup[], s: Settings): StreamGroup[] {
   const hide = csvWords(s.hideWords);
   const need = csvWords(s.requireWords);
+  const preferredAudio = s.audioLang.trim().toLowerCase(); // "" = default -> preferred-audio filter is a no-op
   const filterOne = (stream: Stream): boolean => {
     const t = qualityText(stream);
     if (s.directLinksOnly && isTorrent(stream)) return false;
@@ -414,6 +489,15 @@ export function applyStreamFilters(groups: StreamGroup[], s: Settings): StreamGr
       const r = resolutionOf(stream);
       if (r !== null && r > s.maxQuality) return false;
     }
+    // #117: floor a KNOWN resolution below the minimum; sources with no stated resolution are kept.
+    if (s.minQuality) {
+      const r = resolutionOf(stream);
+      if (r !== null && r < s.minQuality) return false;
+    }
+    // #117: opt-in - only show sources that state a recognizable resolution.
+    if (s.hideUnknownResolution && resolutionOf(stream) === null) return false;
+    // #117: best-effort - drop a source that clearly advertises a different audio language.
+    if (s.preferredAudioOnly && preferredAudio && claimsForeignAudio(t, preferredAudio)) return false;
     if (s.maxFileSizeGB) {
       const gb = sizeGB(t);
       if (gb > 0 && gb > s.maxFileSizeGB) return false;

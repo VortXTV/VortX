@@ -63,6 +63,14 @@ const MAX_QUALITY_OPTS: { v: number; l: string }[] = [
   { v: 1080, l: "1080p" },
   { v: 720, l: "720p" },
 ];
+// Minimum-quality floor (#117). Values match the Apple Minimum-quality picker EXACTLY (Off/720/1080/2160);
+// 4K is 2160 here (NOT 4000, which the app uses only for its Max-quality tag).
+const MIN_QUALITY_OPTS: { v: number; l: string }[] = [
+  { v: 0, l: "Off" },
+  { v: 720, l: "720p" },
+  { v: 1080, l: "1080p" },
+  { v: 2160, l: "4K" },
+];
 const MAX_SIZE_OPTS: { v: number; l: string }[] = [
   { v: 0, l: "Unlimited" },
   { v: 5, l: "5 GB" },
@@ -266,6 +274,11 @@ function streamsSection(s: Settings): string {
     "set-maxq",
     "mq",
   );
+  const minQ = segmented(
+    MIN_QUALITY_OPTS.map((o) => ({ value: String(o.v), label: o.l, on: s.minQuality === o.v })),
+    "set-minq",
+    "mnq",
+  );
   const maxS = segmented(
     MAX_SIZE_OPTS.map((o) => ({ value: String(o.v), label: o.l, on: s.maxFileSizeGB === o.v })),
     "set-maxsize",
@@ -282,7 +295,10 @@ function streamsSection(s: Settings): string {
     row("Hide dead torrents", toggle("toggle-dead", s.hideDeadTorrents)) +
     row("HDR sources only", toggle("toggle-hdr", s.hdrOnly)) +
     row("Hide AV1 sources", toggle("toggle-av1", s.hideAV1)) +
+    row("Preferred audio only", toggle("toggle-prefaudio", s.preferredAudioOnly), "Best effort: hides a source only when its name clearly advertises an audio language other than your preferred audio language. Sources with no stated language, or multiple languages, are kept.") +
     row("Max quality", maxQ) +
+    row("Min quality", minQ, "Drop sources whose stated resolution is below this floor; sources with no stated resolution are kept") +
+    row("Hide unknown quality", toggle("toggle-hideunknown", s.hideUnknownResolution), "Only show sources that state their resolution") +
     row("Max file size", maxS);
   return group(
     "Streams",
@@ -482,6 +498,8 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return commit({ safetyFilter: (d.safety as SafetyFilter) ?? "off" });
     case "set-maxq":
       return commit({ maxQuality: Number(d.mq) || 0 });
+    case "set-minq":
+      return commit({ minQuality: Number(d.mnq) || 0 });
     case "set-maxsize":
       return commit({ maxFileSizeGB: Number(d.ms) || 0 });
     case "toggle-addon-order":
@@ -494,6 +512,10 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return commit({ hdrOnly: !getSettings().hdrOnly });
     case "toggle-av1":
       return commit({ hideAV1: !getSettings().hideAV1 });
+    case "toggle-hideunknown":
+      return commit({ hideUnknownResolution: !getSettings().hideUnknownResolution });
+    case "toggle-prefaudio":
+      return commit({ preferredAudioOnly: !getSettings().preferredAudioOnly });
     case "toggle-direct":
       return commit({ directLinksOnly: !getSettings().directLinksOnly });
     case "toggle-autoplay":
