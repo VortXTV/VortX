@@ -568,8 +568,25 @@ class EngineStremioRepository(
     // no-op (the engine records no progress), never a crash. Continue Watching then updates off the
     // engine's own `continue_watching_preview` re-derivation, which [homeUpdates] already streams live.
 
+    /// The played item's meta type + this stream's video id, captured when the Player is loaded so the
+    /// near-end watched mark in [endPlaybackSession] can scope itself correctly. A SERIES episode must be
+    /// marked per-EPISODE, never with the engine's aggregate MarkAsWatched (which flips every episode of
+    /// the series watched and greys the whole series out of Continue Watching). Single active playback at
+    /// a time; @Volatile for cross-thread visibility (begin/end both run on Dispatchers.Default).
+    @Volatile private var playbackType: String? = null
+    @Volatile private var playbackVideoId: String? = null
+
     override suspend fun beginPlaybackSession(): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        val selected = buildPlayerSelected() ?: return@runCatching
+        val selected = buildPlayerSelected() ?: run {
+            playbackType = null
+            playbackVideoId = null
+            return@runCatching
+        }
+        // Capture the meta type + this stream's video id (streamRequest.path.id -- the episode id for a
+        // series, the movie id for a movie), mirroring Apple reading selected.stream_request.path.id, so
+        // the near-end mark can be episode-scoped for a series.
+        playbackType = selected.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("type")?.ifBlank { null }
+        playbackVideoId = selected.optJSONObject("streamRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
         StremioCoreNative.dispatch(EngineActions.loadPlayer(selected))
     } }
 
@@ -581,14 +598,39 @@ class EngineStremioRepository(
     override suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
         if (durationMs > 0L && positionMs >= 0L) {
             StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
-            // Watched-near-end: past the threshold, mark the title watched so it leaves Continue Watching
-            // and its watched tick flips, matching the Apple player's finish behavior.
+            // Watched-near-end: past the threshold, mark the finished item watched so it leaves Continue
+            // Watching and its tick flips. CRITICAL (mirrors Apple CoreBridge.markPlaybackWatched's type
+            // branch, app/SourcesShared/CoreBridge.swift:1166): a SERIES must be marked per-EPISODE via
+            // MarkVideoAsWatched, NEVER with the aggregate MarkAsWatched(true) -- that flips every episode
+            // of the series watched and greys the whole series out of Continue Watching. Only a movie (any
+            // known non-series type) uses the aggregate; an unknown type skips the explicit mark, since
+            // the final TimeChanged above already recorded near-end progress and we must never risk the
+            // aggregate on an item that might be a series.
             if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
-                StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
+                val type = playbackType
+                val videoId = playbackVideoId
+                if (type == MediaType.SERIES.id && !videoId.isNullOrEmpty()) {
+                    val (season, episode) = seasonEpisodeFromVideoId(videoId)
+                    StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, true))
+                } else if (type != null && type != MediaType.SERIES.id) {
+                    StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
+                }
             }
         }
         StremioCoreNative.dispatch(EngineActions.unloadPlayer())
+        playbackType = null
+        playbackVideoId = null
     } }
+
+    /// Best-effort season/episode from a stremio series video id (`<metaId>:<season>:<episode>`): the
+    /// trailing two colon-separated integers, or null when the id doesn't follow that shape. The engine's
+    /// MarkVideoAsWatched keys on the video id itself and treats season/episode as optional extras (see
+    /// [EngineActions.markVideoAsWatched]), so a null pair still marks the correct episode.
+    private fun seasonEpisodeFromVideoId(videoId: String): Pair<Int?, Int?> {
+        val parts = videoId.split(':')
+        if (parts.size < 3) return null to null
+        return parts[parts.size - 2].toIntOrNull() to parts.last().toIntOrNull()
+    }
 
     /// Build the engine Player `selected` struct from the resident `meta_details`: any Ready stream + its
     /// group's request + the title's meta request, mirroring Apple `loadEnginePlayer`'s fallback (the
