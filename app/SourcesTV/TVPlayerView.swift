@@ -1121,7 +1121,11 @@ struct TVPlayerView: View {
         .font(.system(size: 20, design: .monospaced))
         .padding(Theme.Space.md)
         .frame(width: 440)
-        .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        // Compact non-interactive stats notice: warm glass container (field-weight fill keeps the
+        // monospace numbers legible over bright video). The number text stays opaque; glass is the
+        // container background only.
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 12, style: .continuous),
+                    fillAlpha: VortXGlass.fieldFillAlpha, shadow: .toast)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(Theme.Space.xl)
         .task(id: showStats) {
@@ -1282,7 +1286,9 @@ struct TVPlayerView: View {
                 Text("LIVE").font(.callout.weight(.heavy)).foregroundStyle(Theme.Palette.textPrimary).tracking(1.5)
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
-            .background(.black.opacity(0.4), in: Capsule())
+            // Glass LIVE pill: the danger dot + label stay opaque (status colour); glass is the
+            // container only. Flat shadow so it reads inline within the transport chrome.
+            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
             Spacer(minLength: 0)
             if currentTime > 0 {
                 Text(timeString(currentTime)).font(.callout.monospacedDigit())
@@ -2093,7 +2099,9 @@ struct TVPlayerView: View {
             }
             .frame(width: 760)
             .frame(maxHeight: .infinity)
-            .background(Theme.Palette.surface1.opacity(0.98))
+            // High-alpha side panel glass that stays legible over bright moving video. Docked to the
+            // trailing edge so its shadow is thrown inward, grounding the right-edge slide-in.
+            .vortxGlassPanel(in: Rectangle(), dockedTo: .trailing)
         }
         .ignoresSafeArea()
         .transition(.move(edge: .trailing))
@@ -3432,7 +3440,9 @@ struct TVPlayerView: View {
                 }
                 .padding(.horizontal, 32).padding(.vertical, 22)
                 .frame(maxWidth: 820, alignment: .leading)
-                .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                // Floating Up Next card on the warm card glass, matching the iOS end-of-episode card.
+                .vortxGlass(in: RoundedRectangle(cornerRadius: 20, style: .continuous),
+                            fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
                 .padding(Theme.Space.screenEdge * 1.5)
             }
         }
@@ -3448,7 +3458,11 @@ struct TVPlayerView: View {
         .font(.headline.weight(.semibold))
         .foregroundStyle(highlighted ? Theme.Palette.onAccent : Theme.Palette.textPrimary)
         .padding(.horizontal, 24).padding(.vertical, 13)
-        .background(highlighted ? AnyShapeStyle(Theme.Palette.accent) : AnyShapeStyle(.white.opacity(0.16)), in: Capsule())
+        // Highlighted (Play Now / focused) stays a prominent solid-ember pill for 10-foot legibility;
+        // the idle pill (Watch Credits) rides the warm glass. The opaque accent layer sits above the
+        // glass so, when highlighted, it reads as solid ember rather than tinted glass.
+        .background { if highlighted { Capsule().fill(Theme.Palette.accent) } }
+        .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
         .overlay(Capsule().stroke(Theme.Palette.canvas, lineWidth: highlighted ? 3 : 0))
         .scaleEffect(highlighted ? 1.06 : 1.0)
         .fixedSize(horizontal: true, vertical: false)
