@@ -1306,15 +1306,16 @@ struct TVPlayerView: View {
             .animation(.easeOut(duration: 0.18), value: sel)
     }
 
-    /// Focused button keeps our accent fill (the brand highlight); the resting state uses Liquid Glass on
-    /// tvOS 26+, falling back to the flat translucent fill on older tvOS.
+    /// The SELECTED (remote-focused) button keeps the solid accent fill: that bold ember disc IS the
+    /// 10-foot focus indicator and must stay legible from the couch, so it is deliberately not softened.
+    /// The RESTING discs wear the shared VortX glass (mockup transport discs), which renders warm glass on
+    /// older tvOS and upgrades to Apple Liquid Glass on tvOS 26, matching the nav chrome. Background only:
+    /// the remote-driven `selected` focus state and navigation are untouched.
     @ViewBuilder private func ctrlButtonBackground(_ selected: Bool) -> some View {
         if selected {
             Circle().fill(Theme.Palette.accent)
-        } else if #available(tvOS 26.0, *) {
-            Circle().fill(.clear).glassEffect(.regular, in: Circle())
         } else {
-            Circle().fill(Theme.Palette.textPrimary.opacity(0.12))
+            Circle().fill(.clear).vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
         }
     }
 
@@ -3387,12 +3388,19 @@ struct TVPlayerView: View {
             HStack {
                 Spacer()
                 HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "forward.fill")
+                    Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
                     Text(segment.label).fontWeight(.semibold)
                 }
                 .padding(.horizontal, Theme.Space.xl).padding(.vertical, Theme.Space.md)
-                .foregroundStyle(Theme.Palette.canvas)
-                .background(Capsule().fill(Theme.Palette.accent))
+                // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
+                // glyph, upgrading to Liquid Glass on tvOS 26. Ink label, ember icon.
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                            fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
+                .overlay {
+                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                        .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                }
                 .padding(Theme.Space.screenEdge * 1.5)
             }
         }

@@ -2587,6 +2587,10 @@ struct PlayerScreen: View {
             Button { Haptics.tap(); coordinator.player?.togglePause(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
+                    // Glass transport disc (mockup .big): warm VortX glass, Liquid Glass on OS 26. The inner
+                    // 84pt disc is purely visual; the outer 100pt frame keeps the original tap target.
+                    .frame(width: 84, height: 84)
+                    .vortxGlass(in: Circle(), fillAlpha: VortXGlass.barFillAlpha, shadow: .disc)
                     .frame(width: 100, height: 100)
             }
             .accessibilityLabel(isPaused ? "Play" : "Pause")
@@ -2625,7 +2629,12 @@ struct PlayerScreen: View {
             seekBy(delta)
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(.white).shadow(radius: 4).frame(width: 60, height: 60)
+                .foregroundStyle(.white).shadow(radius: 4)
+                // Glass transport disc (mockup .skip): inner 54pt visual disc, outer 60pt frame keeps the
+                // original tap target. Warm VortX glass, upgrades to Liquid Glass on OS 26.
+                .frame(width: 54, height: 54)
+                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+                .frame(width: 60, height: 60)
         }
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
     }
@@ -2777,7 +2786,7 @@ struct PlayerScreen: View {
             #endif
 
             HStack(spacing: 0) {
-                controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed)) { openPanel(.speed) }
+                controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed), active: speed != 1.0) { openPanel(.speed) }
                 Spacer()
                 controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) }
                 if !audioTracks.isEmpty {   // parity with tvOS: open the Audio panel for ANY track, not only when >1
@@ -2805,11 +2814,17 @@ struct PlayerScreen: View {
                 Spacer()
                 controlButton("camera.viewfinder", "Grab") { grabFrame() }
                 Spacer()
-                controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel) { openPanel(.sleep) }
+                controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel, active: sleepArmed) { openPanel(.sleep) }
             }
             .padding(.horizontal, 8)
         }
-        .padding(.horizontal).padding(.bottom, 22)
+        // Floating glass control bar (mockup .bottom): the scrubber + control pills ride on one rounded,
+        // inset VortX glass panel that upgrades to Apple Liquid Glass on OS 26. Interior padding shapes the
+        // panel; the outer inset floats it off the screen edges. Contents and wiring are unchanged.
+        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 12)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                    fillAlpha: VortXGlass.barFillAlpha, shadow: .bar)
+        .padding(.horizontal, 16).padding(.bottom, 16)
     }
 
     #if !os(tvOS)
@@ -3149,13 +3164,22 @@ struct PlayerScreen: View {
         }
     }
 
-    private func controlButton(_ icon: String, _ title: String, action: @escaping () -> Void) -> some View {
+    private func controlButton(_ icon: String, _ title: String, active: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 7) {
                 Image(systemName: icon).font(.system(size: 15, weight: .semibold))
                 Text(title).font(.subheadline.weight(.medium))
             }
-            .foregroundStyle(.white)
+            // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
+            // when its feature is engaged. Purely visual; the button's action is unchanged.
+            .foregroundStyle(active ? Theme.Palette.accent : .white)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
+            .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .strokeBorder(active ? Theme.Palette.accent.opacity(0.4) : .white.opacity(0.14), lineWidth: 1)
+            }
         }
     }
 
@@ -3163,9 +3187,9 @@ struct PlayerScreen: View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white).padding(11)
-                // Floating transport chrome over the video: Liquid Glass on OS 26, the dark scrim disc on
-                // older systems. Interactive glass since these are pressable controls.
-                .glassChrome(in: Circle(), interactive: true) { Circle().fill(.black.opacity(0.35)) }
+                // Floating top-bar disc (mockup .disc): the shared VortX glass so it reads like the nav
+                // chrome and upgrades to Apple Liquid Glass on OS 26. Background only, hit shape unchanged.
+                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
@@ -3185,12 +3209,19 @@ struct PlayerScreen: View {
                     updateCurrentSkip(at: segment.end)
                 } label: {
                     HStack(spacing: 8) {
-                        Image(systemName: "forward.fill")
+                        Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
                         Text(segment.label).fontWeight(.semibold)
                     }
                     .padding(.horizontal, 22).padding(.vertical, 12)
-                    .foregroundStyle(Theme.Palette.onAccent)
-                    .background(Capsule().fill(Theme.Palette.accent))
+                    // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
+                    // glyph, upgrading to Liquid Glass on OS 26. Ink label, ember icon.
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                                fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                            .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                    }
                 }
                 .padding(.trailing, 28).padding(.bottom, 40)
             }
