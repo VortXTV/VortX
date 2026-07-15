@@ -493,7 +493,8 @@ struct iOSDetailView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .padding(.horizontal, Theme.Space.md)
                     .padding(.vertical, Theme.Space.sm)
-                    .background(.black.opacity(0.72), in: Capsule())
+                    // The transient "trailer preparing" notice reads as a floating glass toast.
+                    .vortxGlassToast(in: Capsule())
                     .padding(.top, Theme.Space.xl)
                     .transition(reduceMotion ? .identity : .opacity)
                     .allowsHitTesting(false)
@@ -971,7 +972,9 @@ struct iOSDetailView: View {
                                 .foregroundStyle(Theme.Palette.textSecondary)
                                 .lineLimit(1)
                                 .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(Theme.Palette.surface2, in: Capsule())
+                                // Glass the static "Also available in" language pill: a non-selected
+                                // glass chip so it reads as raised VortX chrome, not a flat surface fill.
+                                .vortxGlassChip(selected: false)
                                 .accessibilityLabel(chip.label)
                         }
                     }
@@ -4038,8 +4041,9 @@ struct iOSSourceList: View {
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.sm)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface2.opacity(0.6),
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+            // Glass the collapsible per-addon section header so the grouping reads as a deliberate
+            // raised card, matching the settings-card language used across the app's chrome.
+            .vortxSettingsCard()
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -4088,8 +4092,9 @@ struct iOSSourceList: View {
         } else {
             iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false,
                            debridCached: isDebridCached(stream))
-                .background(Theme.Palette.surface1.opacity(0.5),
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                // The disabled (no playable URL) source row sits on the shared card glass so it reads
+                // as the same surface family as the loading / empty state cards, just non-interactive.
+                .vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
     }
 
@@ -4278,16 +4283,24 @@ private struct iOSStreamLabel: View {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func badge(_ text: String, prominent: Bool = false) -> some View {
-        Text(text).font(Theme.Typography.eyebrow).tracking(1)
+    @ViewBuilder private func badge(_ text: String, prominent: Bool = false) -> some View {
+        let label = Text(text).font(Theme.Typography.eyebrow).tracking(1)
             // Keep the badge (including the add-on / debrid / source name) on a single horizontal line at
             // its intrinsic width. Without fixedSize a sibling badge could squeeze the name pill to a
             // near-zero width, wrapping the name to 2-3 characters per line (the reported vertical text).
             .lineLimit(1)
             .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(prominent ? Theme.Palette.accent.opacity(0.22) : Theme.Palette.surface3, in: Capsule())
             .foregroundStyle(prominent ? Theme.Palette.accent : Theme.Palette.textSecondary)
+        if prominent {
+            // The prominent (quality / CACHED) badge carries meaning through its ember accent tint, so it
+            // stays a SOLID accent pill rather than glass.
+            label.background(Theme.Palette.accent.opacity(0.22), in: Capsule())
+        } else {
+            // Neutral stream badges (add-on name, TORRENT) become badge-alpha glass pills so they read as
+            // raised chrome; the flat shadow keeps them inline without floating.
+            label.vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
+        }
     }
 }
 
@@ -4302,7 +4315,10 @@ private struct iOSLoadingRow: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // The "sources streaming in" card sits on the shared card glass (own padding kept, so the
+        // settings-card composite's padding is not layered on top).
+        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
     }
 }
 
@@ -4317,7 +4333,9 @@ private struct iOSEmptyRow: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // The "nothing playable" state card sits on the shared card glass (own padding kept).
+        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
     }
 }
 

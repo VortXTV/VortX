@@ -225,7 +225,9 @@ struct DetailView: View {
                                     .font(Theme.Typography.label.weight(.semibold))
                                     .foregroundStyle(Theme.Palette.textSecondary)
                                     .padding(.horizontal, 16).padding(.vertical, 8)
-                                    .background(Theme.Palette.surface2, in: Capsule())
+                                    // Glass the static "Also available in" language pill: a non-selected
+                                    // glass chip so it reads as raised VortX chrome, not a flat surface fill.
+                                    .vortxGlassChip(selected: false)
                                     .accessibilityLabel(chip.label)
                             }
                         }
