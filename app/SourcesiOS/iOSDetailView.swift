@@ -828,6 +828,17 @@ struct iOSDetailView: View {
                 .frame(width: geo.size.width, alignment: .leading)
             }
         }
+        // Near-full-bleed cinematic backdrop behind the ENTIRE detail page (owner ask). The pinned banner only
+        // paints the top portion of the window (heroBandHeight reserves an inner-scroll region so the Watch /
+        // Quality actions stay visible), which left the scroll region beneath it on flat black canvas: the
+        // "dead black below" report. Painting the SAME art + multi-stop gradient scrim at the full window
+        // height BEHIND the page makes the lower region read as continuous cinematic art with the copy still
+        // legible, without growing the banner (which would push Watch below the fold). `.background` does not
+        // affect the VStack's own layout; the opaque banner still owns the crisp focal art up top. macOS-only.
+        .background(alignment: .top) {
+            backdrop(height: geo.size.height)
+                .ignoresSafeArea()
+        }
     }
     #endif
 
