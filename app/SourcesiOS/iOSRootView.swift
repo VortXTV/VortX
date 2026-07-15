@@ -325,7 +325,11 @@ struct iOSRootView: View {
         // shell is hidden behind canvas while it is owed (opacity gate above), so nothing of the main
         // profile leaks behind it, matching the tvOS RootView flow. Selecting a profile goes through
         // ProfileStore.select via the shared ProfilePickerView, honoring the per-profile history invariant.
-        .platformFullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
+        // On macOS `platformFullScreenRootCover` hosts the picker WINDOW-FILLING at the scene root (via
+        // MacProfileCoverHost / MacRootProfileCoverOverlay) instead of a content-sized `.sheet` that
+        // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
+        // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
+        .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
     }
 
     #if os(macOS)
@@ -418,14 +422,15 @@ struct iOSRootView: View {
         HStack(spacing: Theme.Space.md) {
             VortXWordmark(fontSize: 18)
             Divider().frame(height: 20)
-            HStack(spacing: 0) {
+            HStack(spacing: Theme.Space.xs) {
                 ForEach(visibleTabs, id: \.rawValue) { item in
                     // `tabButton` internally requests `.frame(maxWidth: .infinity)` (right, for the
                     // bottom bar's seven-equal-columns layout on iOS). `.fixedSize()` collapses that
                     // back to the item's intrinsic width here, so the PILL stays compact and centered
                     // instead of stretching to the full window width; `tabButton` itself, and its iOS
-                    // callers, are unchanged.
-                    tabButton(item).fixedSize()
+                    // callers, are unchanged. A small per-item horizontal pad + the row spacing above
+                    // give the compact Mac pill breathing room between tabs.
+                    tabButton(item).fixedSize().padding(.horizontal, Theme.Space.xs)
                 }
             }
             // Same keyboard-browse focus section as the old bottom bar: arrows/Tab walk the pill,
