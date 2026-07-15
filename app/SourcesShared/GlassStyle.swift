@@ -62,6 +62,10 @@ enum VortXGlass {
     /// ember and the existing onAccent-vs-accent AA contrast is preserved, while the glass blur (and OS-26
     /// Liquid Glass) still bend light at the edges for the glass look.
     static let prominentTintAlpha = 0.94
+    /// The selected-chip ember tint alpha. Set a touch above the old direct `accent.opacity(0.18)` chip
+    /// fill because the tint now sits OVER the 50% warm glass fill (which slightly mutes it), so the
+    /// selected-unfocused chip reads at least as strongly as before.
+    static let chipSelectedAlpha = 0.20
 
     /// The 1px edge treatment: a bright top highlight (`inset 0 1px 0 rgba(255,255,255,~.12)`) fading into
     /// a faint warm hairline border (`1px solid rgba(242,236,226,~.14)`) toward the bottom. One gradient
@@ -182,6 +186,10 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     let fillAlpha: Double
     let highlightTop: Double
     let shadow: VortXGlass.Shadow
+    /// An optional active / selected tint composited INSIDE this background subtree, ABOVE the warm fill
+    /// (and the blur) but BELOW the content. Kept nil for plain glass; the chip passes its ember here so the
+    /// selection cue reads on top of the glass instead of being buried beneath the frost + warm fill.
+    var activeFill: Color? = nil
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
@@ -195,6 +203,12 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
             // VortX chrome. Skipped under Reduce Transparency, where `blurLayer` is already an opaque warm fill.
             if !reduceTransparency {
                 shape.fill(VortXGlass.fill(fillAlpha))
+            }
+            // The active / selected ember tint sits ON TOP of the warm fill and the blur, but still inside
+            // the background (so it stays below the content). Rendered in both modes so the selection cue
+            // survives Reduce Transparency too.
+            if let activeFill {
+                shape.fill(activeFill)
             }
         }
         // 1px lit top edge / hairline border.
@@ -307,14 +321,20 @@ extension View {
         background { if active { shape.fill(VortXGlass.activeTint(tint)) } }
     }
 
-    /// The ONE chip path: the neutral glass base plus a parameterized active overlay. Idle = glass pill;
-    /// `selected` = glass pill + the `tint` ember overlay (accent by default; a warn / amber or destructive
-    /// tint is supported). No drop shadow: chips sit inline, and their focus ring / scale ride on top from
-    /// ChipButtonStyle.
+    /// The ONE chip path: the neutral glass base plus a parameterized active tint. Idle = glass pill;
+    /// `selected` = glass pill + the `tint` ember composited ABOVE the glass warm fill but BELOW the label
+    /// (accent by default; a warn / amber or destructive tint is supported). Building the modifier directly
+    /// keeps the ember tint inside the ONE background subtree, so it is NOT buried under the frost + warm
+    /// fill the way a second, outer `.background` would be. No drop shadow: chips sit inline, and their
+    /// focus ring / scale ride on top from ChipButtonStyle.
     func vortxGlassChip(selected: Bool, tint: Color = Theme.Palette.accent) -> some View {
-        let shape = Capsule(style: .continuous)
-        return vortxGlass(in: shape, fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
-            .vortxGlassActive(selected, tint: tint, in: shape)
+        modifier(VortXGlassModifier(
+            shape: Capsule(style: .continuous),
+            fillAlpha: VortXGlass.pillFillAlpha,
+            highlightTop: 0.14,
+            shadow: .flat,
+            activeFill: selected ? tint.opacity(VortXGlass.chipSelectedAlpha) : nil
+        ))
     }
 
     /// A list-row / stream-row glass fill that renders BELOW the caller's ember focus / selection ring and
