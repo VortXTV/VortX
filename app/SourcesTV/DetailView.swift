@@ -1746,11 +1746,16 @@ struct CoreStreamList: View {
                     // Watch/Resume would (never re-runs source selection, per the play-from-start invariant),
                     // just from 0:00, and leaves the stored resume point untouched. Mirrors iOS iOSDetailView.
                     if resumeSeconds != nil {
-                        Button { if watchReady { playBest(best, in: groups, fromStart: true) } } label: {
+                        // Fires the instant it is shown: it lives inside `if let best` (a candidate already
+                        // exists) and only appears for a title that has played before, so a returning press
+                        // replays the remembered source from 0 via playBest's exact-source path. It does NOT
+                        // share Watch-Now's `watchReady` add-on-settle gate: that gate made the chip a silent
+                        // no-op during the multi-second settle window (the "Play from start does nothing"
+                        // report), while the primary button at least showed a spinner. No dead press here.
+                        Button { playBest(best, in: groups, fromStart: true) } label: {
                             Label("Play from start", systemImage: "arrow.counterclockwise")
                         }
                         .buttonStyle(ChipButtonStyle())
-                        .opacity(watchReady ? 1 : 0.55)
                     }
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
@@ -2199,7 +2204,7 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if stream.playableURL != nil {
-            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream)) }
+            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream), lastPlayed: isLastPlayed(stream)) }
                 .buttonStyle(RowFocusStyle())
                 .contextMenu { pinMenu(addon, stream) }
         } else {
@@ -2229,6 +2234,35 @@ struct CoreStreamList: View {
         return SourcePinStore.matches(stream, addon: addon, pin: pin)
     }
 
+    /// The source this title/episode last PLAYED (per profile), so its row can carry a "Played" mark and the
+    /// viewer can see which file they chose on the previous visit (#134: "I have no idea which file I have
+    /// selected"). Reads the per-profile, device-local `LastStreamStore` - the SAME store Continue-Watching
+    /// direct-resume uses - so it never touches the account library and respects the per-profile-history
+    /// invariant (overlay profiles keep their own store keyed on `ProfileStore.activeID`). Scoped to THIS
+    /// episode for a series (a different episode's pick must not mislabel this one); nil for live channels
+    /// (no meaningful source memory) or when nothing has played yet.
+    private var lastPlayedEntry: LastStreamStore.Entry? {
+        guard let meta, !isLive else { return nil }
+        guard let entry = LastStreamStore.entry(for: meta.libraryId, profileID: ProfileStore.shared.activeID) else { return nil }
+        if meta.type == "series", entry.videoId != meta.videoId { return nil }
+        return entry
+    }
+
+    /// True when this row is the exact source the title/episode last played - drives the row's "Played" mark
+    /// and keeps the user's chosen source visible on return instead of the list looking reset to source 0.
+    /// Matches by infoHash first (a torrent / native-debrid file is unambiguous), then by the parsed quality
+    /// signature (the SAME full release-text value stored as the entry's `qualityText`) so an add-on-resolved
+    /// direct link still lights up. Pure reads; writes nothing.
+    private func isLastPlayed(_ stream: CoreStream) -> Bool {
+        guard let entry = lastPlayedEntry else { return false }
+        if let h = stream.infoHash?.lowercased(), !h.isEmpty,
+           let eh = entry.infoHash?.lowercased(), !eh.isEmpty {
+            return h == eh
+        }
+        guard let q = entry.qualityText, !q.isEmpty else { return false }
+        return StreamRanking.signature(stream) == q
+    }
+
     /// Long-press menu: pin this source for the show/movie or for everything, or unpin. A pin floats its
     /// source to the top of the list + the one-press Watch pick, but failover still hops off it if dead.
     @ViewBuilder private func pinMenu(_ addon: String, _ stream: CoreStream) -> some View {
@@ -2253,7 +2287,7 @@ struct CoreStreamList: View {
     }
 
     private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false,
-                             debridCached: Bool = false) -> some View {
+                             debridCached: Bool = false, lastPlayed: Bool = false) -> some View {
         // Cached when EITHER the native coordinator confirmed this raw torrent's hash OR the add-on's own
         // text advertises it cached (⚡ / [RD+] / "cached" / …). Owner plays pre-resolved debrid-ADDON links,
         // so the hash check finds nothing; the text-marker path is what lights the badge. `signature` is the
@@ -2269,6 +2303,10 @@ struct CoreStreamList: View {
                         Image(systemName: "pin.fill").font(.system(size: 18, weight: .bold))
                             .foregroundStyle(Theme.Palette.accent)
                     }
+                    // #134: the exact source this title/episode last played, so returning to the page shows
+                    // which file the viewer chose instead of the list looking reset to source 0. Accent tint
+                    // (like CACHED) so it reads as a status, plus a checkmark glyph for a scan-at-a-glance mark.
+                    if lastPlayed { badge("✓ PLAYED", accent: true) }
                     badge(addon.uppercased())
                     if stream.isTorrent { badge("TORRENT") }
                     // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
@@ -2301,6 +2339,13 @@ struct CoreStreamList: View {
         }
         .padding(Theme.Space.md)
         .opacity(enabled ? 1 : 0.55)
+        .overlay(
+            // #134: a persistent accent ring on the last-played row so the chosen source stands out while
+            // scanning the list even when unfocused. Matches the row shape (Theme.Radius.card, same as
+            // vortxGlassRow); RowFocusStyle draws its own brighter 3px accent ring on top when focused.
+            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                .strokeBorder(Theme.Palette.accent.opacity(0.55), lineWidth: lastPlayed ? 2 : 0)
+        )
     }
 
     @ViewBuilder private func badge(_ text: String, accent: Bool = false) -> some View {
