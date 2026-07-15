@@ -215,6 +215,15 @@ final class VortXSyncManager: ObservableObject {
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
               let dk = Data(base64Encoded: p.dataKey) else { return }
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
+        // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
+        // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
+        // On Apple TV that first transition can be minutes away (screensaver dismissal), leaving the device
+        // on its un-hydrated default profile meanwhile; macOS scenePhase semantics differ too. Mirror what
+        // adopt() does and open the channel so the restored session pulls immediately. Deferred to a fresh
+        // main-actor hop because restore() runs inside init(): calling startRealtime() (which fires syncDown +
+        // connects the socket) re-entrantly during the shared singleton's own construction is unsafe.
+        // Idempotent: startRealtime() no-ops if already live.
+        Task { @MainActor in self.startRealtime() }
     }
 
     func signOut() {

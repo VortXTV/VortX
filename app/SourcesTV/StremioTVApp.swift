@@ -113,6 +113,13 @@ struct StremioTVApp: App {
                 }
             }
             .onAppear {
+                // Cold-launch pull: on a fresh process the initial scenePhase == .active does NOT fire
+                // .onChange(of: scenePhase), so nothing opens the sync channel on launch. On Apple TV the
+                // first real foreground transition is the screensaver dismissal (minutes away), so a reinstall
+                // would sit on the un-hydrated default "Main" profile until then. Open the channel now so a
+                // Keychain-restored session pulls the account's real profile immediately. Idempotent (guards
+                // isSignedIn + !realtimeActive) and it already performs an immediate syncDown().
+                VortXSyncManager.shared.startRealtime()
                 // Profile housekeeping (the library repair scan + sync probe) is background work;
                 // delay it so it never competes with the engine boot and the node server's
                 // cold start for the first seconds on device.
