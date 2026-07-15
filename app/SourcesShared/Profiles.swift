@@ -1029,10 +1029,11 @@ final class ProfileStore: ObservableObject {
             // shows the real profile immediately instead of serializing its default "Main" back up.
             // Scoped to the owner id AND the exact default signature (name == "Main" AND email == nil), so it
             // can NEVER override a real rename: a "Main" the user kept still carries a bound account email and
-            // fails email == nil, and any profile the user actually renamed fails name == "Main". In both of
-            // those cases preferIncoming still governs the record, unchanged.
+            // fails the empty-email check, and any profile the user actually renamed fails name == "Main". In
+            // both of those cases preferIncoming still governs the record, unchanged. The empty-email check
+            // covers both a wiped (nil) and a blanked ("") email so a reinstalled placeholder is caught either way.
             if local.id == UserProfile.ownerID,
-               local.name == "Main", local.email == nil,
+               local.name == "Main", (local.email ?? "").isEmpty,
                (remote.name != "Main" || !(remote.email ?? "").isEmpty) {
                 return remote
             }
