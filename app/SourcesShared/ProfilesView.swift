@@ -101,6 +101,9 @@ struct ProfilePickerView: View {
                         .onAppear { pickerRowWidth = proxy.size.width }
                         .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
                 })
+                // Belt-and-braces: let an active card's ember glow render past the scroll rectangle instead
+                // of being clipped to bounds (FINDING 8). macOS 14+ (VortXMac target), so no availability gate.
+                .scrollClipDisabled()
                 #else
                 // iOS: the horizontal scroll is the systemic S1b fix so 3+ cards do not clip both phone
                 // edges. S12: use the SAME measured-minWidth centering as macOS so a short row (1-2 profiles)
@@ -157,6 +160,13 @@ struct ProfilePickerView: View {
                                             accentID: theme.accentID)
             }
         }
+        // macOS: reserve vertical headroom so activating a card keeps its ember glow (disc shadow radius 34)
+        // and the CardFocusStyle lift/shadows INSIDE the row's laid-out bounds, instead of overflowing and
+        // being clipped by the enclosing horizontal ScrollView (FINDING 8). Uniform on every card (incl. Add)
+        // so the disc tops stay aligned. tvOS/iOS keep their existing row metrics untouched.
+        #if os(macOS)
+        .padding(.vertical, Theme.Space.xl)
+        #endif
     }
 
     private func pick(_ profile: UserProfile) {
@@ -280,7 +290,14 @@ private struct ProfileCardContent: View {
             .frame(width: 200, height: 200)
             .shadow(color: focused ? accent.opacity(0.55) : .clear, radius: 34, y: 6)
             Text(profile.name)
+                // macOS: keep the name at a CONSTANT size so activating a card cannot reflow the column
+                // taller and get the name/ring clipped by the horizontal ScrollView (FINDING 8). Only the
+                // color changes on focus. tvOS/iOS keep the label->cardTitle step-up for ten-foot focus lift.
+                #if os(macOS)
+                .font(Theme.Typography.cardTitle)
+                #else
                 .font(focused ? Theme.Typography.cardTitle : Theme.Typography.label)
+                #endif
                 .foregroundStyle(focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
                 .lineLimit(1)
         }

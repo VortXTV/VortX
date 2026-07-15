@@ -517,6 +517,15 @@ struct iOSDetailView: View {
         #endif
         // macOS has no toolbar back button (toolbar removed), so supply an in-content Back + Esc / Cmd-[.
         .macBackAffordance()
+        // macOS cast/crew tap routing: the cast rail routes a PersonTarget VALUE (a destination-builder
+        // NavigationLink does not fire from the lazy cast rail on Mac), so register the Person destination
+        // here inside this tab's NavigationStack. iOS keeps the inline destination-builder link, so this is
+        // macOS-only and leaves iOS / tvOS untouched.
+        #if os(macOS)
+        .navigationDestination(for: PersonTarget.self) { t in
+            PersonView(personID: t.id, name: t.name, profileURL: t.profileURL)
+        }
+        #endif
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
         .onAppear {
@@ -836,7 +845,12 @@ struct iOSDetailView: View {
         // legible, without growing the banner (which would push Watch below the fold). `.background` does not
         // affect the VStack's own layout; the opaque banner still owns the crisp focal art up top. macOS-only.
         .background(alignment: .top) {
-            backdrop(height: geo.size.height)
+            // Use the blurred-FILL wash, NOT a second crisp `backdrop`: painting `backdrop` again at full
+            // height re-ran the banner's `.fit` fallback for a series (portrait poster), so the crisp banner
+            // poster and this crisp background poster rendered as TWO offset centered images (the "two images"
+            // report). `backdropWash` always fills + blurs + dims, so a movie reads as one continuous image
+            // and a series reads as a crisp poster over soft blurred art (one image), never two.
+            backdropWash(height: geo.size.height)
                 .ignoresSafeArea()
         }
     }
@@ -1047,6 +1061,41 @@ struct iOSDetailView: View {
                            startPoint: .leading, endPoint: .center)
         )
     }
+
+    #if os(macOS)
+    /// The full-window BACKGROUND wash behind the pinned macOS detail page (the pinned banner only paints the
+    /// top band, so the scroll region beneath needs continuous atmosphere). Unlike the crisp `backdrop` banner,
+    /// this ALWAYS uses `.fill` (never the series `.fit` fallback) plus a blur and a dim, so it reads as soft
+    /// atmosphere rather than a SECOND crisp poster: a movie's crisp fill banner sits over a matching (softly
+    /// blurred) fill wash (continuous, no seam), and a series' `.fit` poster banner sits over a soft blurred
+    /// fill of the same art (poster-on-blur) instead of two competing centered posters. Decoupled from the
+    /// banner's `.fit` switch at `backdrop(height:)` on purpose.
+    private func backdropWash(height: CGFloat) -> some View {
+        let bg = meta?.background ?? meta?.poster
+            ?? seedBackdrop
+            ?? FeaturedHeroItem.metahubBackground(forId: id)
+        return AsyncImage(url: URL(string: bg ?? "")) { phase in
+            switch phase {
+            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)   // ALWAYS fill, never .fit
+            default: Theme.Palette.canvas
+            }
+        }
+        .frame(height: height)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .clipped()
+        .blur(radius: 40)
+        // Dim + fade to canvas so the copy scrolling below the banner stays legible over the soft art.
+        .overlay(Theme.Palette.canvas.opacity(0.5))
+        .overlay(
+            LinearGradient(stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.6),
+                .init(color: Theme.Palette.canvas, location: 1.0),
+            ], startPoint: .top, endPoint: .bottom)
+        )
+        .accessibilityHidden(true)
+    }
+    #endif
 
     /// H3 / #44: the muted, looping in-hero trailer painted over the still backdrop. The owner wants the WHOLE
     /// trailer muted here (not a 10s snippet), through the SAME native /yt path as the explicit Trailer button
@@ -1304,6 +1353,17 @@ struct iOSDetailView: View {
         }
     }
 
+    #if os(macOS)
+    /// macOS-only value target for cast/crew navigation: a destination-builder NavigationLink inside the
+    /// lazy cast rail does not fire on Mac, so the rail routes a `PersonTarget` value that `body` resolves
+    /// via `.navigationDestination`. iOS keeps its inline destination-builder link, so this is macOS-only.
+    struct PersonTarget: Hashable {
+        let id: Int
+        let name: String
+        let profileURL: String?
+    }
+    #endif
+
     /// Horizontally scrollable full-cast rail: photo circle, actor name, character name beneath: ALL
     /// entries, not a 3-name line. LazyHStack so a 60-member ensemble builds on demand.
     @ViewBuilder private var castRail: some View {
@@ -1315,10 +1375,23 @@ struct iOSDetailView: View {
                         // (railCastMembers' synthetic NEGATIVE id) has no TMDB person to look up, so it stays
                         // a plain non-tappable tile exactly as before.
                         if member.id > 0 {
+                            #if os(macOS)
+                            // macOS: a destination-builder NavigationLink inside this lazy horizontal stack
+                            // does not reliably activate (the lazy container defers / loses the destination
+                            // builder — the same #25 fragility documented at iOSRootView). Route by VALUE
+                            // instead (registered via `.navigationDestination` in `body`), which fires
+                            // reliably from a LazyHStack on Mac, and give the whole 92pt tile a hit shape so
+                            // the gaps between headshots are clickable too, not just opaque photo pixels.
+                            NavigationLink(value: PersonTarget(id: member.id, name: member.name, profileURL: member.profileURL)) {
+                                castMemberTile(member).contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            #else
                             NavigationLink {
                                 PersonView(personID: member.id, name: member.name, profileURL: member.profileURL)
                             } label: { castMemberTile(member) }
                             .buttonStyle(.plain)
+                            #endif
                         } else {
                             castMemberTile(member)
                         }
@@ -3076,39 +3149,38 @@ struct iOSEpisodeStreams: View {
         // Hard-cap the column to the viewport width (see iOSDetailView.body) so the episode hero's wide
         // single-line metaRow can't stretch the ZStack past the screen and clip the title/synopsis off the left.
         GeometryReader { geo in
+        #if os(macOS)
+        // macOS pinned-episode model (mirrors `iOSDetailView.macDetailBody`, FINDING 3): the episode banner
+        // is a FIXED near-fullscreen top layer and only the overview + source list scroll in an inner
+        // ScrollView, over a continuous blurred backdrop wash. Replaces the old fixed 460 strip + large dead
+        // canvas below (the "tiny hero, blank page" report), so the episode page matches the movie/show page.
+        VStack(spacing: 0) {
+            macEpisodeBanner(width: geo.size.width, height: episodeBandHeight(viewport: geo.size.height))
+            ScrollView {
+                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    episodeOverviewText
+                    sourceListView(width: geo.size.width)
+                }
+                .padding(.bottom, Theme.Space.xl)
+                .frame(width: geo.size.width, alignment: .leading)
+            }
+        }
+        // Continuous cinematic wash behind the whole page (blurred FILL, so it never becomes a second crisp
+        // image); the pinned banner owns the crisp focal art up top.
+        .background(alignment: .top) {
+            backdropWash(height: geo.size.height)
+                .ignoresSafeArea()
+        }
+        #else
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width)
-                // While the episode's player/trailer cover is up, skip the rankedGroups pass (pass [] +
-                // isSuspended) so this hidden episode list stops re-rendering behind the video. Restores on close.
-                iOSSourceList(
-                    groups: presentation != nil ? [] : rankedEpisode(),
-                    progress: core.streamLoadProgress(forStreamId: video.id),
-                    states: core.streamAddonStates(forStreamId: video.id),
-                    settleTimedOut: settleTimedOut,
-                    continuity: rememberedQuality,
-                    pinContext: pinContext,
-                    cachedHashes: debridCache.cachedHashes,
-                    cachedUsenetURLs: debridCache.cachedUsenetURLs,
-                    play: { stream, url in Task { await play(stream, url: url) } },
-                    playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
-                    playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
-                    bestStream: sourceList.best,
-                    resolutionTiers: sourceList.tiers,
-                    download: episodeDownloadHandler,
-                    isSuspended: presentation != nil
-                )
-                // Equatable gate: unrelated episode re-renders skip re-diffing the ranked list (the
-                // groups compare is a buffer-identity fast path until the model republishes).
-                .equatable()
-                .padding(.horizontal, Theme.Space.md)
-                // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
-                .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
-                .frame(maxWidth: .infinity)
+                sourceListView(width: geo.size.width)
             }
             .padding(.bottom, Theme.Space.xl)
             .frame(width: geo.size.width, alignment: .leading)
         }
+        #endif
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         // iOS-only: a macOS navigationTitle on this pushed episode-streams view crashes the shared NSToolbar.
@@ -3229,14 +3301,120 @@ struct iOSEpisodeStreams: View {
         .frame(width: width, alignment: .leading)
     }
 
-    private var backdrop: some View {
+    /// The episode source list (extracted so the iOS single-scroll body and the macOS pinned body render the
+    /// EXACT same list). While the episode's player / trailer cover is up, skip the rankedGroups pass (pass []
+    /// + isSuspended) so this hidden episode list stops re-rendering behind the video; it restores on close.
+    private func sourceListView(width: CGFloat) -> some View {
+        iOSSourceList(
+            groups: presentation != nil ? [] : rankedEpisode(),
+            progress: core.streamLoadProgress(forStreamId: video.id),
+            states: core.streamAddonStates(forStreamId: video.id),
+            settleTimedOut: settleTimedOut,
+            continuity: rememberedQuality,
+            pinContext: pinContext,
+            cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs,
+            play: { stream, url in Task { await play(stream, url: url) } },
+            playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
+            playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
+            bestStream: sourceList.best,
+            resolutionTiers: sourceList.tiers,
+            download: episodeDownloadHandler,
+            isSuspended: presentation != nil
+        )
+        // Equatable gate: unrelated episode re-renders skip re-diffing the ranked list (the
+        // groups compare is a buffer-identity fast path until the model republishes).
+        .equatable()
+        .padding(.horizontal, Theme.Space.md)
+        // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
+        .frame(maxWidth: width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
+        .frame(maxWidth: .infinity)
+    }
+
+    #if os(macOS)
+    /// The pinned episode banner for the macOS pinned model: the crisp backdrop art (bleeding under the top
+    /// chrome) with the show eyebrow + episode title + meta overlaid at the bottom, sized to a near-fullscreen
+    /// band. Mirrors `iOSDetailView.heroBanner`; the episode's own `.macBackAffordance()` supplies Back.
+    private func macEpisodeBanner(width: CGFloat, height: CGFloat) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            backdrop(height: height)
+                .ignoresSafeArea(edges: .top)
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Text(meta.name.uppercased())
+                    .font(Theme.Typography.eyebrow).tracking(1.5)
+                    .foregroundStyle(Theme.Palette.accent)
+                Text(video.episodeTitle)
+                    .font(Theme.Typography.hero).tracking(-1)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(3).minimumScaleFactor(0.6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                metaRow
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.bottom, Theme.Space.lg)
+            .frame(width: width, alignment: .leading)
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    /// The episode overview, rendered in the macOS inner scroll region (the iOS path keeps it inside `hero`).
+    @ViewBuilder private var episodeOverviewText: some View {
+        if let overview = video.overview, !overview.isEmpty {
+            Text(overview)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+                .padding(.horizontal, Theme.Space.md)
+        }
+    }
+
+    /// Near-fullscreen episode band height (ports `iOSDetailView.heroBandHeight`'s macOS formula): ~72% of a
+    /// tall window, always reserving ~320pt of inner-scroll room, floored at 280 and capped at 1000.
+    private func episodeBandHeight(viewport: CGFloat) -> CGFloat {
+        guard viewport > 0 else { return 620 }
+        let reservedForContent: CGFloat = 320
+        let band = min(1000, min(viewport * 0.72, viewport - reservedForContent))
+        return max(280, band)
+    }
+
+    /// The full-window BACKGROUND wash behind the pinned episode page: ALWAYS blurred `.fill` + dim, so the
+    /// new full-window paint reads as soft atmosphere and never becomes a second crisp image beside the banner.
+    private func backdropWash(height: CGFloat) -> some View {
+        AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
+            switch phase {
+            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
+            default: Theme.Palette.canvas
+            }
+        }
+        .frame(height: height)
+        .frame(maxWidth: .infinity, alignment: .top)
+        .clipped()
+        .blur(radius: 40)
+        .overlay(Theme.Palette.canvas.opacity(0.5))
+        .overlay(
+            LinearGradient(stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.6),
+                .init(color: Theme.Palette.canvas, location: 1.0),
+            ], startPoint: .top, endPoint: .bottom)
+        )
+        .accessibilityHidden(true)
+    }
+    #endif
+
+    private var backdrop: some View { backdrop(height: backdropHeight) }
+
+    private func backdrop(height: CGFloat) -> some View {
         AsyncImage(url: URL(string: video.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
             switch phase {
             case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
             default: Theme.Palette.surface1
             }
         }
-        .frame(height: backdropHeight)
+        .frame(height: height)
         // Width anchor for the episode hero ZStack — full viewport width, pinned leading (see iOSDetailView.backdrop).
         .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
