@@ -99,6 +99,11 @@ struct iOSRootView: View {
     @State private var macQuery = ""
     /// Focus for the top-bar search field so ⌘F (menu "Go ▸ Search") lands the cursor in it.
     @FocusState private var macSearchFocused: Bool
+    /// Measured height of the floated top chrome (search strip + nav pill). The content ZStack reserves
+    /// exactly this via a top `.safeAreaInset` so Forms / Lists start below the chrome while a full-bleed
+    /// hero passes under it. Seeded with a close estimate so the first frame is right before measurement
+    /// lands; `MacTopChromeHeightKey` republishes the real value.
+    @State private var macTopChromeHeight: CGFloat = 64
     #endif
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
@@ -175,17 +180,12 @@ struct iOSRootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            #if os(macOS)
-            // Persistent brand + search strip across the whole window (in-content SwiftUI, NEVER a
-            // toolbar/NSToolbar, which is the Beta 7 crash class). Fills the black full-size-content
-            // band under the hidden titlebar: search right, with a leading inset clearing the floating
-            // traffic lights. The wordmark now lives on `macNavPill` below (glass-Browse Mac nav move),
-            // so it is dropped here to avoid a duplicate brand mark.
-            macTopBar
-            #endif
-            // Selected screen fills the space above the bar. Screens mount LAZILY on first visit (#24)
-            // and then stay in this ZStack so each screen's own state (scroll position, search query,
-            // engine subscriptions) survives a tab switch instead of being torn down and rebuilt.
+            // Selected screen fills the whole window. Screens mount LAZILY on first visit (#24) and then
+            // stay in this ZStack so each screen's own state (scroll position, search query, engine
+            // subscriptions) survives a tab switch instead of being torn down and rebuilt. On macOS the
+            // search strip + nav pill now FLOAT over this region (`macTopNavOverlay`) instead of an opaque
+            // in-flow strip, so the Home / Library / Discover hero art bleeds to the window top behind the
+            // chrome (no black canvas band); scroll screens reserve the chrome band below via the inset.
             ZStack {
                 // `isActive` gates each browse screen's `.principal` wordmark: on macOS a principal
                 // toolbar item is hoisted into the shared window titlebar, and every mounted
@@ -204,15 +204,26 @@ struct iOSRootView: View {
                 if isMounted(.settings) { iOSSettingsView().opacity(tab == .settings ? 1 : 0) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // MAC NAV MOVE (CEO greenlit, glass-Browse): macOS drives navigation from a top-center
-            // floating glass pill (`macTopNavOverlay`, floated over the content area below `macTopBar`
-            // so it never overlaps the search strip) instead of the bottom bar. iOS/iPadOS keep the
-            // unchanged bottom tab bar (`bottomTabBarRow`, its own row below the content, a no-op on
-            // macOS). Both helpers gate on the same `#if os(macOS)` idiom the rest of this file already
-            // uses for Mac-only chrome, kept inside @ViewBuilder vars so the conditional never has to
-            // split a chained-modifier expression (which SwiftUI's ViewBuilder cannot parse across an
-            // `#if`/`#else`).
+            #if os(macOS)
+            // Reserve the floated top-chrome band (search strip + nav pill, measured via
+            // `MacTopChromeHeightKey`) so Forms / Lists (Settings, Add-ons, Library, Discover) start BELOW
+            // the chrome instead of under it (the pill-covered-Settings report). Applied BEFORE the overlay
+            // so the chrome still draws over the reserved strip. A full-bleed hero calls
+            // `.ignoresSafeArea(.container, .top)` (FeaturedHeroView) so it passes UNDER this strip to the
+            // window top; only respecting-safe-area scroll screens actually inset.
+            .safeAreaInset(edge: .top, spacing: 0) { Color.clear.frame(height: macTopChromeHeight) }
+            #endif
+            // MAC NAV MOVE (CEO greenlit, glass-Browse): macOS drives navigation + search from the floated
+            // top chrome (`macTopNavOverlay`: the search strip with the top-center nav pill beneath it)
+            // instead of the bottom bar. iOS/iPadOS keep the unchanged bottom tab bar (`bottomTabBarRow`,
+            // a no-op on macOS). Both helpers gate on the same `#if os(macOS)` idiom, kept inside
+            // @ViewBuilder vars so the conditional never splits a chained-modifier expression (which
+            // SwiftUI's ViewBuilder cannot parse across an `#if`/`#else`).
             .overlay(alignment: .top) { macTopNavOverlay }
+            #if os(macOS)
+            // Feed the measured chrome height back into the reserve above (drift-proof vs a magic number).
+            .onPreferenceChange(MacTopChromeHeightKey.self) { macTopChromeHeight = $0 }
+            #endif
 
             bottomTabBarRow
         }
@@ -365,8 +376,8 @@ struct iOSRootView: View {
                 }
             }
             .padding(.horizontal, Theme.Space.sm)
-            .padding(.vertical, 5)
-            .frame(maxWidth: 340)
+            .padding(.vertical, 4)
+            .frame(maxWidth: 300)
             // Glass search field (redesign Phase A): the warm liquid-glass material replaces the flat
             // surface1 capsule so the top-bar search affordance matches the Mac home mockup. The field's
             // text, focus, submit, and clear-button behavior are unchanged; appearance only.
@@ -376,14 +387,21 @@ struct iOSRootView: View {
         // MacWindowChrome over the hidden titlebar.
         .padding(.leading, 84)
         .padding(.trailing, Theme.Space.md)
-        .frame(height: 52)
+        // Compact strip height so the search field reads light at the very top-right. The nav pill now
+        // OVERLAPS this strip in the SAME top band (see `macTopNavOverlay`'s top-aligned ZStack), so this
+        // height only positions the search field near the very top; it no longer stacks a second line below.
+        .frame(height: 32)
         .frame(maxWidth: .infinity)
         .background {
-            Theme.Palette.canvas
-                .overlay(alignment: .bottom) {
-                    Rectangle().fill(Theme.Palette.hairline).frame(height: 0.5)
-                }
+            // The strip now FLOATS over the hero art (not an opaque canvas band that pushed the hero down),
+            // so it is transparent except for a soft top-edge scrim that keeps the traffic lights + search
+            // field legible over bright artwork; the hero's own top gradient does most of the darkening.
+            // Over a scroll screen (Settings, Add-ons) the reserved inset shows canvas behind, so the scrim
+            // is invisible there. Bleeds under the hidden-titlebar region so the scrim covers the whole strip.
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.55), .clear],
+                           startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
         }
     }
 
@@ -445,12 +463,28 @@ struct iOSRootView: View {
     }
     #endif
 
-    /// The macOS top-center floating pill, inset below `macTopBar`; `EmptyView` everywhere else. A
+    /// The floated macOS top chrome: the search strip (`macTopBar`) and the top-center nav pill
+    /// (`macNavPill`) OVERLAID top-aligned in ONE band (a ZStack, not stacked lines), so the centered pill
+    /// rises to sit nearly level with the search bar on the right rather than a full line beneath it (CEO
+    /// ask: search + nav read as almost the same horizontal line, the whole cluster hugging the very top).
+    /// Pill centered, search right, so on a normal-width window they do not collide. Floats OVER the content
+    /// so the Home / Library / Discover hero art bleeds to the window top behind it (no opaque canvas band).
+    /// `EmptyView` everywhere else. A
     /// `@ViewBuilder` var (not an inline `#if` inside a modifier chain) so `body` can unconditionally
-    /// `.overlay` it without SwiftUI's ViewBuilder choking on an `#if`/`#else` split mid-chain.
+    /// `.overlay` it without SwiftUI's ViewBuilder choking on an `#if`/`#else` split mid-chain. Its
+    /// measured height is published via `MacTopChromeHeightKey` so `body` can reserve exactly this band
+    /// (a top `.safeAreaInset`) for the scroll screens that must start below the chrome.
     @ViewBuilder private var macTopNavOverlay: some View {
         #if os(macOS)
-        macNavPill.padding(.top, Theme.Space.md)
+        ZStack(alignment: .top) {
+            macTopBar
+            macNavPill
+        }
+        .background {
+            GeometryReader { g in
+                Color.clear.preference(key: MacTopChromeHeightKey.self, value: g.size.height)
+            }
+        }
         #else
         EmptyView()
         #endif
@@ -679,6 +713,32 @@ struct iOSRootView: View {
             .macFocusRing(tabFocus == .tab(item.rawValue), cornerRadius: Theme.Radius.control)
         #else
         return base
+        #endif
+    }
+}
+
+#if os(macOS)
+/// Publishes the measured height of the floated macOS top chrome (search strip + nav pill) up to
+/// `iOSRootView.body`, which reserves exactly this band via a top `.safeAreaInset` so Forms / Lists start
+/// below the chrome while a full-bleed hero passes under it. `max` reduce so the largest reported band wins
+/// (there is a single source, so this is just a safe default).
+private struct MacTopChromeHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 64
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+#endif
+
+private extension View {
+    /// macOS: reclaim the top container safe area (the window titlebar / traffic-light band) so a
+    /// full-bleed root view reaches the physical window top (y=0) instead of starting below the ~20pt
+    /// titlebar strip. Applied to the Home NavigationStack so the billboard hero matches the Detail hero's
+    /// edge-to-edge top (a scroll view nested inside the stack cannot reclaim past the stack's own frame,
+    /// so the ignore has to sit on the stack). No-op on iOS / iPad (no titlebar strip; they already bleed).
+    @ViewBuilder func macBleedUnderTitlebar() -> some View {
+        #if os(macOS)
+        ignoresSafeArea(.container, edges: .top)
+        #else
+        self
         #endif
     }
 }
@@ -999,6 +1059,17 @@ struct iOSHomeView: View {
             // and again when the rails first hydrate (boardRows / CW arrive async after onAppear).
             .onAppear { seedMacFocusIfNeeded() }
             .onChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
+            // Home black-band fix: let the Home ScrollView bleed UNDER the floated top chrome so the
+            // billboard art reaches the very window top (search strip + nav pill float as glass over it),
+            // instead of starting below the shell's reserved chrome band as a bare near-black strip (the
+            // CEO's "big fat black bar"). The hero's own `.ignoresSafeArea(.container, .top)` cannot reclaim
+            // the shell's top `.safeAreaInset` from INSIDE a scroll view (the ScrollView consumes it into a
+            // content inset), so the ScrollView ITSELF must ignore that top region, the same way the Detail
+            // hero (a fixed banner) already reaches the top. Scoped to the Home ROOT only: the pushed detail
+            // page keeps the shell inset (its pinned banner bleeds on its own), and the list-first /
+            // conditional-hero screens (Settings, Add-ons, Library, Discover) keep the inset so their top
+            // content still starts below the pill. macOS-only; iOS/iPad already bleed with no shell inset.
+            .ignoresSafeArea(.container, edges: .top)
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
@@ -1026,6 +1097,11 @@ struct iOSHomeView: View {
             }
             .iOSPlayerCover($player, account: account, core: core)
         }
+        // Home black-band follow-up: reclaim the last ~20pt window-titlebar strip so the billboard art
+        // reaches y=0 like the Detail hero. The ScrollView-level ignore above reclaims the shell's floated
+        // chrome band, but the NavigationStack still respects the window titlebar safe area, which a scroll
+        // view inside it cannot punch through, so the stack itself ignores that top region. macOS-only.
+        .macBleedUnderTitlebar()
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
         .popToRootOnBump(TabScrollKeys.home, path: $path)
