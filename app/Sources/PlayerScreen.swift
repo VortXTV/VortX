@@ -672,7 +672,7 @@ struct PlayerScreen: View {
                                 .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
                                 // Escape-hatch close on the shared VortX glass disc, matching the transport
                                 // discs and upgrading to Liquid Glass on OS 26. Background only; action unchanged.
-                                .padding(12).vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+                                .padding(12).vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
@@ -2594,7 +2594,7 @@ struct PlayerScreen: View {
                     // Glass transport disc (mockup .big): warm VortX glass, Liquid Glass on OS 26. The inner
                     // 84pt disc is purely visual; the outer 100pt frame keeps the original tap target.
                     .frame(width: 84, height: 84)
-                    .vortxGlass(in: Circle(), fillAlpha: VortXGlass.barFillAlpha, shadow: .disc)
+                    .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
                     .frame(width: 100, height: 100)
             }
             .accessibilityLabel(isPaused ? "Play" : "Pause")
@@ -2637,7 +2637,7 @@ struct PlayerScreen: View {
                 // Glass transport disc (mockup .skip): inner 54pt visual disc, outer 60pt frame keeps the
                 // original tap target. Warm VortX glass, upgrades to Liquid Glass on OS 26.
                 .frame(width: 54, height: 54)
-                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
                 .frame(width: 60, height: 60)
         }
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
@@ -3198,7 +3198,7 @@ struct PlayerScreen: View {
                 .foregroundStyle(.white).padding(11)
                 // Floating top-bar disc (mockup .disc): the shared VortX glass so it reads like the nav
                 // chrome and upgrades to Apple Liquid Glass on OS 26. Background only, hit shape unchanged.
-                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
@@ -4445,7 +4445,7 @@ struct AirPlayRoutePickerButton: View {
             .frame(width: 44, height: 44)
             // AirPlay disc on the shared VortX glass, matching the sibling transport discs and upgrading to
             // Liquid Glass on OS 26. Background only; the AVRoutePickerView behavior is unchanged.
-            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
             .accessibilityLabel("AirPlay")
     }
 }
