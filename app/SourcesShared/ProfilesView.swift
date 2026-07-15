@@ -118,15 +118,10 @@ struct ProfilePickerView: View {
                 #endif
             }
             .padding(Theme.Space.screenInset)
-            // macOS sheet sizing: without a concrete width the sheet adopts the horizontal ScrollView's
-            // tiny ideal width and clipped the avatars. Open wide enough for ~3 cards (230pt each + xl gaps),
-            // capped so a big display never blows the sheet up; the ScrollView carries any overflow.
-            // idealWidth stays UNDER the app's 900pt minimum window width (StremioXiOSApp.swift:176) because
-            // AppKit does not clamp a sheet to its parent window: a 940pt ideal overhung both edges of a
-            // minimum-width window. 860 still fits 3 cards (690pt) plus gaps and insets.
-            #if os(macOS)
-            .frame(minWidth: 760, idealWidth: 860, maxWidth: 1100, minHeight: 520, idealHeight: 600)
-            #endif
+            // macOS no longer presents this as a content-sized `.sheet` (which clipped the trailing Add
+            // Profile card at the window's right edge): it is hosted WINDOW-FILLING at the scene root by
+            // MacRootProfileCoverOverlay, so the canvas + measured-minWidth centering below fill the whole
+            // window and the horizontal ScrollView carries any overflow. No explicit frame needed.
             // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
             // remote, focus will not enter an overlay while anything beneath stays focusable).
             .disabled(pinTarget != nil)

@@ -168,6 +168,12 @@ struct StremioXiOSApp: App {
                 // MacRootPlayerOverlay / MacPlayerHost in PlatformModifiers.
                 #if os(macOS)
                 .modifier(MacRootPlayerOverlay())
+                // Sibling of the player overlay (same reason it sits INSIDE the environmentObjects below:
+                // the hoisted "Who's watching?" picker reads ProfileStore / StremioAccount / CoreBridge /
+                // ThemeManager). Renders the picker WINDOW-FILLING at the scene root without hiding the
+                // window chrome, so the trailing Add Profile circle is never clipped by a content-sized
+                // sheet. See MacRootProfileCoverOverlay / MacProfileCoverHost in PlatformModifiers.
+                .modifier(MacRootProfileCoverOverlay())
                 #endif
                 // Brand launch splash on top of everything (incl. the macOS player overlay) until its
                 // animation finishes — the iPhone/iPad/Mac twin of the tvOS RootTabView splash.
@@ -357,6 +363,12 @@ private struct MacWindowChrome: NSViewRepresentable {
 
         private static func apply(to window: NSWindow?) {
             guard let window else { return }
+            // While the full-window player is up (MacPlayerHost holds its view), do NOT resurrect the
+            // titlebar chain. The player cover runs chrome-free on purpose; re-forcing the titlebar here
+            // painted a persistent grey title strip (with a dead back affordance + the show title) over the
+            // video in fullscreen. Skip until the player is dismissed, at which point the didUpdate observer
+            // + the delayed re-applies restore normal window chrome. No effect when no player is up.
+            if MacPlayerHost.shared.content != nil { return }
             // Cheap early-exit so the didUpdate observer costs nothing once the chrome is right.
             if let close = window.standardWindowButton(.closeButton),
                !close.isHidden, close.alphaValue >= 1,

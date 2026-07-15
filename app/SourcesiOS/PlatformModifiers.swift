@@ -65,6 +65,22 @@ extension View {
         self.background(MacPlayerCoverBridge(item: item, content: content))
         #endif
     }
+
+    /// Like `platformFullScreenCover(isPresented:)`, but on macOS the content is hosted WINDOW-FILLING at
+    /// the scene root (via MacProfileCoverHost / MacRootProfileCoverOverlay) instead of collapsing to a
+    /// content-sized `.sheet`. Used for the launch "Who's watching?" picker so its card row (incl. the
+    /// trailing Add Profile circle) is never clipped by a sheet's intrinsic width. UNLIKE the player cover
+    /// this host does NOT hide the window chrome, so the macOS traffic lights stay live over the picker, and
+    /// it uses a SEPARATE host so it never collides with a full-window player. On iOS / iPadOS this is a
+    /// plain `.fullScreenCover`.
+    @ViewBuilder func platformFullScreenRootCover<C: View>(
+        isPresented: Binding<Bool>, @ViewBuilder content: @escaping () -> C) -> some View {
+        #if os(iOS)
+        self.fullScreenCover(isPresented: isPresented, content: content)
+        #else
+        self.background(MacProfileCoverBridge(isPresented: isPresented, content: content))
+        #endif
+    }
 }
 
 #if os(macOS)
@@ -197,6 +213,72 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var savedTitleVisibility: NSWindow.TitleVisibility = .visible
         var savedTitlebarTransparent = false
         var savedToolbarVisible: Bool?
+    }
+}
+
+/// Holds the macOS "Who's watching?" picker to present WINDOW-FILLING at the app window's ROOT, the same
+/// hoist trick MacPlayerHost uses for the player. A DEDICATED singleton (not MacPlayerHost) so the picker
+/// and a full-window player can never clobber one another's hosted view, and so the picker path never runs
+/// the player's chrome-hider — the traffic lights stay live over the picker.
+final class MacProfileCoverHost: ObservableObject {
+    static let shared = MacProfileCoverHost()
+    @Published var content: AnyView?
+    /// Identity of the bridge currently presenting, so a stale bridge tearing down clears only its own view.
+    private var ownerID: UUID?
+    private init() {}
+
+    func present(_ view: AnyView, owner: UUID) {
+        ownerID = owner
+        content = view
+    }
+
+    func dismiss(owner: UUID) {
+        guard ownerID == owner else { return }
+        ownerID = nil
+        content = nil
+    }
+}
+
+/// Mirrors the picker cover's `isPresented` into MacProfileCoverHost: true -> snapshot the picker into the
+/// host; false (or leaving the view tree) -> clear it. A clear background, like MacPlayerCoverBridge, so it
+/// lives in the call site's view tree without drawing anything itself.
+private struct MacProfileCoverBridge<C: View>: View {
+    @Binding var isPresented: Bool
+    @ViewBuilder let content: () -> C
+    /// Stable per-instance identity (persisted across re-renders by @State) so a torn-down bridge clears
+    /// only its own hosted view — see MacProfileCoverHost.ownerID.
+    @State private var ownerID = UUID()
+    var body: some View {
+        Color.clear
+            .onChange(of: isPresented) { _, _ in sync() }
+            .onAppear { if isPresented { sync() } }
+            .onDisappear { MacProfileCoverHost.shared.dismiss(owner: ownerID) }
+    }
+    private func sync() {
+        if isPresented {
+            MacProfileCoverHost.shared.present(AnyView(content()), owner: ownerID)
+        } else {
+            MacProfileCoverHost.shared.dismiss(owner: ownerID)
+        }
+    }
+}
+
+/// Applied ONCE at the WindowGroup scene root (macOS only), a sibling of MacRootPlayerOverlay: renders the
+/// active MacProfileCoverHost picker full-window over the dimmed + disabled app. UNLIKE the player overlay
+/// it does NOT hide the window titlebar / traffic lights (no MacPlayerChromeHider), so the picker reads as a
+/// normal window that just happens to fill with the "Who's watching?" surface. The picker's own PIN gate
+/// and profile-editor / sign-in sheets present ABOVE this, as they attach to the window.
+struct MacRootProfileCoverOverlay: ViewModifier {
+    @ObservedObject private var host = MacProfileCoverHost.shared
+    func body(content: Content) -> some View {
+        ZStack {
+            content
+                .opacity(host.content == nil ? 1 : 0)
+                .disabled(host.content != nil)
+            if let picker = host.content {
+                picker.ignoresSafeArea(.all)
+            }
+        }
     }
 }
 #endif
