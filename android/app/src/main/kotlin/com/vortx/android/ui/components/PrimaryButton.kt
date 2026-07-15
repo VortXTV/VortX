@@ -25,6 +25,7 @@ import androidx.compose.foundation.clickable
 import com.vortx.android.ui.theme.VortXMotion
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlassProminent
 import com.vortx.android.ui.theme.vortxShadow
 
 /// The ONE gold CTA (DESIGN-SYSTEM.md §3 "Primary button"): accent fill, on-accent text, control
@@ -56,9 +57,16 @@ fun PrimaryButton(
     Row(
         modifier = modifier
             .scale(scale)
-            .clip(VortXShapes.control)
+            // Active = ember glass (prominent), keeping the accent glow it always cast; disabled/loading stay
+            // the flat muted surface2 slab (a stood-down state is not glass), per spec.
             .then(if (active) Modifier.vortxShadow(VortXTheme.elevation.glow(colors.accent, alpha = 0.30f), VortXShapes.control) else Modifier)
-            .background(fill, VortXShapes.control)
+            .then(
+                if (active) {
+                    Modifier.vortxGlassProminent(shape = VortXShapes.control, tint = colors.accent)
+                } else {
+                    Modifier.clip(VortXShapes.control).background(fill, VortXShapes.control)
+                },
+            )
             .clickable(
                 enabled = enabled && !loading,
                 interactionSource = interactionSource,

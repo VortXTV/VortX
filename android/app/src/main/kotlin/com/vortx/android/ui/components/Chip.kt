@@ -2,7 +2,6 @@ package com.vortx.android.ui.components
 
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -19,7 +18,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -30,6 +28,7 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXMotion
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlassChip
 
 /// The single secondary control for the whole app (DESIGN-SYSTEM.md §3 "Chip"): Quality, Sources,
 /// Trailer, Save, Share, season, filters, type switch, nav links all render through this ONE
@@ -63,10 +62,6 @@ fun Chip(
         animationSpec = VortXMotion.stateAware(reduced),
         label = "chipScale",
     )
-    val fill = when {
-        selected -> accent.copy(alpha = 0.18f)
-        else -> colors.surface2
-    }
     val textColor = when {
         selected -> accentText
         !enabled -> colors.textTertiary
@@ -76,8 +71,10 @@ fun Chip(
     Row(
         modifier = modifier
             .scale(scale)
-            .clip(VortXShapes.chip)
-            .background(fill, VortXShapes.chip)
+            // Glass chip base: idle = warm glass pill, selected = glass pill + ember tint. The 1px accent
+            // ring below stays as the selected affordance (part of the VortX selection language), riding on
+            // top of the glass.
+            .vortxGlassChip(selected = selected, tint = accent)
             .then(
                 if (selected) Modifier.border(BorderStroke(1.dp, accent), VortXShapes.chip) else Modifier,
             )

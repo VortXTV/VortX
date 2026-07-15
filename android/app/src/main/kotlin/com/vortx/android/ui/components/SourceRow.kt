@@ -1,6 +1,5 @@
 package com.vortx.android.ui.components
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,13 +11,11 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXIcons
-import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
-import com.vortx.android.ui.theme.vortxShadow
+import com.vortx.android.ui.theme.vortxGlassRow
 
 /// One ranked source (DESIGN-SYSTEM.md §3 "Source row"): a surface-card row, leading play/download
 /// icon, a prominent [quality] badge (4K/1080p) + [addon] badge + a TORRENT badge when [isTorrent],
@@ -40,9 +37,7 @@ fun SourceRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .vortxShadow(VortXTheme.elevation.rest, VortXShapes.card)
-            .clip(VortXShapes.card)
-            .background(colors.surface1, VortXShapes.card)
+            .vortxGlassRow()
             .clickable(enabled = enabled, onClick = onClick)
             .padding(VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),

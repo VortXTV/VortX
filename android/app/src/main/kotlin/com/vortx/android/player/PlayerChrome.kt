@@ -45,6 +45,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.model.Playable
+import com.vortx.android.ui.theme.VortXGlass
+import com.vortx.android.ui.theme.vortxGlass
+import com.vortx.android.ui.theme.vortxGlassPanel
+import com.vortx.android.ui.theme.vortxGlassProminent
 
 /// The VortX-specific chrome layered over whichever [PlayerEngine] is live. It is fully engine-agnostic:
 /// it renders the [PlayerState] snapshot and calls back through the transport + track lambdas, never
@@ -200,7 +204,9 @@ private fun ControlSelectionSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color(0xFF11110F))
+                // The selection sheet is a VortX glass panel (was a flat near-black fill): high-alpha warm
+                // glass so track labels stay legible over bright video. Top-rounded, flush to the bottom.
+                .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -261,9 +267,9 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 15.sp,
+                    // Primary recovery action as ember glass (was a solid accent slab).
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(emberAccent)
+                        .vortxGlassProminent(shape = RoundedCornerShape(8.dp), tint = emberAccent)
                         .clickable(onClick = onRetry)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -271,9 +277,13 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     text = "Back",
                     color = Color.White,
                     fontSize = 15.sp,
+                    // Secondary action as neutral VortX glass (was a flat white 12% fill).
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color.White.copy(alpha = 0.12f))
+                        .vortxGlass(
+                            shape = RoundedCornerShape(8.dp),
+                            fillAlpha = VortXGlass.fieldFillAlpha,
+                            shadow = VortXGlass.Shadow.flat,
+                        )
                         .clickable(onClick = onBack)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -395,9 +405,10 @@ private fun ChromeBadge(text: String, accent: Color) {
         color = Color.White,
         fontSize = 10.sp,
         fontWeight = FontWeight.Bold,
+        // The SOURCE / DOLBY VISION / speed badges as ember glass (was a near-opaque accent fill): the
+        // prominent glass keeps the ember color but reads as tinted glass over the video frame.
         modifier = Modifier
-            .clip(RoundedCornerShape(4.dp))
-            .background(accent.copy(alpha = 0.85f))
+            .vortxGlassProminent(shape = RoundedCornerShape(6.dp), tint = accent)
             .padding(horizontal = 8.dp, vertical = 3.dp),
     )
 }
