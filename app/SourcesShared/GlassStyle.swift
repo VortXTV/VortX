@@ -58,10 +58,17 @@ enum VortXGlass {
     static let badgeFillAlpha = 0.72
     /// Text-entry field glass: tuned higher than a pill so typed text keeps contrast over the blur.
     static let fieldFillAlpha = 0.62
-    /// The accent tint alpha for the PROMINENT (primary-action) glass: near-opaque so the surface reads as
-    /// ember and the existing onAccent-vs-accent AA contrast is preserved, while the glass blur (and OS-26
-    /// Liquid Glass) still bend light at the edges for the glass look.
-    static let prominentTintAlpha = 0.94
+    /// Player transport / top-bar discs (play-pause, seek, top-row icon buttons) that float over BRIGHT,
+    /// moving video: heavier than a bar or pill so the white glyph reads crisp against a hot backdrop,
+    /// while the blur (and OS-26 Liquid Glass) still bends light at the disc edge so it stays glass, not a
+    /// solid puck. A touch above `fieldFillAlpha` since a disc sits over live video, not just a blur.
+    static let discFillAlpha = 0.66
+    /// The accent tint alpha for the PROMINENT (primary-action) glass: kept in the GLASS range (not near
+    /// opaque) so the button reads as tinted ember GLASS, with the heavier `.thinMaterial` frost showing
+    /// through for the "more glass than chrome" look, while the onAccent label still clears AA over the
+    /// tinted fill. Under Reduce Transparency the modifier forces this to a full 1.0 opaque accent instead,
+    /// so the accessibility path stays a solid, maximally legible ember CTA.
+    static let prominentTintAlpha = 0.66
     /// The selected-chip ember tint alpha. Set a touch above the old direct `accent.opacity(0.18)` chip
     /// fill because the tint now sits OVER the 50% warm glass fill (which slightly mutes it), so the
     /// selected-unfocused chip reads at least as strongly as before.
@@ -101,7 +108,9 @@ enum VortXGlass {
         var x: CGFloat = 0
         static let bar = Shadow(color: .black.opacity(0.50), radius: 22, y: 14)   // floating tab bar / nav pill
         static let pill = Shadow(color: .black.opacity(0.45), radius: 16, y: 8)   // smaller floating pill / field
-        static let disc = Shadow(color: .black.opacity(0.35), radius: 12, y: 6)   // round icon button
+        // Tight, close shadow: a 12pt blur on a ~44pt disc smears a dark halo/ring around the button, so
+        // this stays small and close so round transport / top-bar discs read grounded, not haloed.
+        static let disc = Shadow(color: .black.opacity(0.26), radius: 6, y: 3)   // round icon button
         /// Inline scroll-column card / row: a lighter shadow than a floating pill, since these sit on the
         /// canvas rather than hovering high above it.
         static let card = Shadow(color: .black.opacity(0.28), radius: 10, y: 5)
@@ -131,12 +140,15 @@ enum VortXGlass {
 
     // MARK: The shared blur gate (ONE definition every preset reuses)
 
-    /// The blur layer under every VortX glass preset: real Apple Liquid Glass on OS 26, the frosted
-    /// `.ultraThinMaterial` on older systems, and an opaque warm `surface1` under Reduce Transparency so
-    /// the surface stays legible. Extracting it here means the OS-26 upgrade and the Reduce-Transparency
-    /// fallback are byte-identical across every preset instead of re-derived per modifier.
+    /// The blur layer under every VortX glass preset: real Apple Liquid Glass on OS 26, a frosted
+    /// `material` (default `.ultraThinMaterial`) on older systems, and an opaque warm `surface1` under
+    /// Reduce Transparency so the surface stays legible. Extracting it here means the OS-26 upgrade and the
+    /// Reduce-Transparency fallback are byte-identical across every preset instead of re-derived per
+    /// modifier. `material` lets a preset pick a heavier frost (the prominent primary-action glass passes
+    /// `.thinMaterial`); all chrome keeps the default, so those call sites are untouched.
     @ViewBuilder
-    static func blurLayer<S: InsettableShape>(in shape: S, reduceTransparency: Bool) -> some View {
+    static func blurLayer<S: InsettableShape>(in shape: S, reduceTransparency: Bool,
+                                              material: Material = .ultraThinMaterial) -> some View {
         if reduceTransparency {
             // No blur when transparency is reduced: an opaque warm surface keeps the chrome legible.
             shape.fill(Theme.Palette.surface1)
@@ -145,8 +157,9 @@ enum VortXGlass {
             // in place. VortX's tint + highlight + shadow still layer on top, so identity is preserved.
             shape.fill(.clear).glassEffect(.regular, in: shape)
         } else {
-            // Custom material on every older OS: the frosted blur that carries the warm tint above.
-            shape.fill(.ultraThinMaterial)
+            // Custom material on every older OS: the frosted blur that carries the warm tint above. The
+            // caller-chosen `material` defaults to `.ultraThinMaterial` (chrome), heavier for prominent.
+            shape.fill(material)
         }
     }
 
@@ -222,12 +235,13 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
 // MARK: - The prominent (primary-action) ember glass
 
 /// The PROMINENT variant for a primary action (Play / Resume): the same OS-26 gate + Reduce-Transparency
-/// fallback as the neutral glass, but tinted with a near-opaque `tint` (accent) so the button stays
-/// ember-forward and prominent, Apple's prominent-glass pattern. The high tint alpha preserves the
-/// existing onAccent-vs-accent AA text contrast; the glass blur (and real Liquid Glass on OS 26) still
-/// bends light at the edges so the button reads as glass, not a flat slab. Under Reduce Transparency it
-/// falls back to an OPAQUE accent surface (not surface1): a primary CTA must stay ember and fully legible,
-/// and surface1 would demote it to a neutral chip.
+/// fallback as the neutral glass, but tinted with a GLASS-range `tint` (accent) over a heavier
+/// `.thinMaterial` frost, so the button reads as tinted ember GLASS (more frosted than chrome) rather than
+/// a near-flat ember slab, Apple's prominent-glass pattern. The tint stays light enough for the frost to
+/// show yet keeps the onAccent label AA-legible over the tinted fill; the blur (and real Liquid Glass on
+/// OS 26) bends light at the edges for the glass look. Under Reduce Transparency it falls back to an
+/// OPAQUE accent surface (tint forced to 1.0, not surface1): a primary CTA must stay ember and fully
+/// legible, and surface1 would demote it to a neutral chip.
 private struct VortXGlassProminentModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let tint: Color
@@ -239,9 +253,11 @@ private struct VortXGlassProminentModifier<S: InsettableShape>: ViewModifier {
 
     private var glass: some View {
         ZStack {
-            VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency)
-            // Near-opaque accent tint over the blur. At full alpha under Reduce Transparency the button is
-            // a solid ember slab (identical to the pre-glass primary); otherwise a hint of glass shows.
+            // Heavier `.thinMaterial` frost (vs chrome's `.ultraThinMaterial`) so the tinted ember still
+            // reads as GLASS with the label legible over it, per the "more glass on buttons" direction.
+            VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency, material: .thinMaterial)
+            // Ember accent tint kept in the glass range so the frost shows through. Forced fully opaque
+            // under Reduce Transparency so the CTA falls back to a solid, maximally legible ember slab.
             shape.fill(tint.opacity(reduceTransparency ? 1.0 : VortXGlass.prominentTintAlpha))
         }
         // A slightly brighter top highlight than neutral glass, so the ember surface still reads lit.
