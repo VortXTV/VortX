@@ -36,11 +36,12 @@ private struct ProviderCard<Content: View>: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) { content }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxSettingsCard()
     }
 }
 
-/// The code + QR panel shown while a device/PIN flow is pending.
+/// The code + QR panel shown while a device/PIN flow is pending. Kept OPAQUE (white QR plate + solid text):
+/// a scan target and a one-time code must stay high-contrast even inside the now-glass ProviderCard parent.
 private struct PairingPanel: View {
     let code: String
     let url: String

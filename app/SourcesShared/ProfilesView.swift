@@ -227,8 +227,7 @@ struct PinGateOverlay: View {
                 }
             }
             .padding(Theme.Space.xxl)
-            .background(Theme.Palette.surface1,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
     }
 }
@@ -527,8 +526,7 @@ struct ProfileEditorView: View {
                 }
             }
             .padding(Theme.Space.xxl)
-            .background(Theme.Palette.surface1,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             // Unfocusable while the PIN gate is up, so the remote lands in the gate (tvOS).
             .disabled(switchPinPrompt)
 

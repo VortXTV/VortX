@@ -57,7 +57,7 @@ private struct NuvioConnectCard: View {
             }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxSettingsCard()
         }
         .buttonStyle(.plain)
     }

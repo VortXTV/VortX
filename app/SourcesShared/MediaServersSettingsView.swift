@@ -56,7 +56,7 @@ struct MediaServersSettingsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 
     private func kindButton(_ kind: MediaServerKind, _ label: String) -> some View {
@@ -101,7 +101,7 @@ private struct MSServerCard: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 
     private var kindLabel: String {
@@ -157,7 +157,7 @@ private struct MSAddServerFlow: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 }
 

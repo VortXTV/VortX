@@ -64,7 +64,7 @@ struct SyncSettingsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
 
         Text("Your profiles, settings, and metadata keys sync to this account, end-to-end encrypted. They also sync automatically a moment after any change.")
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
@@ -147,7 +147,7 @@ struct SyncSettingsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 
     // MARK: Actions

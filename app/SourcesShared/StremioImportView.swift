@@ -40,7 +40,7 @@ struct StremioImportView: View {
                         .keyboardType(.URL)
                         #endif
                         .padding(Theme.Space.sm)
-                        .background(Theme.Palette.surface2, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+                        .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
                     Button { installAll() } label: {
                         Label(installing ? "Installing…" : "Install all add-ons",
                               systemImage: "square.and.arrow.down.on.square")
@@ -67,7 +67,7 @@ struct StremioImportView: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) { content() }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxSettingsCard()
     }
 
     private var trimmedURLs: [String] {

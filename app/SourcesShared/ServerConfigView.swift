@@ -61,7 +61,7 @@ struct ServerConfigView: View {
             .autocorrectionDisabled()
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
             .frame(maxWidth: 1000)
             .onSubmit { save() }   // Return submits (the primary interaction on Mac's hardware keyboard)
         #else
@@ -69,7 +69,7 @@ struct ServerConfigView: View {
             .textContentType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
             .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
             .frame(maxWidth: 1000)
             .onSubmit { save() }   // Return submits (the primary interaction on Mac's hardware keyboard)
         #endif

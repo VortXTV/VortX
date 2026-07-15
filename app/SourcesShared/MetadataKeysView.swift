@@ -78,7 +78,7 @@ struct SkipKeysView: View {
     }
     .padding(Theme.Space.md)
     .frame(maxWidth: .infinity, alignment: .leading)
-    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    .vortxSettingsCard()
 }
 
 /// A plain (non-masked) field: a base URL is configuration, not a credential.
@@ -103,5 +103,5 @@ struct SkipKeysView: View {
     }
     .padding(Theme.Space.md)
     .frame(maxWidth: .infinity, alignment: .leading)
-    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    .vortxSettingsCard()
 }

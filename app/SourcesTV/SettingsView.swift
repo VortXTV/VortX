@@ -324,8 +324,7 @@ struct SettingsView: View {
         section("Playback") {
             if PlaybackSettings.directLinksOnlyForced {
                 directLinksOnlyRow
-                    .background(Theme.Palette.surface1,
-                                in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    .vortxSettingsCard()
             } else {
                 Button { setDirectLinksOnly(!directLinksOnly) } label: {
                     directLinksOnlyRow
@@ -1129,7 +1128,7 @@ struct SettingsView: View {
         }
         .padding(Theme.Space.lg)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
         // tvOS focus is spatial: "Log Out" sits far right (after a Spacer) while the next focusable
         // views are left-aligned, outside the downward beam. Making each section a focus section lets
         // the engine redirect focus into it even when it's off the movement axis.

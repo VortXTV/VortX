@@ -82,7 +82,7 @@ struct XRDBSettingsView: View {
                 .tint(Theme.Palette.accent)
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxSettingsCard()
                 field("Custom instance URL (optional)", text: $baseURL, hint: "Leave blank to use VortX's own service. Or set your own XRDB-compatible endpoint.", url: true)
                 field("Profile alias (optional)", text: $alias, hint: "Only used with a custom instance: the config profile alias from its Configurator.", url: false)
 
@@ -101,7 +101,7 @@ struct XRDBSettingsView: View {
                 .tint(Theme.Palette.accent)
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxSettingsCard()
                 Toggle(isOn: $erdbFanartPosters) {
                     Text("Use fanart posters")
                         .font(Theme.Typography.cardTitle)
@@ -111,7 +111,7 @@ struct XRDBSettingsView: View {
                 .tint(Theme.Palette.accent)
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxSettingsCard()
                 Text("Pull posters from fanart.tv instead of the default source (requires ERDB on). Uses your fanart key from Metadata keys if you set one, otherwise VortX's own key.")
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
@@ -133,7 +133,7 @@ struct XRDBSettingsView: View {
                 .tint(Theme.Palette.accent)
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxSettingsCard()
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
@@ -156,6 +156,6 @@ struct XRDBSettingsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 }

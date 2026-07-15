@@ -96,22 +96,17 @@ struct SourceFilterChipsView: View {
                 Text(kind.label)
                     .font(Theme.Typography.eyebrow)
                     .tracking(1.2)
-                    .foregroundStyle(isOn ? Theme.Palette.onAccent.opacity(0.85) : kind.tint)
+                    .foregroundStyle(kind.tint)
                 Text(title)
                     .font(Theme.Typography.label)
-                    .foregroundStyle(isOn ? Theme.Palette.onAccent : Theme.Palette.textPrimary)
+                    .foregroundStyle(isOn ? kind.tint : Theme.Palette.textPrimary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, Theme.Space.sm)
             .padding(.vertical, Theme.Space.xs)
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(isOn ? kind.tint : Theme.Palette.surface2)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(isOn ? Color.clear : Theme.Palette.hairline, lineWidth: 1)
-            )
+            // The shared glass chip: neutral idle pill, ember/warn tint composited above the glass when
+            // engaged (kind.tint keeps Only=accent and Avoid=warn reading clearly, same as ChipButtonStyle).
+            .vortxGlassChip(selected: isOn, tint: kind.tint)
         }
         .buttonStyle(.plain)
     }
@@ -158,7 +153,7 @@ struct SourceFilterChipsView: View {
                 #endif
                 .padding(.horizontal, Theme.Space.sm)
                 .padding(.vertical, Theme.Space.xs)
-                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.Palette.surface2))
+                .vortxGlassField(in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -206,17 +201,10 @@ struct SourceFilterChipsView: View {
         Button { prefs.avoidBehavior = value } label: {
             Text(title)
                 .font(Theme.Typography.label)
-                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textPrimary)
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textPrimary)
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.vertical, Theme.Space.xs)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(selected ? Theme.Palette.accent : Theme.Palette.surface2)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(selected ? Color.clear : Theme.Palette.hairline, lineWidth: 1)
-                )
+                .vortxGlassChip(selected: selected)
         }
         .buttonStyle(.plain)
     }
@@ -283,6 +271,7 @@ struct SourceFilterChipsView: View {
                 .foregroundStyle(Theme.Palette.textTertiary)
         }
         .padding(Theme.Space.sm)
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Theme.Palette.surface1))
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .flat)
     }
 }
