@@ -645,7 +645,9 @@ struct PlayerScreen: View {
                         .font(.footnote.weight(.medium))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(.black.opacity(0.72), in: Capsule())
+                        // Transient engine notice as the shared VortX glass toast (warm glass + soft toast
+                        // shadow), upgrading to Liquid Glass on OS 26. Background only; auto-hide logic unchanged.
+                        .vortxGlassToast(in: Capsule())
                         .padding(.top, 24)
                     Spacer()
                 }
@@ -668,7 +670,9 @@ struct PlayerScreen: View {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                                .padding(12).background(.black.opacity(0.55), in: Circle())
+                                // Escape-hatch close on the shared VortX glass disc, matching the transport
+                                // discs and upgrading to Liquid Glass on OS 26. Background only; action unchanged.
+                                .padding(12).vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
@@ -2300,11 +2304,11 @@ struct PlayerScreen: View {
             .buttonStyle(.plain)
         }
         .padding(16)
-        // Floating Up Next card over the video tail: Liquid Glass on OS 26, the frosted material on older
-        // systems. Non-interactive (the card is a surface; its own buttons stay pressable).
-        .glassChrome(in: RoundedRectangle(cornerRadius: 18, style: .continuous)) {
-            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.ultraThinMaterial)
-        }
+        // Floating Up Next card over the video tail on the shared VortX glass card preset (warm tint + top
+        // highlight + card shadow), upgrading to Liquid Glass on OS 26. Non-interactive surface (its own
+        // buttons stay pressable). Background only; countdown / auto-advance logic unchanged.
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
         .frame(maxWidth: 480)
         .padding(.horizontal, 24).padding(.bottom, 96)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
@@ -3027,7 +3031,10 @@ struct PlayerScreen: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
-        .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        // Skip-editor bar container on the shared VortX glass pill (warm glass + pill shadow), upgrading to
+        // Liquid Glass on OS 26. Its inner control pills keep their plain fills. Background only; editor logic unchanged.
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 10, style: .continuous),
+                    fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
         .padding(.horizontal, 8)
     }
 
@@ -3156,7 +3163,9 @@ struct PlayerScreen: View {
                 Text("LIVE").font(.caption.weight(.heavy)).foregroundStyle(.white).tracking(1)
             }
             .padding(.horizontal, 11).padding(.vertical, 6)
-            .background(.black.opacity(0.4), in: Capsule())
+            // Live position indicator (in place of the scrubber) on the shared VortX glass pill, upgrading to
+            // Liquid Glass on OS 26. Background only; the red dot stays a plain fill and playback state is unchanged.
+            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
             Spacer()
             if currentTime > 0 {
                 Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.85))
@@ -3556,7 +3565,10 @@ struct PlayerScreen: View {
                     Spacer()
                     Button { close() } label: {
                         Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white.opacity(0.7)).padding(7).background(.white.opacity(0.12), in: Circle())
+                            // Panel close on the shared VortX glass disc, matching the transport discs and
+                            // upgrading to Liquid Glass on OS 26. Background only; close() action unchanged.
+                            .foregroundStyle(.white.opacity(0.7)).padding(7)
+                            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
                             .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
                     }
                     .accessibilityLabel("Close panel")
@@ -3572,8 +3584,12 @@ struct PlayerScreen: View {
                 }
                 .frame(maxHeight: 360)
             }
-            .background(Theme.Palette.surface1)
-            .clipShape(RoundedRectangle(cornerRadius: 18))
+            // Selection panel on the shared high-alpha VortX glass panel so it stays legible over bright,
+            // moving video, upgrading to Liquid Glass on OS 26. Content is clipped to the same rounded shape
+            // first so the inner selected-row fills round with it; the glass shape / stroke / shadow match.
+            // Background only; panel rows and their apply() logic are unchanged.
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .vortxGlassPanel(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             .frame(maxWidth: 560)
             .padding()
             .tint(Theme.Palette.accent)
@@ -4427,7 +4443,9 @@ struct AirPlayRoutePickerButton: View {
     var body: some View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
-            .background(.black.opacity(0.35), in: Circle())
+            // AirPlay disc on the shared VortX glass, matching the sibling transport discs and upgrading to
+            // Liquid Glass on OS 26. Background only; the AVRoutePickerView behavior is unchanged.
+            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
             .accessibilityLabel("AirPlay")
     }
 }
