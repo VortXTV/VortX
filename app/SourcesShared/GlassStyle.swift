@@ -5,7 +5,7 @@ import UIKit
 
 /// VortX "liquid glass": the warm-dark floating-chrome material from the approved redesign mockups.
 ///
-/// It is a CUSTOM material that renders the same on every OS version and platform — a translucent
+/// It is a CUSTOM material that renders the same on every OS version and platform: a translucent
 /// warm-dark fill over a blur, a 1px top-highlight border, and a soft drop shadow. Where Apple's real
 /// Liquid Glass exists (iOS / tvOS / macOS 26), that becomes the blur layer, so the look only UPGRADES
 /// on newer systems, it never diverges: the warm tint, top highlight, ember active state, and shadow are
@@ -23,7 +23,7 @@ enum VortXGlass {
     // MARK: Tokens (single source of truth, shared by the SwiftUI material and the tvOS UIKit tab bar)
 
     /// The warm near-black glass fill (mockups: `rgba(20,17,16,~.5)`). Fixed sRGB, NOT the user-themeable
-    /// `canvas`, so the glass reads warm even under the OLED true-black chrome setting — the glass is a
+    /// `canvas`, so the glass reads warm even under the OLED true-black chrome setting, staying a
     /// stable identity surface, not the app background.
     private static let fillRGB = (r: 0.078, g: 0.067, b: 0.063)   // ≈ #141110
 

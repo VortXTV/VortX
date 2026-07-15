@@ -419,7 +419,7 @@ struct RootTabView: View {
         // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and tint it with the
         // SAME warm fill the SwiftUI VortXGlass material uses, so the tvOS top nav reads as VortX glass and
         // matches the Mac / iOS chrome. Under Reduce Transparency, stand down to an opaque warm surface for
-        // legibility. RE-SKIN ONLY — this changes the bar's BACKGROUND appearance; the native TabView, its
+        // legibility. RE-SKIN ONLY: this changes the bar's BACKGROUND appearance; the native TabView, its
         // focus engine, tab tags/order, and the ember selection indicator below are all untouched.
         if UIAccessibility.isReduceTransparencyEnabled {
             appearance.configureWithOpaqueBackground()

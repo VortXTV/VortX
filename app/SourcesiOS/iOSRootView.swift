@@ -354,7 +354,7 @@ struct iOSRootView: View {
             .frame(maxWidth: 340)
             // Glass search field (redesign Phase A): the warm liquid-glass material replaces the flat
             // surface1 capsule so the top-bar search affordance matches the Mac home mockup. The field's
-            // text, focus, submit, and clear-button behavior are unchanged — appearance only.
+            // text, focus, submit, and clear-button behavior are unchanged; appearance only.
             .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
         }
         // 84pt leading clears the traffic lights (~70pt of buttons + breathing room) restored by
@@ -437,7 +437,7 @@ struct iOSRootView: View {
         .accessibilityLabel("Tabs")
         // Floating glass pill (redesign Phase A): the tab items ride VortX's warm liquid-glass material,
         // inset from the screen edges with a soft drop shadow, so the bar reads as a floating element over
-        // the canvas instead of a solid attached strip. RE-SKIN ONLY — the bar still holds its own row at
+        // the canvas instead of a solid attached strip. RE-SKIN ONLY: the bar still holds its own row at
         // the bottom of the shell VStack (content never scrolls under it and is never obscured); only its
         // appearance floats. Selection, tap wiring, a11y, and the offline/update banners are untouched.
         .padding(.horizontal, Theme.Space.sm)
