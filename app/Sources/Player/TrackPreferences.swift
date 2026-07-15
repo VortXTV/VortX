@@ -229,6 +229,29 @@ struct TrackPreferences: Equatable {
         return out.isEmpty ? ["en"] : out
     }
 
+    /// Preferred trailer AUDIO languages (ISO-639-1 base codes, priority order) for selecting the matching audio
+    /// track when a YouTube trailer ships MULTIPLE audio languages. The explicit trailer-language picker
+    /// (`stremiox.trailerLanguage`) first when set, then the preferred audio languages, then the device
+    /// languages. Deduped, lowercased, never empty (device languages default to ["en"]). Foundation-only so it
+    /// is available in EVERY target that compiles the player (the resolver honors the richer
+    /// `TMDBClient.preferredTrailerLanguages`; this is the player-side `alang` belt-and-suspenders for a file
+    /// that itself exposes more than one embedded audio track).
+    static var trailerAudioLanguages: [String] {
+        var seen = Set<String>(); var out: [String] = []
+        func add(_ raw: String?) {
+            guard let raw, !raw.isEmpty else { return }
+            let base = Locale(identifier: raw).language.languageCode?.identifier ?? String(raw.prefix(2))
+            let code = base.lowercased()
+            guard !code.isEmpty, seen.insert(code).inserted else { return }
+            out.append(code)
+        }
+        let override = UserDefaults.standard.string(forKey: "stremiox.trailerLanguage")
+        add((override?.isEmpty ?? true) ? nil : override)
+        for c in current.audioLanguages { add(c) }
+        for c in deviceLanguages { add(c) }
+        return out.isEmpty ? ["en"] : out
+    }
+
     /// Current preferences: device languages plus sensible defaults until the user customizes them.
     static var current: TrackPreferences {
         let d = UserDefaults.standard

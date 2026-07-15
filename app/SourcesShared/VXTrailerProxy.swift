@@ -279,7 +279,7 @@ final class VXTrailerProxy {
                 connection.cancel()
                 return
             }
-            self.streamWindows(connection, upstream: upstreamURL, pos: start, end: end)
+            self.streamWindows(connection, upstream: upstreamURL, pos: start, end: end, promised: length, sent: 0)
         })
     }
 
@@ -288,13 +288,18 @@ final class VXTrailerProxy {
     /// Fetch `[pos, end]` from googlevideo one <=1 MiB `&range=` window at a time, writing each to the client
     /// before requesting the next (backpressure keeps memory bounded to a single window). Each window is fetched
     /// with a bounded retry (see `fetchWindow`) so a transient upstream hiccup does not truncate the track.
-    private func streamWindows(_ connection: NWConnection, upstream: URL, pos: Int, end: Int) {
+    /// `promised` is the fixed Content-Length announced in the 206; `sent` is the running total already written,
+    /// used only to confirm (in the log) that the FULL body was delivered when the loop completes.
+    private func streamWindows(_ connection: NWConnection, upstream: URL, pos: Int, end: Int, promised: Int, sent: Int) {
         guard pos <= end else {
-            connection.cancel()   // done: the 206 body is complete
+            // Done: the 206 body is complete. `sent` should equal `promised`; log both so a device trace can
+            // confirm the full clip streamed (a mismatch would pinpoint a truncation the fix missed).
+            NSLog("[trailer] proxy stream complete host=%@ served=%d/%d bytes", upstream.host ?? "?", sent, promised)
+            connection.cancel()
             return
         }
         let stop = min(pos + Self.windowSize - 1, end)
-        fetchWindow(connection, upstream: upstream, start: pos, stop: stop, end: end, attempt: 1)
+        fetchWindow(connection, upstream: upstream, start: pos, stop: stop, end: end, promised: promised, sent: sent, attempt: 1)
     }
 
     /// Fetch ONE `[start, stop]` window and, on success, write it to the client and advance to the next window.
@@ -302,7 +307,16 @@ final class VXTrailerProxy {
     /// idempotent `&range=` window up to `maxWindowAttempts` with a small backoff BEFORE giving up. This is the
     /// fix for trailers dying halfway: previously any single window failure did `connection.cancel()`, closing
     /// the socket after fewer bytes than the fixed Content-Length promised and truncating that one track.
-    private func fetchWindow(_ connection: NWConnection, upstream: URL, start: Int, stop: Int, end: Int, attempt: Int) {
+    ///
+    /// SHORT-READ FIX (the remaining "stops partway" bug): googlevideo may answer a bounded `&range=start-stop`
+    /// with FEWER bytes than the window width (a 200/206 with a partial body under throttling or at an internal
+    /// segment boundary). The old loop advanced to `stop + 1` REGARDLESS of how many bytes actually arrived, so
+    /// the undelivered bytes were skipped: the fixed-length 206 was then never satisfied (mpv stalled waiting for
+    /// the missing tail) and the byte misalignment corrupted the stream, cutting playback partway. The advance is
+    /// now by the ACTUAL bytes received (`start + data.count`), so a short read simply makes the next window pick
+    /// up exactly where this one ended and the promised Content-Length is always delivered in full.
+    private func fetchWindow(_ connection: NWConnection, upstream: URL, start: Int, stop: Int, end: Int,
+                             promised: Int, sent: Int, attempt: Int) {
         guard let windowURL = Self.appendRange(upstream, start: start, stop: stop) else {
             connection.cancel()
             return
@@ -322,21 +336,35 @@ final class VXTrailerProxy {
                 // than cancelling and truncating this track. Only close once the retry budget is exhausted.
                 if attempt < Self.maxWindowAttempts {
                     self.queue.asyncAfter(deadline: .now() + Self.windowRetryBaseDelay * Double(attempt)) { [weak self] in
-                        self?.fetchWindow(connection, upstream: upstream, start: start, stop: stop, end: end, attempt: attempt + 1)
+                        self?.fetchWindow(connection, upstream: upstream, start: start, stop: stop, end: end,
+                                          promised: promised, sent: sent, attempt: attempt + 1)
                     }
                 } else {
-                    NSLog("[yt-proxy] window %d-%d gave up after %d attempts (status=%d err=%@)",
-                          start, stop, attempt, status, String(describing: error))
+                    NSLog("[trailer] proxy window %d-%d gave up after %d attempts served=%d/%d (status=%d err=%@)",
+                          start, stop, attempt, sent, promised, status, String(describing: error))
                     connection.cancel()
                 }
                 return
             }
-            connection.send(content: data, completion: .contentProcessed { [weak self] sendError in
+            // A short read is NOT a failure: accept the bytes and resume from where they actually ended. Clamp to
+            // the requested window so a (theoretical) over-delivery can never push past the promised
+            // Content-Length; a bounded `&range=` normally returns exactly the window, so this is just a guard.
+            let requested = stop - start + 1
+            let payload = data.count > requested ? Data(data.prefix(requested)) : data
+            if payload.count < requested {
+                NSLog("[trailer] proxy short read host=%@ window=%d-%d requested=%d got=%d (resuming from actual)",
+                      upstream.host ?? "?", start, stop, requested, payload.count)
+            }
+            connection.send(content: payload, completion: .contentProcessed { [weak self] sendError in
                 guard let self, sendError == nil else {
                     connection.cancel()   // client went away or a slow write failed
                     return
                 }
-                self.streamWindows(connection, upstream: upstream, pos: stop + 1, end: end)
+                // Advance by the bytes ACTUALLY delivered, never the requested window width, so a short upstream
+                // read cannot skip bytes and truncate the stream.
+                let nextPos = start + payload.count
+                self.streamWindows(connection, upstream: upstream, pos: nextPos, end: end,
+                                   promised: promised, sent: sent + payload.count)
             })
         }
         task.resume()

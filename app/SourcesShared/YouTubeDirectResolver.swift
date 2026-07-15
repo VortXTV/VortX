@@ -50,9 +50,21 @@ enum YouTubeDirectResolver {
     /// `wantMuxedOnly`: a pure-AVPlayer context that cannot take an audio sidecar; the resolver then returns a
     /// muxed format only (nil when the client exposed none). Default (false) returns muxed-when-present, else
     /// the adaptive video+audio pair at any height.
-    static func resolve(videoID: String, maxHeight: Int = 1080, wantMuxedOnly: Bool = false) async -> Resolved? {
-        // Hero + trailer button double-resolve the same id within seconds; serve the second from cache.
-        let cacheKey = "\(videoID)|\(maxHeight)|\(wantMuxedOnly ? 1 : 0)"
+    ///
+    /// `preferredAudioLanguages`: ISO-639-1 codes in priority order used to pick the AUDIO track when a modern
+    /// YouTube trailer ships MULTIPLE audio languages (the "trailer played in the wrong language" bug). nil (the
+    /// default) resolves to `TMDBClient.preferredTrailerLanguages`, the exact same priority the app used to pick
+    /// this trailer's id (explicit picker -> UI language -> audio langs -> device langs), so the audio track
+    /// matches the trailer's intended language. Never empty in practice (device languages default to ["en"]).
+    static func resolve(videoID: String,
+                        maxHeight: Int = 1080,
+                        wantMuxedOnly: Bool = false,
+                        preferredAudioLanguages: [String]? = nil) async -> Resolved? {
+        let prefLangs = preferredAudioLanguages ?? TMDBClient.preferredTrailerLanguages
+        // Hero + trailer button double-resolve the same id within seconds; serve the second from cache. The
+        // preferred-language head is part of the key so a later resolve with a different audio preference does
+        // NOT get served a stale wrong-language pick from the cache.
+        let cacheKey = "\(videoID)|\(maxHeight)|\(wantMuxedOnly ? 1 : 0)|\(prefLangs.joined(separator: "-"))"
         if let hit = await cache.get(cacheKey) {
             NSLog("[yt-direct] id=%@ client=%@ %@ h=%d", videoID, "cache", hit.isMuxed ? "muxed" : "adaptive", hit.height)
             return hit
@@ -61,7 +73,8 @@ enum YouTubeDirectResolver {
         for client in clients {
             guard let streaming = await fetchStreamingData(videoID: videoID, client: client) else { continue }
 
-            if let resolved = pick(from: streaming, maxHeight: maxHeight, wantMuxedOnly: wantMuxedOnly) {
+            if let resolved = pick(from: streaming, maxHeight: maxHeight, wantMuxedOnly: wantMuxedOnly,
+                                   preferredLanguages: prefLangs) {
                 await cache.set(cacheKey, resolved)
                 NSLog("[yt-direct] id=%@ client=%@ %@ h=%d",
                       videoID, client.name, resolved.isMuxed ? "muxed" : "adaptive", resolved.height)
@@ -157,6 +170,15 @@ enum YouTubeDirectResolver {
     /// (a JS-required client) is rejected by the pickers below -- the whole point is no nsig, no JS engine.
     private struct PlayerResponse: Decodable {
         struct PlayabilityStatus: Decodable { let status: String? }
+        /// A YouTube multi-language audio track descriptor, present on each audio adaptiveFormat when the video
+        /// ships more than one audio language. `id` is like "en.4" / "en-US.4" / "hi.3" (base ISO code before the
+        /// first '.'/'-'); `displayName` is human-readable ("English original", "Hindi"); `audioIsDefault` marks
+        /// the track YouTube would auto-select. Absent on single-audio videos.
+        struct AudioTrack: Decodable {
+            let displayName: String?
+            let id: String?
+            let audioIsDefault: Bool?
+        }
         struct Format: Decodable {
             let itag: Int?
             let url: String?
@@ -165,6 +187,7 @@ enum YouTubeDirectResolver {
             let cipher: String?
             let height: Int?
             let bitrate: Int?
+            let audioTrack: AudioTrack?
         }
         struct StreamingData: Decodable {
             let formats: [Format]?
@@ -229,34 +252,57 @@ enum YouTubeDirectResolver {
         return url
     }
 
-    /// Apply the resolution policy to one client's streamingData. Prefer a MUXED format when the client
-    /// exposed one (a single self-contained url is simpler and needs no sidecar), otherwise fall back to the
-    /// adaptive video+audio pair at ANY resolvable height.
+    /// Apply the resolution policy to one client's streamingData, honoring the user's preferred AUDIO language.
     ///
     ///   * wantMuxedOnly -> best muxed only (nil when none). A caller that literally cannot take a sidecar
     ///     (a pure AVPlayer context) sets this; NO shipping trailer/ambient caller does, they all play
     ///     through mpv, which mounts the audio leg as `--audio-file`.
-    ///   * otherwise -> best muxed (itag 22 then 18) if one exists, ELSE the adaptive pair.
+    ///   * otherwise -> best muxed (itag 22 then 18) if one exists, ELSE the adaptive video+audio pair.
     ///
-    /// The earlier policy took the adaptive pair only when its height was > 720 and otherwise demanded a
-    /// muxed format. That silently returned nil for the (now common) modern trailer that a residential IOS
-    /// InnerTube client answers with ZERO muxed formats and a best adaptive avc1 stream at <= 720 (verified
-    /// live: a real trailer returns playable OK, muxed 0, adaptive avc1 topping out at 720 with audio/mp4
-    /// present, yet the old gate discarded that perfectly playable pair). Muxed formats are no longer the
-    /// >720 discriminator, so the pair is accepted at whatever height the client offers.
+    /// WRONG-LANGUAGE FIX: modern YouTube trailers increasingly ship MULTIPLE audio languages as separate
+    /// audio adaptiveFormats (each tagged with an `audioTrack`). The old audio pick took the single highest
+    /// BITRATE audio/mp4 across ALL languages, so a foreign dub could win over English even with the app set to
+    /// English. `pickAudio` now selects the track whose `audioTrack` language matches `preferredLanguages`
+    /// (in priority order), falling back to YouTube's default/original track, then to highest bitrate for a
+    /// genuinely single-audio video (unchanged behavior there, so single-audio trailers are untouched).
+    ///
+    /// A muxed progressive stream (itag 22/18) carries ONE embedded audio track whose language we cannot
+    /// re-select. So when the client exposes MORE THAN ONE audio language AND one of them matches the user's
+    /// preference, the adaptive pair (which lets us pick that exact language) is taken IN PLACE OF the muxed
+    /// default. When there is only a single audio language, the muxed-first policy is kept exactly as before.
     private static func pick(from streaming: PlayerResponse.StreamingData,
                              maxHeight: Int,
-                             wantMuxedOnly: Bool) -> Resolved? {
-        // A muxed progressive stream (itag 22/18) is a single self-contained url: prefer it whenever the
-        // client exposed one, for both the muxed-only and the default case.
-        if let muxed = pickMuxed(streaming.formats ?? []) {
+                             wantMuxedOnly: Bool,
+                             preferredLanguages: [String]) -> Resolved? {
+        let adaptive = streaming.adaptiveFormats ?? []
+        let audioChoice = pickAudio(adaptive, preferredLanguages: preferredLanguages)
+        let audioLangs = distinctAudioLanguages(adaptive)
+
+        // Only override the muxed-first policy for a genuine MULTI-language trailer whose preferred language is
+        // actually available adaptively: single-audio trailers keep the exact muxed-first path (no regression).
+        let preferAdaptiveForLanguage = !wantMuxedOnly
+            && (audioChoice?.matchedPreferred ?? false)
+            && audioLangs.count > 1
+
+        if !preferAdaptiveForLanguage, let muxed = pickMuxed(streaming.formats ?? []) {
+            NSLog("[trailer] audio=muxed single-embedded-track h=%d availLangs=[%@] prefLangs=[%@]",
+                  muxed.height, audioLangs.joined(separator: ","), preferredLanguages.joined(separator: ","))
             return Resolved(videoURL: muxed.url, audioURL: nil, height: muxed.height, isMuxed: true)
         }
-        // No muxed format (the modern-trailer norm on the IOS client): take the adaptive video+audio pair at
-        // ANY height, unless the caller explicitly cannot take an audio sidecar (wantMuxedOnly).
-        if !wantMuxedOnly,
-           let pair = pickAdaptivePair(streaming.adaptiveFormats ?? [], maxHeight: maxHeight) {
-            return Resolved(videoURL: pair.video, audioURL: pair.audio, height: pair.height, isMuxed: false)
+
+        // Adaptive path (the modern-trailer norm on the IOS client): a video-only leg + the language-selected
+        // audio leg, unless the caller cannot take a sidecar (wantMuxedOnly).
+        if !wantMuxedOnly, let videoLeg = pickAdaptiveVideo(adaptive, maxHeight: maxHeight), let audio = audioChoice {
+            NSLog("[trailer] audio=adaptive lang=%@ display=%@ matchedPref=%@ ytDefault=%@ availLangs=[%@] prefLangs=[%@] h=%d",
+                  audio.lang ?? "und", audio.display ?? "?",
+                  audio.matchedPreferred ? "Y" : "N", audio.isDefault ? "Y" : "N",
+                  audioLangs.joined(separator: ","), preferredLanguages.joined(separator: ","), videoLeg.height)
+            return Resolved(videoURL: videoLeg.url, audioURL: audio.url, height: videoLeg.height, isMuxed: false)
+        }
+
+        // Fallback: a muxed default we skipped above for a language override that then had no adaptive video leg.
+        if let muxed = pickMuxed(streaming.formats ?? []) {
+            return Resolved(videoURL: muxed.url, audioURL: nil, height: muxed.height, isMuxed: true)
         }
         return nil
     }
@@ -272,11 +318,28 @@ enum YouTubeDirectResolver {
         return nil
     }
 
-    /// Best adaptive video+audio pair under `maxHeight`. Video: mp4/avc1 (H.264 for AVPlayer/mpv hardware
-    /// decode) picked by highest height then highest bitrate; vp9 is allowed only when no avc1 stream carries
-    /// a plain url. Audio: audio/mp4 (m4a) highest bitrate. Both legs must have plain urls or there is no pair.
-    private static func pickAdaptivePair(_ adaptive: [PlayerResponse.Format],
-                                         maxHeight: Int) -> (video: URL, audio: URL, height: Int)? {
+    /// Base ISO-639-1 language code of an audio format's `audioTrack`, e.g. "en.4"/"en-US.4"/"hi.3" -> "en"/"hi".
+    /// nil when the format has no `audioTrack` (a single-audio video) or an unusable id.
+    private static func audioLanguageCode(_ f: PlayerResponse.Format) -> String? {
+        guard let id = f.audioTrack?.id, !id.isEmpty else { return nil }
+        let head = id.split(whereSeparator: { $0 == "." || $0 == "-" }).first.map(String.init) ?? id
+        return head.isEmpty ? nil : head.lowercased()
+    }
+
+    /// Distinct audio-track languages exposed by the adaptive set (base ISO codes), used to detect a genuine
+    /// multi-language trailer. Empty / single-element for the ordinary single-audio trailer.
+    private static func distinctAudioLanguages(_ adaptive: [PlayerResponse.Format]) -> [String] {
+        var seen = Set<String>(); var out: [String] = []
+        for f in adaptive where (f.mimeType?.hasPrefix("audio/mp4") ?? false) && plainURL(f) != nil {
+            if let code = audioLanguageCode(f), seen.insert(code).inserted { out.append(code) }
+        }
+        return out
+    }
+
+    /// Best adaptive VIDEO leg under `maxHeight`. mp4/avc1 (H.264 for hardware decode) by highest height then
+    /// highest bitrate; vp9 allowed only when no avc1 stream carries a plain url. Plain url required.
+    private static func pickAdaptiveVideo(_ adaptive: [PlayerResponse.Format],
+                                          maxHeight: Int) -> (url: URL, height: Int)? {
         func bestVideo(where codecMatch: (String) -> Bool) -> (URL, Int)? {
             var best: (url: URL, height: Int, bitrate: Int)?
             for f in adaptive {
@@ -290,22 +353,60 @@ enum YouTubeDirectResolver {
             guard let b = best else { return nil }
             return (b.url, b.height)
         }
-
-        let video = bestVideo(where: { $0.hasPrefix("video/mp4") && $0.contains("avc1") })
+        return bestVideo(where: { $0.hasPrefix("video/mp4") && $0.contains("avc1") })
             ?? bestVideo(where: { $0.contains("vp9") || $0.contains("vp09") })
-        guard let (videoURL, height) = video else { return nil }
+    }
 
-        var bestAudio: (url: URL, bitrate: Int)?
-        for f in adaptive {
-            guard let mime = f.mimeType, mime.hasPrefix("audio/mp4"),
-                  let url = plainURL(f) else { continue }
-            let br = f.bitrate ?? 0
-            if let b = bestAudio, br <= b.bitrate { continue }
-            bestAudio = (url, br)
+    /// The chosen adaptive AUDIO leg plus what it is (for diagnostics + the muxed-override decision).
+    private struct AudioChoice {
+        let url: URL
+        let lang: String?          // base ISO code of the picked track, nil for a single-audio video
+        let display: String?       // YouTube's human-readable track name
+        let matchedPreferred: Bool // the pick matched one of preferredLanguages (a genuine localized hit)
+        let isDefault: Bool        // YouTube's own default/original track
+    }
+
+    /// Pick the audio/mp4 leg honoring `preferredLanguages`. Priority:
+    ///   1. First preferred language (in order) that any audio track matches -> highest bitrate among that language.
+    ///   2. Else YouTube's `audioIsDefault` track (the original) -> highest bitrate among it.
+    ///   3. Else highest bitrate overall (the single-audio path: identical to the previous behavior).
+    /// Only audio/mp4 formats with a plain url are considered; nil when none exist.
+    private static func pickAudio(_ adaptive: [PlayerResponse.Format],
+                                  preferredLanguages: [String]) -> AudioChoice? {
+        // (format, url) audio candidates with a plain url.
+        let candidates: [(f: PlayerResponse.Format, url: URL)] = adaptive.compactMap { f in
+            guard (f.mimeType?.hasPrefix("audio/mp4") ?? false), let url = plainURL(f) else { return nil }
+            return (f, url)
         }
-        guard let audio = bestAudio else { return nil }
+        guard !candidates.isEmpty else { return nil }
 
-        return (videoURL, audio.url, height)
+        func highestBitrate(_ list: [(f: PlayerResponse.Format, url: URL)]) -> (f: PlayerResponse.Format, url: URL)? {
+            list.max { ($0.f.bitrate ?? 0) < ($1.f.bitrate ?? 0) }
+        }
+
+        // 1. Preferred-language match, in priority order.
+        for code in preferredLanguages where !code.isEmpty {
+            let want = code.lowercased()
+            let matches = candidates.filter { audioLanguageCode($0.f) == want }
+            if let pick = highestBitrate(matches) {
+                return AudioChoice(url: pick.url, lang: audioLanguageCode(pick.f),
+                                   display: pick.f.audioTrack?.displayName, matchedPreferred: true,
+                                   isDefault: pick.f.audioTrack?.audioIsDefault ?? false)
+            }
+        }
+
+        // 2. YouTube's default/original track.
+        let defaults = candidates.filter { $0.f.audioTrack?.audioIsDefault == true }
+        if let pick = highestBitrate(defaults) {
+            return AudioChoice(url: pick.url, lang: audioLanguageCode(pick.f),
+                               display: pick.f.audioTrack?.displayName, matchedPreferred: false, isDefault: true)
+        }
+
+        // 3. Highest bitrate overall (single-audio video, or a multi-audio video with no default flag).
+        guard let pick = highestBitrate(candidates) else { return nil }
+        return AudioChoice(url: pick.url, lang: audioLanguageCode(pick.f),
+                           display: pick.f.audioTrack?.displayName, matchedPreferred: false,
+                           isDefault: pick.f.audioTrack?.audioIsDefault ?? false)
     }
 
     // MARK: - In-memory cache

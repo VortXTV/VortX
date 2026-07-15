@@ -953,9 +953,19 @@ final class MPVMetalViewController: PlatformViewController {
             // Referer/extra headers from a browser context would only confuse googlevideo's UA binding.
             setString("referrer", "")
             setString("http-header-fields", "")
-            NSLog("[yt-probe] loadFile googlevideo: proxying via 127.0.0.1 playHost=%@ sidecar=%@ applyingUA=%@",
+            // Trailer audio-language belt-and-suspenders: the resolver already selects the preferred-language
+            // audio LEG (the load-bearing fix for multi-language trailers). This additionally tells mpv which
+            // language to auto-select IF a single opened file itself exposes more than one embedded audio track
+            // (a muxed multi-audio format, or a future HLS path). Set only on this googlevideo (trailer) branch,
+            // so the main player's default track selection is never touched. Trailer instances only ever play
+            // trailers, so it does not bleed into anything else.
+            let trailerAlang = TrackPreferences.trailerAudioLanguages
+            if !trailerAlang.isEmpty {
+                setString("alang", trailerAlang.joined(separator: ","))
+            }
+            NSLog("[trailer] loadFile googlevideo: proxying via 127.0.0.1 playHost=%@ sidecar=%@ alang=%@ ua=%@",
                   playURL.host ?? "?", sidecar == nil ? "none" : (sidecar!.host ?? "?"),
-                  YouTubeDirectResolver.googlevideoUserAgent)
+                  trailerAlang.joined(separator: ","), YouTubeDirectResolver.googlevideoUserAgent)
         }
 
         // yt-direct adaptive pair: mount the external audio stream so mpv merges it with the video-only
