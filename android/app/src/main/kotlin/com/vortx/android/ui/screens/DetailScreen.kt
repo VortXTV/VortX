@@ -61,9 +61,12 @@ import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SourceRow
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlass
+import com.vortx.android.ui.theme.vortxGlassToast
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
 
@@ -201,8 +204,8 @@ fun DetailScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(VortXTheme.spacing.md)
-                    .clip(VortXShapes.chip)
-                    .background(VortXTheme.colors.surface2, VortXShapes.chip)
+                    // Transient, non-blocking notice: the VortX glass toast (was a flat surface2 pill).
+                    .vortxGlassToast(VortXShapes.chip)
                     .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
             )
         }
@@ -218,8 +221,13 @@ private fun BackChip(onBack: () -> Unit, modifier: Modifier = Modifier) {
         modifier = modifier
             .windowInsetsPadding(WindowInsets.statusBars)
             .padding(VortXTheme.spacing.md)
-            .clip(VortXShapes.chip)
-            .background(Color.Black.copy(alpha = 0.35f), VortXShapes.chip),
+            // The contextual Back chip floats over the backdrop as VortX glass (was a flat black scrim pill).
+            // The chip is chrome, distinct from the backdrop art below it, which stays clean.
+            .vortxGlass(
+                shape = VortXShapes.chip,
+                fillAlpha = VortXGlass.pillFillAlpha,
+                shadow = VortXGlass.Shadow.pill,
+            ),
     ) {
         IconButton(onClick = onBack) {
             Icon(VortXIcons.back, contentDescription = "Back", tint = Color.White)

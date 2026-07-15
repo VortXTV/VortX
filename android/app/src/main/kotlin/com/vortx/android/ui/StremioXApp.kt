@@ -9,6 +9,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -17,8 +18,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
@@ -40,6 +43,7 @@ import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlassStrip
 import com.vortx.android.ui.viewmodel.AccountViewModel
 import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -157,14 +161,27 @@ fun StremioXApp(
         val authState by accountVm.authState.collectAsStateWithLifecycle()
         Scaffold(
             topBar = {
+                // The top bar reads as VortX glass: the stock opaque Material3 container is made transparent
+                // and the flush glass strip renders behind it. Title / items / behavior are unchanged.
                 TopAppBar(
                     title = {
                         if (tab == Tab.HOME) Wordmark() else Text(tab.label, style = VortXTheme.type.screenTitle)
                     },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Color.Transparent,
+                        scrolledContainerColor = Color.Transparent,
+                    ),
+                    modifier = Modifier.vortxGlassStrip(),
                 )
             },
             bottomBar = {
-                NavigationBar {
+                // The bottom nav bar reads as VortX glass too: transparent M3 container plus zero tonal
+                // overlay, with the flush glass strip behind. Every tab item stays exactly as it was.
+                NavigationBar(
+                    containerColor = Color.Transparent,
+                    tonalElevation = 0.dp,
+                    modifier = Modifier.vortxGlassStrip(),
+                ) {
                     Tab.entries.forEach { t ->
                         NavigationBarItem(
                             selected = t == tab,

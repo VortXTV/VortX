@@ -1,17 +1,16 @@
 package com.vortx.android.ui.components
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
-import com.vortx.android.ui.theme.VortXTheme
-import com.vortx.android.ui.theme.vortxShadow
+import com.vortx.android.ui.theme.vortxGlass
 
-/// `surface1` fill, card radius, `rest` shadow (DESIGN-SYSTEM.md §3 "Surface card") — the one row/panel
-/// container for the app. NEVER nest a [SurfaceCard] inside another (§7 anti-pattern "nested cards");
-/// a row that needs internal grouping uses padding/dividers, not another card.
+/// The one row/panel container for the app: now the VortX glass card (warm translucent fill, lit top edge,
+/// soft shadow) at card radius, replacing the old flat `surface1` fill. NEVER nest a [SurfaceCard] inside
+/// another (§7 anti-pattern "nested cards"); a row that needs internal grouping uses padding/dividers, not
+/// another card.
 @Composable
 fun SurfaceCard(
     modifier: Modifier = Modifier,
@@ -19,9 +18,11 @@ fun SurfaceCard(
 ) {
     Column(
         modifier = modifier
-            .vortxShadow(VortXTheme.elevation.rest, VortXShapes.card)
-            .clip(VortXShapes.card)
-            .background(VortXTheme.colors.surface1, VortXShapes.card),
+            .vortxGlass(
+                shape = VortXShapes.card,
+                fillAlpha = VortXGlass.cardFillAlpha,
+                shadow = VortXGlass.Shadow.card,
+            ),
         content = content,
     )
 }

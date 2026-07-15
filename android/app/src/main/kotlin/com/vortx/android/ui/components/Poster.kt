@@ -1,6 +1,5 @@
 package com.vortx.android.ui.components
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -19,8 +18,10 @@ import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlass
 
 /// [PosterCard]'s `art` slot for a real catalog item: a Coil [AsyncImage] with crossfade when
 /// [posterUrl] is present, falling back to [DefaultPosterArt] (the deterministic brand-tinted
@@ -104,16 +105,20 @@ fun LoadingRail(title: String = "Loading your library", modifier: Modifier = Mod
     }
 }
 
-/// A small capsule label, e.g. the add-on name or a "TORRENT" tag on a source row — mirrors the
-/// tvOS `badge`.
+/// A small capsule label, e.g. the add-on name or a "TORRENT" tag on a source row: now the VortX glass
+/// badge (warm translucent fill, lit top edge) rather than a flat `surface2` pill. It is chrome only,
+/// used on source / episode rows and the sources list, NEVER painted over poster or backdrop art.
 @Composable
 fun Badge(text: String, modifier: Modifier = Modifier) {
     androidx.compose.material3.Text(
         text = text.uppercase(),
         style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textSecondary, fontWeight = FontWeight.SemiBold),
         modifier = modifier
-            .clip(VortXShapes.pill)
-            .background(VortXTheme.colors.surface2, VortXShapes.pill)
+            .vortxGlass(
+                shape = VortXShapes.pill,
+                fillAlpha = VortXGlass.badgeFillAlpha,
+                shadow = VortXGlass.Shadow.flat,
+            )
             .padding(horizontal = 10.dp, vertical = 4.dp),
     )
 }
