@@ -367,8 +367,9 @@ struct RootTabView: View {
             .foregroundStyle(Theme.Palette.textSecondary)
             .padding(.horizontal, Theme.Space.lg)
             .padding(.vertical, Theme.Space.sm)
-            .background(Theme.Palette.surface1.opacity(0.92), in: Capsule())
-            .overlay(Capsule().stroke(Theme.Palette.hairline, lineWidth: 1))
+            // glass-Browse: the edge-flush strip preset (shared blur + warm tint, top-highlight only)
+            // in place of the flat surface1 capsule + hairline stroke.
+            .vortxGlassStrip(edge: .bottom)
             .padding(.bottom, Theme.Space.lg)
             .allowsHitTesting(false)
             .accessibilityElement(children: .combine)

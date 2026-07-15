@@ -150,7 +150,11 @@ struct AddonsView: View {
                                 }
                                 .padding(Theme.Space.md)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                                // glass-Browse: this nav row is bespoke chrome, not routed through a shared
+                                // row style, so it flips straight to the settings-card glass preset in place
+                                // of the flat surface1 fill (same throughout this file: install/discover/
+                                // reorder rows, the add-on card).
+                                .vortxSettingsCard()
                             }
                             .buttonStyle(.plain)
                             // Drag add-ons into the order you want. The order is the PRIORITY spine (which
@@ -170,7 +174,7 @@ struct AddonsView: View {
                                     }
                                     .padding(Theme.Space.md)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                                    .vortxSettingsCard()
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -251,7 +255,7 @@ struct AddonsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 
     private var discoverLink: some View {
@@ -265,7 +269,7 @@ struct AddonsView: View {
             }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .vortxSettingsCard()
         }
         .buttonStyle(.plain)
     }
@@ -381,7 +385,7 @@ struct AddonsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .vortxSettingsCard()
     }
 
     /// The add-on's action chips, in their own row beneath the info so they never steal width from the name /
@@ -464,7 +468,7 @@ struct AddonReorderView: View {
                     Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
                 }
                 .padding(.vertical, 4)
-                .listRowBackground(Theme.Palette.surface1)
+                .listRowBackground(Color.clear.vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)))
                 .listRowSeparator(.hidden)
             }
             .onMove(perform: move)

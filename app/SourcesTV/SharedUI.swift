@@ -712,7 +712,9 @@ struct PosterCard: View {
                                 .font(.system(size: 15, weight: .semibold).monospacedDigit())
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 8).padding(.vertical, 3)
-                                .background(.black.opacity(0.6), in: Capsule())
+                                // glass-Browse: the on-poster badge alpha (never the poster image itself),
+                                // so the resume timecode reads as VortX chrome instead of a flat black pill.
+                                .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
                                 .padding(Theme.Space.sm)
                                 .accessibilityLabel("Resumes at \(timecode)")
                         }

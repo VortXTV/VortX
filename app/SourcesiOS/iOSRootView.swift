@@ -178,8 +178,9 @@ struct iOSRootView: View {
             #if os(macOS)
             // Persistent brand + search strip across the whole window (in-content SwiftUI, NEVER a
             // toolbar/NSToolbar, which is the Beta 7 crash class). Fills the black full-size-content
-            // band under the hidden titlebar: wordmark left of center, search right, with a leading
-            // inset clearing the floating traffic lights.
+            // band under the hidden titlebar: search right, with a leading inset clearing the floating
+            // traffic lights. The wordmark now lives on `macNavPill` below (glass-Browse Mac nav move),
+            // so it is dropped here to avoid a duplicate brand mark.
             macTopBar
             #endif
             // Selected screen fills the space above the bar. Screens mount LAZILY on first visit (#24)
@@ -203,8 +204,17 @@ struct iOSRootView: View {
                 if isMounted(.settings) { iOSSettingsView().opacity(tab == .settings ? 1 : 0) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // MAC NAV MOVE (CEO greenlit, glass-Browse): macOS drives navigation from a top-center
+            // floating glass pill (`macTopNavOverlay`, floated over the content area below `macTopBar`
+            // so it never overlaps the search strip) instead of the bottom bar. iOS/iPadOS keep the
+            // unchanged bottom tab bar (`bottomTabBarRow`, its own row below the content, a no-op on
+            // macOS). Both helpers gate on the same `#if os(macOS)` idiom the rest of this file already
+            // uses for Mac-only chrome, kept inside @ViewBuilder vars so the conditional never has to
+            // split a chained-modifier expression (which SwiftUI's ViewBuilder cannot parse across an
+            // `#if`/`#else`).
+            .overlay(alignment: .top) { macTopNavOverlay }
 
-            customTabBar
+            bottomTabBarRow
         }
         .onChange(of: tab) { newTab in
             visitedTabs.insert(newTab.rawValue)   // lazy mount: remember every visit (#24)
@@ -319,13 +329,14 @@ struct iOSRootView: View {
     }
 
     #if os(macOS)
-    /// The persistent macOS top strip: brand wordmark left, an always-visible search field right. Pure
-    /// in-content SwiftUI, NEVER `.toolbar`/`.searchable`/`navigationTitle`, which bridge into the
-    /// shared window NSToolbar and crash (`_insertNewItemWithItemIdentifier`, the Beta 7 class). The
-    /// leading inset clears the floating traffic lights over the hidden titlebar's full-size content.
+    /// The persistent macOS top strip: an always-visible search field, right-aligned. Pure in-content
+    /// SwiftUI, NEVER `.toolbar`/`.searchable`/`navigationTitle`, which bridge into the shared window
+    /// NSToolbar and crash (`_insertNewItemWithItemIdentifier`, the Beta 7 class). The leading inset
+    /// clears the floating traffic lights over the hidden titlebar's full-size content. The brand
+    /// wordmark used to anchor this strip's leading edge; it now lives on `macNavPill` (MAC NAV MOVE,
+    /// glass-Browse), so this strip is search-only to avoid a duplicate mark.
     private var macTopBar: some View {
         HStack(spacing: Theme.Space.md) {
-            VortXWordmark(fontSize: 20)
             Spacer(minLength: Theme.Space.md)
             HStack(spacing: Theme.Space.sm) {
                 Image(systemName: "magnifyingglass")
@@ -396,7 +407,60 @@ struct iOSRootView: View {
         if dest != .home { MacSearchBridge.shared.pending = q }
         tab = dest
     }
+
+    /// MAC NAV MOVE (CEO greenlit): the macOS navigation shell, restructured from the old bottom bar
+    /// into a top-center floating glass pill (the Mac mockup): the VortX mark, then the SAME tab items
+    /// as the bar (`tabButton`, `visibleTabs`), so tab identity / selection / scroll-to-top / the
+    /// macOS keyboard focus-ring wiring carry over UNCHANGED — only the pill's position and the
+    /// wordmark move. Structural on macOS ONLY (see the `#if os(macOS)` gate around this whole
+    /// extension and around its call site in `body`); iOS/iPadOS keep `customTabBar` at the bottom.
+    private var macNavPill: some View {
+        HStack(spacing: Theme.Space.md) {
+            VortXWordmark(fontSize: 18)
+            Divider().frame(height: 20)
+            HStack(spacing: 0) {
+                ForEach(visibleTabs, id: \.rawValue) { item in
+                    // `tabButton` internally requests `.frame(maxWidth: .infinity)` (right, for the
+                    // bottom bar's seven-equal-columns layout on iOS). `.fixedSize()` collapses that
+                    // back to the item's intrinsic width here, so the PILL stays compact and centered
+                    // instead of stretching to the full window width; `tabButton` itself, and its iOS
+                    // callers, are unchanged.
+                    tabButton(item).fixedSize()
+                }
+            }
+            // Same keyboard-browse focus section as the old bottom bar: arrows/Tab walk the pill,
+            // Enter switches tabs.
+            .focusSection()
+        }
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.xs)
+        .vortxGlass(in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Tabs")
+    }
     #endif
+
+    /// The macOS top-center floating pill, inset below `macTopBar`; `EmptyView` everywhere else. A
+    /// `@ViewBuilder` var (not an inline `#if` inside a modifier chain) so `body` can unconditionally
+    /// `.overlay` it without SwiftUI's ViewBuilder choking on an `#if`/`#else` split mid-chain.
+    @ViewBuilder private var macTopNavOverlay: some View {
+        #if os(macOS)
+        macNavPill.padding(.top, Theme.Space.md)
+        #else
+        EmptyView()
+        #endif
+    }
+
+    /// The iOS/iPadOS bottom tab bar row; a no-op on macOS, which drives navigation from
+    /// `macTopNavOverlay` instead (MAC NAV MOVE). Kept as its own `@ViewBuilder` var for the same
+    /// #if-inside-a-view-builder reason as `macTopNavOverlay`.
+    @ViewBuilder private var bottomTabBarRow: some View {
+        #if os(macOS)
+        EmptyView()
+        #else
+        customTabBar
+        #endif
+    }
 
     /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
     /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
@@ -1373,8 +1437,9 @@ struct DownloadsView: View {
             controls(record)
         }
         .padding(Theme.Space.sm)
-        .background(Theme.Palette.surface1.opacity(0.6),
-                    in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // glass-Browse: a bespoke card row, not routed through a shared row style, so it flips straight
+        // to the glass card preset instead of the flat surface1 fill.
+        .vortxSettingsCard()
         // No whole-row .onTapGesture: it swallowed the taps meant for the Play / Pause / Resume / Delete
         // buttons inside the row (none of them fired). The dedicated Play button handles playback.
     }
@@ -1507,7 +1572,9 @@ struct iOSLibraryDownloadsPill: View {
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.sm)
             .frame(maxWidth: .infinity)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            // glass-Browse: the Downloads pill is bespoke chrome, so it flips straight to the glass card
+            // preset instead of the flat surface1 fill.
+            .vortxSettingsCard()
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1964,8 +2031,9 @@ struct iOSDiscoverView: View {
         }
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.sm)
-        .background(Theme.Palette.surface1, in: Capsule())
-        .overlay(Capsule().stroke(Theme.Palette.surface2, lineWidth: 1))
+        // glass-Browse: the merged Discover search field is bespoke chrome (not routed through a shared
+        // row/chip style), so it flips straight to the glass field preset instead of the flat surface1 fill.
+        .vortxGlassField(in: Capsule())
         .padding(.horizontal, Theme.Space.md)
     }
 
@@ -3212,7 +3280,9 @@ struct PosterCardiOS: View {
                             }
                             .foregroundStyle(.white)
                             .padding(.horizontal, 5).padding(.vertical, 2)
-                            .background(.black.opacity(0.6), in: Capsule())
+                            // glass-Browse: the on-poster badge alpha (never the poster image itself), so
+                            // the rating badge reads as VortX chrome instead of a flat black pill.
+                            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
                             .padding(5)
                         }
                     }
@@ -3224,7 +3294,8 @@ struct PosterCardiOS: View {
                                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 5).padding(.vertical, 2)
-                                .background(.black.opacity(0.6), in: Capsule())
+                                // glass-Browse: same on-poster badge alpha as the rating badge above.
+                                .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
                                 .padding(5)
                                 // Lift clear of the 4pt progress stripe pinned to the very bottom.
                                 .padding(.bottom, 4)
@@ -3394,14 +3465,37 @@ extension View {
                     }
                 }
             }
-            // #4: a translucent (frosted) top bar, so the hero and content read as scrolling under a
-            // blurred chrome rather than a flat opaque strip.
-            .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
+            // #4 / glass-Browse: a translucent top bar, so the hero and content read as scrolling under
+            // a blurred chrome rather than a flat opaque strip. Tinted with the SAME warm VortXGlass fill
+            // as the bottom tab bar (VortXGlass.toolbarAppearance()), not a raw system .ultraThinMaterial,
+            // so top and bottom chrome read as one glass system. Re-skin only: SwiftUI's
+            // `.toolbarBackground` only accepts a ShapeStyle, so the glass tint goes on via the same
+            // UIKit appearance-proxy idiom RootTabView already uses for the tvOS tab bar.
             .toolbarBackground(.visible, for: .navigationBar)
+            .onAppear { Self.applyVortXNavBarAppearance() }
         #else
         self
         #endif
     }
+
+    #if os(iOS)
+    /// Tint the system nav bar's own blur with `VortXGlass.toolbarAppearance()`'s SAME warm fill /
+    /// Reduce-Transparency fallback, via the global `UINavigationBar.appearance()` proxy (mirrors the
+    /// `UITabBar.appearance()` proxy RootTabView already uses for the tvOS tab bar). `UIToolbarAppearance`
+    /// and `UINavigationBarAppearance` both derive from `UIBarAppearance`, so its `backgroundEffect` /
+    /// `backgroundColor` carry over directly: ONE glass source of truth for both bar kinds. Idempotent
+    /// property assignment, safe to call from every `onAppear`.
+    fileprivate static func applyVortXNavBarAppearance() {
+        let toolbar = VortXGlass.toolbarAppearance()
+        let nav = UINavigationBarAppearance()
+        nav.backgroundEffect = toolbar.backgroundEffect
+        nav.backgroundColor = toolbar.backgroundColor
+        nav.shadowColor = .clear
+        UINavigationBar.appearance().standardAppearance = nav
+        UINavigationBar.appearance().scrollEdgeAppearance = nav
+        UINavigationBar.appearance().compactAppearance = nav
+    }
+    #endif
 
     /// A scroll/drag on a browse screen quiets the ambient hero rotation; the model resumes it after a
     /// spell of inactivity (#53). Implemented as a non-blocking `simultaneousGesture` so it observes

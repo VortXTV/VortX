@@ -36,8 +36,11 @@ struct iOSLiveView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
             // navigationTitle bridges into the single shared window toolbar on macOS where every mounted
             // tab stamps its own title, crashing NSToolbar on duplicate inserts. So it is iOS-only.
+            // glass-Browse: routed through the shared `stremioWordmarkTitle` helper (wordmark + the
+            // VortXGlass top-bar tint) like every other tab, so Live matches the tab bar instead of
+            // falling back to a bare, unglassed system nav bar.
             #if os(iOS)
-            .navigationTitle("Live TV")
+            .stremioWordmarkTitle("Live TV")
             #endif
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name,

@@ -141,7 +141,9 @@ struct FeaturedHeroView: View {
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .padding(.horizontal, Theme.Space.md)
                     .padding(.vertical, Theme.Space.sm)
-                    .background(.black.opacity(0.72), in: Capsule())
+                    // glass-Browse: a non-interactive notice, so it flips to the shared toast glass
+                    // preset in place of the flat black capsule.
+                    .vortxGlassToast(in: Capsule())
                     .padding(.bottom, Theme.Space.md)
                     .transition(reduceMotion ? .identity : .opacity)
                     .allowsHitTesting(false)

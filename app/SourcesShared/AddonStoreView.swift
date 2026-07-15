@@ -160,7 +160,9 @@ struct AddonStoreView: View {
             field
         }
         .padding(Theme.Space.md)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // glass-Browse: the store search field is bespoke chrome (not a shared row/chip), so it flips
+        // straight to the glass field preset instead of the flat surface1 fill.
+        .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
     }
 
     @ViewBuilder private var field: some View {
