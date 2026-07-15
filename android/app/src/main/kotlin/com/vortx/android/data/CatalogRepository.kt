@@ -122,6 +122,25 @@ interface CatalogRepository {
     /// the per-profile resume position. The player only ever receives a concrete URL.
     suspend fun resolve(source: StreamSource): Result<Playable>
 
+    // ---- Live playback progress (engine Player) ----
+    //
+    // Mirrors Apple's `CoreBridge` Player lifecycle so Continue Watching + resume track on Android too.
+    // Default bodies are benign no-ops, so the offline preview (whose progress is not engine-backed) and
+    // any future one-shot implementation satisfy the contract without change; [EngineStremioRepository]
+    // overrides them for the real engine dispatch.
+
+    /// Load the engine Player for the title currently open in `meta_details`, so subsequent
+    /// [reportProgress] ticks attribute to the right library item. Call once when playback begins.
+    suspend fun beginPlaybackSession(): Result<Unit> = Result.success(Unit)
+
+    /// Report the live playback position + duration (ms) to the engine, so Continue Watching updates.
+    /// Call periodically while playing.
+    suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = Result.success(Unit)
+
+    /// Report a final position and tear the engine Player down. Call once when the player closes (save on
+    /// exit). A near-the-end position additionally marks the title watched.
+    suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = Result.success(Unit)
+
     // ---- S05: Detail watched-state + library mutations ----
     //
     // Every mutation returns the freshly re-pulled [MetaDetail] so the caller can swap its state in one

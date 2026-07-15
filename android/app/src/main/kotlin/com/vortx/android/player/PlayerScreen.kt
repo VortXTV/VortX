@@ -1,5 +1,9 @@
 package com.vortx.android.player
 
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -20,6 +24,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import com.vortx.android.model.Playable
+import kotlinx.coroutines.delay
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -49,10 +54,23 @@ fun PlayerScreen(
     modifier: Modifier = Modifier,
     emberAccent: Color = DefaultEmber,
     engineOverride: PlayerEngineRouter.Override = PlayerEngineRouter.Override.AUTO,
+    /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
+    /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
+    onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
+    /// to [onBack] (return to the detail page, which shows the sources).
+    onError: () -> Unit = onBack,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val currentOnBack by rememberUpdatedState(onBack)
+    val currentOnProgress by rememberUpdatedState(onProgress)
+    val currentOnError by rememberUpdatedState(onError)
+
+    // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
+    // current playback speed reflected in the speed control.
+    var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
+    var speed by remember(playable.url) { mutableStateOf(1.0f) }
 
     // Force-to-ExoPlayer latch: flipped when the mpv engine reports a surface failure, so the remember
     // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playable url so a new
@@ -89,6 +107,7 @@ fun PlayerScreen(
     }
 
     val playerState by engine.state.collectAsStateWithLifecycle()
+    val latestState by rememberUpdatedState(playerState)
 
     // When playback ends, hand control back to the detail page.
     LaunchedEffect(playerState.hasEnded) {
@@ -102,17 +121,74 @@ fun PlayerScreen(
         if (failedFlag) forceExoPlayer = true
     }
 
+    // Periodic progress writeback while playing, so Continue Watching updates live. The engine's state
+    // position advances ~1s on both engines (mpv's time-pos observer, ExoPlayer's position ticker), so a
+    // throttled read here is accurate; the host debounces the engine dispatch.
+    LaunchedEffect(engine) {
+        while (true) {
+            delay(PROGRESS_REPORT_MS)
+            val s = latestState
+            if (!s.isPaused && s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+        }
+    }
+
+    // Save-on-exit: emit the freshest position when the player leaves composition, so the host's
+    // end-of-session write records where the viewer actually stopped.
+    DisposableEffect(engine) {
+        onDispose {
+            val s = latestState
+            if (s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+        }
+    }
+
+    // AudioFocus: pause when another app takes audio (a call, another player) so VortX never talks over
+    // it, and resume on gain. Standard AudioManager focus request (minSdk 26 carries AudioFocusRequest).
+    DisposableEffect(engine) {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+            when (change) {
+                AudioManager.AUDIOFOCUS_LOSS,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> engine.pause()
+                AudioManager.AUDIOFOCUS_GAIN -> engine.play()
+            }
+        }
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build(),
+            )
+            .setOnAudioFocusChangeListener(focusListener)
+            .build()
+        audioManager?.requestAudioFocus(request)
+        onDispose { audioManager?.abandonAudioFocusRequest(request) }
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
-        engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb())
+        engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb(), scaleMode = scaleMode)
 
         PlayerChrome(
             playable = playable,
             state = playerState,
             dolbyVisionAvailable = displaySupportsDolbyVision(context),
             emberAccent = emberAccent,
+            speed = speed,
+            scaleMode = scaleMode,
             onBack = currentOnBack,
             onTogglePause = engine::togglePause,
             onSeek = engine::seekTo,
+            onSelectAudio = engine::selectAudioTrack,
+            onSelectSubtitle = engine::selectSubtitleTrack,
+            onSetSpeed = { newSpeed ->
+                speed = newSpeed
+                engine.setPlaybackSpeed(newSpeed)
+            },
+            onToggleScaleMode = {
+                scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
+            },
+            onErrorRetry = currentOnError,
             modifier = Modifier.fillMaxSize(),
         )
     }
@@ -130,3 +206,8 @@ private fun mpvSurfaceFailed(engine: PlayerEngine): Boolean {
 }
 
 internal val DefaultEmber = Color(0xFFD97706)
+
+/// Progress writeback cadence: report the live position to the host every few seconds while playing. The
+/// host debounces the actual engine dispatch, so this only needs to be frequent enough that a save-on-
+/// exit lands near where the viewer actually stopped.
+private const val PROGRESS_REPORT_MS = 5_000L

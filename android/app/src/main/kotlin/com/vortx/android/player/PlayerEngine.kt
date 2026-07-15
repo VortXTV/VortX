@@ -37,6 +37,10 @@ interface PlayerEngine {
     fun togglePause()
     fun seekTo(positionMs: Long)
 
+    /// Set the playback speed multiplier (1.0 = normal). Both engines support this natively (ExoPlayer's
+    /// `setPlaybackSpeed`, mpv's `speed` property); the chrome offers a small set of presets.
+    fun setPlaybackSpeed(speed: Float)
+
     /// Select a track by its engine-native id (from [PlayerState.audioTracks] / [subtitleTracks]).
     /// `null` disables the track (subtitles off). No-op for an unknown id.
     fun selectAudioTrack(id: Int)
@@ -55,9 +59,15 @@ interface PlayerEngine {
     /// The engine's video surface, hosted by the caller's `AndroidView`. Implementations own surface
     /// attach/detach against their lifecycle. [emberArgb] lets an engine tint any built-in chrome
     /// (ExoPlayer's scrubber) to the VortX accent; mpv ignores it (VortX draws its own chrome).
+    /// [scaleMode] is re-applied on recomposition (ExoPlayer's `resizeMode`, mpv's `panscan`) so the
+    /// chrome's aspect/zoom toggle takes effect without rebuilding the surface.
     @Composable
-    fun VideoSurface(modifier: Modifier, emberArgb: Int)
+    fun VideoSurface(modifier: Modifier, emberArgb: Int, scaleMode: VideoScaleMode)
 }
+
+/// How the video fills the surface: [FIT] letterboxes to preserve the whole frame (default), [ZOOM]
+/// crops to fill the screen (fill/zoom). The chrome's aspect toggle cycles between them.
+enum class VideoScaleMode { FIT, ZOOM }
 
 /// A single audio or subtitle track the chrome can offer. `id` is the engine-native selector passed
 /// back to [PlayerEngine.selectAudioTrack] / [selectSubtitleTrack]; `title` / `lang` are for display.
@@ -76,6 +86,9 @@ data class PlayerState(
     val isPaused: Boolean = false,
     val isBuffering: Boolean = false,
     val hasEnded: Boolean = false,
+    /// Set when the live engine reports an unrecoverable playback error (ExoPlayer's `onPlayerError`),
+    /// so the chrome can offer a return-to-sources fallback instead of a dead black frame.
+    val hasError: Boolean = false,
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),
 )

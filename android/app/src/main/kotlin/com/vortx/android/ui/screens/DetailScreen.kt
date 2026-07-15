@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
+import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -605,14 +606,19 @@ private fun SourcesSection(
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
                 }
+                // Groups + streams are already ranked best-first by CatalogRepository.streams(); here we
+                // derive the quality label, flavour tags, and size from the source's own tags via the same
+                // StreamRanking parse that scored them, so the picker shows a real "4K · HDR · Remux · 18 GB"
+                // line the viewer can choose from.
                 state.data.forEach { group ->
                     group.streams.forEach { source ->
                         SourceRow(
                             addon = source.addon,
                             title = source.title,
-                            quality = source.quality,
+                            quality = StreamRanking.qualityLabel(source),
                             isTorrent = source.isTorrent,
-                            flavorTags = listOfNotNull(source.description),
+                            flavorTags = StreamRanking.flavorTags(source),
+                            size = StreamRanking.sizeText(source),
                             enabled = !resolving,
                             onClick = { onPlay(source) },
                         )
