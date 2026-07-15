@@ -219,7 +219,7 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
 /// Holds the macOS "Who's watching?" picker to present WINDOW-FILLING at the app window's ROOT, the same
 /// hoist trick MacPlayerHost uses for the player. A DEDICATED singleton (not MacPlayerHost) so the picker
 /// and a full-window player can never clobber one another's hosted view, and so the picker path never runs
-/// the player's chrome-hider — the traffic lights stay live over the picker.
+/// the player's chrome-hider, so the traffic lights stay live over the picker.
 final class MacProfileCoverHost: ObservableObject {
     static let shared = MacProfileCoverHost()
     @Published var content: AnyView?
@@ -246,7 +246,7 @@ private struct MacProfileCoverBridge<C: View>: View {
     @Binding var isPresented: Bool
     @ViewBuilder let content: () -> C
     /// Stable per-instance identity (persisted across re-renders by @State) so a torn-down bridge clears
-    /// only its own hosted view — see MacProfileCoverHost.ownerID.
+    /// only its own hosted view (see MacProfileCoverHost.ownerID).
     @State private var ownerID = UUID()
     var body: some View {
         Color.clear
