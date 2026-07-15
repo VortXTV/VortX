@@ -39,6 +39,16 @@ actor TraktAuth {
     /// API base for OAuth endpoints. Trakt serves OAuth off the same host as the data API.
     static let apiBase = "https://api.trakt.tv"
 
+    /// The OAuth redirect URI registered for this app at https://trakt.tv/oauth/applications. Trakt
+    /// requires it on the `refresh_token` grant and it MUST byte-for-byte equal the registered value,
+    /// or the refresh 401s and the session is silently dropped (which presents to the user as "Trakt
+    /// stopped working" after the first successful sign-in). This is the documented out-of-band value
+    /// for a device/no-callback client; it is a PUBLIC constant (not a secret), so it is hardcoded here
+    /// rather than plumbed through xcconfig/Info.plist. NOTE: the DEVICE token exchange
+    /// (`POST /oauth/device/token`) does NOT send a redirect_uri; Trakt's device flow does not expect
+    /// one, and sending a stray value there can get the exchange rejected. Only `performRefresh` uses it.
+    static let registeredRedirectURI = "urn:ietf:wg:oauth:2.0:oob"
+
     /// True once a non-empty client id/secret pair is present. Everything no-ops until then.
     static var isConfigured: Bool { !clientID.isEmpty && !clientSecret.isEmpty }
 
@@ -131,7 +141,13 @@ actor TraktAuth {
             authorized: false
         )
         let (data, status) = try await send(request)
-        guard status == 200 else { throw TraktAuthError.server(status: status) }
+        DiagnosticsLog.log("trakt-auth", "device/code -> HTTP \(status)")
+        guard status == 200 else {
+            // A 401 at the CODE step means the shipped client_id is not a valid Trakt app key. Surface it
+            // distinctly from a transient server fault so a provisioning problem is unambiguous.
+            if status == 401 { throw TraktAuthError.invalidClient }
+            throw TraktAuthError.server(status: status)
+        }
         return try decode(TraktDeviceCode.self, from: data)
     }
 
@@ -160,12 +176,26 @@ actor TraktAuth {
         case 200:
             let token = try decode(TraktToken.self, from: data)
             store(token)
+            DiagnosticsLog.log("trakt-auth", "device/token -> 200 authorized")
             return .authorized(token)
         case 400:
-            // Pending: the user has not finished authorizing yet. Keep polling.
+            // Pending: the user has not finished authorizing yet. Keep polling. Trakt sends a bare 400
+            // with no OAuth error body for pending; a rejected client is a distinct status (401 below),
+            // so this stays a clean keep-polling signal and is intentionally NOT logged (it repeats every
+            // `interval` seconds and would flood the capped diagnostics log).
             return .pending
+        case 401:
+            // The client_id/client_secret PAIR was rejected. `device/code` needs only the id (so a user
+            // code was still minted and shown), but this token exchange also needs the secret; a wrong or
+            // mismatched TRAKT_CLIENT_SECRET fails ONLY here. This is exactly the SIMKL-works / Trakt-fails
+            // asymmetry the tester saw: SIMKL's PIN flow authenticates with the client_id alone and never
+            // sends a secret, so a bad Trakt secret is invisible to it. Surfaced as a terminal, actionable
+            // error instead of spinning until the code expires.
+            DiagnosticsLog.log("trakt-auth", "device/token -> 401 invalid_client (verify TRAKT_CLIENT_SECRET matches the app)")
+            throw TraktAuthError.invalidClient
         case 429:
             // Slow down: the app polled faster than `interval`. Back off, then keep polling.
+            DiagnosticsLog.log("trakt-auth", "device/token -> 429 slow_down")
             return .slowDown
         case 404:
             throw TraktAuthError.invalidDeviceCode
@@ -176,6 +206,7 @@ actor TraktAuth {
         case 418:
             throw TraktAuthError.denied
         default:
+            DiagnosticsLog.log("trakt-auth", "device/token -> HTTP \(status) (unexpected)")
             throw TraktAuthError.server(status: status)
         }
     }
@@ -186,7 +217,9 @@ actor TraktAuth {
     @discardableResult
     func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> TraktToken {
         let deadline = Date().addingTimeInterval(TimeInterval(expiresIn))
-        var waitSeconds = max(interval, 1)
+        let baseInterval = max(interval, 1)
+        var waitSeconds = baseInterval
+        DiagnosticsLog.log("trakt-auth", "poll start interval=\(baseInterval)s expiresIn=\(expiresIn)s")
         while Date() < deadline {
             try await sleep(seconds: waitSeconds)
             try Task.checkCancellation()
@@ -194,11 +227,16 @@ actor TraktAuth {
             case .authorized(let token):
                 return token
             case .pending:
-                waitSeconds = max(interval, 1)
+                waitSeconds = baseInterval
             case .slowDown:
-                waitSeconds = max(interval, 1) + 1   // back off per Trakt guidance
+                // Escalate on REPEATED 429s (Trakt raises the required interval each time it slows you
+                // down); a flat `interval + 1` never grows and keeps tripping the limit. Reset to the base
+                // happens on the next successful pending. Capped so a persistent 429 cannot stretch a
+                // single poll unbounded.
+                waitSeconds = min(waitSeconds + 1, baseInterval + 10)
             }
         }
+        DiagnosticsLog.log("trakt-auth", "poll deadline reached without authorization (expired)")
         throw TraktAuthError.expired
     }
 
@@ -246,8 +284,9 @@ actor TraktAuth {
             let refresh_token: String
             let client_id: String
             let client_secret: String
-            // Trakt requires a redirect_uri even on the refresh grant; the device flow uses the
-            // documented out-of-band value.
+            // Trakt requires a redirect_uri on the refresh grant, and it must equal the app's registered
+            // value exactly (see `registeredRedirectURI`). The device token exchange, by contrast, sends
+            // no redirect_uri at all.
             let redirect_uri: String
             let grant_type: String
         }
@@ -255,7 +294,7 @@ actor TraktAuth {
             refresh_token: refreshToken,
             client_id: Self.clientID,
             client_secret: Self.clientSecret,
-            redirect_uri: "urn:ietf:wg:oauth:2.0:oob",
+            redirect_uri: Self.registeredRedirectURI,
             grant_type: "refresh_token"
         )
         let request = try makeRequest(path: "/oauth/token", method: "POST", body: body, authorized: false)
@@ -396,6 +435,10 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
     case codeAlreadyUsed
     case expired
     case denied
+    /// The Trakt app credentials (client_id/client_secret pair) were rejected by the OAuth endpoint
+    /// (HTTP 401). Distinct from a transient `.server` fault: it means the shipped credentials do not
+    /// match a valid, enabled Trakt application, so retrying will not help until they are fixed.
+    case invalidClient
     case server(status: Int)
     case transport(String)
     case decoding
@@ -409,6 +452,7 @@ enum TraktAuthError: LocalizedError, Sendable, Equatable {
         case .codeAlreadyUsed: return "This Trakt sign-in code was already used."
         case .expired: return "The Trakt sign-in code expired. Please try again."
         case .denied: return "Trakt access was denied."
+        case .invalidClient: return "Trakt did not accept this app's credentials. Please report this if it continues."
         case .server(let status): return "Trakt returned an error (HTTP \(status))."
         case .transport(let message): return message
         case .decoding: return "Could not read the response from Trakt."
