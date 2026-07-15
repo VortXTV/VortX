@@ -218,10 +218,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private static let hlsMaxSegmentBytes = 32 << 20
     /// The playlist's EXT-X-TARGETDURATION: must be >= every EXTINF and stay constant across reloads.
     static let hlsTargetDuration = 5
-    /// Belt-and-braces to the flush-rc check (#76): if the moov placeholder is located but its size backpatch
-    /// never lands within this window while packets still flow, the init is starved (an unparseable audio bed
-    /// blocking moov finalization); fail so the demotion runs in ~1s rather than at the 20s start watchdog.
+    /// Init-starve guard (#76/#134): if a moov size-0 placeholder is located but its size backpatch never
+    /// lands within this window while packets still flow, the init is starved and the mount is dead; fail so
+    /// the demotion runs in ~1s rather than at the start watchdog. With the pre-init cut gate (#134) the only
+    /// legitimate way a placeholder reaches the scan is a >AVIO-buffer moov flushed mid-write (whose backpatch
+    /// arrives via the seekable-AVIO overwrite path); this guard catches that path wedging.
     private static let hlsInitStarveSecs = 4.0
+    /// Pre-init moov deadline (#134 correction): fail fast when this much MEDIA time has been muxed since
+    /// the first video packet and movenc has still not even STARTED the moov (no placeholder armed). That
+    /// shape means some mapped track has never delivered a parseable packet, so the force=0 auto-flush
+    /// defers forever and no init can ever publish. Measured on the MEDIA clock, not wall time, on
+    /// purpose: a slow chunked mount advances media slowly and must never be failed early (the
+    /// progress-aware start watchdog owns that call); this trips only while packets are flowing briskly
+    /// and the moov is provably uncompletable. movenc attempts the auto-flush every 1s of media
+    /// (frag_duration), and the DV pre-scan drain is capped at 240 packets (under ~10s of media even if
+    /// all-video), so 12s of pure deferral is conclusive without ever tripping inside the drain.
+    private static let hlsPreInitMoovDeadlineSecs = 12.0
 
     /// Start the remux on a dedicated background thread. Idempotent-ish: call once per session.
     ///
@@ -874,7 +886,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // seek-free half: the buffered packets are the exact bytes the loop would have read, so muxing them in
         // order reproduces a full stream. Same streamMap / convertP7 / rescale path as the live loop below.
         while !prebuffered.isEmpty, !isCancelled {
-            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
+            if let starve = hlsInitStarved() { buffer.fail(starve); return }
             let p = prebuffered.removeFirst()
             defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
             let inIdx = Int(p.pointee.stream_index)
@@ -918,9 +930,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let AVERROR_EOF_CONST: Int32 = -541478725
         var readRetries = 0
         let maxReadRetries = 4
+        // One-shot startup diagnostic (#134): the stalled-mount logs froze with produced at a few KB and NO
+        // further remux activity for 15s+, which means av_read_frame itself sat blocked on the source (a
+        // sizeless/chunked debrid link going quiet right after the probe read-ahead, rw_timeout x reconnect
+        // in play). That input-side stall is otherwise invisible in a device export; log the FIRST live read
+        // that takes pathologically long so the next diagnostics export separates "source went quiet"
+        // (network) from "muxer wedged" (code) in one line. Date() twice per read until it fires, then free.
+        var slowReadLogged = false
         while !isCancelled {
-            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
+            if let starve = hlsInitStarved() { buffer.fail(starve); return }
+            let readBegan = slowReadLogged ? nil : Date()
             let rf = av_read_frame(inCtx, pkt)
+            if let readBegan {
+                let took = Date().timeIntervalSince(readBegan)
+                if took > 3.0 {
+                    slowReadLogged = true
+                    DiagnosticsLog.log("dv", "live source read stalled \(String(format: "%.1f", took))s (rc=\(rf), produced=\(buffer.producedCount)B)")
+                }
+            }
             if rf < 0 {
                 if rf == AVERROR_EOF_CONST { break }   // genuine EOF: write the trailer + finish() below
                 if isCancelled { break }
@@ -1254,13 +1281,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         DiagnosticsLog.log("dv", "hls init scan aborted: \(reason)")
     }
 
-    /// Belt-and-braces to the flush-rc check (#76): the moov placeholder was located but its size backpatch has
-    /// never landed to publish the init, `hlsInitStarveSecs` after it was seen and while packets are still being
-    /// fed. That means moov finalization is wedged (the unparseable audio bed blocking it), so the mount is dead;
-    /// the caller fails the buffer so demotion runs in ~1s rather than at the 20s start watchdog. Remux-thread only.
-    private func hlsInitStarved() -> Bool {
-        guard hlsIndexingEnabled, !hlsHeadDone, hlsMoovStart != nil, let located = hlsMoovLocatedAt else { return false }
-        return Date().timeIntervalSince(located) > Self.hlsInitStarveSecs
+    /// Init-starve guard (#76/#134): returns the fail-fast reason once the init provably can no longer
+    /// publish, or nil while it is still viable (or already published). Checked between packets while data
+    /// still flows, so a stalled source can never trip it (remux thread only). Two independent trips:
+    /// backpatch starve (#76), the moov placeholder was located but its size backpatch never landed within
+    /// `hlsInitStarveSecs` (with the pre-init cut gate this only arms on the legitimate >AVIO-buffer moov
+    /// path, so it means finalization is wedged); and the pre-init moov deadline (#134),
+    /// `hlsPreInitMoovDeadlineSecs` of media muxed and movenc never even started the moov (see the
+    /// constant). The caller fails the buffer so demotion runs in ~1s rather than at the start watchdog.
+    private func hlsInitStarved() -> String? {
+        guard hlsIndexingEnabled, !hlsHeadDone else { return nil }
+        if hlsMoovStart != nil, let located = hlsMoovLocatedAt,
+           Date().timeIntervalSince(located) > Self.hlsInitStarveSecs {
+            return "init starved: moov size backpatch never landed"
+        }
+        if hlsMoovStart == nil, let start = hlsSegmentStartSec {
+            let media = hlsLastVideoSec - start
+            if media > Self.hlsPreInitMoovDeadlineSecs {
+                return "init starved: moov never began after \(String(format: "%.1f", media))s of media (a mapped track never parsed)"
+            }
+        }
+        return nil
     }
 
     /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
@@ -1269,6 +1310,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// the muxer's open fragment (`av_interleaved_write_frame(ctx, nil)`, the documented movenc fragment
     /// cut) + flush the AVIO tail, after which `buffer.producedCount` is EXACTLY the segment's end byte.
     /// movenc's own frag_duration auto-cuts continue as shipped; they simply become intra-segment fragments.
+    /// Cuts are GATED on the init segment being published (`hlsHeadDone`): pre-init a forced flush is both
+    /// useless (no segment can close before `hlsSegmentStartByte` exists) and DANGEROUS (see the #134 note
+    /// inside), so the delayed moov is left entirely to movenc's own safe frag_duration auto-flush. The
+    /// pre-init branch still pushes the AVIO tail on every base-video packet, so an auto-flushed moov
+    /// reaches the head scan on the next packet rather than on a 4 MiB AVIO-buffer overflow (note inside).
     private func hlsMaybeCut(outCtx: UnsafeMutablePointer<AVFormatContext>,
                              pkt: UnsafeMutablePointer<AVPacket>,
                              timeBase: AVRational) {
@@ -1283,6 +1329,40 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsSegmentStartSec = sec   // the first base-video packet opens segment 0
             return
         }
+        // #134 root cause: NEVER force a fragment flush before the init segment is published. The forced
+        // flush below reaches movenc as mov_flush_fragment(force=1), which BYPASSES the "all tracks have
+        // data" guard and tries to serialize the delayed moov even when the mapped audio track has no
+        // parsed packet yet (a probe window that re-delivered only video so far, or a first (E)AC3 burst
+        // the parser has not finished). movenc then HALF-writes the moov into the AVIO buffer (ftyp +
+        // video trak, dying at the audio sample entry: "Cannot write moov atom before (E)AC3 packets"),
+        // and mov_write_packet(s, NULL) SWALLOWS that error (returns 1, libavformat 62.12.101), so the
+        // flushRc check below can never see it and movenc's moov_written stays 0. The avio_flush below
+        // then pushed that ORPHANED ftyp+moov with a size-0 placeholder into the produced stream,
+        // hlsIndexHead armed hlsMoovStart on it, and the one-shot head scan waited forever for a size
+        // backpatch movenc never issues: a LATER successful moov is a FRESH ftyp+moov appended at a
+        // higher offset, invisible to the armed scan. Init never published -> media.m3u8 starved ->
+        // "TRUE STALL -> libmpv HDR10" on ~half of all DV mounts (issue #134). So pre-init, ONLY the
+        // forced flush is skipped. There is nothing to cut yet anyway (hlsCloseSegment no-ops until
+        // hlsFinalizeInit sets hlsSegmentStartByte); movenc's frag_duration auto-flush (force=0) DEFERS
+        // WHOLE until every mapped track really has data (mov_flush_fragment returns before writing a
+        // byte), so it can never begin a moov it has to abandon: the first head bytes it ever emits are
+        // a COMPLETE ftyp+moov with its size backpatched in-buffer, or the >AVIO-buffer overflow path
+        // whose placeholder+backpatch the init-starve guard already polices. Cuts resume here on the
+        // first packet after the init publishes. hlsHeadDone also flips on hlsAbortInitScan, so a dead
+        // scan cannot park this gate forever (that mount is already failing over). Legacy loader
+        // delivery is untouched (hlsIndexingEnabled guard).
+        guard hlsHeadDone else {
+            // Push the AVIO tail even though the cut is skipped. movenc lands that completed moov in the
+            // 4 MiB AVIO buffer during a packet write, and with AVFMT_FLAG_FLUSH_PACKETS unset nothing
+            // else drains the buffer until it OVERFLOWS: waiting for the overflow adds ~1.3s of startup
+            // latency to every DV mount and never comes at all on a chunked/slow mount that stalls under
+            // 4 MiB (a completed, playable moov sitting unserved until the start watchdog demotes the
+            // title to HDR10). avio_flush only moves bytes movenc already finished writing and cannot
+            // call back into movenc, so it can publish the moov early but can never re-create the
+            // half-moov orphan above.
+            avio_flush(outCtx.pointee.pb)
+            return
+        }
         let elapsed = sec - start
         let isKey = (pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST) != 0
         let openBytes = buffer.producedCount - (hlsSegmentStartByte ?? 0)
@@ -1291,13 +1371,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 || openBytes >= Self.hlsMaxSegmentBytes else { return }
         let flushRc = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
         if flushRc < 0 {
-            // A delayed moov (movflags delay_moov) is emitted on the FIRST fragment flush; when the audio bed's
-            // sample entry cannot be finalized (an E-AC3/DDP track libav could not parse) this flush fails and
-            // the moov is never written. That rc used to be discarded (`_ =`), so the init never published, the
-            // playlist starved, and only the 20s start watchdog demoted. Fail here so the HLS server 404s and
-            // the existing demotion runs in ~1s. (Every later cut flushes too; a failure there is just as fatal.)
-            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsHeadDone) (delayed moov write failed)")
-            buffer.fail("delayed moov write failed (\(flushRc))")
+            // Post-init only (the hlsHeadDone gate above): a failed cut means the interleave drain or the
+            // fragment write died, so the pipeline is wedged; fail so the HLS server 404s and the demotion
+            // runs in ~1s instead of the start watchdog. NOTE (#134): this rc can NOT see a failed DELAYED
+            // MOOV write. movenc's mov_write_packet(s, NULL) discards mov_flush_fragment's error and returns
+            // 1 (libavformat 62.12.101), which is why the pre-init force is gated off above rather than
+            // rc-checked here; the moov-write failure that CAN surface (an unparseable audio bed at movenc's
+            // own force=0 auto-flush) comes back through the av_interleaved_write_frame(pkt) rc in the mux
+            // loops, which already logs + fails the buffer.
+            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsHeadDone)")
+            buffer.fail("fragment flush failed (\(flushRc))")
             return
         }
         avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
