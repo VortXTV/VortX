@@ -4,6 +4,21 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 2 - 2026-07-15
+
+A fix beta on top of 0.3.14 Beta 1, with the same feature set. It sharpens the Dolby Vision and Atmos handoff on Apple TV, corrects the Mac layout and the liquid-glass player chrome, restores Apple TV focus smoothness, and closes a set of smaller playback and download fixes.
+
+### Fixed (build 182)
+
+- **Dolby Vision and Atmos hold on Apple TV.** On about half of Dolby Vision titles the picture waited fifteen to twenty seconds and then dropped to HDR10, losing Atmos with it; a packaging step in the Dolby Vision lane was stalling before the first frame and is fixed, so those titles keep true Dolby Vision and their Atmos audio. Apple TV especially, plus iPhone, iPad, and Mac.
+- **Dolby Vision plays as Dolby Vision on Mac and iPhone, not tone-mapped HDR10.** A Dolby Vision title that the engine picker showed as the direct player was quietly rendering through the other engine; it now routes correctly, and the engine label matches what is actually playing. iPhone, iPad, and Mac.
+- **Mac fullscreen no longer washes out HDR and Dolby Vision color.** Entering fullscreen used to desaturate the picture and leave it flat; it now keeps HDR and Dolby Vision color vivid in fullscreen and after you exit. Mac.
+- **A corrected Mac layout.** The Home hero is about two-thirds of the window with Continue Watching below it and the artwork running to the very top, search and navigation now sit together at the top instead of the nav floating halfway down the hero, the player lost the grey bar and the dead back control at the top along with the soft halos behind its round buttons, the top buttons read crisply, the volume slider is colored again, the who's-watching selected profile is no longer clipped, episode and season pages have proper full heroes, and cast members are tappable. Mac.
+- **Apple TV is smooth again and its colors are full strength.** Focusable rows were re-compositing a live blur on every focus move, dragging the frame rate down and dulling the color; that is gone. Play from start works, and the source you picked is remembered and marked Played when you return. Apple TV.
+- **iPhone downloads and player labels.** A download that reached 100 percent but could not save because the device was locked now finishes saving the moment you unlock instead of failing, and the player's bottom control labels no longer wrap mid-word. iPhone, iPad.
+- **Decade catalog shelves load their cover art.** Apple TV, iPhone, iPad, and Mac.
+- **Trakt sign-in troubleshooting.** Clearer diagnostics so a failed connect records exactly where it failed. Apple TV, iPhone, iPad, and Mac.
+
 ## 0.3.13 - 2026-07-11
 
 The community release, and the roll-up of the whole 0.3.12 test line (builds 167 to 174). Its headline is a player reliability series contributed by jbecker-it, his second contribution to VortX and his biggest yet, field-tested on real hardware: the pause-shortly-after-start crash is gone, watch progress saves on streams that never report a length, heavy scrubbing can no longer lose your place or falsely mark an episode watched, audio no longer distorts after big seeks or track changes, and Continue Watching updates the moment you stop watching. Alongside it, the Dolby Vision recovery line from builds 167 to 173, the launch profile picker and Liquid Glass from build 173, and a set of community-reported fixes: add-on HTTP and HLS streams now appear (#122), removed add-ons no longer ghost the Home customize list (#121), the diagnostic log saves without a QR code (#113), stream rows fit narrow iPhones (#118), and where-to-watch logos are legible everywhere (#95). In-place update, nothing resets.
