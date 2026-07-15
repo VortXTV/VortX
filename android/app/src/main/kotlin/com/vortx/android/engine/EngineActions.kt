@@ -20,6 +20,7 @@ object EngineActions {
     const val FIELD_META_DETAILS = "meta_details"
     const val FIELD_CTX = "ctx"
     const val FIELD_CONTINUE_WATCHING_PREVIEW = "continue_watching_preview"
+    const val FIELD_PLAYER = "player"
 
     /// Load the Home board (every catalog of every installed add-on). Mirrors CoreBridge.loadBoard.
     ///
@@ -276,6 +277,32 @@ object EngineActions {
         val args = JSONArray().put(season).put(isWatched)
         return envelope(FIELD_META_DETAILS, action("MetaDetails", action("MarkSeasonAsWatched", args)))
     }
+
+    // ---- Live playback progress (engine Player) ----
+    //
+    // Mirrors Apple `CoreBridge`'s Player lifecycle (`loadEnginePlayer` / `reportProgress` /
+    // `unloadEnginePlayer`, app/SourcesShared/CoreBridge.swift): Load the `player` model with the picked
+    // stream + its requests so the engine attributes progress to the right library item, then dispatch
+    // `TimeChanged` ticks (positions in ms) so `continue_watching_preview` updates live, then `Unload` on
+    // close so a stale Player can't absorb the next title's ticks. All dispatched with field = "player".
+
+    /// Load the engine `player` model for the picked stream. [selected] is the engine's `Player` selected
+    /// struct (`{ stream, streamRequest, metaRequest, subtitlesPath }`), assembled by the repository from
+    /// the resident `meta_details` (see [EngineStremioRepository.beginPlaybackSession]). The library item
+    /// keys on the META, not the specific stream, so any Ready stream + this title's requests attributes
+    /// correctly, matching Apple `loadEnginePlayer`'s fallback path.
+    fun loadPlayer(selected: JSONObject): String =
+        envelope(FIELD_PLAYER, action("Load", JSONObject().put("model", "Player").put("args", selected)))
+
+    /// Report the playback position to the engine Player (both values in MS), so Continue Watching
+    /// reflects it live. Mirrors Apple `reportProgress`'s `Player -> TimeChanged` dispatch.
+    fun playerTimeChanged(timeMs: Long, durationMs: Long, device: String): String {
+        val payload = JSONObject().put("time", timeMs).put("duration", durationMs).put("device", device)
+        return envelope(FIELD_PLAYER, action("Player", action("TimeChanged", payload)))
+    }
+
+    /// Tear down the engine Player. Mirrors Apple `unloadEnginePlayer`.
+    fun unloadPlayer(): String = envelope(FIELD_PLAYER, action("Unload", null))
 
     // ---- low-level builders ----
 

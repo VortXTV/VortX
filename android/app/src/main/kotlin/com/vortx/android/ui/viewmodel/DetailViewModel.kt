@@ -3,6 +3,7 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -127,18 +128,33 @@ class DetailViewModel(
     fun play(source: StreamSource) {
         if (_playback.value is Playback.Resolving) return
         _playback.value = Playback.Resolving
+        val resumeMs = resumeOffsetMs()
         viewModelScope.launch {
             _playback.value = repo.resolve(source).fold(
-                onSuccess = { Playback.Ready(it) },
+                onSuccess = { playable ->
+                    Playback.Ready(if (resumeMs > 0L) playable.copy(startPositionMs = resumeMs) else playable)
+                },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
         }
     }
 
-    /// The best source (first stream of the first group, which the engine returns best-first), for the
-    /// hero Watch button. Returns null when no sources resolved yet.
+    /// The best source across ALL loaded groups (ranked by [StreamRanking], not just the first stream of
+    /// the first group), for the hero Watch button. Returns null when no sources resolved yet. The sources
+    /// list itself is already ranked by [CatalogRepository.streams], so this and the top of the list agree.
     fun bestSource(): StreamSource? =
-        (_streams.value as? UiState.Success)?.data?.firstOrNull()?.streams?.firstOrNull()
+        (_streams.value as? UiState.Success)?.data?.let { StreamRanking.best(it) }
+
+    /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
+    /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0
+    /// (start from the top). Mirrors the Apple player reading `libraryItem.state.timeOffset` for resume,
+    /// so Continue-Watching titles resume where they were left off.
+    private fun resumeOffsetMs(): Long {
+        val lib = (_meta.value as? UiState.Success)?.data?.libraryItem ?: return 0L
+        if (lib.timeOffsetMs <= 0L) return 0L
+        val target = _selectedEpisodeId.value
+        return if (target == null || lib.videoId == null || lib.videoId == target) lib.timeOffsetMs else 0L
+    }
 
     fun clearPlayback() {
         _playback.value = Playback.Idle

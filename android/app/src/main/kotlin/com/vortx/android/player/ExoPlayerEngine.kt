@@ -2,6 +2,8 @@ package com.vortx.android.player
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.view.View
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -9,6 +11,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
@@ -57,10 +60,27 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         override fun onIsPlayingChanged(isPlaying: Boolean) = publish()
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = publish()
         override fun onTracksChanged(tracks: Tracks) = publish(tracks = tracks)
+
+        // Surface an unrecoverable decode/network error so the chrome can fall back to the ranked source
+        // list instead of leaving a dead black frame (error-to-sources fallback).
+        override fun onPlayerError(error: PlaybackException) {
+            _state.value = _state.value.copy(hasError = true)
+        }
+    }
+
+    // ExoPlayer pushes position only on discrete callbacks, never per second, so a 1s ticker republishes
+    // while playing -- keeps the chrome scrubber live AND gives the progress reporter a fresh position.
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ticker = object : Runnable {
+        override fun run() {
+            if (player.isPlaying) publish()
+            mainHandler.postDelayed(this, POSITION_POLL_MS)
+        }
     }
 
     init {
         player.addListener(listener)
+        mainHandler.postDelayed(ticker, POSITION_POLL_MS)
     }
 
     /// Snapshot the current player state into an immutable [PlayerState] and republish. `buffering` /
@@ -155,6 +175,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun pause() { player.pause() }
     override fun togglePause() { if (player.isPlaying) player.pause() else player.play() }
     override fun seekTo(positionMs: Long) { player.seekTo(positionMs.coerceAtLeast(0L)) }
+    override fun setPlaybackSpeed(speed: Float) { player.setPlaybackSpeed(speed.coerceIn(MIN_SPEED, MAX_SPEED)) }
 
     override fun selectAudioTrack(id: Int) = selectTrack(id, C.TRACK_TYPE_AUDIO)
 
@@ -214,12 +235,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun onEnterForeground() { /* resume is the chrome's choice; keep paused-on-return conservative */ }
 
     override fun release() {
+        mainHandler.removeCallbacks(ticker)
         player.removeListener(listener)
         player.release()
     }
 
     @Composable
-    override fun VideoSurface(modifier: Modifier, emberArgb: Int) {
+    override fun VideoSurface(modifier: Modifier, emberArgb: Int, scaleMode: VideoScaleMode) {
         AndroidView(
             modifier = modifier,
             factory = { ctx ->
@@ -230,13 +252,29 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     this.player = this@ExoPlayerEngine.player
                     useController = false
                     setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    resizeMode = scaleMode.toResizeMode()
                     setKeepContentOnPlayerReset(true)
+                    // Hold the screen awake while the surface is attached (keep-screen-on during playback).
+                    keepScreenOn = true
                 }
             },
-            update = { view -> view.applyEmberScrubber(emberArgb) },
+            update = { view ->
+                view.applyEmberScrubber(emberArgb)
+                view.resizeMode = scaleMode.toResizeMode()
+            },
             onRelease = { view -> view.player = null },
         )
+    }
+
+    private fun VideoScaleMode.toResizeMode(): Int = when (this) {
+        VideoScaleMode.FIT -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+        VideoScaleMode.ZOOM -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+    }
+
+    private companion object {
+        const val POSITION_POLL_MS = 1_000L
+        const val MIN_SPEED = 0.25f
+        const val MAX_SPEED = 4.0f
     }
 }
 

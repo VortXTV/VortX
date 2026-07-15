@@ -10,6 +10,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerEngine
 import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
+import com.vortx.android.player.VideoScaleMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -136,6 +137,8 @@ class MpvPlayer private constructor(
         mpv.command(arrayOf("seek", (positionMs.coerceAtLeast(0L) / 1000.0).toString(), "absolute"))
     }
 
+    override fun setPlaybackSpeed(speed: Float) { mpv.setPropertyString(PROP_SPEED, speed.toString()) }
+
     override fun selectAudioTrack(id: Int) { mpv.setPropertyString(PROP_AID, id.toString()) }
 
     override fun selectSubtitleTrack(id: Int?) {
@@ -192,13 +195,15 @@ class MpvPlayer private constructor(
     }
 
     @Composable
-    override fun VideoSurface(modifier: Modifier, emberArgb: Int) {
+    override fun VideoSurface(modifier: Modifier, emberArgb: Int, scaleMode: VideoScaleMode) {
         // Host a SurfaceView; attach the Surface to mpv on surfaceCreated, detach on destroyed. This is
         // the Android analogue of Apple pinning the Metal layer as mpv's wid.
         AndroidView(
             modifier = modifier,
             factory = { ctx ->
                 SurfaceView(ctx).apply {
+                    // Hold the screen awake while the surface is attached (keep-screen-on during playback).
+                    keepScreenOn = true
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
                             runCatching { mpv.attachSurface(holder.surface) }
@@ -214,6 +219,11 @@ class MpvPlayer private constructor(
                         }
                     })
                 }
+            },
+            // Aspect/zoom toggle: FIT keeps the whole frame (panscan 0), ZOOM crops to fill (panscan 1).
+            // Re-applied on recompose so the chrome's toggle takes effect without rebuilding the surface.
+            update = {
+                mpv.setPropertyString(PROP_PANSCAN, if (scaleMode == VideoScaleMode.ZOOM) "1.0" else "0.0")
             },
         )
     }
@@ -231,6 +241,8 @@ class MpvPlayer private constructor(
         private const val PROP_SID = "sid"
         private const val PROP_SUB_DELAY = "sub-delay"
         private const val PROP_VID = "vid"
+        private const val PROP_SPEED = "speed"
+        private const val PROP_PANSCAN = "panscan"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
         private const val OPT_DEMUXER_MAX_BYTES = "demuxer-max-bytes"
 

@@ -1,5 +1,6 @@
 package com.vortx.android.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -9,9 +10,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -45,6 +48,7 @@ import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import kotlinx.coroutines.launch
 
 private enum class Tab(val label: String, val icon: ImageVector) {
     HOME("Home", VortXIcons.home),
@@ -73,6 +77,9 @@ fun StremioXApp(
         var showAddons by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
         val appContext = LocalContext.current.applicationContext
+        // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
+        // (final progress tick + Player unload) still runs after the player leaves composition.
+        val appScope = rememberCoroutineScope()
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
@@ -89,7 +96,30 @@ fun StremioXApp(
         // back returns to the detail page underneath.
         val playable = playing
         if (playable != null) {
-            PlayerScreen(playable = playable, onBack = { playing = null })
+            // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
+            // [1] = duration. Reset when the played source changes.
+            val lastProgress = remember(playable) { longArrayOf(0L, 0L) }
+            // Hardware/gesture back pops the player overlay instead of exiting the app (there was no
+            // BackHandler anywhere in the shell before; this is the minimum one, scoped to the player).
+            BackHandler { playing = null }
+            // Engine playback session: load the Player so progress attributes to the right library item,
+            // then end it (final tick + unload + watched-near-end) when the player closes.
+            DisposableEffect(playable) {
+                appScope.launch { repo.beginPlaybackSession() }
+                onDispose {
+                    appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                }
+            }
+            PlayerScreen(
+                playable = playable,
+                onBack = { playing = null },
+                onError = { playing = null },
+                onProgress = { pos, dur ->
+                    lastProgress[0] = pos
+                    lastProgress[1] = dur
+                    appScope.launch { repo.reportProgress(pos, dur) }
+                },
+            )
             return@VortXTheme
         }
 

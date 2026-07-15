@@ -510,7 +510,10 @@ class EngineStremioRepository(
         val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, action) {
             EngineState.parseStreamGroups(it).isNotEmpty()
         }
-        EngineState.parseStreamGroups(state)
+        // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
+        // first within each add-on block, and the strongest add-on block first. This is what makes the
+        // hero "Watch" auto-pick and the source picker meaningful, mirroring Apple's ranked source list.
+        StreamRanking.rankedGroups(EngineState.parseStreamGroups(state))
     } }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
@@ -521,8 +524,13 @@ class EngineStremioRepository(
         // in-process streaming server (nodejs-mobile, not yet wired), so it surfaces a clear error the
         // player layer can show instead of failing opaquely.
         val handle = source.id.substringBefore('#')
+        // Flag DV/Atmos from the source's own tags so [PlayerEngineRouter] routes those to the ExoPlayer
+        // engine (its DefaultRenderersFactory does the DV codec fallback + DefaultAudioSink negotiates
+        // Atmos passthrough); a text parse is the only pre-play signal, same as Apple.
+        val isDolbyVision = StreamRanking.isDolbyVision(source)
+        val isAtmos = StreamRanking.isAtmos(source)
         if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
-            Playable(url = handle, title = source.title, viaStreamingServer = false)
+            Playable(url = handle, title = source.title, viaStreamingServer = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent
             // url == null, so the id-handle is the infoHash). If the user has a debrid key configured,
@@ -537,7 +545,7 @@ class EngineStremioRepository(
             // is configured.
             val resolved = debridResolver.resolve(infoHash = handle)
             if (resolved != null) {
-                Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false)
+                Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
             } else {
                 throw UnsupportedOperationException(
                     "Torrent playback needs a debrid key or the streaming-server bridge (not yet wired on Android).",
@@ -548,6 +556,70 @@ class EngineStremioRepository(
                 "This source type is not playable on Android yet.",
             )
         }
+    }
+
+    // ---- Live playback progress (engine Player) ----
+    //
+    // The Android port of Apple CoreBridge's loadEnginePlayer / reportProgress / unloadEnginePlayer
+    // (app/SourcesShared/CoreBridge.swift). The engine's `player` model attributes every TimeChanged tick
+    // to the library item keyed on the META (not the specific stream), so [beginPlaybackSession] scrapes
+    // the RESIDENT meta_details for any Ready stream + this title's requests and Loads the Player with
+    // them -- exactly Apple's fallback path. Every dispatch is fail-soft: a shape mismatch is a silent
+    // no-op (the engine records no progress), never a crash. Continue Watching then updates off the
+    // engine's own `continue_watching_preview` re-derivation, which [homeUpdates] already streams live.
+
+    override suspend fun beginPlaybackSession(): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        val selected = buildPlayerSelected() ?: return@runCatching
+        StremioCoreNative.dispatch(EngineActions.loadPlayer(selected))
+    } }
+
+    override suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        if (durationMs <= 0L || positionMs < 0L) return@runCatching
+        StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
+    } }
+
+    override suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        if (durationMs > 0L && positionMs >= 0L) {
+            StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
+            // Watched-near-end: past the threshold, mark the title watched so it leaves Continue Watching
+            // and its watched tick flips, matching the Apple player's finish behavior.
+            if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
+            }
+        }
+        StremioCoreNative.dispatch(EngineActions.unloadPlayer())
+    } }
+
+    /// Build the engine Player `selected` struct from the resident `meta_details`: any Ready stream + its
+    /// group's request + the title's meta request, mirroring Apple `loadEnginePlayer`'s fallback (the
+    /// library item keys on the meta, so any Ready stream attributes correctly). Null when nothing Ready
+    /// is resident (no title open, or streams not answered yet), in which case the Player Load is skipped.
+    private fun buildPlayerSelected(): JSONObject? {
+        val root = runCatching { JSONObject(StremioCoreNative.getState(EngineActions.metaDetailsField())) }.getOrNull() ?: return null
+        val metaItems = root.optJSONArray("metaItems") ?: return null
+        var metaRequest: JSONObject? = null
+        for (i in 0 until metaItems.length()) {
+            val item = metaItems.optJSONObject(i) ?: continue
+            val request = item.optJSONObject("request") ?: continue
+            if (item.optJSONObject("content")?.optString("type") == "Ready") { metaRequest = request; break }
+            if (metaRequest == null) metaRequest = request
+        }
+        val meta = metaRequest ?: return null
+
+        val streamGroups = root.optJSONArray("streams") ?: return null
+        for (g in 0 until streamGroups.length()) {
+            val group = streamGroups.optJSONObject(g) ?: continue
+            val content = group.optJSONObject("content") ?: continue
+            if (content.optString("type") != "Ready") continue
+            val rawStream = content.optJSONArray("content")?.optJSONObject(0) ?: continue
+            val streamRequest = group.optJSONObject("request") ?: continue
+            return JSONObject()
+                .put("stream", rawStream)
+                .put("streamRequest", streamRequest)
+                .put("metaRequest", meta)
+                .put("subtitlesPath", JSONObject.NULL)
+        }
+        return null
     }
 
     // ---- S05: Detail watched-state + library mutations ----
@@ -690,5 +762,12 @@ class EngineStremioRepository(
         /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
         /// distinctUntilChanged means an unchanged snapshot never reaches the UI.
         const val HOME_POLL_MS = 3_000L
+
+        /// The `device` tag stamped into every engine `TimeChanged` (Apple sends "iOS"/"tvOS").
+        const val PROGRESS_DEVICE = "Android"
+
+        /// Fraction of the runtime past which a title is treated as finished (marked watched, dropped from
+        /// Continue Watching) when the player closes. Matches the common 90% convention.
+        const val WATCHED_THRESHOLD = 0.9
     }
 }
