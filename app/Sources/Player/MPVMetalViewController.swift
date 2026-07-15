@@ -154,6 +154,19 @@ final class MPVMetalViewController: PlatformViewController {
     
     private var lastLaidOutSize: CGSize = .zero
 
+    /// True once layoutDrawable has kicked off the initial video-output build against a real,
+    /// validly sized surface. mpv configures its VO (render context + moltenvk swapchain) for the
+    /// size the metal layer has at mpv_initialize time. The full-window player and the iOS/tvOS
+    /// hero already have a sized surface then, so their first frame presents normally. The macOS
+    /// EMBEDDED hero clip is the exception: viewDidLoad (hence setupMpv / mpv_initialize) runs
+    /// before the view is in a window, so the VO configured against a zero/unsized surface and
+    /// never built a context that could present a frame, so the timePos -> showClip reveal never
+    /// fired and the hero stayed static. On the first valid layout we force one VO rebuild so the
+    /// context is (re)created at the real size and the first frame is produced. Gated by this flag
+    /// so it fires exactly once per surface config and can never turn an ordinary resize into a
+    /// VO thrash.
+    private var didBuildInitialVideoOutput = false
+
     #if canImport(UIKit)
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
@@ -183,6 +196,12 @@ final class MPVMetalViewController: PlatformViewController {
             metalLayer.contentsScale = scale
             // Force layoutDrawable to re-pin the drawable against the corrected backing scale.
             lastLaidOutSize = .zero
+            // The VO that may already have built against the GUESSED backing scale (NSScreen.main in
+            // viewDidLoad) is now stale, because the drawable is being re-pinned at the real window
+            // scale. Allow one fresh initial build at the corrected size. This only runs when the
+            // scale actually differs (an embed on a non-main display), so it never rebuilds on an
+            // ordinary re-appear where the scale already matches.
+            didBuildInitialVideoOutput = false
         }
         layoutDrawable()
     }
@@ -208,10 +227,22 @@ final class MPVMetalViewController: PlatformViewController {
 
         lastLaidOutSize = size
 
-        // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
-        // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
-        // the video output (vid no → auto) at the new size.
-        if didResize { reconfigureVideoOutput() }
+        // First valid layout: build the video output now that the surface has a real size (see
+        // didBuildInitialVideoOutput). This is the zero/invalid -> valid transition, which is
+        // DISTINCT from a live resize: didResize requires a PRIOR non-zero size, so it is false on
+        // the very first layout, and without this the VO built at mpv_initialize against an unsized
+        // surface (macOS embedded hero) would never be rebuilt and no first frame would present.
+        // The flag makes this fire exactly once, so it can never thrash the VO on every resize;
+        // ordinary resizes fall through to the didResize path below unchanged.
+        if !didBuildInitialVideoOutput {
+            didBuildInitialVideoOutput = true
+            reconfigureVideoOutput()
+        } else if didResize {
+            // libmpv sets the video output up for whatever size it STARTS at but doesn't refill the
+            // surface after a live resize (the video ends up tiny in a corner after rotating). Rebuild
+            // the video output (vid no -> auto) at the new size.
+            reconfigureVideoOutput()
+        }
     }
 
     private func reconfigureVideoOutput() {
