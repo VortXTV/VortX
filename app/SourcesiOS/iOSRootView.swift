@@ -352,8 +352,10 @@ struct iOSRootView: View {
             .padding(.horizontal, Theme.Space.sm)
             .padding(.vertical, 5)
             .frame(maxWidth: 340)
-            .background(Theme.Palette.surface1, in: Capsule())
-            .overlay(Capsule().stroke(Theme.Palette.surface2, lineWidth: 1))
+            // Glass search field (redesign Phase A): the warm liquid-glass material replaces the flat
+            // surface1 capsule so the top-bar search affordance matches the Mac home mockup. The field's
+            // text, focus, submit, and clear-button behavior are unchanged — appearance only.
+            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
         }
         // 84pt leading clears the traffic lights (~70pt of buttons + breathing room) restored by
         // MacWindowChrome over the hidden titlebar.
@@ -433,16 +435,16 @@ struct iOSRootView: View {
         #endif
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
-        .padding(.top, Theme.Space.xs)
-        .background(alignment: .top) {
-            VStack(spacing: 0) {
-                Rectangle()
-                    .fill(Theme.Palette.hairline)
-                    .frame(height: 0.5)
-                Theme.Palette.surface1
-            }
-            .ignoresSafeArea(edges: .bottom)
-        }
+        // Floating glass pill (redesign Phase A): the tab items ride VortX's warm liquid-glass material,
+        // inset from the screen edges with a soft drop shadow, so the bar reads as a floating element over
+        // the canvas instead of a solid attached strip. RE-SKIN ONLY — the bar still holds its own row at
+        // the bottom of the shell VStack (content never scrolls under it and is never obscured); only its
+        // appearance floats. Selection, tap wiring, a11y, and the offline/update banners are untouched.
+        .padding(.horizontal, Theme.Space.sm)
+        .padding(.vertical, Theme.Space.xs)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.xs)
     }
 
     /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
@@ -567,9 +569,11 @@ struct iOSRootView: View {
                     .frame(height: 22)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 2)
+                    // Ember active pill behind the selected glyph, via the shared VortXGlass active token so
+                    // every platform's selected nav item reads identically (redesign Phase A).
                     .background {
                         if selected {
-                            Capsule().fill(Theme.Palette.accent.opacity(0.18))
+                            Capsule().fill(VortXGlass.activeFill)
                         }
                     }
                     // #30: a small accent count badge on the Library tab while downloads are in flight, so

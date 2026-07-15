@@ -416,7 +416,18 @@ struct RootTabView: View {
         item.focused.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.onAccent)]
         item.focused.iconColor = UIColor(Theme.Palette.onAccent)
         let appearance = UITabBarAppearance()
-        appearance.configureWithDefaultBackground()
+        // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and tint it with the
+        // SAME warm fill the SwiftUI VortXGlass material uses, so the tvOS top nav reads as VortX glass and
+        // matches the Mac / iOS chrome. Under Reduce Transparency, stand down to an opaque warm surface for
+        // legibility. RE-SKIN ONLY — this changes the bar's BACKGROUND appearance; the native TabView, its
+        // focus engine, tab tags/order, and the ember selection indicator below are all untouched.
+        if UIAccessibility.isReduceTransparencyEnabled {
+            appearance.configureWithOpaqueBackground()
+            appearance.backgroundColor = UIColor(Theme.Palette.surface1)
+        } else {
+            appearance.configureWithDefaultBackground()
+            appearance.backgroundColor = VortXGlass.fillUIColor(VortXGlass.barFillAlpha)
+        }
         appearance.selectionIndicatorTintColor = UIColor(Theme.Palette.accent)
         appearance.inlineLayoutAppearance = item
         appearance.stackedLayoutAppearance = item
