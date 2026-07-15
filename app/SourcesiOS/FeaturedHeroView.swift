@@ -63,10 +63,13 @@ struct FeaturedHeroView: View {
     /// a huge window never becomes all hero.
     static var heroHeight: CGFloat {
         #if os(macOS)
-        // The Home billboard must COMMAND the window (owner ask: a fixed 520 band read as a small strip in
-        // a tall Mac window, leaving the page looking empty). Size off the HOSTING window's content height so
-        // the hero takes ~56% of the visible window, with a floor so a short window still shows a real
-        // billboard and a cap so an enormous display never turns the whole page into hero.
+        // The Home billboard must NEARLY FILL the window (owner ask: a 520 / 0.56 band read as a small strip
+        // in a tall Mac window, leaving a persistent black dead-band ABOVE the hero behind the floating search
+        // + nav pill and dead black BELOW). Size off the HOSTING window's content height so the hero is
+        // near-full-bleed (~92% of the visible window), with a 640 floor so a short window still shows a real
+        // billboard and a windowHeight cap so it never exceeds the window. The band already bleeds UNDER the
+        // top chrome via `.ignoresSafeArea(.container, edges: .top)` (below), so filling up to the window top
+        // is what removes the dead band above the hero; the dual scrim keeps the chrome legible over the art.
         // Prefer `mainWindow`: a macOS sheet (the Who's-watching picker and other covers present as sheets on
         // Mac, ProfilesView.swift) becomes KEY while up but never MAIN, so keying off keyWindow made the ~7s
         // hero rotation recompute the band from the ~600pt sheet and snap the whole browse column to the 520
@@ -78,7 +81,7 @@ struct FeaturedHeroView: View {
             ?? NSApplication.shared.windows.first(where: { $0.isVisible && !$0.isSheet })?.contentLayoutRect.height
             ?? NSScreen.main?.visibleFrame.height
             ?? 900
-        return min(900, max(520, windowHeight * 0.56))
+        return min(windowHeight, max(640, windowHeight * 0.92))
         #else
         // Size off the app WINDOW, not the physical screen: in iPad Split View / Slide Over the window is
         // shorter/narrower than UIScreen.main, so keying the band off the whole screen would let the
@@ -412,9 +415,18 @@ struct FeaturedHeroView: View {
                     .foregroundStyle(Theme.Palette.onAccent)
                     .padding(.horizontal, Theme.Space.lg)
                     .padding(.vertical, Theme.Space.sm + 2)
+                    // macOS: the primary hero CTA rides the shared PROMINENT ember-glass preset (translucent +
+                    // Liquid-Glass on OS 26) instead of a raw solid accent fill, matching the detail hero's
+                    // Watch CTA. Keeps the ember tint (default) and the onAccent label for AA contrast; the
+                    // resting glow shadow is preserved. iOS/iPad keep the solid accent pill unchanged.
+                    #if os(macOS)
+                    .vortxGlassProminent(in: RoundedRectangle(cornerRadius: Theme.Radius.hero, style: .continuous))
+                    .shadow(color: Theme.Palette.accent.opacity(0.35), radius: 18, y: 8)
+                    #else
                     .background(Theme.Palette.accent,
                                 in: RoundedRectangle(cornerRadius: Theme.Radius.hero, style: .continuous))
                     .shadow(color: Theme.Palette.accent.opacity(0.35), radius: 18, y: 8)
+                    #endif
             }
             .buttonStyle(.plain)
 
