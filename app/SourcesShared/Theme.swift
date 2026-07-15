@@ -243,8 +243,11 @@ private struct PrimaryActionContent: View {
             .foregroundStyle(Theme.Palette.onAccent)
             .padding(.horizontal, Theme.Space.lg)
             .padding(.vertical, Theme.Space.md)
-            .background(active ? Theme.Palette.accentBright : Theme.Palette.accent,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            // Prominent ember GLASS (was a solid accent fill): translucent + Liquid-Glass on OS 26, still
+            // ember-forward, still AA-legible (onAccent on a near-opaque accent tint). The focus brighten
+            // flows through the tint (accentBright on focus); the scale + glow below are preserved.
+            .vortxGlassProminent(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                                 tint: active ? Theme.Palette.accentBright : Theme.Palette.accent)
             .scaleEffect(active && !reduceMotion ? 1.06 : (configuration.isPressed ? 0.97 : 1))
             .shadow(color: Theme.Palette.accent.opacity(active ? 0.55 : 0), radius: 26, y: 12)
             .animation(reduceMotion ? nil : Theme.Motion.focus, value: active)
@@ -281,8 +284,10 @@ private struct RowFocusContent: View {
         let active = focused
         #endif
         let label = configuration.label
-            .background(active ? Theme.Palette.surface2 : Theme.Palette.surface1,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            // Glass row fill (renders BELOW the ember ring / scale / lift-shadow below, which are kept
+            // byte-identical). `focused` lifts the fill alpha for the same brighten the old surface1 ->
+            // surface2 step gave; the `flat` shadow inside means it never fights the lift shadow here.
+            .vortxGlassRow(focused: active)
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
                     .strokeBorder(Theme.Palette.accent, lineWidth: active ? 3 : 0)
@@ -338,13 +343,10 @@ struct CircleIconDisc: View {
             .font(.system(size: diameter * 0.42, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: diameter, height: diameter)
-            // Floating chrome over the hero art: Liquid Glass on OS 26, the frosted material + warm tint
-            // on older systems. The hairline and hit shape ride on top of whichever fill renders.
-            .glassChrome(in: Circle(), interactive: true) {
-                Circle()
-                    .fill(.ultraThinMaterial)
-                    .overlay(Circle().fill(Theme.Palette.canvas.opacity(0.28)))
-            }
+            // Floating chrome over the hero art on the shared glass primitive: warm glass + top highlight,
+            // Liquid Glass on OS 26, opaque warm fallback under Reduce Transparency. The extra hairline and
+            // hit shape ride on top of whichever fill renders.
+            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
             .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.10), lineWidth: 1))
             .contentShape(Circle())
     }
@@ -401,8 +403,11 @@ struct HeroPlayButtonStyle: ButtonStyle {
                 .foregroundStyle(Theme.Palette.onAccent)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, Theme.Space.md)
-                .background(active ? Theme.Palette.accentBright : Theme.Palette.accent,
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.hero, style: .continuous))
+                // Prominent ember GLASS hero CTA (was a solid accent fill): translucent + Liquid-Glass on
+                // OS 26, still ember-forward and AA-legible; the focus brighten flows through the tint, and
+                // the press scale + resting / focus glow below are preserved.
+                .vortxGlassProminent(in: RoundedRectangle(cornerRadius: Theme.Radius.hero, style: .continuous),
+                                     tint: active ? Theme.Palette.accentBright : Theme.Palette.accent)
                 .scaleEffect(configuration.isPressed ? 0.98 : 1)
                 .shadow(color: Theme.Palette.accent.opacity(active ? 0.55 : 0.30), radius: 22, y: 10)
                 .animation(reduceMotion ? nil : Theme.Motion.state, value: configuration.isPressed)

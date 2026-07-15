@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// Filter / segment chip for tvOS, on the StremioX design system (see Theme.swift).
+/// Filter / segment chip (shared across platforms), on the VortX design system (see Theme.swift).
 ///
-/// Three states, all warm-neutral with the ember accent reserved for meaning:
-/// - **idle**     → `surface2` pill, secondary text
-/// - **selected** → soft-ember pill, ember text (pass `accent`/`accentText` to override, e.g. destructive)
-/// - **focused**  → ember ring + lift + brightened text, so the focused chip is unmistakable at ten feet
+/// Now built on the shared glass primitive (`vortxGlassChip`), so every chip flips to VortX's glass
+/// elevation from one place. Three states, all warm-neutral with the ember accent reserved for meaning:
+/// - **idle**     → neutral glass pill, secondary text
+/// - **selected** → glass pill + ember overlay, ember text (pass `accent`/`accentText` to override, e.g. destructive)
+/// - **focused**  → ember ring + lift + brightened text ON TOP of the glass, unmistakable at ten feet
 struct ChipButtonStyle: ButtonStyle {
     var selected: Bool = false
     var accent: Color = Theme.Palette.accent
@@ -32,7 +33,10 @@ struct ChipButtonStyle: ButtonStyle {
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.vertical, Theme.Space.xs + 2)
                 .foregroundStyle(textColor)
-                .background(fill, in: Capsule(style: .continuous))
+                // The one glass chip path: neutral glass base, plus the parameterized ember overlay when
+                // selected (the style's `accent`, so a destructive / warn chip keeps its own tint). The
+                // ember focus ring + scale below still ride ON TOP of the glass.
+                .vortxGlassChip(selected: selected, tint: accent)
                 .overlay(Capsule(style: .continuous).strokeBorder(accent, lineWidth: focused ? 3 : 0))
                 .scaleEffect(configuration.isPressed ? 0.97 : (focused && !reduceMotion ? 1.06 : 1))
                 .padding(focusMargin)
@@ -50,10 +54,6 @@ struct ChipButtonStyle: ButtonStyle {
             #endif
         }
 
-        private var fill: Color {
-            if selected { return accent.opacity(0.18) }
-            return Theme.Palette.surface2
-        }
         private var textColor: Color {
             if selected { return accentText }
             return focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary
