@@ -80,9 +80,8 @@ class DebridResolver(private val keys: DebridKeys) {
                 when (chosen) {
                     DebridService.TOR_BOX -> resolveTorBox(hash, mag, episode)
                     DebridService.REAL_DEBRID -> resolveRealDebrid(mag, episode)
-                    // AllDebrid / Premiumize are not ported yet (parity with the first-wired Apple pair);
-                    // treat as no-op so the caller falls soft rather than erroring.
-                    DebridService.ALL_DEBRID, DebridService.PREMIUMIZE -> null
+                    DebridService.ALL_DEBRID -> resolveAllDebrid(mag, episode)
+                    DebridService.PREMIUMIZE -> resolvePremiumize(mag, episode)
                 }
             }
         } catch (cancel: CancellationException) {
@@ -270,6 +269,124 @@ class DebridResolver(private val keys: DebridKeys) {
     }
 
     // ------------------------------------------------------------------------------------------------
+    // AllDebrid (torrents). Base https://api.alldebrid.com/v4, auth via `agent` + `apikey` QUERY params
+    // (no Authorization header). Flow: /magnet/upload -> poll /magnet/status until statusCode 4 (Ready)
+    // -> pick the file from the link list -> /link/unlock for the direct URL. Mirrors the Apple
+    // AllDebridResolver.resolve. Fail-soft: any failure throws a DebridException the resolve() catch maps
+    // to null, exactly like the RD/TorBox paths.
+    // ------------------------------------------------------------------------------------------------
+
+    private data class AllDebridLink(val link: String, val filename: String, val size: Long)
+
+    private suspend fun resolveAllDebrid(magnet: String, episode: Episode?): String {
+        val apiKey = keys.key(DebridService.ALL_DEBRID)
+        val base = AD_BASE
+
+        // 1. Upload the magnet -> magnet id. `data.magnets` is an ARRAY here (upload can carry several).
+        val upEnv = getJsonQueryAuth(adUrl(base, "/magnet/upload", apiKey, "magnets[]" to magnet))
+        val id = upEnv.optJSONObject("data")
+            ?.optJSONArray("magnets")
+            ?.optJSONObject(0)
+            ?.optIntOrNull("id")
+            ?: throw DebridException.Provider("upload")
+
+        // 2. Poll /magnet/status until Ready (statusCode 4) with links present; 5+ is an error/expired
+        //    magnet. `data.magnets` is a SINGLE object when queried by id (matches the Apple StatusMagnet?).
+        var links = emptyList<AllDebridLink>()
+        for (attempt in 0 until AD_ATTEMPTS) {
+            coroutineContext.ensureActive()
+            if (attempt > 0) delay(AD_INTERVAL_MS)
+            val st = getJsonQueryAuth(adUrl(base, "/magnet/status", apiKey, "id" to id.toString()))
+            val m = st.optJSONObject("data")?.optJSONObject("magnets") ?: continue
+            val statusCode = m.optIntOrNull("statusCode")
+            if (statusCode == 4) {
+                val ready = adLinks(m)
+                if (ready.isNotEmpty()) { links = ready; break }
+            }
+            if (statusCode != null && statusCode >= 5) throw DebridException.Provider("status $statusCode")
+        }
+        if (links.isEmpty()) throw DebridException.NotReady
+
+        // 3. Pick the file. fileIdx is torrent-wide; AD's link list may differ in order/count, so pick by
+        //    the filename/size heuristic (which keeps links[pick.id] aligned), not the raw torrent index.
+        val files = links.mapIndexed { idx, l ->
+            DebridFile(id = idx, name = l.filename, shortName = l.filename.substringAfterLast('/'), size = l.size)
+        }
+        val pick = pickFile(files, episode, fileIdx = null)?.takeIf { it.id in links.indices }
+            ?: throw DebridException.NoMatchingFile
+
+        // 4. Unlock the chosen link into a direct, playable URL.
+        val un = getJsonQueryAuth(adUrl(base, "/link/unlock", apiKey, "link" to links[pick.id].link))
+        return un.optJSONObject("data")?.optStringOrNull("link") ?: throw DebridException.Provider("unlock")
+    }
+
+    private fun adLinks(magnet: JSONObject): List<AllDebridLink> {
+        val arr = magnet.optJSONArray("links") ?: return emptyList()
+        val out = ArrayList<AllDebridLink>(arr.length())
+        for (i in 0 until arr.length()) {
+            val l = arr.optJSONObject(i) ?: continue
+            val link = l.optStringOrNull("link") ?: continue
+            out += AllDebridLink(
+                link = link,
+                filename = l.optStringOrNull("filename").orEmpty(),
+                size = l.optLong("size", 0L),
+            )
+        }
+        return out
+    }
+
+    /// Build an AllDebrid authed URL: `?agent=vortx&apikey=<key>` + the extra query pairs. Matches the
+    /// Apple `authed(_:_:)`. Names are appended literally (e.g. `magnets[]`), values are percent-encoded.
+    private fun adUrl(base: String, path: String, apiKey: String, vararg extra: Pair<String, String>): String {
+        val sb = StringBuilder(base).append(path)
+            .append("?agent=").append(enc(AD_AGENT))
+            .append("&apikey=").append(enc(apiKey))
+        for ((name, value) in extra) sb.append('&').append(name).append('=').append(enc(value))
+        return sb.toString()
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Premiumize (torrents). Base https://www.premiumize.me/api, auth via `apikey` QUERY param (no
+    // Authorization header). ONE call: POST /transfer/directdl with the magnet returns the file list WITH
+    // direct links (instant for cached, so no separate unrestrict step). Mirrors the Apple
+    // PremiumizeResolver.resolve. Same fail-soft (throw -> null) shape as the RD/TorBox paths.
+    // ------------------------------------------------------------------------------------------------
+
+    private data class PremiumizeItem(val path: String, val size: Long, val link: String?, val streamLink: String?)
+
+    private suspend fun resolvePremiumize(magnet: String, episode: Episode?): String {
+        val apiKey = keys.key(DebridService.PREMIUMIZE)
+        val url = "$PM_BASE/transfer/directdl?apikey=${enc(apiKey)}"
+        val dl = postFormQueryAuth(url, mapOf("src" to magnet))
+        if (dl.optString("status") != "success") {
+            throw DebridException.Provider("directdl ${dl.optString("status")}")
+        }
+        val content = dl.optJSONArray("content") ?: throw DebridException.NotReady
+        val items = ArrayList<PremiumizeItem>(content.length())
+        for (i in 0 until content.length()) {
+            val c = content.optJSONObject(i) ?: continue
+            val path = c.optStringOrNull("path").orEmpty()
+            items += PremiumizeItem(
+                path = path,
+                size = c.optLong("size", 0L),
+                link = c.optStringOrNull("link"),
+                streamLink = c.optStringOrNull("stream_link"),
+            )
+        }
+        if (items.isEmpty()) throw DebridException.NotReady
+
+        // fileIdx is torrent-wide; PM's directdl content order may differ, so pick by the filename/size
+        // heuristic (which keeps items[pick.id] aligned), not by the raw torrent index.
+        val files = items.mapIndexed { idx, c ->
+            DebridFile(id = idx, name = c.path, shortName = c.path.substringAfterLast('/'), size = c.size)
+        }
+        val pick = pickFile(files, episode, fileIdx = null)?.takeIf { it.id in items.indices }
+            ?: throw DebridException.NoMatchingFile
+        val item = items[pick.id]
+        return item.streamLink ?: item.link ?: throw DebridException.Provider("no link")
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // Shared file-pick heuristic (mirrors the Apple DebridResolve.pickFile / episodeMatchScore):
     // explicit fileIdx -> SxEy filename match -> largest video file.
     // ------------------------------------------------------------------------------------------------
@@ -277,9 +394,13 @@ class DebridResolver(private val keys: DebridKeys) {
     private fun pickFile(files: List<DebridFile>, episode: Episode?, fileIdx: Int?): DebridFile? {
         if (fileIdx != null && fileIdx in files.indices) return files[fileIdx]
         val videos = files.filter { it.isVideo }
-        if (videos.isEmpty()) return null
-        if (episode == null) return videos.maxByOrNull { it.size }
-        val best = videos
+        // Provider omitted filenames (isVideo false for every entry, e.g. AllDebrid on a cached single-file
+        // torrent): fall back to the whole file list so size selection still resolves instead of
+        // NoMatchingFile. Matches the Apple DebridResolve.pickFile `pool = videos.isEmpty ? files : videos`.
+        val pool = videos.ifEmpty { files }
+        if (pool.isEmpty()) return null
+        if (episode == null) return pool.maxByOrNull { it.size }
+        val best = pool
             .mapNotNull { f ->
                 val name = f.shortName.ifEmpty { f.name }
                 val score = episodeMatchScore(name, episode.season, episode.episode)
@@ -287,7 +408,7 @@ class DebridResolver(private val keys: DebridKeys) {
             }
             .maxByOrNull { it.second }
             ?.first
-        return best ?: videos.maxByOrNull { it.size }   // pack fallback: biggest video
+        return best ?: pool.maxByOrNull { it.size }   // pack fallback: biggest video
     }
 
     /// Score a filename against a SxEy target (SnnEnn, n x nn, "season n ... episode n"). 0 = no match.
@@ -363,6 +484,25 @@ class DebridResolver(private val keys: DebridKeys) {
         return execute(conn)
     }
 
+    /// GET whose auth rides the QUERY string (AllDebrid: `agent` + `apikey`), so NO Authorization header.
+    /// Mirrors the Apple AllDebrid `get` (a plain `URLRequest(url:)`).
+    private fun getJsonQueryAuth(urlString: String): JSONObject {
+        val conn = open(urlString)
+        conn.requestMethod = "GET"
+        return execute(conn)
+    }
+
+    /// POST form-urlencoded whose auth rides the QUERY string (Premiumize: `apikey`), so NO Authorization
+    /// header. Mirrors the Apple Premiumize `form` (apikey in the query, fields in the body).
+    private fun postFormQueryAuth(urlString: String, fields: Map<String, String>): JSONObject {
+        val conn = open(urlString)
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        conn.doOutput = true
+        conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
+        return execute(conn)
+    }
+
     /// Read the response, mapping status codes to [DebridException], then parse the body as JSON. The
     /// body is always read (2xx from the input stream, error from the error stream) so the connection
     /// releases cleanly.
@@ -416,6 +556,9 @@ class DebridResolver(private val keys: DebridKeys) {
         const val TAG = "DebridResolver"
         const val TORBOX_BASE = "https://api.torbox.app/v1/api/torrents"
         const val RD_BASE = "https://api.real-debrid.com/rest/1.0"
+        const val AD_BASE = "https://api.alldebrid.com/v4"
+        const val AD_AGENT = "vortx"
+        const val PM_BASE = "https://www.premiumize.me/api"
 
         const val CONNECT_TIMEOUT_MS = 15_000
         const val READ_TIMEOUT_MS = 20_000
@@ -427,6 +570,10 @@ class DebridResolver(private val keys: DebridKeys) {
         // Real-Debrid poll: up to 12 attempts, 2s apart, matching the Apple resolver.
         const val RD_ATTEMPTS = 12
         const val RD_INTERVAL_MS = 2_000L
+
+        // AllDebrid /magnet/status poll: up to 12 attempts, 3s apart, matching the Apple resolver.
+        const val AD_ATTEMPTS = 12
+        const val AD_INTERVAL_MS = 3_000L
 
         val RD_DEAD_STATUSES = setOf("magnet_error", "error", "virus", "dead")
         // Active-download statuses that trigger the not-cached fast-fail after one grace poll.
