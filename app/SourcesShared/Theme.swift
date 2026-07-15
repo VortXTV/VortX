@@ -343,10 +343,11 @@ struct CircleIconDisc: View {
             .font(.system(size: diameter * 0.42, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: diameter, height: diameter)
-            // Floating chrome over the hero art on the shared glass primitive: warm glass + top highlight,
-            // Liquid Glass on OS 26, opaque warm fallback under Reduce Transparency. The extra hairline and
-            // hit shape ride on top of whichever fill renders.
-            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+            // Floating chrome over the hero art on the shared DISC glass primitive: warm fill at
+            // discFillAlpha + top highlight + tight `.disc` shadow, with a shape-clipped material blur on
+            // every OS (never Apple `glassEffect`, whose un-clipped bloom halos a tight disc), and an opaque
+            // warm fallback under Reduce Transparency. The extra hairline and hit shape ride on top.
+            .vortxGlassDisc(in: Circle())
             .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.10), lineWidth: 1))
             .contentShape(Circle())
     }
