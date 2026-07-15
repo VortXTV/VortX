@@ -769,7 +769,9 @@ struct iOSHomeView: View {
                 // as a normal first child it scrolls with the content and its own controls stay hit-tested.
                 LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Home tab -> scroll here
-                    FeaturedHeroView(model: hero, onOpen: { path.append($0) })
+                    // The redesign mockup's ember "Featured" hero kicker (Home only; Library / Discover pass
+                    // no eyebrow so their heroes are unchanged).
+                    FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
                     // Once this marker (just below the hero) scrolls out of view, the floating
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
@@ -778,7 +780,9 @@ struct iOSHomeView: View {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
                         // offers the engine's "Remove from Continue Watching" (#14).
-                        homeRail(PosterRail(title: String(localized: "Continue Watching"), items: continueWatchingItems,
+                        homeRail(PosterRail(title: String(localized: "Continue Watching"),
+                                            eyebrow: String(localized: "Pick up where you left off"),
+                                            items: continueWatchingItems,
                                             onTap: handleContinueWatchingTap, menu: .continueWatching,
                                             onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) }))
                     }
@@ -792,6 +796,7 @@ struct iOSHomeView: View {
                     // Hidden when there's no TMDB key, no history to seed from, or no results.
                     if !topPicks.items.isEmpty {
                         homeRail(PosterRail(title: String(localized: "Top Picks for you"),
+                                            eyebrow: String(localized: "Based on what you watch"),
                                             items: topPicks.items.map {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
@@ -802,6 +807,7 @@ struct iOSHomeView: View {
                     // handleTap). Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
                     if !traktRails.items.isEmpty {
                         homeRail(PosterRail(title: String(localized: "Trakt Watchlist"),
+                                            eyebrow: String(localized: "From Trakt"),
                                             items: traktRails.items.map {
                                                 RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                          poster: $0.poster, progress: 0)
@@ -824,6 +830,7 @@ struct iOSHomeView: View {
                     // Hidden when there is nothing upcoming, so the default path renders nothing.
                     if !releaseCalendar.upcoming.isEmpty {
                         homeRail(PosterRail(title: String(localized: "Upcoming Episodes"),
+                                            eyebrow: String(localized: "Coming soon"),
                                             items: releaseCalendar.upcoming.map {
                                                 RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
                                                          poster: $0.video.thumbnail, progress: 0,
@@ -835,6 +842,7 @@ struct iOSHomeView: View {
                     // first; hidden when nothing is upcoming. Each card routes to the movie detail like any card.
                     if !releaseCalendar.upcomingMovies.isEmpty {
                         homeRail(PosterRail(title: String(localized: "Upcoming Movies"),
+                                            eyebrow: String(localized: "Coming soon"),
                                             items: releaseCalendar.upcomingMovies.map {
                                                 RailItem(id: $0.id, type: "movie", name: $0.name,
                                                          poster: $0.poster, progress: 0, caption: $0.releaseDateLabel)
@@ -2808,6 +2816,10 @@ struct iOSGroupHeader: View {
 
 private struct PosterRail: View {
     let title: String
+    /// An optional dim uppercase kicker above the shelf title (the redesign mockup's "Pick up where you left
+    /// off" style eyebrow). Tertiary-toned to match the mockup's shelf eyebrows and the tvOS RailHeader
+    /// treatment. Nil on rails that carry no kicker, so their headers are byte-for-byte unchanged.
+    var eyebrow: String? = nil
     let items: [RailItem]
     let onTap: (RailItem) -> Void
     /// Which long-press context menu each card shows on this surface (#14).
@@ -2844,9 +2856,15 @@ private struct PosterRail: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // S2: rail headers read as a section tier ABOVE the card titles below them. cardTitle sat at
             // the same size/weight as a card caption; sectionTitle (via the shared style helper: tracking
-            // + textPrimary) restores the hierarchy for Home / Search / Library rails.
-            Text(title).sectionTitleStyle()
-                .padding(.horizontal, Theme.Space.md)
+            // + textPrimary) restores the hierarchy for Home / Search / Library rails. An optional dim
+            // uppercase eyebrow above the title matches the redesign mockup's shelf headers (and tvOS
+            // RailHeader), so a shelf like Continue Watching reads "Pick up where you left off / Continue
+            // Watching" exactly as the mockup and the tvOS home do.
+            VStack(alignment: .leading, spacing: 4) {
+                if let eyebrow { Text(eyebrow).eyebrowStyle() }
+                Text(title).sectionTitleStyle()
+            }
+            .padding(.horizontal, Theme.Space.md)
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: Theme.Space.sm) {
@@ -2927,11 +2945,15 @@ private struct PosterRail: View {
     @ViewBuilder
     private func railArrow(forward: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
+            // The pointer-reveal scroll affordance floats OVER poster art, so it rides VortX's warm
+            // liquid-glass material (redesign) instead of a flat black plate. White chevron for contrast on
+            // the warm-dark glass; under Reduce Transparency the primitive stands down to an opaque warm
+            // surface, so the control stays legible. Appearance only: the paging action is unchanged.
             Image(systemName: forward ? "chevron.right" : "chevron.left")
                 .font(.system(size: 16, weight: .bold))
                 .foregroundStyle(.white)
                 .frame(width: 38, height: 60)
-                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous), shadow: .disc)
         }
         .buttonStyle(.plain)
         .padding(.horizontal, Theme.Space.xs)

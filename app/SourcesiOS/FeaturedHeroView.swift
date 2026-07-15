@@ -25,6 +25,9 @@ struct FeaturedHeroView: View {
     @ObservedObject var model: FeaturedHeroModel
     /// Open the featured title's detail page (hero Play button).
     let onOpen: (FeaturedHeroItem) -> Void
+    /// An optional ember uppercase kicker rendered above the title, the redesign mockup's "Featured" hero
+    /// eyebrow. Only Home passes it; Library / Discover / Browse leave it nil so their heroes are unchanged.
+    var eyebrow: String? = nil
 
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized hero title/logo override
     @EnvironmentObject private var theme: ThemeManager
@@ -296,6 +299,14 @@ struct FeaturedHeroView: View {
         // S5: title, meta, synopsis, actions, dots. The action row no longer splits the text block; the
         // buttons sit below the copy, matching the detail hero (iOSDetailView heroBelow / heroContent).
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            // The ember uppercase kicker above the title (redesign mockup). Ember-tinted (the hero kicker is
+            // the accent, unlike the dim tertiary shelf eyebrows), with a soft shadow so it reads over art.
+            if let eyebrow {
+                Text(eyebrow)
+                    .eyebrowStyle(Theme.Palette.accent)
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 2)
+                    .accessibilityHidden(true)   // decorative kicker; the title/meta carry the VoiceOver content
+            }
             titleOrLogo(hero)
             metaRow(hero)
             if let overview = hero.description, !overview.isEmpty {
@@ -355,21 +366,31 @@ struct FeaturedHeroView: View {
             .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
     }
 
-    /// ★ imdb · year · runtime · genres — same order and tokens as `iOSDetailView.metaRow`.
+    /// ★ imdb · year · runtime, then genres as bordered meta chips (the redesign mockup's editorial chip
+    /// row). Only HONEST data is shown: the mockup's "4K Dolby Vision" / "Atmos" chips are deliberately NOT
+    /// fabricated here, because a Home hero item carries no stream-format metadata (that is a per-source
+    /// fact resolved at play time), and VortX never claims a format it has not verified. The genre chips
+    /// give the same editorial chip treatment from real catalog data. Two chips keep the row inside the
+    /// band on a narrow iPhone; the shared `MetaBadge` primitive matches the detail page's badges.
     private func metaRow(_ hero: FeaturedHeroItem) -> some View {
-        HStack(spacing: Theme.Space.md) {
+        HStack(spacing: Theme.Space.sm) {
             if let imdb = hero.imdbRating {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     Image(systemName: "star.fill").foregroundStyle(Theme.Palette.accent)
-                    Text(imdb)
+                    Text(imdb).foregroundStyle(Theme.Palette.textSecondary)
                 }
+                .font(Theme.Typography.label)
             }
-            if let r = hero.releaseInfo { Text(r) }
-            if let rt = hero.runtime { Text(rt) }
-            if !hero.genres.isEmpty { Text(hero.genres.prefix(3).joined(separator: " · ")).lineLimit(1) }
+            if let r = hero.releaseInfo {
+                Text(r).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
+            if let rt = hero.runtime {
+                Text(rt).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            }
+            ForEach(Array(hero.genres.prefix(2)), id: \.self) { genre in
+                MetaBadge(text: genre)
+            }
         }
-        .font(Theme.Typography.label)
-        .foregroundStyle(Theme.Palette.textSecondary)
         // Combine the rating/year/runtime/genre tokens into one VoiceOver phrase.
         .accessibilityElement(children: .combine)
     }
@@ -454,9 +475,17 @@ struct FeaturedHeroView: View {
                     }
                 }
             } label: {
+                // The secondary hero action rides VortX's warm liquid-glass material as a floating glass
+                // capsule (redesign mockup), next to the ember-filled primary. Appearance only: the tap
+                // still opens the in-app trailer through the exact same resolve path as before.
                 Label("Trailer", systemImage: "play.rectangle.fill")
+                    .font(Theme.Typography.label.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.sm)
+                    .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
             }
-            .buttonStyle(ChipButtonStyle())
+            .buttonStyle(.plain)
         }
     }
 
