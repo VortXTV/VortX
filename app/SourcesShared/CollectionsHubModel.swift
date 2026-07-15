@@ -521,7 +521,7 @@ final class CollectionsHubModel: ObservableObject {
     /// The representative TMDB discover path for a decade's cover: the decade's popular MOVIES window (mirrors
     /// decadeSubs' primary "Movies" row, ~:207-209). Handed to the /cover edge as its `list` param.
     private static func decadeCoverListPath(_ d: DecadeSpec) -> String {
-        "/discover/movie?primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31&sort_by=popularity.desc"
+        "/3/discover/movie?primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31&sort_by=popularity.desc"
     }
 
     /// Resolve a representative poster for each decade tile off catalogs.vortx.tv/cover. Paints instantly from

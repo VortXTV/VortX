@@ -59,9 +59,10 @@ enum SourceIndexClient {
     /// The pool `content_id` for a title, in the worker's colon form (`tt0903747` for a movie, `tt…:S:E` for an
     /// episode). nil when the id is not a real imdb `tt…` id (ad-hoc paste-a-link plays have no shareable id).
     static func contentID(imdbId: String?, season: Int? = nil, episode: Int? = nil) -> String? {
-        guard let imdbId, imdbId.range(of: #"^tt\d{6,}$"#, options: .regularExpression) != nil else { return nil }
-        if let season, let episode { return "\(imdbId):\(season):\(episode)" }
-        return imdbId
+        guard let imdbId, let m = imdbId.range(of: #"^tt\d{6,}"#, options: .regularExpression) else { return nil }
+        let base = String(imdbId[m])
+        if let season, let episode { return "\(base):\(season):\(episode)" }
+        return base
     }
 
     // MARK: - Descriptor extraction (pure; no user data)

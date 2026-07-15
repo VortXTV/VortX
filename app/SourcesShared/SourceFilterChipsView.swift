@@ -51,6 +51,7 @@ struct SourceFilterChipsView: View {
                  : String(localized: "Tap a chip to prefer, require, or avoid a kind of source. Type words to prefer or avoid them by name. CAM and fake-quality sources stay hidden by the Safety filter."))
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             criterionChips
             keywordLanes
@@ -126,6 +127,7 @@ struct SourceFilterChipsView: View {
                  : String(localized: "Comma-separated words matched in the source name. Prefer boosts, Only requires, Avoid uses the behavior below."))
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
             // Prefer + "Rank it down" are RANKING nudges, so they do nothing while Use add-on ranking order is
             // on (the list keeps the add-on's own order). Only (require) and Avoid = Hide still filter. State
             // it so the Prefer lane is not a silent no-op.
@@ -174,6 +176,7 @@ struct SourceFilterChipsView: View {
             Text(avoidBehaviorCaption)
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -222,6 +225,7 @@ struct SourceFilterChipsView: View {
             Text("Play the top-ranked source straight away instead of opening the source list. Back out of the player any time to see the full source list.")
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -269,6 +273,7 @@ struct SourceFilterChipsView: View {
             Text("A sample of what the current chips would surface. Your real list uses the sources each title actually returns.")
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(Theme.Space.sm)
         .vortxGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous),
