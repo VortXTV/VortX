@@ -119,6 +119,12 @@ struct StremioXiOSApp: App {
                     }
                 }
                 .onAppear {
+                    // Cold-launch pull: the initial scenePhase == .active on a fresh process does NOT fire
+                    // .onChange(of: scenePhase), so nothing opens the sync channel on launch. Open it now so a
+                    // relaunch / reinstall pulls the account's real profile immediately instead of waiting for
+                    // the first real foreground transition. Idempotent (guards isSignedIn + !realtimeActive)
+                    // and it already performs an immediate syncDown().
+                    VortXSyncManager.shared.startRealtime()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }

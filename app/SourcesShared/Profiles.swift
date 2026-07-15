@@ -1020,6 +1020,22 @@ final class ProfileStore: ObservableObject {
         // the union keeps every profile from both sides and preserves a stable, local-first ordering.
         var merged: [UserProfile] = localRoster.map { local in
             guard let remote = incomingByID[local.id] else { return local }
+            // Fresh-install owner-clobber guard (tightly scoped). A just-reinstalled device restores its
+            // session from the Keychain but its roster is still the un-hydrated placeholder owner that
+            // migrateFromSingleAccount mints on a fresh install: the FIXED owner id, name exactly "Main",
+            // and a nil email. If this device's local owner still carries that EXACT placeholder signature
+            // while the incoming (cloud) owner has been hydrated (a real, non-"Main" name OR a real email),
+            // adopt the incoming owner even when the local roster looks "newer", so the reinstalled device
+            // shows the real profile immediately instead of serializing its default "Main" back up.
+            // Scoped to the owner id AND the exact default signature (name == "Main" AND email == nil), so it
+            // can NEVER override a real rename: a "Main" the user kept still carries a bound account email and
+            // fails email == nil, and any profile the user actually renamed fails name == "Main". In both of
+            // those cases preferIncoming still governs the record, unchanged.
+            if local.id == UserProfile.ownerID,
+               local.name == "Main", local.email == nil,
+               (remote.name != "Main" || !(remote.email ?? "").isEmpty) {
+                return remote
+            }
             return preferIncoming ? remote : local
         }
         for remote in incoming where localByID[remote.id] == nil {
