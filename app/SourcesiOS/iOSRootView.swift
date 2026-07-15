@@ -2643,8 +2643,10 @@ private struct iOSOpenLinkView: View {
                             }
                             .padding(Theme.Space.md)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Theme.Palette.surface1,
-                                        in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+                            // glass-Browse: a bespoke file-picker card row, not routed through a shared row
+                            // style, so it flips straight to the glass card preset instead of the flat
+                            // surface1 fill (matches the Downloads rows).
+                            .vortxSettingsCard()
                         }
                         .buttonStyle(.plain)
                     }
@@ -3554,9 +3556,10 @@ private struct MacBackAffordance: ViewModifier {
                         .foregroundStyle(Theme.Palette.textPrimary)
                         .padding(.horizontal, Theme.Space.sm)
                         .padding(.vertical, 6)
-                        // Floating Back chrome over the detail content: Liquid Glass on macOS 26, the frosted
-                        // material below. Interactive since it is a pressable control.
-                        .glassChrome(in: Capsule(), interactive: true) { Capsule().fill(.ultraThinMaterial) }
+                        // Floating Back chrome over the detail content on the shared glass primitive: warm
+                        // glass + top highlight, Liquid Glass on macOS 26, opaque warm fallback under Reduce
+                        // Transparency. Matches the nav / transport discs (CircleIconDisc).
+                        .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
                 }
                 .buttonStyle(.plain)
                 .padding(.leading, Theme.Space.md)

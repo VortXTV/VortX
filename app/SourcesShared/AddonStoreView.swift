@@ -220,7 +220,9 @@ struct AddonStoreView: View {
                                 .font(Theme.Typography.label)
                                 .lineLimit(1)
                                 .padding(.horizontal, 8).padding(.vertical, 3)
-                                .background(Theme.Palette.surface2, in: Capsule())
+                                // Warm glass type chip (idle), matching the shared chip flip, instead of the
+                                // flat surface2 capsule.
+                                .vortxGlassChip(selected: false)
                                 .foregroundStyle(Theme.Palette.textSecondary)
                                 .fixedSize()   // each chip keeps its intrinsic size, never pressuring the name
                         }
@@ -251,7 +253,9 @@ struct AddonStoreView: View {
             .task { health.probeOne(addon.transportUrl) }
         #else
         return content
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            // iOS / Mac: back the row with the shared card glass so it reads as warm glass like the tvOS
+            // RowFocusStyle row above, instead of the flat surface1 fill.
+            .vortxSettingsCard()
             // Lazy per-row probe: only visible rows hit the network, so a 200-entry catalog never bursts.
             .task { health.probeOne(addon.transportUrl) }
         #endif

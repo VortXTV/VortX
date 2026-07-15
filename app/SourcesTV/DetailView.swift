@@ -2303,11 +2303,19 @@ struct CoreStreamList: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    private func badge(_ text: String, accent: Bool = false) -> some View {
-        Text(text).font(Theme.Typography.eyebrow).tracking(1)
+    @ViewBuilder private func badge(_ text: String, accent: Bool = false) -> some View {
+        let label = Text(text).font(Theme.Typography.eyebrow).tracking(1)
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(accent ? Theme.Palette.accent.opacity(0.22) : Theme.Palette.surface3, in: Capsule())
             .foregroundStyle(accent ? Theme.Palette.accent : Theme.Palette.textSecondary)
+        if accent {
+            // The accent badge (CACHED) carries meaning through its ember tint, so it stays a SOLID accent
+            // pill rather than glass (mirrors the iOS iOSStreamLabel badge split).
+            label.background(Theme.Palette.accent.opacity(0.22), in: Capsule())
+        } else {
+            // Neutral badges (add-on name, TORRENT) become badge-alpha glass pills so they read as raised
+            // chrome; the flat shadow keeps them inline without floating.
+            label.vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
+        }
     }
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.

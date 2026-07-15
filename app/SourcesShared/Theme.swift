@@ -463,6 +463,11 @@ struct GlassChromeModifier<GlassShape: Shape, Fallback: View>: ViewModifier {
             } else {
                 content.glassEffect(.regular, in: shape)
             }
+        } else if reduceTransparency {
+            // Reduce Transparency: stand down to an opaque warm surface1 (mirrors VortXGlass.blurLayer), not
+            // the caller's fallback material. Both call sites pass a translucent .ultraThinMaterial, which
+            // ignores Reduce Transparency, so honor the primitive's opaque-surface guarantee here instead.
+            content.background { shape.fill(Theme.Palette.surface1) }
         } else {
             content.background { fallback }
         }

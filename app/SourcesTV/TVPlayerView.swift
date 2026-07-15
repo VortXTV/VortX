@@ -3372,8 +3372,10 @@ struct TVPlayerView: View {
             }
             .padding(.horizontal, Theme.Space.xl).padding(.vertical, Theme.Space.md)
             .foregroundStyle(Theme.Palette.textPrimary)
-            // Floating seek feedback over the video: Liquid Glass on tvOS 26, the frosted material below.
-            .glassChrome(in: Capsule()) { Capsule().fill(.ultraThinMaterial) }
+            // Floating seek feedback over the video: warm toast glass (legible field-weight fill + soft toast
+            // shadow), Liquid Glass on tvOS 26, opaque warm fallback under Reduce Transparency. A compact
+            // non-interactive notice, like the stats overlay.
+            .vortxGlassToast(in: Capsule())
             .padding(.bottom, Theme.Space.screenEdge * 3)
         }
         .transition(.opacity)
