@@ -4,6 +4,7 @@ options:
   developmentLanguage: en
   deploymentTarget:
     iOS: "16.0"
+    tvOS: "16.0"
   createIntermediateGroups: true
   # Full localization roster shipped by the single Resources/Localizable.xcstrings String Catalog.
   # The catalog compiler emits an .lproj for every localization in the catalog regardless of this list,
@@ -184,7 +185,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "180"
+        CURRENT_PROJECT_VERSION: "181"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
@@ -270,7 +271,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "180"
+        CURRENT_PROJECT_VERSION: "181"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -345,7 +346,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "180"
+        CURRENT_PROJECT_VERSION: "181"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -420,7 +421,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "180"
+        CURRENT_PROJECT_VERSION: "181"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -482,7 +483,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "180"
+        CURRENT_PROJECT_VERSION: "181"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
