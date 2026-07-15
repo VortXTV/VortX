@@ -566,10 +566,16 @@ struct PlayerScreen: View {
     /// type), so the chrome can hide the rows AVPlayer has no equivalent for: audio sync (setAudioDelay), audio
     /// output mode, and the hardware-decoding toggle. External add-on subtitles and the subtitle-sync nudge now
     /// work on BOTH engines (AVPlayer renders external cues itself + honours setSubDelay as an overlay offset),
-    /// so those rows are shown. Falls back to the routing decision before the controller mounts so the gate is
-    /// correct even on the first render.
+    /// so those rows are shown.
+    ///
+    /// The MOUNTED controller's type is the truth whenever a controller exists, in BOTH directions: the old
+    /// form only checked "is AVPlayerEngineController" and otherwise fell back to the routing intent, so with
+    /// libmpv actually mounted but the route/latch still saying AVPlayer, the engine label + Settings rows
+    /// claimed AVPlayer while HDR10 tone-mapped pixels were rendering (the "shows AVPlayer but plays libmpv"
+    /// mislabel). Falls back to the routing decision only before any controller mounts, so the gate is still
+    /// correct on the first render.
     private var isAVPlayerActive: Bool {
-        if coordinator.player is AVPlayerEngineController { return true }
+        if let mounted = coordinator.player { return mounted is AVPlayerEngineController }
         #if os(iOS) || os(macOS)
         return useAVPlayerEngine
         #else
@@ -587,7 +593,15 @@ struct PlayerScreen: View {
                 // surface). Without it the first iOS/macOS native-DV MP4/MOV mount never armed the DV
                 // watchdogs (audio-over-black, hev1/dvhe repair, DV diagnostics) that key off
                 // contentIsDolbyVision; source switches were already covered via loadIntoPlayer.
-                .play(initialPlayback.url, headers: initialPlayback.headers,
+                //
+                // RAW url + headers, NEVER the initialPlayback proxy tuple. Routing decides on the RAW url
+                // (routedToAVPlayer), but the mount used to feed the StremioServer 127.0.0.1 proxy rewrite
+                // whenever the stream carried headers, so shouldDVRemux saw a loopback host, the DV remux
+                // lane never mounted, the raw MKV load failed (no Matroska demuxer), and every header-carrying
+                // DV title silently demoted to libmpv HDR10 while the chrome briefly claimed AVPlayer.
+                // AVFoundation attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey in loadFile) and
+                // the remux server takes them directly; only libmpv (mpvSurface below) keeps the proxy.
+                .play(url, headers: headers,
                       isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
                 .live(initialIsLive)
                 .onPropertyChange { _, name, data in handleProperty(name, data) }
@@ -602,6 +616,8 @@ struct PlayerScreen: View {
 
     @ViewBuilder private var mpvSurface: some View {
         MPVMetalPlayerView(coordinator: coordinator)
+            // libmpv KEEPS the proxied initialPlayback tuple: the embedded server applies per-stream headers
+            // server-side (the official-Stremio path picky CDNs need) and rewrites HLS playlists for mpv.
             .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
                   isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
             .live(initialIsLive)
@@ -670,9 +686,9 @@ struct PlayerScreen: View {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                                // Escape-hatch close on the shared VortX glass disc, matching the transport
-                                // discs and upgrading to Liquid Glass on OS 26. Background only; action unchanged.
-                                .padding(12).vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
+                                // Escape-hatch close on the shared TIGHT glass disc (shape-clipped material,
+                                // never glassEffect, so no un-clipped dark halo). Background only; action unchanged.
+                                .padding(12).vortxGlassDisc()
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
@@ -1474,7 +1490,20 @@ struct PlayerScreen: View {
 
     /// (retry, stall recovery, source switch), mirroring tvOS `loadIntoPlayer`.
     private func loadIntoPlayer(_ u: URL, headers h: [String: String]?, live: Bool) {
-        let p = playback(for: u, headers: h)
+        // ENGINE-AWARE playback tuple. The AVFoundation engine must receive the RAW stream url + headers:
+        // it attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey) and the DV remux server takes them
+        // directly, while the StremioServer proxy rewrite (playback(for:)) turns the host into 127.0.0.1,
+        // which makes shouldDVRemux's loopback veto reject the DV remux lane and dead-ends a DV MKV on raw
+        // AVPlayer (no Matroska demuxer -> .failed -> demote to libmpv HDR10). Only libmpv keeps the proxy
+        // (server-side header injection for picky CDNs + HLS playlist rewriting). Keyed off the MOUNTED
+        // controller because that is exactly who receives this loadFile; when no controller is mounted the
+        // call is a no-op either way.
+        let p: (url: URL, headers: [String: String]?)
+        if coordinator.player is AVPlayerEngineController {
+            p = (u, h)
+        } else {
+            p = playback(for: u, headers: h)
+        }
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (u == url) ? audioSidecarURL : nil
@@ -2552,9 +2581,12 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
-        // The trailing transport discs sit shoulder to shoulder; group them so OS 26 blends the glass into
-        // one continuous bar instead of a run of isolated discs. Passthrough (unchanged layout) below 26.
-        .glassChromeCluster()
+        // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the discs are
+        // now the tight material variant (vortxGlassDisc, never glassEffect), so there are no glass panes to
+        // merge and the container only produced the "one continuous blurred slab" over-blur; (2) on OS 26 a
+        // GlassEffectContainer renders interactive descendants with its own monochrome/vibrancy treatment,
+        // which visually suppressed the volume Slider's ember accent tint (volumeControl lives in this bar).
+        // Dropping the container restores the slider's .tint(Theme.Palette.accent) minimum track.
         .padding(.horizontal).padding(.top, 8)
     }
 
@@ -2591,10 +2623,12 @@ struct PlayerScreen: View {
             Button { Haptics.tap(); coordinator.player?.togglePause(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
-                    // Glass transport disc (mockup .big): warm VortX glass, Liquid Glass on OS 26. The inner
-                    // 84pt disc is purely visual; the outer 100pt frame keeps the original tap target.
+                    // Glass transport disc (mockup .big) on the TIGHT disc variant: shape-clipped material,
+                    // never glassEffect (whose un-clipped ambient bloom drew a dark rounded halo around the
+                    // disc over bright video). The inner 84pt disc is purely visual; the outer 100pt frame
+                    // keeps the original tap target.
                     .frame(width: 84, height: 84)
-                    .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
+                    .vortxGlassDisc()
                     .frame(width: 100, height: 100)
             }
             .accessibilityLabel(isPaused ? "Play" : "Pause")
@@ -2634,10 +2668,10 @@ struct PlayerScreen: View {
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
                 .foregroundStyle(.white).shadow(radius: 4)
-                // Glass transport disc (mockup .skip): inner 54pt visual disc, outer 60pt frame keeps the
-                // original tap target. Warm VortX glass, upgrades to Liquid Glass on OS 26.
+                // Glass transport disc (mockup .skip) on the TIGHT disc variant (shape-clipped material,
+                // never glassEffect, no halo): inner 54pt visual disc, outer 60pt frame keeps the tap target.
                 .frame(width: 54, height: 54)
-                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
+                .vortxGlassDisc()
                 .frame(width: 60, height: 60)
         }
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
@@ -3177,7 +3211,12 @@ struct PlayerScreen: View {
         Button(action: action) {
             HStack(spacing: 7) {
                 Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+                // #135: force a single line + allow the font to shrink instead of wrapping mid-word
+                // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
+                // fit at full size so minimumScaleFactor is a no-op there.
                 Text(title).font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
             }
             // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
             // when its feature is engaged. Purely visual; the button's action is unchanged.
@@ -3196,9 +3235,10 @@ struct PlayerScreen: View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white).padding(11)
-                // Floating top-bar disc (mockup .disc): the shared VortX glass so it reads like the nav
-                // chrome and upgrades to Apple Liquid Glass on OS 26. Background only, hit shape unchanged.
-                .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
+                // Floating top-bar disc (mockup .disc) on the TIGHT disc variant: a shape-clipped material,
+                // never glassEffect, so the top-row buttons read as tight pucks (no dark halo, no over-blur).
+                // Background only, hit shape unchanged.
+                .vortxGlassDisc()
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
@@ -3565,10 +3605,11 @@ struct PlayerScreen: View {
                     Spacer()
                     Button { close() } label: {
                         Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                            // Panel close on the shared VortX glass disc, matching the transport discs and
-                            // upgrading to Liquid Glass on OS 26. Background only; close() action unchanged.
+                            // Panel close on the shared TIGHT glass disc, matching the transport discs
+                            // (shape-clipped material, never glassEffect, no halo). Background only;
+                            // close() action unchanged.
                             .foregroundStyle(.white.opacity(0.7)).padding(7)
-                            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+                            .vortxGlassDisc()
                             .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
                     }
                     .accessibilityLabel("Close panel")
@@ -4229,10 +4270,24 @@ struct PlayerScreen: View {
         let enter = nc.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { note in
             guard window == nil || (note.object as? NSWindow) === window else { return }
             macIsFullScreen = true
+            // HDR/DV EDR survives fullscreen: AppKit native fullscreen re-hosts the content in a NEW
+            // fullscreen window/backing, which drops the mpv Metal layer's EDR activation + colorspace
+            // association, so PQ/HLG pixels presented as SDR (washed out) until a new file/gamma change.
+            // These notifications fire AFTER the window/backing swap completes, the correct moment to
+            // re-tag the colorspace and re-assert wantsExtendedDynamicRangeContent on the new backing.
+            // mpv lane only; AVPlayerLayer is EDR-native and needs nothing.
+            Task { @MainActor in
+                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
+            }
         }
         let exit = nc.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { note in
             guard window == nil || (note.object as? NSWindow) === window else { return }
             macIsFullScreen = false
+            // Same re-sync on the way OUT: exiting fullscreen swaps back to the original window/backing,
+            // which loses the EDR activation the same way (see the enter handler above).
+            Task { @MainActor in
+                (coordinator.player as? MPVMetalViewController)?.resyncDynamicRangeForWindowChange()
+            }
         }
         macFullScreenObservers = [enter, exit]
     }
@@ -4443,9 +4498,10 @@ struct AirPlayRoutePickerButton: View {
     var body: some View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
-            // AirPlay disc on the shared VortX glass, matching the sibling transport discs and upgrading to
-            // Liquid Glass on OS 26. Background only; the AVRoutePickerView behavior is unchanged.
-            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.discFillAlpha, shadow: .disc)
+            // AirPlay disc on the shared TIGHT glass disc, matching the sibling transport discs
+            // (shape-clipped material, never glassEffect, no halo). Background only; the
+            // AVRoutePickerView behavior is unchanged.
+            .vortxGlassDisc()
             .accessibilityLabel("AirPlay")
     }
 }

@@ -1244,6 +1244,19 @@ final class MPVMetalViewController: PlatformViewController {
         syncDisplayDynamicRange(sigPeak: getDouble(MPVProperty.videoParamsSigPeak))
     }
 
+    /// Force a FULL dynamic-range re-apply after a window/backing swap (macOS native fullscreen enter/exit,
+    /// which re-hosts the content view in a new fullscreen window and drops the CAMetalLayer's EDR
+    /// activation + color environment). Re-arming the nil sentinel is mandatory: the content range did not
+    /// change across the transition, so without it the `range != appliedDynamicRange` guard in
+    /// syncDisplayDynamicRange early-returns and the colorspace tag + wantsExtendedDynamicRangeContent are
+    /// never re-applied to the new backing (the exact "force a fresh apply" pattern loadFile/teardown use).
+    /// Cheap and idempotent for SDR content (re-tags nil colorspace + EDR off). Called by the macOS chrome
+    /// from the didEnter/didExitFullScreen notification handlers; harmless from any other window change.
+    func resyncDynamicRangeForWindowChange() {
+        appliedDynamicRange = nil
+        reapplyDynamicRange()
+    }
+
     /// Whether the current display can actually present HDR. Drives the Auto tone-map mode. On tvOS the
     /// Apple TV switches the connected display into HDR for HDR content itself (HDRDisplayMode below), so
     /// Auto leaves HDR alone there and only the manual On mode forces SDR.
@@ -1319,6 +1332,18 @@ final class MPVMetalViewController: PlatformViewController {
         // AVPlayer remux lane, which owns the .dolbyVision display-mode request).
         case .dolbyVision: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
         }
+        #if os(iOS) || os(macOS)
+        // EDR is APP-ASSERTED here, never left to MoltenVK. MoltenVK sets
+        // wantsExtendedDynamicRangeContent=true only as a one-time side effect of building the swapchain
+        // (from the vo thread; see MetalLayer's override), so it is not re-assertable: on macOS, entering
+        // native fullscreen moves the content into a NEW fullscreen window/backing store, which drops the
+        // layer's EDR activation, and with nothing re-asserting it the PQ/HLG pixels present as SDR (the
+        // washed-out fullscreen HDR/DV report). Setting it alongside the colorspace tag makes the whole
+        // output chain deterministic and re-appliable via resyncDynamicRangeForWindowChange(). The MetalLayer
+        // setter override is main-thread-safe (async hop when needed). tvOS has no EDR layer control at all
+        // (HDR rides HDRDisplayMode below).
+        metalLayer.wantsExtendedDynamicRangeContent = (range != .sdr)
+        #endif
         DiagnosticsLog.logSync("mpv", "layer colorspace tagged")
         mpvLog.log("output range → \(range.rawValue, privacy: .public) (gamma=\(gamma, privacy: .public) sigPeak=\(sigPeak, privacy: .public))")
         DiagnosticsLog.log("mpv", "output range → \(range.rawValue) (gamma=\(gamma) sigPeak=\(sigPeak))")
