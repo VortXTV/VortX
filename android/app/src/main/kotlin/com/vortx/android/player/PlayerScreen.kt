@@ -4,8 +4,18 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -14,16 +24,26 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.skip.SegmentResolver
+import com.vortx.android.skip.SkipSegment
+import com.vortx.android.skip.SkipTimestampService
+import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.delay
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
@@ -109,6 +129,55 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
+    // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
+    // reports its track list, pick the audio + subtitle track per the persisted TrackPreferences, exactly
+    // ONCE per load. This closes the "manual select only" parity gap. A nil audio pick leaves the engine's
+    // own default; a -1 subtitle pick means "off". Runs after the engine's own default selection, so it
+    // overrides toward the user's language chain (e.g. a Turkish-only preference beats a French dub, #76).
+    val trackPreferences = remember(playable.url) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
+    }
+    var autoSelectDone by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playable.url, playerState.audioTracks, playerState.subtitleTracks) {
+        if (autoSelectDone) return@LaunchedEffect
+        val audioTracks = latestState.audioTracks
+        val subtitleTracks = latestState.subtitleTracks
+        if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
+        val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences)
+        pick.audioId?.let { engine.selectAudioTrack(it) }
+        val subId = pick.subtitleId
+        if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
+        autoSelectDone = true
+    }
+
+    // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
+    // SubtitleView style). The mpv engine also applies it pre-init; this covers the ExoPlayer path and any
+    // future live Settings change once the player-settings screen lands (Round 6).
+    LaunchedEffect(engine) { engine.applySubtitleStyle() }
+
+    // Skip segments (intro / recap / credits) for this title, fetched ONCE the engine reports a real
+    // duration (the crowd providers are keyed + clamped by runtime). Fail-soft: no [Playable.mediaRef]
+    // (an unmappable id / the offline preview), a title with no crowd data, or a flaky edge simply leaves
+    // an empty list and no skip button ever shows. Mirrors the Apple player's skip gate, which loads
+    // SkipTimestampService.candidates once it has the imdb id + duration and resolves them through
+    // SegmentResolver. This is the READ side; the in-player submit editor (SkipDBClient) is a later round.
+    var skipSegments by remember(playable.url) { mutableStateOf<List<SkipSegment>>(emptyList()) }
+    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
+        val ref = playable.mediaRef
+        val imdb = ref?.imdb
+        val durationMs = latestState.durationMs
+        if (imdb.isNullOrEmpty() || durationMs <= 0L) return@LaunchedEffect
+        SkipTimestampService.init(context.applicationContext)
+        val durationSec = durationMs / 1000.0
+        val candidates = SkipTimestampService.candidates(
+            metaId = imdb,
+            season = ref.season,
+            episode = ref.episode,
+            durationSeconds = durationSec,
+        )
+        skipSegments = SegmentResolver.resolve(candidates, durationSec)
+    }
+
     // When playback ends, hand control back to the detail page.
     LaunchedEffect(playerState.hasEnded) {
         if (playerState.hasEnded) currentOnBack()
@@ -138,6 +207,45 @@ fun PlayerScreen(
         onDispose {
             val s = latestState
             if (s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+        }
+    }
+
+    // External progress sync (Trakt / SIMKL). Drives scrobble at the play / pause / stop transitions off
+    // the engine's live [PlayerState], through [ScrobbleService] which fans out to every connected
+    // provider (Trakt live scrobble; SIMKL watched-on-finish). A [Playable] with no [Playable.mediaRef]
+    // (the offline preview, an unmappable id) never scrobbles. [ScrobbleService]'s ops are fire-and-forget
+    // on its own scope, so nothing here blocks playback and the stop still completes after this leaves
+    // composition. See com.vortx.android.integrations.ScrobbleService.
+    val scrobbleRef = playable.mediaRef
+    // Latch the started/paused transitions so a play sends exactly one `start`, a resume sends one `start`,
+    // and a pause sends one `pause`, rather than a scrobble on every recomposition.
+    var scrobbleStarted by remember(playable.url) { mutableStateOf(false) }
+    var scrobblePauseSent by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playerState.isPaused, playerState.durationMs > 0L, playerState.hasEnded) {
+        val ref = scrobbleRef ?: return@LaunchedEffect
+        ScrobbleService.init(context.applicationContext)
+        val s = latestState
+        if (s.durationMs <= 0L || s.hasEnded) return@LaunchedEffect
+        val progress = s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
+        if (!s.isPaused) {
+            // First play, or a resume: Trakt uses `start` for both.
+            ScrobbleService.start(ref, progress)
+            scrobbleStarted = true
+            scrobblePauseSent = false
+        } else if (scrobbleStarted && !scrobblePauseSent) {
+            ScrobbleService.pause(ref, progress)
+            scrobblePauseSent = true
+        }
+    }
+    DisposableEffect(playable.url) {
+        onDispose {
+            val ref = scrobbleRef
+            if (ref != null && scrobbleStarted) {
+                val s = latestState
+                val progress = if (s.durationMs > 0L) s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0 else 0.0
+                // Stop records the watch server-side (Trakt at >= 80%, plus a SIMKL history write).
+                ScrobbleService.stop(ref, progress)
+            }
         }
     }
 
@@ -190,6 +298,63 @@ fun PlayerScreen(
             },
             onErrorRetry = currentOnError,
             modifier = Modifier.fillMaxSize(),
+        )
+
+        // The Skip Intro / Skip Recap / Skip Credits affordance, drawn OVER the chrome (declared last) at
+        // the bottom-right, clear of the transport bar. Shows only while the playhead sits inside a
+        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
+        // scrubber does), so it works identically on libmpv and ExoPlayer.
+        SkipButton(
+            segments = skipSegments,
+            positionMs = playerState.positionMs,
+            emberAccent = emberAccent,
+            onSkip = engine::seekTo,
+        )
+    }
+}
+
+/// The Skip Intro / Skip Recap / Skip Credits button. Renders only while the playhead is inside one of the
+/// resolved [segments]; a tap seeks to that segment's end (ms). Positioned bottom-right, above the
+/// transport bar, as ember glass matching the player's other badges. The active-segment recompute is keyed
+/// on the whole SECOND (not the raw ms position) so it re-derives at most once per second, not per frame.
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
+    segments: List<SkipSegment>,
+    positionMs: Long,
+    emberAccent: Color,
+    onSkip: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (segments.isEmpty()) return
+    val positionSec = positionMs / 1000.0
+    // At most one segment applies at a time after the resolver's clamps (intro/recap sit early, credits/
+    // preview in the back half); if two overlapped, the earliest-starting wins so "Skip Intro" beats a
+    // stray late span.
+    val active = remember(segments, positionSec.toLong()) {
+        segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
+    } ?: return
+
+    Row(
+        modifier = modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 20.dp, bottom = 96.dp)
+            .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+            .clickable { onSkip((active.end * 1000).toLong()) }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.SkipNext,
+            contentDescription = active.label,
+            tint = Color.White,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            text = active.label,
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
         )
     }
 }

@@ -69,8 +69,19 @@ jobs:
         run: cargo install cargo-ndk --version "^3" --locked
 
       # Build BOTH flavors. lint.abortOnError = true (app/build.gradle.kts) still gates each assemble.
+      #
+      # External sync credentials (Trakt device-code OAuth, SIMKL PIN flow) are injected here as env vars,
+      # which app/build.gradle.kts's externalSyncSecret() reads into BuildConfig (TraktAuth / SIMKLAuth).
+      # These are the SAME GitHub Actions secrets the Apple release CI uses (release-tvos.yml feeds them
+      # into the Info.plist): TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, SIMKL_CLIENT_ID, SIMKL_CLIENT_SECRET.
+      # Absent secrets resolve to "" so the build still succeeds with the feature dormant (e.g. on a fork).
       - name: Build debug APKs (full + play)
         working-directory: android
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
         run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
 
       # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant

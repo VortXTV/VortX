@@ -50,6 +50,34 @@ interface PlayerEngine {
     fun addExternalSubtitle(url: String)
     fun setSubtitleDelay(seconds: Double)
 
+    /// Offset the AUDIO track's timing relative to video (seconds, +/-) to fix a lip-sync drift. mpv's
+    /// `audio-delay`. ExoPlayer has no live audio-delay knob, so its implementation is a documented no-op
+    /// (the chrome hides the control when the mpv engine is not live). Mirrors Apple `setAudioDelay`.
+    fun setAudioDelay(seconds: Double) {}
+
+    /// Apply the persisted [SubtitleStyle] to the live engine (mpv `sub-*` properties / ExoPlayer
+    /// `SubtitleView` style). Both concrete engines override; the default is a no-op for any future engine
+    /// that renders no subtitles. Mirrors Apple `applySubtitleStyle`.
+    fun applySubtitleStyle() {}
+
+    /// Apply the device's [AudioOutputMode] (auto/stereo/surround/passthrough). The libmpv engine drives
+    /// its AO channel/passthrough policy; ExoPlayer's `DefaultAudioSink` self-negotiates and exposes no
+    /// runtime force, so its implementation is a documented no-op. Mirrors Apple `setAudioOutputMode`.
+    fun setAudioOutputMode(mode: AudioOutputMode) {}
+
+    /// Live audio volume, 0..100, and mute without losing the level. Both engines override (mpv `volume`/
+    /// `mute`; ExoPlayer `player.volume` 0..1). Mirrors Apple `setVolume` / `setMuted`.
+    fun setVolume(volume0to100: Double) {}
+    fun setMuted(muted: Boolean) {}
+
+    /// The container's chapter markers, for a chapter picker. mpv reads `chapter-list`; ExoPlayer has no
+    /// generic chapter API, so it returns empty (a documented no-op). Mirrors Apple `chapters`.
+    fun chapters(): List<PlayerChapter> = emptyList()
+
+    /// A label -> value list of live playback stats (resolution, codecs, bitrate, hwdec) for a stats
+    /// overlay. Both engines override with what their API exposes. Mirrors Apple `playbackStats`.
+    fun playbackStats(): List<Pair<String, String>> = emptyList()
+
     /// Lifecycle. [onEnterBackground] drops video decode (and, per policy, pauses); [onEnterForeground]
     /// resumes. [release] tears the engine down; the instance is unusable afterward.
     fun onEnterBackground()
@@ -76,6 +104,17 @@ data class PlayerTrack(
     val title: String,
     val lang: String? = null,
     val selected: Boolean = false,
+    /// The container's FORCED disposition (mpv track-list `forced` / ExoPlayer `SELECTION_FLAG_FORCED`).
+    /// [TrackSelector] keys the forced-subtitle policy off this flag, not the title text, so real forced
+    /// tracks auto-enable even when they carry no "forced" label. Mirrors Apple `MPVTrack.forced`.
+    val forced: Boolean = false,
+)
+
+/// A single chapter marker from the container, for the chrome's chapter picker. `startMs` is the chapter
+/// start in milliseconds. Mirrors Apple `MPVChapter`.
+data class PlayerChapter(
+    val title: String,
+    val startMs: Long,
 )
 
 /// The immutable transport + track snapshot the chrome renders. The engine copies-on-write and

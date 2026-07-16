@@ -7,9 +7,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
+import com.vortx.android.player.AudioOutputMode
+import com.vortx.android.player.DiskCacheSetting
+import com.vortx.android.player.PerformanceMode
+import com.vortx.android.player.PlayerChapter
 import com.vortx.android.player.PlayerEngine
 import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
+import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -31,6 +36,7 @@ import org.json.JSONArray
 /// is updated with a plain volatile write to a [MutableStateFlow] (thread-safe).
 class MpvPlayer private constructor(
     private val mpv: MPVLib,
+    private val appContext: Context,
 ) : PlayerEngine {
 
     private val _state = MutableStateFlow(PlayerState())
@@ -85,6 +91,18 @@ class MpvPlayer private constructor(
         for ((name, value) in MpvConfig.baseOptions) {
             mpv.setOptionString(name, value)
         }
+        // Persisted player-settings applied pre-init (mirrors Apple applying SubtitleStyle/AudioOutputMode
+        // options and the disk-cache toggle during setupMpv). All default to a no-op / today's behavior:
+        // SubtitleStyle -> Modern defaults, AudioOutputMode -> Auto, DiskCacheSetting -> OFF (empty list).
+        for ((name, value) in MpvConfig.diskCacheOptions(appContext)) {
+            mpv.setOptionString(name, value)
+        }
+        for ((name, value) in SubtitleStyle.current(appContext).mpvOptions()) {
+            mpv.setOptionString(name, value)
+        }
+        for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
+            mpv.setOptionString(name, value)
+        }
         mpv.init()
 
         mpv.observeProperty(PROP_TIME_POS, MPVLib.Format.DOUBLE)
@@ -107,9 +125,20 @@ class MpvPlayer private constructor(
         }
 
         // Device-scaled forward cache cap, applied per file as a property (the Apple loadFile split).
-        // A LOCAL (torrent/loopback) stream buffers in the streaming server's own cache, so keep mpv's
-        // read-ahead tight; a remote debrid/CDN link keeps the larger buffer for network resilience.
-        val readAhead = if (playable.isTorrent || playable.viaStreamingServer) READ_AHEAD_LOCAL else READ_AHEAD_REMOTE
+        //   - Disk cache ON: hand mpv the large, free-disk-clamped budget so the on-disk cache actually
+        //     fills (the cache-on-disk/cache-dir options are already armed pre-init). Recomputed per file
+        //     so it always reflects CURRENT free space (DiskCacheSetting's UNLIMITED safety).
+        //   - Disk cache OFF: a LOCAL (torrent/loopback) stream buffers in the streaming server's own
+        //     cache, so keep mpv's read-ahead tight; a remote debrid/CDN link keeps the larger buffer for
+        //     network resilience; a constrained device stays tight even for remote (PerformanceMode hook).
+        val reduced = PerformanceMode.isReduced(appContext)
+        val readAhead = when {
+            DiskCacheSetting.diskCacheEnabled(appContext) ->
+                DiskCacheSetting.resolvedMaxBytes(appContext, reduced).toString()
+            playable.isTorrent || playable.viaStreamingServer -> READ_AHEAD_LOCAL
+            reduced -> READ_AHEAD_LOCAL
+            else -> READ_AHEAD_REMOTE
+        }
         mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES, readAhead)
 
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
@@ -149,6 +178,63 @@ class MpvPlayer private constructor(
 
     override fun setSubtitleDelay(seconds: Double) { mpv.setPropertyString(PROP_SUB_DELAY, seconds.toString()) }
 
+    override fun setAudioDelay(seconds: Double) { mpv.setPropertyString(PROP_AUDIO_DELAY, seconds.toString()) }
+
+    override fun setVolume(volume0to100: Double) {
+        mpv.setPropertyString(PROP_VOLUME, volume0to100.coerceIn(0.0, 100.0).toString())
+    }
+
+    override fun setMuted(muted: Boolean) { mpv.setPropertyString(PROP_MUTE, if (muted) "yes" else "no") }
+
+    /// Re-apply the persisted subtitle appearance live (mpv `sub-*` properties). The same values are set as
+    /// options pre-init; this overwrites them for a live Settings change. Mirrors Apple `applySubtitleStyle`.
+    override fun applySubtitleStyle() {
+        for ((name, value) in SubtitleStyle.current(appContext).mpvOptions()) {
+            mpv.setPropertyString(name, value)
+        }
+    }
+
+    /// Apply the device audio-output mode live. `audio-channels` / `audio-spdif` are best-effort mid-file
+    /// (mpv may only fully honor them on the next AO (re)open); applied as options pre-init for the reliable
+    /// path. Mirrors Apple `setAudioOutputMode`.
+    override fun setAudioOutputMode(mode: AudioOutputMode) {
+        for ((name, value) in mode.mpvOptions()) {
+            mpv.setPropertyString(name, value)
+        }
+    }
+
+    /// The container's chapters, read from mpv's `chapter-list` (count + per-index title/time). Empty when
+    /// the file carries no chapters. Mirrors Apple `chapters()`.
+    override fun chapters(): List<PlayerChapter> {
+        val count = mpv.getPropertyInt(PROP_CHAPTER_COUNT) ?: return emptyList()
+        val out = ArrayList<PlayerChapter>(count)
+        for (i in 0 until count) {
+            val timeSec = mpv.getPropertyDouble("chapter-list/$i/time") ?: continue
+            val title = mpv.getPropertyString("chapter-list/$i/title")?.takeIf { it.isNotEmpty() }
+                ?: "Chapter ${i + 1}"
+            out += PlayerChapter(title = title, startMs = (timeSec * 1000).toLong().coerceAtLeast(0L))
+        }
+        return out
+    }
+
+    /// A label -> value list of live playback stats read off mpv properties (the Android analogue of Apple
+    /// `playbackStats()`). Absent/blank properties are dropped so the overlay shows only what mpv knows.
+    override fun playbackStats(): List<Pair<String, String>> {
+        val stats = mutableListOf<Pair<String, String>>()
+        val w = mpv.getPropertyInt("video-params/w") ?: mpv.getPropertyInt("width")
+        val h = mpv.getPropertyInt("video-params/h") ?: mpv.getPropertyInt("height")
+        if (w != null && h != null && w > 0 && h > 0) stats += "Resolution" to "${w}x$h"
+        mpv.getPropertyString("video-codec")?.takeIf { it.isNotEmpty() }?.let { stats += "Video codec" to it }
+        mpv.getPropertyString("hwdec-current")?.takeIf { it.isNotEmpty() && it != "no" }
+            ?.let { stats += "Hardware decode" to it }
+        mpv.getPropertyDouble("container-fps")?.takeIf { it > 0 }
+            ?.let { stats += "Frame rate" to String.format("%.3f fps", it) }
+        mpv.getPropertyString("audio-codec")?.takeIf { it.isNotEmpty() }?.let { stats += "Audio codec" to it }
+        mpv.getPropertyString("audio-params/hr-channels")?.takeIf { it.isNotEmpty() }
+            ?.let { stats += "Channels" to it }
+        return stats
+    }
+
     override fun onEnterBackground() {
         // Drop video decode off-screen (matches Apple enterBackground: `vid=no`) and pause.
         pause()
@@ -164,6 +250,11 @@ class MpvPlayer private constructor(
         mpv.removeObserver(observer)
         mpv.detachSurface()
         mpv.destroy()
+        // A finished title must not leave a large on-disk cache behind (DiskCacheSetting's second owner
+        // guardrail: the cache is wiped on a genuine playback exit). No-op when the disk cache is OFF.
+        if (DiskCacheSetting.diskCacheEnabled(appContext)) {
+            DiskCacheSetting.clearCache(appContext)
+        }
     }
 
     /// Re-read `track-list` (a JSON array of track objects) and republish the audio + subtitle tracks.
@@ -184,6 +275,9 @@ class MpvPlayer private constructor(
                     title = t.optString("title").ifEmpty { t.optString("lang").ifEmpty { "$type $trackId" } },
                     lang = t.optString("lang").ifEmpty { null },
                     selected = t.optBoolean("selected", false),
+                    // mpv track-list carries the container's forced disposition; carry it so TrackSelector's
+                    // forced-subtitle policy keys off the flag, matching the ExoPlayer engine.
+                    forced = t.optBoolean("forced", false),
                 )
                 when (type) {
                     "audio" -> audio.add(entry)
@@ -240,9 +334,13 @@ class MpvPlayer private constructor(
         private const val PROP_AID = "aid"
         private const val PROP_SID = "sid"
         private const val PROP_SUB_DELAY = "sub-delay"
+        private const val PROP_AUDIO_DELAY = "audio-delay"
         private const val PROP_VID = "vid"
         private const val PROP_SPEED = "speed"
         private const val PROP_PANSCAN = "panscan"
+        private const val PROP_VOLUME = "volume"
+        private const val PROP_MUTE = "mute"
+        private const val PROP_CHAPTER_COUNT = "chapter-list/count"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
         private const val OPT_DEMUXER_MAX_BYTES = "demuxer-max-bytes"
 
@@ -255,7 +353,7 @@ class MpvPlayer private constructor(
         /// can fall back to ExoPlayer. Never throws.
         fun create(context: Context): MpvPlayer? {
             val lib = MPVLib.create(context) ?: return null
-            return runCatching { MpvPlayer(lib) }.getOrElse {
+            return runCatching { MpvPlayer(lib, context.applicationContext) }.getOrElse {
                 runCatching { lib.destroy() }
                 null
             }

@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import android.content.Context
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -9,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
@@ -21,6 +23,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.vortx.android.model.Playable
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -119,6 +122,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     title = format.label ?: format.language ?: "Track ${audio.size + subs.size + 1}",
                     lang = format.language,
                     selected = group.isTrackSelected(trackIndex),
+                    // Carry the container's forced disposition so TrackSelector's forced-subtitle policy
+                    // can key off the flag (not the title text), matching the mpv engine.
+                    forced = (format.selectionFlags and C.SELECTION_FLAG_FORCED) != 0,
                 )
                 when (group.type) {
                     C.TRACK_TYPE_AUDIO -> audio.add(entry)
@@ -208,6 +214,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // subtitle at runtime re-issues the media item with the extra sidecar appended.
     private var lastPlayable: Playable? = null
 
+    // The hosted PlayerView, kept so [applySubtitleStyle] can restyle its SubtitleView after creation.
+    private var playerView: PlayerView? = null
+
+    // Volume level saved across a mute so unmute restores it (ExoPlayer has one volume, no separate mute).
+    private var preMuteVolume: Float = 1f
+
     override fun addExternalSubtitle(url: String) {
         val base = lastPlayable ?: return
         val updated = base.copy(externalSubtitles = base.externalSubtitles + url)
@@ -218,6 +230,73 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     }
 
     override fun setSubtitleDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
+
+    // Documented no-op: ExoPlayer exposes no live audio-delay (audio/video sync is the renderer's job),
+    // so there is nothing to drive here. The mpv engine implements this via `audio-delay`.
+    override fun setAudioDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
+
+    // Documented no-op: DefaultAudioSink negotiates channel layout / Atmos passthrough against the device's
+    // AudioCapabilities on its own and offers no runtime force. The router already routes Atmos/passthrough
+    // streams here precisely for that auto-negotiation, so there is nothing to override. The mpv engine
+    // implements the manual auto/stereo/surround/passthrough control.
+    override fun setAudioOutputMode(mode: AudioOutputMode) { /* auto-negotiated by DefaultAudioSink */ }
+
+    // Documented no-op: Media3 has no generic container-chapter API, so there are no chapters to expose.
+    // The mpv engine reads `chapter-list`.
+    override fun chapters(): List<PlayerChapter> = emptyList()
+
+    override fun setVolume(volume0to100: Double) {
+        player.volume = (volume0to100 / 100.0).toFloat().coerceIn(0f, 1f)
+    }
+
+    override fun setMuted(muted: Boolean) {
+        if (muted) {
+            preMuteVolume = player.volume
+            player.volume = 0f
+        } else {
+            player.volume = preMuteVolume
+        }
+    }
+
+    // Apply the persisted subtitle appearance to the hosted SubtitleView. `setApplyEmbeddedStyles(false)`
+    // makes our style win over the file's own cue styling, matching mpv where VortX's sub-* options
+    // override. No-op until the surface exists (re-applied from the AndroidView factory on creation).
+    override fun applySubtitleStyle() {
+        val view = playerView?.subtitleView ?: return
+        val style = SubtitleStyle.current(appContext)
+        val edgeType =
+            if (style.isModern) CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW else CaptionStyleCompat.EDGE_TYPE_OUTLINE
+        view.setApplyEmbeddedStyles(false)
+        view.setStyle(
+            CaptionStyleCompat(
+                style.foregroundColorArgb,
+                style.backgroundColorArgb,
+                AndroidColor.TRANSPARENT, // window (full-width) background stays clear; box is the text bg
+                edgeType,
+                AndroidColor.BLACK,
+                null,
+            ),
+        )
+        view.setFractionalTextSize(style.exoTextSizeFraction)
+    }
+
+    // Live playback stats from the current formats (ExoPlayer's equivalent of mpv's property reads): only
+    // the fields Media3 surfaces. Empty entries are dropped so the overlay shows just what is known.
+    override fun playbackStats(): List<Pair<String, String>> {
+        val stats = mutableListOf<Pair<String, String>>()
+        player.videoFormat?.let { v: Format ->
+            if (v.width > 0 && v.height > 0) stats += "Resolution" to "${v.width}x${v.height}"
+            v.codecs?.let { stats += "Video codec" to it }
+            if (v.frameRate > 0f) stats += "Frame rate" to String.format("%.3f fps", v.frameRate)
+            if (v.bitrate != Format.NO_VALUE) stats += "Video bitrate" to "${v.bitrate / 1000} kbps"
+        }
+        player.audioFormat?.let { a: Format ->
+            a.codecs?.let { stats += "Audio codec" to it }
+            if (a.channelCount != Format.NO_VALUE) stats += "Channels" to a.channelCount.toString()
+            if (a.sampleRate != Format.NO_VALUE) stats += "Sample rate" to "${a.sampleRate} Hz"
+        }
+        return stats
+    }
 
     /// Map a sidecar subtitle URL to a Media3-parseable MIME by extension, or null when unknown (skip it).
     private fun subtitleMimeFromUrl(url: String): String? {
@@ -256,13 +335,19 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     setKeepContentOnPlayerReset(true)
                     // Hold the screen awake while the surface is attached (keep-screen-on during playback).
                     keepScreenOn = true
+                    this@ExoPlayerEngine.playerView = this
+                    // Apply the persisted subtitle appearance now the SubtitleView exists.
+                    this@ExoPlayerEngine.applySubtitleStyle()
                 }
             },
             update = { view ->
                 view.applyEmberScrubber(emberArgb)
                 view.resizeMode = scaleMode.toResizeMode()
             },
-            onRelease = { view -> view.player = null },
+            onRelease = { view ->
+                view.player = null
+                if (playerView === view) playerView = null
+            },
         )
     }
 

@@ -11,12 +11,14 @@ import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
@@ -91,4 +93,10 @@ object VortXIcons {
 
     /// SF `puzzlepiece.extension.fill` — default add-on icon when it has no manifest logo.
     val addon: ImageVector = Icons.Filled.Extension
+
+    /// SF `link` — external-service connection (Settings > Integrations: Trakt / SIMKL).
+    val link: ImageVector = Icons.Filled.Link
+
+    /// SF `server.rack` — a personal media server (Settings > Media servers: Plex / Jellyfin / Emby).
+    val mediaServer: ImageVector = Icons.Filled.Dns
 }
