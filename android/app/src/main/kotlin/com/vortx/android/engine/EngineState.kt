@@ -1,7 +1,9 @@
 package com.vortx.android.engine
 
+import com.vortx.android.model.AddonOrder
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
+import com.vortx.android.model.cwItemIsFinished
 import com.vortx.android.model.DiscoverCatalogOption
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverGenreOption
@@ -150,15 +152,50 @@ internal object EngineState {
         for (i in 0 until items.length()) {
             val obj = items.optJSONObject(i) ?: continue
             if (obj.optBoolean("removed", false)) continue
+            val state = obj.optJSONObject("state")
+            val typeRaw = obj.optString("type", "movie")
+            // Finished-prune backstop, mirroring Apple `CoreCWItem.isFinished` applied in CoreBridge
+            // before publishing the rail: the engine keeps any title with `time_offset > 0` (a movie
+            // parked at the credits, a marked-watched title, one finished on another device and synced
+            // down) in the bucket forever. Drop it here so the rail matches the reference apps.
+            if (cwItemIsFinished(
+                    type = typeRaw,
+                    progress = cwProgressFraction(state),
+                    flaggedWatched = state?.optInt("flaggedWatched", 0) ?: 0,
+                    timesWatched = state?.optInt("timesWatched", 0) ?: 0,
+                )
+            ) {
+                continue
+            }
             out += MetaItem(
                 id = obj.optString("_id").ifEmpty { obj.optString("id") },
-                type = MediaType.fromId(obj.optString("type", "movie")),
+                type = MediaType.fromId(typeRaw),
                 name = obj.optString("name"),
                 poster = obj.optStringOrNull("poster"),
-                progress = cwProgress(obj.optJSONObject("state")),
+                progress = cwProgress(state),
+                resumeSeconds = cwResumeSeconds(state),
             )
         }
         return out
+    }
+
+    /// The raw watch fraction (0f..1f, 0 when unknown) for the finished-prune math -- distinct from
+    /// [cwProgress], which returns null (not 0) so the display track can hide. Mirrors Apple
+    /// `CoreCWItem.progress`.
+    private fun cwProgressFraction(state: JSONObject?): Float {
+        if (state == null) return 0f
+        val timeOffset = state.optDouble("timeOffset", 0.0)
+        val duration = state.optDouble("duration", 0.0)
+        if (duration <= 0.0) return 0f
+        return (timeOffset / duration).toFloat().coerceIn(0f, 1f)
+    }
+
+    /// The saved resume position in whole seconds (`timeOffset` is ms), or null when nothing has been
+    /// played into the title. Mirrors Apple `CoreCWItem.resumeSeconds`.
+    private fun cwResumeSeconds(state: JSONObject?): Double? {
+        val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
+        if (timeOffset <= 0.0) return null
+        return timeOffset / 1000.0
     }
 
     /// Watched fraction (0..1) from a library item's `state` block (`timeOffset`/`duration`, both in
@@ -247,18 +284,23 @@ internal object EngineState {
     /// Parse the `meta_details` field into a UI [MetaDetail] plus its grouped [StreamGroup]s. The meta
     /// lives in `metaItems: [{ request, content: Loadable<metaItem> }]` (first Ready wins); streams
     /// live in `streams: [{ request, content: Loadable<[stream]> }]` grouped by the source add-on.
-    fun parseMetaDetail(json: String): MetaDetail? {
+    fun parseMetaDetail(json: String, appliedAddonOrder: List<String> = emptyList()): MetaDetail? {
         val root = json.toJsonObjectOrNull() ?: return null
         val metaItems = root.optJSONArray("metaItems") ?: return null
-        var meta: JSONObject? = null
+        // #144: choose the ready meta by the user's applied ADD-ON ORDER, not the engine's raw
+        // `profile.addons` order (which a reorder never rewrites). Collect every add-on that returned a
+        // ready meta, tagged with its `request.base`, in engine order; [AddonOrder.pickByAddonOrder]
+        // picks the earliest in the applied order. With an empty order (Android today, until the sync
+        // layer lands) this returns the first ready meta -- byte-identical to the old first-Ready pick,
+        // so English/un-reordered accounts are unchanged. Mirrors Apple `CoreMetaDetails.meta`.
+        val ready = mutableListOf<AddonOrder.Ready<JSONObject>>()
         for (i in 0 until metaItems.length()) {
-            val ready = metaItems.optJSONObject(i)?.readyObject("content")
-            if (ready != null) {
-                meta = ready
-                break
-            }
+            val entry = metaItems.optJSONObject(i) ?: continue
+            val readyMeta = entry.readyObject("content") ?: continue
+            val base = entry.optJSONObject("request")?.optString("base").orEmpty()
+            ready += AddonOrder.Ready(base = base, value = readyMeta)
         }
-        val metaObj = meta ?: return null
+        val metaObj = AddonOrder.pickByAddonOrder(ready, appliedAddonOrder) ?: return null
         val type = MediaType.fromId(metaObj.optString("type", "movie"))
         return MetaDetail(
             id = metaObj.optString("id"),
@@ -270,7 +312,9 @@ internal object EngineState {
             description = metaObj.optStringOrNull("description"),
             releaseInfo = metaObj.optStringOrNull("releaseInfo"),
             runtime = metaObj.optStringOrNull("runtime"),
-            imdbRating = metaObj.optStringOrNull("imdbRating"),
+            // Read the rating from `links` (mirroring Apple `CoreMetaItem.imdbRating`); the engine emits
+            // no top-level `imdbRating`, so the old top-level read decoded null every time.
+            imdbRating = parseImdbRating(metaObj),
             genres = parseGenres(metaObj),
             cast = parseCredits(metaObj, "cast", "actors", "actor"),
             directors = parseCredits(metaObj, "director", "directors"),
@@ -278,6 +322,7 @@ internal object EngineState {
             videos = parseVideos(metaObj),
             libraryItem = parseLibraryItemInfo(root.optJSONObject("libraryItem")),
             watchedVideoIds = parseWatchedVideoIds(root),
+            trailerYouTubeId = parseTrailerYouTubeId(metaObj),
         )
     }
 
@@ -300,6 +345,7 @@ internal object EngineState {
             timeOffsetMs = state?.optLong("timeOffset", 0L) ?: 0L,
             durationMs = state?.optLong("duration", 0L) ?: 0L,
             timesWatched = state?.optInt("timesWatched", 0) ?: 0,
+            flaggedWatched = state?.optInt("flaggedWatched", 0) ?: 0,
         )
     }
 
@@ -317,14 +363,29 @@ internal object EngineState {
         return out
     }
 
-    /// Parse the stream source groups from `meta_details.streams`. One [StreamGroup] per source add-on
+    /// Parse the stream source groups for a title, mirroring Apple `CoreMetaDetails.allStreamGroups`:
+    /// the meta-EMBEDDED stream groups (`metaStreams`) concatenated with the stream-resource responses
+    /// (`streams`), in the engine's own `[metaStreams, streams]` order. Catalog add-ons that serve plain
+    /// HTTP/HLS links usually inline them in the meta's videos instead of implementing a separate
+    /// `stream` resource, so official clients list `metaStreams` alongside `streams`. Reading only
+    /// `streams` made every such add-on show ZERO sources (#122). One [StreamGroup] per source add-on
     /// (named by the request base host), best-effort, in engine order.
     fun parseStreamGroups(json: String): List<StreamGroup> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
-        val streams = root.optJSONArray("streams") ?: return emptyList()
+        // #122: metaStreams FIRST, then the stream-resource groups, matching Apple's concat order. A
+        // payload with only `metaStreams` (no `streams`) is now surfaced instead of dropped.
+        return parseStreamGroupArray(root.optJSONArray("metaStreams")) +
+            parseStreamGroupArray(root.optJSONArray("streams"))
+    }
+
+    /// One pass over a `[{ request, content: Loadable<[stream]> }]` array into [StreamGroup]s, dropping
+    /// still-loading/empty entries. Shared by the metaStreams and streams passes so both decode
+    /// identically.
+    private fun parseStreamGroupArray(array: JSONArray?): List<StreamGroup> {
+        if (array == null) return emptyList()
         val groups = mutableListOf<StreamGroup>()
-        for (i in 0 until streams.length()) {
-            val entry = streams.optJSONObject(i) ?: continue
+        for (i in 0 until array.length()) {
+            val entry = array.optJSONObject(i) ?: continue
             val addon = addonName(entry.optJSONObject("request"))
             val content = entry.readyArray("content") ?: continue
             val sources = mutableListOf<StreamSource>()
@@ -496,6 +557,9 @@ internal object EngineState {
 
     // ---- element parsers ----
 
+    /// Mirrors Apple `CoreMeta`: `posterShape`/`logo`/`background` are top-level preview fields, while
+    /// `imdbRating`/`genres` are read from `links` (the engine emits no top-level rating/genres for a
+    /// preview -- category "imdb" carries the rating in its name, category "Genres" carries each genre).
     private fun parseMetaPreview(obj: JSONObject): MetaItem = MetaItem(
         id = obj.optString("_id").ifEmpty { obj.optString("id") },
         type = MediaType.fromId(obj.optString("type", "movie")),
@@ -503,6 +567,11 @@ internal object EngineState {
         poster = obj.optStringOrNull("poster"),
         year = obj.optStringOrNull("releaseInfo"),
         description = obj.optStringOrNull("description"),
+        posterShape = obj.optStringOrNull("posterShape"),
+        logo = obj.optStringOrNull("logo"),
+        background = obj.optStringOrNull("background"),
+        imdbRating = parseImdbRating(obj),
+        genres = parseGenres(obj),
     )
 
     private fun parseLibraryItem(obj: JSONObject): MetaItem = MetaItem(
@@ -545,6 +614,42 @@ internal object EngineState {
         return genres
     }
 
+    /// The IMDb rating, read from the first `links` entry categorized (case-insensitively) "imdb" whose
+    /// name carries the rating value. Mirrors Apple `CoreMeta.imdbRating` / `CoreMetaItem.imdbRating`
+    /// (the engine emits no top-level `imdbRating` for a preview). Null when absent.
+    private fun parseImdbRating(meta: JSONObject): String? {
+        val links = meta.optJSONArray("links") ?: return null
+        for (i in 0 until links.length()) {
+            val link = links.optJSONObject(i) ?: continue
+            if (link.optString("category").equals("imdb", ignoreCase = true)) {
+                link.optStringOrNull("name")?.let { return it }
+            }
+        }
+        return null
+    }
+
+    /// The first playable YouTube trailer id, mirroring Apple `CoreMetaItem.trailerYouTubeID`: prefer a
+    /// `trailerStreams` entry with a non-empty `ytId`, else a `links` entry categorized "Trailer" whose
+    /// name is a youtube.com URL. Null when the meta carries no trailer.
+    private fun parseTrailerYouTubeId(meta: JSONObject): String? {
+        meta.optJSONArray("trailerStreams")?.let { streams ->
+            for (i in 0 until streams.length()) {
+                val yt = streams.optJSONObject(i)?.optStringOrNull("ytId")
+                if (!yt.isNullOrEmpty()) return yt
+            }
+        }
+        meta.optJSONArray("links")?.let { links ->
+            for (i in 0 until links.length()) {
+                val link = links.optJSONObject(i) ?: continue
+                if (link.optString("category").equals("Trailer", ignoreCase = true)) {
+                    val name = link.optStringOrNull("name") ?: continue
+                    MetaDetail.youTubeId(name)?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
     /// Credits (cast/director/writer) come from the same `links` array as [parseGenres] -- each named
     /// person is one categorized link, the engine's own convention (mirrors Apple `CoreMetaItem.cast`/
     /// `.directors`/`.writers`). [categories] accepts singular and plural spellings since add-ons
@@ -567,9 +672,15 @@ internal object EngineState {
         val url = obj.optStringOrNull("url")
         val infoHash = obj.optStringOrNull("infoHash")
         val externalUrl = obj.optStringOrNull("externalUrl")
-        val isTorrent = url == null && infoHash != null
-        // Stable id matching CoreStream.id: (url|externalUrl|infoHash) + "#" + name + description.
-        val handle = url ?: externalUrl ?: infoHash ?: "?"
+        val ytId = obj.optStringOrNull("ytId")
+        val nzbUrl = obj.optStringOrNull("nzbUrl")
+        val fileIdx = if (obj.has("fileIdx") && !obj.isNull("fileIdx")) obj.optInt("fileIdx") else null
+        // isTorrent mirrors Apple `CoreStream.isTorrent` (`url == nil && infoHash != nil && nzbUrl ==
+        // nil`) so a USENET stream (`.nzb`, no url) is classified as usenet, never torrent.
+        val isTorrent = url == null && infoHash != null && nzbUrl == null
+        val behaviorHints = obj.optJSONObject("behaviorHints")
+        // Stable id matching CoreStream.id: (url|externalUrl|infoHash|nzbUrl) + "#" + name + description.
+        val handle = url ?: externalUrl ?: infoHash ?: nzbUrl ?: "?"
         val name = obj.optStringOrNull("name")
         val description = obj.optStringOrNull("description")
         return StreamSource(
@@ -579,6 +690,21 @@ internal object EngineState {
             description = description,
             quality = null,
             isTorrent = isTorrent,
+            url = url,
+            ytId = ytId,
+            infoHash = infoHash,
+            fileIdx = fileIdx,
+            externalUrl = externalUrl,
+            nzbUrl = nzbUrl,
+            fileMustInclude = obj.optStringOrNull("fileMustInclude"),
+            vortxProvider = obj.optStringOrNull("vortxProvider"),
+            bingeGroup = behaviorHints?.optStringOrNull("bingeGroup"),
+            filename = behaviorHints?.optStringOrNull("filename"),
+            notWebReady = if (behaviorHints != null && behaviorHints.has("notWebReady")) {
+                behaviorHints.optBoolean("notWebReady")
+            } else {
+                null
+            },
         )
     }
 

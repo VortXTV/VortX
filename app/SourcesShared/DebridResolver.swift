@@ -86,6 +86,31 @@ struct DebridPlaybackRef: Sendable, Equatable {
     let fileIdx: Int?
 }
 
+/// One item ALREADY in the user's debrid cloud (a finished torrent / stored file), surfaced by the
+/// browsable-library feature so it can be listed and played straight from the account (no add-on, no
+/// re-download). `Sendable` value type: it crosses from the resolver actor to the browse UI and back to
+/// the same provider's resolver for the on-demand direct-link resolve. The resolution fields are opaque
+/// to the UI and interpreted ONLY by the owning provider's resolver (`resolveLibraryItem`): each provider
+/// stores what its own resolve leg needs (a torrent+file id, a link to unlock, or an already-direct link).
+struct DebridLibraryItem: Sendable, Identifiable, Equatable {
+    /// Stable, provider-scoped id for SwiftUI: "<service.rawValue>:<providerId>".
+    let id: String
+    let service: DebridService
+    let name: String
+    /// Total bytes, or 0 when the provider omitted a size.
+    let size: Int64
+    /// When it was added to the cloud, or nil when the provider omitted / an unparseable timestamp.
+    let added: Date?
+    /// The provider's own item id (torrent / magnet / file id) in string form, for the resolve leg.
+    let providerId: String
+    /// A chosen file id inside the item, when the list step already picked one (TorBox).
+    let fileId: Int?
+    /// A restricted link the provider must unlock/unrestrict to a direct URL (AllDebrid).
+    let restrictedLink: String?
+    /// An already-direct, immediately playable link (Premiumize stream link).
+    let directLink: String?
+}
+
 // MARK: - Protocol
 
 /// A single debrid provider's resolver. Actor-isolated: each owns its own URLSession and serial work.
@@ -112,6 +137,14 @@ protocol DebridResolving: Actor {
     /// `torrentId`+`fileId` (when present) take the fast provider-native path; otherwise fall back to a full
     /// re-add via `resolve` using the carried `infoHash`/`fileIdx`. Throws `.notCached` when the file is gone.
     func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL
+
+    /// List what is ALREADY in this provider's cloud (finished torrents / stored files), each carrying
+    /// enough to resolve to a direct URL on demand. Powers the browsable debrid library. Default: none.
+    func listCloudLibrary() async throws -> [DebridLibraryItem]
+
+    /// Resolve one previously-listed `DebridLibraryItem` to a direct, streamable URL through this provider.
+    /// Default: unsupported (throws), so a provider that has not implemented browsing stays inert.
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL
 }
 
 extension DebridResolving {
@@ -126,6 +159,28 @@ extension DebridResolving {
     func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL {
         let magnet = DebridResolve.magnet(forHash: infoHash)
         return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: nil)
+    }
+
+    /// Default: a provider that has not implemented cloud browsing surfaces nothing (never throws, so the
+    /// coordinator's fail-soft aggregate simply skips it).
+    func listCloudLibrary() async throws -> [DebridLibraryItem] { [] }
+
+    /// Default: browsing not supported for this provider.
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL { throw DebridError.noMatchingFile }
+}
+
+/// Cross-provider timestamp parsing for the browsable library: RD/TorBox emit ISO-8601 strings (with or
+/// without fractional seconds), AllDebrid/Premiumize emit Unix seconds (handled at their call sites). Any
+/// unparseable value yields nil so the row simply omits the "added" line rather than showing a wrong date.
+enum DebridDate {
+    static func parse(iso: String?) -> Date? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: iso) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: iso)
     }
 }
 
@@ -1442,5 +1497,254 @@ final class DebridCacheAwareness: ObservableObject {
             self.lastUsenetQueried = urls
             self.cachedUsenetURLs = Set(cachedMD5s.compactMap { byMD5[$0] })
         }
+    }
+}
+
+// MARK: - Browsable cloud library (list + resolve, per provider)
+//
+// Each provider lists what is ALREADY in the user's account and resolves a chosen item to a direct URL,
+// reusing that provider's existing private HTTP + decode helpers (same-file extensions can touch them).
+// A short throwaway `DebridFile` reuses `DebridResolve.pickFile` (largest-video heuristic) so the same
+// file-pick logic that powers streaming also picks the playable file inside a browsed torrent.
+
+extension TorBoxResolver {
+    /// A `/torrents/mylist` row, richer than the resolve-path `Item` (adds name / size / created_at).
+    private struct LibraryRow: Decodable {
+        let id: Int
+        let name: String?
+        let size: Int64?
+        let createdAt: String?
+        let downloadFinished: Bool?
+        let downloadPresent: Bool?
+        let downloadState: String?
+        let files: [Cached.File]?
+        enum CodingKeys: String, CodingKey {
+            case id, name, size, files
+            case createdAt = "created_at"
+            case downloadFinished = "download_finished", downloadPresent = "download_present"
+            case downloadState = "download_state"
+        }
+        var ready: Bool {
+            (downloadFinished == true && downloadPresent == true)
+                || downloadState == "cached" || downloadState == "completed"
+        }
+    }
+
+    func listCloudLibrary() async throws -> [DebridLibraryItem] {
+        guard let url = URL(string: "\(Self.base)/mylist?bypass_cache=true") else { return [] }
+        let env: Envelope<[LibraryRow]> = try await get(url)
+        return (env.data ?? []).compactMap { row -> DebridLibraryItem? in
+            guard row.ready else { return nil }
+            let files = (row.files ?? []).map(file(from:))
+            // Pick the file that would stream (largest video; no episode target for a bare library browse).
+            guard let pick = DebridResolve.pickFile(files, episode: nil, fileIdx: nil) else { return nil }
+            let name = (row.name?.isEmpty == false) ? row.name! : pick.shortName
+            return DebridLibraryItem(
+                id: "\(service.rawValue):\(row.id)",
+                service: service,
+                name: name.isEmpty ? "Untitled" : name,
+                size: row.size ?? files.reduce(Int64(0)) { $0 + $1.size },
+                added: DebridDate.parse(iso: row.createdAt),
+                providerId: String(row.id),
+                fileId: pick.id,
+                restrictedLink: nil,
+                directLink: nil)
+        }
+    }
+
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        guard let tid = Int(item.providerId) else { throw DebridError.providerError("bad torrent id") }
+        if let fid = item.fileId {
+            return try await requestDL(torrentId: tid, fileId: fid)
+        }
+        // No stored file id (defensive): fetch the item and pick the largest video before minting the link.
+        guard let row = try await fetchItem(id: tid) else { throw DebridError.notCached }
+        let files = (row.files ?? []).map(file(from:))
+        guard let pick = DebridResolve.pickFile(files, episode: nil, fileIdx: nil) else { throw DebridError.noMatchingFile }
+        return try await requestDL(torrentId: tid, fileId: pick.id)
+    }
+}
+
+extension RealDebridResolver {
+    /// A `/torrents` list row (the account's torrent cloud). `status == "downloaded"` == finished + playable.
+    private struct TorrentRow: Decodable {
+        let id: String
+        let filename: String?
+        let bytes: Int64?
+        let status: String?
+        let added: String?
+    }
+
+    func listCloudLibrary() async throws -> [DebridLibraryItem] {
+        let rows: [TorrentRow] = try await get("\(Self.base)/torrents?limit=200")
+        return rows.compactMap { r -> DebridLibraryItem? in
+            guard (r.status ?? "") == "downloaded" else { return nil }
+            return DebridLibraryItem(
+                id: "\(service.rawValue):\(r.id)",
+                service: service,
+                name: (r.filename?.isEmpty == false) ? r.filename! : "Untitled",
+                size: r.bytes ?? 0,
+                added: DebridDate.parse(iso: r.added),
+                providerId: r.id,
+                fileId: nil,
+                restrictedLink: nil,
+                directLink: nil)
+        }
+    }
+
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        // `/torrents/info/{id}`: `links` align 1:1 with the SELECTED files, in file order, so pick the
+        // largest video among the selected files and unrestrict its aligned link.
+        let info: Info = try await get("\(Self.base)/torrents/info/\(item.providerId)")
+        guard let links = info.links, !links.isEmpty else { throw DebridError.notReady }
+        let selected = (info.files ?? []).filter { $0.selected == 1 }
+        let dfiles = selected.enumerated().map { idx, f -> DebridFile in
+            DebridFile(id: idx, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
+        }
+        guard let pick = DebridResolve.pickFile(dfiles, episode: nil, fileIdx: nil), links.indices.contains(pick.id) else {
+            throw DebridError.noMatchingFile
+        }
+        let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
+        guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
+        return u
+    }
+}
+
+extension AllDebridResolver {
+    /// The list form of `/magnet/status`: `magnets` is an ARRAY (the id-specific call returns one object).
+    private struct StatusListEnv: Decodable {
+        let status: String
+        let data: D?
+        struct D: Decodable {
+            let magnets: [Magnet]?
+            struct Magnet: Decodable {
+                let id: Int?
+                let filename: String?
+                let size: Int64?
+                let statusCode: Int?
+                let uploadDate: Int?
+                let links: [L]?
+                struct L: Decodable { let link: String; let filename: String?; let size: Int64? }
+            }
+        }
+    }
+
+    func listCloudLibrary() async throws -> [DebridLibraryItem] {
+        let env: StatusListEnv = try await get(authed("/magnet/status", []))
+        guard env.status == "success" else { return [] }
+        return (env.data?.magnets ?? []).compactMap { m -> DebridLibraryItem? in
+            guard m.statusCode == 4 else { return nil }   // 4 = Ready
+            let links = m.links ?? []
+            let dfiles = links.enumerated().map { idx, l -> DebridFile in
+                let n = l.filename ?? ""
+                return DebridFile(id: idx, name: n, shortName: (n as NSString).lastPathComponent, size: l.size ?? 0, mimetype: nil)
+            }
+            guard let pick = DebridResolve.pickFile(dfiles, episode: nil, fileIdx: nil), links.indices.contains(pick.id) else { return nil }
+            let name = (m.filename?.isEmpty == false) ? m.filename!
+                : (pick.shortName.isEmpty ? "Untitled" : pick.shortName)
+            return DebridLibraryItem(
+                id: "\(service.rawValue):\(m.id ?? 0)",
+                service: service,
+                name: name,
+                size: m.size ?? links.reduce(Int64(0)) { $0 + ($1.size ?? 0) },
+                added: m.uploadDate.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                providerId: String(m.id ?? 0),
+                fileId: nil,
+                restrictedLink: links[pick.id].link,
+                directLink: nil)
+        }
+    }
+
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        guard let restricted = item.restrictedLink else { throw DebridError.noMatchingFile }
+        let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: restricted)]))
+        guard let s = un.data?.link, let u = URL(string: s) else { throw DebridError.providerError("unlock") }
+        return u
+    }
+}
+
+extension PremiumizeResolver {
+    /// `/folder/list` (root): the cloud files, each already carrying a direct `stream_link` / `link`.
+    private struct FolderList: Decodable {
+        let status: String
+        let content: [Entry]?
+        struct Entry: Decodable {
+            let id: String?
+            let name: String?
+            let type: String?
+            let size: Int64?
+            let createdAt: Int?
+            let link: String?
+            let streamLink: String?
+            enum CodingKeys: String, CodingKey {
+                case id, name, type, size, link
+                case createdAt = "created_at"
+                case streamLink = "stream_link"
+            }
+        }
+    }
+
+    func listCloudLibrary() async throws -> [DebridLibraryItem] {
+        let list: FolderList = try await getFolderList("/folder/list")
+        guard list.status == "success" else { return [] }
+        return (list.content ?? []).compactMap { e -> DebridLibraryItem? in
+            guard (e.type ?? "") == "file" else { return nil }   // skip subfolders (root browse only)
+            guard let direct = e.streamLink ?? e.link, !direct.isEmpty else { return nil }
+            let name = (e.name?.isEmpty == false) ? e.name! : "Untitled"
+            // Video files only: reuse DebridFile.isVideo (extension / mimetype heuristic).
+            let looksVideo = DebridFile(id: 0, name: name, shortName: (name as NSString).lastPathComponent,
+                                        size: 0, mimetype: nil).isVideo
+            guard looksVideo || e.streamLink != nil else { return nil }
+            return DebridLibraryItem(
+                id: "\(service.rawValue):\(e.id ?? direct)",
+                service: service,
+                name: name,
+                size: e.size ?? 0,
+                added: e.createdAt.map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                providerId: e.id ?? "",
+                fileId: nil,
+                restrictedLink: nil,
+                directLink: direct)
+        }
+    }
+
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        guard let s = item.directLink, let u = URL(string: s) else { throw DebridError.providerError("no link") }
+        return u   // Premiumize folder files are already direct: no extra unrestrict round trip.
+    }
+
+    /// GET with the apikey query (folder/list is a GET), reusing the shared decode contract.
+    private func getFolderList<T: Decodable>(_ path: String) async throws -> T {
+        var c = URLComponents(string: Self.base + path)
+        c?.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        return try await DebridHTTP.decode(session, URLRequest(url: c?.url ?? URL(string: Self.base)!))
+    }
+}
+
+// MARK: - Coordinator: cloud library aggregate
+
+extension DebridCoordinator {
+    /// Every configured provider's cloud library, keyed by service, queried CONCURRENTLY (the resolvers are
+    /// actors). FAIL-SOFT: with no key the map is empty; a provider that errors or is empty simply does not
+    /// appear (its `try?` collapses to no entry), so the browse UI hides that section rather than erroring.
+    func cloudLibrary() async -> [DebridService: [DebridLibraryItem]] {
+        await warmIfNeeded()
+        guard !resolvers.isEmpty else { return [:] }
+        return await withTaskGroup(of: (DebridService, [DebridLibraryItem]).self) { group in
+            for (service, resolver) in resolvers {
+                group.addTask { (service, (try? await resolver.listCloudLibrary()) ?? []) }
+            }
+            var out: [DebridService: [DebridLibraryItem]] = [:]
+            for await (service, items) in group where !items.isEmpty { out[service] = items }
+            return out
+        }
+    }
+
+    /// Resolve a chosen library item to a direct, streamable URL through its own provider's resolver.
+    /// Throws `.noKey` when that provider is no longer configured; other `DebridError`s when the file is gone.
+    func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
+        await warmIfNeeded()
+        guard let resolver = resolvers[item.service] else { throw DebridError.noKey }
+        return try await resolver.resolveLibraryItem(item)
     }
 }

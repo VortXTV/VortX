@@ -11,10 +11,14 @@ struct HomeView: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var becauseYouWatched = BecauseYouWatchedModel()   // "Because you watched <title>" rail, seeded from recent watches
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
     @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
+    @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
+    @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
+    @State private var showCustomize = false   // presents the Home rows reorder/hide manage screen
     @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
@@ -83,86 +87,16 @@ struct HomeView: View {
                             // history inside CoreBridge.removeFromLibrary.
                             // Continue Watching stays a RAIL at the top in BOTH Home layouts (#105): it is a
                             // queue the user steps through in recency order, not a browse surface, so the
-                            // poster-wall option never reshapes it.
+                            // poster-wall option never reshapes it. It is PINNED first (not part of
+                            // HomeRailPreferences), so "Customize Home" never moves or hides it.
                             CoreContinueWatchingRow(items: continueWatching, focusModel: focusModel)
                         }
-                        // Collections hub (Discover cards, Streaming-service tiles, Genre tiles), right after
-                        // Continue Watching per the owner's row order. Each tile opens a sub-catalog browse grid.
-                        // Needs a TMDB key; hidden without one. Replaces the old flat streaming rails + nested groups.
-                        if showCollectionsHub, CollectionsHubModel.isAvailable {
-                            TVCollectionsHub(model: collectionsHub)
-                        }
-                        // Local recommendations seeded from this profile's recent watch history (#0.3.9).
-                        // Hidden when there's no TMDB key, no history to seed from, or no results.
-                        if !topPicks.items.isEmpty {
-                            TopPicksRow(items: topPicks.items, focusModel: focusModel)
-                        }
-                        // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id).
-                        // Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
-                        if !traktRails.items.isEmpty {
-                            TraktWatchlistRow(items: traktRails.items, focusModel: focusModel)
-                        }
-                        // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby
-                        // servers, imdb-keyed cards that open the normal detail page. Hidden with no server.
-                        ForEach(mediaServerRails.rails) { rail in
-                            StreamingRow(title: rail.title, items: rail.items, focusModel: focusModel)
-                        }
-                        // "Upcoming Episodes": the next-airing episode of each series in the library within
-                        // the next 45 days, soonest first (see ReleaseCalendarModel). Hidden when there is
-                        // nothing upcoming, so the default (no dated episodes) renders nothing.
-                        if !releaseCalendar.upcoming.isEmpty {
-                            UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
-                        }
-                        // "Upcoming Movies": library movies with a future release date in the next 45 days,
-                        // soonest first; hidden when nothing is upcoming. Each card routes to the movie DetailView.
-                        if !releaseCalendar.upcomingMovies.isEmpty {
-                            VStack(alignment: .leading, spacing: Theme.Space.md) {
-                                RailHeader(eyebrow: String(localized: "Coming soon"), title: String(localized: "Upcoming Movies"))
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
-                                        ForEach(releaseCalendar.upcomingMovies) { m in
-                                            PosterCard(title: m.name, poster: m.poster, type: "movie", id: m.id, menu: .catalog,
-                                                       onFocus: { focusModel.focus(FocusedHero(id: m.id, type: "movie", title: m.name,
-                                                                                               backdrop: m.poster, metaLine: m.releaseDateLabel,
-                                                                                               overview: nil, genreLine: nil)) })
-                                        }
-                                    }
-                                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
-                                }
-                            }
-                        }
-                        // #105: each add-on catalog renders as a horizontal rail (default) or, with the
-                        // "Poster wall" Home layout, as a vertical grid under the same section header.
-                        // The special rails above (Continue Watching, hub, Top Picks, Streaming, Upcoming)
-                        // stay rails in both modes; only the add-on catalog sections reshape.
-                        ForEach(core.boardRows) { row in
-                            Group {
-                                if catalogPrefs.homeLayout == .wall {
-                                    CoreCatalogWallSection(row: row, focusModel: focusModel)
-                                } else {
-                                    CoreCatalogRowView(row: row, focusModel: focusModel)
-                                }
-                            }
-                            // Vertical board widening, mirroring iOS Home (iOSRootView's `ForEach(core.boardRows)`):
-                            // when the LAST populated board section appears, load the next window of Home catalogs.
-                            // Without it tvOS Home was silently capped at the engine board's first ~30 catalogs in
-                            // BOTH layouts, so a user with many add-on catalogs never saw the rest. Attached here at
-                            // the SECTION level (on the Group, above the wall/rail branch) so it fires in BOTH layouts,
-                            // not inside one. The `LazyVStack` materializes this only as scroll/focus nears the last
-                            // section, so it is not a per-frame call; repeats are gated inside `loadBoardNextPage`
-                            // (boardHasNextPage + boardPageInFlight, cleared on the next `board` emit), the SAME
-                            // idempotency `loadBoardRowNextPage` relies on, so no tvOS-side dedup is added, matching iOS.
-                            //
-                            // Composition with `ensureLiveCatalogsLoaded` (#121, driven from the Live tab): that
-                            // widens the window to a FIXED bound (every installed catalog) so trailing LIVE catalogs
-                            // sitting inside the loaded window hydrate; THIS grows the window itself incrementally as
-                            // Home is scrolled. Both only ever raise the shared `boardRowsLoaded` and share CoreBridge's
-                            // single in-flight gate, so they compose additively and never fight: whichever asks for
-                            // more wins, and neither narrows the window the other opened.
-                            .onAppear {
-                                if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
-                                    core.loadBoardNextPage()
-                                }
+                        // Every other Home section renders in the user's arranged order, minus the hidden ones
+                        // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this
+                        // is a no-op until the user customizes via the "Customize Home" manage screen.
+                        ForEach(railPrefs.arrange(HomeRail.tvDefaultOrder)) { section in
+                            if !railPrefs.isHidden(section) {
+                                homeSection(section)
                             }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
@@ -183,6 +117,7 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .fullScreenCover(isPresented: $showCustomize) { TVHomeRailEditorView() }
         }
     }
 
@@ -218,12 +153,15 @@ struct HomeView: View {
         .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
         // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
         .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
+        // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
     }
 
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
+        becauseYouWatched.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
@@ -235,12 +173,15 @@ struct HomeView: View {
         let catalog = core.library?.catalog ?? []
         let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
         let series = catalog.filter { $0.type == "series" }
-        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
-        releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
+        let seriesNames = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         let movies = catalog.filter { $0.type == "movie" }
         let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
-        releaseCalendar.refreshMovies(movieIDs: movies.map(\.id), movieNames: movieNames, moviePosters: moviePosters, metaBases: bases)
+        // Fold the local watchlist into both Upcoming rails (refreshUpcoming) so a bookmarked-but-not-in-library
+        // title still surfaces its next air / release date; library ids win on name / poster.
+        releaseCalendar.refreshUpcoming(librarySeriesIDs: series.map(\.id), librarySeriesNames: seriesNames,
+                                        libraryMovieIDs: movies.map(\.id), libraryMovieNames: movieNames,
+                                        libraryMoviePosters: moviePosters, metaBases: bases)
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
@@ -258,11 +199,117 @@ struct HomeView: View {
         focusModel.warm(continueWatching.map(\.focusedHero))
     }
 
-    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent).
+    /// Render one reorderable Home section. Each case is the section's ORIGINAL view, unchanged, moved behind
+    /// a stable `HomeRail` key so `HomeRailPreferences` can order + hide it. Continue Watching is pinned
+    /// separately (above), so it has no case here. Every internal gate (empty checks, `showCollectionsHub`,
+    /// pagination) still applies, so a not-hidden section in default order is byte-identical to today.
+    @ViewBuilder
+    private func homeSection(_ section: HomeRail) -> some View {
+        switch section {
+        case .collectionsHub:
+            // Collections hub (Discover cards, Streaming-service tiles, Genre tiles). Each tile opens a
+            // sub-catalog browse grid. Needs a TMDB key; hidden without one.
+            if showCollectionsHub, CollectionsHubModel.isAvailable {
+                TVCollectionsHub(model: collectionsHub)
+            }
+        case .topPicks:
+            // Local recommendations seeded from this profile's recent watch history (#0.3.9).
+            if !topPicks.items.isEmpty {
+                TopPicksRow(items: topPicks.items, focusModel: focusModel)
+            }
+        case .becauseYouWatched:
+            // "Because you watched <title>": recommendations named after the most recent seed.
+            if let rail = becauseYouWatched.rail {
+                StreamingRow(title: rail.title, items: rail.items, focusModel: focusModel)
+            }
+        case .traktWatchlist:
+            // Trakt watchlist as a client-side rail. Zero engine writes; dormant with empty creds.
+            if !traktRails.items.isEmpty {
+                TraktWatchlistRow(items: traktRails.items, focusModel: focusModel)
+            }
+        case .mediaServers:
+            // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby servers.
+            ForEach(mediaServerRails.rails) { rail in
+                StreamingRow(title: rail.title, items: rail.items, focusModel: focusModel)
+            }
+        case .importedLists:
+            // Imported lists (Integrations -> Import a list): each imported public list paints as its own row.
+            ForEach(imported.catalogs) { catalog in
+                if !catalog.isEmpty {
+                    StreamingRow(title: catalog.title, items: catalog.previews, focusModel: focusModel)
+                }
+            }
+        case .upcomingEpisodes:
+            // "Upcoming Episodes": next-airing episode of each library series within 45 days, soonest first.
+            if !releaseCalendar.upcoming.isEmpty {
+                UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
+            }
+        case .upcomingMovies:
+            // "Upcoming Movies": library movies with a future release date in the next 45 days.
+            if !releaseCalendar.upcomingMovies.isEmpty {
+                upcomingMoviesSection
+            }
+        case .addonCatalogs:
+            // Each add-on catalog as a rail (or poster-wall). Per-catalog order/hiding is owned by
+            // CatalogPreferences; this section moves the whole block. Vertical pagination stays attached.
+            ForEach(core.boardRows) { row in
+                boardSection(row)
+            }
+        case .editorialCollections:
+            // No editorial rails on tvOS (iOS-only); never in tvDefaultOrder, so this never renders.
+            EmptyView()
+        }
+    }
+
+    /// "Upcoming Movies" rail (extracted from the body so the section switch stays small).
+    private var upcomingMoviesSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: String(localized: "Coming soon"), title: String(localized: "Upcoming Movies"))
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(releaseCalendar.upcomingMovies) { m in
+                        PosterCard(title: m.name, poster: m.poster, type: "movie", id: m.id, menu: .catalog,
+                                   onFocus: { focusModel.focus(FocusedHero(id: m.id, type: "movie", title: m.name,
+                                                                           backdrop: m.poster, metaLine: m.releaseDateLabel,
+                                                                           overview: nil, genreLine: nil)) })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
+            }
+        }
+    }
+
+    /// One engine board catalog section (rail or poster-wall), with the vertical board-widening trigger on
+    /// the LAST populated section. Unchanged from the previous inline `ForEach(core.boardRows)` body; see the
+    /// long note there (kept below) for why the `.onAppear` sits at the section level for both layouts.
+    @ViewBuilder
+    private func boardSection(_ row: CoreBoardRow) -> some View {
+        Group {
+            if catalogPrefs.homeLayout == .wall {
+                CoreCatalogWallSection(row: row, focusModel: focusModel)
+            } else {
+                CoreCatalogRowView(row: row, focusModel: focusModel)
+            }
+        }
+        // Vertical board widening (mirrors iOS Home): when the LAST populated board section appears, load the
+        // next window of Home catalogs. At the SECTION level so it fires in BOTH the rail and wall layouts;
+        // repeats are gated inside CoreBridge.loadBoardNextPage (boardHasNextPage + boardPageInFlight).
+        .onAppear {
+            if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
+                core.loadBoardNextPage()
+            }
+        }
+    }
+
+    /// The brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows the theme accent),
+    /// plus a trailing "Customize Home" action that opens the rows manage screen.
     private var header: some View {
         HStack(spacing: 0) {
             VortXWordmark(fontSize: 42)
             Spacer()
+            Button { showCustomize = true } label: { Image(systemName: "slider.horizontal.3") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .accessibilityLabel(Text("Customize Home"))
         }
         .padding(.horizontal, Theme.Space.screenEdge)
     }
@@ -879,5 +926,73 @@ struct LoadingRail: View {
                 .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
         }
+    }
+}
+
+/// tvOS manage screen to reorder + hide the Home rows. No drag on tvOS, so each row carries Up / Down and a
+/// Show/Hide toggle (the same pattern as `TVReorderServicesView`), each row its own `.focusSection()`. Writes
+/// straight to `HomeRailPreferences`, so the live Home re-lays out on dismiss. Continue Watching is pinned
+/// first and is intentionally not listed. Presented as a full-screen cover; the remote's Menu button (or the
+/// Done chip) closes it.
+struct TVHomeRailEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var prefs = HomeRailPreferences.shared
+    private let defaults = HomeRail.tvDefaultOrder
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                HStack(alignment: .center) {
+                    Text("Customize Home").screenTitleStyle()
+                    Spacer()
+                    Button { dismiss() } label: { Text("Done") }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+
+                Text("Reorder or hide the rows on your Home screen. Continue Watching always stays at the top.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.sm)
+
+                let rails = prefs.arrange(defaults)
+                LazyVStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    ForEach(Array(rails.enumerated()), id: \.element.id) { index, rail in
+                        row(index: index, rail: rail, count: rails.count)
+                    }
+                }
+
+                Button { prefs.reset() } label: {
+                    Label("Reset to default", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.md)
+            }
+            .padding(.vertical, Theme.Space.lg)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .onExitCommand { dismiss() }   // remote Menu button closes the cover
+    }
+
+    private func row(index: Int, rail: HomeRail, count: Int) -> some View {
+        let hidden = prefs.isHidden(rail)
+        return HStack(spacing: Theme.Space.md) {
+            Text("\(index + 1)").font(.system(size: 18, weight: .bold))
+                .foregroundStyle(Theme.Palette.textTertiary).frame(width: 44)
+            Image(systemName: rail.systemImage)
+                .foregroundStyle(hidden ? Theme.Palette.textTertiary : Theme.Palette.accent)
+            Text(rail.title).font(.system(size: 22, weight: .medium))
+                .foregroundStyle(hidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+            Spacer()
+            Button { prefs.setHidden(rail, !hidden) } label: {
+                Label(hidden ? "Hidden" : "Shown", systemImage: hidden ? "eye.slash" : "eye")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            Button { prefs.moveUp(rail, defaults: defaults) } label: { Image(systemName: "chevron.up") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == 0)
+            Button { prefs.moveDown(rail, defaults: defaults) } label: { Image(systemName: "chevron.down") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == count - 1)
+        }
+        .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
+        .focusSection()
     }
 }

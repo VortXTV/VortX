@@ -1,8 +1,25 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// External sync provider credentials (Trakt device-code OAuth, SIMKL PIN flow). Injected into BuildConfig
+// from a GITIGNORED gradle property (local.properties) or a CI env var of the same name -- mirroring the
+// Apple release CI, which feeds $(TRAKT_CLIENT_ID)/$(TRAKT_CLIENT_SECRET)/$(SIMKL_CLIENT_ID) into the
+// Info.plist from GitHub Actions secrets (see .github/workflows/release-tvos.yml). The real values NEVER
+// live in this file (the repo is public); they sit only in the gitignored local.properties on a dev box,
+// and come from `secrets.*` in CI. An absent value resolves to "" so a fresh/public clone ships the
+// feature DORMANT: TraktAuth.isConfigured / SIMKLAuth.isConfigured stay false and nothing makes a network
+// call, exactly like the Apple side. local.properties precedes the env var so a dev override wins locally.
+val externalSyncProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun externalSyncSecret(name: String): String =
+    (externalSyncProps.getProperty(name) ?: System.getenv(name) ?: "").trim()
 
 android {
     namespace = "com.vortx.android"
@@ -17,6 +34,14 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.3.0"
+
+        // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
+        // SIMKLAuth). Empty default keeps the feature dormant on a public/unprovisioned build; see the
+        // externalSyncSecret() helper above. buildConfig = true is set in buildFeatures {} below.
+        buildConfigField("String", "TRAKT_CLIENT_ID", "\"${externalSyncSecret("TRAKT_CLIENT_ID")}\"")
+        buildConfigField("String", "TRAKT_CLIENT_SECRET", "\"${externalSyncSecret("TRAKT_CLIENT_SECRET")}\"")
+        buildConfigField("String", "SIMKL_CLIENT_ID", "\"${externalSyncSecret("SIMKL_CLIENT_ID")}\"")
+        buildConfigField("String", "SIMKL_CLIENT_SECRET", "\"${externalSyncSecret("SIMKL_CLIENT_SECRET")}\"")
 
         // Package ONLY the ABIs the Rust engine is cross-compiled for (the cargoNdkBuild task's
         // androidAbis list below). Without this, the libmpv AAR's extra armeabi-v7a/x86 slices made
@@ -120,6 +145,15 @@ dependencies {
     // directly; we're staying on it for S01 (out of scope to migrate DebridKeys here), flagged for a
     // future session.
     implementation(libs.security.crypto)
+
+    // Tink, for `com.google.crypto.tink.subtle.X25519` ONLY -- the raw RFC 7748 X25519 scalar mult used by
+    // the VortX E2E-account device-pairing crypto (com.vortx.android.sync.VortXPairingCrypto). Its shared
+    // secret is byte-identical to the Apple app's CryptoKit Curve25519 and the webapp's WebCrypto X25519,
+    // which is what lets a pairing handoff cross platforms. Pinned (libs.versions.toml) to the SAME version
+    // security-crypto already pulls transitively, so this is an explicit re-declaration (self-documenting +
+    // stable), not a new artifact. All other account crypto (PBKDF2 / AES-GCM / HKDF) is hand-rolled over
+    // the JDK's javax.crypto in VortXCrypto, so Tink is the sole crypto dependency the account layer needs.
+    implementation(libs.tink.android)
 
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.

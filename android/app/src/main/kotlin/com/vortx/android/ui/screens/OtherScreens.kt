@@ -224,6 +224,8 @@ fun SettingsScreen(
     authState: AuthState,
     onAccountClick: () -> Unit,
     onAddonsClick: () -> Unit,
+    onIntegrationsClick: () -> Unit,
+    onMediaServersClick: () -> Unit,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
 ) {
@@ -237,6 +239,8 @@ fun SettingsScreen(
     ) {
         SettingRow(VortXIcons.account, "Account", accountValue, onClick = onAccountClick)
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
+        SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)
+        SettingRow(VortXIcons.mediaServer, "Media servers", "Plex, Jellyfin, Emby", onClick = onMediaServersClick)
         SettingRow(VortXIcons.audioOutput, "Audio output", "Auto")
         SettingRow(VortXIcons.subtitles, "Subtitle size", "Medium")
         if (BuildConfig.DEBUG && onOpenGallery != null) {

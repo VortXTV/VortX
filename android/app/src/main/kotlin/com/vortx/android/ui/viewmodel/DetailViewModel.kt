@@ -1,17 +1,34 @@
 package com.vortx.android.ui.viewmodel
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.debrid.DebridCoordinator
+import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.debrid.DebridResolver
+import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.integrations.buildMediaRef
+import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
+import com.vortx.android.model.MediaRef
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.singularity.SourceIndexClient
+import com.vortx.android.singularity.SourceIndexServeSource
+import com.vortx.android.sources.ResolvedPin
+import com.vortx.android.sources.SourcePinContext
+import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourcePreferencesStore
+import com.vortx.android.torbox.TorBoxSearchSource
 import com.vortx.android.ui.UiState
-import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,7 +49,44 @@ class DetailViewModel(
     private val repo: CatalogRepository,
     private val type: MediaType,
     private val id: String,
+    appContext: Context,
 ) : ViewModel() {
+
+    private val app = appContext.applicationContext
+
+    // ---- Source-list assembly + debrid orchestration (the assembly + coordinator wave) ----
+    //
+    // The detail source rows are driven by [SourceListModel]: it folds ALL the lanes (the ranked engine
+    // add-on groups + the user's TorBox search results + the community Singularity pool + the media-server
+    // direct-play copies) into ONE ranked list through the same [StreamRanking] the app uses, off the render
+    // path, coalesced (~4 rebuilds/sec) with an O(1) epoch signature. [DebridCoordinator] drives the play
+    // side: cache-check fan-out (badge + rank up account-cached torrents), the multi-candidate failover race
+    // (top pick dead -> next cached, honouring the label-authoritative quality gate), and the 20-min
+    // fresh-link resume replay. Both were built + build-green in the prior wave; this class makes them live.
+    private val debridKeys = DebridKeys(app)
+    private val debrid = DebridCoordinator(DebridResolver(debridKeys), debridKeys)
+    private val torbox = TorBoxSearchSource(debridKeys)
+    private val singularity = SourceIndexServeSource()
+    private val sourceModel = SourceListModel(viewModelScope)
+    private val sourcePrefs = SourcePreferencesStore(app)
+    private val sourcePins = SourcePinStore(app)
+    private val trackPrefs = TrackPreferencesStore(app)
+
+    /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
+    /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
+    /// clobbers the Loading shimmer or a load Error with an empty Success.
+    @Volatile private var sourcesReady = false
+
+    /// The account-confirmed cached sets from the last [DebridCoordinator.cacheCheck], feeding the failover
+    /// race ([resolveFirstPlayable]) and the cache badge. Replaced per load; empty with no debrid key.
+    @Volatile private var cachedHashes: Set<String> = emptySet()
+    @Volatile private var cachedUsenetURLs: Set<String> = emptySet()
+
+    /// In-session record of the last natively-resolved debrid source per play target (episode id, or the movie
+    /// id), so a re-play of the SAME target within [DebridCoordinator.FRESH_LINK_WINDOW_MS] replays the exact
+    /// stored link (or reresolves it) via [DebridCoordinator.resumePlaybackURL] instead of re-running source
+    /// selection. Lost on process death (no cross-launch persistence yet), which is the safe first cut.
+    private var resumeRef: ResumeRef? = null
 
     private val _meta = MutableStateFlow<UiState<MetaDetail>>(UiState.Loading)
     val meta: StateFlow<UiState<MetaDetail>> = _meta.asStateFlow()
@@ -79,11 +133,19 @@ class DetailViewModel(
                 repo.peekMeta(type, id)?.let { fresh -> _meta.value = UiState.Success(fresh) }
             }
         }
+        // Start the assembly pipeline and bridge its ranked output to [_streams]. The bridge is gated by
+        // [sourcesReady] so the coalescer's empty first paint (bind paints once immediately, and every new
+        // load resets rawGroups to empty) never overwrites the Loading shimmer or a load Error.
+        sourceModel.bind(torbox, singularity)
+        viewModelScope.launch {
+            sourceModel.state.collect { st ->
+                if (sourcesReady) _streams.value = UiState.Success(st.groups)
+            }
+        }
         viewModelScope.launch {
             if (type == MediaType.SERIES) {
                 // A series' hero Watch/Resume target depends on which episode + watched state the meta
-                // carries, so meta must land before the sources fan-out is scoped -- unlike a movie,
-                // this can't run in parallel with the (title-level) streams call.
+                // carries, so meta must land before the sources fan-out is scoped.
                 _meta.value = repo.meta(type, id).toUiState()
                 val detail = (_meta.value as? UiState.Success)?.data
                 val primary = detail?.let { primaryEpisodeOf(it) }
@@ -91,29 +153,167 @@ class DetailViewModel(
                     _selectedSeason.value = primary.first.season
                     selectEpisode(primary.first.id)
                 } else {
-                    _streams.value = repo.streams(type, id).toUiState()
+                    loadSources(null)
                 }
             } else {
-                // Movie: meta and title-level sources are independent, so fan them out together --
-                // the hero appears the moment meta lands, exactly as before.
-                val metaJob = async { repo.meta(type, id) }
-                val streamsJob = async { repo.streams(type, id) }
-                _meta.value = metaJob.await().toUiState()
-                _streams.value = streamsJob.await().toUiState()
+                // Movie: land meta first (the hero + the media-server scoping both read it), then load the
+                // title-level sources through the assembly.
+                _meta.value = repo.meta(type, id).toUiState()
+                loadSources(null)
             }
         }
     }
 
-    /// Reload sources scoped to a series [episodeId] (the engine `CoreVideo.id`). Re-drives the sources
-    /// list into Loading then its result, so the section shows progress while the chosen episode's
-    /// stream add-ons fan out. A no-op if the same episode is re-selected. Movies never call this.
+    /// Reload sources scoped to a series [episodeId] (the engine `CoreVideo.id`). A no-op if the same episode
+    /// is re-selected. Movies never call this. [loadSources] drives the Loading -> result transition.
     fun selectEpisode(episodeId: String) {
         if (_selectedEpisodeId.value == episodeId) return
         _selectedEpisodeId.value = episodeId
-        _streams.value = UiState.Loading
         viewModelScope.launch {
-            _streams.value = repo.streams(type, id, episodeId).toUiState()
+            loadSources(episodeId)
         }
+    }
+
+    /// Load + assemble the sources for [episodeId] (null = movie / title-level) through [sourceModel]: feed
+    /// the raw engine add-on groups plus the TorBox / Singularity / media-server lanes and drive the detail
+    /// rows from the assembled, ranked, coalesced [SourceListState]. The add-on groups paint immediately; the
+    /// contributor lanes + the account cache badge fold in a beat later through the coalescer, the "sources
+    /// stream in behind the hero" shape. Fail-soft: an add-on-load failure surfaces as [UiState.Error] and
+    /// leaves any still-arriving contributor lane to be handled on the next load.
+    private suspend fun loadSources(episodeId: String?) {
+        // Reset per-target state so a superseded episode's rows / cache badges can never leak into the new one.
+        sourcesReady = false
+        cachedHashes = emptySet()
+        cachedUsenetURLs = emptySet()
+        _streams.value = UiState.Loading
+        sourceModel.setRawGroups(emptyList())
+
+        val detail = (_meta.value as? UiState.Success)?.data
+        val imdb = id.takeIf { it.startsWith("tt") }
+        val ep = episodeId?.let { eid -> detail?.videos?.firstOrNull { it.id == eid } }
+        val season = if (type == MediaType.SERIES) ep?.season?.takeIf { it > 0 } else null
+        val episodeNum = if (type == MediaType.SERIES) ep?.episode?.takeIf { it > 0 } else null
+
+        // Kick the contributor lanes + install the ranking context BEFORE the raw feed, so the first coalesced
+        // rebuild ranks against the real user prefs/pin (never the empty default, which would clobber the
+        // globally-installed reading) and merges every lane in one pass.
+        torbox.refresh(imdb, season, episodeNum)
+        singularity.refresh(SourceIndexClient.contentId(imdb, season, episodeNum), isSignedIn())
+        sourceModel.setContext(buildContext(episodeId, imdb, season, episodeNum))
+        // Dormant + no network when no media server is connected (matches the pre-assembly guard).
+        val serverGroups = if (MediaServerRepository.hasServers) mediaServerGroups(episodeId) else emptyList()
+        sourceModel.setMediaServerGroups(serverGroups)
+
+        repo.streams(type, id, episodeId).fold(
+            onSuccess = { raw ->
+                // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
+                // the model so the fuller assembled + re-ranked list refines it a beat later.
+                if (episodeId == _selectedEpisodeId.value) {
+                    sourcesReady = true
+                    _streams.value = UiState.Success(raw)
+                    sourceModel.setRawGroups(raw)
+                    runCacheCheck(raw, episodeId, season, episodeNum)
+                }
+            },
+            onFailure = {
+                if (episodeId == _selectedEpisodeId.value) {
+                    _streams.value = UiState.Error(it.message ?: "Something went wrong loading your add-ons.")
+                }
+            },
+        )
+    }
+
+    /// The frozen ranking context [sourceModel] assembles against: the real user preference snapshot + the
+    /// effective per-title / provider pin (so a re-rank of the merged list keeps a pinned source on top and
+    /// honours the user's filters), the chosen episode's [SourceListModel.Context.streamId], and the
+    /// Singularity pool [SourceListModel.Context.contentId] for the fire-and-forget hoard seed.
+    private fun buildContext(episodeId: String?, imdb: String?, season: Int?, episodeNum: Int?): SourceListModel.Context =
+        SourceListModel.Context(
+            metaId = id,
+            streamId = episodeId,
+            prefs = sourcePrefs.snapshot(trackPrefs.current.audioLanguages),
+            pin = currentPin(),
+            contentId = SourceIndexClient.contentId(imdb, season, episodeNum),
+        )
+
+    /// Query the user's debrid account for which of the loaded torrents it has CACHED, then use the result to
+    /// (a) feed the failover race + resume ([cachedHashes] / [cachedUsenetURLs]) and (b) badge + rank up the
+    /// account-cached add-on torrents that carried no cache tag (re-fed to [sourceModel] so the same
+    /// [StreamRanking] the app uses lights the badge + applies the cache bonus). No key -> no network, no
+    /// badge. Guards against a superseding episode selection landing first.
+    private fun runCacheCheck(raw: List<StreamGroup>, episodeId: String?, season: Int?, episodeNum: Int?) {
+        if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
+        viewModelScope.launch {
+            // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
+            // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
+            // torrents self-badge from the index's own check_cache tag, so they need no account round trip here.
+            val laneStreams = raw.flatMap { it.streams } + torbox.streams.value + singularity.streams.value
+            val hashes = laneStreams
+                .mapNotNull { it.infoHash?.trim()?.lowercase()?.takeIf { h -> h.isNotEmpty() } }
+                .distinct()
+            if (hashes.isEmpty()) return@launch
+            val hits = debrid.cacheCheck(hashes)
+            if (episodeId != _selectedEpisodeId.value) return@launch // a newer selection won; drop this stale check
+            cachedHashes = hits.keys
+            // Usenet cached is already index-confirmed in the stream text (the TorBox search check_cache tag),
+            // so derive the failover's cached-usenet set from that rather than a second md5 round trip.
+            cachedUsenetURLs = laneStreams
+                .filter { it.isUsenet && StreamRanking.isCachedSource(it) }
+                .mapNotNull { it.nzbUrl }
+                .toSet()
+            // Badge + rank up any account-cached add-on torrent the add-on itself did not tag.
+            val decorated = decorateCached(raw, cachedHashes)
+            if (decorated !== raw && episodeId == _selectedEpisodeId.value) sourceModel.setRawGroups(decorated)
+        }
+    }
+
+    /// Fold a "cached" marker into the add-on torrents whose infoHash the account confirmed cached and that do
+    /// not already read cached, so the text-based [StreamRanking] lights the badge + applies the +cache bonus.
+    /// The marker rides the description AND a cache-busting id suffix (the score/quality caches key on the id),
+    /// while the id's handle (`substringBefore('#')`, read by the resolve + dedup paths) is left untouched.
+    /// Returns [groups] unchanged (same instance) when nothing needed marking.
+    private fun decorateCached(groups: List<StreamGroup>, hashes: Set<String>): List<StreamGroup> {
+        if (hashes.isEmpty()) return groups
+        var changed = false
+        val out = groups.map { group ->
+            val streams = group.streams.map { s ->
+                val h = s.infoHash?.trim()?.lowercase()
+                if (h != null && h in hashes && !StreamRanking.isCachedSource(s)) {
+                    changed = true
+                    val desc = s.description?.let { "$it · $CACHED_MARKER" } ?: CACHED_MARKER
+                    s.copy(description = desc, id = s.id + CACHED_ID_SUFFIX)
+                } else {
+                    s
+                }
+            }
+            group.copy(streams = streams)
+        }
+        return if (changed) out else groups
+    }
+
+    /// The effective per-title (else provider) source pin, so a re-rank of the merged list floats a pinned
+    /// source to the top exactly as the engine repo's first rank does.
+    private fun currentPin(): ResolvedPin? = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
+
+    /// Whether the account is signed in, gating the community Singularity SERVE lane. Reads the engine's live
+    /// auth state (the engine repo is also the [AuthRepository]); false for the offline preview repo.
+    private fun isSignedIn(): Boolean = (repo as? AuthRepository)?.authState?.value is AuthState.SignedIn
+
+    /// Build the media-server direct-play groups for the current title, scoped to the chosen [episodeId]'s
+    /// season/number for a series. Returns `[]` before meta loads or with no server connected.
+    private suspend fun mediaServerGroups(episodeId: String?): List<StreamGroup> {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return emptyList()
+        val ep = episodeId?.let { eid -> detail.videos.firstOrNull { it.id == eid } }
+        val season = if (type == MediaType.SERIES) ep?.season?.takeIf { it > 0 } else null
+        val episode = if (type == MediaType.SERIES) ep?.episode?.takeIf { it > 0 } else null
+        val year = detail.releaseInfo?.take(4)?.toIntOrNull()
+        return MediaServerRepository.directPlayGroups(
+            detailId = id,
+            season = season,
+            episode = episode,
+            title = detail.name,
+            year = year,
+        )
     }
 
     /// Browse a different season's episode list (does NOT touch the sources selection -- the hero keeps
@@ -129,21 +329,171 @@ class DetailViewModel(
         if (_playback.value is Playback.Resolving) return
         _playback.value = Playback.Resolving
         val resumeMs = resumeOffsetMs()
+        // Resolve the external-sync identity ONCE here, the one place that knows the meta id + the chosen
+        // episode, and ride it on the Playable so the player can scrobble it to Trakt / SIMKL (the engine
+        // resolve() only knows the opaque source, not the title identity). Null for an id we can't map, in
+        // which case playback simply doesn't scrobble.
+        val ref = currentMediaRef()
         viewModelScope.launch {
             _playback.value = repo.resolve(source).fold(
                 onSuccess = { playable ->
-                    Playback.Ready(if (resumeMs > 0L) playable.copy(startPositionMs = resumeMs) else playable)
+                    Playback.Ready(
+                        playable.copy(
+                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            mediaRef = ref,
+                        ),
+                    )
                 },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
         }
     }
 
-    /// The best source across ALL loaded groups (ranked by [StreamRanking], not just the first stream of
-    /// the first group), for the hero Watch button. Returns null when no sources resolved yet. The sources
-    /// list itself is already ranked by [CatalogRepository.streams], so this and the top of the list agree.
+    /// The hero Watch/Resume action: play the LABELED BEST source, but robustly. Three tiers, in order:
+    ///
+    ///  1. CW RESUME: if this exact target was resolved to a native debrid link earlier this session, replay
+    ///     it through [DebridCoordinator.resumePlaybackURL] -- the stored link straight back when it is still
+    ///     inside the 20-min fresh window, or a freshly reresolved link for the SAME file/provider otherwise,
+    ///     with NO re-run of source selection (owner requirement: resume plays THAT source).
+    ///  2. FAILOVER: race the account-confirmed-cached candidates in rank order ([resolveFirstPlayable]),
+    ///     honouring the label-authoritative quality gate, so a dead / false-cached top pick never blocks a
+    ///     genuinely-cached one and the played quality never drops below the "Watch Now" promise. The winning
+    ///     fresh link is remembered for a later in-session resume.
+    ///  3. FALLBACK: single-resolve the labeled best through the engine repo (a direct / media-server / single
+    ///     debrid source, or the promised confirmed-cached best when the gate refused every lower-res winner).
+    fun playBest() {
+        if (_playback.value is Playback.Resolving) return
+        val groups = (_streams.value as? UiState.Success)?.data ?: return
+        val best = bestSource() ?: return
+        _playback.value = Playback.Resolving
+        val resumeMs = resumeOffsetMs()
+        val ref = currentMediaRef()
+        val targetId = _selectedEpisodeId.value ?: id
+        viewModelScope.launch {
+            // 1) CW resume: replay the exact stored debrid source for this target if we have one.
+            resumeRef?.takeIf { it.targetId == targetId }?.let { stored ->
+                val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
+                if (resumed.refreshed && resumed.url.isNotEmpty()) {
+                    resumeRef = stored.copy(
+                        url = resumed.url,
+                        savedAtMs = if (resumed.url != stored.url) System.currentTimeMillis() else stored.savedAtMs,
+                    )
+                    _playback.value = Playback.Ready(playableFrom(best, resumed.url, resumeMs, ref))
+                    return@launch
+                }
+            }
+            // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
+            val winner = resolveBestViaFailover(groups, best)
+            if (winner != null) {
+                val source = winner.candidate.source ?: best
+                resumeRef = ResumeRef(targetId, winner.ref, winner.ref.url, System.currentTimeMillis())
+                _playback.value = Playback.Ready(playableFrom(source, winner.ref.url, resumeMs, ref))
+                return@launch
+            }
+            // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
+            //    debrid, or the confirmed-cached best the gate insisted on).
+            _playback.value = repo.resolve(best).fold(
+                onSuccess = { playable ->
+                    Playback.Ready(
+                        playable.copy(
+                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            mediaRef = ref,
+                        ),
+                    )
+                },
+                onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
+            )
+        }
+    }
+
+    /// Race the account-confirmed-cached, resolvable candidates (raw torrents / usenet, in the list's rank
+    /// order) and return the first that mints a real link and passes the label-authoritative quality gate, or
+    /// null when there is nothing cached to race / every leg fails (the caller then single-resolves the
+    /// labeled best). Byte-identical to today's path with no debrid key: returns before any await.
+    private suspend fun resolveBestViaFailover(
+        groups: List<StreamGroup>,
+        best: StreamSource,
+    ): DebridCoordinator.PlayableWinner? {
+        if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return null
+        if (cachedHashes.isEmpty() && cachedUsenetURLs.isEmpty()) return null
+        // Rank the candidates EXACTLY as the labeled best is picked (score + pin), de-duplicated by handle, so
+        // the failover order matches the visible list.
+        val ranked = StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+        val candidates = ranked.mapNotNull { toCandidate(it) }
+        if (candidates.isEmpty()) return null
+        return debrid.resolveFirstPlayable(
+            candidates = candidates,
+            episode = currentEpisode(),
+            cachedHashes = cachedHashes,
+            cachedUsenetURLs = cachedUsenetURLs,
+            labeledBest = best,
+        )
+    }
+
+    /// Map a ranked [StreamSource] to a resolvable [DebridCoordinator.DebridCandidate], or null when it is not
+    /// ours to resolve (already carries a direct/debrid [StreamSource.url], or is neither a raw torrent nor a
+    /// usenet stream). The source rides along so the failover's quality gate can rank it.
+    private fun toCandidate(s: StreamSource): DebridCoordinator.DebridCandidate? {
+        if (s.url != null) return null
+        return when {
+            s.isUsenet -> DebridCoordinator.DebridCandidate(
+                nzbUrl = s.nzbUrl,
+                fileMustInclude = s.fileMustInclude,
+                fileIdx = s.fileIdx,
+                source = s,
+            )
+            !s.infoHash.isNullOrEmpty() -> DebridCoordinator.DebridCandidate(
+                infoHash = s.infoHash,
+                fileIdx = s.fileIdx,
+                source = s,
+            )
+            else -> null
+        }
+    }
+
+    /// The chosen episode as a debrid resolve hint (so a season-pack resolve picks the right file), or null
+    /// for a movie / an episode with no usable season+number.
+    private fun currentEpisode(): DebridResolver.Episode? {
+        if (type != MediaType.SERIES) return null
+        val detail = (_meta.value as? UiState.Success)?.data ?: return null
+        val ep = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value } ?: return null
+        val season = ep.season.takeIf { it > 0 } ?: return null
+        val number = ep.episode.takeIf { it > 0 } ?: return null
+        return DebridResolver.Episode(season, number)
+    }
+
+    /// Build the [Playable] for a natively-resolved debrid [url] off its winning [source]: the DV/Atmos routing
+    /// flags parsed from the source tags (same as the engine repo's resolve), the resume offset, and the
+    /// external-sync identity. The url is a plain direct stream, so it plays without the streaming-server bridge.
+    private fun playableFrom(source: StreamSource, url: String, resumeMs: Long, ref: MediaRef?): Playable =
+        Playable(
+            url = url,
+            title = source.title,
+            viaStreamingServer = false,
+            isTorrent = false,
+            isDolbyVision = StreamRanking.isDolbyVision(source),
+            isAtmos = StreamRanking.isAtmos(source),
+            startPositionMs = resumeMs,
+            mediaRef = ref,
+        )
+
+    /// The external-sync media identity for the source about to play: the movie/show IMDb (or TMDB) id from
+    /// the meta id, plus the chosen episode's season/number for a series. Null before meta loads or for an
+    /// unmappable id. See [buildMediaRef].
+    private fun currentMediaRef(): MediaRef? {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return null
+        val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
+        val year = detail.releaseInfo?.take(4)?.toIntOrNull()
+        return buildMediaRef(type = type, metaId = id, episode = episode, title = detail.name, year = year)
+    }
+
+    /// The best source across ALL loaded groups (the labeled "Watch" pick). Prefers [SourceListModel]'s own
+    /// assembled best (ranked with the same prefs/pin/continuity the list is), falling back to ranking the
+    /// published groups directly before the first assembly lands. Null when no sources resolved yet. Drives
+    /// the hero Watch button's enabled state.
     fun bestSource(): StreamSource? =
-        (_streams.value as? UiState.Success)?.data?.let { StreamRanking.best(it) }
+        sourceModel.state.value.best
+            ?: (_streams.value as? UiState.Success)?.data?.let { StreamRanking.best(it) }
 
     /// The engine resume position (ms) for the source about to play: the saved library `timeOffset` when
     /// it applies to the current target (a movie, or the series episode whose sources are shown), else 0
@@ -287,6 +637,36 @@ class DetailViewModel(
 
     private fun sortedEpisodes(videos: List<Episode>): List<Episode> =
         videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
+
+    /// Tear down the assembly pipeline + contributor lanes when the screen goes away. [SourceListModel.close]
+    /// stops the coalescer (it runs on [viewModelScope], which is cancelled anyway, but the contributors own
+    /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
+    override fun onCleared() {
+        super.onCleared()
+        sourceModel.close()
+        torbox.close()
+        singularity.close()
+    }
+
+    /// An in-session native-debrid resolve for one play target, feeding the [DebridCoordinator.resumePlaybackURL]
+    /// fresh-link replay: [ref] regenerates the SAME source, [url]/[savedAtMs] gate the instant-replay window.
+    private data class ResumeRef(
+        val targetId: String,
+        val ref: DebridCoordinator.DebridPlaybackRef,
+        val url: String,
+        val savedAtMs: Long,
+    )
+
+    private companion object {
+        /// The text marker folded into an account-cached source's description so the text-based [StreamRanking]
+        /// lights the cache badge + applies the +cache bonus (it looks for a bolt / "cached").
+        const val CACHED_MARKER = "⚡ Cached"
+
+        /// A cache-busting suffix appended to a decorated source's id (the score/quality caches key on the id).
+        /// It carries no '#', so `id.substringBefore('#')` -- the handle the resolve + dedup paths read -- is
+        /// unchanged.
+        const val CACHED_ID_SUFFIX = " cached"
+    }
 }
 
 /// Playback request state for the detail page. Resolving covers the engine round-trip (streaming

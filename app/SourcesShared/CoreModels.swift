@@ -426,8 +426,40 @@ struct CoreMetaDetails: Decodable {
     /// meta-embedded HTTP/HLS source is never invisible to a path that only read `streams`.
     var allStreamGroups: [CoreStreamGroup] { (metaStreams ?? []) + streams }
 
-    /// First fully-loaded meta (addons are queried in order; take the first that resolved).
-    var meta: CoreMetaItem? { metaItems.compactMap { $0.content?.ready }.first }
+    /// First fully-loaded meta, chosen by the user's ADD-ON PRIORITY order rather than the engine's raw
+    /// `profile.addons` order. The catalog list, Home board and add-on list are display-sorted by the
+    /// user's applied order (`VortXSyncManager.appliedAddonOrder`, set by the in-app Reorder screen or the
+    /// dashboard drag); the engine's `meta_items` are NOT (a reorder never rewrites the engine's
+    /// `profile.addons` Vec, which is what `AggrRequest::AllOfResource` walks). Without this a user whose
+    /// #1 add-on is a localized meta provider (e.g. a French Cinemeta) sees French on the catalog but the
+    /// DETAIL synopsis resolves from whichever add-on the engine lists first (the protected English
+    /// Cinemeta, always seeded at index 0), i.e. English text under a French title (#144). Pick the ready
+    /// meta whose add-on is earliest in the applied order so the detail honors the same priority the
+    /// catalog does. With no applied order this is exactly the old `.first` (engine order) behavior, so
+    /// English users and un-reordered accounts are unchanged.
+    var meta: CoreMetaItem? {
+        // (addon transport base, meta) for every add-on that returned a ready meta, in engine order.
+        var ready: [(base: String, meta: CoreMetaItem)] = []
+        for entry in metaItems {
+            if let m = entry.content?.ready { ready.append((entry.request.base, m)) }
+        }
+        guard let first = ready.first else { return nil }
+        let order = VortXSyncManager.appliedAddonOrder
+        guard !order.isEmpty else { return first.meta }   // no user order -> engine order, unchanged
+        var rank: [String: Int] = [:]
+        for (i, url) in order.enumerated() { rank[url] = i }
+        // Earliest applied-order add-on wins; add-ons not in the order sort AFTER the ordered ones and keep
+        // engine order among themselves (a stable min: equal ranks fall back to the first ready seen).
+        let best = ready.min { a, b in
+            switch (rank[AddonTombstones.normalize(a.base)], rank[AddonTombstones.normalize(b.base)]) {
+            case let (x?, y?): return x < y
+            case (_?, nil):    return true
+            case (nil, _?):    return false
+            case (nil, nil):   return false
+            }
+        }
+        return best?.meta ?? first.meta
+    }
     var watchedIds: Set<String> { Set(watchedVideoIds ?? []) }
 }
 

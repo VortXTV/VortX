@@ -18,6 +18,11 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourcePinContext
+import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourcePreferencesStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -91,6 +96,20 @@ class EngineStremioRepository(
     /// [AuthIdentityStore]'s doc comment.
     private val identityStore by lazy { AuthIdentityStore(appContext) }
 
+    /// Source-ranking preferences + pins, the Android port of Apple `SourcePreferences` / `SourcePinStore`.
+    /// Read by [StreamRanking] through an immutable snapshot installed before each source rank (the frozen
+    /// snapshot pattern, so an off-thread rank never races a Settings edit). With no preferences set these
+    /// are all defaults, so ranking stays byte-identical to the core-only scorer.
+    private val sourcePrefs by lazy { SourcePreferencesStore(appContext) }
+    /// Per-profile pins: the store reads the ACTIVE profile id from [ProfileStore] for its per-profile
+    /// key, so one profile's pins can never leak into another (falls back to the shared default before
+    /// [ProfileStore] is initialized). Reload wave: [ProfileStore.select] fires the switch listener that
+    /// calls [SourcePinStore.reload] on a switch.
+    private val sourcePins by lazy {
+        SourcePinStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE }
+    }
+    private val trackPrefs by lazy { TrackPreferencesStore(appContext) }
+
     /// Field names that changed in the most recent engine event. extraBufferCapacity + DROP_OLDEST
     /// keeps a burst of back-to-back events from ever suspending (blocking) the native callback thread
     /// that publishes them -- see the class doc.
@@ -133,6 +152,16 @@ class EngineStremioRepository(
 
     init {
         start()
+        // Reload-hook wiring (the seam earlier waves left): on a profile switch / sync fold, re-sync the
+        // per-profile source-ranking layer. SourcePreferences.reload() drops the memoized scores computed
+        // under the previous profile's flat filter keys (which ProfileStore.applyPlayback has just
+        // rewritten); SourcePinStore.reload() re-reads the new active profile's pins. No-op until
+        // ProfileStore is initialized (VortXApplication.onCreate), which always precedes engine
+        // construction, so this registers exactly once for the process.
+        ProfileStore.sharedOrNull()?.addSwitchListener {
+            sourcePrefs.reload()
+            sourcePins.reload()
+        }
     }
 
     /// Initialize the engine once. Idempotent; safe to call from multiple repositories (the native
@@ -513,7 +542,15 @@ class EngineStremioRepository(
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
         // first within each add-on block, and the strongest add-on block first. This is what makes the
         // hero "Watch" auto-pick and the source picker meaningful, mirroring Apple's ranked source list.
-        StreamRanking.rankedGroups(EngineState.parseStreamGroups(state))
+        //
+        // Build + install the user-preference snapshot FIRST (Apple's frozen snapshot: the ranker reads a
+        // stable copy off-thread, never the live store). Installing it also lets DetailViewModel's later
+        // media-server re-rank + best-source pick inherit the same preferences. The effective pin for this
+        // title (per-title, else provider) rides the rank so a pinned source floats to the top.
+        val snapshot = sourcePrefs.snapshot(trackPrefs.current.audioLanguages)
+        StreamRanking.installReading(snapshot)
+        val pin = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
+        StreamRanking.rankedGroups(EngineState.parseStreamGroups(state), prefs = snapshot, pin = pin)
     } }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {

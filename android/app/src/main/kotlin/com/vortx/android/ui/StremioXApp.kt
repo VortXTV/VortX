@@ -38,7 +38,9 @@ import com.vortx.android.ui.screens.AddonsScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.HomeScreen
+import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LibraryScreen
+import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.theme.VortXIcons
@@ -79,6 +81,8 @@ fun StremioXApp(
         var showGallery by remember { mutableStateOf(false) }
         var showAccount by remember { mutableStateOf(false) }
         var showAddons by remember { mutableStateOf(false) }
+        var showIntegrations by remember { mutableStateOf(false) }
+        var showMediaServers by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
         val appContext = LocalContext.current.applicationContext
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
@@ -138,6 +142,20 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showIntegrations) {
+            // Settings > Integrations: connect Trakt / SIMKL. Self-contained (drives the auth singletons
+            // directly), so it needs no repository or ViewModel, matching its own doc comment.
+            IntegrationsScreen(onBack = { showIntegrations = false })
+            return@VortXTheme
+        }
+
+        if (showMediaServers) {
+            // Settings > Media servers: connect Plex / Jellyfin / Emby. Self-contained like Integrations
+            // (drives the MediaServerRepository singleton directly), so it needs no repository or ViewModel.
+            MediaServersScreen(onBack = { showMediaServers = false })
+            return@VortXTheme
+        }
+
         val current = detail
         if (current != null) {
             // A ViewModel keyed to this title's id, fed type+id through the factory's DetailArgs.
@@ -146,6 +164,7 @@ fun StremioXApp(
                 factory = StremioXViewModelFactory(
                     repo = repo,
                     detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                    appContext = appContext,
                 ),
             )
             DetailScreen(
@@ -203,6 +222,8 @@ fun StremioXApp(
                     authState = authState,
                     onAccountClick = { showAccount = true },
                     onAddonsClick = { showAddons = true },
+                    onIntegrationsClick = { showIntegrations = true },
+                    onMediaServersClick = { showMediaServers = true },
                     modifier = content,
                     onOpenGallery = { showGallery = true },
                 )

@@ -13,9 +13,10 @@ import com.vortx.android.search.SearchHistoryStore
 /// [CatalogRepository]/[AuthRepository] seams to each ViewModel. When Hilt/Koin is introduced for the
 /// engine, this is the one place that changes. [detailArgs] are supplied per detail page. [auth]
 /// defaults to the offline preview so every existing call site (none of which touch account state)
-/// keeps compiling unchanged; only the account screen passes a real one. [appContext] is required only
-/// by [SearchViewModel] (its [SearchHistoryStore] is plain-`SharedPreferences`-backed, see that store's
-/// doc) -- every other ViewModel ignores it, so existing non-search call sites are unaffected.
+/// keeps compiling unchanged; only the account screen passes a real one. [appContext] is required by
+/// [SearchViewModel] (its [SearchHistoryStore] is plain-`SharedPreferences`-backed) and by
+/// [DetailViewModel] (debrid keys + the source-list assembly's preference / pin stores); every other
+/// ViewModel ignores it, so existing non-detail / non-search call sites are unaffected.
 class StremioXViewModelFactory(
     private val repo: CatalogRepository,
     private val auth: AuthRepository = PreviewAuthRepository(),
@@ -38,7 +39,10 @@ class StremioXViewModelFactory(
         modelClass.isAssignableFrom(AccountViewModel::class.java) -> AccountViewModel(auth) as T
         modelClass.isAssignableFrom(DetailViewModel::class.java) -> {
             val args = requireNotNull(detailArgs) { "DetailViewModel requires DetailArgs" }
-            DetailViewModel(repo, args.type, args.id) as T
+            val context = requireNotNull(appContext) {
+                "DetailViewModel requires an app Context (debrid keys + source-list assembly)"
+            }
+            DetailViewModel(repo, args.type, args.id, context) as T
         }
         else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }

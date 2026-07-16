@@ -33,10 +33,13 @@ import Foundation
 /// real later reinstall out-races it. Mixed-fleet caveat: an older client's genuine re-removal is
 /// indistinguishable from its stale re-emit until that client updates.
 ///
-/// SAFETY: official/protected stubs are NEVER tombstoned (a logout resets the engine to exactly those,
-/// so tombstoning one would wrongly suppress a default forever). The state only ever changes from EXPLICIT
-/// install/remove intent, never from an inferred diff, and the apply step is gated behind a SUCCESSFUL
-/// account pull.
+/// SAFETY: PROTECTED stubs (Cinemeta, Local Files: protected=true) are NEVER tombstoned (a logout resets
+/// the engine to exactly those, so tombstoning one would wrongly suppress an essential default forever, and
+/// the UI has no Remove for them). A REMOVABLE official add-on (YouTube, WatchHub, Public Domain,
+/// OpenSubtitles: official=true, protected=false) CAN be tombstoned: the engine re-seeds OFFICIAL_ADDONS on
+/// every reset, so without a tombstone a user's deletion of one is resurrected on the next launch (#137).
+/// The state only ever changes from EXPLICIT install/remove intent, never from an inferred diff, and the
+/// apply step is gated behind a SUCCESSFUL account pull.
 enum AddonTombstones {
     /// Per-entry removal / install timestamps (milliseconds since epoch), the b172 last-writer-wins stores.
     private static let removedAtKey = "stremiox.addons.removedAt"
@@ -88,8 +91,8 @@ enum AddonTombstones {
     }
 
     /// Record an add-on removal so it sticks across devices. Idempotent for the caller. Returns true when the
-    /// url becomes NEWLY effectively-removed. Callers MUST guard official/protected before calling (a default
-    /// stub is never a real removal).
+    /// url becomes NEWLY effectively-removed. Callers MUST guard PROTECTED before calling (a protected stub is
+    /// never a real removal); a removable official add-on is a legitimate removal and IS tombstoned (#137).
     @discardableResult
     static func tombstone(_ transportUrl: String) -> Bool {
         let key = normalize(transportUrl)

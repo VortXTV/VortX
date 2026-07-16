@@ -14,6 +14,8 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.engine.EngineStremioRepository
+import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.profile.ProfileStore
 
 /// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
 ///
@@ -54,6 +56,22 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     private val fallbackCatalogRepository by lazy { PreviewCatalogRepository() }
     private val fallbackAuthRepository by lazy { PreviewAuthRepository() }
+
+    /// Warm the media-server store from disk at process start (idempotent), so a Plex/Jellyfin/Emby server
+    /// connected in a previous run is queryable for direct-play sources on the very first detail page WITHOUT
+    /// the user opening Settings. Dormant + cheap when no server is connected (an empty prefs read); it never
+    /// touches the network here. The settings screen calls the same idempotent init defensively.
+    override fun onCreate() {
+        super.onCreate()
+        // Stand up the multi-profile core once, before anything touches the engine (the engine is built
+        // lazily on first catalog/auth access, after this). ProfileStore.init hydrates the roster, heals
+        // the owner singleton, and makes ProfileStore.shared/activeProfileId available to the source-pin
+        // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
+        runCatching { ProfileStore.init(this) }
+            .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        runCatching { MediaServerRepository.init(this) }
+            .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
+    }
 
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
     /// fail-soft boundary [MainActivity] used to own directly) so a native-side problem degrades the

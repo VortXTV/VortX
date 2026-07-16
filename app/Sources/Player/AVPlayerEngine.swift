@@ -962,6 +962,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let ns = item.error as NSError?
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
+            // #143: the HLS stack's REAL reason lives only in the item's error log (the NSError carries a
+            // bare CoreMedia code like -12927 with no comment). Dump the last few events so the next device
+            // export names the exact resource + CoreMedia's own errorComment. Fail-soft, bounded.
+            if let events = item.errorLog()?.events, !events.isEmpty {
+                for ev in events.suffix(4) {
+                    let uri = ev.uri.flatMap { URL(string: $0)?.lastPathComponent ?? $0 } ?? "?"
+                    DiagnosticsLog.log("avplayer", "errorLog: \(ev.errorDomain)#\(ev.errorStatusCode) uri=\(uri) comment=\(ev.errorComment ?? "none")")
+                }
+            }
             VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
             // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv HDR10.
             // For a DV source this is the tail of the [dv] trail (a remux fail-soft usually preceded it), so

@@ -263,6 +263,11 @@ struct TVPlayerView: View {
     @State private var chapterFractions: [Double] = []    // chapter boundary positions (0...1) for scrubber ticks
     @State private var upNextSuppressed = false           // user chose Watch Credits: hide band + don't auto-advance this episode
     @State private var upNextWantsCredits = false         // which band button is focused (false = Play Now, true = Watch Credits)
+    // Sleep timer (parity with iOS/Mac): pause playback after a set time, or stop at the end of the current
+    // episode. Transport input never cancels it; only picking "Off" (or a genuine dismiss) does.
+    @State private var sleepMinutes: Int? = nil           // nil = off (unless sleepAtEpisodeEnd)
+    @State private var sleepAtEpisodeEnd = false          // stop at episode end instead of auto-advancing
+    @State private var sleepTask: Task<Void, Never>? = nil
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds ("10"/"15"/"30"), shared with iOS
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
     private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
@@ -297,6 +302,16 @@ struct TVPlayerView: View {
     @State private var preloadingID: String?
     @State private var switchingEpisode = false        // re-entrancy guard: a rapid double Next / Up-Next-Select must not launch two overlapping episode resolves (mirrors iOS goToEpisode)
     @State private var autoAdvanceRetryUsed = false     // one-shot latch for the EOF last-chance episode-list backfill (defense in depth for a lost launch backfill race)
+    // "Still watching?" idle guard: after a long unattended stretch (no remote input for `idleWatchTimeout`,
+    // or `idleAutoAdvanceLimit` back-to-back auto-advances with zero input) pause and ask, so a binge does
+    // not run all night. ANY press / swipe re-arms it, so an attended session never trips. Mirrors PlayerScreen.
+    @State private var stillWatching = false             // the modal is up (playback paused, awaiting Continue / Stop)
+    @State private var stillWatchingWantsStop = false    // remote focus: false = Continue (default), true = Stop
+    @State private var idleDeadline: Date = .distantFuture   // wall-clock idle deadline; pushed forward on every press
+    @State private var consecutiveAutoAdvances = 0        // back-to-back auto-advances with no interaction between them
+    @State private var stillWatchingPendingAdvance = false  // roll to the next episode when Continue is chosen at a binge boundary
+    private static let idleWatchTimeout: TimeInterval = 4 * 60 * 60   // 4h of no interaction -> "Still watching?"
+    private static let idleAutoAdvanceLimit = 4                       // 4 back-to-back auto-advances, zero input -> same
     @State private var leftPlayback = false             // set the instant leavePlayback() runs, so a pending EOF backfill never resurrects a stopped player
     @State private var warmedID: String?               // next episode whose source was pre-warmed
     @State private var curHint: String?                // quality signature of what is playing now
@@ -329,7 +344,7 @@ struct TVPlayerView: View {
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, skipEditor }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, sleep, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -369,7 +384,7 @@ struct TVPlayerView: View {
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
-            RemoteCatcher(onPress: { handlePress($0) }, onSwipe: { showControls() })
+            RemoteCatcher(onPress: { handlePress($0) }, onSwipe: { noteInteraction(); if !stillWatching { showControls() } })
 
             if buffering && !loadFailed {
                 VStack(spacing: Theme.Space.md) {
@@ -414,6 +429,7 @@ struct TVPlayerView: View {
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
+            if stillWatching { stillWatchingOverlay }
         }
         .onAppear {
             VXProbeState.shared.setRoute("player")
@@ -453,7 +469,7 @@ struct TVPlayerView: View {
                 showEngineNote("Player engine override is forcing libmpv, so Dolby Vision plays as HDR10. Set Settings > Player engine to Auto for true Dolby Vision.")
             }
             startStallWatchdog()
-            scheduleHide(); startHideLoop()
+            scheduleHide(); startHideLoop(); noteInteraction()   // arm the "Still watching?" idle deadline at open
             if episodes.isEmpty, let m = curMeta, loadedEpisodes.isEmpty {
                 // Direct resume launches with no meta loaded: fetch it behind playback
                 // so the sources panel shows THIS title (not whatever detail page was
@@ -508,7 +524,7 @@ struct TVPlayerView: View {
         .onDisappear {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             LoopbackPlaybackAssertion.end()   // #130: release the loopback-playback background assertion
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
             // capture frames now (AVPlayer via AVPlayerItemVideoOutput). Independent of the engine-teardown rules below.
@@ -896,6 +912,18 @@ struct TVPlayerView: View {
     // MARK: - Remote handling (all input arrives here from the UIKit catcher)
 
     private func handlePress(_ type: UIPress.PressType) {
+        noteInteraction()   // any remote press is presence: re-arm the "Still watching?" idle guard
+        if stillWatching {
+            switch type {
+            case .leftArrow:  stillWatchingWantsStop = false        // focus Continue
+            case .rightArrow: stillWatchingWantsStop = true         // focus Stop
+            case .select:     if stillWatchingWantsStop { stopStillWatching() } else { continueStillWatching() }
+            case .playPause:  continueStillWatching()               // Play/Pause = keep watching
+            case .menu:       continueStillWatching()               // Back proves presence: dismiss + resume, never a surprise exit
+            default: break
+            }
+            return
+        }
         if showStreamQR {
             if type == .menu || type == .select || type == .playPause { showStreamQR = false }
             return
@@ -920,6 +948,7 @@ struct TVPlayerView: View {
                 case .audioSettings:    openPanel(.audio)
                 case .subtitleSettings: openPanel(.subtitles)
                 case .engine:           openPanel(.playerSettings)
+                case .sleep:            openPanel(.playerSettings)
                 default:                closePanel()
                 }
             case .upArrow: moveOption(-1)
@@ -1478,6 +1507,8 @@ struct TVPlayerView: View {
             return playerSettingsRows()
         case .engine:
             return engineRows()
+        case .sleep:
+            return sleepRows()
         case .skipEditor:
             return skipEditorRows()
         case .episodes:
@@ -1767,6 +1798,12 @@ struct TVPlayerView: View {
                 openPanel(.engine)
             })
         }
+        // Sleep timer (parity with iOS/Mac): drill-in mirrors the "Player engine" row above. The detail
+        // reflects the current arm state so the viewer sees it without opening the sub-panel.
+        rows.append(OptionRow(label: "Sleep", isHeader: true))
+        let sleepDetail = sleepAtEpisodeEnd ? "End of episode  ·  ›"
+            : sleepMinutes.map { "\($0) min  ·  ›" } ?? "Off  ·  ›"
+        rows.append(OptionRow(label: "Sleep timer", detail: sleepDetail) { openPanel(.sleep) })
         rows.append(OptionRow(label: "Info", isHeader: true))
         rows.append(OptionRow(label: showStats ? "Hide playback info" : "Show playback info",
                               isSelected: showStats) {
@@ -1797,6 +1834,46 @@ struct TVPlayerView: View {
             })
         }
         return rows
+    }
+
+    /// The Sleep Timer picker rows (parity with iOS/Mac): Off, a set of timed auto-pauses, and, for a series
+    /// with a next episode, "End of episode" (stop at the current item's end instead of auto-advancing).
+    /// Option set matches the shipped iOS/Mac picker exactly so the two chromes stay in parity.
+    private func sleepRows() -> [OptionRow] {
+        var rows: [OptionRow] = [OptionRow(label: "Off", isSelected: sleepMinutes == nil && !sleepAtEpisodeEnd) {
+            armSleep(minutes: nil, atEpisodeEnd: false)
+        }]
+        for m in [15, 30, 45, 60, 90] {
+            rows.append(OptionRow(label: "\(m) minutes", isSelected: sleepMinutes == m && !sleepAtEpisodeEnd) {
+                armSleep(minutes: m, atEpisodeEnd: false)
+            })
+        }
+        // Only meaningful for a series with a next episode; it stops the auto-advance at the end of this one.
+        if hasNextEpisode {
+            rows.append(OptionRow(label: "End of episode", isSelected: sleepAtEpisodeEnd) {
+                armSleep(minutes: nil, atEpisodeEnd: true)
+            })
+        }
+        return rows
+    }
+
+    /// (Re)arm the sleep timer. `minutes` runs a timed auto-pause; `atEpisodeEnd` lets the current episode
+    /// finish then stops (no auto-advance, handled in `autoAdvance`). Both nil/false = off. Cancels any prior
+    /// timer. Transport input never touches this task, so only "Off"/re-arm (or a dismiss) cancels it. Mirrors
+    /// PlayerScreen.armSleep; the timed pause reuses the existing togglePause path.
+    private func armSleep(minutes: Int?, atEpisodeEnd: Bool) {
+        sleepTask?.cancel(); sleepTask = nil
+        sleepAtEpisodeEnd = atEpisodeEnd
+        sleepMinutes = minutes
+        guard let minutes else { return }
+        let seconds = Double(minutes) * 60
+        sleepTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            if !isPaused { coordinator.player?.togglePause() }   // pause via the existing path
+            showEngineNote("Sleep timer: playback paused.")
+            sleepMinutes = nil
+        }
     }
 
     /// When the user has chosen a default external player (Settings → Play in), hand the launch stream
@@ -2000,6 +2077,7 @@ struct TVPlayerView: View {
         coordinator.player?.setSubDelay(subDelay)
         VXProbe.event("subs", "subs sync \(subDelay)s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
+        SubtitleOffsetMemory.save(subDelay, forContentKey: communityContentKey)   // remember this title's manual offset (device-local, exact)
     }
     private func adjustAudioDelay(_ delta: Double) {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
@@ -2050,6 +2128,7 @@ struct TVPlayerView: View {
         case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
         case .engine:           return "Player Engine"
+        case .sleep:            return "Sleep Timer"
         case .skipEditor:       return "Edit Skip Segment"
         }
     }
@@ -2208,6 +2287,14 @@ struct TVPlayerView: View {
         // Either completion point can land first (tracks vs the add-on fetch), so both call this; the guards
         // + the one-shot latch inside make the double call safe. No-op when userPickedSubtitle is set.
         autoSelectAddonSubtitleIfNeeded()
+        // Restore the viewer's OWN last manual sync offset for this title (device-local, instant, offline).
+        // Only when nothing is dialed in this session and the pooled seed hasn't fired; claiming the pooled
+        // latch here suppresses the crowd seed so the viewer's own correction wins.
+        if subDelay == 0, !pooledSeededOffset, let saved = SubtitleOffsetMemory.savedOffset(forContentKey: communityContentKey) {
+            subDelay = saved
+            coordinator.player?.setSubDelay(saved)
+            pooledSeededOffset = true
+        }
     }
 
     /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it
@@ -3543,6 +3630,16 @@ struct TVPlayerView: View {
 
     /// Auto-advance when an episode ends: next episode if there is one, otherwise leave the player.
     private func autoAdvance() {
+        if sleepAtEpisodeEnd {
+            // Sleep timer set to "End of episode": this episode finished, so stop here instead of
+            // auto-advancing. It is already marked watched (endFileEof), so Continue Watching rolls
+            // forward on its own; do NOT finishedWatching (that would clear the whole series). Mirrors
+            // PlayerScreen's endFileEof sleep-end branch.
+            sleepAtEpisodeEnd = false
+            saveProgress(at: currentTime)
+            leavePlayback()
+            return
+        }
         if upNextSuppressed {
             // User chose Watch Credits: play through to the end, then stop here instead of auto-jumping.
             // The episode is marked watched, so Continue Watching rolls forward on its own.
@@ -3550,7 +3647,17 @@ struct TVPlayerView: View {
             leavePlayback()
             return
         }
-        if hasNextEpisode { playNext(); return }
+        if hasNextEpisode {
+            // "Still watching?" binge guard: after N back-to-back auto-advances with zero remote input,
+            // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
+            consecutiveAutoAdvances += 1
+            if consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
+                presentStillWatching(pendingAdvance: true)
+            } else {
+                playNext()
+            }
+            return
+        }
         // LAST-CHANCE BACKFILL: a series reaching EOF with NO episode list (episodes:[] launch whose
         // behind-playback loader never landed) must not be misread as a finale. Re-kick the meta fetch
         // once, wait briefly, advance if a list materializes, else exit exactly as before. One-shot:
@@ -4273,8 +4380,103 @@ struct TVPlayerView: View {
                 if showInfo, !showOptions, !loadFailed, Date() >= hideDeadline {
                     withAnimation { showInfo = false }
                 }
+                maybePromptStillWatching()   // "Still watching?" idle guard rides the same 2/s poll
             }
         }
+    }
+
+    // MARK: - "Still watching?" idle guard
+
+    /// Record any remote interaction: push the idle deadline out and clear the auto-advance streak, so an
+    /// attended session never trips the prompt. Cheap (a Date write); called from the top of handlePress.
+    private func noteInteraction() {
+        idleDeadline = Date().addingTimeInterval(Self.idleWatchTimeout)
+        consecutiveAutoAdvances = 0
+    }
+
+    /// Fire the timed prompt iff the session looks unattended AND is actually playing. Never interrupts a
+    /// paused / buffering / options / failed session; each is re-checked on the next poll tick.
+    private func maybePromptStillWatching() {
+        guard hasStartedPlaying, !stillWatching else { return }
+        guard !isPaused, !showOptions, !buffering, !loadFailed else { return }
+        guard Date() >= idleDeadline else { return }
+        presentStillWatching()
+    }
+
+    /// Pause playback (unless at an episode boundary, where the file has already ended) and raise the modal,
+    /// hiding the transport underneath. `pendingAdvance` rolls to the next episode if Continue is chosen.
+    private func presentStillWatching(pendingAdvance: Bool = false) {
+        guard !stillWatching else { return }
+        stillWatchingPendingAdvance = pendingAdvance
+        stillWatchingWantsStop = false
+        if !pendingAdvance, !isPaused { coordinator.player?.togglePause() }   // mid-title: pause; boundary: already ended
+        withAnimation { showInfo = false; stillWatching = true }
+    }
+
+    /// "Continue": re-arm the guard, then resume -- either roll to the pending next episode (binge boundary)
+    /// or un-pause the current title.
+    private func continueStillWatching() {
+        let advance = stillWatchingPendingAdvance
+        stillWatchingPendingAdvance = false
+        withAnimation { stillWatching = false }
+        noteInteraction()
+        if advance {
+            playNext()
+        } else {
+            if isPaused { coordinator.player?.togglePause() }
+            showControls()
+        }
+    }
+
+    /// "Stop": save progress, then leave the player entirely (mirrors Back / Close).
+    private func stopStillWatching() {
+        stillWatching = false
+        stillWatchingPendingAdvance = false
+        saveProgress(at: currentTime)
+        leavePlayback()
+    }
+
+    /// "Still watching?" modal: a dimming scrim plus a centered warm-glass card with Continue / Stop. Raised
+    /// after a long unattended stretch so a stream does not play all night; the two pills mirror the Up Next
+    /// band's focus styling (highlighted = solid ember). Left/Right move focus, Select activates.
+    private var stillWatchingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.6).ignoresSafeArea()
+            VStack(spacing: Theme.Space.md) {
+                Text("Still watching?")
+                    .font(.title.weight(.bold)).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Playback paused after a long stretch with no activity.")
+                    .font(.title3).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 28) {
+                    stillWatchingButton("Continue", systemImage: "play.fill", highlighted: !stillWatchingWantsStop)
+                    stillWatchingButton("Stop", systemImage: nil, highlighted: stillWatchingWantsStop)
+                }
+                .padding(.top, Theme.Space.md)
+            }
+            .padding(.horizontal, 56).padding(.vertical, 44)
+            .frame(maxWidth: 820)
+            .vortxGlass(in: RoundedRectangle(cornerRadius: 24, style: .continuous),
+                        fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
+        }
+        .transition(.opacity)
+        .animation(.easeOut(duration: 0.15), value: stillWatchingWantsStop)
+        .accessibilityElement(children: .contain)
+    }
+
+    private func stillWatchingButton(_ title: String, systemImage: String?, highlighted: Bool) -> some View {
+        HStack(spacing: 8) {
+            if let img = systemImage { Image(systemName: img) }
+            Text(title).lineLimit(1)
+        }
+        .font(.headline.weight(.semibold))
+        .foregroundStyle(highlighted ? Theme.Palette.onAccent : Theme.Palette.textPrimary)
+        .padding(.horizontal, 28).padding(.vertical, 14)
+        .background { if highlighted { Capsule().fill(Theme.Palette.accent) } }
+        .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
+        .overlay(Capsule().stroke(Theme.Palette.canvas, lineWidth: highlighted ? 3 : 0))
+        .scaleEffect(highlighted ? 1.06 : 1.0)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func timeString(_ t: Double) -> String {

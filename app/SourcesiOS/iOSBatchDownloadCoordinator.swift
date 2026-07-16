@@ -290,13 +290,25 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// dead episode.
     private func resolveAndQueue(_ job: Job) async -> Outcome {
         let core = CoreBridge.shared
-        // Skip the dispatch when this episode's streams are ALREADY resident (the user just had its
-        // source page open): less churn on the shared meta slot, identical result.
-        if core.streamGroups(forStreamId: job.video.id).isEmpty {
+        // Point the engine's SINGLE shared meta_details slot at THIS episode's streams. The slot is
+        // engine-wide (the open series-detail page and every sibling episode share it), so an episode load
+        // issued while the engine / detail page is still settling the series meta can be RACED: loadMeta
+        // writes the pre-load state back onto `metaDetails`, and the engine's episode NewState can land
+        // BEFORE that write, leaving the Swift-side slot stale (zero groups for this episode) even though the
+        // engine actually resolved it. That is the "first selected episode says no sources" report (#142):
+        // the FIRST episode's load collides with the in-flight detail load while later episodes run from a
+        // quiescent slot. So keep (re)asserting the per-episode load until the engine registers this
+        // episode's stream loadables, rather than trusting one up-front dispatch. loadMeta re-reads the LIVE
+        // engine state, so a re-assert also re-syncs a stale slot even when the dispatch itself is de-duped.
+        func assertEpisodeLoad() {
             core.loadMeta(type: "series", id: job.seriesId, streamType: "series", streamId: job.video.id)
         }
+        // Only load when this episode's streams aren't already resident (the user just had its source page
+        // open): less churn on the shared meta slot, identical result.
+        if core.streamGroups(forStreamId: job.video.id).isEmpty { assertEpisodeLoad() }
         var groups: [CoreStreamSourceGroup] = []
         var firstPlayableAt: Date? = nil
+        var lastAssertAt = Date()
         for _ in 0 ..< 80 {                                // ~20s ceiling, matching the episode page
             if Task.isCancelled { return .cancelled }
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
@@ -306,6 +318,15 @@ final class BatchDownloadCoordinator: ObservableObject {
                 sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: job.video.id))))
             if !groups.isEmpty, firstPlayableAt == nil { firstPlayableAt = Date() }
             let progress = core.streamLoadProgress(forStreamId: job.video.id)
+            // The engine has registered NO loadable for this episode (total == 0) and nothing is resident:
+            // the shared slot never actually switched to this episode (the #142 race). Re-assert the load,
+            // bounded to roughly every 2.5s, so a dropped or stale first-episode selection recovers instead
+            // of timing out to a FALSE "no source". A no-op once the episode's loadables register (total > 0),
+            // and skipped entirely once any groups (engine or contributor) are in hand.
+            if progress.total == 0, groups.isEmpty, Date().timeIntervalSince(lastAssertAt) > 2.5 {
+                lastAssertAt = Date()
+                assertEpisodeLoad()
+            }
             let elapsed = firstPlayableAt.map { Date().timeIntervalSince($0) } ?? 0
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                             secondsSinceFirstPlayable: elapsed,

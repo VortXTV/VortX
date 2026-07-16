@@ -17,6 +17,11 @@ struct StremioTVApp: App {
         // its FIRST verdict (launchOffline) is ready to land an offline launch on the Library tab (where
         // Downloads live) and the shell's "You're offline" chip tracks the live (debounced) state.
         ConnectivityMonitor.shared.start()
+        // Bring DownloadManager up at launch so its "auto-delete watched downloads" subscription (it
+        // observes WatchedIndex and prunes finished downloads when the opt-in setting is ON) is live from
+        // the start on tvOS. Without touching the singleton here, nothing on tvOS instantiates it at launch,
+        // so the subscription would only arm once a Downloads screen happened to be opened.
+        _ = DownloadManager.shared
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.

@@ -1,8 +1,9 @@
 import Foundation
 
 /// Additive-READ Trakt shadow: on sign-in and foreground (throttled) it pulls the user's watched
-/// history + watchlist into a LOCAL cache (Application Support JSON) and exposes the watched `tt…` id
-/// set so `WatchedIndex` can UNION it into the read path behind the opt-in `traktImportWatched` toggle.
+/// history + watchlist into a LOCAL cache (Application Support JSON) and exposes the watched id set
+/// (imdb `tt…` AND `tmdb:<id>` forms) so `WatchedIndex` can UNION it into the read path behind the
+/// opt-in `traktImportWatched` toggle.
 /// It also owns an offline RETRY QUEUE for pushes (watchlist / watched) that failed while offline, drained
 /// on the next refresh.
 ///
@@ -22,8 +23,10 @@ final class TraktSyncEngine {
     private static let queueCap = 200
 
     private let lock = NSLock()
-    /// The watched `tt…` id set pulled from Trakt (movies + shows), unioned into `WatchedIndex`.
-    private var watchedTT: Set<String>
+    /// The watched id set pulled from Trakt (movies + shows), unioned into `WatchedIndex`. Holds BOTH
+    /// identity forms per title: imdb `tt…` and `tmdb:<id>` (plus `tmdb:movie:<id>` / `tmdb:tv:<id>`),
+    /// so a cover keyed by either identity matches. A cover carries one id; the union covers both.
+    private var watchedIDs: Set<String>
     /// Persisted retry queue of pushes that failed (offline). Drained on refresh.
     private var pendingPushes: [PendingPush]
     private var lastRefresh: Date?
@@ -34,19 +37,19 @@ final class TraktSyncEngine {
     private var generation = 0
 
     private init() {
-        watchedTT = Self.loadWatched()
+        watchedIDs = Self.loadWatched()
         pendingPushes = Self.loadQueue()
     }
 
     // MARK: - Read side (WatchedIndex consumes this)
 
-    /// The shadow watched `tt…` id set, or empty when the import toggle is off. Synchronous + lock-guarded
-    /// so `WatchedIndex.rebuild` can union it inline. Gated on the toggle here so a single call site in
-    /// WatchedIndex stays clean.
+    /// The shadow watched id set (imdb + tmdb forms), or empty when the import toggle is off. Synchronous
+    /// + lock-guarded so `WatchedIndex.rebuild` can union it inline. Gated on the toggle here so a single
+    /// call site in WatchedIndex stays clean.
     func shadowWatchedIDs() -> Set<String> {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktImportWatched, default: false) else { return [] }
         lock.lock(); defer { lock.unlock() }
-        return watchedTT
+        return watchedIDs
     }
 
     // MARK: - Disconnect
@@ -57,7 +60,7 @@ final class TraktSyncEngine {
     /// (cross-account contamination). The caller notifies `WatchedIndex` so the read path rebuilds.
     func reset() {
         lock.lock()
-        watchedTT = []
+        watchedIDs = []
         pendingPushes = []
         lastRefresh = nil
         generation &+= 1   // invalidate any in-flight refresh so it cannot write its pre-reset result back
@@ -98,8 +101,9 @@ final class TraktSyncEngine {
         }
     }
 
-    /// Pull GET /sync/watched/{movies,shows} and fold the tt ids into the shadow cache. Reuses `TraktAuth`
-    /// for a live bearer so `TraktService` stays untouched. Fail-soft: a failed leg contributes nothing.
+    /// Pull GET /sync/watched/{movies,shows} and fold each title's ids (imdb + tmdb forms) into the shadow
+    /// cache. Reuses `TraktAuth` for a live bearer so `TraktService` stays untouched. Fail-soft: a failed
+    /// leg contributes nothing.
     private func pullWatched() async {
         // Import is opt-in: when the toggle is off, `shadowWatchedIDs()` returns empty anyway, so pulling
         // (and hitting the Trakt read endpoints + refreshing a token) would be pure waste. Skip the network
@@ -108,27 +112,51 @@ final class TraktSyncEngine {
         lock.lock(); let gen = generation; lock.unlock()
         var next = Set<String>()
         for type in ["movies", "shows"] {
+            let isSeries = (type == "shows")
             guard let rows = await getWatched(type: type) else { continue }
             for row in rows {
-                let container = (row[type == "movies" ? "movie" : "show"]) as? [String: Any]
-                if let ids = container?["ids"] as? [String: Any], let imdb = ids["imdb"] as? String, !imdb.isEmpty {
-                    next.insert(imdb)
+                let container = (row[isSeries ? "show" : "movie"]) as? [String: Any]
+                guard let ids = container?["ids"] as? [String: Any] else { continue }
+                // Fold EVERY identity Trakt gives us for this title into the shadow set, not just imdb.
+                // The badge read is a plain `ids.contains(item.id)`, and catalog covers are keyed by
+                // whatever identity their source uses: Cinemeta covers are `tt…`, but our TMDB-backed
+                // hub / Discover covers (and library items added from them) are `tmdb:<id>` (see
+                // TMDBClient's `"tmdb:\(id)"`). Capturing ONLY imdb dropped every tmdb-keyed cover AND
+                // any Trakt record that lacks an imdb id, so a title watched on Trakt showed as
+                // unwatched (issue #143). Same id-mismatch class the trickplay tmdb-identity fix killed.
+                if let imdb = ids["imdb"] as? String, !imdb.isEmpty { next.insert(imdb) }
+                // Trakt returns tmdb as a JSON number. Insert the canonical `tmdb:<id>` form the hub
+                // covers use, plus the typed `tmdb:movie:<id>` / `tmdb:tv:<id>` shape some metas carry,
+                // so either cover-id form matches. We know movie-vs-show from the endpoint we pulled.
+                if let tmdb = Self.intID(ids["tmdb"]) {
+                    next.insert("tmdb:\(tmdb)")
+                    next.insert(isSeries ? "tmdb:tv:\(tmdb)" : "tmdb:movie:\(tmdb)")
                 }
+                // A title Trakt returns with NEITHER imdb nor tmdb cannot be matched to any cover, so it
+                // is simply absent from the set (no badge). We never guess an identity it did not give us.
             }
         }
         guard !next.isEmpty else { return }
         lock.lock()
-        // A disconnect while this pull was in flight wiped watchedTT and bumped generation; do NOT write
+        // A disconnect while this pull was in flight wiped watchedIDs and bumped generation; do NOT write
         // the pre-reset set back, or the imported badges would resurrect after the user disconnected.
         guard generation == gen else { lock.unlock(); return }
-        let changed = next != watchedTT
-        watchedTT = next
-        let snapshot = watchedTT
+        let changed = next != watchedIDs
+        watchedIDs = next
+        let snapshot = watchedIDs
         lock.unlock()
         if changed {
             Self.saveWatched(snapshot)
             await MainActor.run { WatchedIndex.shared.externalShadowChanged() }
         }
+    }
+
+    /// Coerce a Trakt JSON id value (an NSNumber from JSONSerialization, or defensively a numeric
+    /// String) to a positive Int, or nil. Used to normalize the tmdb id into a `tmdb:<id>` shadow key.
+    private static func intID(_ value: Any?) -> Int? {
+        if let n = value as? Int, n > 0 { return n }
+        if let s = value as? String, let n = Int(s), n > 0 { return n }
+        return nil
     }
 
     /// Authenticated GET returning the raw JSON array, or nil on any failure.

@@ -1,8 +1,10 @@
 package com.vortx.android.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -23,6 +25,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -40,18 +43,29 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
+import com.vortx.android.VortXApplication
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.person.CastMember
+import com.vortx.android.person.PersonSeed
+import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.ratings.MdbListRatings
+import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
@@ -68,7 +82,9 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.theme.vortxGlassToast
 import com.vortx.android.ui.viewmodel.DetailViewModel
+import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
+import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
 /// Title detail, driven by [DetailViewModel] -- movie/series per DESIGN-SYSTEM.md §4 "Detail":
 /// a fixed hero banner (backdrop + dual scrim + bottom-left title block, NOT a full-page wash, the
@@ -92,6 +108,85 @@ fun DetailScreen(
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val mutationError by viewModel.mutationError.collectAsStateWithLifecycle()
+
+    // Detail-local navigation for the cast/person feature, kept OUT of StremioXApp's own nav graph and
+    // out of DetailViewModel (the media-servers wave owns those): a tapped cast tile opens the Person
+    // page ([personTarget]); a Person-page filmography tile opens that title's own detail ([titleTarget]).
+    // Both are plain overlay state on this screen, so no top-level route is added and neither wave collides.
+    var personTarget by remember { mutableStateOf<PersonSeed?>(null) }
+    var titleTarget by remember { mutableStateOf<MetaItem?>(null) }
+
+    // Nested title detail (opened from a Person page's filmography grid): a full DetailScreen for the
+    // tapped title, built off the Application's shared repository so it reuses the exact detail flow
+    // without threading a new callback through the app shell. System back closes it back to the Person page.
+    titleTarget?.let { target ->
+        val app = LocalContext.current.applicationContext as VortXApplication
+        val nestedVm: DetailViewModel = viewModel(
+            key = "detail-nested-${target.id}",
+            factory = StremioXViewModelFactory(
+                repo = app.catalogRepository,
+                detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id),
+                appContext = app,
+            ),
+        )
+        BackHandler { titleTarget = null }
+        DetailScreen(
+            viewModel = nestedVm,
+            title = target.name,
+            onBack = { titleTarget = null },
+            onPlay = onPlay,
+            modifier = modifier,
+        )
+        return
+    }
+
+    // Person page overlay (opened from a tappable cast tile below): shown in place of the detail body,
+    // seeded for instant header paint. System back closes it back to this title.
+    personTarget?.let { seed ->
+        val personVm: PersonViewModel = viewModel(
+            key = "person-${seed.id}",
+            factory = PersonViewModel.Factory(seed.id),
+        )
+        BackHandler { personTarget = null }
+        PersonScreen(
+            viewModel = personVm,
+            seed = seed,
+            onBack = { personTarget = null },
+            onOpenTitle = { titleTarget = it },
+            modifier = modifier,
+        )
+        return
+    }
+
+    // View-local TMDB cast enrichment, mirroring the Apple detail views' `loadCredits` @State: fetch the
+    // full cast (person ids + character + headshots) through VortX's keyless signed edge, keyed off the
+    // meta's imdb id. Fail-soft -- an empty result (no tt id, or the edge is down) leaves the plain-name
+    // cast fallback below. Held here (not in DetailViewModel) so the media-servers wave's ViewModel is
+    // untouched, exactly as the credits fetch is view-local on iOS/tvOS.
+    var castMembers by remember { mutableStateOf<List<CastMember>>(emptyList()) }
+    val loadedMeta = metaState as? UiState.Success
+    val castImdbId = loadedMeta?.data?.id
+    val castType = loadedMeta?.data?.type
+    LaunchedEffect(castImdbId, castType) {
+        castMembers = emptyList()
+        if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
+            castMembers = TMDBPersonClient.credits(castImdbId, castType)
+        }
+    }
+
+    // View-local VortX ratings enrichment, mirroring the Apple detail views loading `VortXRatingsClient`:
+    // the keyless, edge-signed ratings.vortx.tv service returns cross-provider critic scores (Rotten
+    // Tomatoes / Metacritic / TMDB) the engine meta does not carry, keyed off the meta's imdb id. Fail-soft
+    // -- a non-`tt` id, a title with no scores, or a down edge leaves this null and the ratings strip is
+    // omitted. Held here (not in DetailViewModel) so the media-servers wave's ViewModel is untouched,
+    // exactly as the cast credits fetch is view-local.
+    var vortxRatings by remember { mutableStateOf<MdbListRatings?>(null) }
+    LaunchedEffect(castImdbId, castType) {
+        vortxRatings = null
+        if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
+            vortxRatings = VortXRatingsClient.ratings(castImdbId, castType.id)
+        }
+    }
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
@@ -121,11 +216,22 @@ fun DetailScreen(
                         watchEnabled = viewModel.bestSource() != null && !resolving,
                         resolving = resolving,
                         sourcesOpen = sourcesOpen,
-                        onWatch = { viewModel.bestSource()?.let(viewModel::play) },
+                        onWatch = { viewModel.playBest() },
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                     )
+                }
+                // VortX cross-provider critic scores under the hero actions (only when the ratings service
+                // returned at least one), the additive detail ratings strip -- IMDb already shows in the
+                // hero MetaRow, so this surfaces Rotten Tomatoes / Metacritic / TMDB.
+                vortxRatings?.let { r ->
+                    item {
+                        RatingsRow(
+                            ratings = r,
+                            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                        )
+                    }
                 }
                 if (sourcesOpen) {
                     item {
@@ -148,8 +254,16 @@ fun DetailScreen(
                         )
                     }
                 }
-                if (m.data.cast.isNotEmpty() || m.data.directors.isNotEmpty() || m.data.writers.isNotEmpty()) {
-                    item { CreditsSection(m.data) }
+                if (m.data.cast.isNotEmpty() || castMembers.isNotEmpty() ||
+                    m.data.directors.isNotEmpty() || m.data.writers.isNotEmpty()
+                ) {
+                    item {
+                        CreditsSection(
+                            m = m.data,
+                            castMembers = castMembers,
+                            onPersonTap = { personTarget = it },
+                        )
+                    }
                 }
                 if (m.data.type == MediaType.SERIES && m.data.videos.isNotEmpty()) {
                     item {
@@ -376,6 +490,42 @@ private fun MetaText(text: String) {
     Text(text = text, style = VortXTheme.type.label.copy(color = Color.White.copy(alpha = 0.82f)))
 }
 
+/// The VortX cross-provider ratings strip: Rotten Tomatoes / Metacritic / TMDB critic scores from the
+/// keyless [VortXRatingsClient], rendered as compact score badges. Shown only when at least one provider
+/// returned a value (the caller already dropped a null / empty result). Mirrors the extra ratings the Apple
+/// detail row renders from `MDBListRatings`; IMDb stays in the hero [MetaRow], so this shows the three
+/// critic providers the engine meta does not carry.
+@Composable
+private fun RatingsRow(ratings: MdbListRatings, modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        ratings.rottenTomatoes?.let { RatingBadge("Rotten Tomatoes", "$it%") }
+        ratings.metacritic?.let { RatingBadge("Metacritic", it.toString()) }
+        ratings.tmdb?.let { RatingBadge("TMDB", "$it%") }
+    }
+}
+
+/// One provider score badge: the emphasized value over its muted provider label.
+@Composable
+private fun RatingBadge(label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = value,
+            style = VortXTheme.type.label.copy(
+                color = VortXTheme.colors.textPrimary,
+                fontWeight = FontWeight.SemiBold,
+            ),
+        )
+        Text(
+            text = label,
+            style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textTertiary),
+        )
+    }
+}
+
 /// The hero-actions cluster (DESIGN-SYSTEM.md §4 Detail): the ONE gold Watch/Resume [PrimaryButton] +
 /// a Sources chip (toggles the raw per-add-on list below, unranked pending S06) + a Library chip
 /// reflecting the engine's saved state. For a series the button label/target follows
@@ -444,22 +594,112 @@ private fun ActionsCluster(
     }
 }
 
-/// Cast/Director/Writer credits (DESIGN-SYSTEM.md §4 Detail "credits"), read straight from the
-/// engine's own categorized `links` (see [com.vortx.android.engine.EngineState.parseCredits]) --
-/// no extra network call. Full cast headshots (the Apple TMDB-credits enrichment) are deferred; see
-/// this session's report.
+/// Cast & Crew (DESIGN-SYSTEM.md §4 Detail "credits"), ported from the Apple detail views' cast rail:
+/// when TMDB credits resolved ([castMembers] non-empty), the cast shows as a horizontal rail of
+/// headshot tiles that tap through to the Person page (real person id only); otherwise it falls back to
+/// the engine's plain categorized-`links` cast names (no extra call, no headshots), exactly like the
+/// Apple `railCastMembers` fallback. Director / Writer stay plain credit lines either way.
 @Composable
-private fun CreditsSection(m: MetaDetail) {
-    Column(
-        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
-        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
-    ) {
-        Text(text = "Credits", style = VortXTheme.type.sectionTitle)
-        m.cast.takeIf { it.isNotEmpty() }?.let { CreditLine("Cast", it) }
+private fun CreditsSection(
+    m: MetaDetail,
+    castMembers: List<CastMember>,
+    onPersonTap: (PersonSeed) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+        Text(
+            text = "Cast & Crew",
+            style = VortXTheme.type.sectionTitle,
+            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+        )
+        // TMDB rail (tappable headshots) when it resolved, else the meta's plain-name cast list.
+        if (castMembers.isNotEmpty()) {
+            CastRail(members = castMembers, onPersonTap = onPersonTap)
+        } else {
+            m.cast.takeIf { it.isNotEmpty() }?.let { CreditLine("Cast", it) }
+        }
         m.directors.takeIf { it.isNotEmpty() }?.let { CreditLine("Director", it) }
         m.writers.takeIf { it.isNotEmpty() }?.let { CreditLine("Writer", it) }
     }
 }
+
+/// The horizontal full-cast rail: one [CastTile] per member, scrolling edge-to-edge (its own leading/
+/// trailing inset rather than a padded parent) so tiles slide under the screen edge like the hub rails.
+@Composable
+private fun CastRail(members: List<CastMember>, onPersonTap: (PersonSeed) -> Unit) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+    ) {
+        // No item key: TMDB cast ids are effectively unique here, but keying by a possibly-repeated id
+        // risks the duplicate-key crash the grid screens guard against, and this list is static per title.
+        items(members) { member ->
+            CastTile(
+                member = member,
+                // Only a real TMDB person id opens the Person page; a name-only entry stays a plain tile.
+                onTap = if (member.isTappable) {
+                    { onPersonTap(PersonSeed(member.id, member.name, member.profileUrl)) }
+                } else {
+                    null
+                },
+            )
+        }
+    }
+}
+
+/// One cast entry: a circular headshot (initials-disc fallback), the actor name, and the character
+/// beneath -- mirroring the Apple `castMemberTile`. Clickable only when [onTap] is non-null.
+@Composable
+private fun CastTile(member: CastMember, onTap: (() -> Unit)?) {
+    Column(
+        modifier = Modifier
+            .width(84.dp)
+            .then(if (onTap != null) Modifier.clickable(onClick = onTap) else Modifier),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(72.dp)
+                .clip(CircleShape)
+                .background(VortXTheme.colors.surface2),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (member.profileUrl.isNullOrBlank()) {
+                Text(
+                    text = castInitials(member.name),
+                    style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                )
+            } else {
+                AsyncImage(
+                    model = member.profileUrl,
+                    contentDescription = member.name,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+        }
+        Text(
+            text = member.name,
+            style = VortXTheme.type.label,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        member.character?.let {
+            Text(
+                text = it,
+                style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private fun castInitials(name: String): String =
+    name.split(" ").filter { it.isNotBlank() }.take(2)
+        .mapNotNull { it.firstOrNull()?.uppercase() }.joinToString("")
 
 @Composable
 private fun CreditLine(role: String, names: List<String>) {
@@ -468,6 +708,7 @@ private fun CreditLine(role: String, names: List<String>) {
         style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
     )
 }
 

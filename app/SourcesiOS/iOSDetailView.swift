@@ -208,6 +208,12 @@ struct iOSDetailView: View {
     private var sourcePin: ResolvedPin? { pinStore.effectivePin(pinContext) }
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // blur unwatched episode thumbnails to avoid spoilers
+    // Spoiler-safe mode (SourcePreferences.spoilerSafeKey): veil an UNWATCHED episode's art + synopsis on the
+    // episode list until the viewer reveals it. Observed via @AppStorage on the same flat key SourcePreferences
+    // persists, so a later Settings toggle redraws this view. `revealedEpisodeIds` is a session-only reveal set
+    // (read-only against the watch state, never a watch write), so revealing an episode never marks it watched.
+    @AppStorage("vortx.detail.spoilerSafe") private var spoilerSafe = true
+    @State private var revealedEpisodeIds: Set<String> = []
 
     // A SINGLE presentation slot drives every full-screen cover (player OR trailer). On macOS the
     // `platformFullScreenPlayerCover(item:)` calls become a `.sheet(item:)`, and two sheets attached to
@@ -216,6 +222,7 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
+    @State private var downloadPicker: DownloadPickerRequest?   // pre-download quality picker payload (#30 follow-up)
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (snapshot -> merge -> rank
     /// off-main -> publish once, coalesced at ~250 ms). The body reads only its published output, so a
     /// CoreBridge revision storm during source search no longer rebuilds a 1000+ stream list per body
@@ -254,6 +261,11 @@ struct iOSDetailView: View {
     #endif
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
+    /// Franchise/collection this movie belongs to (TMDB belongs_to_collection -> parts, in release order),
+    /// rendered as the "Part of the … Collection" rail. Nil for a standalone film / series / any miss, which
+    /// hides the row. `collectionKey` de-dupes the fetch per imdb id.
+    @State private var collection: TMDBClient.CollectionResult?
+    @State private var collectionKey: String?
     /// Cast & Crew disclosure: the full cast rail shows by default (#10, owner wants who-played-who with
     /// photos visible); the "Cast & Crew" button can still fold it away to declutter, animating
     /// transform/opacity only.
@@ -474,6 +486,7 @@ struct iOSDetailView: View {
                             .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
                             .frame(maxWidth: .infinity)
                             whereToWatchSection
+                            collectionSection
                             moreLikeThisSection
                         }
                     }
@@ -549,6 +562,7 @@ struct iOSDetailView: View {
             // These resolve from the tt id alone, so a hub-seeded title whose Cinemeta meta never
             // arrives still gets its cast, synopsis fallback, and a More-Like-This rail (#7/#29).
             loadCredits()
+            loadCollection()
             loadSimilarFallback()
             refreshLanguageChips()
         }
@@ -576,6 +590,7 @@ struct iOSDetailView: View {
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
             if let m = meta { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m); resolvePreferredTrailerIfNeeded(m) }
             loadCredits()   // meta may have surfaced the imdb defaultVideoId for a tmdb:/kitsu: catalog id
+            loadCollection()   // ditto: the imdb id may only now be known for a tmdb:/kitsu: catalog id
             refreshLanguageChips()
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
@@ -831,6 +846,7 @@ struct iOSDetailView: View {
                     .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
                     .frame(maxWidth: .infinity)
                     whereToWatchSection
+                    collectionSection
                     moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)
@@ -928,6 +944,12 @@ struct iOSDetailView: View {
         }
         .padding(.horizontal, Theme.Space.md)
         .frame(width: width, alignment: .leading)
+        // Pre-download quality picker (#30 follow-up). Attached HERE, nested under the body's player cover,
+        // NOT on the body itself: on macOS `platformFullScreenPlayerCover` becomes a `.sheet(item:)`, and a
+        // second `.sheet(item:)` on the SAME view shadows it (see the `presentation` note). heroBelow is the
+        // shared host for both the movie (`watchNow`) and series (`seriesHeroActions`) Download chips on iOS
+        // AND macOS, so one attachment here covers both entry points on both platforms.
+        .downloadQualityPicker($downloadPicker)
     }
 
     /// The synopsis to render: the engine meta's description, else TMDB's overview (a hub-seeded tt id
@@ -1471,6 +1493,17 @@ struct iOSDetailView: View {
             : profiles.watchedVideoIds(forMeta: m.id)
     }
 
+    /// Show-level watched rollup (issue #143): a series reads as watched once every AIRED, regular-season
+    /// episode is watched, so unaired episodes and Season 0 specials never hold a finished show back, and a
+    /// series whose episodes were MARKED (not played) still flips the poster badge even though the engine's
+    /// library `times_watched` stays 0. Read-only: fed into WatchedIndex, never a write. Called on appear and
+    /// whenever the watched set or the episode list changes.
+    private func publishSeriesWatchRollup() {
+        guard let m = meta, let videos = m.videos, !videos.isEmpty else { return }
+        WatchedIndex.shared.noteSeriesWatched(m.id,
+            isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watchedSet))
+    }
+
     /// Series hero: a primary "Resume S#E#" / "Play S#E#" button (with a progress stripe when the
     /// resume episode is partially watched), then the trailer + library chips — the touch/Mac twin
     /// of the tvOS series hero. Tapping it pushes that episode's source list (the same screen an
@@ -1504,16 +1537,17 @@ struct iOSDetailView: View {
             // overflow onto the next line under the hero's hard width cap (prevents "Tr / ail / er" slivers).
             FlowLayout(spacing: Theme.Space.sm) {
                 #if !os(tvOS)
-                // Offline (#30): download the primary episode's auto-picked source — the series twin of the
-                // movie Download chip. Gated on the primary episode resolving; the chip reflects state.
+                // Offline (#30): open the pre-download quality picker for the primary episode — the series twin
+                // of the movie Download chip. Gated on the primary episode resolving; the chip reflects state.
                 if let primary {
                     downloadChip(videoId: primary.video.id, ready: true) {
-                        Task { await downloadBestSeries(primary.video) }
+                        Task { await presentSeriesDownloadPicker(primary.video) }
                     }
                 }
                 #endif
                 trailerButton
                 iOSLibraryChip()
+                iOSWatchlistChip()
                 shareChip
             }
         }
@@ -1721,9 +1755,10 @@ struct iOSDetailView: View {
                 qualityMenu(groups)
 
                 #if !os(tvOS)
-                // Offline (#30): download the best source, the offline twin of Watch Now. The chip reflects
-                // state (idle / Downloading / Downloaded) so a tap gives visible feedback.
-                downloadChip(videoId: meta?.id ?? id, ready: movieReady) { Task { await downloadBest() } }
+                // Offline (#30): open the pre-download quality picker, the offline twin of Watch Now. The chip
+                // reflects state (idle / Downloading / Downloaded) so a tap gives visible feedback; `movieReady`
+                // guarantees the sources are loaded when it fires (the source-list precondition).
+                downloadChip(videoId: meta?.id ?? id, ready: movieReady) { presentMovieDownloadPicker() }
                 #endif
 
                 Button { scrollToSources() } label: {
@@ -1734,6 +1769,7 @@ struct iOSDetailView: View {
 
                 trailerButton
                 iOSLibraryChip()
+                iOSWatchlistChip()
                 shareChip
             }
             // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
@@ -2028,6 +2064,21 @@ struct iOSDetailView: View {
                 guard creditsKey == imdb else { return }   // title switched mid-fetch
                 if !result.cast.isEmpty { castMembers = result.cast }
                 if fallbackOverview == nil { fallbackOverview = result.overview }
+            }
+        }
+    }
+
+    /// Fetch this movie's franchise/collection (TMDB belongs_to_collection -> parts, release order) from the
+    /// keyless edge. Movies only; keyed per imdb id so meta arriving after the tt-only first load doesn't
+    /// refetch (works with meta=nil for a hub-seeded tt). Fail-soft: a standalone film / miss leaves the row hidden.
+    private func loadCollection() {
+        guard effectiveType != "series", let imdb = ratingsImdbID, collectionKey != imdb else { return }
+        collectionKey = imdb
+        Task {
+            let result = await TMDBClient.movieCollection(imdbID: imdb, type: effectiveType)
+            await MainActor.run {
+                guard collectionKey == imdb else { return }   // title switched mid-fetch
+                collection = result
             }
         }
     }
@@ -2353,19 +2404,26 @@ struct iOSDetailView: View {
                                         sourceName: stream.name, qualityText: StreamRanking.signature(stream))
     }
 
-    /// "Download best" — the offline twin of Watch Now: download the auto-picked best source.
-    private func downloadBest() async {
-        guard let stream = movieBest, let url = stream.playableURL else { return }
-        await downloadStream(stream, url: url)
+    /// Present the pre-download quality picker for the MOVIE (#30 follow-up): hands the picker the SAME
+    /// display-filtered, ranked groups + remembered-quality continuity + source pin + confirmed cached-debrid
+    /// hashes the source list and `StreamRanking.best` already use, so it lists exactly the sources "Download
+    /// best" would have chosen from and the user picks the exact quality to save. Sync: the movie's sources are
+    /// already loaded when the `movieReady`-gated chip fires. The picker's coordinator owns the transfer +
+    /// automatic next-best fallback; nothing here writes to the account / libraryItem docs.
+    private func presentMovieDownloadPicker() {
+        downloadPicker = DownloadPickerRequest(
+            meta: moviePlaybackMeta, episode: nil, groups: rankedMovie().groups,
+            continuity: rememberedQuality, pin: sourcePin, cachedHashes: debridCache.cachedHashes)
     }
 
-    /// Download-best for a SERIES: queue the primary episode's auto-picked source — the offline twin of the
-    /// series hero's Resume/Play, which targets the SAME episode (`seriesPrimaryEpisode`) and the SAME
-    /// `StreamRanking.best` path. A series detail loads meta only, so this loads + settles that episode's
-    /// streams (mirroring `iOSResolveEpisodeStream`), ranks them, resolves a cached-debrid direct link when
-    /// possible, then hands the episode's series-typed `PlaybackMeta` to `DownloadManager`. No-op if nothing
-    /// resolves. Device-local only; writes nothing to the account / libraryItem docs.
-    private func downloadBestSeries(_ video: CoreVideo) async {
+    /// Present the pre-download quality picker for a SERIES' primary episode (#30 follow-up) — the series twin
+    /// of the movie Download chip. A series detail loads meta only, so this first loads + settles THAT
+    /// episode's streams (mirroring the episode page's resolve gate), then hands the picker the SAME
+    /// display-filtered groups + remembered-quality continuity + source pin + confirmed cached-debrid hashes
+    /// the play path uses, tagged with the episode's `DebridEpisode(season:episode:)` so a season-pack link
+    /// resolves to the right episode. No-op if meta is missing or nothing settles. The picker's coordinator
+    /// owns the transfer + automatic next-best fallback; nothing here writes to the account / libraryItem docs.
+    private func presentSeriesDownloadPicker(_ video: CoreVideo) async {
         guard let m = meta else { return }
         core.loadMeta(type: "series", id: m.id, streamType: "series", streamId: video.id)
         var groups: [CoreStreamSourceGroup] = []
@@ -2379,21 +2437,15 @@ struct iOSDetailView: View {
                                             secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, pin: sourcePin,
-                                            debridCachedHashes: debridCache.cachedHashes),
-              let url = best.playableURL else { return }
+        guard !groups.isEmpty else { return }
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
-        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
-        // Same loopback-torrent prime as the per-row download (#21): the server must /create it first.
-        if resolved == nil, best.isTorrent {
-            torrentPrime?.cancel()
-            torrentPrime = prepareTorrentStream(best)
-        }
         let pm = PlaybackMeta(libraryId: m.id, videoId: video.id, type: "series",
                               name: m.name, poster: video.thumbnail ?? m.poster,
                               season: video.season, episode: video.episode)
-        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: resolved ?? url,
-                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
+        downloadPicker = DownloadPickerRequest(
+            meta: pm, episode: ep, groups: groups,
+            continuity: rememberedQuality, pin: sourcePin, cachedHashes: debridCache.cachedHashes,
+            subtitle: video.season.flatMap { s in video.episode.map { "S\(s)E\($0)" } })
     }
     #endif
 
@@ -2613,11 +2665,13 @@ struct iOSDetailView: View {
             // else the first non-special, else 1 — matching the tvOS rule. Re-applies when a large series'
             // episodes stream in after the list first appears (onChange videos.count), guarded so a manual tap
             // is never overridden.
-            .onAppear { applyEpisodeSeason(seasons) }
+            .onAppear { applyEpisodeSeason(seasons); publishSeriesWatchRollup() }
             // Single-param onChange: the zero-/two-param forms are iOS 17+, target here is iOS 16.
             .onChange(of: videos.count) { _ in
                 applyEpisodeSeason(Array(Set(videos.compactMap { $0.season })).sorted())
+                publishSeriesWatchRollup()
             }
+            .onChange(of: watched) { _ in publishSeriesWatchRollup() }   // a mark flips the show-level badge (#143)
             .onChange(of: season) { _ in didApplySeason = true }
         }
     }
@@ -2642,6 +2696,14 @@ struct iOSDetailView: View {
     /// Tapping an episode now PUSHES its own source-list screen (the full ranked sources + Quality
     /// picker) instead of silently auto-playing the best source — mirroring the tvOS `CoreEpisodeStreams`
     /// flow. The user sees every source for that episode and picks one, which plays via the primed path.
+    /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it has
+    /// not yet been revealed this session. Read-only against `watchedSet` (never a write), so it honours the
+    /// per-profile watch invariant. It gates the reveal-first tap and the withheld synopsis; the thumbnail blur
+    /// additionally unions the legacy `SpoilerBlurSetting` (see `episodeThumbnail`).
+    private func spoilerVeiled(_ v: CoreVideo, isWatched: Bool) -> Bool {
+        spoilerSafe && !isWatched && !revealedEpisodeIds.contains(v.id)
+    }
+
     @ViewBuilder private func episodeRow(_ v: CoreVideo, isWatched: Bool, progress: Double) -> some View {
         #if !os(tvOS)
         // #119 multi-select mode: rows toggle membership instead of pushing the source page. An
@@ -2662,6 +2724,16 @@ struct iOSDetailView: View {
             }
             .buttonStyle(RowFocusStyle())
             .accessibilityValue(isSelected ? "Selected" : "")
+        } else if spoilerVeiled(v, isWatched: isWatched) {
+            // Spoiler-safe: a veiled row REVEALS on tap instead of pushing the source page, so the first tap can
+            // never jump straight into a spoilery source list / backdrop. Once revealed it re-renders as the
+            // normal navigation row, so a second tap opens the episode as usual.
+            Button { revealedEpisodeIds.insert(v.id) } label: {
+                episodeRowLabel(v, isWatched: isWatched, progress: progress)
+            }
+            .buttonStyle(RowFocusStyle())
+            .accessibilityValue("Spoiler hidden")
+            .accessibilityHint("Reveals this episode's artwork and description")
         } else {
             episodeRowNavigation(v, isWatched: isWatched, progress: progress)
         }
@@ -2719,7 +2791,13 @@ struct iOSDetailView: View {
                     Text(String(aired.prefix(10)))
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
                 }
-                if let overview = v.overview, !overview.isEmpty {
+                if spoilerVeiled(v, isWatched: isWatched) {
+                    // Synopsis withheld until the viewer reveals this episode (spoiler-safe mode). The row itself
+                    // is the reveal control (see episodeRow), so this is a static hint, not a nested button.
+                    Label("Tap to reveal", systemImage: "eye.slash")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                        .accessibilityLabel("Description hidden")
+                } else if let overview = v.overview, !overview.isEmpty {
                     Text(overview)
                         .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                         .lineLimit(2).fixedSize(horizontal: false, vertical: true)
@@ -2888,7 +2966,11 @@ struct iOSDetailView: View {
         // (`features.spoilerBlur`); else baked true. `_ = spoilerBlur` keeps the view observing the
         // @AppStorage so a Settings toggle triggers a redraw.
         _ = spoilerBlur
-        let blurArt = SpoilerBlurSetting.isEnabled && !isWatched   // hide future-episode imagery until you have watched it
+        // Hide future-episode imagery until you have watched OR revealed it. The blur fires under the new
+        // spoiler-safe mode OR the legacy thumbnail-blur setting; either way a per-episode reveal (a tap on the
+        // row, tracked in revealedEpisodeIds) clears it, so revealing an episode always shows its art.
+        let revealed = revealedEpisodeIds.contains(v.id)
+        let blurArt = !isWatched && !revealed && (spoilerSafe || SpoilerBlurSetting.isEnabled)
         return AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
             switch phase {
             case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
@@ -2933,6 +3015,35 @@ struct iOSDetailView: View {
     }
 
     private func seasonLabel(_ s: Int) -> String { s == 0 ? "Specials" : "Season \(s)" }
+
+    // MARK: Part of the Collection (franchise)
+
+    /// The "Part of the … Collection" rail: every entry in this movie's TMDB collection in release order,
+    /// each tappable to open its detail. Reuses the exact More-Like-This idiom (shared catalog card +
+    /// NavigationLink to iOSDetailView), so it honors the same poster orientation / hide-labels settings.
+    /// Rendered only when the collection has more than one entry (a one-item "collection" is not a franchise).
+    @ViewBuilder private var collectionSection: some View {
+        if let collection, collection.parts.count > 1 {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                iOSRailHeader(eyebrow: "Collection", title: TMDBClient.collectionRowTitle(collection.name))
+                    .padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.sm) {
+                        ForEach(collection.parts) { item in
+                            NavigationLink {
+                                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                            } label: {
+                                PosterCardiOS(id: item.id, type: item.type, name: item.name,
+                                              poster: item.poster, progress: 0)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                }
+            }
+        }
+    }
 
     // MARK: More Like This
 
@@ -4545,6 +4656,33 @@ private struct iOSLibraryChip: View {
                   systemImage: saved ? "bookmark.fill" : "bookmark")
         }
         .buttonStyle(ChipButtonStyle(selected: saved))
+    }
+}
+
+/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`) — a pure app-side
+/// bookmark separate from the engine Library, engine-safe ids only (tt / tmdb). Reads the open title from the
+/// engine detail meta exactly like `iOSLibraryChip` reads `core.detailInLibrary`, so it needs no call-site
+/// plumbing; a synthetic magnet / paste-a-link title (no tt / tmdb id) hides the chip since it can't be
+/// watchlisted. The touch/Mac twin of the tvOS `WatchlistChip`.
+private struct iOSWatchlistChip: View {
+    @EnvironmentObject private var core: CoreBridge
+    @State private var isWatchlisted = false
+
+    var body: some View {
+        if let meta = core.metaDetails?.meta, meta.id.hasPrefix("tt") || meta.id.hasPrefix("tmdb") {
+            Button {
+                isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: meta.id, type: meta.type,
+                                                               name: meta.name, poster: meta.poster)
+            } label: {
+                Label(isWatchlisted ? "In Watchlist" : "Watchlist",
+                      systemImage: isWatchlisted ? "star.fill" : "star")
+            }
+            .buttonStyle(ChipButtonStyle(selected: isWatchlisted))
+            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id) }
+            .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id)
+            }
+        }
     }
 }
 

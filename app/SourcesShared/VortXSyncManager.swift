@@ -103,7 +103,11 @@ final class VortXSyncManager: ObservableObject {
     /// malicious/garbage synced `doc.addonOrder` can't balloon UserDefaults. Applied in the setter, which is the
     /// single chokepoint for both the in-app reorder and the syncDown apply.
     private static let maxAddonOrderEntries = 1024
-    static var appliedAddonOrder: [String] {
+    /// `nonisolated`: it only touches thread-safe `UserDefaults` (and Sendable `let` backing constants), so
+    /// nonisolated read sites like `CoreMetaDetails.meta` (the #144 detail-language pick, a plain Decodable
+    /// evaluated off the main actor) can consult the shared order without an actor hop. All existing
+    /// main-actor callers keep working (nonisolated members are callable from any context).
+    nonisolated static var appliedAddonOrder: [String] {
         get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
         set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
     }
@@ -670,8 +674,9 @@ final class VortXSyncManager: ObservableObject {
         // SUBTRACT the durable removal tombstones from the union (the add-on analogue of subtracting
         // deletedProfiles from the roster union): an add-on the user removed must NOT come back, even if
         // the engine still briefly holds it OR a peer device's prior doc.vortx.addons still carries it.
-        // Official/protected stubs are never tombstoned, so this never drops a default. Compared on the
-        // same normalized (trim+lowercase) transportUrl the tombstone is stored under.
+        // PROTECTED stubs (Cinemeta, Local Files) are never tombstoned, so this never drops an essential
+        // default; a removable official add-on the user deleted IS dropped (#137). Compared on the same
+        // normalized (trim+lowercase) transportUrl the tombstone is stored under.
         let removedAddons = AddonTombstones.all()
         var addonList: [[String: Any]] = []
         var seenAddonURLs = Set<String>()
@@ -1087,7 +1092,7 @@ final class VortXSyncManager: ObservableObject {
                 Self.shared.withRemoteApplySuppressed {
                     for addon in CoreBridge.shared.addons
                     where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
-                        && !addon.isOfficial && !addon.isProtected {
+                        && !addon.isProtected {
                         CoreBridge.shared.uninstallAddon(addon, tombstone: false)
                     }
                 }

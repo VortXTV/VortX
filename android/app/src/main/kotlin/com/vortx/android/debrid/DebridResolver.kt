@@ -5,13 +5,16 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
 
@@ -41,19 +44,28 @@ class DebridResolver(private val keys: DebridKeys) {
     }
 
     /// One file inside a debrid torrent. [id] is the provider's file id used to request the stream link.
-    private data class DebridFile(
+    /// Public because the [DebridCoordinator] surfaces the cached-file lists from [checkCache] to the
+    /// ranker/assembly layer. Mirrors the Apple `DebridFile` (adds the optional `mimetype` TorBox returns).
+    data class DebridFile(
         val id: Int,
         val name: String,
         val shortName: String,
         val size: Long,
+        val mimetype: String? = null,
     ) {
         val isVideo: Boolean
             get() {
+                mimetype?.lowercase()?.let { if (it.startsWith("video/")) return true }
                 val candidate = shortName.ifEmpty { name }
                 val ext = candidate.substringAfterLast('.', "").lowercase()
                 return ext in VIDEO_EXTENSIONS
             }
     }
+
+    /// The url of a resolved debrid link PLUS the provider ids needed to LATER regenerate a fresh link
+    /// without a full re-add ([reresolveLink]). TorBox carries stable `torrentId`/`fileId`; the other three
+    /// leave them null and reresolve by re-adding the magnet. Mirrors the Apple `resolveWithIds` tuple.
+    data class ResolvedLink(val url: String, val torrentId: Int?, val fileId: Int?)
 
     /// A series episode target, for picking the right file in a season pack. Null for movies.
     data class Episode(val season: Int, val episode: Int)
@@ -76,14 +88,7 @@ class DebridResolver(private val keys: DebridKeys) {
         val chosen = service?.takeIf(keys::isConfigured) ?: keys.configuredServices().firstOrNull() ?: return null
         val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
         return try {
-            withContext(Dispatchers.IO) {
-                when (chosen) {
-                    DebridService.TOR_BOX -> resolveTorBox(hash, mag, episode)
-                    DebridService.REAL_DEBRID -> resolveRealDebrid(mag, episode)
-                    DebridService.ALL_DEBRID -> resolveAllDebrid(mag, episode)
-                    DebridService.PREMIUMIZE -> resolvePremiumize(mag, episode)
-                }
-            }
+            withContext(Dispatchers.IO) { resolveWithIdsInternal(chosen, hash, mag, fileIdx = null, episode).url }
         } catch (cancel: CancellationException) {
             throw cancel
         } catch (error: DebridException) {
@@ -96,12 +101,114 @@ class DebridResolver(private val keys: DebridKeys) {
     }
 
     // ------------------------------------------------------------------------------------------------
+    // Coordinator-facing throwing entry points (used by [DebridCoordinator]). Unlike [resolve] above,
+    // these THROW [DebridException] so the coordinator can implement per-candidate catch, bounded
+    // timeouts, and multi-candidate failover itself. Each hops to [Dispatchers.IO] at its boundary so the
+    // caller need not (a nested `withContext(IO)` when already on IO is a cheap no-op). Mirrors the Apple
+    // `DebridResolving.resolveWithIds` / `reresolveLink` protocol requirements.
+    // ------------------------------------------------------------------------------------------------
+
+    /// Resolve a torrent through [service], surfacing the provider ids for a later [reresolveLink]. The
+    /// [magnet] is built from [infoHash] (+ [trackers]) when null. Throws on any failure. Runs on IO.
+    suspend fun resolveWithIds(
+        service: DebridService,
+        infoHash: String,
+        magnet: String? = null,
+        fileIdx: Int? = null,
+        episode: Episode? = null,
+        trackers: List<String> = emptyList(),
+    ): ResolvedLink {
+        val hash = infoHash.trim().lowercase()
+        val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
+        return withContext(Dispatchers.IO) { resolveWithIdsInternal(service, hash, mag, fileIdx, episode) }
+    }
+
+    /// Regenerate a FRESH direct link for an already-resolved file through the SAME [service], skipping the
+    /// add step where the provider supports it. On TorBox with both ids present this is a single `requestdl`
+    /// (no re-add); an evicted file (or any provider blip) falls through to a full re-add from [infoHash].
+    /// Every other provider (and TorBox with missing ids) re-adds the magnet, which the provider dedups.
+    /// Throws when the file is genuinely gone. Runs on IO. Mirrors the Apple `reresolveLink`.
+    suspend fun reresolveLink(
+        service: DebridService,
+        infoHash: String,
+        torrentId: Int?,
+        fileId: Int?,
+        fileIdx: Int?,
+    ): String = withContext(Dispatchers.IO) {
+        val hash = infoHash.trim().lowercase()
+        // TorBox fast path: mint a fresh link from the stored ids with no re-add. Any DEBRID-side failure
+        // (evicted file, provider blip, transient auth, not-ready) is recoverable by the full re-add below,
+        // so fall through on all of them; only a genuine cancellation aborts.
+        if (service == DebridService.TOR_BOX && torrentId != null && fileId != null) {
+            try {
+                return@withContext torBoxRequestDl(TORBOX_BASE, keys.key(DebridService.TOR_BOX), torrentId, fileId)
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: DebridException) {
+                Log.d(TAG, "torbox reresolve fast-path failed (${error.message}); re-adding")
+            }
+        }
+        resolveWithIdsInternal(service, hash, buildMagnet(hash, emptyList()), fileIdx, episode = null).url
+    }
+
+    /// Build a minimal magnet from an [infoHash] (+ optional [trackers]) for the coordinator's failover
+    /// legs, when a candidate carried no pre-built magnet. Mirrors the Apple `DebridResolve.magnet`.
+    fun magnet(infoHash: String, trackers: List<String> = emptyList()): String =
+        buildMagnet(infoHash.trim().lowercase(), trackers)
+
+    /// The single service dispatch shared by [resolve] and [resolveWithIds]. Throws [DebridException] on
+    /// failure. TorBox carries its stable ids; the other three return null ids (reresolve re-adds).
+    private suspend fun resolveWithIdsInternal(
+        service: DebridService,
+        hash: String,
+        magnet: String,
+        fileIdx: Int?,
+        episode: Episode?,
+    ): ResolvedLink = when (service) {
+        DebridService.TOR_BOX -> resolveTorBox(hash, magnet, episode, fileIdx)
+        DebridService.REAL_DEBRID -> ResolvedLink(resolveRealDebrid(magnet, episode, fileIdx), null, null)
+        DebridService.ALL_DEBRID -> ResolvedLink(resolveAllDebrid(magnet, episode, fileIdx), null, null)
+        DebridService.PREMIUMIZE -> ResolvedLink(resolvePremiumize(magnet, episode, fileIdx), null, null)
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Batch cache-availability (the coordinator's cache-check fan-out calls one service at a time). Returns
+    // infoHash -> cached files for the hashes the account has cached; an absent/empty entry means not
+    // cached. Real-Debrid returns empty (it removed its instant cache-check upstream), so a "cached" badge
+    // on an RD row is an add-on claim, confirmed only by the add-then-poll resolve. Fail-soft: a provider
+    // error yields no confirmations (the resolve path still works). Mirrors the Apple per-actor `checkCache`.
+    // ------------------------------------------------------------------------------------------------
+
+    /// Which of [hashes] [service] has cached, hash -> files. Runs on IO. Never throws (fail-soft): a
+    /// provider/network error simply yields no confirmations for that batch.
+    suspend fun checkCache(service: DebridService, hashes: List<String>): Map<String, List<DebridFile>> {
+        if (hashes.isEmpty() || !keys.isConfigured(service)) return emptyMap()
+        val normalized = hashes.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        if (normalized.isEmpty()) return emptyMap()
+        return try {
+            withContext(Dispatchers.IO) {
+                when (service) {
+                    DebridService.TOR_BOX -> torBoxCheckCache(normalized)
+                    DebridService.REAL_DEBRID -> emptyMap()   // removed upstream
+                    DebridService.ALL_DEBRID -> allDebridCheckCache(normalized)
+                    DebridService.PREMIUMIZE -> premiumizeCheckCache(normalized)
+                }
+            }
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            Log.d(TAG, "debrid cache-check error for ${service.displayName}", error)
+            emptyMap()
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // TorBox (torrents). Base https://api.torbox.app/v1/api/torrents, Bearer auth. Flow (cached):
     // createtorrent (idempotent) -> poll mylist by hash until ready -> requestdl. TorBox is the only one
     // of the four that kept an instant cache-check, but the resolve path here is add-then-poll like RD.
     // ------------------------------------------------------------------------------------------------
 
-    private suspend fun resolveTorBox(hash: String, magnet: String, episode: Episode?): String {
+    private suspend fun resolveTorBox(hash: String, magnet: String, episode: Episode?, fileIdx: Int?): ResolvedLink {
         val apiKey = keys.key(DebridService.TOR_BOX)
         val base = TORBOX_BASE
 
@@ -122,10 +229,48 @@ class DebridResolver(private val keys: DebridKeys) {
             files = polled.second
         }
         val id = torrentId ?: throw DebridException.NotReady
-        val pick = pickFile(files, episode, fileIdx = null) ?: throw DebridException.NoMatchingFile
+        val pick = pickFile(files, episode, fileIdx) ?: throw DebridException.NoMatchingFile
 
-        // 3. Request the direct stream URL.
-        return torBoxRequestDl(base, apiKey, id, pick.id)
+        // 3. Request the direct stream URL; carry the stable ids for a later reresolve.
+        val url = torBoxRequestDl(base, apiKey, id, pick.id)
+        return ResolvedLink(url, id, pick.id)
+    }
+
+    /// TorBox torrent cache-check: `/checkcached?hash=<comma-list>&format=list&list_files=true`, Bearer auth.
+    /// TorBox is the only one of the four that kept an instant cache-check. Up to 100 hashes per call.
+    private suspend fun torBoxCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+        val out = HashMap<String, List<DebridFile>>()
+        val apiKey = keys.key(DebridService.TOR_BOX)
+        for (chunk in hashes.chunked(100)) {
+            coroutineContext.ensureActive()
+            val joined = chunk.joinToString(",")
+            val env = getJson("$TORBOX_BASE/checkcached?hash=${enc(joined)}&format=list&list_files=true", apiKey)
+            val data = env.optJSONArray("data") ?: continue
+            for (i in 0 until data.length()) {
+                val c = data.optJSONObject(i) ?: continue
+                val h = c.optString("hash").lowercase()
+                if (h.isNotEmpty()) out[h] = torBoxCachedFiles(c.optJSONArray("files"))
+            }
+        }
+        return out
+    }
+
+    private fun torBoxCachedFiles(arr: JSONArray?): List<DebridFile> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<DebridFile>(arr.length())
+        for (i in 0 until arr.length()) {
+            val f = arr.optJSONObject(i) ?: continue
+            val name = f.optStringOrNull("name").orEmpty()
+            val shortName = f.optStringOrNull("short_name").orEmpty()
+            out += DebridFile(
+                id = f.optInt("id", i),
+                name = name.ifEmpty { shortName },
+                shortName = shortName.ifEmpty { name.substringAfterLast('/') },
+                size = f.optLong("size", 0L),
+                mimetype = f.optStringOrNull("mimetype"),
+            )
+        }
+        return out
     }
 
     /// The requestdl leg: mint a direct stream URL for a known torrent_id+file_id. A missing/evicted
@@ -196,7 +341,7 @@ class DebridResolver(private val keys: DebridKeys) {
     // selection packs into a single unstreamable RAR, and selectFiles is a no-op once downloaded.
     // ------------------------------------------------------------------------------------------------
 
-    private suspend fun resolveRealDebrid(magnet: String, episode: Episode?): String {
+    private suspend fun resolveRealDebrid(magnet: String, episode: Episode?, fileIdx: Int?): String {
         val apiKey = keys.key(DebridService.REAL_DEBRID)
         val base = RD_BASE
 
@@ -217,7 +362,7 @@ class DebridResolver(private val keys: DebridKeys) {
         if (fileList.isEmpty()) throw DebridException.NotReady
 
         // 3. Pick the ONE target file, then select ONLY it.
-        val pick = pickFile(fileList, episode, fileIdx = null) ?: throw DebridException.NoMatchingFile
+        val pick = pickFile(fileList, episode, fileIdx) ?: throw DebridException.NoMatchingFile
         postFormNoBody("$base/torrents/selectFiles/$id", apiKey, mapOf("files" to pick.id.toString()))
 
         // 4. Poll info until `downloaded`, with the NOT-CACHED FAST-FAIL: RD retired the instant
@@ -278,7 +423,10 @@ class DebridResolver(private val keys: DebridKeys) {
 
     private data class AllDebridLink(val link: String, val filename: String, val size: Long)
 
-    private suspend fun resolveAllDebrid(magnet: String, episode: Episode?): String {
+    // fileIdx is accepted for a uniform dispatch signature but NOT applied to the pick: AD's link list can
+    // differ from the torrent's file order/count, so the pick runs the filename/size heuristic (fileIdx=null)
+    // to keep links[pick.id] aligned. Matches the Apple AllDebridResolver.resolve.
+    private suspend fun resolveAllDebrid(magnet: String, episode: Episode?, fileIdx: Int?): String {
         val apiKey = keys.key(DebridService.ALL_DEBRID)
         val base = AD_BASE
 
@@ -345,6 +493,45 @@ class DebridResolver(private val keys: DebridKeys) {
         return sb.toString()
     }
 
+    /// AllDebrid cache-check: `GET /magnet/instant`, repeated `magnets[]` = infohashes, query auth. AllDebrid
+    /// still ships this (only RD removed its cache-check), but it is known flaky, so a failed/empty chunk
+    /// simply yields no confirmations for those hashes (resolve still works). Batch ~40. Mirrors Apple.
+    private suspend fun allDebridCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+        val out = HashMap<String, List<DebridFile>>()
+        val apiKey = keys.key(DebridService.ALL_DEBRID)
+        for (chunk in hashes.chunked(40)) {
+            coroutineContext.ensureActive()
+            val pairs = chunk.map { "magnets[]" to it }.toTypedArray()
+            val env = try {
+                getJsonQueryAuth(adUrl(AD_BASE, "/magnet/instant", apiKey, *pairs))
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                continue
+            }
+            if (env.optString("status") != "success") continue
+            val magnets = env.optJSONObject("data")?.optJSONArray("magnets") ?: continue
+            for (i in 0 until magnets.length()) {
+                val m = magnets.optJSONObject(i) ?: continue
+                if (!m.optBoolean("instant", false)) continue
+                val h = m.optString("hash").lowercase()
+                if (h.isEmpty()) continue
+                val files = ArrayList<DebridFile>()
+                m.optJSONArray("files")?.let { arr ->
+                    for (j in 0 until arr.length()) {
+                        val f = arr.optJSONObject(j) ?: continue
+                        val n = f.optStringOrNull("n") ?: continue
+                        files += DebridFile(0, n, n.substringAfterLast('/'), f.optLong("s", 0L))
+                    }
+                }
+                // A cached hash MUST map to a non-empty file list to count as confirmed; if the instant tree
+                // was omitted, a placeholder keeps the hash confirmed (resolve picks the file).
+                out[h] = files.ifEmpty { listOf(DebridFile(0, h, h, 0L)) }
+            }
+        }
+        return out
+    }
+
     // ------------------------------------------------------------------------------------------------
     // Premiumize (torrents). Base https://www.premiumize.me/api, auth via `apikey` QUERY param (no
     // Authorization header). ONE call: POST /transfer/directdl with the magnet returns the file list WITH
@@ -354,7 +541,10 @@ class DebridResolver(private val keys: DebridKeys) {
 
     private data class PremiumizeItem(val path: String, val size: Long, val link: String?, val streamLink: String?)
 
-    private suspend fun resolvePremiumize(magnet: String, episode: Episode?): String {
+    // fileIdx is accepted for a uniform dispatch signature but NOT applied to the pick: PM's directdl content
+    // order can differ from the torrent's, so the pick runs the filename/size heuristic (fileIdx=null) to keep
+    // items[pick.id] aligned. Matches the Apple PremiumizeResolver.resolve.
+    private suspend fun resolvePremiumize(magnet: String, episode: Episode?, fileIdx: Int?): String {
         val apiKey = keys.key(DebridService.PREMIUMIZE)
         val url = "$PM_BASE/transfer/directdl?apikey=${enc(apiKey)}"
         val dl = postFormQueryAuth(url, mapOf("src" to magnet))
@@ -384,6 +574,198 @@ class DebridResolver(private val keys: DebridKeys) {
             ?: throw DebridException.NoMatchingFile
         val item = items[pick.id]
         return item.streamLink ?: item.link ?: throw DebridException.Provider("no link")
+    }
+
+    /// Premiumize cache-check: `POST /cache/check` with repeated `items[]` = bare infohashes (apikey in the
+    /// query). The `response` array is positionally aligned with `items[]`; a `true` means directdl will hit
+    /// instantly. Premiumize still ships this (only RD removed its cache-check). Fail-soft per chunk; batch
+    /// ~80. Mirrors the Apple PremiumizeResolver.checkCache.
+    private suspend fun premiumizeCheckCache(hashes: List<String>): Map<String, List<DebridFile>> {
+        val out = HashMap<String, List<DebridFile>>()
+        val apiKey = keys.key(DebridService.PREMIUMIZE)
+        for (chunk in hashes.chunked(80)) {
+            coroutineContext.ensureActive()
+            val url = "$PM_BASE/cache/check?apikey=${enc(apiKey)}"
+            val r = try {
+                postFormPairsQueryAuth(url, chunk.map { "items[]" to it })
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                continue
+            }
+            if (r.optString("status") != "success") continue
+            val flags = r.optJSONArray("response") ?: continue
+            val filenames = r.optJSONArray("filename")
+            val filesizes = r.optJSONArray("filesize")
+            for ((i, hash) in chunk.withIndex()) {
+                if (i >= flags.length() || !flags.optBoolean(i, false)) continue
+                val name = filenames?.optStringOrNull(i) ?: hash
+                out[hash.lowercase()] = listOf(DebridFile(0, name, name.substringAfterLast('/'), pmSize(filesizes, i)))
+            }
+        }
+        return out
+    }
+
+    /// Premiumize returns `filesize` as a base-10 STRING on a hit and the integer `0` on a miss; decode both.
+    private fun pmSize(arr: JSONArray?, index: Int): Long {
+        if (arr == null || index >= arr.length() || arr.isNull(index)) return 0L
+        return when (val v = arr.opt(index)) {
+            is Number -> v.toLong()
+            is String -> v.toLongOrNull() ?: 0L
+            else -> 0L
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // TorBox usenet. A DROP-IN TWIN of the TorBox torrent path pointed at the `/usenet/*` backend (base
+    // https://api.torbox.app/v1/api/usenet, same Bearer auth). A usenet stream carries an .nzb LINK instead
+    // of an infohash; the resolver adds the nzb, waits until TorBox has it present, picks the video file, and
+    // mints a direct HTTPS URL. The identifier is the md5 of the nzb link (TorBox's usenet cache key). Usenet
+    // is a TorBox-only backend among the four services. Mirrors the Apple TorBoxUsenetResolver.
+    // ------------------------------------------------------------------------------------------------
+
+    /// The md5 (hex) of an nzb link: TorBox's usenet cache identifier (the usenet twin of the torrent
+    /// infohash). Mirrors the Apple `TorBoxUsenetResolver.identifier(forNzbURL:)`.
+    fun usenetIdentifier(nzbUrl: String): String =
+        MessageDigest.getInstance("MD5").digest(nzbUrl.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    /// Which nzb md5s the user's TorBox usenet account has cached, md5 -> files. Empty (no-op) with no TorBox
+    /// key. Never throws (fail-soft). Runs on IO. Mirrors the Apple usenet checkCache.
+    suspend fun usenetCheckCache(nzbMd5s: List<String>): Map<String, List<DebridFile>> {
+        if (nzbMd5s.isEmpty() || !keys.isConfigured(DebridService.TOR_BOX)) return emptyMap()
+        val normalized = nzbMd5s.map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        if (normalized.isEmpty()) return emptyMap()
+        return try {
+            withContext(Dispatchers.IO) {
+                val out = HashMap<String, List<DebridFile>>()
+                val apiKey = keys.key(DebridService.TOR_BOX)
+                for (chunk in normalized.chunked(100)) {
+                    coroutineContext.ensureActive()
+                    val env = getJson(
+                        "$USENET_BASE/checkcached?hash=${enc(chunk.joinToString(","))}&format=list&list_files=true",
+                        apiKey,
+                    )
+                    val data = env.optJSONArray("data") ?: continue
+                    for (i in 0 until data.length()) {
+                        val c = data.optJSONObject(i) ?: continue
+                        val h = c.optString("hash").lowercase()
+                        if (h.isNotEmpty()) out[h] = torBoxCachedFiles(c.optJSONArray("files"))
+                    }
+                }
+                out
+            }
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            Log.d(TAG, "usenet cache-check error", error)
+            emptyMap()
+        }
+    }
+
+    /// Resolve one usenet stream (nzb link) to a direct HTTPS URL: createusenetdownload -> poll mylist until
+    /// present -> pick the file (fileMustInclude regex first, then the shared heuristic) -> requestdl. Throws
+    /// on failure. [knownHash] is the stream's authoritative NZB md5 when its emitter carried one (else the
+    /// md5-of-the-link fallback). Runs on IO. Mirrors the Apple TorBoxUsenetResolver.resolve.
+    suspend fun resolveUsenet(
+        nzbUrl: String,
+        knownHash: String? = null,
+        fileMustInclude: String? = null,
+        fileIdx: Int? = null,
+        episode: Episode? = null,
+    ): String = withContext(Dispatchers.IO) {
+        val apiKey = keys.key(DebridService.TOR_BOX)
+        val base = USENET_BASE
+
+        // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
+        //    download id if the same nzb is already in the user's usenet list.
+        val created = postJson(
+            "$base/createusenetdownload",
+            apiKey,
+            JSONObject().put("link", nzbUrl).put("post_processing", -1),
+        )
+        var usenetId = created.optJSONObject("data")?.optIntOrNull("usenetdownload_id")
+
+        // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
+        var files = emptyList<DebridFile>()
+        val immediate = usenetId?.let { id ->
+            runCatching { usenetItem(base, apiKey, id) }.getOrNull()?.takeIf(::torBoxReady)
+        }
+        if (immediate != null) {
+            files = torBoxFiles(immediate)
+        } else {
+            val polled = usenetPollByHash(base, apiKey, usenetId, knownHash?.lowercase() ?: usenetIdentifier(nzbUrl))
+            usenetId = polled.first
+            files = polled.second
+        }
+        val id = usenetId ?: throw DebridException.NotReady
+
+        // 3. Pick the file, honoring fileMustInclude / fileIdx, then the shared episode/size heuristic.
+        val pick = pickUsenetFile(files, fileMustInclude, fileIdx, episode) ?: throw DebridException.NoMatchingFile
+
+        // 4. Request the direct stream URL.
+        usenetRequestDl(base, apiKey, id, pick.id)
+    }
+
+    /// File pick with the usenet-specific [mustInclude] regex applied FIRST (when present + it matches a
+    /// video), then the shared [pickFile] (explicit idx -> SxEy -> largest video). Mirrors the Apple pick.
+    private fun pickUsenetFile(files: List<DebridFile>, mustInclude: String?, fileIdx: Int?, episode: Episode?): DebridFile? {
+        if (!mustInclude.isNullOrEmpty()) {
+            val re = runCatching { Regex(mustInclude, RegexOption.IGNORE_CASE) }.getOrNull()
+            if (re != null) {
+                val matched = files.filter { f ->
+                    if (!f.isVideo) return@filter false
+                    re.containsMatchIn(f.shortName.ifEmpty { f.name })
+                }
+                pickFile(matched, episode, fileIdx = null)?.let { return it }
+            }
+        }
+        return pickFile(files, episode, fileIdx)
+    }
+
+    /// The usenet `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id. Auth rides the
+    /// Bearer header (the key is not repeated in the query). A missing file surfaces as [NotCached].
+    private suspend fun usenetRequestDl(base: String, apiKey: String, usenetId: Int, fileId: Int): String {
+        val env = getJson("$base/requestdl?usenet_id=$usenetId&file_id=$fileId&redirect=false", apiKey)
+        return env.optStringOrNull("data") ?: throw DebridException.NotCached
+    }
+
+    /// Fetch one usenet download by numeric id (its mylist item shares the torrent item shape).
+    private suspend fun usenetItem(base: String, apiKey: String, id: Int): JSONObject {
+        val env = getJson("$base/mylist?id=$id&bypass_cache=true", apiKey)
+        return env.optJSONObject("data") ?: JSONObject()
+    }
+
+    /// Poll the usenet list until the download is ready: by id when we have one (fetch that item), else scan
+    /// mylist for the matching nzb md5, promoting the resolved id out. Uncached surfaces as [NotReady].
+    /// Honors cancellation so a raced/bounded resolve stops promptly. Mirrors the Apple pollById.
+    private suspend fun usenetPollByHash(base: String, apiKey: String, startId: Int?, hash: String): Pair<Int?, List<DebridFile>> {
+        var id = startId
+        for (attempt in 0 until POLL_ATTEMPTS) {
+            coroutineContext.ensureActive()
+            if (attempt > 0) delay(POLL_INTERVAL_MS)
+            val known = id
+            if (known != null) {
+                val item = runCatching { usenetItem(base, apiKey, known) }.getOrNull()
+                if (item != null && torBoxReady(item)) {
+                    val f = torBoxFiles(item)
+                    if (f.isNotEmpty()) return known to f
+                }
+                continue
+            }
+            val env = getJson("$base/mylist?bypass_cache=true", apiKey)
+            val list = env.optJSONArray("data") ?: continue
+            for (i in 0 until list.length()) {
+                val item = list.optJSONObject(i) ?: continue
+                val itemHash = item.optString("hash").lowercase()
+                val f = torBoxFiles(item)
+                if (itemHash == hash && torBoxReady(item) && f.isNotEmpty()) {
+                    id = item.optIntOrNull("id")
+                    return id to f
+                }
+            }
+        }
+        throw DebridException.NotReady
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -432,41 +814,85 @@ class DebridResolver(private val keys: DebridKeys) {
     // entry point already switched context), and each connection sets finite connect/read timeouts.
     // ------------------------------------------------------------------------------------------------
 
-    private fun getJson(urlString: String, bearer: String): JSONObject {
+    /// Run a blocking request on [conn] such that a coroutine cancellation (a raced / timed-out resolve leg)
+    /// DISCONNECTS the socket, so an in-flight connect/write/read is unblocked promptly instead of parking its
+    /// IO thread until the finite connect/read timeout. [HttpURLConnection] reads are NOT interruptible by
+    /// coroutine cancellation or Thread.interrupt(); only closing the socket (`disconnect()`) unblocks them,
+    /// which is what makes the coordinator's 5s resolve budget real rather than soft. Also releases the
+    /// connection if [block] throws BEFORE [execute]'s own finally-disconnect runs (e.g. the output write
+    /// fails), so no connection is leaked. `disconnect()` is idempotent, so the cancel-path, throw-path, and
+    /// execute()'s finally disconnects safely overlap. Mirrors the Apple URLSession task cancel tearing down
+    /// the socket. [block] runs synchronously on the current (Dispatchers.IO) thread; a concurrent cancel on
+    /// another thread fires [invokeOnCancellation] and disconnects, unblocking [block]'s read.
+    private suspend fun <T> sendCancellable(conn: HttpURLConnection, block: () -> T): T =
+        suspendCancellableCoroutine { cont ->
+            cont.invokeOnCancellation { runCatching { conn.disconnect() } }
+            val outcome = try {
+                Result.success(block())
+            } catch (error: Throwable) {
+                // block() threw before execute()'s finally could disconnect (e.g. the write failed): release
+                // the socket here so it is never leaked, then surface the failure.
+                runCatching { conn.disconnect() }
+                Result.failure(error)
+            }
+            cont.resumeWith(outcome)
+        }
+
+    private suspend fun getJson(urlString: String, bearer: String): JSONObject {
         val conn = open(urlString)
         conn.requestMethod = "GET"
         conn.setRequestProperty("Authorization", "Bearer $bearer")
-        return execute(conn)
+        return sendCancellable(conn) { execute(conn) }
     }
 
-    private fun postForm(urlString: String, bearer: String, fields: Map<String, String>): JSONObject {
+    private suspend fun postForm(urlString: String, bearer: String, fields: Map<String, String>): JSONObject {
         val conn = open(urlString)
         conn.requestMethod = "POST"
         conn.setRequestProperty("Authorization", "Bearer $bearer")
         conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
         conn.doOutput = true
-        conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
-        return execute(conn)
-    }
-
-    /// A POST whose 2xx carries no JSON body (RD selectFiles is 204). Validates the status only.
-    private fun postFormNoBody(urlString: String, bearer: String, fields: Map<String, String>) {
-        val conn = open(urlString)
-        conn.requestMethod = "POST"
-        conn.setRequestProperty("Authorization", "Bearer $bearer")
-        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-        conn.doOutput = true
-        conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
-        val code = conn.responseCodeSafe()
-        try {
-            if (code == 401 || code == 403) throw DebridException.InvalidKey
-            if (code !in 200..299) throw DebridException.Provider("HTTP $code")
-        } finally {
-            conn.disconnect()
+        return sendCancellable(conn) {
+            conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
+            execute(conn)
         }
     }
 
-    private fun postMultipart(urlString: String, bearer: String, fields: Map<String, String>): JSONObject {
+    /// A Bearer-auth POST with a JSON body (the TorBox usenet createusenetdownload leg). Mirrors the Apple
+    /// TorBoxUsenetResolver.postJSON.
+    private suspend fun postJson(urlString: String, bearer: String, json: JSONObject): JSONObject {
+        val conn = open(urlString)
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Authorization", "Bearer $bearer")
+        conn.setRequestProperty("Content-Type", "application/json")
+        conn.doOutput = true
+        return sendCancellable(conn) {
+            conn.outputStream.use { it.write(json.toString().toByteArray(Charsets.UTF_8)) }
+            execute(conn)
+        }
+    }
+
+    /// A POST whose 2xx carries no JSON body (RD selectFiles is 204). Validates the status only. The whole
+    /// body (write + status read + checks) sits inside the try/finally so the connection is ALWAYS released,
+    /// including when the write or `responseCodeSafe()` throws.
+    private suspend fun postFormNoBody(urlString: String, bearer: String, fields: Map<String, String>) {
+        val conn = open(urlString)
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Authorization", "Bearer $bearer")
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        conn.doOutput = true
+        sendCancellable(conn) {
+            try {
+                conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCodeSafe()
+                if (code == 401 || code == 403) throw DebridException.InvalidKey
+                if (code !in 200..299) throw DebridException.Provider("HTTP $code")
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    private suspend fun postMultipart(urlString: String, bearer: String, fields: Map<String, String>): JSONObject {
         val boundary = "vortx-${UUID.randomUUID()}"
         val conn = open(urlString)
         conn.requestMethod = "POST"
@@ -480,27 +906,45 @@ class DebridResolver(private val keys: DebridKeys) {
                 .append(v).append("\r\n")
         }
         body.append("--").append(boundary).append("--\r\n")
-        conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-        return execute(conn)
+        return sendCancellable(conn) {
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            execute(conn)
+        }
     }
 
     /// GET whose auth rides the QUERY string (AllDebrid: `agent` + `apikey`), so NO Authorization header.
     /// Mirrors the Apple AllDebrid `get` (a plain `URLRequest(url:)`).
-    private fun getJsonQueryAuth(urlString: String): JSONObject {
+    private suspend fun getJsonQueryAuth(urlString: String): JSONObject {
         val conn = open(urlString)
         conn.requestMethod = "GET"
-        return execute(conn)
+        return sendCancellable(conn) { execute(conn) }
     }
 
     /// POST form-urlencoded whose auth rides the QUERY string (Premiumize: `apikey`), so NO Authorization
     /// header. Mirrors the Apple Premiumize `form` (apikey in the query, fields in the body).
-    private fun postFormQueryAuth(urlString: String, fields: Map<String, String>): JSONObject {
+    private suspend fun postFormQueryAuth(urlString: String, fields: Map<String, String>): JSONObject {
         val conn = open(urlString)
         conn.requestMethod = "POST"
         conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
         conn.doOutput = true
-        conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
-        return execute(conn)
+        return sendCancellable(conn) {
+            conn.outputStream.use { it.write(formBody(fields).toByteArray(Charsets.UTF_8)) }
+            execute(conn)
+        }
+    }
+
+    /// Like [postFormQueryAuth] but with REPEATED form keys preserved (Premiumize `/cache/check` needs many
+    /// `items[]=...`, which a `Map` would collapse). `apikey` rides the query. Mirrors the Apple `formItems`.
+    private suspend fun postFormPairsQueryAuth(urlString: String, pairs: List<Pair<String, String>>): JSONObject {
+        val conn = open(urlString)
+        conn.requestMethod = "POST"
+        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+        conn.doOutput = true
+        val body = pairs.joinToString("&") { "${enc(it.first)}=${enc(it.second)}" }
+        return sendCancellable(conn) {
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            execute(conn)
+        }
     }
 
     /// Read the response, mapping status codes to [DebridException], then parse the body as JSON. The
@@ -555,6 +999,7 @@ class DebridResolver(private val keys: DebridKeys) {
     private companion object {
         const val TAG = "DebridResolver"
         const val TORBOX_BASE = "https://api.torbox.app/v1/api/torrents"
+        const val USENET_BASE = "https://api.torbox.app/v1/api/usenet"
         const val RD_BASE = "https://api.real-debrid.com/rest/1.0"
         const val AD_BASE = "https://api.alldebrid.com/v4"
         const val AD_AGENT = "vortx"
