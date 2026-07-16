@@ -156,14 +156,16 @@ final class CoreBridge: ObservableObject {
            let addons = profile["addons"] as? [[String: Any]] {
             for addon in addons { if let url = addon["transportUrl"] as? String { raw[url] = addon } }
         }
-        // Enforce durable removal tombstones at the publish point. Official/protected stubs are NEVER
-        // tombstoned (a logout resets the engine to exactly those), so this can only ever remove a
-        // user-installed add-on the user explicitly deleted.
+        // Enforce durable removal tombstones at the publish point. PROTECTED stubs (Cinemeta, Local Files)
+        // are NEVER tombstoned (a logout resets the engine to exactly those, and the UI has no Remove for
+        // them), so this can only ever remove an add-on the user explicitly deleted: a user-installed
+        // add-on OR a REMOVABLE official one (YouTube, WatchHub, Public Domain, OpenSubtitles are
+        // official=true, protected=false and the engine re-seeds them on every reset, #137).
         let removed = AddonTombstones.all()
         if !removed.isEmpty {
             func isTombstoned(_ descriptor: CoreDescriptor) -> Bool {
                 removed.contains(AddonTombstones.normalize(descriptor.transportUrl))
-                    && !descriptor.isOfficial && !descriptor.isProtected
+                    && !descriptor.isProtected
             }
             let toUninstall = typed.filter(isTombstoned).compactMap { raw[$0.transportUrl] }
             let survivingTyped = typed.filter { !isTombstoned($0) }
@@ -210,17 +212,21 @@ final class CoreBridge: ObservableObject {
     /// `tombstone` (default true) records a DURABLE cross-device removal in `AddonTombstones` so the
     /// removal SYNCS: `vortxSummary` pushes the set into `doc.vortx.deletedAddons` and subtracts it from
     /// the `doc.vortx.addons` UNION, and `syncDown` re-applies it on peers (mirrors `deletedProfiles`).
-    /// Official/protected stubs are NEVER tombstoned (a logout resets the engine to exactly those, so a
-    /// tombstone there would wrongly suppress a default forever). The Change-URL replace path passes
+    /// PROTECTED stubs (Cinemeta, Local Files) are NEVER tombstoned (a logout resets the engine to exactly
+    /// those, so a tombstone there would wrongly suppress an essential default forever; the UI also offers
+    /// no Remove for them). A REMOVABLE official add-on (YouTube, WatchHub, Public Domain, OpenSubtitles:
+    /// official=true, protected=false) IS tombstoned, because the engine re-seeds OFFICIAL_ADDONS on every
+    /// reset and would otherwise resurrect a user's deletion on the next launch (#137); a genuine re-add
+    /// through the store clears it via `AddonTombstones.forget`. The Change-URL replace path passes
     /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
-    /// URL must stay re-addable on every device. The genuine in-app Remove button keeps the default.
+    /// URL must stay re-addable on every device.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
         // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
         // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
         // `guard let raw ... else { return }` made Remove a SILENT NO-OP in that case, which is exactly the
         // owner-reported "pressing delete doesn't delete." Tombstoning + refreshAddons still suppresses it.
-        if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
+        if tombstone, !descriptor.isProtected {
             AddonTombstones.tombstone(descriptor.transportUrl)
             // Propagate the removal to your other devices PROMPTLY. The tombstone write arms the
             // UserDefaults-didChange auto-sync, but that push is DEBOUNCED and reschedules on every write,
@@ -915,14 +921,16 @@ final class CoreBridge: ObservableObject {
 
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
     /// descriptor's transportUrl) is in the durable removal tombstone set. Mirrors the refreshAddons
-    /// enforcement (CoreBridge.refreshAddons): official/protected add-ons are never subtracted, so a
-    /// malformed web-authored removal of a default can hide nothing, exactly like the list surface.
+    /// enforcement (CoreBridge.refreshAddons): PROTECTED add-ons (Cinemeta, Local Files) are never
+    /// subtracted, so a malformed web-authored removal of an essential default can hide nothing. A
+    /// removable official add-on (YouTube, WatchHub, …) the user deleted IS subtracted, matching the list
+    /// and board surfaces (#137).
     @MainActor
     private func isTombstonedAddonBase(_ base: String, removed: Set<String>) -> Bool {
         let key = AddonTombstones.normalize(base)
         guard removed.contains(key) else { return false }
         if let descriptor = addons.first(where: { AddonTombstones.normalize($0.transportUrl) == key }),
-           descriptor.isOfficial || descriptor.isProtected {
+           descriptor.isProtected {
             return false
         }
         return true
@@ -2018,12 +2026,13 @@ final class CoreBridge: ObservableObject {
     /// list, so every other ctx-derived read surface (the Home board rows, the catalog manager list)
     /// must subtract this set too, or a removed add-on's catalogs ghost forever (#121). Read-side only:
     /// stored hide/order prefs for a ghost key stay intact, so a genuine reinstall gets the user's old
-    /// catalog prefs back. Official/protected stubs are never suppressed, mirroring `refreshAddons`.
+    /// catalog prefs back. PROTECTED stubs (Cinemeta, Local Files) are never suppressed; a removable
+    /// official add-on the user deleted IS, mirroring `refreshAddons` (#137).
     private static func tombstonedBases(in addons: [CoreDescriptor]) -> Set<String> {
         let removed = AddonTombstones.all()
         guard !removed.isEmpty else { return [] }
         var out = Set<String>()
-        for addon in addons where !addon.isOfficial && !addon.isProtected {
+        for addon in addons where !addon.isProtected {
             let key = AddonTombstones.normalize(addon.transportUrl)
             if removed.contains(key) { out.insert(key) }
         }

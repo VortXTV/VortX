@@ -180,6 +180,86 @@ final class DownloadStore: ObservableObject {
     func formattedTotalSize() -> String {
         ByteCountFormatter.string(fromByteCount: totalBytesOnDisk(), countStyle: .file)
     }
+
+    /// Recorded byte total for a subset of records (the larger of done/total per record). Reads the INDEX,
+    /// not the filesystem, so it is cheap enough to call while rendering a grouped list (a per-group total in
+    /// a focus-driven view must not stat the disk on every re-render). Completed items dominate; an in-flight
+    /// item contributes its known-so-far bytes. Feeds the per-show folder header size.
+    func recordedSize(of records: [DownloadRecord]) -> String {
+        let bytes = records.reduce(Int64(0)) { $0 + max($1.bytesDone, $1.bytesTotal) }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    // MARK: Grouping (per-show download folders)
+
+    /// The device's downloads as per-show FOLDERS (one group per series) plus standalone movies, derived on
+    /// demand from the flat `records` index. This is a pure DERIVATION: it adds no persisted state and does
+    /// NOT change the on-disk layout (files stay flat under the Downloads dir / their system-managed
+    /// `.movpkg`), so the relocated-container path rebuild + the off-main destination resolver keep working
+    /// unchanged, and nothing here touches a `libraryItem` document.
+    ///
+    /// GROUP ORDER is newest-activity-first, matching the flat list (`records` is already `addedAt`-desc, so
+    /// the first record of each key marks the group's newest activity). WITHIN a show folder the episodes are
+    /// sorted by SEASON then EPISODE ascending, regardless of the order they were downloaded in, with any
+    /// episode missing a season/episode number sinking to the end (tie-broken oldest-first) so the folder
+    /// always reads S1E1, S1E2, S2E1 ... A movie (or a series record carrying no season/episode) forms its own
+    /// single-item group and renders as a plain row. Exposed on the store so BOTH the Apple TV downloads
+    /// screen and the iOS downloads screen can render the same folders from one source of truth.
+    func groupedDownloads() -> [DownloadGroup] {
+        var order: [String] = []                       // group keys in newest-first encounter order
+        var byKey: [String: [DownloadRecord]] = [:]
+        for record in records {
+            let key = Self.groupKey(for: record)
+            if byKey[key] == nil { order.append(key) }
+            byKey[key, default: []].append(record)
+        }
+        return order.compactMap { key -> DownloadGroup? in
+            guard let items = byKey[key], let head = items.first else { return nil }
+            let sorted = head.type == "series" ? items.sorted(by: Self.episodeOrder) : items
+            return DownloadGroup(id: key, title: head.name, poster: head.poster,
+                                 type: head.type, records: sorted)
+        }
+    }
+
+    /// Grouping key: a series collects ALL its episodes under the series id (`contentId`), so every downloaded
+    /// episode of the same show lands in one folder; a movie stands alone under its own `videoId` (for a movie
+    /// `contentId == videoId`, so this is unique per movie). The `series:` / `movie:` prefixes keep the two
+    /// namespaces from ever colliding on an id that happens to match.
+    private static func groupKey(for record: DownloadRecord) -> String {
+        record.type == "series" ? "series:\(record.contentId)" : "movie:\(record.videoId)"
+    }
+
+    /// Season-then-episode ascending; an unknown season or episode sorts last (so a stray untagged episode
+    /// never jumps ahead of S1E1), tie-broken oldest-added-first for a stable order.
+    private static func episodeOrder(_ a: DownloadRecord, _ b: DownloadRecord) -> Bool {
+        let seasonA = a.season ?? Int.max, seasonB = b.season ?? Int.max
+        if seasonA != seasonB { return seasonA < seasonB }
+        let episodeA = a.episode ?? Int.max, episodeB = b.episode ?? Int.max
+        if episodeA != episodeB { return episodeA < episodeB }
+        return a.addedAt < b.addedAt
+    }
+}
+
+/// A virtual "folder" of downloads for one show (all episodes of a series) or a single movie, derived from
+/// the flat download index by `DownloadStore.groupedDownloads()`. Purely a view model: it holds no state of
+/// its own and drives a grouped SwiftUI list directly (Identifiable). See `groupedDownloads()` for the
+/// grouping + season/episode ordering rules.
+struct DownloadGroup: Identifiable {
+    /// `series:<seriesId>` for a show folder, or `movie:<videoId>` for a standalone movie.
+    let id: String
+    /// The show title (or movie title). For a series every episode carries the series name, so any record's
+    /// `name` is the show name.
+    let title: String
+    let poster: String?
+    /// "series" (a show folder) or "movie" (a standalone row).
+    let type: String
+    /// The group's downloads: for a series, episodes sorted season-then-episode; for a movie, the one record.
+    let records: [DownloadRecord]
+
+    /// True for a show folder (a series). A movie group renders as a plain row instead of a folder.
+    var isShow: Bool { type == "series" }
+    /// Number of downloads in the folder (episode count for a show).
+    var count: Int { records.count }
 }
 
 private extension JSONEncoder {

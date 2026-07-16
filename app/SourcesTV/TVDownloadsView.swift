@@ -27,9 +27,16 @@ struct TVDownloadsView: View {
                 .foregroundStyle(Theme.Palette.textTertiary)
                 .frame(maxWidth: 1100, alignment: .leading)
                 .padding(.horizontal, Theme.Space.screenEdge)
-            LazyVStack(spacing: Theme.Space.sm) {
-                ForEach(store.records) { record in
-                    row(record)
+            // Grouped: each series is ONE folder holding its episodes sorted by season then episode
+            // (regardless of download order); a movie renders as a standalone row. The grouping is derived
+            // from the shared store, so the iOS downloads screen renders the same folders from the same API.
+            LazyVStack(spacing: Theme.Space.md) {
+                ForEach(store.groupedDownloads()) { group in
+                    if group.isShow {
+                        showFolder(group)
+                    } else if let movie = group.records.first {
+                        row(movie)
+                    }
                 }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
@@ -48,15 +55,72 @@ struct TVDownloadsView: View {
         .padding(.horizontal, Theme.Space.screenEdge)
     }
 
+    // MARK: Show folder
+
+    /// One show's downloads as a folder: a folder header (title + episode count + size) with its episodes
+    /// listed underneath, already sorted by season then episode. Always expanded (no disclosure control) so
+    /// the TV focus engine can reach every episode's action chips directly, which a collapsed section would
+    /// hide. Each episode reuses the standard row but titled by its "S1E2" label (the folder header carries
+    /// the show name, so repeating it per episode would be noise).
+    @ViewBuilder private func showFolder(_ group: DownloadGroup) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            folderHeader(group)
+            VStack(spacing: Theme.Space.sm) {
+                ForEach(group.records) { record in
+                    row(record, title: episodeTitle(record))
+                }
+            }
+            .padding(.leading, Theme.Space.lg)   // indent the episodes under their folder
+        }
+    }
+
+    /// The folder's header: a folder glyph, the show title, and a "N episodes · size" caption. A static label
+    /// (not focusable): the focusable targets are the per-episode action chips below it.
+    private func folderHeader(_ group: DownloadGroup) -> some View {
+        HStack(alignment: .center, spacing: Theme.Space.md) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 30))
+                .foregroundStyle(Theme.Palette.accent)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(group.title)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                Text(folderCaption(group))
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            Spacer(minLength: Theme.Space.md)
+        }
+        .padding(.horizontal, Theme.Space.md)
+    }
+
+    private func folderCaption(_ group: DownloadGroup) -> String {
+        let episodes = group.count == 1
+            ? String(localized: "1 episode")
+            : String(localized: "\(group.count) episodes")
+        return "\(episodes)  ·  \(store.recordedSize(of: group.records))"
+    }
+
+    /// The per-episode title inside a folder: "S1E2" (or "E2" with no season), falling back to the full
+    /// display title for a record with no episode numbering.
+    private func episodeTitle(_ record: DownloadRecord) -> String {
+        if let s = record.season, let e = record.episode { return "S\(s)E\(e)" }
+        if let e = record.episode { return "E\(e)" }
+        return record.displayTitle
+    }
+
     // MARK: Row
 
     /// One download row: a state glyph, the title + subtitle (quality / progress / error) with a progress
     /// bar while active, then the per-state action bar. The actions are focusable chips (Play for a
     /// completed row, Pause / Resume for an in-flight or failed one) so the TV focus engine always has a
     /// clear target; Delete is always available. No tap-the-whole-row gesture, which is a touch idiom.
-    @ViewBuilder private func row(_ record: DownloadRecord) -> some View {
+    /// `title` overrides the row heading (used by a show folder to title each episode "S1E2" instead of
+    /// repeating the show name); nil uses the record's own display title (movies + standalone rows).
+    @ViewBuilder private func row(_ record: DownloadRecord, title: String? = nil) -> some View {
         HStack(alignment: .center, spacing: Theme.Space.lg) {
-            content(record)
+            content(record, title: title)
             Spacer(minLength: Theme.Space.md)
             controls(record)
         }
@@ -64,11 +128,11 @@ struct TVDownloadsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder private func content(_ record: DownloadRecord) -> some View {
+    @ViewBuilder private func content(_ record: DownloadRecord, title: String? = nil) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
             leadingGlyph(record)
             VStack(alignment: .leading, spacing: 8) {
-                Text(record.displayTitle)
+                Text(title ?? record.displayTitle)
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                     .lineLimit(2)

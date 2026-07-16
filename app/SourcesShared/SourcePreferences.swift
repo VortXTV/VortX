@@ -118,6 +118,13 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let preferKey             = "vortx.streaming.preferKeywords"
     static let avoidBehaviorKey      = "vortx.streaming.avoidBehavior"
     static let autoPickBestKey       = "vortx.streaming.autoPickBest"
+    // Spoiler-safe mode (detail-page DISPLAY preference, not a ranking/filter knob). When on, an UNWATCHED
+    // series episode shows its thumbnail blurred and its synopsis withheld behind a reveal affordance on the
+    // detail episode list, so upcoming-episode art and descriptions do not spoil the show; a per-episode tap
+    // (iOS/Mac) or focus (tvOS) reveals just that one episode. Global (NOT per-profile, like the existing
+    // thumbnail-blur setting) and READ-ONLY against the watch state, so it never touches ranking or watch
+    // writes and is deliberately absent from rankingSignature / the ranker Snapshot / reload().
+    static let spoilerSafeKey        = "vortx.detail.spoilerSafe"
 
     /// Documented per-profile stream-filter defaults, in ONE place. `init()` / `reload()` seed the
     /// string-valued props from these (an absent flat key already reads as the same intrinsic zero /
@@ -145,6 +152,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     static let defaultPreferKeywords        = ""
     static let defaultAvoidBehavior         = "hide"
     static let defaultAutoPickBest          = false
+    /// Spoiler-safe mode defaults ON, so a fresh install protects upcoming-episode art + synopses out of the
+    /// box. An absent flat key reads as this default (no migration needed).
+    static let defaultSpoilerSafe           = true
     /// A fresh install's source-type priority: the declared `SourceType` order (Debrid, Usenet,
     /// Torrent, Direct), which is exactly the order `readOrder()` fills in for any missing type.
     static let defaultTypeOrder: [SourceType] = SourceType.allCases
@@ -274,6 +284,15 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         didSet { UserDefaults.standard.set(defaultSourceSort, forKey: Self.defaultSortKey) }
     }
 
+    /// Spoiler-safe mode: see `spoilerSafeKey`. A pure DISPLAY preference the detail episode list reads; it is
+    /// NOT a ranking / filter input, so it is deliberately kept out of `rankingSignature`, `noFiltersActive`,
+    /// the ranker `Snapshot`, and the per-profile `reload()` (it is global, exactly like the thumbnail-blur
+    /// setting). The detail views observe the same flat key via `@AppStorage`, so a later Settings toggle bound
+    /// to this property and the views stay in sync through UserDefaults.
+    @Published var spoilerSafe: Bool {
+        didSet { UserDefaults.standard.set(spoilerSafe, forKey: Self.spoilerSafeKey) }
+    }
+
     /// True when none of the opt-in filters are engaged, so the ranking can take its no-op fast path.
     /// Prefer terms count as "active" too: even though they only BOOST (never filter), keeping the fast
     /// path off when any exist means the ranker always applies the prefer nudge (Lane A). Avoid terms in
@@ -371,6 +390,9 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
         preferKeywords = UserDefaults.standard.string(forKey: Self.preferKey) ?? Self.defaultPreferKeywords
         avoidBehavior  = UserDefaults.standard.string(forKey: Self.avoidBehaviorKey) ?? Self.defaultAvoidBehavior
         autoPickBest   = UserDefaults.standard.object(forKey: Self.autoPickBestKey) as? Bool ?? Self.defaultAutoPickBest
+        // Absent key reads as the ON default, so a fresh install is spoiler-safe without any migration. Global
+        // (not per-profile), so it is intentionally NOT re-synced in reload() on a profile switch.
+        spoilerSafe    = UserDefaults.standard.object(forKey: Self.spoilerSafeKey) as? Bool ?? Self.defaultSpoilerSafe
         rebuildKeywordRegexes()   // didSet does not fire for initial assignment, so seed the compiled forms
     }
 

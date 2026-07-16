@@ -26,6 +26,9 @@ struct iOSSettingsView: View {
     @ObservedObject private var pinStore = SourcePinStore.shared
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @State private var serverOnline: Bool?
+    /// Settings search query. Empty shows the full settings tree; a non-empty query filters the sections
+    /// below to those whose title or any of their row keywords contain it (case-insensitive substring).
+    @State private var settingsQuery = ""
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
     // Diagnostic-log export over the LAN: the sheet flag + the started (url, qr) payload. Identical to the
@@ -73,6 +76,10 @@ struct iOSSettingsView: View {
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
+    // Spoiler-safe mode (SourcePreferences.spoilerSafeKey) supersets the legacy thumbnail-only blur: the ONE
+    // visible toggle below drives both keys together so the detail views' `(spoilerSafe || spoilerBlur)` gate
+    // has a single source of truth (no leftover legacy default-on blur when the user turns spoiler-safe off).
+    @AppStorage(SourcePreferences.spoilerSafeKey) private var spoilerSafe = SourcePreferences.defaultSpoilerSafe
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
     // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as tvOS.
     @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
@@ -96,6 +103,9 @@ struct iOSSettingsView: View {
     /// Auto-add watched to Library (D8): when playback of a title crosses ~60s it is added to the Library.
     /// Default ON. Read at the 60s progress tick in PlayerScreen / TVPlayerView via LibraryAutoAdd.
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true
+    /// Auto-delete watched downloads: when ON, a completed download whose title crosses the watched
+    /// threshold is removed to reclaim space. Default OFF. Read by DownloadManager at its watched-state tick.
+    @AppStorage(DownloadManager.autoDeleteWatchedDefaultsKey) private var autoDeleteWatched = false
     /// Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
     /// writes this same key, so the last level persists; this picker sets it explicitly. Read by PlayerScreen.
     @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
@@ -129,28 +139,37 @@ struct iOSSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // Search field pinned at the top: typing filters the sections below (additive, the whole
+                // tree stays intact and returns the moment the field is cleared).
+                searchSection
+                // When a search matches nothing, say so instead of leaving a blank form.
+                if isSearching && !hasAnySettingsMatch {
+                    noSettingsMatchRow
+                }
                 // Each section's row cards use the brand surface, not the system grouped grey (#49
                 // follow-up): `.listRowBackground` on a Section repaints all its rows. Combined with
                 // `.scrollContentBackground(.hidden)` + the canvas background below, the cards now read
                 // as warm dark surfaces with canvas showing between them, matching the rest of the app
-                // (and identical on iPadOS, which shares this view).
-                profilesSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                languageSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                accountSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                stremioMirrorSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                playbackSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                notificationsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                streamsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                communitySection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                serverSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                tabBarSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                appearanceSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                audioSubtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                subtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                advancedSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                backupSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                aboutSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                engineSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+                // (and identical on iPadOS, which shares this view). Each section is gated by
+                // `sectionMatches`, so an empty query shows the whole tree and a query keeps only the hits.
+                if sectionMatches(.profiles) { profilesSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.language) { languageSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.account) { accountSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.stremioMirror) { stremioMirrorSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.playback) { playbackSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.downloads) { downloadsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.notifications) { notificationsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.streams) { streamsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.community) { communitySection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.server) { serverSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.tabBar) { tabBarSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.appearance) { appearanceSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.audioSubtitle) { audioSubtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.subtitle) { subtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.advanced) { advancedSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.backup) { backupSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.about) { aboutSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.engine) { engineSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
             }
             // Grouped form style renders proper inset section cards + headers and a centered column
             // on macOS (the default macOS form style is the ugly full-width label-left layout). On the
@@ -303,6 +322,69 @@ struct iOSSettingsView: View {
         }
     }
 
+    // MARK: Settings search
+
+    /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
+    private var trimmedSettingsQuery: String {
+        settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether the user is actively filtering. An empty (or whitespace-only) field is treated as no filter.
+    private var isSearching: Bool { !trimmedSettingsQuery.isEmpty }
+
+    /// A section shows when there is no query, or when the query is a case-insensitive substring of the
+    /// section's title or any of its row keywords.
+    private func sectionMatches(_ id: SettingsSearchSection) -> Bool {
+        let q = trimmedSettingsQuery
+        guard !q.isEmpty else { return true }
+        if id.title.lowercased().contains(q) { return true }
+        return id.keywords.contains { $0.contains(q) }
+    }
+
+    /// True when at least one section matches the current query (drives the empty-state row).
+    private var hasAnySettingsMatch: Bool {
+        SettingsSearchSection.allCases.contains { sectionMatches($0) }
+    }
+
+    /// The search field pinned at the top of Settings. Typing filters the sections below; the clear button
+    /// (and clearing the text) restores the full tree. Styled on the same glass list row as every section.
+    @ViewBuilder private var searchSection: some View {
+        Section {
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                TextField("Search settings", text: $settingsQuery)
+                    .textFieldStyle(.plain)
+                    .autocorrectionDisabled(true)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .submitLabel(.search)
+                if !settingsQuery.isEmpty {
+                    Button {
+                        settingsQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(Text("Clear search"))
+                }
+            }
+        }
+        .listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+    }
+
+    /// Shown in place of the settings tree when a query matches nothing, so the form is never blank.
+    @ViewBuilder private var noSettingsMatchRow: some View {
+        Section {
+            Text("No settings match \"\(settingsQuery)\".")
+                .font(.callout)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+        .listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+    }
+
     // MARK: Profiles
 
     @ViewBuilder private var profilesSection: some View {
@@ -409,6 +491,7 @@ struct iOSSettingsView: View {
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
+            NavigationLink("Your debrid cloud") { DebridLibraryView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
             NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
             NavigationLink("Media servers (Plex, Jellyfin, Emby)") { MediaServersSettingsView() }
@@ -716,6 +799,19 @@ struct iOSSettingsView: View {
             Text("Notifications")
         } footer: {
             Text("Get a notification when a new episode of a series you open is about to air. Scheduled on-device for upcoming episodes, so no background tracking is needed.")
+        }
+    }
+
+    // MARK: Downloads
+
+    @ViewBuilder private var downloadsSection: some View {
+        Section {
+            Toggle("Auto-delete watched downloads", isOn: $autoDeleteWatched)
+                .tint(Theme.Palette.accent)
+        } header: {
+            Text("Downloads")
+        } footer: {
+            Text("When on, a completed download is removed automatically once you finish watching it, to reclaim space. Off by default, so downloads stay until you delete them.")
         }
     }
 
@@ -1078,11 +1174,17 @@ struct iOSSettingsView: View {
             }
             NavigationLink("Streaming services") { iOSReorderServicesView() }
             NavigationLink("Discover & region") { iOSDiscoverSettingsView() }
+            // The full "Upcoming" calendar (next air / release dates of library + watchlisted titles).
+            NavigationLink("Upcoming") { iOSUpcomingScreen() }
             // Fold Search into Discover (one combined surface with a search field above the browse) so the
             // tab bar is less cluttered on mobile. Default OFF, fully reversible — Search returns as its own tab.
             Toggle("Combine Discover & Search", isOn: $mergeDiscoverSearch)
             Toggle("Budget & box office", isOn: $showFinancials)
-            Toggle("Blur unwatched episode thumbnails", isOn: $spoilerBlur)
+            // Spoiler-safe mode: veils an unwatched episode's art AND synopsis (supersets the old thumbnail-only
+            // blur). One toggle drives both the new key and the legacy `vortx.spoilerBlur` so turning it off
+            // fully clears the veil (no leftover legacy default-on blur). Retires the separate blur row.
+            Toggle("Spoiler-safe mode", isOn: Binding(get: { spoilerSafe },
+                                                      set: { spoilerSafe = $0; spoilerBlur = $0 }))
             // Poster appearance (width / corner radius / landscape art / labels) lives on its own screen
             // with a live preview. The old inline "Cinematic landscape cards" toggle moved there.
             NavigationLink("Poster style") { iOSPosterStyleView() }
@@ -1368,6 +1470,11 @@ struct iOSSettingsView: View {
             } label: {
                 Label("What's New", systemImage: "sparkles")
             }
+            NavigationLink {
+                WatchStatsView()
+            } label: {
+                Label("Watch Stats", systemImage: "chart.bar.xaxis")
+            }
         }
     }
 
@@ -1383,6 +1490,77 @@ struct iOSSettingsView: View {
         Section("Engine") {
             LabeledContent("stremio-core schema", value: "\(core.schemaVersion)")
             LabeledContent("Home rows", value: "\(core.boardRows.count)")
+        }
+    }
+}
+
+/// The searchable Settings sections on iPhone / iPad / Mac. Each case carries the section's on-screen
+/// title plus the row keywords it should match, so the search field can filter the tree by a
+/// case-insensitive substring of any title or row label. Keywords are stored lowercased so matching
+/// is a plain `contains` with no per-keystroke re-casing. Kept in sync with the sections `iOSSettingsView`
+/// actually renders (the tvOS `SettingsView` keeps its own equivalent list).
+private enum SettingsSearchSection: CaseIterable {
+    case profiles, language, account, stremioMirror, playback, downloads, notifications, streams,
+         community, server, tabBar, appearance, audioSubtitle, subtitle, advanced, backup, about, engine
+
+    var title: String {
+        switch self {
+        case .profiles: return "Profiles"
+        case .language: return "Language"
+        case .account: return "Account"
+        case .stremioMirror: return "Stremio mirror"
+        case .playback: return "Playback"
+        case .downloads: return "Downloads"
+        case .notifications: return "Notifications"
+        case .streams: return "Streams"
+        case .community: return "Community"
+        case .server: return "Streaming Server"
+        case .tabBar: return "Tab bar"
+        case .appearance: return "Appearance"
+        case .audioSubtitle: return "Audio & Subtitles"
+        case .subtitle: return "Subtitle Style"
+        case .advanced: return "Advanced (mpv options)"
+        case .backup: return "Backup & Restore"
+        case .about: return "About"
+        case .engine: return "Engine"
+        }
+    }
+
+    var keywords: [String] {
+        switch self {
+        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
+        case .language: return ["app language", "system default", "localization", "translation"]
+        case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
+                               "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
+                               "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
+                               "media server", "plex", "jellyfin", "emby", "api key"]
+        case .stremioMirror: return ["mirror", "two-way sync", "add-ons", "library", "continue watching"]
+        case .playback: return ["direct links only", "audio output", "video upscaling", "streaming cache",
+                                "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
+                                "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
+                                "trickplay", "autoplay trailers", "trailer language", "default volume",
+                                "auto-add watched", "landscape", "background playback", "keep playing", "play in",
+                                "external player"]
+        case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
+        case .notifications: return ["new episode alerts", "episode", "notification"]
+        case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
+                               "safety filter", "regex", "max quality", "minimum quality", "max file size",
+                               "compact source rows", "pinned sources", "resolution"]
+        case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
+        case .server: return ["server", "configure server", "server log", "restart", "embedded", "node", "lan", "share"]
+        case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
+        case .appearance: return ["editorial home rows", "collections on home", "collections on discover",
+                                  "refresh collections", "streaming services", "discover & region",
+                                  "combine discover", "budget & box office", "spoiler", "blur", "poster style",
+                                  "hide poster labels", "accent", "background", "oled", "dolby vision", "hdr",
+                                  "text size", "performance"]
+        case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
+                                     "subtitles", "forced", "match audio to subtitle"]
+        case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
+        case .advanced: return ["mpv", "custom options", "diagnostic logging", "diagnostic log", "export log"]
+        case .backup: return ["backup", "restore", "export library", "import library"]
+        case .about: return ["version", "player", "what's new", "update", "libmpv", "mpvkit"]
+        case .engine: return ["stremio-core", "schema", "home rows", "diagnostics", "ffi"]
         }
     }
 }
@@ -1561,5 +1739,54 @@ enum NewEpisodeNotifications {
     /// SourcesiOS file — can reach it. This thin shim keeps the existing callers unchanged; behavior is identical.
     static func fetchSeriesMeta(id: String, bases: [String]) async -> CoreMetaItem? {
         await SeriesMetaFetcher.fetch(id: id, bases: bases)
+    }
+}
+
+/// One tapped Upcoming row, routed to its detail page. `id` is the meta (series / movie) catalog id.
+private struct iOSUpcomingSelection: Identifiable {
+    let metaId: String
+    let type: String
+    var id: String { metaId + "|" + type }
+}
+
+/// The Settings "Upcoming" entry: a self-contained calendar of the next air / release dates of the user's
+/// library AND watchlisted titles. Owns its own `ReleaseCalendarModel` (so it is reachable without visiting
+/// Home) and refreshes it via `refreshUpcoming`, which folds the local watchlist (`LibraryAutoAdd`) in beside
+/// the library. A tapped row opens that title's `iOSDetailView` as a sheet (the pushed calendar keeps its own
+/// context, so no dependency on the Settings navigation stack's path).
+private struct iOSUpcomingScreen: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()
+    @State private var selected: iOSUpcomingSelection?
+
+    var body: some View {
+        UpcomingView(model: releaseCalendar) { id, type in
+            selected = iOSUpcomingSelection(metaId: id, type: type)
+        }
+        .navigationTitle("Upcoming")
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refresh() }
+        .onChange(of: core.library?.catalog.count ?? 0) { _ in refresh() }
+        .onChange(of: account.addons.count) { _ in refresh() }
+        .sheet(item: $selected) { sel in
+            NavigationStack { iOSDetailView(id: sel.metaId, type: sel.type, title: "") }
+        }
+    }
+
+    /// Derived exactly like the Home `refreshReleaseCalendar`: series / movie library ids + names / posters and
+    /// the `providesMeta` add-on bases, handed to `refreshUpcoming` (which adds the watchlisted-not-in-library titles).
+    private func refresh() {
+        let catalog = core.library?.catalog ?? []
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let seriesNames = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshUpcoming(librarySeriesIDs: series.map(\.id), librarySeriesNames: seriesNames,
+                                        libraryMovieIDs: movies.map(\.id), libraryMovieNames: movieNames,
+                                        libraryMoviePosters: moviePosters, metaBases: bases)
     }
 }

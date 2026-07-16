@@ -18,6 +18,11 @@ struct DetailView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var similarItems: [MetaPreview] = []
+    /// Franchise/collection this movie belongs to (TMDB belongs_to_collection -> parts, in release order),
+    /// rendered as the "Part of the … Collection" rail JUST ABOVE More Like This. Nil for a standalone film /
+    /// series / any miss, which hides the row. `collectionKey` de-dupes the fetch per imdb id.
+    @State private var collection: TMDBClient.CollectionResult?
+    @State private var collectionKey: String?
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
     @State private var financials: TMDBClient.Financials?
@@ -101,6 +106,7 @@ struct DetailView: View {
             }
             captureHero()
             loadCredits()
+            loadCollection()
             if let m = core.metaDetails?.meta, m.id == id {
                 loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates()
             } else {
@@ -125,8 +131,10 @@ struct DetailView: View {
             captureHero()
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
             castMembers = []; creditsKey = nil  // new title: reset the cast rail before refetching (H16)
+            collection = nil; collectionKey = nil   // new title: drop the old franchise rail before refetching
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             loadCredits()
+            loadCollection()
             if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
             refreshLanguageChips()
         }
@@ -253,6 +261,21 @@ struct DetailView: View {
         }
     }
 
+    /// Fetch this movie's franchise/collection (TMDB belongs_to_collection -> parts, release order) from the
+    /// keyless edge, keyed per imdb id so meta arriving after the tt-only first load doesn't refetch (works
+    /// with meta=nil for a hub-seeded tt). Movies only. Fail-soft: a standalone film / miss leaves the row hidden.
+    private func loadCollection() {
+        guard effectiveType != "series", let imdb = ratingsImdbID, collectionKey != imdb else { return }
+        collectionKey = imdb
+        Task {
+            let result = await TMDBClient.movieCollection(imdbID: imdb, type: effectiveType)
+            await MainActor.run {
+                guard collectionKey == imdb else { return }   // title switched mid-fetch
+                collection = result
+            }
+        }
+    }
+
     /// Fetch MDBList ratings for this title (no-op without a key / imdb id). Fail-soft: leaves the row
     /// hidden on any miss. Skipped for live channels, which carry no ratings.
     private func loadRatings() {
@@ -355,6 +378,27 @@ struct DetailView: View {
                     LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                         ForEach(railCastMembers.prefix(30)) { member in
                             CastMemberCard(member: member)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.lg)
+                }
+            }
+        }
+    }
+
+    /// The "Part of the … Collection" rail: every entry in this movie's TMDB collection in release order,
+    /// each a PosterCard that opens its detail, mirroring the More-Like-This rail exactly. Shown only when
+    /// the collection has more than one entry (a one-item "collection" is not a franchise).
+    @ViewBuilder private var collectionSection: some View {
+        if let collection, collection.parts.count > 1 {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                RailHeader(eyebrow: "Collection", title: TMDBClient.collectionRowTitle(collection.name))
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                        ForEach(collection.parts) { item in
+                            PosterCard(title: item.name, poster: item.poster,
+                                       type: item.type, id: item.id)
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -502,11 +546,29 @@ struct DetailView: View {
                             .id("detailContent")
                         castSection
                         whereToWatchSection
+                        collectionSection
                         moreLikeThisSection
                     }
                     .padding(.bottom, Theme.Space.xl)
                 }
             }
+        }
+        // Show-level watched rollup (issue #143): a series reads as watched once every AIRED, regular-season
+        // episode is watched, so unaired episodes and Season 0 specials never hold a finished show back, and a
+        // series whose episodes were MARKED (not played) still flips the poster badge even though the engine's
+        // library `times_watched` stays 0. Read-only: fed into WatchedIndex, never a write. Recomputed when the
+        // watched set changes (a mark) or the episode list streams in.
+        .onAppear {
+            WatchedIndex.shared.noteSeriesWatched(meta.id,
+                isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watched))
+        }
+        .onChange(of: watched) {
+            WatchedIndex.shared.noteSeriesWatched(meta.id,
+                isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watched))
+        }
+        .onChange(of: videos.count) {
+            WatchedIndex.shared.noteSeriesWatched(meta.id,
+                isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watched))
         }
     }
 
@@ -578,6 +640,7 @@ struct DetailView: View {
                     // SECOND SECTION (below the fold): scrolls in only on deliberate down-nav.
                     castSection
                     whereToWatchSection
+                    collectionSection
                     moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)
@@ -782,6 +845,7 @@ struct DetailView: View {
                             .buttonStyle(ChipButtonStyle())
                         }
                         LibraryChip()
+                        WatchlistChip()
                         trailerChip(m)
                         Spacer(minLength: 0)
                     }
@@ -1157,6 +1221,11 @@ struct CoreSeasonedEpisodes: View {
     var watched: Set<String> = []
     var initialSeason: Int?
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // observed so a Settings toggle redraws; effective value via SpoilerBlurSetting (user wins over the RemoteConfig fleet default)
+    // Spoiler-safe mode (SourcePreferences.spoilerSafeKey): veil an UNWATCHED episode's art + synopsis until it
+    // is revealed. On tvOS the reveal is FOCUS: the focused row (focusedEpisode == v.id) un-blurs + shows its
+    // synopsis, peripheral unwatched rows stay veiled. Observed via @AppStorage on the same flat key so a later
+    // Settings toggle redraws. Read-only against `watched` (never a watch write).
+    @AppStorage("vortx.detail.spoilerSafe") private var spoilerSafe = true
     @State private var showBulkMenu = false
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe so accent ticks recolor on theme change
@@ -1297,6 +1366,13 @@ struct CoreSeasonedEpisodes: View {
             .season
     }
 
+    /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it is
+    /// NOT the currently focused row. Read-only against `watched` (never a write), so it honours the
+    /// per-profile watch invariant. tvOS reveals by FOCUS, so the focused row is always un-veiled.
+    private func spoilerVeiled(_ v: CoreVideo, isWatched: Bool) -> Bool {
+        spoilerSafe && !isWatched && focusedEpisode != v.id
+    }
+
     private func episodeRow(_ v: CoreVideo) -> some View {
         let isWatched = watched.contains(v.id)
         let progress = episodeProgress(v)
@@ -1318,7 +1394,13 @@ struct CoreSeasonedEpisodes: View {
                     if let released = v.released, released.count >= 10 {
                         Text(String(released.prefix(10))).font(.system(size: 16)).foregroundStyle(Theme.Palette.textTertiary)
                     }
-                    if let overview = v.overview, !overview.isEmpty {
+                    if spoilerVeiled(v, isWatched: isWatched) {
+                        // Synopsis withheld until this row is focused (spoiler-safe mode). Focusing the row
+                        // reveals it (below); peripheral rows read as hidden.
+                        Label("Focus to reveal", systemImage: "eye.slash")
+                            .font(.system(size: 18)).foregroundStyle(Theme.Palette.textTertiary)
+                            .accessibilityLabel("Description hidden")
+                    } else if let overview = v.overview, !overview.isEmpty {
                         Text(overview).font(.system(size: 18)).foregroundStyle(Theme.Palette.textSecondary)
                             .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     }
@@ -1340,7 +1422,11 @@ struct CoreSeasonedEpisodes: View {
         // (`features.spoilerBlur`); else baked true, identical to shipping when no remote config is present.
         // `_ = spoilerBlur` keeps the view observing the @AppStorage so a Settings toggle triggers a redraw.
         _ = spoilerBlur
-        let blurArt = SpoilerBlurSetting.isEnabled && !isWatched   // hide future-episode imagery until you have watched it
+        // Hide future-episode imagery until watched OR revealed. On tvOS the reveal is FOCUS, and only in the
+        // new spoiler-safe mode: gating focus-reveal on `spoilerSafe` keeps the legacy thumbnail-blur setting
+        // behaving exactly as shipped (blurred regardless of focus) when the new mode is off.
+        let revealed = isWatched || (spoilerSafe && focusedEpisode == v.id)
+        let blurArt = !revealed && (spoilerSafe || SpoilerBlurSetting.isEnabled)
         return AsyncImage(url: URL(string: v.thumbnail ?? "")) { phase in
             switch phase {
             case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
@@ -1802,6 +1888,7 @@ struct CoreStreamList: View {
                     }
 
                     LibraryChip()
+                    WatchlistChip()
                 }
                 // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
                 if let reason = StreamRanking.pickReason(best) {
@@ -2405,6 +2492,33 @@ struct LibraryChip: View {
                   systemImage: saved ? "bookmark.fill" : "bookmark")
         }
         .buttonStyle(ChipButtonStyle(selected: saved))
+    }
+}
+
+/// Add / remove the open title from the local "want to watch" watchlist (`LibraryAutoAdd`) — a pure app-side
+/// bookmark separate from the engine Library, engine-safe ids only (tt / tmdb). Reads the open title from the
+/// engine detail meta exactly like `LibraryChip` reads `core.detailInLibrary`, so it needs no call-site
+/// plumbing; a synthetic magnet / paste-a-link title (no tt / tmdb id) hides the chip since it can't be
+/// watchlisted. The tvOS twin of the touch `iOSWatchlistChip`.
+struct WatchlistChip: View {
+    @EnvironmentObject private var core: CoreBridge
+    @State private var isWatchlisted = false
+
+    var body: some View {
+        if let meta = core.metaDetails?.meta, meta.id.hasPrefix("tt") || meta.id.hasPrefix("tmdb") {
+            Button {
+                isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: meta.id, type: meta.type,
+                                                               name: meta.name, poster: meta.poster)
+            } label: {
+                Label(isWatchlisted ? "In Watchlist" : "Watchlist",
+                      systemImage: isWatchlisted ? "star.fill" : "star")
+            }
+            .buttonStyle(ChipButtonStyle(selected: isWatchlisted))
+            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id) }
+            .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id)
+            }
+        }
     }
 }
 

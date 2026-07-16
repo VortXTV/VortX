@@ -461,6 +461,16 @@ enum StreamRanking {
         if preferred.contains(where: { claimsLanguage(text, $0) }) { return 0 }
         // Multi-language release: never demote (it likely carries or can select the viewer's track).
         if isMultiLanguage(text) { return 0 }
+        // We can only judge a release "clearly foreign" against a viewer language we can actually detect.
+        // `langTokens` covers 12 languages, but the audio picker (and device locales) allow codes it has no
+        // tokens for (Turkish, Dutch, Polish, Swedish, ...). For such a viewer the allowed-language check
+        // above can NEVER match, so a release that DOES carry their language (e.g. a Turkish+English dual for
+        // a Turkish viewer, which isMultiLanguage misses when only the English token is detectable) would
+        // fall through and be demoted purely on its English tag - hiding a source that advertises the allowed
+        // language (#136). If NONE of the preferred codes are detectable, we cannot tell whether the release
+        // carries the viewer's audio, so KEEP it (score 0) rather than over-hide. Viewers on a covered
+        // language (the default English included) are unaffected: their guard passes and demotion is unchanged.
+        guard preferred.contains(where: { langTokens[$0] != nil }) else { return 0 }
         // Single, clearly-foreign release: demote so the viewer's language wins over resolution.
         // Only match the foreign token in the TECHNICAL-TAGS portion (after the year/resolution), not
         // the title, so a foreign word in an English title is not mistaken for foreign audio

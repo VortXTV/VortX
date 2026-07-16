@@ -135,6 +135,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// serve queue). The head-scan / cut state further down is remux-thread-only and needs no lock.
     private let hlsLock = NSLock()
     private var _hlsInitData: Data?
+    /// The lifeboat variant's init segment (#143): the same ftyp+moov with the dvcC/dvvC box surgically
+    /// removed, so the variant that deliberately declares NO Dolby Vision (no SUPPLEMENTAL-CODECS, no
+    /// VIDEO-RANGE - the b170 filter-survivor) never serves content that DECLARES Dolby Vision. Falls back
+    /// to the exact `_hlsInitData` bytes when the strip is not applicable (P5) or the moov shape is
+    /// unexpected. Published atomically with `_hlsInitData`.
+    private var _hlsInitDataHDR: Data?
     private var _hlsSegments: [HLSSegment] = []
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
@@ -157,10 +163,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
     var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
 
-    /// Consistent snapshot of the published HLS index for the local server.
-    func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
+    /// Consistent snapshot of the published HLS index for the local server. `initDataHDR` is the lifeboat
+    /// variant's DV-stripped init (#143); non-nil exactly when `initData` is.
+    func hlsSnapshot() -> (initData: Data?, initDataHDR: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
         hlsLock.lock(); defer { hlsLock.unlock() }
-        return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
+        return (_hlsInitData, _hlsInitDataHDR, _hlsSegments, _hlsEnded, _hlsSignaling)
     }
 
     /// Monotonic mount-progress counters for the chrome's PROGRESS-AWARE start watchdog. Every field only
@@ -1236,6 +1243,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Publish the init segment (ftyp .. end-of-moov) read back from the produced buffer. One-shot. Nothing is
     /// served until this sets `_hlsInitData`, so the whole init is still resident from offset 0 (no eviction
     /// yet) and `snapshotPrefix` returns it regardless of moov size.
+    ///
+    /// #143 (-12927 device rejections): the SERVED inits are rewritten copies so each master variant's init
+    /// agrees with that variant's declarations - CoreMedia rejected every DV mount right after fetching
+    /// /init.mp4 (master + media + init all served, seg0 never requested), the signature of a declaration /
+    /// content cross-check failure, and both b182/b181 logs show it deterministically on healthy mounts:
+    ///  - DV variant (/init.mp4): the master declares SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p" but FFmpeg's
+    ///    movenc has no way to write the Dolby Vision CMAF media-profile brand into ftyp (it writes only the
+    ///    generic 'dby1'; ftyp here is exactly [iso5, iso5, iso6, dby1, mp41], 32B). Apple's authoring spec:
+    ///    the SUPPLEMENTAL-CODECS fields "must be compatibility brands that pertain to that codec's
+    ///    bitstream" and for DV "the compatibility brand and the VIDEO-RANGE attribute act as cross-checks.
+    ///    Leaving out either one is incorrect." Reference packagers (shaka) write db1p/db4h into the init
+    ///    ftyp from the DOVI record for exactly this reason. So the DECLARED brand is appended to the served
+    ///    copy's ftyp. Byte surgery on the retained Data only: buffer offsets, segment byte ranges, and the
+    ///    legacy loader delivery are untouched.
+    ///  - Lifeboat variant (/init-hdr.mp4): the b170 filter-survivor declares plain HEVC (no
+    ///    SUPPLEMENTAL-CODECS, no VIDEO-RANGE) but used to serve the SAME init whose dvvC box DECLARES
+    ///    Dolby Vision - the exact "leaving out either one" mismatch, on whichever variant the selector
+    ///    lands when the pipeline is not provably HDR at master-parse. Its served copy has the dvcC/dvvC
+    ///    box stripped (ancestor box sizes fixed), making it honestly the HDR10 base layer; the in-band
+    ///    RPU NALs remaining in the shared segments are ignorable ES metadata for a non-DV decode. P5 is
+    ///    exempt (its CODECS is dvh1.05.LL: DV IS declared, and a dvh1 sample entry requires its dvcC).
     private func hlsFinalizeInit(moovStart: Int, moovSize: Int) {
         guard !hlsHeadDone else { return }
         let initLen = moovStart + moovSize
@@ -1243,10 +1271,131 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsAbortInitScan("init \(initLen)B (moov \(moovSize)B @\(moovStart)) not fully resident")
             return
         }
-        hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
-        hlsSegmentStartByte = initLen   // segment 0 starts right after the init
+        hlsLock.lock(); let sig = _hlsSignaling; hlsLock.unlock()
+        // "dvh1.08.06/db1p" -> "db1p" (nil for P5 / plain-HEVC signaling: nothing declared, nothing to add).
+        let declaredBrand: String? = sig?.supplementalCodec.flatMap { s in
+            let fields = s.split(separator: "/")
+            return fields.count >= 2 ? String(fields[1]) : nil
+        }
+        var servedDV = initData
+        var dvNote = "brand n/a"
+        var servedHDR = initData   // fallback: byte-identical to the source init (pre-#143 behavior)
+        var hdrNote = "same as dv"
+        if let brand = declaredBrand {
+            // DV-declared lane (P8.1/8.4, incl. converted P7): brand the DV init, strip the lifeboat's.
+            if let branded = Self.appendFtypCompatibleBrand(initData, brand: brand) {
+                servedDV = branded
+                dvNote = "+\(brand)"
+            } else {
+                dvNote = "\(brand) NOT appended (unexpected ftyp shape)"
+            }
+            if let stripped = Self.stripDoViConfigBox(initData) {   // from the ORIGINAL bytes: no db1p here
+                servedHDR = stripped
+                hdrNote = "dovi stripped"
+            } else {
+                hdrNote = "strip failed, original bytes"
+            }
+        } else if sig?.videoCodec.hasPrefix("hvc1") == true, let stripped = Self.stripDoViConfigBox(initData) {
+            // P8 with an unknown compat id: the master deliberately declares plain HEVC HDR on BOTH variants,
+            // so neither may serve a dvvC-bearing init (same undeclared-DV mismatch, same -12927 exposure).
+            servedDV = stripped
+            servedHDR = stripped
+            dvNote = "dovi stripped (undeclared P8)"
+            hdrNote = "same as dv"
+        }
+        hlsLock.lock(); _hlsInitData = servedDV; _hlsInitDataHDR = servedHDR; hlsLock.unlock()
+        hlsSegmentStartByte = initLen   // segment 0 starts right after the init (BUFFER offsets: original length)
         hlsHeadDone = true; hlsHeadBuf = []
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData))) served dv=\(servedDV.count)B [\(dvNote)] hdr=\(servedHDR.count)B [\(hdrNote)]" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
+    }
+
+    // MARK: - #143 served-init byte surgery (pure, fail-soft: nil keeps the original bytes)
+
+    /// Big-endian 32-bit read/write on a byte array (bounds are the caller's responsibility; every caller
+    /// below validates `i + 4 <= count` via its box-size checks first).
+    private static func be32(_ b: [UInt8], _ i: Int) -> Int {
+        (Int(b[i]) << 24) | (Int(b[i + 1]) << 16) | (Int(b[i + 2]) << 8) | Int(b[i + 3])
+    }
+    private static func putBE32(_ b: inout [UInt8], _ i: Int, _ v: Int) {
+        b[i] = UInt8((v >> 24) & 0xFF); b[i + 1] = UInt8((v >> 16) & 0xFF)
+        b[i + 2] = UInt8((v >> 8) & 0xFF); b[i + 3] = UInt8(v & 0xFF)
+    }
+    private static func fourccAt(_ b: [UInt8], _ i: Int) -> String {
+        guard i + 4 <= b.count else { return "" }
+        return String(bytes: b[i ..< i + 4], encoding: .ascii) ?? ""
+    }
+
+    /// Append one compatibility brand (e.g. "db1p") to the ftyp of a captured ftyp+moov init segment.
+    /// Returns nil when the data does not open with a sane ftyp immediately followed by moov, or when the
+    /// brand is already present (movenc never writes it today, but stay idempotent).
+    static func appendFtypCompatibleBrand(_ data: Data, brand: String) -> Data? {
+        let brandBytes = Array(brand.utf8)
+        guard brandBytes.count == 4 else { return nil }
+        var b = [UInt8](data)
+        let n = b.count
+        guard n >= 24 else { return nil }
+        let ftypSize = be32(b, 0)
+        // ftyp: size + 'ftyp' + major + minor (16B) then 4-byte brands; moov must follow immediately.
+        guard ftypSize >= 16, ftypSize % 4 == 0, ftypSize + 8 <= n,
+              fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
+        var off = 8   // scan major + compatible brands for an existing copy
+        while off + 4 <= ftypSize {
+            if b[off] == brandBytes[0], b[off + 1] == brandBytes[1],
+               b[off + 2] == brandBytes[2], b[off + 3] == brandBytes[3] { return nil }
+            off += 4
+        }
+        b.insert(contentsOf: brandBytes, at: ftypSize)
+        putBE32(&b, 0, ftypSize + 4)
+        return Data(b)
+    }
+
+    /// Remove the dvcC/dvvC box from a captured ftyp+moov init segment, fixing the size of every enclosing
+    /// box (moov/trak/mdia/minf/stbl/stsd/<visual sample entry>). Returns nil when the layout is not the
+    /// movenc shape this remux produces (the caller then serves the unmodified bytes).
+    static func stripDoViConfigBox(_ data: Data) -> Data? {
+        var b = [UInt8](data)
+        let n = b.count
+        guard n >= 24 else { return nil }
+        let ftypSize = be32(b, 0)
+        guard ftypSize >= 8, ftypSize + 8 <= n, fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
+        let moovSize = be32(b, ftypSize)
+        guard moovSize >= 8, ftypSize + moovSize <= n else { return nil }
+        var ancestors: [Int] = []          // box-start offsets whose 32-bit sizes must shrink
+        var target: (start: Int, size: Int)?
+        // Descend ONLY the fixed container path movenc writes; every other child is skipped opaquely.
+        // Payload offsets: plain containers 8; stsd 16 (FullBox header + entry_count); visual sample entry 86
+        // (8B box header + 78B fixed VisualSampleEntry fields before its child boxes).
+        func search(boxStart: Int, boxSize: Int, type: String) -> Bool {
+            let payload: Int
+            switch type {
+            case "moov", "trak", "mdia", "minf", "stbl": payload = 8
+            case "stsd": payload = 16
+            case "hvc1", "hev1", "dvh1", "dvhe": payload = 86
+            default: return false
+            }
+            let end = boxStart + boxSize
+            var p = boxStart + payload
+            while p + 8 <= end {
+                let s = be32(b, p)
+                guard s >= 8, p + s <= end else { return false }   // malformed child: abort the whole strip
+                let t = fourccAt(b, p + 4)
+                if t == "dvcC" || t == "dvvC" {
+                    target = (p, s)
+                    ancestors.append(boxStart)
+                    return true
+                }
+                if search(boxStart: p, boxSize: s, type: t) {
+                    ancestors.append(boxStart)
+                    return true
+                }
+                p += s
+            }
+            return false
+        }
+        guard search(boxStart: ftypSize, boxSize: moovSize, type: "moov"), let hit = target else { return nil }
+        for off in ancestors { putBE32(&b, off, be32(b, off) - hit.size) }
+        b.removeSubrange(hit.start ..< hit.start + hit.size)
+        return Data(b)
     }
 
     /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so

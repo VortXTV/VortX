@@ -228,4 +228,256 @@ final class ReleaseCalendarModel: ObservableObject {
         }
         return out.sorted { $0.releaseDate < $1.releaseDate }
     }
+
+    // MARK: - Combined watchlist + library entry point
+
+    /// One call that populates BOTH rails from the user's library AND their local watchlist
+    /// (`LibraryAutoAdd.watchlist`), so the Upcoming surface shows the next air / release date of a followed
+    /// title whether it is in the account library or only bookmarked to watch later. Library ids come first and
+    /// win on name / poster (they carry the fresher engine meta); a watchlisted title not already in the library
+    /// is appended, using its stored name / poster snapshot as the only fallback. Pure fan-in over the existing
+    /// `refresh` / `refreshMovies`: no new network path, same 45-day horizon, same fail-soft behaviour, and each
+    /// rail keeps its own signature so a routine re-emit still never refetches. A host calls this instead of the
+    /// two library-only methods when it wants the watchlist folded in; the watchlist-only ids drop back out the
+    /// moment the user un-bookmarks (the id set changes, the signature changes, the rail rebuilds).
+    func refreshUpcoming(librarySeriesIDs: [String], librarySeriesNames: [String: String],
+                         libraryMovieIDs: [String], libraryMovieNames: [String: String] = [:],
+                         libraryMoviePosters: [String: String] = [:],
+                         metaBases: [String], reference: Date = Date()) {
+        let watch = LibraryAutoAdd.watchlist()
+
+        var seriesIDs = librarySeriesIDs
+        var seriesNames = librarySeriesNames
+        let librarySeriesSet = Set(librarySeriesIDs)
+        for entry in watch where entry.type == "series" && !librarySeriesSet.contains(entry.id) {
+            seriesIDs.append(entry.id)
+            if seriesNames[entry.id] == nil, let n = entry.name, !n.isEmpty { seriesNames[entry.id] = n }
+        }
+
+        var movieIDs = libraryMovieIDs
+        var movieNames = libraryMovieNames
+        var moviePosters = libraryMoviePosters
+        let libraryMovieSet = Set(libraryMovieIDs)
+        for entry in watch where entry.type == "movie" && !libraryMovieSet.contains(entry.id) {
+            movieIDs.append(entry.id)
+            if movieNames[entry.id] == nil, let n = entry.name, !n.isEmpty { movieNames[entry.id] = n }
+            if moviePosters[entry.id] == nil, let p = entry.poster, !p.isEmpty { moviePosters[entry.id] = p }
+        }
+
+        refresh(seriesIDs: seriesIDs, seriesNames: seriesNames, metaBases: metaBases, reference: reference)
+        refreshMovies(movieIDs: movieIDs, movieNames: movieNames, moviePosters: moviePosters,
+                      metaBases: metaBases, reference: reference)
+    }
+}
+
+// MARK: - UpcomingView (self-contained calendar-style list)
+
+/// A self-contained "Upcoming" screen: the model's upcoming EPISODES and MOVIES merged into one chronological
+/// list, grouped by calendar day, soonest first: the calendar/agenda shape the feature calls for, rather than
+/// the two horizontal home rails. Pure presentation over the same published `upcoming` / `upcomingMovies`, so a
+/// host just hands it the model (already refreshed via `refreshUpcoming(...)` or the two library-only methods)
+/// and an `onSelect` that routes to the title's `DetailView`. The `onSelect` closure keeps this view free of any
+/// per-platform navigation, so the ONE view compiles and renders on tvOS, iPhone, iPad, and Mac unchanged;
+/// wiring passes decide where it is presented and how the row routes.
+///
+/// Fail-soft and honest: an empty model renders a friendly empty state (the host can present it unconditionally),
+/// and every poster resolves through the shared `PosterArtwork` / `PosterImageLoader` path so it matches every
+/// other surface's art and cache.
+struct UpcomingView: View {
+    @ObservedObject var model: ReleaseCalendarModel
+    /// Routes a tapped row to its detail page: (catalog id, "series" | "movie"). Default no-op so the view can be
+    /// previewed / dropped in before a host wires navigation.
+    var onSelect: (String, String) -> Void = { _, _ in }
+
+    var body: some View {
+        Group {
+            if sections.isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.sm, pinnedViews: [.sectionHeaders]) {
+                        ForEach(sections) { section in
+                            Section {
+                                ForEach(section.rows) { row in
+                                    UpcomingCalendarRowView(row: row, onSelect: onSelect)
+                                }
+                            } header: {
+                                Text(section.label)
+                                    .eyebrowStyle(Theme.Palette.textSecondary)
+                                    .padding(.vertical, Theme.Space.xs)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Theme.Palette.canvas)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenInset)
+                    .padding(.vertical, Theme.Space.md)
+                }
+            }
+        }
+    }
+
+    // MARK: derived calendar model (presentation only)
+
+    /// Both rails flattened into one chronological list. Episode rows carry the SERIES id (so tapping opens the
+    /// show); movie rows carry the movie id. Cheap to recompute (<=120 items) on a publish.
+    private var rows: [UpcomingCalendarRow] {
+        let eps = model.upcoming.map(UpcomingCalendarRow.init(episode:))
+        let movies = model.upcomingMovies.map(UpcomingCalendarRow.init(movie:))
+        return (eps + movies).sorted { $0.date < $1.date }
+    }
+
+    /// The list grouped by calendar day, each section headed by a friendly day label ("Today", "Tomorrow", a
+    /// weekday within a week, else "Wed, Jul 30"), days ascending. A struct (not a tuple) so `ForEach` can key
+    /// on the day directly (Swift has no key path to a tuple element).
+    private var sections: [UpcomingDaySection] {
+        let calendar = Calendar.current
+        let grouped = Dictionary(grouping: rows) { calendar.startOfDay(for: $0.date) }
+        return grouped.keys.sorted().map { day in
+            UpcomingDaySection(id: day, label: Self.dayHeader(day, calendar: calendar),
+                               rows: (grouped[day] ?? []).sorted { $0.date < $1.date })
+        }
+    }
+
+    /// A short, locale-aware section header for a day. Fresh `DateFormatter` per section (<=~105 days spanned,
+    /// negligible) keeps this free of shared mutable formatter state.
+    private static func dayHeader(_ day: Date, calendar: Calendar, now: Date = Date()) -> String {
+        if calendar.isDateInToday(day) { return "Today" }
+        if calendar.isDateInTomorrow(day) { return "Tomorrow" }
+        let formatter = DateFormatter()
+        let daysAway = calendar.dateComponents([.day], from: calendar.startOfDay(for: now), to: day).day ?? 99
+        formatter.setLocalizedDateFormatFromTemplate(daysAway < 7 ? "EEEE" : "EEEMMMd")
+        return formatter.string(from: day)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: Theme.Space.sm) {
+            Image(systemName: "calendar").font(.system(size: 40)).foregroundStyle(Theme.Palette.textTertiary)
+            Text("Nothing upcoming")
+                .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
+            Text("Add series and movies to your watchlist or library to see their next air and release dates here.")
+                .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 420)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(Theme.Space.xl)
+    }
+}
+
+/// One day's worth of calendar rows under a friendly header. `id` is the day's start (unique per section), so
+/// `ForEach` keys on it without a key path to a tuple element (which Swift does not allow).
+private struct UpcomingDaySection: Identifiable {
+    let id: Date
+    let label: String
+    let rows: [UpcomingCalendarRow]
+}
+
+/// One flattened calendar row (an episode air date or a movie release date), carrying everything a row needs
+/// pre-derived so the list body stays a pure render. `posterFallback` is the add-on art (episode still / movie
+/// poster) the `PosterArtwork`-by-id resolution falls back to.
+private struct UpcomingCalendarRow: Identifiable {
+    let id: String
+    let metaId: String
+    let type: String        // "series" | "movie", passed straight to onSelect / DetailView routing
+    let title: String
+    let subtitle: String
+    let date: Date
+    let dateLabel: String
+    let posterFallback: String?
+
+    init(episode e: ReleaseCalendarModel.UpcomingEpisode) {
+        id = "ep:" + e.id
+        metaId = e.seriesId
+        type = "series"
+        title = e.seriesName.isEmpty ? "Untitled" : e.seriesName
+        subtitle = e.episodeLabel
+        date = e.airDate
+        dateLabel = e.airDateLabel
+        posterFallback = e.video.thumbnail
+    }
+
+    init(movie m: ReleaseCalendarModel.UpcomingMovie) {
+        id = "mv:" + m.id
+        metaId = m.id
+        type = "movie"
+        title = m.name.isEmpty ? "Untitled" : m.name
+        subtitle = "Movie"
+        date = m.releaseDate
+        dateLabel = m.releaseDateLabel
+        posterFallback = m.poster
+    }
+}
+
+/// One calendar row: a small poster, the title + what/when caption, and the date. The whole row is a button
+/// that hands (id, type) back to the host so it can push the right `DetailView`. `.plain` so the shared row
+/// keeps no per-platform focus/press chrome; a wiring pass adds any tvOS focus polish where it places the view.
+private struct UpcomingCalendarRowView: View {
+    let row: UpcomingCalendarRow
+    let onSelect: (String, String) -> Void
+
+    var body: some View {
+        Button { onSelect(row.metaId, row.type) } label: {
+            HStack(spacing: Theme.Space.md) {
+                UpcomingPosterThumb(id: row.metaId, fallback: row.posterFallback)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(row.title)
+                        .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                    Text(row.subtitle)
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary).lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(row.dateLabel)
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.accent).lineLimit(1)
+            }
+            .padding(.vertical, Theme.Space.xs)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// A small 2:3 poster for a calendar row, resolved by id through the shared `PosterArtwork` / `PosterImageLoader`
+/// path (same art source + cache as every rail), with a warm-cache peek and a `.task(id:)` load so a revisit
+/// never flashes blank, and a film-glyph placeholder while it loads / when no art resolves. Cross-platform image
+/// bridge mirrors `AddonLogoIcon`.
+private struct UpcomingPosterThumb: View {
+    let id: String
+    let fallback: String?
+    @State private var image: VXPosterImage?
+
+    private static let width: CGFloat = 44
+    private static let height: CGFloat = 66
+
+    private var url: String? { PosterArtwork.poster(id: id, fallback: fallback) }
+    private var warmCache: VXPosterImage? {
+        guard let url, let parsed = URL(string: url) else { return nil }
+        return PosterImageLoader.cached(parsed)
+    }
+
+    var body: some View {
+        Group {
+            if let img = image ?? warmCache {
+                imageView(img).resizable().scaledToFill()
+            } else {
+                Rectangle().fill(Theme.Palette.surface2)
+                    .overlay(Image(systemName: "film").foregroundStyle(Theme.Palette.textTertiary))
+            }
+        }
+        .frame(width: Self.width, height: Self.height)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+        .task(id: url) {
+            guard image == nil, let url, !url.isEmpty else { return }
+            // 132px = 44pt @3x: only the on-card size ever sits in memory, never a full-res poster.
+            if let img = await PosterImageLoader.load(url, maxPixel: 132) { image = img }
+        }
+    }
+
+    private func imageView(_ img: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
+    }
 }

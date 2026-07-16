@@ -138,6 +138,7 @@ enum CatalogPrefsStore {
     static let hiddenCategoriesKey = "vortx.discover.hiddenCategories"
     static let regionKey = "vortx.discover.regionPreference"   // "" / absent = follow the device region
     static let homeLayoutKey = "vortx.home.layout"   // tvOS Home: "rails" (default) | "wall" (#105)
+    static let filtersKey = "vortx.discover.filters"   // advanced Discover filter set (JSON, absent = none)
 
     static func hidden() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? []) }
     static func order() -> [String] { UserDefaults.standard.stringArray(forKey: orderKey) ?? [] }
@@ -161,6 +162,22 @@ enum CatalogPrefsStore {
     static func setRegionOverride(_ code: String?) {
         if let code, !code.isEmpty { UserDefaults.standard.set(code.uppercased(), forKey: regionKey) }
         else { UserDefaults.standard.removeObject(forKey: regionKey) }
+    }
+
+    /// The user's advanced Discover filter set (genre include/exclude, year window, age rating, runtime,
+    /// season count, upcoming-only), decoded from JSON. Absent / undecodable => `.empty`, so a default
+    /// install filters nothing. Plain static so the Discover view can read it without touching the actor.
+    static func discoverFilters() -> DiscoverFilters {
+        guard let data = UserDefaults.standard.data(forKey: filtersKey),
+              let decoded = try? JSONDecoder().decode(DiscoverFilters.self, from: data) else { return .empty }
+        return decoded
+    }
+    /// Persist the filter set. An inactive (empty) set removes the key so a default install stores nothing.
+    static func setDiscoverFilters(_ filters: DiscoverFilters) {
+        guard filters.isActive, let data = try? JSONEncoder().encode(filters) else {
+            UserDefaults.standard.removeObject(forKey: filtersKey); return
+        }
+        UserDefaults.standard.set(data, forKey: filtersKey)
     }
 
     /// Poster width preset (default `.balanced` = today's look). Read as a plain static so card/grid views
@@ -249,6 +266,15 @@ final class CatalogPreferences: ObservableObject {
             CatalogPrefsStore.setRegionOverride(regionOverride)
             // Region changed: reload the hub (providers/backdrops are region-keyed) so tiles reflect it.
             CollectionsHubModel.shared.load()
+        }
+    }
+    /// The user's advanced Discover filters, applied client-side over the loaded Discover previews. Empty by
+    /// default so Discover is unchanged until a filter is set. Two-way bound by the Discover filter panel;
+    /// persists on change (an empty set clears the stored key).
+    @Published var discoverFilters: DiscoverFilters = CatalogPrefsStore.discoverFilters() {
+        didSet {
+            guard oldValue != discoverFilters else { return }
+            CatalogPrefsStore.setDiscoverFilters(discoverFilters)
         }
     }
     private init() {}
@@ -475,4 +501,316 @@ enum DiscoverRegions {
         ("NG", "Nigeria"), ("KE", "Kenya"), ("IL", "Israel"), ("GR", "Greece"), ("CZ", "Czechia"),
         ("RO", "Romania"), ("HU", "Hungary"), ("CH", "Switzerland"), ("AT", "Austria"), ("NZ", "New Zealand"),
     ]
+}
+
+// MARK: - Discover advanced filters
+
+/// The user's advanced Discover filter set, applied client-side over the loaded catalog previews and
+/// persisted so it survives relaunch: genre include/exclude, a release-year window, age ratings, a runtime
+/// window, a season-count window (series), and an upcoming-only switch. Every field is optional / empty by
+/// default, so a fresh install filters nothing and Discover looks exactly as before.
+///
+/// Matching is intentionally FIELD-PRESENT only (see `matches`): a filter narrows the items that actually
+/// carry its field and leaves items missing that field untouched, because catalog previews are sparse
+/// (Cinemeta carries genres + year in `links`; runtime / certification / season count usually arrive only on
+/// the detail meta). This keeps the filters honest instead of hiding everything a preview cannot describe.
+/// Genres are matched case-insensitively; the stored keys are the canonical option labels the panel shows.
+struct DiscoverFilters: Codable, Equatable {
+    var includedGenres: Set<String> = []
+    var excludedGenres: Set<String> = []
+    var minYear: Int? = nil
+    var maxYear: Int? = nil
+    var ageRatings: Set<String> = []
+    var minMinutes: Int? = nil
+    var maxMinutes: Int? = nil
+    var minSeasons: Int? = nil
+    var maxSeasons: Int? = nil
+    var upcomingOnly: Bool = false
+
+    static let empty = DiscoverFilters()
+
+    var isActive: Bool { activeCount > 0 }
+
+    /// Count of the distinct active filter groups, for the toolbar badge and the summary line.
+    var activeCount: Int {
+        var n = 0
+        if !includedGenres.isEmpty { n += 1 }
+        if !excludedGenres.isEmpty { n += 1 }
+        if minYear != nil || maxYear != nil { n += 1 }
+        if !ageRatings.isEmpty { n += 1 }
+        if minMinutes != nil || maxMinutes != nil { n += 1 }
+        if minSeasons != nil || maxSeasons != nil { n += 1 }
+        if upcomingOnly { n += 1 }
+        return n
+    }
+
+    /// Tri-state genre helpers: a chip cycles Off -> Include -> Exclude -> Off.
+    enum GenreState: Equatable { case off, include, exclude }
+    func genreState(_ g: String) -> GenreState {
+        if includedGenres.contains(g) { return .include }
+        if excludedGenres.contains(g) { return .exclude }
+        return .off
+    }
+    mutating func cycleGenre(_ g: String) {
+        switch genreState(g) {
+        case .off:     includedGenres.insert(g)
+        case .include: includedGenres.remove(g); excludedGenres.insert(g)
+        case .exclude: excludedGenres.remove(g)
+        }
+    }
+}
+
+/// Static option catalogs for the Discover filter panel: age ratings, decade windows, runtime + season
+/// buckets, and a curated anime-genre supplement. Shared (SourcesShared) so tvOS and the later iOS pass render
+/// the same set from one source.
+enum DiscoverFilterOptions {
+    /// Common movie + TV certifications. Matching is best-effort: previews rarely carry a certification, so
+    /// this narrows only the items that do (see `DiscoverFilters`).
+    static let ageRatings: [String] = ["G", "PG", "PG-13", "R", "NC-17", "TV-Y", "TV-G", "TV-PG", "TV-14", "TV-MA"]
+
+    /// A release-year window presented as a decade chip. Selecting several spans their union (min start ..
+    /// max end), which is what the panel writes into `minYear` / `maxYear`.
+    struct Decade: Identifiable, Hashable { let label: String; let start: Int; let end: Int; var id: Int { start } }
+    static let decades: [Decade] = [
+        Decade(label: "2020s", start: 2020, end: 2029),
+        Decade(label: "2010s", start: 2010, end: 2019),
+        Decade(label: "2000s", start: 2000, end: 2009),
+        Decade(label: "1990s", start: 1990, end: 1999),
+        Decade(label: "1980s", start: 1980, end: 1989),
+        Decade(label: "1970s", start: 1970, end: 1979),
+        Decade(label: "Older", start: 1900, end: 1969),
+    ]
+
+    /// A single-select min/max window. `nil` bound = open on that side.
+    struct Bucket: Identifiable, Hashable { let label: String; let min: Int?; let max: Int?; var id: String { label } }
+    /// Runtime windows in MINUTES.
+    static let durationBuckets: [Bucket] = [
+        Bucket(label: "Under 30m", min: nil, max: 29),
+        Bucket(label: "30-60m", min: 30, max: 60),
+        Bucket(label: "60-90m", min: 60, max: 90),
+        Bucket(label: "90-120m", min: 90, max: 120),
+        Bucket(label: "Over 2h", min: 121, max: nil),
+    ]
+    /// Season-count windows (series).
+    static let seasonBuckets: [Bucket] = [
+        Bucket(label: "1 season", min: 1, max: 1),
+        Bucket(label: "2-3", min: 2, max: 3),
+        Bucket(label: "4-6", min: 4, max: 6),
+        Bucket(label: "7+", min: 7, max: nil),
+    ]
+
+    /// A curated anime-genre supplement surfaced when the current Discover catalog is anime, on TOP of the
+    /// genres present in the loaded items and the engine's own genre extra.
+    static let animeGenres: [String] = [
+        "Shounen", "Shoujo", "Seinen", "Josei", "Isekai", "Mecha",
+        "Slice of Life", "Iyashikei", "Ecchi", "Sports", "Supernatural", "Psychological",
+    ]
+}
+
+// MARK: - Client-side filtering (shared by every Discover surface)
+
+/// Preview-level fields the Discover filters read. Catalog previews are sparse, so year + genres are the
+/// reliable ones (Cinemeta puts them in `links`); certification / runtime / season count are best-effort and
+/// usually nil, which the field-present matching in `DiscoverFilters.matches` treats as "leave the item
+/// alone." Lives in SourcesShared so tvOS Discover and the iOS Discover screen filter identically.
+extension CoreMeta {
+    /// The leading 4-digit year parsed from `releaseInfo` ("2021", "2019-2023", "2020-"), or nil.
+    var releaseYear: Int? {
+        guard let s = releaseInfo else { return nil }
+        var digits = ""
+        for ch in s {
+            if ch.isNumber { digits.append(ch); if digits.count == 4 { break } }
+            else if !digits.isEmpty { break }
+        }
+        guard digits.count == 4, let y = Int(digits), y > 1800, y < 2200 else { return nil }
+        return y
+    }
+    /// Best-effort certification from a `links` rating category (some add-ons attach one); nil for most previews.
+    var certificationLabel: String? {
+        let cats: Set<String> = ["certification", "mpaa", "mpaa rating", "rated", "content rating", "age rating"]
+        guard let name = (links ?? []).first(where: { cats.contains($0.category.lowercased()) })?.name else { return nil }
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    /// Best-effort runtime in minutes from a `links` runtime/duration category ("92 min", "1h 32m"); nil when absent.
+    var previewRuntimeMinutes: Int? {
+        guard let raw = (links ?? []).first(where: { ["runtime", "duration"].contains($0.category.lowercased()) })?.name else { return nil }
+        var total = 0, matched = false
+        let scanner = Scanner(string: raw.lowercased())
+        scanner.charactersToBeSkipped = CharacterSet.alphanumerics.inverted
+        while !scanner.isAtEnd {
+            guard let n = scanner.scanInt(), n >= 0 else { break }
+            let unit = scanner.scanCharacters(from: CharacterSet.lowercaseLetters) ?? ""
+            total += unit.hasPrefix("h") ? n * 60 : n   // bare number or "min" -> minutes
+            matched = true
+        }
+        return matched && total > 0 ? total : nil
+    }
+    /// Best-effort season count from a `links` "seasons" category; nil for previews (which carry no episodes).
+    var previewSeasonCount: Int? {
+        guard let raw = (links ?? []).first(where: { ["season", "seasons"].contains($0.category.lowercased()) })?.name else { return nil }
+        let scanner = Scanner(string: raw)
+        scanner.charactersToBeSkipped = CharacterSet.decimalDigits.inverted
+        if let n = scanner.scanInt(), n > 0 { return n }
+        return nil
+    }
+}
+
+extension DiscoverFilters {
+    /// Whether a catalog preview passes every active filter. FIELD-PRESENT semantics: a filter only narrows
+    /// items that carry its field, so a sparse preview is never hidden by a field it does not describe.
+    func matches(_ item: CoreMeta, currentYear: Int) -> Bool {
+        // Genre include / exclude (case-insensitive), applied only to items that carry genres.
+        let genres = (item.genres ?? []).map { $0.lowercased() }
+        if !genres.isEmpty {
+            if !includedGenres.isEmpty {
+                let inc = Set(includedGenres.map { $0.lowercased() })
+                if !genres.contains(where: inc.contains) { return false }   // none of the included genres present
+            }
+            if !excludedGenres.isEmpty {
+                let exc = Set(excludedGenres.map { $0.lowercased() })
+                if genres.contains(where: exc.contains) { return false }
+            }
+        }
+        // Release-year window + upcoming-only, applied only to items with a parseable year.
+        if let y = item.releaseYear {
+            if let lo = minYear, y < lo { return false }
+            if let hi = maxYear, y > hi { return false }
+            if upcomingOnly, y < currentYear { return false }   // known-past titles drop; this year / future stay
+        }
+        // Age rating: narrows only items that carry a certification.
+        if !ageRatings.isEmpty, let cert = item.certificationLabel,
+           !ageRatings.contains(where: { $0.caseInsensitiveCompare(cert) == .orderedSame }) { return false }
+        // Runtime window: narrows only items that carry a runtime.
+        if let m = item.previewRuntimeMinutes {
+            if let lo = minMinutes, m < lo { return false }
+            if let hi = maxMinutes, m > hi { return false }
+        }
+        // Season-count window (series): narrows only items that carry a season count.
+        if let s = item.previewSeasonCount {
+            if let lo = minSeasons, s < lo { return false }
+            if let hi = maxSeasons, s > hi { return false }
+        }
+        return true
+    }
+}
+
+// MARK: - Imported list catalogs (paste a public list URL, browse it as a native row)
+
+/// Which public list service a catalog came from. Drives the row's provider label and the re-fetch path
+/// (see `ListImport` / `LetterboxdImportClient` / `MDBListClient`).
+enum ImportedListProvider: String, Codable, Hashable {
+    case letterboxd, mdblist, trakt
+
+    var label: String {
+        switch self {
+        case .letterboxd: return "Letterboxd"
+        case .mdblist:    return "MDBList"
+        case .trakt:      return "Trakt"
+        }
+    }
+}
+
+/// One resolved title inside an imported list. The `id` is ALWAYS an engine-safe Stremio id (an IMDb `tt…`
+/// id, or a `tmdb:…` id), never an app-private key, so tapping a card routes through the engine exactly like
+/// an add-on catalog card. Persisted with its catalog so the row paints instantly on launch without
+/// re-fetching the source list.
+struct ImportedListItem: Codable, Hashable, Identifiable {
+    let id: String        // engine-safe: "tt…" or "tmdb:…"
+    let type: String      // "movie" | "series"
+    let name: String
+    let poster: String?   // metahub-by-tt or the source poster; nil is tolerated (card shows a labeled tile)
+
+    /// Adapt to the same `MetaPreview` the add-on and curated Home rails render, so an imported row plugs into
+    /// the identical poster-rail path with no new card view.
+    var preview: MetaPreview {
+        MetaPreview(id: id, type: type, name: name, poster: poster, posterShape: nil, popularity: nil)
+    }
+}
+
+/// A named list a user imported from a public URL, stored on-device and rendered as a native Home row. It is
+/// self-contained: `items` are already resolved to engine-safe ids, so a render never touches the account
+/// library or writes a `libraryItem` document (invariant). `sourceURL` is kept only so the same list can be
+/// refreshed or de-duplicated; it is never pushed into engine or account state.
+struct ImportedListCatalog: Codable, Hashable, Identifiable {
+    let id: String                    // "imported:<provider>:<user>:<slug>"
+    var title: String
+    let provider: ImportedListProvider
+    let sourceURL: String
+    var items: [ImportedListItem]
+    var addedAt: Date
+
+    /// The row's cards, ready for the same poster-rail path the curated/add-on rows use.
+    var previews: [MetaPreview] { items.map(\.preview) }
+    var isEmpty: Bool { items.isEmpty }
+}
+
+/// On-device persistence for imported list catalogs (JSON in UserDefaults). Plain statics so a launch-time
+/// read can build the rows off the main actor, mirroring `CatalogPrefsStore`.
+enum ImportedCatalogsStore {
+    static let key = "vortx.catalog.importedLists"
+    /// Ceiling on stored lists, so the persisted blob (each list up to `ListImport.maxItems` small records)
+    /// stays a bounded UserDefaults value.
+    static let maxCatalogs = 50
+
+    static func load() -> [ImportedListCatalog] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([ImportedListCatalog].self, from: data) else { return [] }
+        return decoded
+    }
+
+    static func save(_ catalogs: [ImportedListCatalog]) {
+        let capped = Array(catalogs.prefix(maxCatalogs))
+        guard let data = try? JSONEncoder().encode(capped) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+/// The registry the paste-URL screen and Home read. `register` adds or replaces a resolved catalog (built by
+/// `ListImport.importList`); the Home render (a later pass) iterates `catalogs` and renders each
+/// `catalog.previews` as one poster rail, the same shape `CuratedCollectionsModel.collections` uses.
+@MainActor
+final class ImportedCatalogs: ObservableObject {
+    static let shared = ImportedCatalogs()
+    @Published private(set) var catalogs: [ImportedListCatalog] = ImportedCatalogsStore.load()
+    private init() {}
+
+    /// Whether a list from this exact source URL is already imported (drives the paste screen's "already
+    /// added" hint and lets it offer refresh instead of a duplicate).
+    func contains(sourceURL: String) -> Bool { catalogs.contains { $0.sourceURL == sourceURL } }
+    func catalog(withID id: String) -> ImportedListCatalog? { catalogs.first { $0.id == id } }
+
+    /// Add or replace a resolved catalog, newest first. A re-import of the same list (same id or same source
+    /// URL) replaces the existing row in place rather than duplicating it. Empty catalogs are rejected so a
+    /// failed resolve never registers a blank row. Returns false when nothing was stored.
+    @discardableResult
+    func register(_ catalog: ImportedListCatalog) -> Bool {
+        guard !catalog.isEmpty else { return false }
+        var next = catalogs.filter { $0.id != catalog.id && $0.sourceURL != catalog.sourceURL }
+        next.insert(catalog, at: 0)
+        persist(next)
+        return true
+    }
+
+    func remove(id: String) { persist(catalogs.filter { $0.id != id }) }
+
+    /// Rename an imported row (user-editable title). No-op when the id is unknown or the title is blank.
+    func rename(id: String, to title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        persist(catalogs.map { entry in
+            guard entry.id == id else { return entry }
+            var updated = entry
+            updated.title = trimmed
+            return updated
+        })
+    }
+
+    /// Persist an explicit order (drag-to-reorder on the manager screen).
+    func reorder(_ ordered: [ImportedListCatalog]) { persist(ordered) }
+
+    private func persist(_ next: [ImportedListCatalog]) {
+        catalogs = next
+        ImportedCatalogsStore.save(next)
+    }
 }

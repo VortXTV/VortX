@@ -40,6 +40,20 @@ final class WatchedIndex: ObservableObject {
     /// (e.g. one scheduled just before a profile switch).
     private var generation = 0
 
+    /// Series ids the ACTIVE profile has fully watched by its AIRED, REGULAR-SEASON episodes (issue #143),
+    /// derived by the detail views (the only place with a series' full video list AND the watched set) and
+    /// unioned into `ids`. This flips the poster cover badge for a series whose episodes were MARKED rather
+    /// than played, whose engine `LibraryItem.times_watched` stays 0 (a per-episode / per-season mark
+    /// updates only the WatchedBitField). Purely in-memory and read-only; never written to engine / profile
+    /// / disk. Cleared on a profile switch (see `rebuild`) so it never leaks across profiles.
+    private var derivedSeriesWatched: Set<String> = []
+    /// Last published BASE set (engine buckets ∪ live ∪ Trakt shadow, or the overlay set), kept so
+    /// `noteSeriesWatched` can republish `base ∪ derivedSeriesWatched` without a full rebuild, preserving
+    /// the `ids = base ∪ derived` invariant.
+    private var lastBase: Set<String> = []
+    /// The profile the derived set was computed for; a change clears it in `rebuild`.
+    private var lastActiveProfile: UUID?
+
     /// Engine model fields whose change can move watched state: `ctx` carries the library bucket
     /// (every mark / unmark / sync lands there), `library` and `continue_watching_preview` re-emit
     /// on marks and progress saves and back the instant in-memory union.
@@ -76,6 +90,14 @@ final class WatchedIndex: ObservableObject {
         // No rail is visible during playback; the ~20s engine progress saves would otherwise
         // re-parse the buckets for nothing. The $playerActive(false) event above catches up.
         guard !CoreBridge.shared.playerActive else { return }
+        // A profile switch swaps the whole watched source; the derived series-completion set (issue #143)
+        // was computed for the OUTGOING profile, so drop it before this profile's pass so a badge never
+        // leaks across profiles. Its detail view re-feeds the new profile's completion on next open.
+        let currentProfile = ProfileStore.shared.activeID
+        if currentProfile != lastActiveProfile {
+            lastActiveProfile = currentProfile
+            derivedSeriesWatched.removeAll()
+        }
         generation &+= 1
         let gen = generation
         guard ProfileStore.shared.activeUsesEngineHistory else {
@@ -95,9 +117,11 @@ final class WatchedIndex: ObservableObject {
         // in the window before the resweep re-triggers rebuild via ctx events, and the generation
         // guard drops these passes' publishes.
         let expectedUID = CoreBridge.shared.currentUID()
-        // Trakt shadow (additive-read, opt-in): union the tt ids watched on Trakt into the badge set. Empty
-        // when the import toggle is off. Kick a throttled refresh so a stale cache re-pulls; the pull calls
-        // back into `externalShadowChanged` (one more rebuild) when it changes something. NEVER an engine write.
+        // Trakt shadow (additive-read, opt-in): union the ids watched on Trakt into the badge set. The
+        // shadow holds BOTH identity forms per title (imdb `tt…` and `tmdb:<id>`), so a cover keyed by
+        // either identity matches the plain `ids.contains(item.id)` read below (issue #143). Empty when the
+        // import toggle is off. Kick a throttled refresh so a stale cache re-pulls; the pull calls back into
+        // `externalShadowChanged` (one more rebuild) when it changes something. NEVER an engine write.
         TraktSyncEngine.shared.refreshIfStale()
         let shadow = TraktSyncEngine.shared.shadowWatchedIDs()
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -117,11 +141,28 @@ final class WatchedIndex: ObservableObject {
     /// already coalesces bursts.
     func externalShadowChanged() { rebuild() }
 
+    /// A detail view computed whether a SERIES is fully watched by its aired, regular-season episodes
+    /// (issue #143). Union it into the badge set (read-only, in-memory) so the poster cover flips even when
+    /// the engine's library `times_watched` stays 0 for a series whose episodes were marked rather than
+    /// played, and un-badge it when the show drops back below complete. Main-queue only (SwiftUI callers).
+    /// Never writes engine / profile / disk state.
+    func noteSeriesWatched(_ metaId: String, isFullyWatched: Bool) {
+        let contained = derivedSeriesWatched.contains(metaId)
+        guard isFullyWatched != contained else { return }
+        if isFullyWatched { derivedSeriesWatched.insert(metaId) } else { derivedSeriesWatched.remove(metaId) }
+        let merged = lastBase.union(derivedSeriesWatched)
+        if merged != ids { ids = merged }
+    }
+
     /// Publish on main, dropping stale generations and no-op sets (identical set republishes nothing,
-    /// so rails do not re-evaluate on the routine resweep).
+    /// so rails do not re-evaluate on the routine resweep). Always records the base and unions the derived
+    /// series-completion set so `ids = base ∪ derivedSeriesWatched` holds after every pass.
     private func publish(_ next: Set<String>, ifCurrent gen: Int) {
-        guard gen == generation, next != ids else { return }
-        ids = next
+        guard gen == generation else { return }
+        lastBase = next
+        let merged = next.union(derivedSeriesWatched)
+        guard merged != ids else { return }
+        ids = merged
     }
 
     /// Ids with `state.timesWatched > 0` across BOTH persisted engine buckets (the recent split and

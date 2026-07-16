@@ -930,6 +930,10 @@ final class MPVMetalViewController: PlatformViewController {
         // auto-advanced / skipped episodes are washed out" report. (HDR is only verifiable on a real HDR
         // display, not the Simulator.)
         appliedDynamicRange = nil
+        // A fresh `loadfile ... replace` re-runs mpv's track auto-selection, which clears any secondary
+        // subtitle back to none. Mirror that here so an in-place episode / source switch doesn't leave the
+        // dual-subtitle picker showing a stale second-language checkmark from the previous file.
+        secondarySubtitleID = -1
         // The URL / audio sidecar mpv actually opens. `url` and `audioSidecar` are `let` params; a googlevideo
         // trailer swaps these to their local VXTrailerProxy (127.0.0.1) equivalents below, BEFORE they are handed
         // to mpv via `args` and the `audio-files` append. Everything downstream (args, isLocalStream, the audio
@@ -1494,7 +1498,47 @@ final class MPVMetalViewController: PlatformViewController {
         #if os(tvOS)
         armSeekCacheHold()   // a sid change triggers the same demuxer refresh-seek as an audio switch
         #endif
+        // mpv refuses to render one track as BOTH the primary and the secondary subtitle. If the new
+        // primary is the track currently pinned as the secondary, drop the secondary first so the primary
+        // switch always lands (and the dual-subtitle picker stays consistent). No-op when no secondary is set.
+        if id >= 0, id == secondarySubtitleID {
+            setSecondarySubtitleTrack(-1)
+        }
         setString(MPVProperty.sid, id < 0 ? "no" : String(id))
+    }
+
+    /// The current SECONDARY subtitle id (mpv `secondary-sid`), -1 = none. libmpv can render two subtitle
+    /// tracks at once for language study: the primary at its normal bottom position and this one pinned to
+    /// the top. Tracked here (not read back from the property each time) because the chrome's picker needs a
+    /// stable selected-id and the track-list `selected` flag is true for BOTH the primary and secondary
+    /// tracks once dual subtitles are on, so it can't tell them apart.
+    private(set) var secondarySubtitleID: Int = -1
+
+    /// The current PRIMARY subtitle id (mpv `sid`), or -1 when subtitles are off. Read back so the chrome can
+    /// distinguish the primary track from the secondary one when building the dual-subtitle pickers. mpv
+    /// subtitle track ids are 1-based, so a 0/absent read means "off".
+    var primarySubtitleID: Int {
+        guard mpv != nil else { return -1 }
+        let v = getInt(MPVProperty.sid)
+        return v > 0 ? v : -1
+    }
+
+    /// Select (or clear, with a negative id) the SECONDARY subtitle track. mpv shows it alongside the primary
+    /// `sid` for dual-language study. The secondary line is pinned to the TOP (`secondary-sub-pos` = 0) so it
+    /// never collides with the primary line at the bottom; recent mpv already defaults the secondary to the
+    /// top, and setting an unknown property is a harmless no-op, so this is safe across engine versions. The
+    /// user's subtitle style (font, size, colour) applies to both tracks automatically.
+    func setSecondarySubtitleTrack(_ id: Int) {
+        secondarySubtitleID = id
+        #if os(tvOS)
+        armSeekCacheHold()   // a secondary-sid change triggers the same demuxer refresh-seek as a primary sid switch
+        #endif
+        guard id >= 0 else {
+            setString(MPVProperty.secondarySid, "no")
+            return
+        }
+        setString(MPVProperty.secondarySid, String(id))
+        setString(MPVProperty.secondarySubPos, "0")   // top of frame, clear of the primary line at the bottom
     }
 
     /// Session-lived map of add-on subtitle URL -> already-downloaded LOCAL file. Once a subtitle has been

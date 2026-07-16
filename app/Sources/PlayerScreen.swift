@@ -122,19 +122,20 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters, engine
+        case speed, subtitles, subtitleSettings, secondarySubtitles, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters, engine
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
-            case .chapters: 12; case .engine: 13
+            case .chapters: 12; case .engine: 13; case .secondarySubtitles: 14
             }
         }
         var title: String {
             switch self {
             case .speed: "Playback Speed"; case .subtitles: "Subtitles"
-            case .subtitleSettings: "Subtitle Settings"; case .audio: "Audio"
+            case .subtitleSettings: "Subtitle Settings"; case .secondarySubtitles: "Second Subtitle"
+            case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
@@ -147,7 +148,7 @@ struct PlayerScreen: View {
         /// colour steppers, output mode, player settings, sleep) and the browse panels (info, episodes).
         var dismissesAfterPick: Bool {
             switch self {
-            case .subtitles, .audio, .quality, .sources, .chapters, .engine: true
+            case .subtitles, .secondarySubtitles, .audio, .quality, .sources, .chapters, .engine: true
             default: false
             }
         }
@@ -254,6 +255,17 @@ struct PlayerScreen: View {
     @State private var sleepAtEpisodeEnd = false        // stop at episode end instead of auto-advancing
     @State private var sleepDeadline: Date? = nil       // when the timed pause fires (for the countdown label)
     @State private var sleepTask: Task<Void, Never>?
+    // "Still watching?" idle guard: after a long unattended stretch (no transport/seek/tap for
+    // `idleWatchTimeout`, or `idleAutoAdvanceLimit` back-to-back auto-advances with zero input between them)
+    // pause playback and ask, so a binge does not run all night. ANY interaction re-arms it, so an
+    // actively-attended session never trips. Mirrors TVPlayerView.
+    @State private var stillWatchingPrompt = false          // the modal is up (playback paused, awaiting Continue / Stop)
+    @State private var idleDeadline = Date.distantFuture    // wall-clock idle deadline; pushed forward on every interaction
+    @State private var idleWatchTask: Task<Void, Never>?    // single poll loop; started on open, cancelled on teardown
+    @State private var consecutiveAutoAdvances = 0          // back-to-back auto-advances with no interaction between them
+    @State private var pendingStillWatchingEpisodeId: String?  // next episode to roll to when Continue is chosen at a binge boundary
+    private static let idleWatchTimeout: TimeInterval = 4 * 60 * 60   // 4h of no interaction -> "Still watching?"
+    private static let idleAutoAdvanceLimit = 4                       // 4 back-to-back auto-advances, zero input -> same
     @State private var showExternalChooser = false   // "Play in another app" sheet
     #if !os(tvOS)
     // Skip-segment editor state (iOS/Mac only). Submits keyless to skip.vortx.tv; also to skipdb.tv
@@ -676,6 +688,8 @@ struct PlayerScreen: View {
 
             if loadFailed { loadErrorOverlay }
 
+            if stillWatchingPrompt { stillWatchingOverlay }
+
             // Always-present escape hatch until the first frame arrives: a top-most close button so the
             // player is NEVER a trap, even with controls auto-hidden and the spinner covering the
             // tap-to-restore layer. macOS has no Esc/▶︎ remote fallback, so this is the only reliable
@@ -766,7 +780,7 @@ struct PlayerScreen: View {
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             configureCommunityTrickplayProvisional()
             startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
-            scheduleHide(); startLoadTimeout()
+            scheduleHide(); startLoadTimeout(); startIdleWatch()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
             if !isTrailer { PlayerOrientation.forceLandscape() }   // rotate to landscape as the stream opens, even under rotation lock
@@ -783,7 +797,7 @@ struct PlayerScreen: View {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-            refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel()
+            refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
             #if os(iOS) || os(macOS)
             engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
             #endif
@@ -1113,7 +1127,14 @@ struct PlayerScreen: View {
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
                 // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
                 // Suppressed while the skip editor is open so an end-of-credits edit isn't yanked away.
-                goToEpisode(episodes[i + 1].id, autoAdvance: true)
+                // "Still watching?" binge guard: after N back-to-back auto-advances with zero interaction,
+                // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
+                consecutiveAutoAdvances += 1
+                if consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
+                    presentStillWatching(pendingNext: episodes[i + 1].id)
+                } else {
+                    goToEpisode(episodes[i + 1].id, autoAdvance: true)
+                }
             } else if hasNext, !skipEditActive {
                 onNext()                                  // legacy non-episode caller (in-place)
             } else if !skipEditActive {
@@ -2345,6 +2366,49 @@ struct PlayerScreen: View {
         .accessibilityElement(children: .contain)
     }
     private var canPrevEpisode: Bool { (episodeIndex ?? -1) > 0 }
+
+    /// "Still watching?" modal: a dimming scrim plus a centered glass card with Stop / Continue. Raised
+    /// after a long unattended stretch so a stream does not play all night; Continue resumes, Stop leaves.
+    private var stillWatchingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 6) {
+                Text("Still watching?")
+                    .font(.title2.weight(.bold)).foregroundStyle(.white)
+                Text("Playback paused after a long stretch with no activity.")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 12) {
+                    Button { stopStillWatching() } label: {
+                        Text("Stop").font(.headline.weight(.semibold)).foregroundStyle(.white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 12)
+                            .background(.white.opacity(0.18), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Stop watching")
+                    Button { continueStillWatching() } label: {
+                        Label("Continue", systemImage: "play.fill").font(.headline.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.onAccent)
+                            .frame(maxWidth: .infinity).padding(.vertical, 12)
+                            .background(Theme.Palette.accent, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.defaultAction)   // Return / primary click = keep watching (macOS + HW keyboard)
+                    .accessibilityLabel("Continue watching")
+                }
+                .padding(.top, 14)
+            }
+            .padding(24)
+            .frame(maxWidth: 420)
+            // Shared VortX warm-glass card (matches the Up Next / panel surfaces), upgrading to Liquid Glass on OS 26.
+            .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                        fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
+            .padding(.horizontal, 32)
+        }
+        .transition(.opacity)
+        .zIndex(200)
+        .accessibilityElement(children: .contain)
+    }
 
     private func goToNextEpisode() { if let i = episodeIndex, i + 1 < episodes.count { goToEpisode(episodes[i + 1].id) } }
     private func goToPrevEpisode() { if let i = episodeIndex, i > 0 { goToEpisode(episodes[i - 1].id) } }
@@ -3754,12 +3818,23 @@ struct PlayerScreen: View {
             }
             return rs
         case .subtitles:
-            var rs: [Row] = [Row(label: String(localized: "Off"), selected: subtitleTracks.allSatisfy { !$0.selected }) {
+            // Dual-subtitle state (libmpv only). When a secondary subtitle is on, libmpv marks BOTH the
+            // primary and secondary tracks `selected`, so the flag can no longer identify the primary on its
+            // own: key the primary checkmarks off the engine's explicit `primarySubtitleID` instead. When no
+            // secondary is set (the ordinary case, and always on the AVPlayer engine where `mpvEngine` is nil)
+            // this stays nil and the rows fall back to the `selected` flag exactly as before.
+            let mpvEngine = coordinator.player as? MPVMetalViewController
+            let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
+            let dualActive = secondaryID >= 0
+            let primaryID = mpvEngine?.primarySubtitleID ?? -1
+            let primaryOff = dualActive ? (primaryID < 0) : subtitleTracks.allSatisfy { !$0.selected }
+            let primarySel: ((MPVTrack) -> Bool)? = dualActive ? { $0.id == primaryID } : nil
+            var rs: [Row] = [Row(label: String(localized: "Off"), selected: primaryOff) {
                 userPickedSubtitle = true
                 VXProbe.log("subs", "selected track off")
                 coordinator.player?.setSubtitleTrack(-1)
             }]
-            rs += groupedTrackRows(subtitleTracks) { id in
+            rs += groupedTrackRows(subtitleTracks, isSelected: primarySel) { id in
                 userPickedSubtitle = true
                 VXProbe.log("subs", "selected embedded track \(id)")
                 coordinator.player?.setSubtitleTrack(id)
@@ -3804,7 +3879,38 @@ struct PlayerScreen: View {
                     })
                 }
             }
+            // Second subtitle (language-study dual tracks). libmpv renders two subtitle tracks at once, so this
+            // drill-in only appears on that engine and only when there are at least two tracks to choose a
+            // second from. On the AVPlayer engine there is no secondary-subtitle overlay, so the row is hidden
+            // and playback degrades gracefully to the single primary subtitle (see .secondarySubtitles below).
+            if mpvEngine != nil, subtitleTracks.count >= 2 {
+                let secondLabel: String = {
+                    if let t = subtitleTracks.first(where: { $0.id == secondaryID }) {
+                        return String(localized: "Second subtitle") + " · " + langName(t.lang.isEmpty ? "und" : t.lang)
+                    }
+                    return String(localized: "Second subtitle")
+                }()
+                rs.append(Row(label: secondLabel, detail: "›") { openPanel(.secondarySubtitles) })
+            }
             rs.append(Row(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) })
+            return rs
+        case .secondarySubtitles:
+            // Pick a SECOND subtitle track shown at the same time as the primary (top of frame vs. bottom), for
+            // language study. libmpv-only: driven through the concrete engine because `secondary-sid` has no
+            // AVPlayer equivalent. mpv refuses to show one track as both primary and secondary, so the current
+            // primary is excluded from the options. The checkmark keys off the engine's tracked secondary id.
+            let mpvEngine = coordinator.player as? MPVMetalViewController
+            let secondaryID = mpvEngine?.secondarySubtitleID ?? -1
+            let primaryID = mpvEngine?.primarySubtitleID ?? -1
+            var rs: [Row] = [Row(label: String(localized: "Off"), selected: secondaryID < 0) {
+                VXProbe.log("subs", "secondary subtitle off")
+                mpvEngine?.setSecondarySubtitleTrack(-1)
+            }]
+            let secondaryOptions = subtitleTracks.filter { primaryID < 0 || $0.id != primaryID }
+            rs += groupedTrackRows(secondaryOptions, isSelected: { $0.id == secondaryID }) { id in
+                VXProbe.log("subs", "selected secondary subtitle track \(id)")
+                mpvEngine?.setSecondarySubtitleTrack(id)
+            }
             return rs
         case .subtitleSettings:
             let now = String(format: "%+.1fs", subDelay)
@@ -3975,18 +4081,26 @@ struct PlayerScreen: View {
 
     /// Group tracks by language so multiple same-language tracks read clearly (an "English" header with
     /// two variants), instead of a flat list of identical rows. Mirrors tvOS `groupedTrackRows`.
-    private func groupedTrackRows(_ tracks: [MPVTrack], select: @escaping (Int) -> Void) -> [Row] {
+    /// `isSelected`, when given, decides the checkmark from an EXPLICIT id instead of the track's own
+    /// `selected` flag: the dual-subtitle pickers need this because once a secondary subtitle is on, libmpv
+    /// marks BOTH the primary and secondary tracks `selected`, so the flag alone can no longer tell them
+    /// apart. Passing nil keeps the original behaviour (audio + the single-track subtitle case), so
+    /// single-subtitle rendering is unchanged.
+    private func groupedTrackRows(_ tracks: [MPVTrack],
+                                  isSelected: ((MPVTrack) -> Bool)? = nil,
+                                  select: @escaping (Int) -> Void) -> [Row] {
+        let sel: (MPVTrack) -> Bool = { isSelected?($0) ?? $0.selected }
         let groups = Dictionary(grouping: tracks) { $0.lang.isEmpty ? "und" : $0.lang.lowercased() }
         var rs: [Row] = []
         for code in groups.keys.sorted(by: { langName($0) < langName($1) }) {
             guard let ts = groups[code] else { continue }   // defensive; key comes from groups.keys so always present
             if ts.count == 1 {
                 let t = ts[0]
-                rs.append(Row(label: langName(code), detail: t.title, selected: t.selected) { select(t.id) })
+                rs.append(Row(label: langName(code), detail: t.title, selected: sel(t)) { select(t.id) })
             } else {
                 rs.append(Row(label: langName(code), isHeader: true))
                 for (i, t) in ts.enumerated() {
-                    rs.append(Row(label: t.title.isEmpty ? "Track \(i + 1)" : t.title, selected: t.selected) { select(t.id) })
+                    rs.append(Row(label: t.title.isEmpty ? "Track \(i + 1)" : t.title, selected: sel(t)) { select(t.id) })
                 }
             }
         }
@@ -4116,6 +4230,7 @@ struct PlayerScreen: View {
         coordinator.player?.setSubDelay(subDelay)
         VXProbe.log("subs", "synced delay=\(String(format: "%+.1f", subDelay))s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
+        SubtitleOffsetMemory.save(subDelay, forContentKey: communityContentKey)   // remember this title's manual offset (device-local, exact)
     }
     private func adjustAudioDelay(_ delta: Double) {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
@@ -4159,7 +4274,7 @@ struct PlayerScreen: View {
     /// the cover down — so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
-        hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
+        hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         #if os(iOS) || os(macOS)
         avStartWatchdog?.cancel()
@@ -4340,6 +4455,14 @@ struct PlayerScreen: View {
         // + the one-shot latch inside make the double call safe. No-op when userPickedSubtitle is set (an
         // explicit pick, incl. one just re-applied above, hard-stops the async add-on auto path).
         autoSelectAddonSubtitleIfNeeded()
+        // Restore the viewer's OWN last manual sync offset for this title (device-local, instant, offline).
+        // Only when nothing is dialed in this session and the pooled seed hasn't fired; claiming the pooled
+        // latch here suppresses the crowd seed so the viewer's own correction wins.
+        if subDelay == 0, !pooledSeededOffset, let saved = SubtitleOffsetMemory.savedOffset(forContentKey: communityContentKey) {
+            subDelay = saved
+            coordinator.player?.setSubDelay(saved)
+            pooledSeededOffset = true
+        }
     }
 
     /// Push a resume/progress position to the presenter, refusing to REGRESS the stored resume below a
@@ -4456,11 +4579,13 @@ struct PlayerScreen: View {
     /// timer keeps them up; showing them re-arms the timer. Mirrors tvOS's "show on input, hide on a
     /// fresh deadline" approach, fixing the unreliable show/hide.
     private func toggleControls() {
+        noteInteraction()            // a tap is presence: re-arm the "Still watching?" idle guard
         if panel != nil { return }   // a tap behind an open panel shouldn't flip the bar; the scrim handles dismissal
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
         if controlsVisible { scheduleHide() } else { hideTask?.cancel() }
     }
     private func scheduleHide() {
+        noteInteraction()            // every control interaction routes through here: re-arm the idle guard
         hideTask?.cancel()
         controlsVisible = true
         hideTask = Task { @MainActor in
@@ -4471,6 +4596,71 @@ struct PlayerScreen: View {
             guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused, !skipEditActive else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
         }
+    }
+
+    // MARK: - "Still watching?" idle guard
+
+    /// Record any user interaction: push the idle deadline out and clear the auto-advance streak, so an
+    /// actively-attended session never trips the prompt. Cheap (a Date write); safe from every control path.
+    private func noteInteraction() {
+        idleDeadline = Date().addingTimeInterval(Self.idleWatchTimeout)
+        consecutiveAutoAdvances = 0
+    }
+
+    /// Start the single idle-watch poll. One long-lived loop (not a per-interaction Task) re-checks the
+    /// deadline every 15s; interactions just move the deadline. Cancelled in onDisappear / leavePlayback.
+    private func startIdleWatch() {
+        idleWatchTask?.cancel()
+        idleDeadline = Date().addingTimeInterval(Self.idleWatchTimeout)
+        idleWatchTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(15))
+                guard !Task.isCancelled else { return }
+                maybePromptStillWatching()
+            }
+        }
+    }
+
+    /// Fire the timed prompt iff the session looks unattended AND is actually playing. Never interrupts a
+    /// paused / buffering / panel / failed / scrubbing session (those are not "running all night", and a
+    /// modal there is just noise); each is re-checked on the next poll tick.
+    private func maybePromptStillWatching() {
+        guard hasStartedPlaying, !stillWatchingPrompt else { return }
+        guard !isPaused, panel == nil, !scrubbing, !buffering, !loadFailed, !skipEditActive else { return }
+        guard Date() >= idleDeadline else { return }
+        presentStillWatching()
+    }
+
+    /// Pause playback (unless we are at an episode boundary, where the file has already ended) and raise the
+    /// modal. `pendingNext` is the episode to roll to if the viewer taps Continue at a binge boundary.
+    private func presentStillWatching(pendingNext: String? = nil) {
+        guard !stillWatchingPrompt else { return }
+        pendingStillWatchingEpisodeId = pendingNext
+        if pendingNext == nil, !isPaused { coordinator.player?.togglePause() }   // mid-title: pause; boundary: already ended
+        hideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) { stillWatchingPrompt = true }
+    }
+
+    /// "Continue": re-arm the guard, then resume -- either roll to the pending next episode (binge boundary)
+    /// or un-pause the current title.
+    private func continueStillWatching() {
+        withAnimation(.easeInOut(duration: 0.2)) { stillWatchingPrompt = false }
+        let next = pendingStillWatchingEpisodeId
+        pendingStillWatchingEpisodeId = nil
+        noteInteraction()
+        if let next {
+            goToEpisode(next, autoAdvance: true)
+        } else {
+            if isPaused { coordinator.player?.togglePause() }
+            scheduleHide()
+        }
+    }
+
+    /// "Stop": leave the player entirely (mirrors the transport Close).
+    private func stopStillWatching() {
+        stillWatchingPrompt = false
+        pendingStillWatchingEpisodeId = nil
+        leavePlayback()
     }
 
     private func speedLabel(_ s: Double) -> String { s == s.rounded() ? "\(Int(s))×" : String(format: "%g×", s) }

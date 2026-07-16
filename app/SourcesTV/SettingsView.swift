@@ -15,6 +15,9 @@ struct SettingsView: View {
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
+    /// Settings search query. Empty shows the full settings tree; a non-empty query filters the sections
+    /// below to those whose title or any of their row keywords contain it (case-insensitive substring).
+    @State private var settingsQuery = ""
     @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     @State private var showRestartConfirm = false
@@ -36,6 +39,10 @@ struct SettingsView: View {
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
+    // Spoiler-safe mode (SourcePreferences.spoilerSafeKey) supersets the legacy thumbnail-only blur: the ONE
+    // visible row below drives both keys together so the detail views' `(spoilerSafe || spoilerBlur)` gate has
+    // a single source of truth (no leftover legacy default-on blur when the user turns spoiler-safe off).
+    @AppStorage(SourcePreferences.spoilerSafeKey) private var spoilerSafe = SourcePreferences.defaultSpoilerSafe
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -103,21 +110,28 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Text("Settings").screenTitleStyle()
-                    profilesSection
-                    accountSection
-                    stremioMirrorSection
-                    playbackSection
-                    notificationsSection
-                    streamsSection
-                    communitySection
-                    serverSection
-                    tabBarSection
-                    appearanceSection
-                    audioSubtitleSection
-                    subtitleSection
-                    advancedSection
-                    backupSection
-                    aboutSection
+                    // Focusable search field: typing filters the sections below (additive, the whole tree
+                    // stays intact and returns the moment the field is cleared). Each section is gated by
+                    // `sectionMatches`, so an empty query shows everything and a query keeps only the hits.
+                    searchSection
+                    if isSearching && !hasAnySettingsMatch {
+                        noSettingsMatchSection
+                    }
+                    if sectionMatches(.profiles) { profilesSection }
+                    if sectionMatches(.account) { accountSection }
+                    if sectionMatches(.stremioMirror) { stremioMirrorSection }
+                    if sectionMatches(.playback) { playbackSection }
+                    if sectionMatches(.notifications) { notificationsSection }
+                    if sectionMatches(.streams) { streamsSection }
+                    if sectionMatches(.community) { communitySection }
+                    if sectionMatches(.server) { serverSection }
+                    if sectionMatches(.tabBar) { tabBarSection }
+                    if sectionMatches(.appearance) { appearanceSection }
+                    if sectionMatches(.audioSubtitle) { audioSubtitleSection }
+                    if sectionMatches(.subtitle) { subtitleSection }
+                    if sectionMatches(.advanced) { advancedSection }
+                    if sectionMatches(.backup) { backupSection }
+                    if sectionMatches(.about) { aboutSection }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.vertical, Theme.Space.xl)
@@ -168,6 +182,65 @@ struct SettingsView: View {
                 serverOnline = online
                 try? await Task.sleep(for: .seconds(online ? 12 : 3))
             }
+        }
+    }
+
+    // MARK: Settings search
+
+    /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
+    private var trimmedSettingsQuery: String {
+        settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether the user is actively filtering. An empty (or whitespace-only) field is treated as no filter.
+    private var isSearching: Bool { !trimmedSettingsQuery.isEmpty }
+
+    /// A section shows when there is no query, or when the query is a case-insensitive substring of the
+    /// section's title or any of its row keywords.
+    private func sectionMatches(_ id: SettingsSearchSection) -> Bool {
+        let q = trimmedSettingsQuery
+        guard !q.isEmpty else { return true }
+        if id.title.lowercased().contains(q) { return true }
+        return id.keywords.contains { $0.contains(q) }
+    }
+
+    /// True when at least one section matches the current query (drives the empty-state card).
+    private var hasAnySettingsMatch: Bool {
+        SettingsSearchSection.allCases.contains { sectionMatches($0) }
+    }
+
+    /// The focusable search field at the top of Settings. Focusing it opens the tvOS keyboard; typing
+    /// filters the sections below and the Clear chip (or emptying the field) restores the full tree. Sits
+    /// on the same settings-card glass as every section so it reads as part of the same surface.
+    private var searchSection: some View {
+        HStack(spacing: Theme.Space.md) {
+            Image(systemName: "magnifyingglass")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textTertiary)
+            TextField("Search settings", text: $settingsQuery)
+                .textFieldStyle(.plain)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .autocorrectionDisabled(true)
+            if !settingsQuery.isEmpty {
+                Button { settingsQuery = "" } label: {
+                    Label("Clear", systemImage: "xmark.circle.fill")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
+            }
+        }
+        .padding(Theme.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .vortxSettingsCard()
+        .focusSection()
+    }
+
+    /// Shown in place of the settings tree when a query matches nothing, so the screen is never blank.
+    private var noSettingsMatchSection: some View {
+        section("No matches") {
+            Text("No settings match \"\(settingsQuery)\".")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
@@ -681,6 +754,11 @@ struct SettingsView: View {
                 Label("Discover & region", systemImage: "globe")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
+            // The full "Upcoming" calendar (next air / release dates of library + watchlisted titles).
+            NavigationLink { TVUpcomingScreen() } label: {
+                Label("Upcoming", systemImage: "calendar")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
             Text("Discover cards, Streaming-service tiles, and Genre tiles high on Home and Discover; tap a tile to browse its catalogs (Movies, Shows, New, Top week/month/year, Trending). Needs a TMDB key.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
@@ -689,9 +767,13 @@ struct SettingsView: View {
             Text("Show a movie's budget, box office, and profit on its detail page. Movies only; needs a TMDB key.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow(String(localized: "Blur unwatched episodes"), [("1", "Blur"), ("0", "Show")],
-                      selection: Binding(get: { spoilerBlur ? "1" : "0" }, set: { spoilerBlur = ($0 == "1") }))
-            Text("Blur episode thumbnails you have not watched yet, to avoid spoilers.")
+            // Spoiler-safe mode supersets the old thumbnail-only blur: it veils an unwatched episode's art AND
+            // synopsis. One row drives both the new key and the legacy `vortx.spoilerBlur` so turning it off
+            // fully clears the veil (no leftover legacy default-on blur). Retires the separate blur row.
+            choiceRow(String(localized: "Spoiler-safe mode"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { spoilerSafe ? "1" : "0" },
+                                         set: { spoilerSafe = ($0 == "1"); spoilerBlur = ($0 == "1") }))
+            Text("Veils art and synopsis for episodes you have not watched yet, to avoid spoilers.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
@@ -1145,6 +1227,69 @@ struct SettingsView: View {
     }
 }
 
+/// The searchable Settings sections on Apple TV. Each case carries the section's on-screen title plus the
+/// row keywords it should match, so the search field can filter the tree by a case-insensitive substring of
+/// any title or row label. Keywords are stored lowercased so matching is a plain `contains`. Kept in sync
+/// with the sections `SettingsView` actually renders (the iOS `iOSSettingsView` keeps its own equivalent).
+private enum SettingsSearchSection: CaseIterable {
+    case profiles, account, stremioMirror, playback, notifications, streams, community,
+         server, tabBar, appearance, audioSubtitle, subtitle, advanced, backup, about
+
+    var title: String {
+        switch self {
+        case .profiles: return "Profiles"
+        case .account: return "Account"
+        case .stremioMirror: return "Stremio mirror"
+        case .playback: return "Playback"
+        case .notifications: return "Notifications"
+        case .streams: return "Streams"
+        case .community: return "Community"
+        case .server: return "Streaming Server"
+        case .tabBar: return "Tab Bar"
+        case .appearance: return "Appearance"
+        case .audioSubtitle: return "Audio & Subtitles"
+        case .subtitle: return "Subtitle Style"
+        case .advanced: return "Advanced (mpv options)"
+        case .backup: return "Backup & Restore"
+        case .about: return "About"
+        }
+    }
+
+    var keywords: [String] {
+        switch self {
+        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
+        case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
+                               "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
+                               "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
+                               "media server", "plex", "jellyfin", "emby", "api key"]
+        case .stremioMirror: return ["mirror", "two-way sync", "add-ons", "library", "continue watching"]
+        case .playback: return ["direct links only", "audio output", "video upscaling", "streaming cache",
+                                "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
+                                "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
+                                "trickplay", "autoplay trailers", "trailer language", "default volume",
+                                "auto-add watched", "play in", "external player"]
+        case .notifications: return ["new episode alerts", "episode", "notification"]
+        case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
+                               "safety filter", "regex", "max quality", "minimum quality", "max file size",
+                               "compact source rows", "pinned sources", "resolution"]
+        case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
+        case .server: return ["server", "configure server", "restart", "embedded", "node"]
+        case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
+        case .appearance: return ["accent", "background", "oled", "app language", "language",
+                                  "cinematic catalog cards", "hide poster labels", "poster style",
+                                  "collections on home", "collections on discover", "refresh collections",
+                                  "streaming services", "discover & region", "budget & box office", "spoiler",
+                                  "blur", "dolby vision", "hdr", "text size", "performance"]
+        case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
+                                     "subtitles", "forced", "match audio to subtitle"]
+        case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
+        case .advanced: return ["mpv", "custom options", "diagnostic logging", "diagnostic log", "export log"]
+        case .backup: return ["backup", "restore", "export library", "import library"]
+        case .about: return ["version", "player", "what's new", "update", "libmpv", "mpvkit"]
+        }
+    }
+}
+
 private struct TogglePill: View {
     let isOn: Bool
 
@@ -1240,5 +1385,53 @@ private struct AccentCircle: View {
 
     private var ringWidth: CGFloat {
         focused || selected ? 5 : 0
+    }
+}
+
+/// One tapped Upcoming row, routed to its detail page. `metaId` is the meta (series / movie) catalog id.
+private struct TVUpcomingSelection: Identifiable {
+    let metaId: String
+    let type: String
+    var id: String { metaId + "|" + type }
+}
+
+/// The Settings "Upcoming" entry: a self-contained calendar of the next air / release dates of the user's
+/// library AND watchlisted titles. Owns its own `ReleaseCalendarModel` (so it is reachable without visiting
+/// Home) and refreshes it via `refreshUpcoming`, which folds the local watchlist (`LibraryAutoAdd`) in beside
+/// the library. A tapped row opens that title's `DetailView` in a sheet with its own NavigationStack, so the
+/// detail page keeps the navigation context its internal source / episode links need.
+struct TVUpcomingScreen: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()
+    @State private var selected: TVUpcomingSelection?
+
+    var body: some View {
+        UpcomingView(model: releaseCalendar) { id, type in
+            selected = TVUpcomingSelection(metaId: id, type: type)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refresh() }
+        .onChange(of: core.library?.catalog.count ?? 0) { refresh() }
+        .onChange(of: account.addons.count) { refresh() }
+        .sheet(item: $selected) { sel in
+            NavigationStack { DetailView(type: sel.type, id: sel.metaId) }
+        }
+    }
+
+    /// Derived exactly like the Home `refreshReleaseCalendar`: series / movie library ids + names / posters and
+    /// the `providesMeta` add-on bases, handed to `refreshUpcoming` (which adds the watchlisted-not-in-library titles).
+    private func refresh() {
+        let catalog = core.library?.catalog ?? []
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let seriesNames = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshUpcoming(librarySeriesIDs: series.map(\.id), librarySeriesNames: seriesNames,
+                                        libraryMovieIDs: movies.map(\.id), libraryMovieNames: movieNames,
+                                        libraryMoviePosters: moviePosters, metaBases: bases)
     }
 }

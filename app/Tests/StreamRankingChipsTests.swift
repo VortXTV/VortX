@@ -275,6 +275,63 @@ do {
     check(absurdSeedLift == realSeedLift, "absurd seeder count lands in the same tiebreak bucket as a hot real swarm")
 }
 
+// 8. Audio-language filter (#136): the `preferredAudioOnly` filter must drop a source ONLY when it POSITIVELY
+//    advertises a single foreign audio language the viewer did not allow. A source that advertises an ALLOWED
+//    language, states NO language, or is multi-language must always PASS. Mirror of StreamRanking.languageScore
+//    (WITH the #136 langTokens-coverage guard) + the shipped `passesUserFilters` drop `languageScore(text) < 0`.
+//    Keep in lockstep with StreamRanking.languageScore; the langTokens subset below is representative, not full.
+do {
+    // The 12 languages StreamRanking.langTokens can detect (keyed by ISO code; representative word tokens).
+    let langTokens: [String: [String]] = [
+        "en": ["english"], "es": ["spanish", "latino", "castellano"], "fr": ["french", "vostfr"],
+        "de": ["german", "deutsch"], "it": ["italian"], "pt": ["portuguese", "dublado"],
+        "hi": ["hindi"], "ja": ["japanese"], "ko": ["korean"], "zh": ["chinese", "mandarin"],
+        "ar": ["arabic"], "ru": ["russian"],
+    ]
+    func claims(_ text: String, _ code: String) -> Bool {
+        (langTokens[code] ?? []).contains { text.lowercased().contains($0) }
+    }
+    func isMulti(_ text: String) -> Bool {
+        let t = text.lowercased()
+        if t.contains("multi") || t.contains("dual") { return true }
+        return langTokens.keys.filter { claims(t, $0) }.count >= 2
+    }
+    // Mirror of the FIXED StreamRanking.languageScore (foreign demotion == -5000, with the #136 coverage guard).
+    func languageScore(_ text: String, preferred: Set<String>) -> Int {
+        guard !preferred.isEmpty else { return 0 }
+        if preferred.contains(where: { claims(text, $0) }) { return 0 }   // advertises an allowed language
+        if isMulti(text) { return 0 }                                     // multi/dual: viewer's track selectable
+        guard preferred.contains(where: { langTokens[$0] != nil }) else { return 0 }   // #136: undetectable viewer language -> keep
+        let foreign = langTokens.keys.filter { !preferred.contains($0) }
+        return foreign.contains(where: { claims(text, $0) }) ? -5000 : 0
+    }
+    // The shipped filter drops only on a negative score.
+    func audioHidden(_ text: String, preferred: Set<String>) -> Bool { languageScore(text, preferred: preferred) < 0 }
+
+    // THE EXACT BUG: a stream that advertises an ALLOWED language must PASS.
+    check(!audioHidden("Show S01E01 1080p WEB-DL English", preferred: ["en"]),
+          "#136: an English source PASSES for an English-audio viewer")
+    check(!audioHidden("Show S01E01 1080p WEB-DL Spanish", preferred: ["es"]),
+          "#136: a Spanish source PASSES for a Spanish-audio viewer")
+    // Unlabelled source: no language stated -> always kept.
+    check(!audioHidden("Show S01E01 2160p REMUX HDR", preferred: ["en"]),
+          "#136: an unlabelled source PASSES (no language advertised)")
+    // Multi / dual release: the viewer's track is selectable -> kept.
+    check(!audioHidden("Show S01E01 1080p Dual Audio Hindi English", preferred: ["en"]),
+          "#136: a dual-audio release PASSES (multi-language)")
+    // The regression the fix targets: an UNCOVERED viewer language (Turkish, not in langTokens) carried
+    // alongside an English tag. The old code demoted it purely on the English tag, hiding a source that
+    // advertised the allowed (Turkish) language. The coverage guard keeps it.
+    check(!audioHidden("Show S01E01 1080p WEB-DL Turkish English", preferred: ["tr"]),
+          "#136: a Turkish+English dual PASSES for a Turkish viewer (langTokens has no 'tr')")
+    check(!audioHidden("Show S01E01 1080p WEB-DL English", preferred: ["nl"]),
+          "#136: an uncovered-language viewer never has valid sources hidden by the audio filter")
+    // The intended behavior is NOT broken: a single clearly-foreign release a COVERED viewer did not allow
+    // is STILL demoted (dropped), so the filter keeps working for supported languages.
+    check(audioHidden("Show S01E01 2160p WEB-DL Chinese", preferred: ["en"]),
+          "#136: a Chinese-only source is still hidden for an English viewer (filter still works)")
+}
+
 if failures == 0 {
     print("PASS: all StreamRankingChips properties hold")
     exit(0)
