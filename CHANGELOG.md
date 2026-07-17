@@ -4,6 +4,27 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 3 - pending
+
+The largest beta of the 0.3.14 line. It adds deep Trakt integration (check-in, ratings, a resume suggestion, and your lists), your SIMKL plan-to-watch on Home, an Apple TV Top Shelf, Match Frame Rate for smoother films, and a sync fix that stops one device from overwriting another. Android gains trickplay scrub-preview capture, a real settings surface, and library transfer.
+
+### Added
+
+- **Apple TV Top Shelf.** With VortX selected on the Home screen, the top shelf shows your Continue Watching, and picking one opens straight into that title. Apple TV.
+- **Trakt check-in.** Post to Trakt that you are watching a title right now, for the times you are watching where VortX cannot see (a cinema, a broadcast, someone else's screen). It never touches your VortX resume point. Apple TV, iPhone, iPad, and Mac.
+- **Trakt ratings.** Rate any movie or show from one to ten and it goes to your Trakt account. Apple TV, iPhone, iPad, and Mac.
+- **Trakt resume suggestion.** If Trakt has a resume point for a title you have not started in VortX, the title page offers it as a suggestion, without ever overwriting your own position. Apple TV, iPhone, iPad, and Mac.
+- **Trakt lists and SIMKL plan-to-watch on Home.** Your Trakt personal lists and your SIMKL plan-to-watch appear as their own rows, resolved to full posters. Apple TV, iPhone, iPad, and Mac.
+- **Match Frame Rate.** An opt-in Settings switch so a 24p film asks the Apple TV for a 24Hz-family display mode instead of being pulled to 60Hz, removing the judder in slow pans. Off by default, and it only ever asks for a rate the file actually carries. Apple TV.
+- **Auto-delete watched downloads.** A Settings switch that removes a downloaded title once you have finished watching it, so the device reclaims the space on its own. Apple TV, iPhone, iPad, and Mac.
+- **Android: trickplay scrub-preview capture, a real Playback and Sources settings surface, and library transfer.** Trickplay capture runs on the mpv engine only and fails closed when it cannot read a frame. Android.
+
+### Fixed
+
+- **Your account data no longer gets lost between devices (#145).** A sync bug could let one device overwrite settings, profiles, or library entries another device had just changed; syncing now merges each device's latest instead of replacing wholesale, so nothing you change on one device is quietly undone by another. Apple TV, iPhone, iPad, and Mac.
+- **A setting changed on the web dashboard now lands correctly on your devices.** Some appearance and safety settings used different wording on the website than in the app, so a web change could arrive as a value the app could not display and blank the row; the app now understands both spellings and keeps your setting intact. Apple TV, iPhone, iPad, and Mac.
+- **Apple TV focus looks right everywhere.** The stray white system highlight behind some buttons and cards is gone, replaced end to end by VortX's own focus treatment, and glass surfaces sit above the background instead of blending into it. Apple TV.
+
 ## 0.3.14 Beta 2 - 2026-07-15
 
 A fix beta on top of 0.3.14 Beta 1, with the same feature set. It sharpens the Dolby Vision and Atmos handoff on Apple TV, corrects the Mac layout and the liquid-glass player chrome, restores Apple TV focus smoothness, and closes a set of smaller playback and download fixes.
