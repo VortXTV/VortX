@@ -197,6 +197,13 @@ struct HomeView: View {
         focusModel.seedIfEmpty(continueWatching.first?.focusedHero
                                ?? core.boardRows.first?.items.first?.focusedHero)
         focusModel.warm(continueWatching.map(\.focusedHero))
+        // Mirror Continue Watching onto the tvOS Home screen's Top Shelf. Hooked HERE because `seed()`
+        // is already the point every input the shelf cares about converges on: it runs on appear and on
+        // each of the Continue Watching / overlay-profile-history / active-profile changes, so the shelf
+        // tracks the rail (including a profile switch, which must swap whose titles are on show, and a
+        // sign-out, which must clear them). The writer resolves the profile-aware history itself and the
+        // store diffs content, so an unchanged re-seed writes nothing and wakes no extension.
+        TopShelfSnapshotWriter.publishCurrent()
     }
 
     /// Render one reorderable Home section. Each case is the section's ORIGINAL view, unchanged, moved behind

@@ -64,6 +64,18 @@ struct StremioTVApp: App {
             .environmentObject(ProfileStore.shared)
             .environmentObject(VortXSyncManager.shared)
             .preferredColorScheme(.dark)
+            // The app's own `vortx://` scheme. Its only minter today is the Top Shelf extension handing
+            // back a tap from the tvOS Home screen; the router parks the destination and RootView
+            // presents it, so a link that arrives during the splash / profile picker still lands.
+            //
+            // Both Top Shelf actions (select AND play/pause) route here as "open the detail page",
+            // where the primary button already reads "Resume <time>" and runs the real resume: the
+            // exact stored source, a fresh debrid link, the episode-moved gate. A one-press resume
+            // straight from the shelf wants that logic (today private to the Continue Watching rail's
+            // `directResume`) lifted into a shared helper. That is a refactor of the app's most
+            // bug-historied path and does not belong inside a new feature's diff, so it is left as a
+            // deliberate follow-up rather than duplicated out here where the two copies would drift.
+            .onOpenURL { DeepLinkRouter.shared.handle($0) }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.

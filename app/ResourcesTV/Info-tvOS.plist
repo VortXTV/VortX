@@ -42,6 +42,32 @@
 	     ATS key). No effect for embedded-server users (loopback is exempt). (issue #58) -->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>VortX connects to the streaming server you point it at, such as one you run at home on your local network or reach over Tailscale.</string>
+	<!-- VortX's OWN URL scheme, the first one this app has registered. The Top Shelf extension mints
+	     links against it to hand a tap back to the app (StremioTVApp's onOpenURL routes them), and it
+	     is the general front door for any later deep link.
+	     $(VORTX_URL_SCHEME) is substituted per target from project.yml: "vortx" for VortXTV and
+	     "vortx-lite" for VortXTVLite. It MUST stay a build setting rather than a literal, because both
+	     targets share this one plist and can be installed side by side: two apps registering the same
+	     scheme leaves the OS free to pick either as the handler. TopShelfSnapshot.urlScheme reads the
+	     VortXURLScheme key below so the app parses back exactly what it registered. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$(VORTX_URL_SCHEME)</string>
+			</array>
+		</dict>
+	</array>
+	<!-- The registered scheme, readable at runtime (TopShelfSnapshot.urlScheme). CFBundleURLTypes is
+	     awkward to read back and the extension has no copy of it at all, so both processes read this
+	     flat key instead; the extension's own plist carries the same key. -->
+	<key>VortXURLScheme</key>
+	<string>$(VORTX_URL_SCHEME)</string>
 	<!-- Schemes the player's "Play in" handoff may probe with canOpenURL; keep in sync
 	     with ExternalPlayers.candidates. -->
 	<key>LSApplicationQueriesSchemes</key>

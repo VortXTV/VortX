@@ -18,7 +18,8 @@ enum ContentDynamicRange: String {
 }
 
 /// Drives the Apple TV's HDMI display-mode switch so HDR content lights the TV's
-/// HDR mode instead of being tone-mapped to SDR.
+/// HDR mode instead of being tone-mapped to SDR, and (opt-in) so SDR content is sent
+/// at its own frame rate instead of the panel's default.
 ///
 /// tvOS has no extended-dynamic-range flag on CAMetalLayer (that API is iOS and
 /// macOS only). The only HDR output path is asking AVDisplayManager to renegotiate
@@ -32,10 +33,21 @@ enum ContentDynamicRange: String {
 enum HDRDisplayMode {
     private static let log = Logger(subsystem: "com.stremiox.app", category: "hdr")
 
-    /// Posted (once per process) when a display-mode request is refused because the user has
-    /// Match Dynamic Range OFF, so the player chrome can surface an actionable hint instead of the
-    /// request dying silently in the log. `userInfo["message"]` carries the display text.
+    /// Posted (once per process, per kind) when a display-mode request is refused because the user has the
+    /// matching tvOS Match Content setting OFF, so the player chrome can surface an actionable hint instead
+    /// of the request dying silently in the log. `userInfo["message"]` carries the display text.
     static let userHintNotification = Notification.Name("vortx.hdr.userHint")
+
+    /// Match Frame Rate. When ON, an SDR file whose frame rate is known asks the Apple TV for an SDR display
+    /// mode that CARRIES that rate, so a 24p film runs at a 24Hz-family mode instead of being pulled to the
+    /// panel's default 60Hz (the 3:2 pulldown judder in pans). When OFF, an SDR file resets the display mode
+    /// exactly as it always has.
+    ///
+    /// Declared OUTSIDE the `#if os(tvOS)` block on purpose: only tvOS renegotiates an HDMI mode, but the
+    /// iOS/Mac Settings screens bind the same key so the preference exists identically on every app (and the
+    /// account restores one key, not one per platform).
+    static let matchFrameRateKey = "vortx.player.matchFrameRate"
+    static let defaultMatchFrameRate = false
 
     private static func note(_ message: String) {
         log.log("\(message, privacy: .public)")
@@ -158,11 +170,34 @@ enum HDRDisplayMode {
         // 2026-06-10, .ips on file). Real hardware has it since tvOS 11.2. Guard at
         // runtime too in case some device variant ever lacks it.
         guard let manager = displayManager(of: window) else { return }
-        guard range != .sdr else {
+        // SDR: historically an unconditional reset (clear the criteria, let the panel sit in its default
+        // mode). With Match Frame Rate ON and a KNOWN frame rate we instead fall through to the criteria
+        // path below, which builds an SDR criteria carrying `fps` so 24p films stop juddering. Toggle OFF,
+        // or an unknown/absent frame rate (nothing to match), keeps the historical reset unchanged: there is
+        // no rate to ask for, and defaulting to 60 like the HDR path does would be a made-up request.
+        let isFrameRateMatch = (range == .sdr)
+        if isFrameRateMatch, !(matchFrameRateEnabled && fps > 0) {
             reset(in: window)
             return
         }
         guard manager.isDisplayCriteriaMatchingEnabled else {
+            // Same silent-refusal guardrail for both kinds of request, but the actionable setting differs, so
+            // the hint names the one the user actually has to turn on. tvOS exposes ONE combined flag here
+            // (there is no per-axis API), so a frame-rate request can also be refused while only Match Frame
+            // Rate is off and Match Dynamic Range is on; naming Match Frame Rate is still the right advice
+            // for an SDR request. Each kind gets its OWN one-shot flag so an SDR hint cannot swallow the
+            // Dolby Vision / HDR hint later in the same process. Fail-soft: message-only, playback untouched.
+            if isFrameRateMatch {
+                note("frame-rate match skipped: Match Content is OFF (tvOS Settings > Video and Audio > Match Content)")
+                if !matchFrameRateHintPosted {
+                    matchFrameRateHintPosted = true
+                    NotificationCenter.default.post(
+                        name: userHintNotification, object: nil,
+                        userInfo: ["message": "Turn on Settings > Video and Audio > Match Content > Match Frame Rate to play this title at its own frame rate"])
+                }
+                reset(in: window)   // refused: land exactly where the toggle-off path lands
+                return
+            }
             note("display switch skipped: Match Dynamic Range is OFF (tvOS Settings > Video and Audio > Match Content)")
             // Guardrail: this silent refusal is the #1 real-world reason "DV/HDR never engages" (Match
             // Dynamic Range is OFF by default on every Apple TV). Surface ONE user-visible hint per process
@@ -175,6 +210,8 @@ enum HDRDisplayMode {
             }
             return
         }
+        // HDR with an unknown rate keeps its historical 60 default; the SDR path never reaches here with
+        // fps <= 0 (it reset above), so it always carries the file's real rate.
         let rate = Float(fps > 0 ? fps : 60)
         guard let criteria = makeCriteria(range: range, rate: rate, width: width, height: height) else {
             note("display switch failed: could not build criteria")
@@ -232,11 +269,16 @@ enum HDRDisplayMode {
             note("criteria failed: SPI initializer unavailable and public path failed")
             return nil
         }
+        // Exhaustive on purpose. This used to be `default: 4` with a "sdr never reaches here" note, which the
+        // Match Frame Rate path makes false: an SDR request landing on `default` would ask the panel for
+        // HDR10 and light its HDR mode over SDR pixels. Listing every case makes the compiler, not a comment,
+        // enforce that a new ContentDynamicRange gets a deliberate integer.
         let dynamicRange: Int32
         switch range {
+        case .sdr:         dynamicRange = 1
         case .hlg:         dynamicRange = 2
+        case .hdr10:       dynamicRange = 4   // PQ
         case .dolbyVision: dynamicRange = 5
-        default:           dynamicRange = 4   // hdr10 / PQ (sdr never reaches here, it resets above)
         }
         note("criteria via SPI int initializer, videoDynamicRange=\(dynamicRange)")
         return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: dynamicRange)
@@ -244,16 +286,28 @@ enum HDRDisplayMode {
 
     /// A synthetic CMVideoFormatDescription describing the content for the public criteria initializer.
     /// Dolby Vision uses the 'dvh1' codec type (this is what flips videoDynamicRange to 5, the panel's DV
-    /// mode); HDR10 is HEVC+PQ (=4); HLG is HEVC+HLG (=2). All BT.2020, matching real DV/HDR bitstreams.
+    /// mode); HDR10 is HEVC+PQ (=4); HLG is HEVC+HLG (=2). Those three are BT.2020, matching real DV/HDR
+    /// bitstreams. SDR (=1, the Match Frame Rate path) is BT.709 end to end instead: the criteria then says
+    /// "keep the panel in SDR, just take this refresh rate", which is the whole point of the frame-rate
+    /// request. Describing SDR content with the BT.2020/PQ extensions would ask for an HDR mode.
     private static func makeFormatDescription(range: ContentDynamicRange, width: Int, height: Int) -> CMFormatDescription? {
-        let transfer: CFString = range == .hlg
-            ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
-            : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
-        let extensions: [CFString: Any] = [
-            kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
-            kCMFormatDescriptionExtension_TransferFunction: transfer,
-            kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
-        ]
+        let extensions: [CFString: Any]
+        if range == .sdr {
+            extensions = [
+                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+                kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+            ]
+        } else {
+            let transfer: CFString = range == .hlg
+                ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
+                : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+            extensions = [
+                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+                kCMFormatDescriptionExtension_TransferFunction: transfer,
+                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+            ]
+        }
         let codec: CMVideoCodecType = range == .dolbyVision
             ? kCMVideoCodecType_DolbyVisionHEVC   // 'dvh1', the DV sample-entry codec type
             : kCMVideoCodecType_HEVC
@@ -276,6 +330,19 @@ enum HDRDisplayMode {
     /// One user-visible Match-Dynamic-Range hint per process (see the guard in `request`).
     @MainActor
     private static var matchRangeHintPosted = false
+
+    /// One user-visible Match-Frame-Rate hint per process, kept separate from `matchRangeHintPosted` so the
+    /// two kinds of refusal cannot suppress each other.
+    @MainActor
+    private static var matchFrameRateHintPosted = false
+
+    /// The user's Match Frame Rate preference. Read straight off UserDefaults on each request (rather than
+    /// cached) so a change applies to the next title without an app restart, exactly like the tone-map mode
+    /// the mpv lane reads. `object(forKey:) as? Bool` distinguishes "never set" from "set to false", so the
+    /// default lives in one place instead of relying on `bool(forKey:)` returning false for an absent key.
+    private static var matchFrameRateEnabled: Bool {
+        UserDefaults.standard.object(forKey: matchFrameRateKey) as? Bool ?? defaultMatchFrameRate
+    }
 
     /// Return the TV to its default display mode. Safe to call repeatedly.
     @MainActor

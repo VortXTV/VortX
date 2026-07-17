@@ -82,6 +82,7 @@ struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var core: CoreBridge   // tear down the engine Player on a genuine player exit
+    @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
     @State private var splashDone = false
 
     var body: some View {
@@ -93,6 +94,21 @@ struct RootView: View {
             RootTabView()
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
+                // A `vortx://open` link (today: a Top Shelf tap) opens the title's detail page.
+                //
+                // Presented as a REAL modal over the shell, wrapped in its own NavigationStack, which is
+                // the idiom the Upcoming screen's detail sheet already uses. It deliberately does NOT
+                // push into Home's navigation stack: the shell is mounted once and never rebuilt (see the
+                // focus rules above), and reaching into a tab's stack from outside is exactly the kind of
+                // mid-flight mutation that parked the tab bar offscreen. UIKit moves focus into a real
+                // presentation natively, so the Siri remote lands in the detail page and Menu dismisses it
+                // back to wherever the user was.
+                //
+                // Hung on the shell child rather than on the ZStack because the profile picker's cover is
+                // already on the ZStack, and two presentation modifiers on ONE view do not both present.
+                .fullScreenCover(item: deepLinkDetail) { target in
+                    NavigationStack { DetailView(type: target.type, id: target.id) }
+                }
             if let req = presenter.request {
                 // #76: AVPlayer is now FIRST-CLASS under the full TVPlayerView chrome. Every request goes to
                 // TVPlayerView, which picks the engine per stream in `playerSurface` (AVPlayer for HLS / Dolby
@@ -130,6 +146,13 @@ struct RootView: View {
             guard presenter.request == nil else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { TabBarHealer.heal("player-closed") }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { TabBarHealer.heal("player-closed+3s") }
+            // Republish the Top Shelf on playback EXIT: what you just watched is the thing the Home
+            // screen should now be offering to resume. Delayed a beat so the engine has landed the play
+            // record first, otherwise the snapshot captures the pre-play progress. Home's own re-seed
+            // also publishes, so this is the freshness pass for the case where the user leaves the app
+            // straight from the player and never lands back on Home. Cheap and self-deduping: the store
+            // diffs content and writes nothing when the shelf has not actually moved.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { TopShelfSnapshotWriter.publishCurrent() }
         }
         // The picker dismissing (or a profile switch settling) makes the shell visible again; re-assert
         // the bar in case it desynced while hidden, so the menu is never missing on return (issue #75).
@@ -152,6 +175,20 @@ struct RootView: View {
         Binding(
             get: { splashDone && profiles.needsPicker && presenter.request == nil },
             set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+        )
+    }
+
+    /// The deep link's detail page, presented only once the shell is actually ready for it: past the
+    /// splash, past the profile picker, and with no player up.
+    ///
+    /// The target stays PARKED in the router until then rather than being dropped, so the two cases
+    /// that matter both land: a cold launch started BY a Top Shelf tap (the link arrives long before
+    /// the shell mounts) and a tap that arrives while playback is up (it opens when the player closes).
+    /// The getter re-evaluates whenever those inputs change, so parking costs nothing.
+    private var deepLinkDetail: Binding<DeepLinkDetailTarget?> {
+        Binding(
+            get: { splashDone && shellVisible ? router.detailTarget : nil },
+            set: { target in if target == nil { router.detailTarget = nil } }
         )
     }
 }

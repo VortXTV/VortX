@@ -20,6 +20,9 @@ struct SettingsView: View {
     @State private var settingsQuery = ""
     @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
+    // Match Frame Rate: HDRDisplayMode owns both the key and the display-mode behavior it drives, so the key
+    // string lives there rather than being duplicated as a literal across the Settings screens.
+    @AppStorage(HDRDisplayMode.matchFrameRateKey) private var matchFrameRate = HDRDisplayMode.defaultMatchFrameRate
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
@@ -36,6 +39,9 @@ struct SettingsView: View {
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    // Top Shelf mirror of Continue Watching (the tvOS Home screen row). The writer reads this same key,
+    // and the change handler below republishes so a toggle takes effect without waiting for a re-seed.
+    @AppStorage(TopShelfSnapshotWriter.showKey) private var topShelfCW = TopShelfSnapshotWriter.showDefault
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
@@ -100,6 +106,13 @@ struct SettingsView: View {
     // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
     // authorization through UNUserNotificationCenter directly (see setNotifyNewEpisodes below).
     @AppStorage("stremiox.notifyNewEpisodes") private var notifyNewEpisodes = true
+    // Auto-delete watched downloads: a completed download whose title becomes fully finished-watched has its
+    // file + record removed to reclaim space. Default OFF, so the feature stays inert until opted into. SAME
+    // key iOS/Mac binds (DownloadManager.autoDeleteWatchedDefaultsKey is the single source of truth for the
+    // name). Enforcement is already cross-platform: DownloadManager reads this key straight off UserDefaults
+    // at each finished-watched signal, and that path is in SourcesShared with no os(iOS) guard, so tvOS was
+    // already honouring the key with no way to set it here.
+    @AppStorage(DownloadManager.autoDeleteWatchedDefaultsKey) private var autoDeleteWatched = false
     /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
     /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
     private enum AccountFocus: Hashable { case vortx, importStremio }
@@ -121,6 +134,7 @@ struct SettingsView: View {
                     if sectionMatches(.account) { accountSection }
                     if sectionMatches(.stremioMirror) { stremioMirrorSection }
                     if sectionMatches(.playback) { playbackSection }
+                    if sectionMatches(.downloads) { downloadsSection }
                     if sectionMatches(.notifications) { notificationsSection }
                     if sectionMatches(.streams) { streamsSection }
                     if sectionMatches(.community) { communitySection }
@@ -479,6 +493,23 @@ struct SettingsView: View {
         return all.map { (id: String($0), label: $0 == 100 ? String(localized: "Max (100%)") : "\($0)%") }
     }
 
+    // MARK: Downloads
+
+    /// Auto-delete watched downloads. UI only: the enforcement already runs here, since DownloadManager
+    /// reads the same key off UserDefaults at each finished-watched signal from shared code. This is the
+    /// switch that was missing on Apple TV, bound to the SAME key the iOS/Mac view binds, with the same copy.
+    /// Downloads have their own screen on Apple TV, so this sits in Settings next to the other opt-ins rather
+    /// than on the Downloads screen, matching where iOS/Mac put it.
+    private var downloadsSection: some View {
+        section(String(localized: "Downloads")) {
+            choiceRow(String(localized: "Auto-delete watched downloads"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { autoDeleteWatched ? "1" : "0" },
+                                         set: { autoDeleteWatched = ($0 == "1") }))
+            Text("When on, a completed download is removed automatically once you finish watching it, to reclaim space. Off by default, so downloads stay until you delete them.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
     // MARK: Notifications
 
     /// New-episode alerts (F5). Same key + behavior as the iOS view: enabling requests notification
@@ -740,6 +771,21 @@ struct SettingsView: View {
             Text("Tune poster width, corner radius, landscape 16:9 art, and labels, with a live preview.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
+            // Top Shelf: the row tvOS shows on its OWN Home screen when VortX is focused, above the app
+            // grid. Opt-out (default Show), because that row is visible to the whole room the moment the
+            // TV wakes, without opening VortX and without passing the profile picker.
+            // Republished from the SETTER, not a chained `.onChange` on the body: this section's body
+            // already sits against the type-check budget that the b176 gate hit, and one more chained
+            // modifier is how that regresses. It also has to be immediate rather than left to Home's
+            // next re-seed, because someone who just hid the row may well press the TV button straight
+            // from here, and the shelf must already be cleared when they land. @AppStorage writes
+            // through synchronously, so the publish below reads the value just set.
+            choiceRow(String(localized: "Continue Watching on the TV Home screen"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { topShelfCW ? "1" : "0" },
+                                         set: { topShelfCW = ($0 == "1"); TopShelfSnapshotWriter.publishCurrent() }))
+            Text("Puts what you are part-way through on the Apple TV Home screen, above the apps, so it is one press away. Hide it to keep your viewing off that screen.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
             choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
                       selection: Binding(get: { showHubHome ? "1" : "0" }, set: { showHubHome = ($0 == "1") }))
             choiceRow(String(localized: "Collections on Discover"), [("1", "Show"), ("0", "Hide")],
@@ -778,6 +824,14 @@ struct SettingsView: View {
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
             Text("Auto tone-maps HDR and Dolby Vision to SDR only on a TV that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple on your TV; Always HDR forces pass-through.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Frame-rate matching is SDR-only by design: HDR and Dolby Vision titles already ask for their own
+            // frame rate as part of the display-mode switch, so this row adds nothing for them and does not
+            // gate them either.
+            choiceRow(String(localized: "Match Frame Rate"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { matchFrameRate ? "1" : "0" }, set: { matchFrameRate = ($0 == "1") }))
+            Text("Sends a film at its own frame rate, so 24p titles play smoothly instead of juddering in slow pans. Needs Settings > Video and Audio > Match Content > Match Frame Rate turned on in tvOS. Takes effect on the next title you play.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             stepperRow(String(localized: "App text size"), value: theme.textScale,
@@ -1232,7 +1286,7 @@ struct SettingsView: View {
 /// any title or row label. Keywords are stored lowercased so matching is a plain `contains`. Kept in sync
 /// with the sections `SettingsView` actually renders (the iOS `iOSSettingsView` keeps its own equivalent).
 private enum SettingsSearchSection: CaseIterable {
-    case profiles, account, stremioMirror, playback, notifications, streams, community,
+    case profiles, account, stremioMirror, playback, downloads, notifications, streams, community,
          server, tabBar, appearance, audioSubtitle, subtitle, advanced, backup, about
 
     var title: String {
@@ -1241,6 +1295,7 @@ private enum SettingsSearchSection: CaseIterable {
         case .account: return "Account"
         case .stremioMirror: return "Stremio mirror"
         case .playback: return "Playback"
+        case .downloads: return "Downloads"
         case .notifications: return "Notifications"
         case .streams: return "Streams"
         case .community: return "Community"
@@ -1268,6 +1323,7 @@ private enum SettingsSearchSection: CaseIterable {
                                 "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
                                 "trickplay", "autoplay trailers", "trailer language", "default volume",
                                 "auto-add watched", "play in", "external player"]
+        case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
         case .notifications: return ["new episode alerts", "episode", "notification"]
         case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
                                "safety filter", "regex", "max quality", "minimum quality", "max file size",
@@ -1279,7 +1335,9 @@ private enum SettingsSearchSection: CaseIterable {
                                   "cinematic catalog cards", "hide poster labels", "poster style",
                                   "collections on home", "collections on discover", "refresh collections",
                                   "streaming services", "discover & region", "budget & box office", "spoiler",
-                                  "blur", "dolby vision", "hdr", "text size", "performance"]
+                                  "blur", "dolby vision", "hdr", "match frame rate", "frame rate", "judder",
+                                  "24p", "refresh rate", "text size", "performance",
+                                  "top shelf", "tv home screen", "home screen", "continue watching"]
         case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
                                      "subtitles", "forced", "match audio to subtitle"]
         case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
