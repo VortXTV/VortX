@@ -12,6 +12,12 @@ struct DetailView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
+    /// Observed so the episode ticks repaint when an async Trakt shadow pull lands while this page is open.
+    /// The Trakt episode mirror is read synchronously from a non-observable cache, so without this the page
+    /// would show the pre-pull state until some unrelated event happened to re-evaluate it. WatchedIndex
+    /// republishes nothing when the set is unchanged and never rebuilds during playback, so this costs
+    /// nothing in the steady state.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     // #44 in-hero trailer gating, the SAME keys iOS uses: the "Autoplay trailers" setting + reduce-motion.
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
@@ -148,6 +154,23 @@ struct DetailView: View {
     private var ratingsImdbID: String? {
         if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
         return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// The numeric TMDB id when this page was opened from a TMDB-keyed catalog ("tmdb:123",
+    /// "tmdb:movie:123"). Carried alongside `ratingsImdbID` so a title whose tt id has not resolved (or
+    /// does not exist) can still be rated, and so the rating stays findable once the tt id does arrive.
+    /// Same extraction rule as `ScrobbleCoordinator.numericTMDB`, applied to the catalog id.
+    private var ratingTMDBID: Int? {
+        guard id.lowercased().hasPrefix("tmdb") else { return nil }
+        return id.lowercased().split(separator: ":").compactMap { Int($0) }.first
+    }
+
+    /// "Your rating" chip. The SHARED control (SourcesShared/TraktRatingControl.swift), the same view the
+    /// iPhone/iPad/Mac detail page mounts, so the two surfaces cannot drift. It renders nothing unless
+    /// Trakt is configured + connected and the ratings toggle is on, so this is a no-op on a
+    /// credential-less build. Series rate at the SHOW level, matching the title-level watchlist writes.
+    @ViewBuilder private var ratingChip: some View {
+        TraktRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
     }
 
     /// The pool `content_key` for this title (P1). Movies/series key on the imdb id (no season/episode here,
@@ -516,10 +539,16 @@ struct DetailView: View {
 
     /// Series keep the hero + episode-list layout (the page below the hero is full of content).
     private func seriesPage(_ meta: CoreMetaItem, videos: [CoreVideo]) -> some View {
-        let watched = profiles.activeUsesEngineHistory
+        // VortX's own watched set (the authority), then the same set widened by the optional Trakt episode
+        // mirror for DISPLAY. Additive only: the union can add a tick to an episode VortX never saw, never
+        // remove one it recorded. `seriesPrimaryEpisode` takes both because resume must be decided on the
+        // local set alone (see its doc). Mirrors iOSDetailView.localWatchedSet / watchedSet exactly.
+        let localWatched = profiles.activeUsesEngineHistory
             ? (core.metaDetails?.watchedIds ?? [])
             : profiles.watchedVideoIds(forMeta: meta.id)
-        let primary = seriesPrimaryEpisode(videos, watched: watched, metaID: meta.id)
+        let watched = localWatched.union(
+            TraktEpisodeShadow.watchedVideoIDs(showIdentity: meta.id, videos: videos))
+        let primary = seriesPrimaryEpisode(videos, watched: watched, localWatched: localWatched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
         // FIX (build 137): the series/season hero was chopped at the top + not full-bleed because the
         // backdrop lived INSIDE hero(), i.e. inside the VStack inside the ScrollView, so its
@@ -846,7 +875,13 @@ struct DetailView: View {
                         }
                         LibraryChip()
                         WatchlistChip()
+                        ratingChip
                         trailerChip(m)
+                        // "I'm watching this" on Trakt, for a cinema or someone else's TV. A series checks
+                        // into an EPISODE, so it passes the same episode the Play button above would start;
+                        // a movie has none and passes nil. Hidden unless Trakt is connected and the action
+                        // was turned on, so this costs a movie page nothing by default.
+                        TraktCheckinChip(season: primaryEpisode?.season, episode: primaryEpisode?.episode)
                         Spacer(minLength: 0)
                     }
                 }
@@ -1133,7 +1168,12 @@ struct DetailView: View {
         return sortedEpisodes(videos).first { $0.id == videoId }?.season
     }
 
-    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
+    /// The hero's Resume/Play target. `watched` is the DISPLAY set (VortX ∪ the optional Trakt episode
+    /// mirror) and picks the next unstarted episode; `localWatched` is VortX's OWN set and is the only
+    /// thing allowed to veto a resume. Keeping them apart is what stops an optional mirror from overriding
+    /// the account that owns the data (see the resume comment below). Twin of iOSDetailView's version.
+    private func seriesPrimaryEpisode(_ videos: [CoreVideo], watched: Set<String>,
+                                      localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
         let sorted = sortedEpisodes(videos)
         // Resume position: the engine's library entry is account level, so overlay
         // profiles resolve theirs from the profile overlay instead (the same
@@ -1146,10 +1186,18 @@ struct DetailView: View {
             let state = core.metaDetails?.libraryItem?.state
             return (state?.videoId, state?.timeOffset ?? 0)
         }()
+        // RESUME is decided against VortX's OWN watched set, never the Trakt-unioned one. The resume
+        // position and the local watched flag are two halves of one fact this device recorded: "you are
+        // partway through this episode". A Trakt watched flag on that same episode is a staler claim from
+        // an optional mirror (you finished it elsewhere, or on an account that scrobbles other devices),
+        // and if it were allowed to answer here it would suppress the Resume button and jump the user to
+        // the NEXT episode with their half-watched one silently abandoned. The VortX account is primary:
+        // it alone decides where you are. Trakt only contributes below, to skip episodes VortX has no
+        // record of at all.
         if resume.timeOffset > 0,
            let videoId = resume.videoId,
            let video = sorted.first(where: { $0.id == videoId }),
-           !watched.contains(video.id) {
+           !localWatched.contains(video.id) {
             return (video, true)
         }
         if let next = sorted.first(where: { !watched.contains($0.id) }) {
@@ -1652,6 +1700,30 @@ struct CoreStreamList: View {
     /// contribution (also the no-imdb-id case, e.g. a live channel). The feature is further gated on a
     /// TorBox key inside `TorBoxSearchSource.refresh`.
     var imdbId: String? = nil
+
+    /// The title's numeric TMDB id when this page came from a TMDB-keyed catalog ("tmdb:123",
+    /// "tmdb:movie:123"). Same extraction rule as `DetailView.ratingTMDBID`, applied to the library id, so
+    /// a title whose tt id never resolved can still be rated from this row.
+    private var ratingTMDBID: Int? {
+        guard let libraryId = meta?.libraryId.lowercased(), libraryId.hasPrefix("tmdb") else { return nil }
+        return libraryId.split(separator: ":").compactMap { Int($0) }.first
+    }
+
+    /// "Your rating" chip for the sources row, the SAME shared control the hero row and the iPhone/iPad/Mac
+    /// detail page mount, so no surface can drift from another.
+    ///
+    /// This list is the ONLY chip row an episode page has (it never renders the hero row), so without this
+    /// the whole rating feature would be unreachable while bingeing a series, which is exactly where it is
+    /// most wanted. It is declared here rather than borrowed from `DetailView` because this is a separate
+    /// struct: the identifier is not in scope across the type boundary, however adjacent the two rows look.
+    ///
+    /// `imdbId` is already the SHOW-level tt id at EVERY call site (the episode page deliberately passes the
+    /// show's id, not the episode's), which is the exact level ratings are recorded at, so an episode page
+    /// rates its show and matches the title-level intent of the watchlist writes.
+    @ViewBuilder private var ratingChip: some View {
+        TraktRatingChip(imdb: imdbId, tmdb: ratingTMDBID, isSeries: (meta?.type ?? "") == "series")
+    }
+
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
@@ -1728,6 +1800,27 @@ struct CoreStreamList: View {
         guard let meta, !isLive else { return nil }
         let secs = core.engineResumeSeconds(for: meta) ?? ProfileStore.shared.resumeOffset(for: meta)
         return secs >= 1 ? secs : nil
+    }
+
+    /// The runtime used to turn Trakt's playback PERCENT into a timecode. Prefers the engine's real
+    /// (mpv-measured) duration and falls back to the meta's PROVISIONAL `runtime` string; nil when neither
+    /// is known, which suppresses the chip rather than inventing a timecode. Unlike iOS, this view's `meta`
+    /// is a PlaybackMeta (no runtime), so the fallback reads the loaded CoreMetaItem off the bridge.
+    /// (`state.duration` is milliseconds, like `state.timeOffset`.)
+    private var traktDurationSeconds: Double? {
+        if let d = core.metaDetails?.libraryItem?.state.duration, d > 0 { return d / 1000.0 }
+        return core.metaDetails?.meta?.runtimeSeconds
+    }
+
+    /// A position Trakt holds from ANOTHER device worth offering, or nil. Read-only and advisory: it is NOT
+    /// consulted by `resumeSeconds` or by the primary Watch/Resume button, which keep reading VortX's own
+    /// authority. All policy lives in `TraktPlaybackShadow`, shared with iOS so the two cannot drift.
+    /// Suppressed for live channels, which have no resume point to offer.
+    private var traktSuggestionSeconds: Double? {
+        guard let meta, !isLive else { return nil }
+        return TraktPlaybackShadow.shared.suggestionSeconds(for: meta,
+                                                            localSeconds: resumeSeconds,
+                                                            durationSeconds: traktDurationSeconds)
     }
 
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (see `SourceListModel`):
@@ -1844,6 +1937,19 @@ struct CoreStreamList: View {
                         .buttonStyle(ChipButtonStyle())
                     }
 
+                    // "Resume from 41:23": a position Trakt holds from another device that is ahead of this
+                    // one's. A SUGGESTION, never an override: the primary Watch/Resume above still plays from
+                    // THIS device's own saved position, and tapping this only changes where this one playback
+                    // begins (the same seam "Play from start" uses, via playBest's exact-source path, so it
+                    // never re-picks the source either). Nothing here writes engine state, the account, or
+                    // Trakt. Hidden unless the user opted in. Mirrors iOS iOSDetailView.
+                    if let suggestion = traktSuggestionSeconds, let stamp = resumeTimecode(suggestion) {
+                        Button { playBest(best, in: groups, startAt: suggestion) } label: {
+                            Label("Resume from \(stamp)", systemImage: "arrow.triangle.branch")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                    }
+
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
                     // 720p / Others), then the flavors inside it (Dolby Vision · Remux, HDR · Atmos, …).
                     Button { showQualityPicker = true } label: {
@@ -1889,6 +1995,7 @@ struct CoreStreamList: View {
 
                     LibraryChip()
                     WatchlistChip()
+                    ratingChip
                 }
                 // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
                 if let reason = StreamRanking.pickReason(best) {
@@ -1946,6 +2053,10 @@ struct CoreStreamList: View {
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
+        // Warm the Trakt playback shadow so the "Resume from <time>" chip decides off a cache rather than
+        // blocking the page on a network call. Internally throttled, opt-in gated, and a no-op when Trakt is
+        // unconfigured or disconnected, so it costs nothing for everyone else. Mirrors iOS iOSDetailView.
+        .onAppear { TraktPlaybackShadow.shared.refreshIfStale() }
         .task {
             // Belt-and-suspenders over .defaultFocus (a hint tvOS drops when a sibling like the trailer chip
             // is laid out first): force the seat onto the Watch Now slot once, just after appear. One-shot
@@ -2196,11 +2307,17 @@ struct CoreStreamList: View {
     /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
     /// single-resolve `play(best)`, so the no-key / no-cache path is unchanged. A MANUAL row tap still calls
     /// `play(_:)` directly (`streamRow`), resolving exactly the row the user chose.
-    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false) {
-        Task { await playBestResolving(best, in: groups, fromStart: fromStart) }
+    /// `startAt` is "Play from start" generalized past 0:00: begin at an explicit second, still WITHOUT
+    /// re-picking the source and still WITHOUT touching the stored resume point. It carries the Trakt
+    /// "Resume from <time>" chip's offer down to the player and is the ONLY way that feature reaches
+    /// playback. Nothing on this path reads Trakt. Mirrors iOS `playMovie(fromStart:startAt:)`.
+    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false,
+                          startAt: Double? = nil) {
+        Task { await playBestResolving(best, in: groups, fromStart: fromStart, startAt: startAt) }
     }
 
-    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup], fromStart: Bool = false) async {
+    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup],
+                                              fromStart: Bool = false, startAt: Double? = nil) async {
         // EXACT-SOURCE RESUME (owner requirement): if this title was last played through a specific debrid
         // source, resume THAT source directly - reresolve a fresh link for the same file - instead of
         // re-running source selection across every add-on (the "Tried N sources / this source didn't load"
@@ -2223,7 +2340,8 @@ struct CoreStreamList: View {
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
                                                         infoHash: hash, torrentId: entry.debridTorrentId,
                                                         fileId: entry.debridFileId, fileIdx: entry.fileIdx),
-                                                    wasExplicitPick: true, wasResume: true, startFromZero: fromStart)
+                                                    wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
+                                                    startAtSeconds: startAt)
                 return
             }
         }
@@ -2238,17 +2356,19 @@ struct CoreStreamList: View {
             presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
-                                                headers: win.stream.requestHeaders, startFromZero: fromStart)
+                                                headers: win.stream.requestHeaders, startFromZero: fromStart,
+                                                startAtSeconds: startAt)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
         // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
-        await playResolving(best, explicit: false, fromStart: fromStart)
+        await playResolving(best, explicit: false, fromStart: fromStart, startAt: startAt)
     }
 
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
-    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false) async {
+    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool, fromStart: Bool = false,
+                                          startAt: Double? = nil) async {
         // INSTANT FIRST-PLAY: cache-gate the manual resolve on the account-confirmed sets so only a genuinely
         // cached pick runs the blocking debrid resolve (~1 round trip to the direct link); a not-confirmed pick
         // returns nil with zero network and falls straight through to the embedded path below, which plays in a
@@ -2261,7 +2381,7 @@ struct CoreStreamList: View {
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, wasExplicitPick: explicit,
-                                                startFromZero: fromStart)
+                                                startFromZero: fromStart, startAtSeconds: startAt)
             return
         }
         // Today's path, unchanged.
@@ -2272,7 +2392,7 @@ struct CoreStreamList: View {
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, wasExplicitPick: explicit,
-                                            startFromZero: fromStart)
+                                            startFromZero: fromStart, startAtSeconds: startAt)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

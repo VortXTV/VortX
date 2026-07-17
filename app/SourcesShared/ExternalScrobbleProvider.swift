@@ -98,6 +98,28 @@ enum ExternalSyncToggle {
     /// Default OFF: importing another service's history into the read path is opt-in, and it NEVER
     /// writes any engine libraryItem (additive-read only). Callers MUST read it with `default: false`.
     static let traktImportWatched = "vortx.trakt.importWatched"
+    /// Rate titles from the detail page, and mirror those ratings to Trakt. Gates BOTH the rating control
+    /// and its wire: with no native VortX rating store yet, a rating made with the mirror off would land
+    /// only in a local file nothing else reads, so offering the control there would be a half-feature.
+    /// Default ON, like scrobble/watchlist (the control only ever appears once Trakt is CONNECTED, and it
+    /// only moves on a deliberate user action), rather than OFF like `traktImportWatched`, which
+    /// reinterprets another service's history as VortX watched state.
+    /// Turning this OFF never deletes anything: the ratings live in `TraktRatingsStore`'s local shadow,
+    /// so switching it back on restores every rating the user already gave.
+    static let traktRatings = "vortx.trakt.ratings"
+    /// Offer a one-tap "Resume from <time>" chip before playback when Trakt holds a position from another
+    /// device that is ahead of this device's own. Default OFF for the same reason as `traktImportWatched`:
+    /// reading another service's state into a VortX surface is opt-in. It is a SUGGESTION only. VortX stays
+    /// the sole resume authority: nothing behind this key ever writes an engine libraryItem, the account, or
+    /// Trakt. Callers MUST read it with `default: false`.
+    static let traktResumeSuggestion = "vortx.trakt.resumeSuggestion"
+    /// Offer an "I'm watching this" action on detail pages, for viewing that happens where VortX cannot
+    /// see it (a cinema, someone else's TV). Default OFF, and it gates only whether the ACTION IS OFFERED:
+    /// nothing behind this key ever fires on its own, so the check-in itself always takes a deliberate tap.
+    /// OFF by default because this puts a new control on a detail page and announces viewing on the user's
+    /// public Trakt feed; both are things to be asked for, not defaulted into. Callers MUST read it with
+    /// `default: false`.
+    static let traktCheckin = "vortx.trakt.checkin"
 
     /// A toggle's value, returning `defaultOn` when the user has never set it. `defaultOn` MUST match the
     /// key's @AppStorage default in the settings view (ON for scrobble/watchlist, OFF for importWatched),
@@ -135,17 +157,17 @@ struct TraktProvider: ExternalScrobbleProvider {
     var watchlistEnabled: Bool { TraktAuth.isConfigured && ExternalSyncToggle.isOn(ExternalSyncToggle.traktWatchlist) }
 
     func scrobbleStart(_ ref: ExternalMediaRef) async {
-        guard let item = scrobbleItem(ref) else { return }
+        guard let item = Self.scrobbleItem(ref) else { return }
         _ = try? await TraktService.shared.scrobbleStart(item: item, progress: ref.progress)
     }
 
     func scrobblePause(_ ref: ExternalMediaRef) async {
-        guard let item = scrobbleItem(ref) else { return }
+        guard let item = Self.scrobbleItem(ref) else { return }
         _ = try? await TraktService.shared.scrobblePause(item: item, progress: ref.progress)
     }
 
     func scrobbleStop(_ ref: ExternalMediaRef) async {
-        guard let item = scrobbleItem(ref) else { return }
+        guard let item = Self.scrobbleItem(ref) else { return }
         _ = try? await TraktService.shared.scrobbleStop(item: item, progress: ref.progress)
     }
 
@@ -154,7 +176,7 @@ struct TraktProvider: ExternalScrobbleProvider {
         // episode-of-show by season/number (show imdb + S/E), which the flat `TraktSyncItems.episodes`
         // array can't express from just the show's id. A stop at >=80% progress makes Trakt record the
         // watch in history, so the coordinator passes progress 100 on the definitive-watch path.
-        guard let item = scrobbleItem(ref) else { return }
+        guard let item = Self.scrobbleItem(ref) else { return }
         do { _ = try await TraktService.shared.scrobbleStop(item: item, progress: 100) }
         catch { enqueueIfTransient(ref, .watched, error) }
     }
@@ -186,12 +208,16 @@ struct TraktProvider: ExternalScrobbleProvider {
     // MARK: Mapping neutral ref -> Trakt wire types
 
     /// The `ids` bag Trakt accepts, from whichever identity the ref carries.
-    private func ids(_ ref: ExternalMediaRef) -> TraktIDs {
+    private static func ids(_ ref: ExternalMediaRef) -> TraktIDs {
         TraktIDs(imdb: (ref.imdb?.isEmpty == false) ? ref.imdb : nil, tmdb: ref.tmdb)
     }
 
     /// A scrobble target (movie, or episode anchored to its show by season/number).
-    private func scrobbleItem(_ ref: ExternalMediaRef) -> TraktScrobbleItem? {
+    ///
+    /// STATIC and non-private so the user-initiated check-in path (`TraktCheckinModel`) maps a ref the
+    /// SAME way instead of keeping a second copy of this that could drift: `POST /checkin` takes exactly
+    /// the scrobble item shape. Stateless, so this needs no provider instance.
+    static func scrobbleItem(_ ref: ExternalMediaRef) -> TraktScrobbleItem? {
         guard ref.hasUsableID else { return nil }
         if ref.isSeries {
             guard let season = ref.season, let number = ref.episode else { return nil }
@@ -207,8 +233,8 @@ struct TraktProvider: ExternalScrobbleProvider {
     private func titleItems(_ ref: ExternalMediaRef) -> TraktSyncItems? {
         guard ref.hasUsableID else { return nil }
         if ref.isSeries {
-            return TraktSyncItems(shows: [TraktShow(ids: ids(ref), title: ref.title, year: ref.year)])
+            return TraktSyncItems(shows: [TraktShow(ids: Self.ids(ref), title: ref.title, year: ref.year)])
         }
-        return TraktSyncItems(movies: [TraktMovie(ids: ids(ref), title: ref.title, year: ref.year)])
+        return TraktSyncItems(movies: [TraktMovie(ids: Self.ids(ref), title: ref.title, year: ref.year)])
     }
 }

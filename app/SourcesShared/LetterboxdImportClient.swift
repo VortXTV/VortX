@@ -210,8 +210,15 @@ enum ListImport {
     }
 
     /// A stable per-list id so re-importing the same list updates the existing row rather than duplicating it.
+    /// THE one id format for imported rows: `TraktMyListsClient` builds ids through this same call, so adding
+    /// your own list from the My Lists screen and pasting that list's public URL land on the SAME id and
+    /// replace each other in place instead of painting the list twice.
+    static func stableID(provider: ImportedListProvider, user: String, slug: String) -> String {
+        "imported:\(provider.rawValue):\(user):\(slug)".lowercased()
+    }
+
     private static func stableID(_ d: Detected) -> String {
-        "imported:\(d.provider.rawValue):\(d.user):\(d.slug)".lowercased()
+        stableID(provider: d.provider, user: d.user, slug: d.slug)
     }
 
     /// Turn a URL slug into a readable title ("official-top-250" -> "Official Top 250") as a fallback when the
@@ -384,11 +391,16 @@ enum LetterboxdImportClient {
 
 // MARK: - Trakt
 
-/// A public Trakt list read through the documented API. Public lists need only the app's `trakt-api-key`
-/// (client id) header, no OAuth. Each item carries `ids.imdb` and `ids.tmdb` directly, so no title search is
-/// needed. Fail-soft to an empty list on any error.
+/// A Trakt list read through the documented API. Public lists need only the app's `trakt-api-key` (client id)
+/// header, no OAuth. Each item carries `ids.imdb` and `ids.tmdb` directly, so no title search is needed.
+/// Fail-soft to an empty list on any error.
+///
+/// `authorized: true` additionally attaches the signed-in user's bearer, which is what makes a PRIVATE or
+/// friends-only list readable (Trakt answers 404 on those without it). `TraktMyListsClient` passes true; the
+/// paste-a-public-URL path keeps the default false, so pasting a link never silently reaches into the
+/// connected account for a list the link itself could not open.
 enum TraktListImportClient {
-    static func fetchRawList(user: String, slug: String) async -> RawList {
+    static func fetchRawList(user: String, slug: String, authorized: Bool = false) async -> RawList {
         let path: String
         if user.isEmpty {
             path = "/lists/\(ListImport.encodePath(slug))/items/movie,show"
@@ -401,6 +413,9 @@ enum TraktListImportClient {
         req.setValue("2", forHTTPHeaderField: "trakt-api-version")
         req.setValue(TraktAuth.clientID, forHTTPHeaderField: "trakt-api-key")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if authorized, let token = try? await TraktAuth.shared.validToken() {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
 
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse, http.statusCode == 200,

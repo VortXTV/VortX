@@ -230,8 +230,13 @@ final class ScrobbleCoordinator {
     /// Build an `ExternalMediaRef`, resolving the play identity to a Trakt/SIMKL-usable id set. A `tt…`
     /// id is used directly; a `tmdb:…` id resolves to its tt (cached, else one async lookup) and keeps the
     /// numeric tmdb as a fallback; anything else yields no usable id. `nil` when nothing is usable.
-    private static func makeRef(libraryId: String, isSeries: Bool, season: Int?, episode: Int?,
-                                title: String?, progress: Double) async -> ExternalMediaRef? {
+    ///
+    /// Non-private so the user-initiated check-in path (`TraktCheckinModel`) resolves identity through this
+    /// SAME resolver. It is the one place that knows how an engine `libraryId` becomes a service id, and a
+    /// second copy would drift the moment either side learned a new id form. Callers outside the fan-out
+    /// must apply the gates themselves: this resolves an identity, it does not authorize a push.
+    static func makeRef(libraryId: String, isSeries: Bool, season: Int?, episode: Int?,
+                        title: String?, progress: Double) async -> ExternalMediaRef? {
         var imdb: String?
         var tmdb: Int?
         if libraryId.range(of: #"^tt\d{6,}$"#, options: .regularExpression) != nil {
