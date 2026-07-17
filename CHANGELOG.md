@@ -4,19 +4,52 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.14 Beta 2 - 2026-07-15
+## 0.3.14 Beta 3 - 2026-07-17
 
-A fix beta on top of 0.3.14 Beta 1, with the same feature set. It sharpens the Dolby Vision and Atmos handoff on Apple TV, corrects the Mac layout and the liquid-glass player chrome, restores Apple TV focus smoothness, and closes a set of smaller playback and download fixes.
+The largest beta of the 0.3.14 line. It brings twenty new features to Apple TV, iPhone, iPad, and Mac, makes VortX the front door on every Apple device, restores your setup cleanly on a fresh install, holds Dolby Vision and Atmos end to end on Apple TV, and cleans up the Apple TV look. A large Android surface landed this cycle too; Android is build-green and not yet a shipping user platform, so its work is noted at the end rather than in the feature list.
 
-### Fixed (pending next build)
+### New
+
+- **Search your settings.** A search box at the top of Settings jumps straight to any setting by name, so a single toggle no longer means paging through every screen. Apple TV, iPhone, iPad, and Mac.
+- **Two subtitle tracks at once.** Show a second subtitle line alongside the first, for example your own language over the original, each on its own line. Apple TV, iPhone, iPad, and Mac.
+- **Spoiler-safe mode.** For a show you have not caught up on, VortX hides episode titles, thumbnails, and descriptions so an episode list or a Continue Watching card cannot give away what happens next. Turn it on in Settings. Apple TV, iPhone, iPad, and Mac.
+- **Browse your debrid cloud.** See what is already saved in your debrid account and play it straight from inside VortX, with no separate website to open. Apple TV, iPhone, iPad, and Mac.
+- **A watchlist and an upcoming calendar.** Keep a watchlist of what you mean to get to, and see a calendar of when your shows' next episodes and new releases land. Apple TV, iPhone, iPad, and Mac.
+- **A Because you watched rail.** Home suggests titles drawn from what you have actually been watching, so there is always a good next thing to start. Apple TV, iPhone, iPad, and Mac.
+- **Watch stats.** A personal summary of what you have watched and how much, so you can see your own viewing at a glance. Apple TV, iPhone, iPad, and Mac.
+- **Franchise grouping.** Films that belong to one series are gathered together, so a saga reads as a single set instead of scattered entries. Apple TV, iPhone, iPad, and Mac.
+- **A still-watching check.** After a long unattended run, VortX pauses to ask whether you are still there before it plays on through a whole season on its own. Apple TV, iPhone, iPad, and Mac.
+- **Library categories.** Organize your library into your own sections, so a large collection stays sorted the way you think about it. Apple TV, iPhone, iPad, and Mac.
+- **Import your lists.** Bring your watchlists and collections into VortX from Letterboxd, MDBList, and Trakt, so what you have curated elsewhere comes with you. Apple TV, iPhone, iPad, and Mac.
+- **Auto-delete watched downloads.** Optionally free up space by removing a download by itself once you have finished watching it. Turn it on in Settings. iPhone, iPad, and Mac.
+- **Smart library filters.** Filter your library by unwatched, by genre, and more, so you can find exactly what you are in the mood for. Apple TV, iPhone, iPad, and Mac.
+- **A download queue manager.** See everything that is downloading in one place, and reorder, pause, resume, or clear it from a single screen. iPhone, iPad, and Mac.
+- **Advanced Discover filters.** Narrow Discover by genre, year, rating, and more to zero in on what you want to watch. Apple TV, iPhone, iPad, and Mac.
+- **Subtitle timing is remembered.** A subtitle offset you set to line captions up is now saved, so the next time you play that title it is already in sync. Apple TV, iPhone, iPad, and Mac.
+- **Per-show download folders.** Downloads file themselves under the show they belong to, so a long series stays tidy instead of one flat list. iPhone, iPad, and Mac.
+- **Pick the quality before you download.** Choose the quality you want up front instead of taking the default, so a download lands exactly as you meant it to. iPhone, iPad, and Mac.
+- **Reorder your Home rails.** Arrange the rows on Home into the order you want, so what matters to you sits at the top. Apple TV, iPhone, iPad, and Mac.
+- **The sleep timer now works on Apple TV.** Set VortX to stop playing after a chosen time on the Apple TV, the way it already does on your other devices. Apple TV.
+
+### Improved
+
+- **VortX becomes the front door on iPhone, iPad, and Mac too.** Sign-in now leads with your VortX account on iPhone, iPad, and Mac, matching what Apple TV already did, and a VortX sign-in unlocks every tab on its own with no Stremio account required. VortX is now the authority for your account, add-ons, library, and Continue Watching, importing from Stremio once rather than mirroring it continuously, and a device that has not caught up can never overwrite the ones that have. Apple TV, iPhone, iPad, and Mac.
+- **A cleaner Apple TV look.** A focused row no longer paints a heavy white slab over the controls next to it, and the app's glass now lifts off the background as real depth instead of reading as a dark border. Apple TV.
+
+### Fixed
 
 - **A finished TV show now shows as watched, even with specials or an unaired episode (#143).** The show-level watched badge on a series poster used to require every single video to be watched, including Season 0 specials and episodes that have not aired yet, so a show you had actually finished never turned watched, even though each episode's own tick was correct. A series now reads as watched once all of its aired, regular-season episodes are watched: specials are never required, and an episode that has not aired yet does not count against you. This also covers a series whose episodes were marked watched rather than played, which previously left the poster unmarked. Apple TV, iPhone, iPad, and Mac.
 - **Dolby Vision and Atmos on Apple TV, the rest of the fix (#143 logs).** Beyond the packaging stall fixed in Beta 2, the remaining Dolby Vision titles were refused by the player at the very first segment because the stream's internal labels did not match what its playlist promised: the Dolby compatibility brand was declared but not carried inside the stream, and the fallback variant advertised plain HDR while pointing at a Dolby Vision stream. The stream now declares itself consistently end to end, and if any title still fails the player records the exact reason for the next report. Needs an Apple TV to confirm. Apple TV especially, plus iPhone, iPad, and Mac.
+- **A fresh install restores your settings, profiles, and Continue Watching, and a reinstall can no longer wipe them (#145).** Signing in on a fresh install now brings back your settings, profiles, and Continue Watching, and a device that has already restored can no longer be overwritten by a reinstall that came up empty. The restore runs once, waits for a real answer from your account before it applies anything, and retries a blank pull instead of treating it as an empty account, so a network blip during setup can never clear what you had. Needs a reinstall on a real device to confirm end to end. Apple TV, iPhone, iPad, and Mac.
 - **Your title synopsis follows your add-on language (#144).** With a localized catalog add-on, for example French Cinemeta, at the top of your order, the title page description now matches it instead of falling back to English, the same order your catalog rows already use. Apple TV, iPhone, iPad, and Mac.
 - **A removed add-on stays removed (#137).** Deleting a built-in add-on such as YouTube, WatchHub, or Public Domain and reopening the app no longer brings it back; only the protected essentials, Cinemeta and Local Files, are always kept. Apple TV, iPhone, iPad, and Mac.
 - **Batch download saves every selected episode (#142).** Picking two or more episodes to download together could skip the first with a false "no sources" while only the later ones saved. Every episode shares one engine stream slot, and the first episode's lookup could be raced by the detail page still settling, so it read empty for the whole window. The coordinator now re-asserts and re-reads each episode's load until the engine actually registers its sources, instead of trusting one up-front request, so every selected episode that has sources is saved. iPhone, iPad, and Mac.
 - **Keep-only-my-audio-languages no longer over-hides (#136).** For viewers whose audio language is one the ranker cannot yet detect from release names (Turkish, Dutch, Polish, Swedish, and other codes outside the built-in token set), the filter could hide releases that actually carried their language, judging them on an English tag alone. It now keeps any source that advertises an allowed language or states none, and still drops only releases that positively advertise a different one. Viewers on a supported language, English included, are unaffected. Apple TV, iPhone, iPad, and Mac.
 - **Shows watched on Trakt now show as watched (#143).** Titles you finished on Trakt but never added to your library now carry the watched check on their covers, matched by both of a title's ids so a Trakt-only watch is not missed. Apple TV, iPhone, iPad, and Mac.
+
+## 0.3.14 Beta 2 - 2026-07-15
+
+A fix beta on top of 0.3.14 Beta 1, with the same feature set. It sharpens the Dolby Vision and Atmos handoff on Apple TV, corrects the Mac layout and the liquid-glass player chrome, restores Apple TV focus smoothness, and closes a set of smaller playback and download fixes.
 
 ### Fixed (build 182)
 
