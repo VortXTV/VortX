@@ -133,6 +133,12 @@ final class SourcePreferences: ObservableObject, SourcePrefsReading {
     /// profile no longer INHERITS the previously active profile's value (b176 / #117). Change a default
     /// here and both the seed and the switch-reset move together, so the two can never drift.
     static let defaultSafetyMode            = "off"
+    /// Every id the Safety filter may hold, in Picker order (SourcesiOS/iOSSettingsView + SourcesTV/SettingsView
+    /// render these tags). Named here, next to the default, because the ids used to exist ONLY as Picker tags:
+    /// with no list to validate against, a synced doc could carry any string, `safetyMode != "off"` would read
+    /// it as safety-ON, and the Picker had no matching tag to show it with (the webapp shipped "moderate" for
+    /// exactly this reason). ProfileStore gates incoming values against this.
+    static let safetyModes: [String]        = ["off", "balanced", "strict"]
     static let defaultInstantOnly           = false
     static let defaultHideDeadTorrents      = false
     static let defaultHDROnly               = false

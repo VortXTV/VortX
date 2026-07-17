@@ -5,13 +5,24 @@
 // (the :root gold theme in app.css is just the default; every control reads var(--accent*) / var(--bg) /
 // surfaces, so writing overrides onto documentElement re-themes everything for free).
 
+// VOCABULARY (HARD): the six enums below are SYNCED values, not private web state. They are written into
+// doc.profileEdits...playback.{forced,safetyMode,subFont,subColor,subBackground,subSizeScale} and read back
+// RAW by the Apple app (Profiles.playbackPrefs -> applyPlaybackPrefs -> live UserDefaults). The APP is the
+// source of truth for every id here; iOS, tvOS, Android and the vortx.tv dashboard already agree with it.
+// The webapp once shipped its OWN spellings ("moderate", "on", "shadow", "none", "cyan", "mint", "mono"),
+// which the app cannot parse, so a web write silently corrupted the account's playback state. Do not add,
+// rename, or "improve" an id here without changing the app first: an id that is not in the app's list is
+// not a nicer label, it is a corrupt value on someone's Apple TV.
+//   app source of truth ->  SubtitleStyle.fonts / .colors / .backgrounds / .sizeScaleRange (Player/SubtitleStyle.swift)
+//                           TrackPreferences.ForcedPolicy                (Player/TrackPreferences.swift)
+//                           the Safety filter Picker tags               (SourcesiOS/iOSSettingsView.swift)
 export type Background = "warm" | "oled";
-export type SubtitlesMode = "off" | "on" | "forced";
-export type SafetyFilter = "off" | "moderate" | "strict";
+export type SubtitlesMode = "off" | "forced" | "always";
+export type SafetyFilter = "off" | "balanced" | "strict";
 export type Performance = "auto" | "full" | "reduced";
-export type SubtitleFont = "modern" | "classic" | "mono";
-export type SubtitleColor = "white" | "yellow" | "cyan" | "mint";
-export type SubtitleEdge = "outline" | "shadow" | "box" | "none";
+export type SubtitleFont = "modern" | "classic";
+export type SubtitleColor = "white" | "yellow" | "soft";
+export type SubtitleEdge = "outline" | "shaded" | "box";
 export type SourceType = "debrid" | "usenet" | "torrent" | "direct";
 
 export interface Settings {
@@ -80,19 +91,19 @@ export const ACCENTS: Accent[] = [
 /** OLED background overrides (ThemeManager oled branch): true black canvas + neutral surfaces. */
 const OLED = { bg: "#000000", surface1: "#0e0e0f", surface2: "#181819", surface3: "#242426", hairline: "#323234" };
 
-/** Subtitle color presets (the app's Subtitle Style "Color" row). */
+/** Subtitle color presets (the app's Subtitle Style "Color" row). Hexes mirror SubtitleStyle.colors so the
+ *  swatch previews the colour the player will actually draw; a swatch that renders a different colour than
+ *  the app is the same lie as a wrong id, just harder to notice. */
 export const SUB_COLORS: Record<SubtitleColor, string> = {
   white: "#ffffff",
-  yellow: "#f5d061",
-  cyan: "#7fdbff",
-  mint: "#8ce0b0",
+  yellow: "#ffff00",
+  soft: "#f2f2f2",
 };
 
-/** Subtitle font presets - the app's "Modern / Classic / Mono" choices map to web font stacks. */
+/** Subtitle font presets - the app's "Modern / Classic" choices map to web font stacks (SubtitleStyle.fonts). */
 export const SUB_FONTS: Record<SubtitleFont, string> = {
   modern: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
   classic: "'Times New Roman', Georgia, serif",
-  mono: "'SF Mono', 'Roboto Mono', ui-monospace, monospace",
 };
 
 export const TEXT_MIN = 0.8;
@@ -107,7 +118,7 @@ const DEFAULTS: Settings = {
   textScale: 1,
   audioLang: "",
   subtitleLang: "",
-  subtitlesMode: "on",
+  subtitlesMode: "always",
   autoplayTrailers: true,
   mdblistKey: "",
   subtitleScale: 1,
@@ -134,19 +145,75 @@ const DEFAULTS: Settings = {
   subtitleEdge: "outline",
 };
 
-export const SUB_MIN = 0.7;
+// SubtitleStyle.sizeScaleRange (0.60...1.80). The webapp's floor used to be 0.7, so the web slider could
+// not express, and silently re-clamped, a 0.6 set on an app.
+export const SUB_MIN = 0.6;
 export const SUB_MAX = 1.8;
 export const SUB_STEP = 0.1;
+
+/** The canonical id list per synced enum: the app's vocabulary, and the ONLY values that may be persisted
+ *  or written up. Exported so the pickers and the sync bridge render/validate from one authority instead of
+ *  each restating the vocabulary (restating it is how the drift happened in the first place). */
+export const SUB_MODE_IDS: readonly SubtitlesMode[] = ["off", "forced", "always"];
+export const SAFETY_IDS: readonly SafetyFilter[] = ["off", "balanced", "strict"];
+export const SUB_FONT_IDS: readonly SubtitleFont[] = ["modern", "classic"];
+export const SUB_COLOR_IDS: readonly SubtitleColor[] = ["white", "yellow", "soft"];
+export const SUB_EDGE_IDS: readonly SubtitleEdge[] = ["outline", "shaded", "box"];
+
+/** LEGACY SHIM: the webapp's old private spellings -> the app's vocabulary. Real accounts already hold these
+ *  values (written by every shipped webapp build to date), in localStorage AND in the synced doc, so reading
+ *  them has to MIGRATE rather than reject: rejecting would silently revert a user's real choice. Each legacy
+ *  id maps to the app value closest to the user's original intent; "cyan"/"mint" and "none" have no app
+ *  equivalent at all and degrade to the app default for that row. Retire a row here only once no live doc can
+ *  still carry it, which is not a thing we can currently prove, so treat this table as permanent. */
+const LEGACY_SUB_MODE: Readonly<Record<string, SubtitlesMode>> = { on: "always" };
+const LEGACY_SAFETY: Readonly<Record<string, SafetyFilter>> = { moderate: "balanced" };
+const LEGACY_SUB_FONT: Readonly<Record<string, SubtitleFont>> = { mono: "modern" };
+const LEGACY_SUB_COLOR: Readonly<Record<string, SubtitleColor>> = { cyan: "white", mint: "white" };
+const LEGACY_SUB_EDGE: Readonly<Record<string, SubtitleEdge>> = { shadow: "shaded", none: "outline" };
+
+/** Canonical id, migrated legacy id, or undefined when the value is absent/unrecognized. Undefined means "I
+ *  do not know what this is": every caller then keeps the value it already had rather than inventing one. */
+function canonId<T extends string>(v: unknown, ids: readonly T[], legacy: Readonly<Record<string, T>>): T | undefined {
+  if (typeof v !== "string") return undefined;
+  return (ids as readonly string[]).includes(v) ? (v as T) : legacy[v];
+}
+
+export const canonSubMode = (v: unknown): SubtitlesMode | undefined => canonId(v, SUB_MODE_IDS, LEGACY_SUB_MODE);
+export const canonSafety = (v: unknown): SafetyFilter | undefined => canonId(v, SAFETY_IDS, LEGACY_SAFETY);
+export const canonSubFont = (v: unknown): SubtitleFont | undefined => canonId(v, SUB_FONT_IDS, LEGACY_SUB_FONT);
+export const canonSubColor = (v: unknown): SubtitleColor | undefined => canonId(v, SUB_COLOR_IDS, LEGACY_SUB_COLOR);
+export const canonSubEdge = (v: unknown): SubtitleEdge | undefined => canonId(v, SUB_EDGE_IDS, LEGACY_SUB_EDGE);
+
+/** Clamp the fine subtitle multiplier into SubtitleStyle.sizeScaleRange. */
+export const canonSubScale = (n: number): number => Math.min(SUB_MAX, Math.max(SUB_MIN, n));
+
+/** Force a settings object onto the app's vocabulary, migrating legacy ids and falling back to the default
+ *  for anything unrecognized. Applied to every localStorage read, so a browser holding pre-fix values heals
+ *  on load and can never write a foreign id back up to the account. */
+export function canonicalizeSettings(s: Settings): Settings {
+  return {
+    ...s,
+    subtitlesMode: canonSubMode(s.subtitlesMode) ?? DEFAULTS.subtitlesMode,
+    safetyFilter: canonSafety(s.safetyFilter) ?? DEFAULTS.safetyFilter,
+    subtitleFont: canonSubFont(s.subtitleFont) ?? DEFAULTS.subtitleFont,
+    subtitleColor: canonSubColor(s.subtitleColor) ?? DEFAULTS.subtitleColor,
+    subtitleEdge: canonSubEdge(s.subtitleEdge) ?? DEFAULTS.subtitleEdge,
+    subtitleScale: canonSubScale(typeof s.subtitleScale === "number" && Number.isFinite(s.subtitleScale) ? s.subtitleScale : 1),
+  };
+}
 
 let cache: Settings | null = null;
 const listeners = new Set<(s: Settings) => void>();
 
-/** Read the persisted settings, merged over defaults (tolerant of corrupt / partial JSON). */
+/** Read the persisted settings, merged over defaults (tolerant of corrupt / partial JSON) and forced onto the
+ *  app's vocabulary. The canonicalize step is what stops a browser that still holds pre-fix values (this key
+ *  long predates the fix) from feeding a legacy id straight back into the account on the next write-up. */
 export function getSettings(): Settings {
   if (cache) return cache;
   try {
     const raw = localStorage.getItem(KEY);
-    cache = raw ? { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) } : { ...DEFAULTS };
+    cache = canonicalizeSettings(raw ? { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Settings>) } : { ...DEFAULTS });
   } catch {
     cache = { ...DEFAULTS };
   }
@@ -219,21 +286,20 @@ export function applySettings(s: Settings = getSettings()): void {
   applySubtitleEdge(root, s.subtitleEdge);
 }
 
-/** Map the subtitle "Background" choice to the cue backing + text edge (`video::cue` reads both vars). */
+/** Map the subtitle "Background" choice to the cue backing + text edge (`video::cue` reads both vars). The
+ *  backing alphas mirror SubtitleStyle.mpvOptions' sub-back-color: shaded = #80000000 (~50% black), box =
+ *  #FF000000 (opaque), outline = #00000000 (none, the outline carries the contrast). Keeping these in step
+ *  with mpv is what makes the same id look the same on web and on device. */
 function applySubtitleEdge(root: HTMLElement, edge: SubtitleEdge): void {
   const outline =
     "-1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000, 0 0 4px rgba(0,0,0,0.9)";
   switch (edge) {
     case "box":
-      root.style.setProperty("--sub-bg", "rgba(0, 0, 0, 0.75)");
+      root.style.setProperty("--sub-bg", "rgba(0, 0, 0, 1)");
       root.style.setProperty("--sub-shadow", "none");
       break;
-    case "shadow":
-      root.style.setProperty("--sub-bg", "transparent");
-      root.style.setProperty("--sub-shadow", "2px 2px 4px rgba(0,0,0,0.95)");
-      break;
-    case "none":
-      root.style.setProperty("--sub-bg", "transparent");
+    case "shaded":
+      root.style.setProperty("--sub-bg", "rgba(0, 0, 0, 0.5)");
       root.style.setProperty("--sub-shadow", "none");
       break;
     case "outline":

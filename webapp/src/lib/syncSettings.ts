@@ -15,15 +15,15 @@ import {
   ACCENTS,
   TEXT_MIN,
   TEXT_MAX,
-  SUB_MIN,
-  SUB_MAX,
+  canonSubMode,
+  canonSafety,
+  canonSubFont,
+  canonSubColor,
+  canonSubEdge,
+  canonSubScale,
+  canonicalizeSettings,
   type Settings,
   type Background,
-  type SubtitlesMode,
-  type SafetyFilter,
-  type SubtitleFont,
-  type SubtitleColor,
-  type SubtitleEdge,
   type SourceType,
 } from "./settings";
 
@@ -39,12 +39,10 @@ function oneOf<T extends string>(v: unknown, set: readonly T[]): T | undefined {
 }
 
 const BACKGROUNDS = ["warm", "oled"] as const;
-const SUB_MODES: readonly SubtitlesMode[] = ["off", "on", "forced"];
-const SAFETY: readonly SafetyFilter[] = ["off", "moderate", "strict"];
-const SUB_FONT_IDS: readonly SubtitleFont[] = ["modern", "classic", "mono"];
-const SUB_COLOR_IDS: readonly SubtitleColor[] = ["white", "yellow", "cyan", "mint"];
-const SUB_EDGE_IDS: readonly SubtitleEdge[] = ["outline", "shadow", "box", "none"];
 const SOURCE_TYPES: readonly SourceType[] = ["debrid", "usenet", "torrent", "direct"];
+// The synced enums are NOT restated here on purpose: settings.ts owns the vocabulary and this module reads
+// it through the canon* helpers. This file previously kept its own copy of all five lists, which is exactly
+// how the webapp drifted from the app without anything failing loudly.
 
 /** The MAIN/owner profile id in the synced doc (the profile whose settings mirror the webapp's single
  *  global Settings). The entry flagged `main`, else the first profile. Null when there are no profiles. */
@@ -97,16 +95,18 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
   if (audio !== undefined) out.audioLang = audio;
   const sub = str(p.subtitleLang);
   if (sub !== undefined) out.subtitleLang = sub;
-  const mode = oneOf<SubtitlesMode>(p.forced ?? p.forcedPolicy, SUB_MODES);
+  // canon* accepts the app's vocabulary AND migrates the webapp's own legacy spellings, so a doc this
+  // browser corrupted before the fix reads back as the user's intent instead of being dropped.
+  const mode = canonSubMode(p.forced ?? p.forcedPolicy);
   if (mode) out.subtitlesMode = mode;
-  const font = oneOf<SubtitleFont>(p.subFont, SUB_FONT_IDS);
+  const font = canonSubFont(p.subFont);
   if (font) out.subtitleFont = font;
-  const color = oneOf<SubtitleColor>(p.subColor, SUB_COLOR_IDS);
+  const color = canonSubColor(p.subColor);
   if (color) out.subtitleColor = color;
-  const edge = oneOf<SubtitleEdge>(p.subBackground, SUB_EDGE_IDS);
+  const edge = canonSubEdge(p.subBackground);
   if (edge) out.subtitleEdge = edge;
   const ss = num(p.subSizeScale);
-  if (ss !== undefined) out.subtitleScale = clamp(ss, SUB_MIN, SUB_MAX);
+  if (ss !== undefined) out.subtitleScale = canonSubScale(ss);
 
   // Stream filtering + ranking.
   const ao = bool(p.useAddonOrder);
@@ -115,7 +115,7 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
     const order = (p.sourceTypeOrder as unknown[]).map((x) => oneOf<SourceType>(x, SOURCE_TYPES)).filter((x): x is SourceType => !!x);
     if (order.length) out.sourceOrder = [...new Set(order)];
   }
-  const safety = oneOf<SafetyFilter>(p.safetyMode, SAFETY);
+  const safety = canonSafety(p.safetyMode);
   if (safety) out.safetyFilter = safety;
   const inst = bool(p.instantOnly);
   if (inst !== undefined) out.instantOnly = inst;
@@ -141,8 +141,12 @@ export function settingsPatchFromDoc(doc: Obj): Partial<Settings> {
  *  settings object, preserving keys the webapp does not model (avatar, isKids, subSize, keywordsAreRegex,
  *  etc.) so a web write never drops an app/dashboard value. Returns the new settings object to store at
  *  doc.profileEdits.roster[main].settings (dashboard-compatible shape: `accent` + nested `playback`). */
-export function mergeWebappSettingsIntoProfile(existing: unknown, s: Settings): Obj {
+export function mergeWebappSettingsIntoProfile(existing: unknown, sIn: Settings): Obj {
   const base = obj(existing);
+  // Canonicalize AT THE BOUNDARY. getSettings() already heals what it loads, but this is the one function
+  // that puts web values into the account doc, and the app reads those values raw. Gating here means no
+  // future caller (a test, an importer, a restored backup) can push a foreign id into someone's account.
+  const s = canonicalizeSettings(sIn);
   return {
     ...base,
     // Write BOTH accent (dashboard key) and accentID (app key) to the same value so neither reader, nor
