@@ -30,11 +30,12 @@ import org.json.JSONObject
  * `vortx.profiles` (best-effort, for a doc authored by Apple / the web before SettingsBackup lands).
  *
  * NEVER-SHRINK: [buildVortx] deep-copies the pulled vortx block and OVERWRITES only the keys this round
- * owns (profiles / roster / byProfile / deletedProfiles / activeProfile / updatedAt / rosterModified),
- * so foreign keys another surface wrote (addons, addonsOwnedAt, library, deletedAddons/Ts,
- * deletedLibrary/Ts) survive the write untouched. Existing `byProfile` buckets are carried forward and
- * only overwritten where the local overlay actually has entries, so a device that lacks a profile's
- * overlay never shrinks the account's copy of it.
+ * owns (profiles / roster / byProfile / activeProfile / updatedAt / rosterModified), so foreign keys
+ * another surface wrote (addons, addonsOwnedAt, library, deletedAddons/Ts, deletedLibrary/Ts) survive the
+ * write untouched. Existing `byProfile` buckets are carried forward and only overwritten where the local
+ * overlay actually has entries, so a device that lacks a profile's overlay never shrinks the account's
+ * copy of it. `deletedProfiles` is not overwritten at all: it is READ-MERGED (pulled UNION local), so a
+ * device can only ever ADD a delete tombstone and never retract one a peer authored (#145 M6).
  *
  * NEVER-ZERO: a momentarily-empty local roster (there should always be at least the owner, but be
  * defensive) returns the existing vortx block unchanged rather than writing an empty roster over a
@@ -229,7 +230,24 @@ object VortXSyncDoc {
 
         // Durable cross-device delete tombstones (app-authoritative; the dashboard only READS them). Empty
         // set is omitted so a fresh account never writes the key.
-        if (deleted.isNotEmpty()) v.put("deletedProfiles", JSONArray(deleted.toList())) else v.remove("deletedProfiles")
+        //
+        // READ-MERGE, never rebuild-from-local (#145 M6). This was the one key that broke the never-shrink
+        // contract this block otherwise honors: `v` is a deep copy of the pulled block, so `remove` here
+        // ACTIVELY DELETED the account's tombstones whenever the LOCAL set happened to be empty (a fresh
+        // install / reinstall), and `put(local)` overwrote a peer's tombstone this device had not folded.
+        // Either way the next union-merge RESURRECTED the deleted profile. UNION the pulled set with the
+        // local one instead: this device may only ADD a tombstone, never retract one another device authored.
+        // Ids are normalized (Apple emits UPPERCASE `uuidString`; normalizeId uppercases) and the owner is
+        // dropped defensively, so a foreign-cased id cannot fork into a second, non-matching tombstone.
+        // Sorted for a deterministic array that is byte-identical to Apple `vortxSummary` for the same set.
+        // The union can only be empty when the pulled set was empty too, so `remove` is now just the
+        // fresh-account/omit-when-empty shape guard (and strips a malformed empty key) - it can no longer
+        // drop a populated set. Mirrors Apple `vortxSummary`'s deletedProfiles read-merge.
+        val priorDeleted = existingVortx?.optJSONArray("deletedProfiles")?.toStringList().orEmpty()
+            .map { UserProfile.normalizeId(it) }
+            .filter { it != UserProfile.OWNER_ID }
+        val deletedUnion = (deleted + priorDeleted).sorted()
+        if (deletedUnion.isNotEmpty()) v.put("deletedProfiles", JSONArray(deletedUnion)) else v.remove("deletedProfiles")
 
         // updatedAt: epoch-MS, byte-parity with Apple (the dashboard reads it). rosterModified: the
         // epoch-SECONDS tiebreak a peer Android device folds via mergeInRoster's `incomingModified`.

@@ -61,6 +61,33 @@ final class ThemeManager: ObservableObject {
         textScale = saved.map { min(max($0, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound) } ?? 1.0
     }
 
+    /// Re-read the persisted theme into the published properties. This object reads these three keys ONLY
+    /// in `init`, so anything that rewrites them behind it (an account settings pull, a backup file restore:
+    /// both write `UserDefaults` directly, and `UserDefaults` KVO does not fire for DOTTED keys like these,
+    /// so nothing else notices) leaves the singleton holding the PRE-restore values.
+    ///
+    /// That is not merely a stale repaint. Every property here re-persists itself in `didSet`, so the next
+    /// write from ANY path (a profile switch through `applyTheme`, the iOS Stepper's `$theme.textScale`
+    /// binding, the tvOS +/- buttons via `adjustTextScale`) flushes the STALE in-memory value straight back
+    /// over the value the restore just wrote, and the restored theme is permanently gone. Re-reading first is
+    /// what makes that write-back harmless: it can then only ever write the restored value back.
+    ///
+    /// Assigning re-fires each `didSet`, which re-persists the identical value it was just read from (a no-op
+    /// write) and publishes, so observers repaint LIVE without a relaunch. Guarded per property so an
+    /// unchanged value never churns `objectWillChange`. The defaults mirror `init` exactly, so a restore that
+    /// omits a key lands on the same value a fresh launch would pick. Call on the main thread (the same
+    /// contract as `SourcePreferences.reload`).
+    func reloadFromDefaults() {
+        let d = UserDefaults.standard
+        let savedAccent = d.string(forKey: Self.accentKey) ?? "vortx"
+        if accentID != savedAccent { accentID = savedAccent }
+        let savedOLED = d.bool(forKey: Self.oledKey)
+        if oled != savedOLED { oled = savedOLED }
+        let savedScale = (d.object(forKey: Self.textScaleKey) as? Double)
+            .map { min(max($0, Self.textScaleRange.lowerBound), Self.textScaleRange.upperBound) } ?? 1.0
+        if textScale != savedScale { textScale = savedScale }
+    }
+
     /// Nudge the text scale one step within range (the tvOS Settings +/- buttons; the iOS Settings
     /// Stepper writes `$theme.textScale` directly). Rounds to whole percent; the `textScale` setter
     /// clamps to range and publishes, so observers repaint live.

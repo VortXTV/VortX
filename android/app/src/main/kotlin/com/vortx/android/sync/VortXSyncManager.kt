@@ -452,6 +452,13 @@ class VortXSyncManager(context: Context) {
             // remote-apply flag so this union does not self-arm a push.
             applyingRemote = true
             try {
+                // TOMBSTONES FIRST (#145 M6), the same precedence syncDown already applies and the same
+                // order Apple `mergeLocalIntoDoc` folds in: mergeInRoster below SUBTRACTS deletedProfileIDs
+                // from the union, so without this fold the pulled cloud roster re-seeds a profile a peer
+                // deleted and the push sends it straight back up, resurrecting it on every device. The fold
+                // is a monotone, idempotent union that also prunes the live roster, so it needs no version
+                // gate; buildVortx then emits the folded set (and read-merges the pulled one again).
+                if (parsed.deletedProfiles.isNotEmpty()) store.mergeDeletedTombstones(parsed.deletedProfiles)
                 parsed.roster?.let { if (it.isNotEmpty()) store.mergeInRoster(it, parsed.rosterModifiedSeconds) }
             } finally {
                 applyingRemote = false

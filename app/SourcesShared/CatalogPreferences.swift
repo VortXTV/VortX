@@ -279,6 +279,41 @@ final class CatalogPreferences: ObservableObject {
     }
     private init() {}
 
+    /// Re-read every persisted catalog/appearance preference. These properties are seeded ONLY at init, so an
+    /// account settings pull or a backup restore (direct `UserDefaults` writes, and `UserDefaults` KVO does
+    /// not fire for the dotted keys behind `CatalogPrefsStore`) leaves the singleton on the pre-restore values.
+    ///
+    /// `landscapeCards` ... `discoverFilters` each re-persist themselves in `didSet`, so leaving them stale
+    /// means the next Appearance/Poster-Style/Discover-filter change flushes the whole stale set back over the
+    /// restored one. Re-read first so a later write can only build on the restored value. `hidden` / `order` /
+    /// `hiddenCategories` are mutated through the store (read-modify-write against `UserDefaults`), so those
+    /// carry only the stale-display half of the bug; they are re-read here for the same live-repaint reason.
+    ///
+    /// Guarded per property so an unchanged value never churns `objectWillChange` (and, for `regionOverride`,
+    /// never fires a redundant hub reload). Call on the main thread.
+    func reloadFromDefaults() {
+        let savedHidden = CatalogPrefsStore.hidden()
+        if hidden != savedHidden { hidden = savedHidden }
+        let savedOrder = CatalogPrefsStore.order()
+        if order != savedOrder { order = savedOrder }
+        let savedCategories = CatalogPrefsStore.hiddenCategories()
+        if hiddenCategories != savedCategories { hiddenCategories = savedCategories }
+        let savedLandscape = CatalogPrefsStore.landscapeCards()
+        if landscapeCards != savedLandscape { landscapeCards = savedLandscape }
+        let savedWidth = CatalogPrefsStore.widthPreset()
+        if posterWidth != savedWidth { posterWidth = savedWidth }
+        let savedRadius = CatalogPrefsStore.radiusPreset()
+        if posterRadius != savedRadius { posterRadius = savedRadius }
+        let savedHideLabels = CatalogPrefsStore.hideLabels()
+        if hidePosterLabels != savedHideLabels { hidePosterLabels = savedHideLabels }
+        let savedLayout = CatalogPrefsStore.homeLayout()
+        if homeLayout != savedLayout { homeLayout = savedLayout }
+        let savedRegion = CatalogPrefsStore.regionOverride()
+        if regionOverride != savedRegion { regionOverride = savedRegion }
+        let savedFilters = CatalogPrefsStore.discoverFilters()
+        if discoverFilters != savedFilters { discoverFilters = savedFilters }
+    }
+
     func isHidden(_ key: String) -> Bool { hidden.contains(key) }
 
     /// Whether a Discover-hub category (a card, a genre, or a whole section) is hidden.
