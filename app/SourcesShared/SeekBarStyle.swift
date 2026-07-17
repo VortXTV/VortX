@@ -414,7 +414,8 @@ struct SeekBarStylePicker: View {
                     .foregroundStyle(Theme.Palette.textSecondary)
                 ForEach(SeekBarStyle.allCases) { style in
                     Button { raw = style.rawValue } label: { row(style) }
-                        .buttonStyle(.plain)
+                        // tvOS: `.plain` left the system focus platter on, and it travelled the whole style list.
+                        .vortxCardButton()
                 }
             }
             .padding(.horizontal, Theme.Space.screenInset)

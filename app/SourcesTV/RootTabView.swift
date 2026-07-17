@@ -317,6 +317,10 @@ struct RootTabView: View {
         }
         .onAppear {
             applyTabBarAccent()
+            // Same idea as applyTabBarAccent, for the other tvOS system-white default: the UITextField
+            // card. Stand it down once at shell appear so every field on tvOS shows the VortX surface
+            // authored behind it instead of an opaque near-white slab. See VortXGlass.applyTextFieldAppearance.
+            VortXGlass.applyTextFieldAppearance()
             updates.startMonitoring()   // launch check + hourly re-check while open
             let name = Self.tabName(selection)
             VXProbeState.shared.setRoute(name)
@@ -417,17 +421,28 @@ struct RootTabView: View {
         item.focused.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.onAccent)]
         item.focused.iconColor = UIColor(Theme.Palette.onAccent)
         let appearance = UITabBarAppearance()
-        // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and tint it with the
-        // SAME warm fill the SwiftUI VortXGlass material uses, so the tvOS top nav reads as VortX glass and
-        // matches the Mac / iOS chrome. Under Reduce Transparency, stand down to an opaque warm surface for
-        // legibility. RE-SKIN ONLY: this changes the bar's BACKGROUND appearance; the native TabView, its
-        // focus engine, tab tags/order, and the ember selection indicator below are all untouched.
+        // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and give it the REAL
+        // VortX glass treatment, so the tvOS top nav reads as VortX glass and matches the Mac / iOS chrome.
+        // Under Reduce Transparency, stand down to an opaque warm surface for legibility. RE-SKIN ONLY: this
+        // changes the bar's BACKGROUND appearance; the native TabView, its focus engine, tab tags/order, and
+        // the ember selection indicator below are all untouched.
+        //
+        // This used to be `backgroundColor = fillUIColor(barFillAlpha)`, which was a colour WASH and nothing
+        // else: no top highlight, no shadow, and no visible surface either. The wash painted the bar with the
+        // fixed near-black SCRIM tone, but this bar floats over the app's OWN dark chrome, so the scrim
+        // dragged it toward the canvas it was already sitting on instead of raising it. Measured on Apple TV
+        // 4K: the bar rendered at a 1.002:1 contrast ratio against the canvas, i.e. the app's highest chrome
+        // was invisible, while an inline settings card behind it read at 1.102:1. The bar now takes the `.lift`
+        // tone AND its 1px lit top edge via `tabBarBackgroundImage()` (drawn, because a native bar cannot host
+        // a SwiftUI material), over the system blur that `configureWithDefaultBackground` supplies, so content
+        // scrolling behind the bar is still sampled. The drop shadow is applied per-bar in `retintTabBars`,
+        // where the real `UITabBar` layer is in hand.
         if UIAccessibility.isReduceTransparencyEnabled {
             appearance.configureWithOpaqueBackground()
             appearance.backgroundColor = UIColor(Theme.Palette.surface1)
         } else {
             appearance.configureWithDefaultBackground()
-            appearance.backgroundColor = VortXGlass.fillUIColor(VortXGlass.barFillAlpha)
+            appearance.backgroundImage = VortXGlass.tabBarBackgroundImage()
         }
         appearance.selectionIndicatorTintColor = UIColor(Theme.Palette.accent)
         appearance.inlineLayoutAppearance = item
@@ -445,10 +460,38 @@ struct RootTabView: View {
         if let tabs = controller as? UITabBarController {
             tabs.tabBar.standardAppearance = appearance
             tabs.tabBar.scrollEdgeAppearance = appearance
+            applyTabBarShadow(to: tabs.tabBar)
             tabs.tabBar.setNeedsLayout()
         }
         controller.children.forEach { retintTabBars(under: $0, with: appearance) }
         retintTabBars(under: controller.presentedViewController, with: appearance)
+    }
+
+    /// Float the tvOS tab bar on the SAME drop shadow every other VortX glass surface casts.
+    ///
+    /// `UITabBarAppearance` has no drop-shadow knob at all (`shadowColor` / `shadowImage` are the 1px
+    /// separator line, not an elevation shadow), which is why the bar had none: a `UIBarAppearance` simply
+    /// cannot express one. The real `UITabBar` view is reachable here though, so the shadow goes on its
+    /// layer, reading its geometry straight from `VortXGlass.Shadow.bar` (the token the SwiftUI floating bar
+    /// / nav pill already uses) so the two stay in lockstep from ONE definition rather than drifting apart.
+    ///
+    /// `shadowPath` is deliberately left nil: Core Animation then derives the shadow from the layer's
+    /// composited alpha, which means it follows the bar's actual ROUNDED floating platter instead of the
+    /// square bounds a hand-built path would give. One bar, once per appearance pass, so the cost of the
+    /// alpha-derived shadow is irrelevant here. Skipped under Reduce Transparency, where the bar stands down
+    /// to a flat opaque surface and a float shadow would be off-message.
+    private func applyTabBarShadow(to tabBar: UITabBar) {
+        guard !UIAccessibility.isReduceTransparencyEnabled else {
+            tabBar.layer.shadowOpacity = 0
+            return
+        }
+        let shadow = VortXGlass.Shadow.bar
+        tabBar.layer.shadowColor = UIColor(shadow.color).cgColor
+        // The alpha is already carried by the token's colour, so the layer's own opacity stays at full.
+        tabBar.layer.shadowOpacity = 1
+        tabBar.layer.shadowRadius = shadow.radius
+        tabBar.layer.shadowOffset = CGSize(width: shadow.x, height: shadow.y)
+        tabBar.clipsToBounds = false
     }
 }
 

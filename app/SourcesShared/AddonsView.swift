@@ -156,7 +156,8 @@ struct AddonsView: View {
                                 // reorder rows, the add-on card).
                                 .vortxSettingsCard()
                             }
-                            .buttonStyle(.plain)
+                            // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
+                            .vortxCardButton()
                             // Drag add-ons into the order you want. The order is the PRIORITY spine (which
                             // add-on's catalogs and sources come first) and syncs to the dashboard + your
                             // other devices via doc.addonOrder, the same order the dashboard drag writes.
@@ -271,7 +272,8 @@ struct AddonsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .vortxSettingsCard()
         }
-        .buttonStyle(.plain)
+        // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
+        .vortxCardButton()
     }
 
     private func install() {

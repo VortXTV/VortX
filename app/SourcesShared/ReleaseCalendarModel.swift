@@ -433,7 +433,8 @@ private struct UpcomingCalendarRowView: View {
             .padding(.vertical, Theme.Space.xs)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        // tvOS: `.plain` left the system focus platter on over this calendar row.
+        .vortxCardButton()
     }
 }
 
