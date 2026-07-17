@@ -37,6 +37,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.BuildConfig
+import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.DiscoverFilters
@@ -290,7 +291,12 @@ fun SettingsScreen(
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.
-        SettingRow(VortXIcons.download, "Downloads", downloadsValue, onClick = onDownloadsClick)
+        // Hidden for Beta 3 (DownloadManager.CREATE_PATH_WIRED): the download subsystem is built but has no
+        // create entry point yet, so this row would open a screen a tester can never fill. It returns the moment
+        // a Download action wires DownloadManager.download().
+        if (DownloadManager.CREATE_PATH_WIRED) {
+            SettingRow(VortXIcons.download, "Downloads", downloadsValue, onClick = onDownloadsClick)
+        }
         // A fixed descriptor of what the screen holds, NOT a live summary like the three rows above it. A
         // title count would have to come from an engine library read on every recomposition of Settings, and
         // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as

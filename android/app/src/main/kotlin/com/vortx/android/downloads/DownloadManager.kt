@@ -59,6 +59,13 @@ object DownloadManager {
 
     private const val PREFS = "vortx.downloads"
     const val MAX_CONCURRENT_KEY = "vortx.downloads.maxConcurrent"
+    /**
+     * Gates the Settings > Downloads row. The download subsystem is fully built (manager, worker, store,
+     * notifications, screen) but has no CREATE entry point yet: nothing calls [download], so the screen can
+     * only ever show "No downloads yet". The row is hidden until a Download action (on the streams or detail
+     * screen) actually calls [download]; flip this to true in the same change that wires that action.
+     */
+    const val CREATE_PATH_WIRED = false
     private const val QUEUE_ORDER_KEY = "vortx.downloads.queueOrder"
     private const val AWAITING_UNLOCK_KEY = "vortx.downloads.awaitingUnlock"
 
