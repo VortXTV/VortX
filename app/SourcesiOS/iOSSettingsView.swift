@@ -44,6 +44,10 @@ struct iOSSettingsView: View {
     #endif
 
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
+    // Match Frame Rate is an Apple TV display-mode preference (HDRDisplayMode owns the behavior), but it is
+    // bound here on the SAME key so the setting reads and writes identically on every app and the account
+    // restores one value for all of them.
+    @AppStorage(HDRDisplayMode.matchFrameRateKey) private var matchFrameRate = HDRDisplayMode.defaultMatchFrameRate
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -73,6 +77,13 @@ struct iOSSettingsView: View {
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    // Apple TV Top Shelf mirror of Continue Watching. Settings parity: the SAME flat key the tvOS
+    // SettingsView binds ("vortx.topShelf.showContinueWatching", declared on tvOS by
+    // TopShelfSnapshotWriter, which the phone targets do not compile). It is surfaced here BECAUSE the
+    // key syncs with the account: the row is on show in the living room, and the phone in your hand is
+    // the natural place to turn it off. Nothing on iOS/iPad/Mac reads it, so the toggle only takes
+    // effect on the Apple TV, which is what the row's caption says.
+    @AppStorage("vortx.topShelf.showContinueWatching") private var topShelfCW = true
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
@@ -1170,6 +1181,10 @@ struct iOSSettingsView: View {
             // cannot remove from Home" report).
             Toggle("Show editorial Home rows", isOn: $showCuratedRails)
             // Collections hub (Discover cards + Streaming-service tiles + Genre tiles) on Home / Discover; needs a TMDB key.
+            // Apple TV Top Shelf row (same key as tvOS Settings; takes effect on the Apple TV).
+            Toggle("Continue Watching on the TV Home screen", isOn: $topShelfCW)
+            Text("Puts what you are part-way through on the Apple TV Home screen, above the apps. Applies to VortX on Apple TV.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Collections on Home", isOn: $showHubHome)
             Toggle("Collections on Discover", isOn: $showHubDiscover)
             Picker("Refresh collections", selection: $hubCadence) {
@@ -1217,6 +1232,8 @@ struct iOSSettingsView: View {
                 Text("Always HDR").tag("off")
             }
 
+            Toggle("Match Frame Rate", isOn: $matchFrameRate)
+
             Stepper(value: $theme.textScale,
                     in: ThemeManager.textScaleRange,
                     step: ThemeManager.textScaleStep) {
@@ -1235,6 +1252,7 @@ struct iOSSettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Accent recolors selection and progress across the app. OLED Black uses true black, best on AMOLED panels.")
                 Text("Auto tone-maps HDR and Dolby Vision to SDR only on a screen that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple; Always HDR to force pass-through.")
+                Text("Match Frame Rate sends a film at its own frame rate, so 24p titles play smoothly instead of juddering in slow pans. It applies on Apple TV, where VortX can set the display mode, and needs Settings > Video and Audio > Match Content > Match Frame Rate turned on there. Takes effect on the next title you play.")
                 Text("Performance Auto keeps the full experience on capable devices and switches to a lighter one on weaker hardware. Reduced trims animations and shrinks playback buffers. Restart the app after changing this.")
             }
         }
@@ -1558,7 +1576,9 @@ private enum SettingsSearchSection: CaseIterable {
                                   "refresh collections", "streaming services", "discover & region",
                                   "combine discover", "budget & box office", "spoiler", "blur", "poster style",
                                   "hide poster labels", "accent", "background", "oled", "dolby vision", "hdr",
-                                  "text size", "performance"]
+                                  "match frame rate", "frame rate", "judder", "24p", "refresh rate",
+                                  "text size", "performance",
+                                  "top shelf", "tv home screen", "home screen", "continue watching"]
         case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
                                      "subtitles", "forced", "match audio to subtitle"]
         case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
