@@ -30,14 +30,51 @@ enum VortXGlass {
 
     // MARK: Tokens (single source of truth, shared by the SwiftUI material and the tvOS UIKit tab bar)
 
-    /// The warm near-black glass fill (mockups: `rgba(20,17,16,~.5)`). Fixed sRGB, NOT the user-themeable
-    /// `canvas`, so the glass reads warm even under the OLED true-black chrome setting, staying a
-    /// stable identity surface, not the app background.
-    private static let fillRGB = (r: 0.078, g: 0.067, b: 0.063)   // ≈ #141110
+    /// What a glass surface is compositing AGAINST, which decides which way its fill has to move it.
+    ///
+    /// This distinction is the whole point. A translucent fill does not have an appearance of its own, it has
+    /// a DIRECTION: it drags whatever is behind it toward its own tone. So one tone cannot serve two opposite
+    /// jobs, and the app has exactly two:
+    ///
+    /// * `.lift`: the surface sits on VortX's OWN dark chrome (chips, cards, rows, bars, fields, toasts).
+    ///   Nothing is behind it but a flat dark fill, so the glass has no light to bend and no bright backdrop
+    ///   to hold back. Its only job is to read as a RAISED plane, which means it must end up BRIGHTER than
+    ///   the chrome. That takes a mid-tone veil.
+    /// * `.scrim`: the surface floats over BRIGHT, arbitrary media (poster art, moving video). Here the
+    ///   glass must hold that media back so a white glyph or label stays legible, which means it must end up
+    ///   DARKER than the backdrop. That takes a dark wash.
+    ///
+    /// The old code had ONE near-black fill and used it for both. That value is CORRECT for `.scrim` and is
+    /// preserved unchanged below, so no player / on-art chrome moves. Applied to `.lift` it was a category
+    /// error rather than a bad number: composited at 50% over `canvas` it landed the surface 0.9/255 from the
+    /// background (1.008:1), while the 1px highlight landed 33/255 away, so the EDGE was ~37x more visible
+    /// than the SURFACE. That is precisely "a bright border with nothing inside": the fill was not weak, it
+    /// was pointed the wrong way. Measured on the CEO's own Apple TV screen, the glass keyword fields
+    /// rendered 18/255 on a 33/255 card, i.e. a DENT, not a raised plane.
+    enum Tone {
+        /// Over VortX's own dark chrome: must read as a raised plane, so it LIFTS. Accent-hued.
+        case lift
+        /// Over bright media (poster art / video): must protect legibility, so it DARKENS. Fixed warm.
+        case scrim
+    }
 
-    /// The warm-dark translucent glass fill at a given alpha.
-    static func fill(_ alpha: Double) -> Color {
-        Color(.sRGB, red: fillRGB.r, green: fillRGB.g, blue: fillRGB.b, opacity: alpha)
+    /// The fixed warm near-black SCRIM (mockups: `rgba(20,17,16,~.5)`). Fixed sRGB, NOT the user-themeable
+    /// `canvas`: a scrim sits over arbitrary poster art and video, never over the chrome, so it must stay a
+    /// stable VortX identity that does not swing with the accent or the OLED switch. This is the ORIGINAL
+    /// glass constant, kept byte-identical, now scoped to the one role it was always right for.
+    private static let scrimRGB = (r: 0.078, g: 0.067, b: 0.063)   // ≈ #141110
+
+    /// The glass fill at a given alpha, for the given backdrop role. `.lift` (the default, and every surface
+    /// that sits on the app's own chrome) resolves to the themeable `glassVeil` so the surface rises one step
+    /// up the SAME ladder as `surface1` / `surface2` / `surface3` and stays hue-coherent across all 9 accents
+    /// and both chrome modes. `.scrim` resolves to the fixed warm near-black above.
+    static func fill(_ alpha: Double, tone: Tone = .lift) -> Color {
+        switch tone {
+        case .lift:
+            return Theme.Palette.glassVeil.opacity(alpha)
+        case .scrim:
+            return Color(.sRGB, red: scrimRGB.r, green: scrimRGB.g, blue: scrimRGB.b, opacity: alpha)
+        }
     }
 
     /// Default fill alphas per surface, matching the mockups (bar ~.55, pill/field ~.5).
@@ -192,6 +229,66 @@ enum VortXGlass {
     static func fillUIColor(_ alpha: Double) -> UIColor { UIColor(fill(alpha)) }
     #endif
 
+    #if os(tvOS)
+    // MARK: The tvOS floating tab bar's glass
+
+    /// The tvOS tab bar's VortX glass background, as a resizable `UIImage` for `UITabBarAppearance`.
+    ///
+    /// This is the answer to the old "the tvOS tab bar cannot host a SwiftUI material" note: true, it
+    /// cannot, but `UIBarAppearance` composites `backgroundEffect` (the system blur) -> `backgroundImage`,
+    /// so DRAWING the VortX treatment and handing it over as the background image puts the real design
+    /// language on the native bar. The blur underneath is kept, so content scrolling behind the bar is
+    /// still sampled; this image supplies the two parts the system blur has no concept of: the VortX glass
+    /// veil and its 1px lit top edge (`highlight()`'s white-at-.14 top stop, the same value the SwiftUI
+    /// `strokeBorder` uses). The image is a 1pt-wide column stretched across the bar, so the fill stays flat
+    /// and only the top cap is preserved, which keeps the highlight exactly 1pt at the top edge no matter
+    /// how wide or tall the bar is laid out.
+    ///
+    /// The bar is `.lift`, not `.scrim`, and that is the whole reason it was invisible. It floats over the
+    /// app's OWN dark chrome, so its job is to read as a RAISED plane, not to hold media back. It used to be
+    /// painted with the fixed near-black scrim (via `backgroundColor = fillUIColor(barFillAlpha)`), which
+    /// dragged the bar TOWARD the canvas it was already sitting on. Measured on Apple TV 4K (tvOS 26.5)
+    /// before the fix: bar rgb(21,18,17) against canvas rgb(22,18,14), a contrast ratio of 1.002:1 and a
+    /// luminance delta of -0.21, i.e. the app's highest chrome rendered a hair DARKER than its background,
+    /// while an inline settings card behind it read at 1.102:1. The only reason the bar had any outline was
+    /// the system's own 1px edge (rgb(28,24,20), luminance +6.0): an edge ~30x more visible than the surface
+    /// it encloses is exactly the CEO's "barely there", and it was a direction error, not a weak number.
+    static func tabBarBackgroundImage() -> UIImage {
+        let highlightTop = 0.14
+        let size = CGSize(width: 1, height: 4)
+        let image = UIGraphicsImageRenderer(size: size).image { ctx in
+            UIColor(fill(barFillAlpha, tone: .lift)).setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            UIColor(white: 1, alpha: highlightTop).setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: size.width, height: 1))
+        }
+        // Preserve the top 2pt (the highlight plus a pixel of fill under it) and stretch the single middle
+        // row; the fill is flat, so stretching it is lossless.
+        return image.resizableImage(withCapInsets: UIEdgeInsets(top: 2, left: 0, bottom: 1, right: 0),
+                                    resizingMode: .stretch)
+    }
+
+    /// Stand the tvOS system text-field chrome DOWN so VortX's own field surface is the one that renders.
+    ///
+    /// On tvOS a SwiftUI `TextField` is backed by a `UITextField` that paints an OPAQUE near-white
+    /// (~#EAE9E9) card of its own, and `.textFieldStyle(.plain)` does NOT remove it (unlike iOS / macOS,
+    /// where `.plain` really is background-free). That system card drew straight OVER whatever VortX put
+    /// behind the field, so a warm `surface1` (LoginView) or a `vortxGlassField` (ServerConfigView,
+    /// StremioImportView, AddonStoreView) was painted and then completely hidden, and the field read as a
+    /// full-width white slab in otherwise warm-dark chrome. It also broke legibility, not just looks:
+    /// `textPrimary` (#F6F1E9) typed onto that near-white card lands at ~1.08:1, far under the 4.5:1 AA
+    /// floor, so typed text was effectively invisible.
+    ///
+    /// Clearing the appearance proxy is the same tactic `applyTabBarAccent` already uses for the tab bar's
+    /// system-white focused pill: neutralize the tvOS default, then let the VortX surface show. Every VortX
+    /// field background is preserved exactly as authored, so this reveals the design system rather than
+    /// changing it.
+    static func applyTextFieldAppearance() {
+        UITextField.appearance().backgroundColor = .clear
+        UITextField.appearance().borderStyle = .none
+    }
+    #endif
+
     #if os(iOS)
     /// A `UIToolbarAppearance` built from the SAME warm glass fill as the tvOS tab bar (RootTabView), so
     /// the iOS top nav bar / toolbar reads as VortX glass and matches the bottom tab bar. Under Reduce
@@ -235,6 +332,10 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     /// and the content behind reads at full vibrance (no desaturating sample). nil on iOS / macOS, where the
     /// real glass is kept byte-identical. Default off.
     var opaqueTVFill: Color? = nil
+    /// What this surface composites against, which decides whether its fill lifts or scrims (see
+    /// `VortXGlass.Tone`). Defaults to `.lift` because the large majority of glass in the app sits on VortX's
+    /// own dark chrome; the three presets that float over bright media (disc / badge / panel) pass `.scrim`.
+    var tone: VortXGlass.Tone = .lift
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
@@ -265,7 +366,7 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
                 // The warm-dark VortX tint over the blur is what makes Apple's neutral Liquid Glass read as
                 // VortX chrome. Skipped under Reduce Transparency, where `blurLayer` is already an opaque warm fill.
                 if !reduceTransparency {
-                    shape.fill(VortXGlass.fill(fillAlpha))
+                    shape.fill(VortXGlass.fill(fillAlpha, tone: tone))
                 }
                 // The active / selected ember tint sits ON TOP of the warm fill and the blur, but still inside
                 // the background (so it stays below the content). Rendered in both modes so the selection cue
@@ -376,7 +477,8 @@ extension View {
         in shape: S,
         fillAlpha: Double = VortXGlass.barFillAlpha,
         highlight: Double = 0.14,
-        shadow: VortXGlass.Shadow = .bar
+        shadow: VortXGlass.Shadow = .bar,
+        tone: VortXGlass.Tone = .lift
     ) -> some View {
         // On tvOS, on-art badges (the only `vortxGlass` callers at `badgeFillAlpha`) drop to a cheap OPAQUE
         // warm capsule: over poster art a live glass badge sampled + desaturated the artwork under it, and
@@ -384,9 +486,15 @@ extension View {
         // full-vibrance art underneath, zero blur cost. `opaqueTVFill` is inert on iOS / macOS and off
         // tvOS, so every other `vortxGlass` surface (player pills / panels / toasts, the offline strip)
         // keeps its glass. The tvOS badge alpha (0.72) is distinct from the pill / field / panel alphas.
-        let opaqueTVFill: Color? = (fillAlpha == VortXGlass.badgeFillAlpha) ? VortXGlass.fill(1.0) : nil
+        //
+        // This opaque capsule is pinned to `.scrim` REGARDLESS of the caller's `tone`, and that is deliberate:
+        // at alpha 1.0 nothing composites, so the "a mid veil lifts darks and holds brights back" argument
+        // does not apply, it would just be a flat mid-grey slab sitting on the artwork. A badge over poster
+        // art needs to stay a dark plate so its white label keeps contrast, so it keeps the original #141110.
+        let opaqueTVFill: Color? = (fillAlpha == VortXGlass.badgeFillAlpha)
+            ? VortXGlass.fill(1.0, tone: .scrim) : nil
         return modifier(VortXGlassModifier(shape: shape, fillAlpha: fillAlpha, highlightTop: highlight,
-                                           shadow: shadow, opaqueTVFill: opaqueTVFill))
+                                           shadow: shadow, opaqueTVFill: opaqueTVFill, tone: tone))
     }
 
     /// The ember active / selected overlay for a nav item / chip: fills `shape` with the soft `tint` (accent
@@ -452,7 +560,12 @@ extension View {
             fillAlpha: VortXGlass.discFillAlpha,
             highlightTop: 0.14,
             shadow: .disc,
-            hugsTightly: true
+            hugsTightly: true,
+            // SCRIM: a transport / hero disc only ever floats over bright, moving video, and its whole job is
+            // to keep the white glyph crisp against a hot backdrop. Lifting it would push it toward the video
+            // it is supposed to hold back (worst case, over near-white video, a white glyph falls from ~6.1:1
+            // to ~4.1:1). This is the role the original near-black fill was designed for, so it keeps it.
+            tone: .scrim
         ))
     }
 
@@ -477,8 +590,12 @@ extension View {
     /// docked `edge` to throw the shadow inward from that edge (edge-docked player / side panels); omit it
     /// for a centered modal.
     func vortxGlassPanel<S: InsettableShape>(in shape: S, dockedTo edge: Edge? = nil) -> some View {
+        // SCRIM: this preset exists specifically for the panel that floats over a bright hero backdrop or the
+        // player, which is why its alpha is the highest in the ladder. Its contract is "text stays legible
+        // over moving video", so it must darken what is behind it, not lift it.
         vortxGlass(in: shape, fillAlpha: VortXGlass.panelFillAlpha,
-                   shadow: edge.map { VortXGlass.Shadow.panelDocked($0) } ?? .panel)
+                   shadow: edge.map { VortXGlass.Shadow.panelDocked($0) } ?? .panel,
+                   tone: .scrim)
     }
 
     /// A full-width, edge-flush strip (banner / edge bar): top-highlight only, minimal inward shadow.
@@ -497,11 +614,23 @@ extension View {
     /// settings surface is one modifier instead of a hand-rolled fill + padding each time. See `SettingsCard`
     /// for the container view.
     func vortxSettingsCard() -> some View {
-        vortxGlass(
-            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+        modifier(VortXGlassModifier(
+            shape: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
             fillAlpha: VortXGlass.cardFillAlpha,
-            shadow: .card
-        )
+            highlightTop: 0.14,
+            shadow: .card,
+            // tvOS: a settings card sits on the app's OWN canvas, never over poster art or video, and that
+            // is where this glass collapses. The warm glass tint (#141110, brightness ~.078) is DARKER than
+            // `canvas` (tintedDark(.085)), so compositing it at `cardFillAlpha` over the canvas lands the
+            // card back at roughly the canvas: measured 1.016:1 against the background on Apple TV, i.e. no
+            // visible card at all, only its 1px highlight. The blur has nothing to bend either, because what
+            // is behind is a flat dark fill rather than art. The pre-glass design raised these surfaces to
+            // `surface1` (.130) for a clear step above `canvas` (.085), so take the same cheap OPAQUE path
+            // `vortxGlassRow` already uses on tvOS: elevation is restored, a live per-frame backdrop blur is
+            // dropped, and the ONE highlight + shadow still ride on top. Inert on iOS / macOS, where these
+            // cards do float over art and the real glass stays byte-identical.
+            opaqueTVFill: Theme.Palette.surface1
+        ))
     }
 }
 

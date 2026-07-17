@@ -4116,7 +4116,13 @@ struct PosterCardiOS: View {
                             .padding(.horizontal, 5).padding(.vertical, 2)
                             // glass-Browse: the on-poster badge alpha (never the poster image itself), so
                             // the rating badge reads as VortX chrome instead of a flat black pill.
-                            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
+                            // SCRIM, not lift: this badge sits ON the poster art with a WHITE label, so its
+                            // job is to hold the artwork back, not to rise off it. `.lift` would drag a
+                            // 72%-alpha mid veil over bright art and cost the white label its contrast. The
+                            // tvOS twin (SharedUI) reaches the same place via `opaqueTVFill`, which is pinned
+                            // to `.scrim`; iOS renders the real glass, so it has to say so explicitly.
+                            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat,
+                                        tone: .scrim)
                             .padding(5)
                         }
                     }
@@ -4128,8 +4134,10 @@ struct PosterCardiOS: View {
                                 .font(.system(size: 10, weight: .semibold).monospacedDigit())
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 5).padding(.vertical, 2)
-                                // glass-Browse: same on-poster badge alpha as the rating badge above.
-                                .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
+                                // glass-Browse: same on-poster badge alpha as the rating badge above, and
+                                // `.scrim` for the same reason: white timecode laid straight on poster art.
+                                .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat,
+                                            tone: .scrim)
                                 .padding(5)
                                 // Lift clear of the 4pt progress stripe pinned to the very bottom.
                                 .padding(.bottom, 4)

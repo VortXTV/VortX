@@ -149,6 +149,33 @@ final class ThemeManager: ObservableObject {
     var surface3: Color { oled ? themeRGB(0.141, 0.141, 0.149) : tintedDark(0.225) }
     var hairline: Color { oled ? themeRGB(0.196, 0.196, 0.204) : tintedDark(0.260) }
 
+    /// The translucent glass VEIL: the tone `VortXGlass` composites over a backdrop to make a raised
+    /// surface. It lives HERE, next to the surface ladder and behind the same `tintedDark` generator, on
+    /// purpose: the veil is not a decorative film, it is the LIFT that puts a glass surface one step up the
+    /// SAME ladder as `surface1` / `surface2` / `surface3`. Keeping it beside them (rather than as a private
+    /// constant inside the glass file) is what stops it drifting away from the chrome again.
+    ///
+    /// Why it is a MID tone, not a near-black: a veil composites, so its tone decides which way the surface
+    /// moves. A veil DARKER than the canvas can only ever push a surface DOWN toward (or below) the
+    /// background, which is how the glass ended up reading as a dent with only its 1px highlight visible. A
+    /// mid veil lifts a dark backdrop and pulls a bright one down, which is exactly what a real material
+    /// does and why it reads on both.
+    ///
+    /// Why THESE numbers: they are derived, not picked. The brightness is the value that makes the EXISTING
+    /// alpha ladder land back on the app's own surfaces, so glass and the opaque surfaces agree instead of
+    /// being two unrelated systems:
+    ///   warm: 0.265 * 0.50 + 0.085 * 0.50 = 0.175 = `surface2` (a pill / chip at `pillFillAlpha`)
+    ///         0.265 * 0.74 + 0.085 * 0.26 = 0.218 ≈ `surface3` (a panel at `panelFillAlpha`)
+    ///   oled: 0.188 * 0.50 + 0.000 * 0.50 = 0.094 = `surface2`
+    ///         0.188 * 0.74 + 0.000 * 0.26 = 0.139 ≈ `surface3`
+    ///
+    /// Why it follows the ACCENT (unlike the fixed-warm scrim in `VortXGlass`): this tone's whole job is to
+    /// be an elevation step OF the chrome, and the chrome is accent-hued (`tintedDark` follows the accent, so
+    /// Ocean chrome is cool and Forest green). A hardcoded warm veil laid a brown film over cool chrome on
+    /// Ocean / Forest / Royal / Mono. Sharing the generator keeps all 9 accents x 2 chrome modes coherent.
+    /// OLED goes near-neutral to match the neutral OLED surfaces above.
+    var glassVeil: Color { oled ? themeRGB(0.188, 0.188, 0.196) : tintedDark(0.265) }
+
     /// A dark surface at `brightness`, hued toward the current accent. Subtle (like the original warm
     /// near-black) but it now shifts with the chosen accent. Saturation is half the accent's, capped, so
     /// vivid accents tint gently and Mono stays near-neutral.

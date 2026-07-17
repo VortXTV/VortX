@@ -2538,12 +2538,18 @@ private struct CastMemberCard: View {
             NavigationLink {
                 PersonView(personID: member.id, name: member.name, profileURL: member.profileURL)
             } label: { cardBody }
-            .buttonStyle(.plain)
+            // `.plain` does NOT shed the tvOS focus platter, so every focused cast member wore a rounded
+            // SQUARE white slab behind its CIRCULAR photo, and the name below rendered white-on-white.
+            // `cardBody` already draws this card's whole focus treatment (photo lift + ring + name
+            // brighten, keyed off `focused`), so take the ring-less, scale-less variant: it stands the
+            // system platter down and adds nothing that could double up on what the card already does.
+            .vortxSelfFocusButton()
             .focused($focused)
             .accessibilityElement(children: .combine)
         } else {
             Button {} label: { cardBody }
-            .buttonStyle(.plain)
+            // Same as the navigable card above: the platter goes, `cardBody` keeps owning the focus look.
+            .vortxSelfFocusButton()
             .focused($focused)
             .accessibilityElement(children: .combine)
         }

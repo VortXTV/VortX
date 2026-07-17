@@ -18,6 +18,9 @@ enum Theme {
         static var surface2: Color { ThemeManager.shared.surface2 } // chips, controls
         static var surface3: Color { ThemeManager.shared.surface3 } // hover / selected fill
         static var hairline: Color { ThemeManager.shared.hairline } // dividers only
+        /// The translucent glass LIFT tone (see `ThemeManager.glassVeil`). Exposed here so the glass reads it
+        /// through the same `Theme.Palette` door as the surfaces it is an elevation step of.
+        static var glassVeil: Color { ThemeManager.shared.glassVeil }
         static let textPrimary   = rgb(0.965, 0.945, 0.914) // #F6F1E9
         static let textSecondary = rgb(0.737, 0.694, 0.631) // #BCB1A1
         static let textTertiary  = rgb(0.620, 0.580, 0.520) // #9E9485 — raised from #8C8273 so 10-11pt text clears 4.5:1 on the warm canvas across all 8 accents

@@ -65,7 +65,9 @@ private struct NuvioConnectCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .vortxSettingsCard()
         }
-        .buttonStyle(.plain)
+        // tvOS: `.plain` kept the system focus platter, which drew a white slab over this card and its
+        // neighbours. The card draws its own `.vortxSettingsCard()` surface, so it takes the card ring.
+        .vortxCardButton()
     }
 }
 
@@ -87,7 +89,8 @@ private struct ListImportConnectCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .vortxSettingsCard()
         }
-        .buttonStyle(.plain)
+        // Same platter bug as the Nuvio card above; same `.vortxSettingsCard()` surface, same card ring.
+        .vortxCardButton()
     }
 }
 

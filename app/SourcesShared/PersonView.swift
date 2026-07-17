@@ -145,7 +145,9 @@ struct PersonView: View {
                             .rotationEffect(.degrees(bioExpanded ? 180 : 0))
                     }
                 }
-                .buttonStyle(.plain)
+                // tvOS: `.plain` left the system focus platter on. This disclosure header draws no surface of its
+                // own, so the ember ring IS its focus affordance; a chip radius keeps it tight to the label.
+                .vortxCardButton(radius: Theme.Radius.chip)
                 .accessibilityLabel("Biography")
                 .accessibilityHint(bioExpanded ? "Collapse" : "Expand")
                 Text(bio)

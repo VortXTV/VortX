@@ -69,7 +69,12 @@ private struct BackToTopButton: ViewModifier {
                             .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
                             .shadow(color: .black.opacity(0.38), radius: 9, y: 3)
                     }
-                    .buttonStyle(.plain)
+                    // Only ever MOUNTED on iOS (iOSRootView), where `.plain` was correct, but this file
+                    // compiles into VortXTV too, so `.plain` here would trip the tvOS guard in
+                    // ChipButtonStyle.swift and bury the real hits in noise. The ring-less variant is
+                    // pixel-identical to `.plain` on iOS (no ring, no scale, same hit shape) and keeps the
+                    // guard's output honest: every warning it emits is a genuine defect.
+                    .vortxSelfFocusButton()
                     .padding(.trailing, Theme.Space.lg)
                     .padding(.bottom, bottomInset)
                     .transition(reduceMotion ? .opacity
