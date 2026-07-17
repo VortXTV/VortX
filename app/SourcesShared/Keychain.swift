@@ -17,6 +17,15 @@ import Security
 /// entirely, macOS stores the SAME accounts in an owner-only file under Application Support instead of
 /// the system keychain. The public API is identical across platforms, so no caller changes.
 enum Keychain {
+    /// Prefix of the UserDefaults fallback slots the iOS/tvOS `set` writes when the Keychain refuses.
+    ///
+    /// Declared OUTSIDE the platform `#if`, and non-private, because `SettingsBackup.secretKeyPrefixes` has to
+    /// exclude these keys from the synced blob and the backup export on EVERY platform, not just the ones that
+    /// can write them: a token leaked by an iPhone travels inside the account's document, so a Mac (which never
+    /// writes a fallback slot of its own) still has to refuse to carry or apply one. Single source of truth on
+    /// purpose, so the exclusion cannot drift away from the thing it excludes.
+    static let fallbackKeyPrefix = "kcfallback."
+
 #if os(macOS)
     // MARK: macOS — file-backed store (no system keychain, no password prompt)
 
@@ -80,7 +89,7 @@ enum Keychain {
 #else
     // MARK: iOS / tvOS — system Keychain with UserDefaults fallback (unchanged)
 
-    private static func fallbackKey(_ account: String) -> String { "kcfallback." + account }
+    private static func fallbackKey(_ account: String) -> String { fallbackKeyPrefix + account }
 
     static func string(_ account: String) -> String? {
         let query: [String: Any] = [

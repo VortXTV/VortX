@@ -112,6 +112,17 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// owner dedupe by id, so no duplicate can form. (A roster only ever belongs to one account, so a
     /// fixed shared id is safe here; per-account uniqueness is not required.)
     static let ownerID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+    /// Canonical form of a profile id that arrived as a STRING from a sync doc (#145 M6). Mirrors Android
+    /// `UserProfile.normalizeId`, which is the case this must agree with byte-for-byte on the wire.
+    ///
+    /// Every id this app MINTS is a `UUID`, and Foundation's `uuidString` is always UPPERCASE, so the whole
+    /// tombstone system is uppercase-keyed: `tombstone(_:)` stores `id.uuidString` and `pruneTombstonedProfiles`
+    /// matches on `id.uuidString`. Ids read back OUT of a doc are plain strings and carry whatever case their
+    /// author used. An unnormalized lowercase id is therefore inert rather than harmless: it never equals the
+    /// owner id (so the defensive owner filter misses it), and it never matches a live profile's uuidString
+    /// (so the tombstone never prunes and the profile stays resurrected). Normalizing on the way in is what
+    /// keeps a foreign-cased id from forking into a second, non-matching tombstone.
+    static func normalizeID(_ raw: String) -> String { raw.uppercased() }
     /// Whether this profile's history is the account library itself (the owner, and any profile on
     /// its own account) or a private synced overlay (every other shared profile).
     var usesEngineHistory: Bool { isOwner || usesOwnAccount }
@@ -761,9 +772,16 @@ final class ProfileStore: ObservableObject {
     /// Fold incoming tombstones (from another device's doc.vortx.deletedProfiles) into the local set,
     /// dropping the owner id defensively. Returns true when the set changed (so callers can prune the
     /// live roster of any now-tombstoned profile). The union means a tombstone propagates everywhere.
+    ///
+    /// This is the single INGEST chokepoint for ids that arrive as strings from a doc, so it normalizes here
+    /// rather than at each call site (#145 M6). Mirrors Android `mergeDeletedTombstones`, which normalizes the
+    /// same way. Without it, a foreign-cased id passes the owner filter, is stored in a set that
+    /// `pruneTombstonedProfiles` matches against uppercase `uuidString`, and so never prunes: the tombstone
+    /// lands but the deleted profile stays on screen. See `UserProfile.normalizeID`.
     @discardableResult
     func mergeDeletedTombstones(_ incoming: [String]) -> Bool {
-        let add = incoming.filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
+        let add = incoming.map { UserProfile.normalizeID($0) }
+            .filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
         guard !add.isEmpty else { return false }
         deletedProfileIDs.formUnion(add)
         saveDeletedTombstones()

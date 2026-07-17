@@ -101,6 +101,22 @@ final class HomeRailPreferences: ObservableObject {
 
     private init() {}
 
+    /// Re-read the persisted layout. The singleton seeds `order` / `hidden` ONLY at init, so an account
+    /// settings pull or a backup restore (which write `UserDefaults` directly, and whose dotted keys do not
+    /// fire `UserDefaults` KVO) leaves this object on the pre-restore layout.
+    ///
+    /// The write-back hazard is the same shape as `ThemeManager`'s, just user-triggered rather than
+    /// automatic: `setHidden` mutates the STALE in-memory set and then persists the WHOLE set, and `setOrder`
+    /// persists the whole arranged list. So hiding one rail after a restore would flush the stale set back
+    /// over the restored one and drop every rail the restore brought back. Re-reading first means the write
+    /// can only ever build on the restored layout. Call on the main thread.
+    func reloadFromDefaults() {
+        let savedOrder = HomeRailStore.order()
+        if order != savedOrder { order = savedOrder }
+        let savedHidden = HomeRailStore.hidden()
+        if hidden != savedHidden { hidden = savedHidden }
+    }
+
     /// Merge the saved order with the platform's default set: honor the saved positions for rails the
     /// platform knows about, then append any default rail not yet in the saved order at its default spot.
     /// This keeps an un-customized Home identical to the hard-coded order AND stays forward-compatible when

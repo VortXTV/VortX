@@ -210,6 +210,11 @@ struct iOSSettingsView: View {
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let count = try SettingsBackup.restore(from: try Data(contentsOf: url))
+                        // The restore only wrote UserDefaults, which no live store observes (UserDefaults KVO
+                        // does not fire for our dotted keys), so re-read the init-once caches here. Without it
+                        // the restored theme / rails / catalog prefs / playlists stay invisible AND the stale
+                        // in-memory copies get flushed back over them on the next change, undoing the restore.
+                        SettingsBackup.reloadLiveStores()
                         backupAlert = BackupAlert(title: String(localized: "Restore Complete"),
                             message: "\(count) settings restored. Relaunch the app to apply everything.")
                     } catch {

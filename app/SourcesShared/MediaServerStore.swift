@@ -181,6 +181,34 @@ final class MediaServerStore: ObservableObject {
 
     // MARK: Persistence
 
+    /// Re-read the persisted server list. The singleton seeds `servers` ONLY in `init`, so an account settings
+    /// pull or a backup restore (both write `UserDefaults` directly, and `UserDefaults` KVO does not fire for a
+    /// dotted key like `vortx.mediaServers.list`) leaves this object holding the pre-restore list. The metadata
+    /// IS syncable (it is a plain app pref, so it rides the `doc.settings` blob), which is exactly what makes
+    /// the stale copy dangerous rather than merely wrong on screen.
+    ///
+    /// Two concrete failures this prevents, both the same shape as `IPTVPlaylistStore`'s:
+    ///  - WRITE-BACK. `save()` re-encodes the WHOLE in-memory array over `listKey`, so renaming one server,
+    ///    marking one `needsReauth`, or removing one after a restore would flush the stale array back over the
+    ///    restored one and drop every server the restore brought back. Re-reading first means a later `save()`
+    ///    can only ever build on the restored list.
+    ///  - MERGE BASE. `applySyncBlob` builds its `byId` map from this in-memory array, so a stale (on a
+    ///    reinstall, EMPTY) base makes the union drop any server the settings blob restored but the `apiKeys`
+    ///    blob does not carry. The two channels are authored separately and can legitimately diverge, so the
+    ///    union must start from the restored list, not from whatever this object happened to load at launch.
+    ///
+    /// Rebuilds the coordinator (mirroring `init`) so a restored server with a Keychain token is queryable
+    /// without a relaunch. Deliberately does NOT `save()` (a read must never write) and does NOT `nudgeSync()`:
+    /// applying the account's own data must not echo straight back up as a fresh push. Guarded, so an unchanged
+    /// list never churns `objectWillChange` or the coordinator. Callers are on the main thread (see
+    /// `SettingsBackup.reloadLiveStores`); this class is intentionally not `@MainActor`, matching `syncBlob()`.
+    func reloadFromDefaults() {
+        let saved = Self.loadRecords()
+        guard servers != saved else { return }
+        servers = saved
+        reloadCoordinator()
+    }
+
     private func save() {
         if let data = try? JSONEncoder().encode(servers) {
             UserDefaults.standard.set(data, forKey: Self.listKey)
