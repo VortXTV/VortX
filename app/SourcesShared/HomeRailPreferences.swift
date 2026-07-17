@@ -20,6 +20,7 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
     case topPicks
     case becauseYouWatched
     case traktWatchlist
+    case simklWatchlist
     case mediaServers
     case upcomingEpisodes
     case upcomingMovies
@@ -37,6 +38,7 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
         case .topPicks:             return "Top Picks for you"
         case .becauseYouWatched:    return "Because You Watched"
         case .traktWatchlist:       return "Trakt Watchlist"
+        case .simklWatchlist:       return "SIMKL Watchlist"
         case .mediaServers:         return "Media Servers"
         case .upcomingEpisodes:     return "Upcoming Episodes"
         case .upcomingMovies:       return "Upcoming Movies"
@@ -53,6 +55,7 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
         case .topPicks:             return "sparkles"
         case .becauseYouWatched:    return "arrow.triangle.branch"
         case .traktWatchlist:       return "bookmark"
+        case .simklWatchlist:       return "bookmark.square"
         case .mediaServers:         return "server.rack"
         case .upcomingEpisodes:     return "calendar.badge.clock"
         case .upcomingMovies:       return "film.stack"
@@ -65,14 +68,14 @@ enum HomeRail: String, CaseIterable, Identifiable, Hashable {
     /// Default Home section order on touch/desktop (iPhone / iPad / Mac). Continue Watching is pinned
     /// above these. This MUST match `iOSHomeView`'s render order so an un-customized Home is byte-identical.
     static let iOSDefaultOrder: [HomeRail] = [
-        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .mediaServers,
+        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
         .upcomingEpisodes, .upcomingMovies, .addonCatalogs, .editorialCollections, .importedLists,
     ]
 
     /// Default Home section order on tvOS. Continue Watching is pinned above these; tvOS has no editorial
     /// rails and lists Imported before Upcoming. MUST match `HomeView`'s render order (zero default change).
     static let tvDefaultOrder: [HomeRail] = [
-        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .mediaServers,
+        .collectionsHub, .topPicks, .becauseYouWatched, .traktWatchlist, .simklWatchlist, .mediaServers,
         .importedLists, .upcomingEpisodes, .upcomingMovies, .addonCatalogs,
     ]
 }

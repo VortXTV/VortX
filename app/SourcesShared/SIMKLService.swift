@@ -53,7 +53,91 @@ actor SIMKLService {
     // its status), so a library-remove must never route to it. The provider's `removeFromWatchlist`
     // is a no-op instead (see `SIMKLProvider`).
 
+    // MARK: - List reads (the read-back side)
+
+    /// One list of one type (`GET /sync/all-items/{type}/{status}`), flattened to neutral entries.
+    ///
+    /// READS ARE NOT RATE-GATED. The S-3 gate exists for SIMKL's 1-POST/sec write limit; putting GETs
+    /// through it would serialize the three type reads a second apart for no reason and, worse, would let
+    /// a rail refresh push the write slot into the future and delay a user's "mark watched" behind it.
+    func list(type: SIMKLListType, status: SIMKLListStatus) async throws -> [SIMKLListEntry] {
+        let data = try await read(path: "/sync/all-items/\(type.rawValue)/\(status.rawValue)")
+        // SIMKL answers an EMPTY BODY (not `{}`) for a list with nothing in it. That is a success with zero
+        // rows, so it must not surface as a decode error the caller might treat as an outage.
+        guard !data.isEmpty else { return [] }
+        let response = try decode(SIMKLAllItemsResponse.self, from: data)
+        switch type {
+        case .movies:
+            return (response.movies ?? []).compactMap { entry in
+                guard let movie = entry.movie else { return nil }
+                return Self.entry(ids: movie.ids, title: movie.title, added: entry.addedToWatchlistAt, type: type)
+            }
+        case .shows, .anime:
+            let rows = (type == .anime ? response.anime : response.shows) ?? []
+            return rows.compactMap { entry in
+                guard let show = entry.show else { return nil }
+                return Self.entry(ids: show.ids, title: show.title, added: entry.addedToWatchlistAt, type: type)
+            }
+        }
+    }
+
+    /// The user's whole plan-to-watch list across movies, shows AND anime.
+    ///
+    /// Each type is fetched INDEPENDENTLY, and a type that throws contributes an empty list instead of
+    /// failing the call. That matters most for the anime read: SIMKL's anime rows are shaped like shows,
+    /// but anime is a separate catalogue, so if that one response ever shifts, the movies and shows the
+    /// user actually has still reach the rail.
+    ///
+    /// Sequential on purpose. The three reads are one throttled rail refresh, not a user-blocking path, so
+    /// there is nothing to win by firing them together, and three concurrent authenticated GETs is exactly
+    /// the burst shape that gets an API key rate-limited (the lesson S-3 already encodes for writes).
+    ///
+    /// Signing-in state is checked ONCE up front so "not connected" surfaces as a thrown error rather than
+    /// as an innocent-looking empty list, which the rail would otherwise render as "you have nothing saved".
+    func planToWatch() async throws -> [SIMKLListEntry] {
+        _ = try await auth.validToken()
+        var out: [SIMKLListEntry] = []
+        for type in SIMKLListType.allCases {
+            out += (try? await list(type: type, status: .planToWatch)) ?? []
+        }
+        return out
+    }
+
+    /// Flatten one decoded row into a neutral entry, dropping rows with no id VortX can open a detail page
+    /// with and no title to show.
+    private static func entry(ids: SIMKLIDs, title: String?, added: String?, type: SIMKLListType) -> SIMKLListEntry? {
+        let name = title ?? ""
+        let imdb = (ids.imdb?.isEmpty == false) ? ids.imdb : nil
+        guard imdb != nil || ids.tmdb != nil, !name.isEmpty else { return nil }
+        return SIMKLListEntry(imdb: imdb, tmdb: ids.tmdb, title: name, type: type.appType, addedAt: added)
+    }
+
     // MARK: - HTTP plumbing
+
+    /// An authenticated GET against the data API, carrying the same required query items + headers every
+    /// SIMKL request needs (S-4 / S-5).
+    private func read(path: String) async throws -> Data {
+        let token = try await auth.validToken()
+        guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
+        components.queryItems = SIMKLAuth.requiredQueryItems
+        guard let url = components.url else { throw SIMKLError.badURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 20
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(SIMKLAuth.clientID, forHTTPHeaderField: "simkl-api-key")
+        request.setValue(SIMKLAuth.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, status) = try await perform(request)
+        try expectSuccess(status)
+        return data
+    }
+
+    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
+        do { return try JSONDecoder().decode(type, from: data) }
+        catch { throw SIMKLError.decoding }
+    }
 
     private func write(path: String, items: SIMKLSyncItems) async throws -> Int {
         let token = try await auth.validToken()
