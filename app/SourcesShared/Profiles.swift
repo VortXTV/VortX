@@ -470,15 +470,15 @@ final class ProfileStore: ObservableObject {
         UserProfile.PlaybackPrefs(
             audioLang: d["audioLang"] as? String ?? base?.audioLang ?? "",
             subtitleLang: d["subtitleLang"] as? String ?? base?.subtitleLang ?? "",
-            forcedPolicy: d["forced"] as? String ?? base?.forcedPolicy ?? "",
-            subFont: d["subFont"] as? String ?? base?.subFont ?? "",
+            forcedPolicy: gatedForcedPolicy(d["forced"] as? String) ?? base?.forcedPolicy ?? "",
+            subFont: gatedSubFont(d["subFont"] as? String) ?? base?.subFont ?? "",
             subSize: d["subSize"] as? String ?? base?.subSize ?? "",
-            subColor: d["subColor"] as? String ?? base?.subColor ?? "",
-            subBackground: d["subBackground"] as? String ?? base?.subBackground ?? "",
-            subSizeScale: d["subSizeScale"] as? Double ?? base?.subSizeScale,
+            subColor: gatedSubColor(d["subColor"] as? String) ?? base?.subColor ?? "",
+            subBackground: gatedSubBackground(d["subBackground"] as? String) ?? base?.subBackground ?? "",
+            subSizeScale: gatedSubSizeScale(d["subSizeScale"] as? Double) ?? base?.subSizeScale,
             sourceTypeOrder: d["sourceTypeOrder"] as? [String] ?? base?.sourceTypeOrder,
             useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder,
-            safetyMode: d["safetyMode"] as? String ?? base?.safetyMode,
+            safetyMode: gatedSafetyMode(d["safetyMode"] as? String) ?? base?.safetyMode,
             instantOnly: d["instantOnly"] as? Bool ?? base?.instantOnly,
             hideDeadTorrents: d["hideDeadTorrents"] as? Bool ?? base?.hideDeadTorrents,
             hdrOnly: d["hdrOnly"] as? Bool ?? base?.hdrOnly,
@@ -513,6 +513,68 @@ final class ProfileStore: ObservableObject {
     private static func gatedMinResolution(_ raw: Int?) -> Int? {
         guard let raw else { return nil }
         return [0, 720, 1080, 2160].contains(raw) ? raw : nil
+    }
+
+    // MARK: Enum vocabulary gates
+    //
+    // The enum-valued playback fields arrive as FREE-FORM STRINGS from a synced doc that any client may have
+    // written, and they land (via applyPlayback) in the live UserDefaults the player and the Settings Pickers
+    // read. An unrecognized id is therefore not a cosmetic problem: `safetyMode != "off"` reads a junk value as
+    // safety-ON while the Picker has no tag to render it (so the row shows blank and the viewer cannot fix it),
+    // and the player asks libass for a colour/background that does not exist. The webapp shipped its own
+    // spellings ("moderate", "on", "shadow", "none", "cyan", "mint", "mono") and corrupted real accounts this
+    // way. Gate every one of them on the way IN, mapping the known foreign ids to the app's vocabulary and
+    // returning nil for anything else so the per-field `?? base?` fallback keeps the viewer's current setting
+    // rather than applying a value nothing can render. Same contract as gatedMaxResolution above.
+    //
+    // The allowed sets are read from the app's OWN source-of-truth arrays rather than restated here, so adding
+    // a subtitle colour or a safety mode cannot silently bypass the gate.
+
+    /// Canonical id, migrated legacy id, or nil when unrecognized.
+    private static func gatedId(_ raw: String?, allowed: [String], legacy: [String: String]) -> String? {
+        guard let raw else { return nil }
+        if allowed.contains(raw) { return raw }
+        return legacy[raw]
+    }
+
+    /// TrackPreferences.ForcedPolicy is the authority (off / forced / always). The webapp's "on" meant
+    /// "always show subtitles in my language", which is `always`.
+    private static func gatedForcedPolicy(_ raw: String?) -> String? {
+        gatedId(raw, allowed: TrackPreferences.ForcedPolicy.allCases.map(\.rawValue), legacy: ["on": "always"])
+    }
+
+    /// SourcePreferences.safetyModes is the authority (off / balanced / strict). The webapp said "moderate".
+    private static func gatedSafetyMode(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SourcePreferences.safetyModes, legacy: ["moderate": "balanced"])
+    }
+
+    /// SubtitleStyle.fonts is the authority (modern / classic). The webapp offered a web-only "mono".
+    /// (`map { $0.id }`, not `map(\.id)`: these are arrays of TUPLES, and a Swift key path cannot name a
+    /// tuple element. Same below.)
+    private static func gatedSubFont(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.fonts.map { $0.id }, legacy: ["mono": SubtitleStyle.defaultFont])
+    }
+
+    /// SubtitleStyle.colors is the authority (white / yellow / soft). The webapp offered web-only "cyan" and
+    /// "mint", which have no app equivalent, so they degrade to the default rather than guessing a hue.
+    private static func gatedSubColor(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.colors.map { $0.id },
+                legacy: ["cyan": SubtitleStyle.defaultColor, "mint": SubtitleStyle.defaultColor])
+    }
+
+    /// SubtitleStyle.backgrounds is the authority (outline / shaded / box). The webapp's "shadow" is closest to
+    /// `shaded`; its "none" (no backing, no outline) has no app equivalent and degrades to the default.
+    private static func gatedSubBackground(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.backgrounds.map { $0.id },
+                legacy: ["shadow": "shaded", "none": SubtitleStyle.defaultBackground])
+    }
+
+    /// The fine subtitle multiplier, clamped into SubtitleStyle.sizeScaleRange (0.60...1.80). A doc value
+    /// outside the range would otherwise be stored and then re-clamped on every read; clamping on the way in
+    /// keeps the stored value and the applied value the same number. The webapp's floor was 0.7.
+    private static func gatedSubSizeScale(_ raw: Double?) -> Double? {
+        guard let raw, raw.isFinite else { return nil }
+        return min(max(raw, SubtitleStyle.sizeScaleRange.lowerBound), SubtitleStyle.sizeScaleRange.upperBound)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.

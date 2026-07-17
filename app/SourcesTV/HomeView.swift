@@ -13,6 +13,7 @@ struct HomeView: View {
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var becauseYouWatched = BecauseYouWatchedModel()   // "Because you watched <title>" rail, seeded from recent watches
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
+    @StateObject private var simklRails = SIMKLRailsModel()   // SIMKL plan-to-watch as a client-side rail (dormant with empty creds)
     @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
@@ -153,6 +154,8 @@ struct HomeView: View {
         .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
         // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
         .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
+        // SIMKL disconnect: same contract as Trakt above, drop the plan-to-watch rail now.
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLRailsModel.disconnectedNote)) { _ in simklRails.clear() }
         // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
     }
@@ -163,6 +166,7 @@ struct HomeView: View {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
         becauseYouWatched.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
+        simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
@@ -225,7 +229,18 @@ struct HomeView: View {
         case .traktWatchlist:
             // Trakt watchlist as a client-side rail. Zero engine writes; dormant with empty creds.
             if !traktRails.items.isEmpty {
-                TraktWatchlistRow(items: traktRails.items, focusModel: focusModel)
+                ExternalWatchlistRow(eyebrow: String(localized: "From Trakt"),
+                                     title: String(localized: "Trakt Watchlist"),
+                                     items: traktRails.items, focusModel: focusModel)
+            }
+        case .simklWatchlist:
+            // SIMKL plan-to-watch as a client-side rail. Zero engine writes; dormant with empty creds.
+            // The read-back half of SIMKL: before this the app only ever PUSHED to SIMKL and showed the
+            // user nothing back.
+            if !simklRails.items.isEmpty {
+                ExternalWatchlistRow(eyebrow: String(localized: "From SIMKL"),
+                                     title: String(localized: "SIMKL Watchlist"),
+                                     items: simklRails.items, focusModel: focusModel)
             }
         case .mediaServers:
             // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby servers.
@@ -782,16 +797,20 @@ struct TopPicksRow: View {
     }
 }
 
-/// The Trakt watchlist as a Home rail. Structurally identical to `TopPicksRow` (MetaPreview cards that
-/// open the normal detail page by imdb id); only the header differs. Zero engine writes.
-struct TraktWatchlistRow: View {
+/// An external service's watchlist as a Home rail (Trakt's watchlist, SIMKL's plan-to-watch).
+/// Structurally identical to `TopPicksRow` (MetaPreview cards that open the normal detail page by imdb
+/// id); only the header differs, so the header is a PARAMETER rather than the reason to fork this view
+/// per service. Zero engine writes.
+struct ExternalWatchlistRow: View {
+    let eyebrow: String
+    let title: String
     let items: [MetaPreview]
     var focusModel: FocusedItemModel? = nil
     @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(eyebrow: String(localized: "From Trakt"), title: String(localized: "Trakt Watchlist"))
+            RailHeader(eyebrow: eyebrow, title: title)
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in

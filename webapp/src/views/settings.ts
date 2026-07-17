@@ -23,9 +23,13 @@ import {
   SUB_MIN,
   SUB_MAX,
   SUB_STEP,
+  canonSubMode,
+  canonSafety,
+  canonSubFont,
+  canonSubColor,
+  canonSubEdge,
   type Settings,
   type SubtitlesMode,
-  type SafetyFilter,
   type Performance,
   type SubtitleFont,
   type SubtitleColor,
@@ -228,9 +232,9 @@ function notificationsSection(episodeAlerts: boolean): string {
 
 /** One-tap quality presets: each bundles several Streams knobs. "Custom" = none match exactly. */
 const QUALITY_PRESETS: Record<"best" | "balanced" | "fast", Partial<Settings>> = {
-  best: { preferredQuality: 0, maxQuality: 0, maxFileSizeGB: 0, instantOnly: false, hideDeadTorrents: true, safetyFilter: "moderate" },
-  balanced: { preferredQuality: 1080, maxQuality: 1080, maxFileSizeGB: 15, instantOnly: false, hideDeadTorrents: true, safetyFilter: "moderate" },
-  fast: { preferredQuality: 720, maxQuality: 720, maxFileSizeGB: 5, instantOnly: true, hideDeadTorrents: true, safetyFilter: "moderate" },
+  best: { preferredQuality: 0, maxQuality: 0, maxFileSizeGB: 0, instantOnly: false, hideDeadTorrents: true, safetyFilter: "balanced" },
+  balanced: { preferredQuality: 1080, maxQuality: 1080, maxFileSizeGB: 15, instantOnly: false, hideDeadTorrents: true, safetyFilter: "balanced" },
+  fast: { preferredQuality: 720, maxQuality: 720, maxFileSizeGB: 5, instantOnly: true, hideDeadTorrents: true, safetyFilter: "balanced" },
 };
 
 /** Which quality preset the current settings exactly match, or null (Custom). */
@@ -255,7 +259,7 @@ function streamsSection(s: Settings): string {
   const safety = segmented(
     [
       { value: "off", label: "Off", on: s.safetyFilter === "off" },
-      { value: "moderate", label: "Moderate", on: s.safetyFilter === "moderate" },
+      { value: "balanced", label: "Balanced", on: s.safetyFilter === "balanced" },
       { value: "strict", label: "Strict", on: s.safetyFilter === "strict" },
     ],
     "set-safety",
@@ -318,10 +322,12 @@ function appearanceSection(accentID: string, background: string, textScale: numb
 }
 
 function audioSubtitlesSection(audioLang: string, subtitleLang: string, mode: SubtitlesMode): string {
+  // Order and ids follow TrackPreferences.ForcedPolicy (off / forced / always). "Always" is what the webapp
+  // used to call "on".
   const subMode = segmented([
     { value: "off", label: "Off", on: mode === "off" },
-    { value: "on", label: "On", on: mode === "on" },
     { value: "forced", label: "Forced", on: mode === "forced" },
+    { value: "always", label: "Always", on: mode === "always" },
   ], "subtitles-mode", "mode");
   const body =
     row("Audio language", langSelect("audio-lang", audioLang, "Original")) +
@@ -335,7 +341,6 @@ function subtitleStyleSection(scale: number, font: SubtitleFont, color: Subtitle
     [
       { value: "modern", label: "Modern", on: font === "modern" },
       { value: "classic", label: "Classic", on: font === "classic" },
-      { value: "mono", label: "Mono", on: font === "mono" },
     ],
     "set-sub-font",
     "font",
@@ -348,10 +353,11 @@ function subtitleStyleSection(scale: number, font: SubtitleFont, color: Subtitle
     .join("");
   const edgeSeg = segmented(
     [
+      // SubtitleStyle.backgrounds: outline only / shaded / solid box. The old web-only "Shadow" and "None"
+      // had no app equivalent and could not survive a round trip.
       { value: "outline", label: "Outline", on: edge === "outline" },
-      { value: "shadow", label: "Shadow", on: edge === "shadow" },
+      { value: "shaded", label: "Shaded", on: edge === "shaded" },
       { value: "box", label: "Box", on: edge === "box" },
-      { value: "none", label: "None", on: edge === "none" },
     ],
     "set-sub-edge",
     "edge",
@@ -469,7 +475,7 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
     case "text-size":
       return commit({ textScale: clampScale(getSettings().textScale + (Number(d.dir) || 0) * TEXT_STEP) });
     case "subtitles-mode":
-      return commit({ subtitlesMode: (d.mode as SubtitlesMode) ?? "on" });
+      return commit({ subtitlesMode: canonSubMode(d.mode) ?? "always" });
     case "set-quality":
       return commit({ preferredQuality: Number(d.q) || 0 });
     case "set-skip":
@@ -479,7 +485,7 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
       return preset ? commit(preset) : false;
     }
     case "set-safety":
-      return commit({ safetyFilter: (d.safety as SafetyFilter) ?? "off" });
+      return commit({ safetyFilter: canonSafety(d.safety) ?? "off" });
     case "set-maxq":
       return commit({ maxQuality: Number(d.mq) || 0 });
     case "set-maxsize":
@@ -503,11 +509,11 @@ export function handleSettingsClick(target: EventTarget | null): boolean {
     case "source-move":
       return moveSource(d.type as SourceType, Number(d.dir) || 0);
     case "set-sub-font":
-      return commit({ subtitleFont: (d.font as SubtitleFont) ?? "modern" });
+      return commit({ subtitleFont: canonSubFont(d.font) ?? "modern" });
     case "set-sub-color":
-      return commit({ subtitleColor: (d.color as SubtitleColor) ?? "white" });
+      return commit({ subtitleColor: canonSubColor(d.color) ?? "white" });
     case "set-sub-edge":
-      return commit({ subtitleEdge: (d.edge as SubtitleEdge) ?? "outline" });
+      return commit({ subtitleEdge: canonSubEdge(d.edge) ?? "outline" });
     case "set-sub-size":
       return commit({ subtitleScale: clampSub(Number(d.size) || 1) });
     case "sub-size":

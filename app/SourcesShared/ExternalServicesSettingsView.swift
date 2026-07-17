@@ -276,7 +276,10 @@ private struct SIMKLConnectCard: View {
     private func disconnect() {
         Task {
             await SIMKLAuth.shared.signOut()
-            await MainActor.run { connected = false; pin = nil; qr = nil }
+            await MainActor.run {
+                connected = false; pin = nil; qr = nil
+                NotificationCenter.default.post(name: SIMKLRailsModel.disconnectedNote, object: nil)   // clear the Home plan-to-watch rail now
+            }
         }
     }
 }

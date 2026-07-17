@@ -760,6 +760,7 @@ struct iOSHomeView: View {
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var becauseYouWatched = BecauseYouWatchedModel()   // "Because you watched <title>" rail, seeded from recent watches
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
+    @StateObject private var simklRails = SIMKLRailsModel()   // SIMKL plan-to-watch as a client-side rail (dormant with empty creds)
     @StateObject private var mediaServerRails = MediaServerCatalogsModel()   // "Recently added" on connected Plex/Jellyfin/Emby servers (dormant with none)
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
@@ -1131,6 +1132,8 @@ struct iOSHomeView: View {
         .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshReleaseCalendar() }
         // Trakt disconnect: drop the watchlist rail immediately rather than waiting for the refresh window.
         .onReceive(NotificationCenter.default.publisher(for: TraktRailsModel.disconnectedNote)) { _ in traktRails.clear() }
+        // SIMKL disconnect: same contract as Trakt above, drop the plan-to-watch rail now.
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLRailsModel.disconnectedNote)) { _ in simklRails.clear() }
         // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
         .onDisappear { hero.stop() }
@@ -1179,6 +1182,19 @@ struct iOSHomeView: View {
                 homeRail(PosterRail(title: String(localized: "Trakt Watchlist"),
                                     eyebrow: String(localized: "From Trakt"),
                                     items: traktRails.items.map {
+                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                 poster: $0.poster, progress: 0)
+                                    },
+                                    onTap: handleTap, showWatchedBadges: true))
+            }
+        case .simklWatchlist:
+            // SIMKL plan-to-watch as a client-side rail (opens the normal detail page by imdb id via handleTap).
+            // Zero engine writes; hidden until SIMKL is connected (dormant with empty creds). The read-back
+            // half of SIMKL: before this the app only ever PUSHED to SIMKL and showed the user nothing.
+            if !simklRails.items.isEmpty {
+                homeRail(PosterRail(title: String(localized: "SIMKL Watchlist"),
+                                    eyebrow: String(localized: "From SIMKL"),
+                                    items: simklRails.items.map {
                                         RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                  poster: $0.poster, progress: 0)
                                     },
@@ -1302,6 +1318,7 @@ struct iOSHomeView: View {
         topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
         becauseYouWatched.refresh(profileID: profiles.activeID, cw: cw, library: library)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
+        simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
