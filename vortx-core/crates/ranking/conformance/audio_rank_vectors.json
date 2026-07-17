@@ -1,0 +1,28 @@
+{
+  "description": "Cross-language conformance for the AUDIO ranking profile (rank_for(audio kind) = the frozen base rank() + an integer lossless-codec bonus of LOSSLESS_BONUS=100 human-points = 100000 milli-points). A lossless codec (FLAC/ALAC/WAV/AIFF/DSD) outranks any lossy one regardless of bitrate/size; an unknown/absent codec is neutral (fail-open). Codec is resolved typed-first (vortx.tags via AudioCodec::from_wire) then from the label. The VIDEO profile is unaffected (the existing rank_vectors.json still holds). Scores are integer milli-points; a port must reproduce them byte-for-byte.",
+  "cases": [
+    {
+      "name": "flac_beats_mp3_equal_otherwise",
+      "streams": [ { "label": "Some Album 320 MP3" }, { "label": "Some Album FLAC" } ],
+      "expect": [ { "raw_index": 1, "score": 100000 }, { "raw_index": 0, "score": 0 } ]
+    },
+    {
+      "name": "unknown_codec_is_neutral_and_keeps_base_order",
+      "streams": [ { "label": "Episode 12 The Interview" }, { "label": "Episode 13" } ],
+      "expect": [ { "raw_index": 0, "score": 0 }, { "raw_index": 1, "score": 0 } ]
+    },
+    {
+      "name": "typed_tags_flac_wins_over_a_misleading_mp3_label",
+      "streams": [ { "label": "Album 128k MP3", "vortx": { "tags": ["flac"] } } ],
+      "expect": [ { "raw_index": 0, "score": 100000 } ]
+    },
+    {
+      "name": "lossless_beats_a_larger_lossy_file",
+      "streams": [
+        { "label": "Some Album MP3", "video_size": 10737418240 },
+        { "label": "Some Album FLAC", "video_size": 1073741824 }
+      ],
+      "expect": [ { "raw_index": 1, "score": 100150 }, { "raw_index": 0, "score": 1500 } ]
+    }
+  ]
+}

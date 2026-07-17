@@ -2,10 +2,11 @@
 //! capability set is derived from the manifest's declared resources.
 
 use vortx_addons::InstalledAddon;
-use vortx_protocol::Stream;
+use vortx_protocol::{ResourcePath, Stream};
 
 use crate::request::{resource_to_kind, ResourceKind, ResourceRequest};
 use crate::source::{Source, SourceKind};
+use crate::transport::FetchRequest;
 use crate::SourceError;
 
 /// Wraps an installed Stremio addon. Every existing addon (Cinemeta, Torrentio, AIOStreams, Comet,
@@ -51,8 +52,23 @@ impl Source for StremioAddonSource {
                 .supports(req.kind.wire(), &req.type_, &req.id)
     }
 
+    fn plan(&self, req: &ResourceRequest, budget_ms: u64) -> Option<FetchRequest> {
+        // Only plan a fetch this addon actually serves; the byte-exact Stremio transport URL is built
+        // from the addon's transport URL (its id) plus the request path, so it resolves identically to
+        // the official client. The host performs the GET; this stays pure.
+        if !self.supports(req) {
+            return None;
+        }
+        Some(FetchRequest {
+            addon_id: self.id().to_string(),
+            url: ResourcePath::from(req).to_url(self.id()),
+            budget_ms,
+        })
+    }
+
     fn resolve(&self, _req: &ResourceRequest) -> Result<Vec<Stream>, SourceError> {
-        // The HTTP transport (fetch + decode) lands in the engine I/O phase.
+        // Direct blocking resolution is not the path: vortx_source::resolve_streams drives plan() through
+        // the host Fetch boundary. This stays as the explicit "no in-kernel I/O" marker.
         Err(SourceError::NotImplemented)
     }
 }

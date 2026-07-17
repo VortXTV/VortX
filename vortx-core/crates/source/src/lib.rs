@@ -14,29 +14,58 @@
 //! engine phase here). Nothing in the shipping engine is touched.
 
 mod adapters;
+mod cached;
 mod canonical;
 mod customization;
+mod entry;
+mod exit;
+mod fanout;
+mod identity;
 mod manifest;
+mod native;
+mod orchestrate;
+mod pagination;
 mod registry;
 mod request;
 mod source;
+mod transport;
 mod validate;
+mod verify;
 
 pub use adapters::{NuvioProviderSource, StremioAddonSource};
+pub use cached::{cached_on, cached_vector, stream_is_cached};
 pub use canonical::canonicalize;
 pub use customization::{
     token_keys, AccentDef, AssetRef, BrandingDef, Color, CustomizationCapability, HeroDecl,
     HomeLayout, LayoutDef, MotionDef, PaletteOverride, RadiusDef, RailDecl, Splash, TabDecl,
     ThemeDef, Wordmark,
 };
+pub use entry::{plan_streams, SourceEntry};
+pub use exit::{should_stop, ExitConfig, ExitDecision, ExitReason, PartialResult};
+pub use fanout::{
+    aggregate, AddonResult, Aggregate, BreakerRegistry, BreakerState, CircuitBreaker,
+    CircuitConfig, FailedAddon, FailureKind, Outcome,
+};
+pub use identity::{reconcile, CanonicalId, ExternalId, IdSet, Namespace};
 pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,
 };
+pub use native::NativeVortxSource;
+pub use orchestrate::{
+    parse_catalog_item, parse_meta_item, parse_stream_item, resolve_streams, settle_catalog,
+    settle_items, settle_meta, settle_streams, ResolvedCatalog, ResolvedItems, ResolvedMeta,
+    ResolvedStreams,
+};
+pub use pagination::{next_page, AddonPage, CatalogCursor, Page};
 pub use registry::SourceRegistry;
-pub use request::{ResourceKind, ResourceRequest};
+pub use request::{EpgWindow, ResourceKind, ResourceRequest};
 pub use source::{Source, SourceKind};
+pub use transport::{
+    execute_plan, plan_fanout, run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest,
+};
 pub use validate::{has_errors, validate, Issue, Severity};
+pub use verify::{manifest_signing_bytes, verify_manifest, ManifestVerification};
 
 /// Errors a [`Source`] can return. `resolve` MUST NOT panic; it returns one of these (the orchestrator
 /// treats any error as an empty result so one bad source never poisons a fan-out).

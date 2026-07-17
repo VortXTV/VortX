@@ -9,11 +9,19 @@
 //!   - A debrid-cached stream gets a within-tier `+8000` bonus: it clears the within-tier spread but
 //!     cannot jump the `15000` tier step.
 //!   - Source class / HDR / audio are the within-tier spread; size is a small final tiebreaker.
+//!
+//! The score is FIXED-POINT, not floating: it is accumulated as an `i64` in milli-points (each human
+//! weight above times `SCALE` = 1000) plus an integer size term computed by integer division. There is no
+//! `f64` anywhere on the scoring path, so the score, and therefore the ordering, is byte-reproducible on
+//! every platform (iOS, Android, a Cloudflare Worker) and can be pinned by cross-language conformance
+//! vectors. The `reasons` strings keep the readable human magnitudes (e.g. `+100000`), not the scaled
+//! values. The only `f64` left is the user-facing `max_filesize_gb` FILTER, which is a pref comparison,
+//! not part of the deterministic score.
 
 use serde::{Deserialize, Serialize};
-use vortx_protocol::Stream;
+use vortx_protocol::{AudioCodec, ContentClass, ContentKind, Stream, VortxStreamHints};
 
-use crate::parse::{parse, Audio, Hdr, ParsedData, Resolution, SourceClass};
+use crate::parse::{parse, parse_typed, Audio, Hdr, ParsedData, Resolution, SourceClass};
 use crate::prefs::RankingPrefs;
 
 /// The resolution tier a ranked stream falls into.
@@ -45,7 +53,8 @@ impl Tier {
 pub struct RankedStream {
     /// Index of this stream in the input slice.
     pub raw_index: usize,
-    pub score: f64,
+    /// Fixed-point score in milli-points (human weight x 1000 + integer size term). Byte-reproducible.
+    pub score: i64,
     pub tier: Tier,
     pub reasons: Vec<String>,
     pub is_dolby_vision: bool,
@@ -54,49 +63,159 @@ pub struct RankedStream {
     pub parsed: ParsedData,
 }
 
-const PREF_RANK_WEIGHT: f64 = 100_000.0;
-const CACHED_BONUS: f64 = 8_000.0;
-const JUNK_PENALTY: f64 = -100_000.0;
+/// Milli-point scale: each human weight contributes `weight * SCALE` so the sub-point size tiebreaker
+/// (0..12 points) survives as an integer (0..12000 milli) without any float.
+const SCALE: i64 = 1_000;
+/// Max size tiebreaker in milli-points (12 points).
+const SIZE_MILLI_CAP: i64 = 12_000;
+/// 1 GiB in bytes; the size term is `bytes * 150 / GIB` (= `gb * 0.15 * 1000`), clamped.
+const GIB: i128 = 1_073_741_824;
 
-fn resolution_tier_score(r: Resolution) -> f64 {
+const PREF_RANK_WEIGHT: i64 = 100_000;
+const CACHED_BONUS: i64 = 8_000;
+const JUNK_PENALTY: i64 = -100_000;
+
+/// Swarm health (seeders) is a within-tier tiebreaker with DIMINISHING returns: each doubling of seeders
+/// adds a fixed step (integer log2 via `leading_zeros`, so byte-reproducible, no float), saturating so a
+/// healthy swarm refines ties but can never override the resolution tier or the AV-quality signals. The cap
+/// is reached around 512+ seeders. Only a typed `vortx.seeders` feeds this; a plain stream has none.
+const SEEDERS_PER_BIT_MILLI: i64 = 2_000;
+const SEEDERS_MILLI_CAP: i64 = 20_000;
+/// Distinct-source confidence (anti-fake) saturates at the hive N=3 quorum: 3+ distinct nodes vouching for
+/// an infohash is full confidence. A small within-tier nudge, below seeders and the AV-quality signals.
+const SOURCES_PER_NODE_MILLI: i64 = 2_000;
+const SOURCES_MILLI_CAP: i64 = 6_000;
+
+/// A preferred-language match is a STRONG within-tier signal: above the AV-quality band (a profile would
+/// rather have its language than slightly better audio), but below the cached bonus and far below the
+/// resolution tier step, so it reorders same-tier ties decisively yet never overrides availability or
+/// resolution. A stream that declares languages but none preferred is demoted by the same amount
+/// (foreign-dub demotion). Unknown languages (a plain stream / empty list) are NOT penalized: fail-open.
+const LANG_MATCH: i64 = 500;
+const LANG_FOREIGN: i64 = -500;
+
+/// The AUDIO-only lossless preference: a lossless codec (FLAC/ALAC/WAV/AIFF/DSD) outranks any lossy one
+/// regardless of bitrate or size. 100 human-points sits comfortably ABOVE the within-tier tiebreaker band
+/// (size <= 12, seeders <= 20, sources <= 6 = at most ~38 points combined), so a small FLAC beats a large
+/// 320k MP3, yet two lossless files still tiebreak by those existing terms. It sits BELOW language preference
+/// (500) and the cached bonus (8000), so availability and the user's language still come first. This term
+/// fires ONLY for the Audio profile; the Video/Live paths never see it (byte-identical).
+const LOSSLESS_BONUS: i64 = 100;
+
+fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
-        Resolution::P2160 => 60_000.0,
-        Resolution::P1080 => 45_000.0,
-        Resolution::P720 => 30_000.0,
-        Resolution::P480 => 15_000.0,
-        Resolution::Unknown => 0.0,
+        Resolution::P2160 => 60_000,
+        Resolution::P1080 => 45_000,
+        Resolution::P720 => 30_000,
+        Resolution::P480 => 15_000,
+        Resolution::Unknown => 0,
     }
 }
 
-fn source_class_score(c: SourceClass) -> f64 {
+fn source_class_score(c: SourceClass) -> i64 {
     match c {
-        SourceClass::Remux => 230.0,
-        SourceClass::BluRay => 150.0,
-        SourceClass::WebDl => 90.0,
-        SourceClass::Web => 75.0,
-        SourceClass::Hdtv => 40.0,
-        SourceClass::Cam => 5.0,
-        SourceClass::Unknown => 0.0,
+        SourceClass::Remux => 230,
+        SourceClass::BluRay => 150,
+        SourceClass::WebDl => 90,
+        SourceClass::Web => 75,
+        SourceClass::Hdtv => 40,
+        SourceClass::Cam => 5,
+        SourceClass::Unknown => 0,
     }
 }
 
-fn hdr_score(h: Hdr) -> f64 {
+fn hdr_score(h: Hdr) -> i64 {
     match h {
-        Hdr::DolbyVision => 120.0,
-        Hdr::Hdr10Plus => 80.0,
-        Hdr::Hdr10 => 60.0,
-        Hdr::None => 0.0,
+        Hdr::DolbyVision => 120,
+        Hdr::Hdr10Plus => 80,
+        Hdr::Hdr10 => 60,
+        Hdr::None => 0,
     }
 }
 
-fn audio_score(a: Audio) -> f64 {
+fn audio_score(a: Audio) -> i64 {
     match a {
-        Audio::Atmos => 90.0,
-        Audio::TrueHd => 70.0,
-        Audio::DtsHdMa => 60.0,
-        Audio::DdPlus => 30.0,
-        Audio::None => 0.0,
+        Audio::Atmos => 90,
+        Audio::TrueHd => 70,
+        Audio::DtsHdMa => 60,
+        Audio::DdPlus => 30,
+        Audio::None => 0,
     }
+}
+
+/// The integer size tiebreaker in milli-points: `clamp(bytes * 150 / GiB, 0, 12000)`. A non-positive or
+/// malformed `video_size` yields 0, so it can never sink a stream below the junk floor.
+fn size_milli(bytes: i64) -> i64 {
+    if bytes <= 0 {
+        return 0;
+    }
+    ((bytes as i128 * 150) / GIB).min(SIZE_MILLI_CAP as i128) as i64
+}
+
+/// The typed `behaviorHints.vortx` side-channel on a stream, if any (a vortx-native source emits it; a plain
+/// Stremio stream does not). The raw accessor; the seeders/sources/size signals read from this directly.
+fn vortx(s: &Stream) -> Option<&VortxStreamHints> {
+    s.behavior_hints.as_ref().and_then(|h| h.vortx.as_ref())
+}
+
+/// The typed side-channel ONLY when it carries title-replacing score inputs (a `resolution` token or
+/// `tags`). A vortx object with neither (e.g. an nzb row carrying only `nzbHash`/`seeders`) does NOT divert
+/// the parsed resolution/source/hdr/audio off the title; those fall back to the parser (the seeders/sources
+/// bonuses still apply). This is the stream-level proxy for the manifest's `ranking.emitsScoreInputs`.
+fn typed_score_inputs(s: &Stream) -> Option<&VortxStreamHints> {
+    vortx(s).filter(|v| v.resolution.is_some() || !v.tags.is_empty())
+}
+
+/// Seeders -> a diminishing-returns within-tier bonus in milli-points: integer log2 (floor(log2(n))+1 via
+/// `leading_zeros`) times a fixed per-doubling step, capped. 0 or a malformed negative yields 0. No float,
+/// so it is byte-reproducible across platforms.
+fn seeders_milli(seeders: i64) -> i64 {
+    if seeders <= 0 {
+        return 0;
+    }
+    let doublings = (i64::BITS - (seeders as u64).leading_zeros()) as i64;
+    (doublings * SEEDERS_PER_BIT_MILLI).min(SEEDERS_MILLI_CAP)
+}
+
+/// Distinct-source confidence -> a small within-tier bonus in milli-points, saturating at the N=3 quorum.
+fn sources_milli(sources: i64) -> i64 {
+    if sources <= 0 {
+        return 0;
+    }
+    (sources * SOURCES_PER_NODE_MILLI).min(SOURCES_MILLI_CAP)
+}
+
+/// The language-preference contribution in human-points (the caller scales by SCALE). Fail-open: no
+/// preference set, or no known stream languages, yields 0. A preferred language present -> +LANG_MATCH; a
+/// stream that declares languages but none preferred -> LANG_FOREIGN (a demotion). Case-insensitive match.
+fn language_points(stream_langs: &[String], preferred: &[String]) -> i64 {
+    if preferred.is_empty() || stream_langs.is_empty() {
+        return 0;
+    }
+    let is_preferred = |lang: &String| preferred.iter().any(|p| p.eq_ignore_ascii_case(lang));
+    if stream_langs.iter().any(is_preferred) {
+        LANG_MATCH
+    } else {
+        LANG_FOREIGN
+    }
+}
+
+/// The ranking score-inputs for a stream: derived from the TYPED vortx fields when present (so the engine
+/// never regex-parses a fragile title and ranks identically across platforms), else parsed from the title.
+fn parsed_for(s: &Stream, label: &str) -> ParsedData {
+    match typed_score_inputs(s) {
+        Some(v) => parse_typed(v),
+        None => parse(label),
+    }
+}
+
+/// Raw size in bytes for the integer score term. The typed `vortx.sizeBytes` takes precedence over the
+/// generic `behaviorHints.videoSize`, falling back to it for a plain Stremio stream (distinct from
+/// `size_gb`, the f64 filter input, which is derived from the same precedence).
+fn size_bytes(s: &Stream) -> Option<i64> {
+    vortx(s)
+        .and_then(|v| v.size_bytes)
+        .or_else(|| s.behavior_hints.as_ref().and_then(|h| h.video_size))
 }
 
 fn label_of(s: &Stream) -> String {
@@ -112,10 +231,7 @@ fn label_of(s: &Stream) -> String {
 }
 
 fn size_gb(s: &Stream) -> Option<f64> {
-    s.behavior_hints
-        .as_ref()
-        .and_then(|h| h.video_size)
-        .map(|bytes| bytes as f64 / 1_073_741_824.0)
+    size_bytes(s).map(|bytes| bytes as f64 / 1_073_741_824.0)
 }
 
 /// Rank `streams` for a profile. `cached[i]` marks stream `i` as debrid-cached (a missing entry is
@@ -143,7 +259,7 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
             continue;
         }
 
-        let parsed = parse(&label);
+        let parsed = parsed_for(s, &label);
 
         if let Some(maxr) = prefs.max_resolution {
             if parsed.resolution.rank() > maxr.rank() {
@@ -158,11 +274,16 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
         }
 
         let mut reasons = Vec::new();
+        let typed = vortx(s);
+        let empty_langs: &[String] = &[];
         let score = score_stream(
             &parsed,
             prefs,
             cached.get(i).copied().unwrap_or(false),
-            gb,
+            size_bytes(s),
+            typed.and_then(|v| v.seeders),
+            typed.and_then(|v| v.sources),
+            typed.map(|v| v.languages.as_slice()).unwrap_or(empty_langs),
             &mut reasons,
         );
         out.push(RankedStream {
@@ -177,26 +298,119 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
         });
     }
 
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.raw_index.cmp(&b.raw_index))
-    });
+    // Pure integer order: score descending, then original index for a stable tiebreak.
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
     out
 }
 
+/// The scoring profile a ranking runs under, selected by content class. `Video` is the FROZEN current ranker
+/// (every existing vector + the plain [`rank`] entry are byte-identical under it). `Live` and `Audio`
+/// currently reuse the video scoring as placeholders and are specialized in later chunks (a live
+/// stream-health profile; `rank_audio` for lossless/bitrate). The selection point exists now so those chunks
+/// slot in without changing callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankProfile {
+    Video,
+    Live,
+    Audio,
+}
+
+impl RankProfile {
+    /// Select the scoring profile for a content kind via its coarse [`ContentClass`].
+    pub fn for_kind(kind: ContentKind) -> RankProfile {
+        match kind.class() {
+            ContentClass::Video => RankProfile::Video,
+            ContentClass::Live => RankProfile::Live,
+            ContentClass::Audio => RankProfile::Audio,
+        }
+    }
+}
+
+/// Rank `streams` under the profile selected by `kind`. The `Video` profile is the byte-identical current
+/// [`rank`] (so `rank_for(Movie, ..)` equals `rank(..)` exactly, forever). `Live` and `Audio` reuse it as
+/// placeholders until their dedicated profiles land; the per-kind branch is structured here so those chunks
+/// slot in without touching callers. Each arm is intentionally the same scoring for now.
+#[allow(clippy::match_same_arms)]
+pub fn rank_for(
+    kind: ContentKind,
+    streams: &[Stream],
+    prefs: &RankingPrefs,
+    cached: &[bool],
+) -> Vec<RankedStream> {
+    match RankProfile::for_kind(kind) {
+        RankProfile::Video => rank(streams, prefs, cached),
+        // placeholder: a live stream-health profile (no resolution tiers, bitrate/uptime first) lands in LT.
+        RankProfile::Live => rank(streams, prefs, cached),
+        RankProfile::Audio => rank_audio(streams, prefs, cached),
+    }
+}
+
+/// The AUDIO scoring profile: the frozen [`rank`] base plus a lossless-codec preference. Built as a pure
+/// post-pass over [`rank`] (NOT a fork of the scorer) so the shared base stays the single source of truth and
+/// the Video path is provably untouched. A surviving stream whose resolved [`AudioCodec`] is lossless gains
+/// [`LOSSLESS_BONUS`]; the list is then re-sorted with the same stable order (score desc, original index).
+/// FAIL-OPEN: an unknown / absent codec is neutral, so a plain stream is byte-identical to its [`rank`] score.
+pub fn rank_audio(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<RankedStream> {
+    let mut out = rank(streams, prefs, cached);
+    for r in &mut out {
+        if audio_codec_of(&streams[r.raw_index]).is_lossless() {
+            r.score += LOSSLESS_BONUS * SCALE;
+            r.reasons
+                .push(format!("lossless audio (+{LOSSLESS_BONUS})"));
+        }
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
+    out
+}
+
+/// Resolve a stream's audio codec for ranking. TYPED path first (the `vortx.tags` channel, scanned through
+/// [`AudioCodec::from_wire`], preferring a lossless match); only if no codec is recognized there does it fall
+/// back to parsing the stream label tokens. FAIL-OPEN: returns [`AudioCodec::Unknown`] when nothing matches.
+fn audio_codec_of(s: &Stream) -> AudioCodec {
+    let mut best = AudioCodec::Unknown;
+    if let Some(v) = vortx(s) {
+        for t in &v.tags {
+            best = merge_codec(best, t);
+        }
+    }
+    if best == AudioCodec::Unknown {
+        let label = label_of(s);
+        for tok in label.split(|c: char| !c.is_ascii_alphanumeric()) {
+            best = merge_codec(best, tok);
+        }
+    }
+    best
+}
+
+/// Fold one token into the running codec choice: ignore unrecognized tokens, take the first recognized codec,
+/// and upgrade a lossy choice to a lossless one (lossless wins) but never the reverse.
+fn merge_codec(best: AudioCodec, token: &str) -> AudioCodec {
+    let c = AudioCodec::from_wire(token);
+    match (c, best) {
+        (AudioCodec::Unknown, _) => best,
+        (_, AudioCodec::Unknown) => c,
+        _ if !best.is_lossless() && c.is_lossless() => c,
+        _ => best,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn score_stream(
     p: &ParsedData,
     prefs: &RankingPrefs,
     cached: bool,
-    gb: Option<f64>,
+    bytes: Option<i64>,
+    seeders: Option<i64>,
+    sources: Option<i64>,
+    stream_langs: &[String],
     reasons: &mut Vec<String>,
-) -> f64 {
-    let mut s = 0.0;
+) -> i64 {
+    // Accumulated in milli-points: each human weight is added as `weight * SCALE`, the size term is
+    // already in milli. The reasons keep the readable human magnitudes.
+    let mut s: i64 = 0;
 
     if p.junk {
-        s += JUNK_PENALTY;
+        s += JUNK_PENALTY * SCALE;
         reasons.push("junk/fake (-100000)".to_string());
     }
 
@@ -206,45 +420,69 @@ fn score_stream(
             .iter()
             .position(|c| *c == p.source_class)
         {
-            let pref_rank = (prefs.source_type_order.len() - idx) as f64;
+            let pref_rank = (prefs.source_type_order.len() - idx) as i64;
             let bonus = pref_rank * PREF_RANK_WEIGHT;
-            s += bonus;
+            s += bonus * SCALE;
             reasons.push(format!("preferred source {:?} (+{bonus})", p.source_class));
         }
     }
 
     let tier = resolution_tier_score(p.resolution);
-    s += tier;
+    s += tier * SCALE;
     reasons.push(format!("{:?} (+{tier})", p.resolution));
 
     if cached && prefs.cached_first {
-        s += CACHED_BONUS;
+        s += CACHED_BONUS * SCALE;
         reasons.push("cached (+8000)".to_string());
     }
 
     let sc = source_class_score(p.source_class);
-    if sc != 0.0 {
-        s += sc;
+    if sc != 0 {
+        s += sc * SCALE;
         reasons.push(format!("{:?} (+{sc})", p.source_class));
     }
     let h = hdr_score(p.hdr);
-    if h != 0.0 {
-        s += h;
+    if h != 0 {
+        s += h * SCALE;
         reasons.push(format!("{:?} (+{h})", p.hdr));
     }
     let a = audio_score(p.audio);
-    if a != 0.0 {
-        s += a;
+    if a != 0 {
+        s += a * SCALE;
         reasons.push(format!("{:?} (+{a})", p.audio));
     }
     if p.repack {
-        s += 5.0;
+        s += 5 * SCALE;
         reasons.push("repack (+5)".to_string());
     }
-    if let Some(g) = gb {
-        // Clamp to a small NON-NEGATIVE tiebreaker. A malformed negative video_size (i64) must never
-        // drive the score below the junk floor, or an add-on could self-suppress its own streams.
-        s += (g * 0.15).clamp(0.0, 12.0);
+    if let Some(b) = bytes {
+        // A small NON-NEGATIVE integer tiebreaker. A malformed negative video_size (i64) yields 0, so it
+        // can never drive the score below the junk floor or let an add-on self-suppress its own streams.
+        s += size_milli(b);
+    }
+    if let Some(sd) = seeders {
+        let m = seeders_milli(sd);
+        if m > 0 {
+            s += m;
+            reasons.push(format!("{sd} seeders (+{})", m / SCALE));
+        }
+    }
+    if let Some(src) = sources {
+        let m = sources_milli(src);
+        if m > 0 {
+            s += m;
+            reasons.push(format!("{src} sources (+{})", m / SCALE));
+        }
+    }
+    let lang = language_points(stream_langs, &prefs.preferred_languages);
+    if lang != 0 {
+        s += lang * SCALE;
+        let label = if lang > 0 {
+            "preferred language"
+        } else {
+            "foreign dub"
+        };
+        reasons.push(format!("{label} ({lang:+})"));
     }
 
     s
@@ -356,6 +594,335 @@ mod tests {
         let junk = stream("2160p FAKE upscale");
         let ranked = rank(&[legit, junk], &prefs, &[false, false]);
         assert_eq!(ranked[0].raw_index, 0); // legit still beats junk
-        assert!(ranked[0].score > 0.0);
+        assert!(ranked[0].score > 0);
+    }
+
+    use vortx_protocol::{StreamBehaviorHints, VortxStreamHints};
+
+    /// A stream whose typed vortx side-channel carries the given resolution token + tags, with a TITLE that
+    /// would parse to something different (so a passing test proves the typed path won).
+    fn typed_stream(misleading_title: &str, resolution: &str, tags: &[&str]) -> Stream {
+        Stream {
+            name: Some(misleading_title.to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some(resolution.to_string()),
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn typed_vortx_inputs_override_a_misleading_title() {
+        // The title says junk 480p cam; the typed object says 2160p remux dv atmos. The engine must rank
+        // from the typed fields, so this is a clean 4k DV remux, not junk.
+        let prefs = RankingPrefs::default();
+        let s = typed_stream("Movie 2024 480p HDCAM", "2160p", &["remux", "dv", "atmos"]);
+        let ranked = rank(&[s], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Uhd);
+        assert!(ranked[0].is_dolby_vision);
+        assert_eq!(ranked[0].audio, Audio::Atmos);
+        assert!(!ranked[0].parsed.junk); // the "hdcam" in the title did NOT make it junk
+                                         // (60000 tier + 230 remux + 120 dv + 90 atmos) * 1000
+        assert_eq!(ranked[0].score, 60_440_000);
+    }
+
+    #[test]
+    fn a_typed_4k_outranks_a_title_parsed_1080p() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_stream("garbage label", "2160p", &["web-dl"]),
+            stream("Movie 1080p WEB-DL"),
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 0); // the typed 4k
+        assert_eq!(ranked[1].raw_index, 1); // the title-parsed 1080p
+    }
+
+    #[test]
+    fn a_plain_stream_still_ranks_from_its_title() {
+        // No vortx object -> the title parser is authoritative (no regression).
+        let prefs = RankingPrefs::default();
+        let ranked = rank(&[stream("2160p BluRay REMUX")], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Uhd);
+        assert_eq!(ranked[0].parsed.source_class, SourceClass::Remux);
+    }
+
+    #[test]
+    fn an_empty_vortx_object_falls_back_to_the_title() {
+        // A vortx object with no resolution and no tags carries no score inputs -> use the title.
+        let prefs = RankingPrefs::default();
+        let mut s = stream("1080p WEB-DL");
+        s.behavior_hints = Some(StreamBehaviorHints {
+            vortx: Some(VortxStreamHints {
+                cached_services: vec!["realdebrid".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ranked = rank(&[s], &prefs, &[false]);
+        assert_eq!(ranked[0].tier, Tier::Fhd); // from the title, not Unknown
+    }
+
+    /// A typed stream with the given resolution token + tags + optional seeders/sources.
+    fn typed_full(
+        resolution: &str,
+        tags: &[&str],
+        seeders: Option<i64>,
+        sources: Option<i64>,
+    ) -> Stream {
+        Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some(resolution.to_string()),
+                    tags: tags.iter().map(|t| t.to_string()).collect(),
+                    seeders,
+                    sources,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn more_seeders_breaks_a_within_tier_tie() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_full("1080p", &["web-dl"], Some(4), None),
+            typed_full("1080p", &["web-dl"], Some(1024), None),
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // 1024 seeders wins the tie
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("seeders")));
+    }
+
+    #[test]
+    fn seeders_never_jump_the_resolution_tier() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            typed_full("720p", &[], Some(999_999), None), // huge swarm, lower tier
+            typed_full("1080p", &[], None, None),         // higher tier, no seeders
+        ];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // 1080p still wins; seeders are bounded below the tier step
+    }
+
+    #[test]
+    fn distinct_sources_confidence_saturates_at_quorum() {
+        let prefs = RankingPrefs::default();
+        // sources 3 and 5 both saturate at the N=3 quorum cap, so they tie; 1 source ranks below.
+        let three = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(3))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
+        let five = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(5))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
+        let one = rank(
+            &[typed_full("1080p", &["web-dl"], None, Some(1))],
+            &prefs,
+            &[false],
+        )[0]
+        .score;
+        assert_eq!(three, five); // saturated at quorum
+        assert!(one < three);
+    }
+
+    /// A typed stream carrying the given audio languages (resolution 1080p, no tags).
+    fn typed_langs(langs: &[&str]) -> Stream {
+        Stream {
+            name: Some("x".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some("1080p".to_string()),
+                    languages: langs.iter().map(|l| l.to_string()).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preferred_language_floats_above_a_foreign_dub() {
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["en".to_string()],
+            ..Default::default()
+        };
+        let streams = [typed_langs(&["ja"]), typed_langs(&["en", "ja"])];
+        let ranked = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // the one carrying "en"
+        assert!(ranked[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("preferred language")));
+        assert!(ranked[1].reasons.iter().any(|r| r.contains("foreign dub")));
+    }
+
+    #[test]
+    fn empty_preferred_languages_is_a_no_op() {
+        let prefs = RankingPrefs::default(); // preferred_languages empty
+        let with = rank(&[typed_langs(&["ja"])], &prefs, &[false])[0].score;
+        let plain = rank(&[typed_langs(&[])], &prefs, &[false])[0].score;
+        assert_eq!(with, plain); // languages present but no preference -> no effect
+    }
+
+    #[test]
+    fn unknown_languages_are_not_penalized() {
+        // A stream that declares NO languages is never demoted (fail-open), even with a preference set.
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["en".to_string()],
+            ..Default::default()
+        };
+        let unknown = rank(&[typed_langs(&[])], &prefs, &[false])[0].score;
+        let foreign = rank(&[typed_langs(&["ja"])], &prefs, &[false])[0].score;
+        assert!(unknown > foreign); // the foreign dub is demoted; the unknown one is not
+    }
+
+    #[test]
+    fn language_match_is_case_insensitive() {
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["EN".to_string()],
+            ..Default::default()
+        };
+        let ranked = rank(&[typed_langs(&["en"])], &prefs, &[false]);
+        assert!(ranked[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("preferred language")));
+    }
+
+    #[test]
+    fn typed_size_bytes_takes_precedence_over_video_size() {
+        // vortx.sizeBytes should drive the size tiebreaker over the generic videoSize.
+        let prefs = RankingPrefs::default();
+        let mut s = typed_stream("x", "1080p", &["web-dl"]);
+        if let Some(bh) = s.behavior_hints.as_mut() {
+            bh.video_size = Some(1); // tiny generic size
+            if let Some(v) = bh.vortx.as_mut() {
+                v.size_bytes = Some(10_737_418_240); // 10 GiB typed
+            }
+        }
+        let ranked = rank(&[s], &prefs, &[false]);
+        // 1080p webdl base = (45000 + 90)*1000 = 45090000; + size_milli(10 GiB) = 1500.
+        assert_eq!(ranked[0].score, 45_091_500);
+    }
+
+    #[test]
+    fn profile_selection_maps_class_to_profile() {
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Movie),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Series),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Unknown),
+            RankProfile::Video
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Channel),
+            RankProfile::Live
+        );
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::Audiobook),
+            RankProfile::Audio
+        );
+    }
+
+    #[test]
+    fn video_kind_ranks_byte_identically_to_the_frozen_ranker() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            stream("1080p WEB-DL"),
+            stream("2160p BluRay REMUX Dolby Vision Atmos"),
+            stream("720p HDTV"),
+        ];
+        let cached = [false, true, false];
+        // The video profile IS the frozen rank(): same scores, same order, forever.
+        assert_eq!(
+            rank_for(ContentKind::Movie, &streams, &prefs, &cached),
+            rank(&streams, &prefs, &cached)
+        );
+    }
+
+    #[test]
+    fn live_still_delegates_to_the_video_profile() {
+        // The live profile is not specialized yet; it stays byte-identical to the frozen video ranker.
+        let prefs = RankingPrefs::default();
+        let streams = [stream("1080p WEB-DL"), stream("2160p WEB-DL")];
+        let base = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(
+            rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]),
+            base
+        );
+    }
+
+    #[test]
+    fn audio_lossless_outranks_lossy_of_equal_everything_else() {
+        let prefs = RankingPrefs::default();
+        let streams = [stream("Some Album 320 MP3"), stream("Some Album FLAC")];
+        let ranked = rank_for(ContentKind::MusicTrack, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // the FLAC floats to the top
+        assert!(ranked[0].score > ranked[1].score);
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("lossless")));
+    }
+
+    #[test]
+    fn audio_without_a_codec_signal_is_byte_identical_to_the_base_rank() {
+        // Fail-open: no recognized codec -> no bonus -> the audio profile equals the frozen rank().
+        let prefs = RankingPrefs::default();
+        let streams = [stream("Episode 12 The Interview"), stream("Episode 13")];
+        let base = rank(&streams, &prefs, &[false, false]);
+        assert_eq!(
+            rank_for(ContentKind::Podcast, &streams, &prefs, &[false, false]),
+            base
+        );
+    }
+
+    #[test]
+    fn the_lossless_bonus_never_fires_on_the_video_profile() {
+        // A video release with a FLAC audio track in its title must NOT get the audio lossless bonus.
+        let prefs = RankingPrefs::default();
+        let streams = [stream("1080p BluRay REMUX FLAC")];
+        let base = rank(&streams, &prefs, &[false]);
+        assert_eq!(
+            rank_for(ContentKind::Movie, &streams, &prefs, &[false]),
+            base
+        );
+    }
+
+    #[test]
+    fn the_typed_tags_codec_wins_over_a_misleading_label() {
+        // The label says MP3; the typed vortx tags say flac. The typed path must win -> lossless bonus.
+        let prefs = RankingPrefs::default();
+        let s = Stream {
+            name: Some("Album 128k MP3".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    tags: vec!["flac".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ranked = rank_for(ContentKind::MusicTrack, &[s], &prefs, &[false]);
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("lossless")));
     }
 }

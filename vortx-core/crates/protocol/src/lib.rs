@@ -12,16 +12,21 @@
 //! in a later phase) that maps them onto these same types, so the rest of the engine only ever sees
 //! one shape.
 
+mod audio;
+mod content;
 mod manifest;
 mod resource;
 mod transport;
 
+pub use audio::{Artist, AudioAlbum, AudioCodec, AudioTrack};
+pub use content::{ContentClass, ContentKind};
 pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
 };
 pub use resource::{
-    AddonCatalogResponse, AddonDescriptor, CatalogResponse, MetaDetail, MetaPreview, MetaResponse,
-    Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle, SubtitlesResponse, Video,
+    AddonCatalogResponse, AddonDescriptor, CatalogResponse, Chapter, MetaDetail, MetaPreview,
+    MetaResponse, Stream, StreamBehaviorHints, StreamResponse, StreamSource, Subtitle,
+    SubtitlesResponse, Video, VortxStreamHints,
 };
 pub use transport::{base_url, ResourcePath};
 
@@ -263,6 +268,16 @@ mod tests {
         assert_eq!(parsed.metas.len(), 2);
         assert!(parsed.metas[0].poster.is_none());
         assert_eq!(parsed.metas[1].imdb_rating.as_deref(), Some("8.1"));
+        assert!(parsed.metas[0].certification.is_none()); // absent stays None (unrated)
+    }
+
+    #[test]
+    fn decodes_catalog_certification_for_parental_controls() {
+        let body = r#"{ "metas": [
+            { "id": "tt1", "type": "movie", "name": "A", "certification": "R" }
+        ] }"#;
+        let parsed = parse_catalog(body).expect("catalog parses");
+        assert_eq!(parsed.metas[0].certification.as_deref(), Some("R"));
     }
 
     #[test]

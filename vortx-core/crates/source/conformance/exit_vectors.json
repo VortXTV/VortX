@@ -1,0 +1,35 @@
+{
+  "description": "Cross-language conformance for quality-aware fan-out early termination. Given the partial results seen so far + an ExitConfig, should_stop returns a deterministic decision: stop on enough cached results at/above the target height, else stop on enough total results, else continue. Integer-only, so every platform stops at the identical point given the same arrival order.",
+  "cases": [
+    {
+      "name": "enough_cached_at_target",
+      "partial": [{ "cached": true, "height": 1080 }, { "cached": false, "height": 2160 }, { "cached": true, "height": 1080 }],
+      "config": { "min_cached_at_target": 2, "target_height": 1080, "min_total": 100 },
+      "expect": { "decision": "stop_now", "reason": "enough_cached" }
+    },
+    {
+      "name": "cached_below_target_does_not_count",
+      "partial": [{ "cached": true, "height": 720 }, { "cached": true, "height": 720 }],
+      "config": { "min_cached_at_target": 2, "target_height": 1080, "min_total": 100 },
+      "expect": { "decision": "continue" }
+    },
+    {
+      "name": "total_count_fallback",
+      "partial": [{ "cached": false, "height": 1080 }, { "cached": false, "height": 720 }, { "cached": false, "height": 480 }],
+      "config": { "min_cached_at_target": 5, "target_height": 2160, "min_total": 3 },
+      "expect": { "decision": "stop_now", "reason": "enough_total" }
+    },
+    {
+      "name": "cached_gate_wins_over_total",
+      "partial": [{ "cached": true, "height": 2160 }, { "cached": true, "height": 2160 }, { "cached": true, "height": 2160 }],
+      "config": { "min_cached_at_target": 2, "target_height": 1080, "min_total": 3 },
+      "expect": { "decision": "stop_now", "reason": "enough_cached" }
+    },
+    {
+      "name": "empty_continues",
+      "partial": [],
+      "config": { "min_cached_at_target": 3, "target_height": 1080, "min_total": 30 },
+      "expect": { "decision": "continue" }
+    }
+  ]
+}

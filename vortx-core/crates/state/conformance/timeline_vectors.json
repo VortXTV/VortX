@@ -1,0 +1,96 @@
+{
+  "description": "Cross-language conformance for the AU2 LogicalTimeline + ResumeTarget. Times are UTC/offset milliseconds (integer). Chapters use the SH5 Chapter wire keys (startMs/endMs). chapter_at uses half-open [start,end) with order-independent derived ends (explicit endMs, else next-greater chapter start, else duration). resume reuses the SH6 finished() contract (finished -> restart at 0) and snaps a position within snap_ms of the current chapter start back to that start. A chapter is identified by its integer index. A port must reproduce every answer byte-for-byte.",
+  "chapter_at": [
+    {
+      "name": "derived_ends_half_open",
+      "duration_ms": 180000,
+      "chapters": [ { "startMs": 0 }, { "startMs": 60000 }, { "startMs": 120000 } ],
+      "cases": [
+        { "offset_ms": 0, "expect": 0 },
+        { "offset_ms": 59999, "expect": 0 },
+        { "offset_ms": 60000, "expect": 1 },
+        { "offset_ms": 179999, "expect": 2 },
+        { "offset_ms": 180000, "expect": null },
+        { "offset_ms": -1, "expect": null }
+      ]
+    },
+    {
+      "name": "explicit_ends_leave_gaps",
+      "duration_ms": 30000,
+      "chapters": [ { "startMs": 0, "endMs": 10000 }, { "startMs": 20000, "endMs": 30000 } ],
+      "cases": [
+        { "offset_ms": 5000, "expect": 0 },
+        { "offset_ms": 15000, "expect": null },
+        { "offset_ms": 25000, "expect": 1 }
+      ]
+    },
+    {
+      "name": "empty_chapters_have_no_real_chapter",
+      "duration_ms": 120000,
+      "chapters": [],
+      "cases": [
+        { "offset_ms": 60000, "expect": null }
+      ]
+    }
+  ],
+  "resume": [
+    {
+      "name": "snap_within_grace_to_chapter_start",
+      "duration_ms": 120000,
+      "chapters": [ { "startMs": 0 }, { "startMs": 60000 } ],
+      "position_ms": 63000,
+      "policy": { "finished_permille": 900, "tail_grace_ms": 0 },
+      "snap_ms": 5000,
+      "expect": { "position_ms": 60000, "chapter_index": 1 }
+    },
+    {
+      "name": "outside_grace_keeps_position",
+      "duration_ms": 120000,
+      "chapters": [ { "startMs": 0 }, { "startMs": 60000 } ],
+      "position_ms": 70000,
+      "policy": { "finished_permille": 900, "tail_grace_ms": 0 },
+      "snap_ms": 5000,
+      "expect": { "position_ms": 70000, "chapter_index": 1 }
+    },
+    {
+      "name": "finished_audiobook_restarts_at_zero",
+      "duration_ms": 3600000,
+      "chapters": [ { "startMs": 0 }, { "startMs": 1800000 } ],
+      "position_ms": 3420000,
+      "policy": { "finished_permille": 900, "tail_grace_ms": 300000 },
+      "snap_ms": 5000,
+      "expect": { "position_ms": 0, "chapter_index": 0 }
+    },
+    {
+      "name": "clamps_overshoot_then_finishes_to_zero",
+      "duration_ms": 120000,
+      "chapters": [],
+      "position_ms": 999999,
+      "policy": { "finished_permille": 900, "tail_grace_ms": 0 },
+      "snap_ms": 5000,
+      "expect": { "position_ms": 0 }
+    },
+    {
+      "name": "unknown_duration_never_finishes_keeps_position",
+      "duration_ms": 0,
+      "chapters": [],
+      "position_ms": 50000,
+      "policy": { "finished_permille": 900, "tail_grace_ms": 300000 },
+      "snap_ms": 5000,
+      "expect": { "position_ms": 50000 }
+    }
+  ],
+  "nav": [
+    {
+      "name": "next_prev_over_three_chapters",
+      "duration_ms": 180000,
+      "chapters": [ { "startMs": 0 }, { "startMs": 60000 }, { "startMs": 120000 } ],
+      "cases": [
+        { "offset_ms": 30000, "next": 1, "prev": 0 },
+        { "offset_ms": 0, "next": 1, "prev": null },
+        { "offset_ms": 120000, "next": null, "prev": 1 },
+        { "offset_ms": 130000, "next": null, "prev": 2 }
+      ]
+    }
+  ]
+}

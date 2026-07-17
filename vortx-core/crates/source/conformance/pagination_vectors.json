@@ -1,0 +1,35 @@
+{
+  "description": "Cross-language conformance for engine pagination across heterogeneous catalogs. Each case runs page1 then page2 (chaining the cursor) and pins the appended item ids per page. Append-only, dedup-aware (no id on two pages), deterministic (addons in sorted id order).",
+  "cases": [
+    {
+      "name": "append_no_overlap",
+      "page1": [
+        { "addon_id": "a", "items": ["x", "y"] },
+        { "addon_id": "b", "items": ["z"] }
+      ],
+      "page2": [
+        { "addon_id": "a", "items": ["w"] },
+        { "addon_id": "b", "items": ["v"] }
+      ],
+      "expect_page1": ["x", "y", "z"],
+      "expect_page2": ["w", "v"]
+    },
+    {
+      "name": "cross_page_dedup",
+      "page1": [{ "addon_id": "a", "items": ["x", "y"] }],
+      "page2": [{ "addon_id": "b", "items": ["y", "z"] }],
+      "expect_page1": ["x", "y"],
+      "expect_page2": ["z"]
+    },
+    {
+      "name": "within_page_dedup",
+      "page1": [
+        { "addon_id": "a", "items": ["same"] },
+        { "addon_id": "b", "items": ["same"] }
+      ],
+      "page2": [],
+      "expect_page1": ["same"],
+      "expect_page2": []
+    }
+  ]
+}

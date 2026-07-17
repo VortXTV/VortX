@@ -25,10 +25,22 @@
 //! (`cosine(v,v) ≈ 1`, `cosine(disjoint) = 0`) rather than golden floats, because IEEE-754 results are
 //! not guaranteed byte-identical across platforms.
 
+mod catalog;
+mod collab;
 mod feature;
+mod homefeed;
 mod recommend;
 mod taste;
 
+pub use catalog::{catalog_ratings, visible_catalog};
+pub use collab::{
+    affinity_from_strengths, collab_bonus, rerank_with_collab, CollabModel, CollabPrefs,
+};
 pub use feature::{cosine, feature_vector, FeatureKey, FeatureVector, MetaFeatures, RuntimeBucket};
+pub use homefeed::{
+    build_home_feed, watch_log_from_library, AllEligible, AllOf, AvailabilitySet,
+    EligibilityFilter, HomeFeed, HomeFeedInput, HomeFeedPrefs, Lane, LaneItem, LaneKind,
+    MaturityGate,
+};
 pub use recommend::{recommend, Candidate, Reason, RecoPrefs, Recommendation};
 pub use taste::{build_taste, Engagement, EngagementSignal, TasteProfile, HALF_LIFE_DAYS};

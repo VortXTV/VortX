@@ -19,22 +19,35 @@
 //! never serialized into a Stremio `libraryItem`; the account token stays in the Keychain only; the
 //! roster never silently drops a profile.
 
+mod finish;
 mod ids;
 mod library;
+mod maturity;
 mod pin;
 mod profile;
 mod roster;
+mod scrobble;
 mod store;
+mod timeline;
+mod watch;
 
+pub use finish::{finished, FinishPolicy};
 pub use ids::ProfileId;
 pub use library::{
     CwItem, HistoryEntry, LibraryItem, ProfileLibrary, ResumePoint, StremioLibraryItem,
-    WatchedBitfield,
+    WatchedBitfield, CW_CAP, FINISHED_PERMILLE,
+};
+pub use maturity::{
+    allows as maturity_allows, allows_raw as maturity_allows_raw, effective_ceiling, gating_mode,
+    parse_certification, GatingMode, MaturityRating, DEFAULT_KIDS_CEILING,
 };
 pub use pin::{hash_pin, pin_preimage, verify_pin};
 pub use profile::{AccountBinding, AddonBinding, ParentalFlags, Profile, ProfileSettings};
 pub use roster::ProfileRoster;
+pub use scrobble::{scrobble, PlaybackEvent, ScrobbleAction, ScrobbleConfig};
 pub use store::VortxStore;
+pub use timeline::{LogicalTimeline, ResumeTarget, Segment, RESUME_SNAP_MS};
+pub use watch::{merge as merge_watch, merge_log, WatchLog, WatchState};
 
 /// Errors from profile-state operations.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

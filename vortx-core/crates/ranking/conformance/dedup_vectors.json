@@ -1,0 +1,46 @@
+{
+  "description": "Cross-language conformance for cross-source stream dedup. Each case feeds stream candidates from several addons and pins the merged groups (member index sets). Connected-components over a conservative merge predicate, exactly reproducible.",
+  "cases": [
+    {
+      "name": "exact_infohash_across_two_sources",
+      "streams": [
+        { "source_id": "torrentio", "name": "The Movie 2024 1080p WEB-DL x264-GRP", "infohash": "aabb", "file_idx": 0, "size_bytes": 2000000000 },
+        { "source_id": "comet", "name": "The.Movie.2024.1080p.WEB-DL.x264-GRP", "infohash": "AABB", "file_idx": 0, "size_bytes": 2000000000 }
+      ],
+      "expect_groups": [[0, 1]]
+    },
+    {
+      "name": "different_resolution_stays_separate",
+      "streams": [
+        { "source_id": "a", "name": "Movie 2024 1080p BluRay x264-GRP", "size_bytes": 1000000000 },
+        { "source_id": "b", "name": "Movie 2024 2160p BluRay x264-GRP", "size_bytes": 4000000000 }
+      ],
+      "expect_groups": [[0], [1]]
+    },
+    {
+      "name": "different_group_stays_separate",
+      "streams": [
+        { "source_id": "a", "name": "Movie 2024 1080p BluRay x264-AAA", "size_bytes": 1000000000 },
+        { "source_id": "b", "name": "Movie 2024 1080p BluRay x264-BBB", "size_bytes": 1000000000 }
+      ],
+      "expect_groups": [[0], [1]]
+    },
+    {
+      "name": "same_release_two_addons_merges",
+      "streams": [
+        { "source_id": "a", "name": "Show S01E01 1080p WEB-DL x264-NTb", "size_bytes": 1500000000 },
+        { "source_id": "b", "name": "Show.S01E01.1080p.WEB-DL.x264-NTb", "size_bytes": 1550000000 }
+      ],
+      "expect_groups": [[0, 1]]
+    },
+    {
+      "name": "three_copies_one_distinct",
+      "streams": [
+        { "source_id": "a", "name": "Film 2020 2160p BluRay x265-GRP", "infohash": "ff", "file_idx": 0, "size_bytes": 20000000000 },
+        { "source_id": "b", "name": "Film.2020.2160p.BluRay.x265-GRP", "infohash": "FF", "file_idx": 0, "size_bytes": 20000000000 },
+        { "source_id": "c", "name": "Film 2020 1080p WEB-DL x264-OTH", "size_bytes": 3000000000 }
+      ],
+      "expect_groups": [[0, 1], [2]]
+    }
+  ]
+}

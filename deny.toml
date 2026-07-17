@@ -37,3 +37,25 @@ ignore = [
   # `cargo update` to pull the patched glib.
   "RUSTSEC-2024-0429",
 ]
+
+# License policy. Consumed by `cargo deny check licenses`, run from the vortx-core workspace
+# (cargo-deny walks up from vortx-core/ and uses this file). Without an explicit allow list,
+# cargo-deny rejects EVERY crate, including permissive ones, so the check fails on MIT and
+# Apache-2.0 as well as on our own copyleft. The allow list below is exactly the set of SPDX
+# licenses present in the vortx-core dependency tree (run `cargo deny list` to reproduce):
+#   * GPL-3.0-or-later is vortx-core's OWN license (see the workspace Cargo.toml). It must be
+#     allowed here or cargo-deny rejects our 15 first-party crates alongside the third-party ones.
+#   * MIT and Apache-2.0 cover almost the whole tree (serde, thiserror, base64, sha2, ...).
+#   * BSD-3-Clause is required by curve25519-dalek, ed25519-dalek, and subtle (BSD-3-only crates).
+#   * Unicode-3.0 is required by unicode-ident via an AND clause, so it must be listed explicitly.
+# Dual/multi-licensed crates whose expression includes a non-listed license (fiat-crypto's
+# "MIT OR Apache-2.0 OR BSD-1-Clause", memchr's "Unlicense OR MIT") are satisfied by MIT or
+# Apache-2.0 above, so BSD-1-Clause and Unlicense do not need their own entries.
+[licenses]
+allow = [
+  "GPL-3.0-or-later",
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+]

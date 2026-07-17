@@ -1,0 +1,38 @@
+{
+  "description": "Cross-language conformance for the XMLTV EPG parser (LT2), the timezone->UTC integer fence in particular. Each time case pins an XMLTV datetime string to its exact UTC milliseconds; the doc case pins a full parse. All times are UTC ms via hand-rolled integer civil-date math (no float, no chrono); a +HHMM/-HHMM offset converts local->UTC; a bare datetime is UTC. episode-num xmltv_ns is 0-indexed and normalized +1; onscreen SxxEyy is 1-indexed.",
+  "times": [
+    { "name": "epoch_utc", "s": "19700101000000 +0000", "ms": 0 },
+    { "name": "known_utc", "s": "20260629140000 +0000", "ms": 1782741600000 },
+    { "name": "plus_0200_to_utc", "s": "20260629160000 +0200", "ms": 1782741600000 },
+    { "name": "minus_0300_to_utc", "s": "20260629110000 -0300", "ms": 1782741600000 },
+    { "name": "bare_is_utc", "s": "20260629140000", "ms": 1782741600000 },
+    { "name": "no_seconds_defaults_zero", "s": "202606291400 +0000", "ms": 1782741600000 },
+    { "name": "malformed_is_none", "s": "not-a-time", "ms": null }
+  ],
+  "docs": [
+    {
+      "name": "channel_plus_programme_full",
+      "xml": "<tv><channel id=\"cnn.us\"><display-name>CNN</display-name><icon src=\"http://l/cnn.png\"/></channel><programme start=\"20260629140000 +0000\" stop=\"20260629150000 +0000\" channel=\"cnn.us\"><title>World News</title><sub-title>Evening</sub-title><desc>Headlines &amp; analysis</desc><category>News</category><episode-num system=\"xmltv_ns\">0.1.0/1</episode-num><new/><rating><value>TV-14</value></rating><icon src=\"http://l/ep.png\"/></programme></tv>",
+      "expect": {
+        "channels": [
+          { "id": "cnn.us", "display_names": ["CNN"], "icon": "http://l/cnn.png" }
+        ],
+        "programs": [
+          {
+            "channel_id": "cnn.us",
+            "start_utc_ms": 1782741600000,
+            "stop_utc_ms": 1782745200000,
+            "title": "World News",
+            "sub_title": "Evening",
+            "desc": "Headlines & analysis",
+            "category": "News",
+            "episode_num": { "season": 1, "episode": 2 },
+            "is_new": true,
+            "rating": "TV-14",
+            "icon": "http://l/ep.png"
+          }
+        ]
+      }
+    }
+  ]
+}
