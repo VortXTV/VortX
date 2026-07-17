@@ -120,6 +120,16 @@ final class VortXSyncManager: ObservableObject {
         get { UserDefaults.standard.double(forKey: editsAtKey(for: account?.id)) }
         set { UserDefaults.standard.set(newValue, forKey: editsAtKey(for: account?.id)) }
     }
+    /// Per-account LWW high-water for web-authored dashboard integration toggles (doc.integrations), the exact
+    /// mirror of lastAppliedProfileEditsAt above. Stored under the `vortx.sync.` prefix so
+    /// SettingsBackup.deviceLocalKeyPrefixes keeps it out of every synced blob and backup, and keyed PER ACCOUNT
+    /// so an account switch cannot skip the new account's dashboard edits against the previous account's mark.
+    /// Not reset on signOut (per-account keying isolates accounts), matching the gates above.
+    private func integrationsAtKey(for accountId: String?) -> String { "vortx.sync.lastAppliedIntegrationsAt." + (accountId ?? "") }
+    private var lastAppliedIntegrationsAt: Double {
+        get { UserDefaults.standard.double(forKey: integrationsAtKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: integrationsAtKey(for: account?.id)) }
+    }
     /// The syncable keys the LAST account document this device APPLIED actually wrote, in migrated form (it
     /// mirrors what SettingsBackup.restore persisted). Keyed PER ACCOUNT like the gates above, and stored under
     /// the `vortx.sync.` prefix so SettingsBackup.deviceLocalKeyPrefixes already keeps it out of every synced blob
@@ -1022,6 +1032,17 @@ final class VortXSyncManager: ObservableObject {
         // authored it) - the same asymmetric read-merge guard as the debrid keys.
         if let blob = IPTVPlaylistStore.shared.syncBlob() { keys["vortx.iptv"] = blob }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
+        // Dashboard integrations mirror (Lane C): publish the app-owned connection + toggle summary under
+        // doc.vortx.integrations so the vortx.tv dashboard can render and edit the Trakt/SIMKL toggles. Derive
+        // the connected flags from the READ-MERGED apiKeys (`keys`), NOT this device's Keychain alone: a device
+        // that just signed in and has not yet pulled its own tokens must never publish connected:false over a
+        // peer's live connection. Mutate the vortx block already set above (line ~970); never a wholesale replace.
+        if var vortxBlock = doc["vortx"] as? [String: Any] {
+            vortxBlock["integrations"] = ExternalSyncToggleSync.summary(
+                traktConnected: keys["traktAccess"] != nil,
+                simklConnected: keys["simklAccess"] != nil)
+            doc["vortx"] = vortxBlock
+        }
         // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
         // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
         // "default" bucket for searches made with no profile selected. Best-effort: skip empty lists.
@@ -1416,6 +1437,30 @@ final class VortXSyncManager: ObservableObject {
                 ProfileStore.shared.applyProfileEdits(edits)
                 lastAppliedProfileEditsAt = editedAt
                 restored = true
+            }
+        }
+        // Web-authored integration toggles (vortx.tv dashboard writes doc.integrations, a SIBLING key like
+        // profileEdits that syncUp preserves via its pull-first read-merge). Apply the per-service toggle edits,
+        // LWW by editedAt once per stamp - the same conflict rule as profileEdits above; without the per-account
+        // high-water a stale web edit would re-apply on every pull and keep reverting a newer on-device change.
+        // Reached INSIDE withRemoteApplySuppressed and AFTER SettingsBackup.restore (line ~1182), which is
+        // exactly ExternalSyncToggleSync.applyEdits's documented caller contract.
+        //
+        // KNOWN LIMITATION (inherited from the profileEdits precedent, low-severity, recoverable, owner-accepted):
+        // these toggles are writable on TWO channels with independent clocks - on-device edits ride doc.settings
+        // (SettingsBackup sweeps vortx.trakt.*/vortx.simkl.*), web edits ride doc.integrations/editedAt. So a web
+        // edit OLDER than a later on-device edit can still be re-applied by a device whose high-water is below it
+        // (e.g. a fresh install) AFTER restore installs the newer value, reverting one recoverable boolean and
+        // propagating it on the next doc.settings push. This is NOT the #145 wholesale-overwrite/peer-deletion
+        // class; it is a single self-fixable toggle, structurally identical to a web profile rename older than a
+        // later on-device rename. The full fix reconciles the two clocks in the shared precedent (stamp on-device
+        // toggle changes and compare clocks in applyEdits, so profileEdits benefits too); deliberately out of
+        // scope for the release that fixes #145, to avoid adding clock complexity to this file under time pressure.
+        if let intEdits = doc["integrations"] as? [String: Any] {
+            let editedAt = (intEdits["editedAt"] as? Double) ?? Double((intEdits["editedAt"] as? Int) ?? 0)
+            if editedAt > lastAppliedIntegrationsAt {
+                if ExternalSyncToggleSync.applyEdits(intEdits) { restored = true }
+                lastAppliedIntegrationsAt = editedAt
             }
         }
         // Stamp the applied version INSIDE the suppression window: persistLastSyncedVersion writes to
