@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto Backup rules (API 30 and below; API 31+ reads data_extraction_rules.xml instead).
+
+  This is the Android analogue of the Apple store's `isExcludedFromBackup` resource value on its Downloads
+  directory (app/SourcesShared/DownloadStore.swift). Downloaded media is large and re-downloadable, and Auto
+  Backup would otherwise try to ship multi-GB files to the user's cloud backup quota. Excluding the directory
+  also keeps index.json out, which is correct and NOT an oversight: the index describes files that exist on THIS
+  device only, so restoring it onto another device would list downloads whose bytes are not there.
+-->
+<full-backup-content>
+    <exclude domain="file" path="Downloads" />
+    <!-- Download queue-manager state (concurrency cap, drain order, the parked-for-unlock set). Meaningless
+         without the files above, so it travels with them. -->
+    <exclude domain="sharedpref" path="vortx.downloads.xml" />
+</full-backup-content>

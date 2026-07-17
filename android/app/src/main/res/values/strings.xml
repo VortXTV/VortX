@@ -8,4 +8,10 @@
          translatable="false" because the brand name itself is never localized. -->
     <string name="wordmark_prefix" translatable="false">Vort</string>
     <string name="wordmark_suffix" translatable="false">X</string>
+
+    <!-- Offline downloads (Round 5). The notification channel is user-visible in Settings > Apps > VortX >
+         Notifications, so both of these are localizable copy, not identifiers. -->
+    <string name="downloads_channel_name">Downloads</string>
+    <string name="downloads_channel_description">Progress for titles you save for offline viewing.</string>
+    <string name="downloads_notification_title">Downloading</string>
 </resources>

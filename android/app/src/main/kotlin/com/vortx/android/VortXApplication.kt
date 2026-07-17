@@ -13,9 +13,14 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.downloads.DownloadManager
+import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.engine.EngineStremioRepository
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.profile.ProfileStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
 ///
@@ -71,6 +76,44 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
         runCatching { MediaServerRepository.init(this) }
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
+        initDownloads()
+    }
+
+    /**
+     * Stand up the offline-downloads subsystem: hydrate the local index, restore the queue-manager settings, then do
+     * the two things that need the process to be alive.
+     *
+     * The store + manager init are synchronous because everything downstream (the Settings row's live count, a
+     * [com.vortx.android.downloads.DownloadWorker] WorkManager revives into this process) reads them, and they cost
+     * one small file read plus one prefs read. The two follow-ups are moved OFF the main thread because they are not:
+     *
+     *  1. [com.vortx.android.downloads.DownloadManager.reconcileInFlight] blocks on WorkManager's future to ask which
+     *     transfers are genuinely still live, and demotes any record that only CLAIMS to be downloading to paused.
+     *     This is Apple's `reconnectInFlightDownloads`, which it must run at launch for the same reason.
+     *  2. [com.vortx.android.downloads.DownloadManager.retryDownloadsAwaitingUnlock] is the app-foreground leg of the
+     *     #132 recovery. Apple wires three triggers for this (`protectedDataDidBecomeAvailable`, `didBecomeActive`,
+     *     `willEnterForeground`); [com.vortx.android.downloads.DownloadUnlockReceiver] covers the unlock/boot legs,
+     *     and this covers the "unlocked while the app was dead, so the broadcast was missed" case. It no-ops when
+     *     nothing is parked, so an ordinary launch pays nothing.
+     */
+    private fun initDownloads() {
+        runCatching {
+            DownloadStore.init(this)
+            DownloadManager.init(this)
+        }.onFailure {
+            Log.w(TAG, "Download store init failed; downloads stay dormant this launch", it)
+            return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            runCatching {
+                DownloadManager.reconcileInFlight()
+                DownloadManager.retryDownloadsAwaitingUnlock()
+            }.onFailure {
+                // Fail-soft: a record that could not be reconciled stays as it is and remains resumable by hand,
+                // which is exactly Apple's fallback. Never let download bookkeeping break app start.
+                Log.w(TAG, "Download reconcile failed; in-flight rows stay as they are and remain resumable", it)
+            }
+        }
     }
 
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same

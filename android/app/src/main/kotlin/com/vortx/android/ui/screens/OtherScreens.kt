@@ -33,15 +33,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.BuildConfig
+import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
+import com.vortx.android.player.AudioOutputMode
+import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.EmptyState
@@ -213,12 +217,24 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
     }
 }
 
-/// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). Most
-/// values are placeholders until preferences are wired (S09); the structure is final. The Account row
-/// is real (S03): it reflects the live engine [AuthState] and opens [AccountScreen] via [onAccountClick].
-/// The Add-ons row (S04) opens the add-on management screen via [onAddonsClick]. In debug builds only,
-/// one extra row opens the S02 design-system gallery for visual review — the boundary is
-/// [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
+/// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). The
+/// Account row is real (S03): it reflects the live engine [AuthState] and opens [AccountScreen] via
+/// [onAccountClick]. The Add-ons row (S04) opens the add-on management screen via [onAddonsClick]. In
+/// debug builds only, one extra row opens the S02 design-system gallery for visual review — the boundary
+/// is [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
+///
+/// The Playback row opens [PlaybackSettingsScreen]. It REPLACES two hardcoded rows ("Audio output / Auto"
+/// and "Subtitle size / Medium") that rendered fixed strings, read no preference and had no onClick: they
+/// showed a value the app was not necessarily using and could not be tapped to change it. Every value
+/// shown here now comes from the store that the engines actually read.
+///
+/// The Sources row opens [SourcesSettingsScreen], the control surface over `SourcePreferencesStore`: the
+/// ranker read those preferences on every source list, but nothing in `ui/` could write them, so the whole
+/// filtering/ranking layer was stuck at its defaults.
+///
+/// The Library row opens [LibraryTransferScreen] (library export / import), which is this screen's analogue
+/// of the Apple settings backup section (iOSSettingsView.swift:222-256). Same shape of gap as the two above:
+/// `LibraryPortability` + `LibraryTransfer` were complete and had no caller anywhere in `ui/`.
 @Composable
 fun SettingsScreen(
     authState: AuthState,
@@ -226,12 +242,40 @@ fun SettingsScreen(
     onAddonsClick: () -> Unit,
     onIntegrationsClick: () -> Unit,
     onMediaServersClick: () -> Unit,
+    onPlaybackClick: () -> Unit,
+    onSourcesClick: () -> Unit,
+    onDownloadsClick: () -> Unit,
+    onLibraryClick: () -> Unit,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
 ) {
     val accountValue = when (authState) {
         is AuthState.SignedIn -> authState.email ?: "Signed in"
         AuthState.SignedOut -> "Not signed in"
+    }
+    // The Playback summary reads the live persisted value rather than restating a default, so the row can
+    // never disagree with the screen it opens.
+    val appContext = LocalContext.current.applicationContext
+    val playbackValue = AudioOutputMode.current(appContext).label
+    // The Sources summary names the top-ranked source type, which is the one decision on that screen a
+    // viewer is most likely to have changed. Read on every recomposition and deliberately NOT `remember`ed,
+    // exactly like the Playback row above: returning from the Sources screen recomposes this, so a cached
+    // value would leave the row asserting an order the viewer just changed. The store's constructor is a
+    // `getSharedPreferences` call, which the framework serves from its own cache.
+    val sourcesStore = SourcePreferencesStore(appContext)
+    val sourcesValue = if (sourcesStore.useAddonOrder) {
+        "Add-on order"
+    } else {
+        sourcesStore.typeOrder.firstOrNull()?.label ?: "Ranked"
+    }
+    // Live download count + size, recomputed when the index changes rather than sampled once, so the row tracks a
+    // transfer that finishes while Settings is open.
+    val downloadRecords by DownloadStore.records.collectAsStateWithLifecycle()
+    val downloadsValue = if (downloadRecords.isEmpty()) {
+        "None"
+    } else {
+        val count = downloadRecords.size
+        "${if (count == 1) "1 title" else "$count titles"}  ·  ${DownloadStore.formattedTotalSize()}"
     }
     Column(
         modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
@@ -241,8 +285,17 @@ fun SettingsScreen(
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
         SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)
         SettingRow(VortXIcons.mediaServer, "Media servers", "Plex, Jellyfin, Emby", onClick = onMediaServersClick)
-        SettingRow(VortXIcons.audioOutput, "Audio output", "Auto")
-        SettingRow(VortXIcons.subtitles, "Subtitle size", "Medium")
+        SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
+        SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
+        // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
+        // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
+        // like a broken measurement, not like an empty list.
+        SettingRow(VortXIcons.download, "Downloads", downloadsValue, onClick = onDownloadsClick)
+        // A fixed descriptor of what the screen holds, NOT a live summary like the three rows above it. A
+        // title count would have to come from an engine library read on every recomposition of Settings, and
+        // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as
+        // the Add-ons and Media servers rows.
+        SettingRow(VortXIcons.library, "Library", "Export, import", onClick = onLibraryClick)
         if (BuildConfig.DEBUG && onOpenGallery != null) {
             SettingRow(VortXIcons.checkmarkCircle, "Design gallery", "Debug", onClick = onOpenGallery)
         }

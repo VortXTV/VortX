@@ -58,6 +58,17 @@ securityCrypto = "1.1.0"
 tink = "1.8.0"
 mpvLibmpv = "1.0.0"
 coil = "3.3.0"
+# WorkManager: the offline-downloads transport (com.vortx.android.downloads.DownloadWorker). It is the Android
+# mechanism with the contract Apple gets from a `.background` URLSession -- work persisted in its own database and
+# re-run in a fresh process after the app dies -- which is why the port uses it rather than android.app.DownloadManager
+# (no pause/resume, no per-record control) or a Media3 DownloadService (an opaque cache, incompatible with this
+# subsystem's <id>.<ext> flat file + index.json record schema).
+#
+# 2.10.0 (Dec 2024) is picked on the SAME forward-metadata-compat rule as composeBom/coil above, NOT because it is the
+# newest: the line has since moved to 2.11.x, but 2.10.0 predates Kotlin 2.3.0 (2025-12-16) by a full year, so the
+# pinned 2.2.10 compiler can read its .kotlin_module metadata with a wide margin. It carries everything this port
+# needs (CoroutineWorker, setForeground/ForegroundInfo, unique work). Bump alongside a coordinated Kotlin bump.
+work = "2.10.0"
 
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
@@ -86,6 +97,8 @@ mpv-libmpv = { group = "dev.jdtech.mpv", name = "libmpv", version.ref = "mpvLibm
 
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+
+work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

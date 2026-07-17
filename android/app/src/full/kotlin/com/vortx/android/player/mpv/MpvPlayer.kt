@@ -1,6 +1,8 @@
 package com.vortx.android.player.mpv
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.runtime.Composable
@@ -16,10 +18,16 @@ import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.util.UUID
 
 /// The libmpv [PlayerEngine] (PRIMARY player, `full` flavor only). Owns one [MPVLib] for its lifetime,
 /// renders into an Android [SurfaceView] (the Android analogue of Apple's Metal `wid` layer), applies
@@ -246,6 +254,92 @@ class MpvPlayer private constructor(
         play()
     }
 
+    /// Grab the current frame as JPEG, downscaled to at most [maxWidth] wide. The libmpv half of the
+    /// community-trickplay capture pipeline; mirrors the INTENT of Apple's Metal-blit
+    /// `MPVMetalViewController.captureFrameJPEGData`, by a necessarily different mechanism.
+    ///
+    /// MECHANISM, and why it is not the Apple one. Apple blits mpv's rendered Metal texture straight out
+    /// of the VO. The Android JNI seam offers no equivalent: [MPVLib.command] returns Unit (it wraps
+    /// `mpv_command`, not `mpv_command_ret`), so mpv's `screenshot-raw` -- the only command that hands
+    /// pixel data BACK to the caller -- cannot deliver its `mpv_node` result through this artifact. The
+    /// reachable route is therefore `screenshot-to-file`, which writes the frame to a path we choose and
+    /// we then read back. Flag `video` takes the decoded video frame WITHOUT OSD or subtitles, which is
+    /// exactly what a scrub thumbnail wants (subtitles burned into a shared community sheet would be a
+    /// bug, since the pool is language-agnostic).
+    ///
+    /// HONEST CAVEAT -- this is the ONE step of the trickplay chain that cannot be verified without a
+    /// device, so it is designed to fail CLOSED rather than to fail wrong. [MpvConfig.HWDEC] is plain
+    /// `mediacodec` (surface-direct), deliberately NOT `mediacodec-copy`, because the direct path is what
+    /// carries HDR/DV to the panel. Surface-direct mediacodec hands decoded frames to the Android Surface
+    /// without ever staging them in CPU-addressable memory, so mpv may hold no readable copy and the
+    /// screenshot can come back missing, empty, or unrendered. We do NOT "fix" that by switching to
+    /// `mediacodec-copy`: that would trade the DV mandate for the trickplay mandate. Instead every
+    /// failure mode degrades to null (no file / empty file / undecodable), and the near-black guard in
+    /// [com.vortx.android.trickplay.TrickplaySession] drops an unrendered frame BEFORE it can reach the
+    /// shared pool. A device test decides whether this yields real frames on `mediacodec`; if it does
+    /// not, the fix is a capture-only software-decode path, never a change to the DV pipeline.
+    ///
+    /// Fail-soft on every step; never throws. The temp file is always cleaned up.
+    override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = withContext(Dispatchers.IO) {
+        // Write into the app cache dir: mpv needs a real filesystem path it can open for writing, and the
+        // frame is transient (it is re-encoded below and the file is deleted in the same call).
+        val file = File(appContext.cacheDir, "vortx-tp-grab-${UUID.randomUUID()}.jpg")
+        try {
+            // mpv guesses the encoder from the extension (.jpg -> JPEG), so pin the quality knob first.
+            // This is the full-resolution intermediate; the real downscale happens on decode below.
+            mpv.setPropertyString(PROP_SCREENSHOT_JPEG_QUALITY, SCREENSHOT_INTERMEDIATE_QUALITY)
+            // argv form (never a joined string) so a path containing mpv's list/escape chars stays one
+            // argument, the same reason `loadfile` above uses the array form.
+            mpv.command(arrayOf("screenshot-to-file", file.absolutePath, "video"))
+            // `command` wraps the synchronous `mpv_command`, but it returns Unit so mpv's status code is
+            // not observable here: the file's own existence + size IS the success signal. A VO that never
+            // serviced the grab (or a surface-direct frame mpv could not read) leaves no file, or an empty
+            // one -> null, and the caller simply skips this capture tick.
+            if (!file.exists() || file.length() <= 0L) return@withContext null
+
+            // Decode DOWNSCALED. inSampleSize keeps a 4K grab from ever being fully realised in memory:
+            // this runs on a jetsam-bound device alongside mpv's own decode buffers, so a full-size ARGB
+            // bitmap (4K = ~33 MB) is exactly the allocation to avoid. Two passes: bounds-only to learn
+            // the real size, then a subsampled decode.
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val srcWidth = bounds.outWidth
+            if (srcWidth <= 0 || bounds.outHeight <= 0) return@withContext null
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSizeFor(srcWidth, maxWidth)
+            }
+            val decoded = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
+
+            // inSampleSize only halves, so the subsampled bitmap is >= maxWidth; scale the remainder
+            // exactly. Never upscale a frame that is already narrower than maxWidth.
+            val scaled = if (decoded.width > maxWidth) {
+                val height = (decoded.height.toDouble() * maxWidth / decoded.width).toInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(decoded, maxWidth, height, true)
+                    .also { if (it !== decoded) decoded.recycle() }
+            } else {
+                decoded
+            }
+
+            val out = ByteArrayOutputStream()
+            val ok = scaled.compress(Bitmap.CompressFormat.JPEG, CAPTURE_JPEG_QUALITY, out)
+            scaled.recycle()
+            if (ok) out.toByteArray() else null
+        } catch (_: IOException) {
+            null
+        } finally {
+            runCatching { file.delete() }
+        }
+    }
+
+    /// Largest power-of-two subsample that still leaves the frame at least [maxWidth] wide, so the exact
+    /// scale afterwards only ever shrinks. Mirrors the standard Android decode-bounds idiom.
+    private fun sampleSizeFor(srcWidth: Int, maxWidth: Int): Int {
+        if (maxWidth <= 0) return 1
+        var sample = 1
+        while (srcWidth / (sample * 2) >= maxWidth) sample *= 2
+        return sample
+    }
+
     override fun release() {
         mpv.removeObserver(observer)
         mpv.detachSurface()
@@ -341,8 +435,18 @@ class MpvPlayer private constructor(
         private const val PROP_VOLUME = "volume"
         private const val PROP_MUTE = "mute"
         private const val PROP_CHAPTER_COUNT = "chapter-list/count"
+        private const val PROP_SCREENSHOT_JPEG_QUALITY = "screenshot-jpeg-quality"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
         private const val OPT_DEMUXER_MAX_BYTES = "demuxer-max-bytes"
+
+        /// Quality of mpv's full-resolution INTERMEDIATE grab. High on purpose: it is re-encoded below at
+        /// [CAPTURE_JPEG_QUALITY] after downscaling, and compressing twice at the final quality would
+        /// stack artifacts. The file is deleted in the same call, so its size never matters on disk.
+        private const val SCREENSHOT_INTERMEDIATE_QUALITY = "90"
+
+        /// Final tile quality, 0.7 == Apple's `kCGImageDestinationLossyCompressionQuality: 0.7` on both of
+        /// its capture paths. Kept identical so an Android-contributed tile matches an Apple one.
+        private const val CAPTURE_JPEG_QUALITY = 70
 
         // Per-file read-ahead: local torrent/loopback vs remote debrid/CDN (mirrors Apple loadFile).
         private const val READ_AHEAD_LOCAL = "96MiB"

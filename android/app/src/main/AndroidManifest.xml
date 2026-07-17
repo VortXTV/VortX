@@ -1,7 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Offline downloads (Round 5). A multi-GB media transfer must run as a foreground service or the OS
+         suspends it the moment the app leaves the screen; this is the Android cost of what Apple gets from a
+         `.background` URLSession for free.
+           - FOREGROUND_SERVICE:           the base permission (API 28+).
+           - FOREGROUND_SERVICE_DATA_SYNC: required from API 34 for the `dataSync` service type, which is the
+                                           documented type for a user-initiated file transfer.
+           - POST_NOTIFICATIONS:           required from API 33 to SHOW the progress notification. It is a runtime
+                                           permission; if the user denies it the foreground service still runs and
+                                           the download still completes, the progress notification just isn't
+                                           displayed. Downloads therefore never gate on it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Wakes DownloadUnlockReceiver so a download parked by a locked-write failure recovers after a reboot,
+         instead of dead-ending at "couldn't save" (#132). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <!-- Android TV: declare leanback so the app shows on the TV launcher, but don't require it
          so phones/tablets install too. -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -16,7 +35,9 @@
         android:localeConfig="@xml/locales_config"
         android:enableOnBackInvokedCallback="true"
         android:supportsRtl="true"
-        android:theme="@style/Theme.VortX">
+        android:theme="@style/Theme.VortX"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -29,5 +50,29 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Declare the foreground-service TYPE on WorkManager's own service. From API 34 a foreground service
+             must declare its type BOTH here and in the ForegroundInfo the worker returns, and the two must
+             agree, or startForeground throws at runtime. The WorkManager artifact ships this component with no
+             type, so the type is merged onto it here rather than redeclared. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
+        <!-- #132 auto-recovery: resume a download parked by a locked-write failure once the user unlocks.
+             MANIFEST-registered, not runtime-registered, precisely because the app process is usually gone by
+             then; a runtime receiver would miss the exact case it exists for. Not exported: both actions are
+             protected system broadcasts, so no other app can drive it. Not directBootAware: it has nothing to
+             do until credential-encrypted storage is readable, which is the very condition it waits for. -->
+        <receiver
+            android:name=".downloads.DownloadUnlockReceiver"
+            android:exported="false"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

@@ -1,8 +1,10 @@
 package com.vortx.android.player
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
 import android.view.Display
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -40,6 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -75,6 +79,12 @@ fun PlayerChrome(
     onSetSpeed: (Float) -> Unit,
     onToggleScaleMode: () -> Unit,
     onErrorRetry: () -> Unit,
+    /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
+    /// no community sheet (the common case for a title nobody has contributed yet, and always so while
+    /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
+    /// what [com.vortx.android.trickplay.TrickplaySession.previewAt] guarantees: an in-memory crop of an
+    /// already-downloaded sprite. Defaults to no preview so the chrome stays usable in isolation.
+    scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
@@ -136,6 +146,7 @@ fun PlayerChrome(
             emberAccent = emberAccent,
             onTogglePause = onTogglePause,
             onSeek = onSeek,
+            scrubPreview = scrubPreview,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter),
@@ -301,6 +312,7 @@ private fun TransportBar(
     emberAccent: Color,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
+    scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
     var scrubbing by remember { mutableStateOf(false) }
@@ -314,6 +326,16 @@ private fun TransportBar(
         else -> 0f
     }
 
+    // The community scrub thumbnail for wherever the finger currently is. Recomputed only when the
+    // scrubbed SECOND changes, not on every pixel of drag: `crop` allocates a bitmap, so keying on the raw
+    // float would allocate on every frame of the gesture and make scrubbing the jankiest thing in the
+    // player. One crop per second of scrubbed time is exactly the tile granularity anyway (tiles are 10s
+    // apart), so nothing visible is lost. This mirrors the SkipButton's per-second recompute key.
+    val scrubSeconds = if (duration > 0L) (scrubValue * duration / 1000.0) else 0.0
+    val previewBitmap = remember(scrubbing, scrubSeconds.toLong()) {
+        if (scrubbing && duration > 0L) scrubPreview(scrubSeconds) else null
+    }
+
     Column(
         modifier = modifier
             .background(
@@ -324,6 +346,19 @@ private fun TransportBar(
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
+        // Scrub preview, drawn ABOVE the transport row so it never covers the slider the finger is on.
+        // Present only while dragging a title that actually has a community sheet; otherwise the row is
+        // simply absent and the transport looks exactly as it does today.
+        previewBitmap?.let { bmp ->
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .padding(start = 64.dp, bottom = 8.dp)
+                    .size(width = 160.dp, height = 90.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onTogglePause) {
                 Icon(
