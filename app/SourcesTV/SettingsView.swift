@@ -584,7 +584,7 @@ struct SettingsView: View {
 
     private func setDirectLinksOnly(_ value: Bool) {
         directLinksOnly = value
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !value, !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
         }
@@ -619,7 +619,7 @@ struct SettingsView: View {
                 // When the embedded server is unreachable, explain itself: node's run state and the
                 // server's own last log lines, so a dead server is diagnosable from the couch.
                 if serverOnline == false && !StremioServer.isCustom {
-                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    #if !VORTX_NO_EMBEDDED_SERVER
                     Text(NodeServer.statusDescription)
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     ForEach(NodeServer.logTail(), id: \.self) { line in

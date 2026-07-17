@@ -13,7 +13,7 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IP discovery
 ///
 /// This deliberately exposes the SAME API surface as the iOS/tvOS `NodeServer`
 /// (`startIfNeeded()`, `statusDescription`, `logTail(_:)`) under the same type name, so the shared
-/// call sites in StremioXiOSApp / iOSSettingsView resolve to the right implementation per platform
+/// call sites in VortXiOSApp / iOSSettingsView resolve to the right implementation per platform
 /// with no `#if os(macOS)` at the call site.
 enum NodeServer {
     private(set) static var started = false
@@ -197,7 +197,7 @@ enum NodeServer {
     }
 
     /// Force-terminate the running node child and stop the server for this process lifetime. Called
-    /// on app termination (see StremioXiOSApp's macOS app-delegate hook) so the child never gets
+    /// on app termination (see VortXiOSApp's macOS app-delegate hook) so the child never gets
     /// reparented to launchd holding port 11470. Idempotent and thread-safe.
     ///
     /// Foundation's `Process` does NOT kill its child when the parent exits, so without this an app

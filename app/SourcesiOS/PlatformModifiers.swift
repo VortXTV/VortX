@@ -137,7 +137,7 @@ private struct MacPlayerCoverBridge<Item: Identifiable, C: View>: View {
     }
 }
 
-/// Applied ONCE at the WindowGroup scene root (StremioXiOSApp, macOS only) so it sits ABOVE any sheet
+/// Applied ONCE at the WindowGroup scene root (VortXiOSApp, macOS only) so it sits ABOVE any sheet
 /// (SignIn / OpenLink) or cover: renders the active MacPlayerHost player full-window over the dimmed +
 /// disabled app, and hides the window titlebar while it is up so no nav chrome floats over the video.
 /// Full-window edge-to-edge, matching the v0.1.6 WebView build. The macOS twin of the tvOS root player.

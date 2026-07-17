@@ -4,14 +4,14 @@ import UIKit
 #endif
 
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
-/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors StremioTVApp's
+/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
 ///
 /// 0.3.0 Track 1, built incrementally: this scaffold proves the shared engine layer compiles and
 /// the Rust⇄Swift FFI links on iOS (the schema-version log is the smoke check). Screens land one
 /// by one on top of this shell.
 @main
-struct StremioXiOSApp: App {
+struct VortXiOSApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var sync = VortXSyncManager.shared
@@ -26,7 +26,7 @@ struct StremioXiOSApp: App {
     // gives us the one reliable "the app is really quitting" hook (applicationWillTerminate),
     // which scenePhase .background/.inactive does NOT provide on macOS — those fire on ordinary
     // window/focus changes, so killing the server there would wrongly stop it mid-use.
-    #if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+    #if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     #endif
 
@@ -50,7 +50,7 @@ struct StremioXiOSApp: App {
         // its FIRST verdict (launchOffline) is ready to route an offline launch to Downloads / Settings
         // and the shell's "You're offline" banner tracks the live (debounced) state.
         ConnectivityMonitor.shared.start()
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
@@ -76,7 +76,7 @@ struct StremioXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
-                        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
                         // #130: after a long suspension iOS can tear down the server's bound listener while
                         // node keeps ticking, so the server reads Offline until a manual restart.
                         // recoverIfSuspended subsumes the old drift-latch probe (isOnline) and, on a
@@ -414,7 +414,7 @@ private struct MacWindowChrome: NSViewRepresentable {
 }
 #endif
 
-#if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+#if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
 import AppKit
 
 /// macOS app delegate whose sole job is to kill the embedded node streaming server when the app

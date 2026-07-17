@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct StremioTVApp: App {
+struct VortXTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var sync = VortXSyncManager.shared
@@ -25,7 +25,7 @@ struct StremioTVApp: App {
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
@@ -70,7 +70,7 @@ struct StremioTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
-                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    #if !VORTX_NO_EMBEDDED_SERVER
                     // #130: after a suspension (Home, app switch, screensaver exit) tvOS can tear down the
                     // server's bound listener while node keeps ticking, so the server reads Offline until a
                     // manual restart. recoverIfSuspended subsumes the old drift-latch probe (isOnline) and,

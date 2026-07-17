@@ -619,7 +619,25 @@ final class VortXSyncManager: ObservableObject {
         if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
-        for entry in engineLibrary { if let id = entry["id"] as? String { libraryByID[id] = entry } }
+        for entry in engineLibrary {
+            guard let id = entry["id"] as? String else { continue }
+            // Wave 4 clobber guard (Finding 1): do NOT let a bare, progress-less engine item (t == 0 AND d == 0,
+            // the signature of a freshly AddToLibrary'd title on a cold / recovered / post-import device whose
+            // engine re-adds owner titles at time 0) OVERWRITE a prior doc entry that already carries a resume
+            // offset. Without this, a second VortX-only device pushing 0 would destroy device A's stored progress
+            // for that title across the whole account. A genuine finish / rewind keeps d > 0 (only t goes to 0),
+            // so it still propagates the zero; only the "no state at all" case is preserved, merged onto the
+            // fresh engine metadata (name / poster / type) so the doc keeps both the offset and current title info.
+            if let prior = libraryByID[id],
+               Self.libSeconds(entry["t"]) == 0, Self.libSeconds(entry["d"]) == 0,
+               (Self.libSeconds(prior["t"]) > 0 || Self.libSeconds(prior["d"]) > 0) {
+                var merged = entry
+                merged["t"] = prior["t"]; merged["d"] = prior["d"]; merged["v"] = prior["v"]
+                libraryByID[id] = merged
+                continue
+            }
+            libraryByID[id] = entry
+        }
         // SUBTRACT the durable removal tombstones from the library union (the library analogue of subtracting
         // deletedAddons from the add-on union): a title the user removed must NOT come back, even if the engine
         // still briefly holds it OR a peer device's prior doc.vortx.library still carries it. Compared on the
@@ -715,7 +733,13 @@ final class VortXSyncManager: ObservableObject {
         // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
         // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
         // resurrecting them. Empty set is omitted so a fresh account never writes the key.
-        let deleted = store.deletedProfileIDs
+        // UNION the account's already-owned tombstones (existingVortx) with the local set so a push can NEVER
+        // SHRINK the deleted-profiles set, symmetric with how foldDocTombstones protects deletedLibrary /
+        // deletedAddons. Without this, a device whose local set is momentarily empty (a fresh reinstall before
+        // its first syncDown fold) could drop the account's tombstones and let a peer resurrect a deleted
+        // profile. A profile is never un-deleted (the owner is never tombstoned), so the union only ever grows.
+        var deleted = store.deletedProfileIDs
+        if let priorDeleted = existingVortx?["deletedProfiles"] as? [String] { deleted.formUnion(priorDeleted) }
         if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
         // Durable cross-device add-on REMOVAL tombstones (app-authoritative, exactly like deletedProfiles;
         // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
@@ -1068,6 +1092,11 @@ final class VortXSyncManager: ObservableObject {
                 if LibraryTombstones.merge(legacyIDs: removedLib, stampsRaw: removedLibTs) { restored = true }
             }
         }
+        // Wave 4 (Finding D): refresh the local owner-resume cache from the pulled owner library, so a WARM
+        // device (non-empty engine, which skips recoverOwnerLibraryIfEmpty) converges its resume offsets to the
+        // account truth without a cold relaunch. Runs after the tombstone fold above so a removed title is
+        // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
+        refreshOwnerResumeCache(from: doc)
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
@@ -1234,22 +1263,28 @@ final class VortXSyncManager: ObservableObject {
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
         guard !ownedLibrary.isEmpty else { return }
-        // Only recover when the engine's account library is genuinely empty (a fresh / cold device). Require
-        // the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
-        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account
-        // library while the engine is still loading its real one. A nil library defers recovery to a later
-        // call once the engine has emitted its library field.
-        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
-        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
-        guard !engineHasLibrary else { return }
         // SKIP any id the user removed (the library analogue of ownedAddons(from:) excluding AddonTombstones):
         // a cold/empty engine must not RE-ADD a title the user explicitly removed, which was the exact
         // resurrection path. The doc's deletedLibrary/deletedLibraryTs were folded into this local set on
         // syncDown AND, on a cold launch, by hydrateEngineFromOwnedAddons right before this runs, so even a
-        // doc that predates the removal is honored. stampIntent: false because this is a machine re-add of
-        // account-owned titles: stamping an addedAt here could mint a machine timestamp that beats a real
-        // removedAt this device has not folded yet, durably resurrecting a removed title.
+        // doc that predates the removal is honored.
         let removedLibrary = LibraryTombstones.all()
+        // Wave 4 (Finding 1a): the engine re-adds each title at time 0 (AddToLibrary has no offset, and
+        // stremio-core exposes no action to inject one), so cache the VortX-owned resume offsets from the doc
+        // UNCONDITIONALLY, before the engine-empty gate below. This is what lets a cold / recovered / post-import
+        // device resume exactly where device A left off; it must populate even when the engine still reports a
+        // (stale, mid-Logout) library, so it runs before the recovery guards. Never destroys.
+        refreshOwnerResumeCache(from: doc)
+        // Only RE-ADD titles to the engine when its account library is genuinely empty (a fresh / cold device).
+        // Require the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
+        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account library
+        // while the engine is still loading its real one. A nil library defers recovery to a later call.
+        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
+        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
+        guard !engineHasLibrary else { return }
+        // stampIntent: false because this is a machine re-add of account-owned titles: stamping an addedAt here
+        // could mint a machine timestamp that beats a real removedAt this device has not folded yet, durably
+        // resurrecting a removed title.
         var recovered = 0
         for item in ownedLibrary {
             guard let id = item["id"] as? String, !id.isEmpty,
@@ -1312,6 +1347,79 @@ final class VortXSyncManager: ObservableObject {
         // syncUp's own guard would already abort, but checking here avoids a wasted makeBackup).
         if case .failed = await pullSyncDocResult() { return }
         await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
+    }
+
+    /// Wave 4: one-time-per-account import of the engine's (Stremio-synced) OWNER library + Continue Watching
+    /// into the VortX account doc, after which `CoreBridge.bootstrapAuth` stops seeding the engine with the
+    /// Stremio token and `StremioAccount.saveProgress`/`resumeOffset` stop hitting api.strem.io by default.
+    ///
+    /// Data-safe migration (design step 4 ordering): CAPTURE first, RECORD only after a confirmed non-failed
+    /// push, so the VortX copy is PROVEN to exist before the token-load is dropped. Never deletes: `vortxSummary`
+    /// FLOOR-unions the engine add-ons + owner library into `doc.vortx.*` (never shrinks, subtracts only the
+    /// user's own removal tombstones), so this can only ADD. Idempotent: once the per-account flag is set this
+    /// is a fast no-op, and a re-run after a reinstall (flag cleared) re-captures additively, losing nothing.
+    ///
+    /// `stremioToken` is the live Stremio authKey (Keychain-only; used solely to key the per-account flag and
+    /// is never written to the account doc).
+    func importOwnerLibraryFromStremioOnce(stremioToken: String) async {
+        guard !stremioToken.isEmpty else { return }
+        guard isSignedIn else { return }                                             // need a VortX account to import INTO
+        guard !ProfileSync.libraryImportedFromStremio(authKey: stremioToken) else { return }   // already migrated
+        // Make the engine load its account library into the readable `library` field so `vortxSummary` captures
+        // the FULL set (the engine persists its bucket locally, so this reflects the Stremio-pulled library).
+        await CoreBridge.shared.loadLibraryAndAwait()
+        // Require the engine to have POSITIVELY reported a library (`library != nil`): a nil library is "still
+        // loading / unknown", not "empty", so we never confirm the import against an unknown state. Retry next launch.
+        guard CoreBridge.shared.library != nil else { return }
+        // Confirm the VortX account doc is reachable (a `.failed`/`.empty` pull means a degraded network: retry
+        // next launch rather than mark imported while unreachable), then push the FLOOR union.
+        guard case .doc = await pullSyncDocResult() else { return }
+        guard await syncUp() else { return }   // push failed: do NOT record the import
+        // The VortX copy is confirmed on the server. Record it so the next launch can stop loading the Stremio
+        // token. The Keychain token is left intact (opt-in reconnect / two-way sync).
+        ProfileSync.markLibraryImportedFromStremio(authKey: stremioToken)
+        DiagnosticsLog.log("sync", "imported the Stremio-owned library into the VortX account (one-time); the engine can now run local")
+    }
+
+    /// Coerce a JSON numeric (Int / Double / NSNumber, or nil) to a whole-second Int, for owner-library
+    /// offset comparisons in the summary union guard.
+    private static func libSeconds(_ v: Any?) -> Int {
+        if let i = v as? Int { return i }
+        if let d = v as? Double { return Int(d) }
+        if let n = v as? NSNumber { return n.intValue }
+        return 0
+    }
+
+    /// True when the VortX account doc is currently pullable (a decryptable `.doc`). Used as a pre-flight gate
+    /// before the post-import engine Logout so we NEVER unload the engine's Stremio session (which resets the
+    /// engine profile, wiping its local library) unless we can immediately rebuild the owner library from the
+    /// account doc this launch. On an unreachable launch we keep the session and retry next launch: no empty UI.
+    func accountDocReachable() async -> Bool {
+        if case .doc = await pullSyncDocResult() { return true }
+        return false
+    }
+
+    /// Wave 4: refresh the local owner-resume cache (`OwnerResumeStore`) from a pulled doc's owner library.
+    /// stremio-core re-adds owner titles at time 0 (it has no action to inject a saved offset), so this cache is
+    /// the VortX-owned resume source. Called BOTH from recoverOwnerLibraryIfEmpty (cold device) AND from syncDown
+    /// (so a WARM device with a non-empty engine, which skips the re-add, still converges its resume offsets to
+    /// the account truth without a cold relaunch). Non-destructive: it only records offsets, and honors removal
+    /// tombstones so a removed title is never cached. A doc t==0 (a finished / rewound title) caches 0, which the
+    /// resume reads treat as "no resume", so a finish propagates correctly.
+    private func refreshOwnerResumeCache(from doc: [String: Any]) {
+        let vortx = doc["vortx"] as? [String: Any]
+        let ownedLibrary = (vortx?["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
+        guard !ownedLibrary.isEmpty else { return }
+        let removed = LibraryTombstones.all()
+        let entries: [(id: String, t: Double, d: Double, v: String?)] = ownedLibrary.compactMap { item in
+            guard let id = item["id"] as? String, !id.isEmpty,
+                  !removed.contains(LibraryTombstones.normalize(id)) else { return nil }
+            return (id: id,
+                    t: Double(Self.libSeconds(item["t"])),
+                    d: Double(Self.libSeconds(item["d"])),
+                    v: item["v"] as? String)
+        }
+        OwnerResumeStore.merge(entries)
     }
 
     /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an

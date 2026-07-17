@@ -90,6 +90,18 @@ final class CoreBridge: ObservableObject {
     /// slot, own-account profiles their own). Resolved per read so a profile switch re-points it.
     private var activeTokenAccount: String { ProfileStore.shared.activeKeychainAccount }
 
+    /// Wave 4: this device has imported its Stremio-owned library into the VortX account AND is not opted into
+    /// two-way Stremio sync, so the engine must run purely LOCAL: never seed / re-auth the Stremio token, never
+    /// pull from api.strem.io. BOTH bootstrapAuth and scheduleSessionRepair gate on this so neither re-establishes
+    /// a Stremio session behind the migration (the logout / re-login ping-pong that would defeat the import).
+    /// Computed from the Keychain token + the per-account import flag + the opt-in. After the post-import Logout
+    /// the (now server-dead) token is cleared, so there is no token and this reads false: the device is then
+    /// simply signed out of Stremio and takes the signed-out recovery path.
+    private var importedAwayFromStremio: Bool {
+        guard let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return false }
+        return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
+    }
+
     private init() {}
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
@@ -433,27 +445,80 @@ final class CoreBridge: ObservableObject {
     ///  - Else migrate the legacy authKey: fetch the real User (PullUserFromAPI builds profile.auth),
     ///    then, once the `ctx` event confirms we're logged in, pull addons + sync the library.
     private func bootstrapAuth() {
+        // Wave 4 (VortX owns the library + Continue Watching): once THIS Stremio account's library has been
+        // imported into the VortX account doc, the engine runs on its purely-LOCAL library bucket (already
+        // mirrored to doc.vortx.library + re-hydrated on cold devices), and the engine's Stremio session is
+        // unloaded (see the importedAway branch below) so stremio-core stops auto-syncing to api.strem.io.
+        // `importedAway` = migrated AND not opted into two-way sync.
+        let stremioToken = Keychain.string(activeTokenAccount)
+        let hasStremioToken = (stremioToken?.isEmpty == false)
+        let importedAway = importedAwayFromStremio
+
         if isLoggedIn() {
+            if importedAway {
+                // Wave 4 (Finding 2): this account is migrated to VortX and NOT opted into two-way sync, yet the
+                // engine still holds a live Stremio session from its own persisted storage. stremio-core
+                // auto-persists library / progress mutations to api.strem.io whenever a session is loaded (the
+                // same upstream-persist behavior the add-on delete paths guard against), so leaving it logged in
+                // keeps writing to Stremio behind our back and the device is not actually independent. Unload the
+                // engine session ONCE. Logout KILLS the Stremio session SERVER-SIDE (so the token is now dead)
+                // and resets the engine to its empty default profile, so: gate it on the account doc being
+                // reachable THIS launch; then clear the now-dead Keychain token (Fix A: reconnecting Stremio
+                // later is a FRESH sign-in, never a reuse of this dead token); then DETERMINISTICALLY recover the
+                // owner library at launch (Fix C: wait for the engine to process the Logout, load the empty
+                // library, then hydrate owned add-ons + recover from doc.vortx) instead of waiting for the 14s
+                // session repair. Next launch has no token, so isLoggedIn() is false and this runs at most once;
+                // on an unreachable launch we keep the session and retry next launch (never an empty UI).
+                Task { @MainActor in
+                    if await VortXSyncManager.shared.accountDocReachable() {
+                        NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
+                        self.logOut()   // Ctx Logout: kills the Stremio session server-side + resets the engine
+                        // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
+                        // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
+                        // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
+                        Keychain.set(nil, for: self.activeTokenAccount)
+                        // Deterministic post-logout recovery: wait for the engine to actually process the Logout
+                        // (isLoggedIn flips false and the library resets), then load that empty library and recover
+                        // the owner library from doc.vortx at launch, not after the 14s repair.
+                        for _ in 0 ..< 30 where self.isLoggedIn() { try? await Task.sleep(nanoseconds: 100_000_000) }
+                        await self.loadLibraryAndAwait()
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    } else {
+                        NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
+                    }
+                    self.loadBoard()
+                }
+                loadBoard()
+                return
+            }
+            // Not migrated yet (or opted into two-way sync): pull/sync from Stremio as before.
             refreshFromAPI()
             // VortX-first (account-owns-everything): hydrate the VortX account's owned add-ons into the engine
             // on EVERY launch, not only when degraded, so doc.vortx.addons is the source of truth and a still-
             // valid Stremio session reconciles ON TOP of it rather than the engine's Stremio-sourced storage
             // being the sole source. Idempotent + never-zero guarded inside the sync manager (installs only the
             // missing owned add-ons), so a healthy engine is a no-op and a failed/empty account pull does nothing.
+            // Then run the one-time library import so the token-load can stop on the next launch (data-safe:
+            // capture-then-record, never destroys; a no-op once the per-account flag is set).
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                if hasStremioToken, let stremioToken {
+                    await VortXSyncManager.shared.importOwnerLibraryFromStremioOnce(stremioToken: stremioToken)
+                }
                 self.loadBoard()
             }
             loadBoard() // refresh the board now too; addons were already hydrated from the engine's own storage
             return       // scheduleSessionRepair() is now called once from start() for ALL paths
         }
-        guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
-            NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
-            // Account-owns-everything: with no Stremio session, hydrate the VortX account's owned add-ons
-            // back into the engine BEFORE loading the board, so a logged-out device shows the account's
-            // add-ons + sources instead of only Cinemeta. Idempotent + never-zero guarded inside the sync
-            // manager (a failed/empty account pull does nothing). loadBoard runs once hydration kicks the
-            // ctx event, and again here so a no-account-doc device still gets the default browsable Home.
+        guard hasStremioToken, let stremioToken, !importedAway else {
+            // Either genuinely signed out (no token), OR post-import + opt-out: do NOT seed the engine with the
+            // Stremio token. Account-owns-everything: hydrate the VortX account's owned add-ons + recover the
+            // owner library BEFORE loading the board, so the device shows the account's add-ons + sources +
+            // library instead of only Cinemeta. Idempotent + never-zero guarded inside the sync manager (a
+            // failed/empty account pull does nothing). loadBoard runs once hydration kicks the ctx event, and
+            // again here so a no-account-doc device still gets the default browsable Home.
+            NSLog("[CoreBridge] engine stays signed out of Stremio (%@)",
+                  hasStremioToken ? "library imported to VortX; token retained but not loaded" : "no token in Keychain")
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
                 self.loadBoard()
@@ -464,9 +529,11 @@ final class CoreBridge: ObservableObject {
             loadBoard()
             return
         }
+        // Not yet imported (or opted into two-way sync): seed the engine from the Stremio token as before. The
+        // ctx event completes the pull; the one-time import then runs on a subsequent launch's isLoggedIn() path.
         awaitingAuthMigration = true
         NSLog("[CoreBridge] seeding engine from legacy authKey…")
-        dispatchCtx(["action": "PullUserFromAPI", "args": ["token": key]])
+        dispatchCtx(["action": "PullUserFromAPI", "args": ["token": stremioToken]])
     }
 
     /// Self-heal a stale or INCOMPLETE engine session. Two failure modes seen in the wild, both of
@@ -497,11 +564,13 @@ final class CoreBridge: ObservableObject {
             // genuinely-logged-out or degraded device.
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
-                // When a Stremio token still exists, also re-establish that session so the live Stremio
-                // pull reconciles on top of the hydrated floor (no zero window: the doc hydrated first).
-                // When there is NO usable token (genuinely logged out), the doc hydration is the whole
-                // recovery — never call switchAccount with an empty token.
-                if hasStremioToken, let key {
+                // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
+                // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
+                // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
+                // logout / re-login ping-pong (and, since the post-import token is server-dead, thrash the UI).
+                // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
+                // Never call switchAccount with an empty token.
+                if hasStremioToken, let key, !self.importedAwayFromStremio {
                     NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
                     self.switchAccount(token: key)
                 } else {
@@ -770,6 +839,22 @@ final class CoreBridge: ObservableObject {
                           "args": ["model": "LibraryWithFilters",
                                    "args": ["request": ["type": NSNull(), "sort": "lastwatched", "page": 1]]]],
                  field: "library")
+    }
+
+    /// Dispatch `loadLibrary()` and AWAIT the engine populating its `library` field (LibraryWithFilters), so a
+    /// caller (the Wave 4 one-time Stremio import) can snapshot the FULL owner library rather than racing the
+    /// load. Bounded poll; returns as soon as `library` is non-nil or the timeout elapses. Idempotent: if the
+    /// library is already loaded this returns immediately without re-dispatching.
+    @MainActor
+    func loadLibraryAndAwait(timeout: TimeInterval = 6) async {
+        if library == nil { loadLibrary() }
+        let deadlineNanos = UInt64(timeout * 1_000_000_000)
+        let stepNanos: UInt64 = 200_000_000   // 0.2s poll cadence
+        var elapsed: UInt64 = 0
+        while library == nil, elapsed < deadlineNanos {
+            try? await Task.sleep(nanoseconds: stepNanos)
+            elapsed += stepNanos
+        }
     }
 
     /// Switch the Library's type / sort, pass the chip's own `request` back verbatim.
@@ -1209,9 +1294,64 @@ final class CoreBridge: ObservableObject {
         // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
         // throughout this file (markPlaybackWatched, removeFromLibrary, setLibraryItemWatched, finishedWatching).
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
-        guard let item = metaDetails?.libraryItem else { return nil }
-        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId { return 0 }
-        return max(0, item.state.timeOffset / 1000.0)
+        guard let item = metaDetails?.libraryItem else { return vortxOwnedResumeSeconds(for: meta) }
+        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId {
+            return vortxOwnedResumeSeconds(for: meta) ?? 0
+        }
+        let engine = max(0, item.state.timeOffset / 1000.0)
+        if engine > 0 { return engine }                                    // freshest local play wins
+        // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
+        // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
+        // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
+        if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
+        return 0
+    }
+
+    /// Resume position (seconds) for `meta` read from the engine's LOCAL library bucket BY ID: the currently
+    /// loaded meta_details item (matched on id), else the Continue-Watching preview, else the loaded library
+    /// catalog. Unlike `engineResumeSeconds` (which reads whatever meta_details currently holds, trusting the
+    /// caller to have loaded the right title), this matches on `meta.libraryId`, so it stays correct even when a
+    /// DIFFERENT title is loaded, the Continue-Watching direct-resume race where meta_details has not landed yet
+    /// and the caller fell through from `engineResumeSeconds`. This is the VortX-owned resume source: the local
+    /// bucket is mirrored to doc.vortx.library and re-hydrated on cold devices, so it needs no Stremio session.
+    /// Returns nil only when the engine has no entry for this title at all (the caller then decides 0 vs the
+    /// opt-in Stremio read). A series entry whose saved episode differs returns 0 (start this episode fresh),
+    /// mirroring `engineResumeSeconds`.
+    @MainActor
+    func engineResumeSecondsByLibraryId(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }   // overlay: not this profile's item
+        // The engine's own library item for this id: the loaded meta, else the published CW, else the RAW preview
+        // (which still includes finished movies / mid-series roll-forwards the published CW prunes), else the
+        // loaded library catalog.
+        var matched: CoreCWItem?
+        if let loaded = metaDetails?.libraryItem, loaded.id == meta.libraryId { matched = loaded }
+        else if let cw = continueWatching.first(where: { $0.id == meta.libraryId }) { matched = cw }
+        else if let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?
+            .items.first(where: { $0.id == meta.libraryId }) { matched = preview }
+        else if let lib = library?.catalog.first(where: { $0.id == meta.libraryId }) { matched = lib }
+        guard let item = matched else { return vortxOwnedResumeSeconds(for: meta) }   // engine has no entry: cache
+        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId {
+            return vortxOwnedResumeSeconds(for: meta) ?? 0
+        }
+        let engine = max(0, item.state.timeOffset / 1000.0)
+        if engine > 0 { return engine }                                    // freshest local play wins
+        // Engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
+        // duration == 0). A genuine finished / rewound 0 keeps duration > 0 and is REAL, so trust it.
+        if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
+        return 0
+    }
+
+    /// The VortX-owned resume offset (seconds) for `meta.libraryId` held in the local owner-resume cache
+    /// (`OwnerResumeStore`, populated from `doc.vortx.library` on cold recovery). Consulted ONLY when the
+    /// engine's own library bucket has no positive offset for the title: a cold / reinstalled / post-import
+    /// device re-adds owner titles at time 0 because stremio-core exposes no action to inject a saved offset,
+    /// so this cache is what restores cross-device resume. Series: only when the cached episode matches. Returns
+    /// nil (not 0) when there is no positive cached offset, so a genuine "start from 0" is never overridden.
+    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
+        guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
+        if meta.type == "series", let v = entry.v, v != meta.videoId { return nil }
+        return entry.t
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)

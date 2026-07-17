@@ -176,6 +176,23 @@ final class ProfileStore: ObservableObject {
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
 
+    /// Per-account "already imported the legacy Stremio roster + overlay watch into VortX" flag. Keyed by a
+    /// SHA-256 prefix of the Stremio authKey (the same shape as ProfileSync's repair flag) so the raw token
+    /// never lands in UserDefaults. Once set, the default path stops reading the Stremio datastore for the
+    /// roster + overlay watch: VortX (doc.vortx.*) is authoritative. The import itself is a UNION / last
+    /// writer wins fold, so it is idempotent; a re-run (for example after a reinstall clears this flag) can
+    /// never lose a profile or a watch record, it only re-confirms what the account already holds.
+    private static func stremioImportKey(_ authKey: String) -> String {
+        let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "vortx.profiles.stremioImportComplete.\(digest)"
+    }
+    private static func stremioImportDone(authKey: String) -> Bool {
+        UserDefaults.standard.bool(forKey: stremioImportKey(authKey))
+    }
+    private static func markStremioImportDone(authKey: String) {
+        UserDefaults.standard.set(true, forKey: stremioImportKey(authKey))
+    }
+
     /// Flat mirror of the ACTIVE profile's disabled add-on set, rewritten on every profile apply so
     /// the off-main board build (`buildBoardRows`) and the main-actor `streamGroups` can both read it
     /// cheaply without decoding the whole roster. Same pattern as `applyPlayback` flattening playback
@@ -797,30 +814,104 @@ final class ProfileStore: ObservableObject {
 
     // MARK: Roster sync (the profile list follows the primary account across devices)
 
-    /// Pull the remote roster once the account is reachable; newest side wins wholesale. AuthKeys
-    /// never sync (each device signs into own-account profiles once); looks, PINs, and identity do.
-    /// Runs the libraryItem repair FIRST: the old transport's documents break the official apps'
-    /// library sync until scrubbed (see ProfileSync), and any watch history found in them is
-    /// migrated into the local cache so nothing is lost.
+    /// Launch reconciliation for the roster + overlay watch. VortX (doc.vortx.*) is authoritative, so this
+    /// no longer reads the Stremio datastore as the source of truth on the normal path. It does three things:
+    ///   1. Runs the libraryItem repair scan FIRST (permanent safety): an old build on the same account can
+    ///      still write the legacy stremiox:* documents that break official Stremio library sync, and any
+    ///      watch history found in them is salvaged into the local cache so nothing is lost.
+    ///   2. Imports the legacy Stremio roster + overlay watch into the VortX account ONCE per account, then
+    ///      never reads Stremio for them again on the default path (VortX is authoritative thereafter).
+    ///   3. Keeps the legacy two-way Stremio sync alive ONLY while the opt-in "also sync to Stremio" mirror
+    ///      is on. By default the roster + overlays stay fresh through the VortX realtime syncDown / poll.
     func bootstrapSync() {
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
             let salvaged = await ProfileSync.prepare(authKey: key)
             if !salvaged.isEmpty { await MainActor.run { self.migrateSalvagedWatch(salvaged) } }
-            guard ProfileSync.cloudAvailable == true else { return }   // per-device profiles only
-            if let remote = await ProfileSync.fetchRoster(authKey: key) {
-                let localModified = Date(timeIntervalSince1970:
-                    UserDefaults.standard.double(forKey: Self.modifiedKey))
-                if remote.mtime > localModified {
-                    await MainActor.run { self.adoptRemoteRoster(remote.profiles) }
-                } else if localModified > remote.mtime {
-                    await ProfileSync.pushRoster(self.profiles, authKey: key)
-                }
-            } else if !profiles.isEmpty {
-                await ProfileSync.pushRoster(profiles, authKey: key)   // first device seeds the roster
+            guard ProfileSync.cloudAvailable == true else { return }   // Stremio custom collection unavailable
+            if !Self.stremioImportDone(authKey: key) {
+                await self.importProfilesFromStremio(authKey: key)
             }
-            refreshWatchFromServer()
+            // Opt-in legacy Stremio mirror (default OFF): only when the user turns it on does the app keep
+            // two-way syncing the roster + overlay watch with the Stremio datastore. Off by default because
+            // VortX owns the data now, so there is nothing more to read from Stremio here.
+            if ProfileSync.alsoSyncToStremio {
+                await self.syncRosterWithStremio(authKey: key)
+                await MainActor.run { self.refreshWatchFromServer() }
+            }
+        }
+    }
+
+    /// ONE-TIME migration of the legacy Stremio-datastore roster + per-profile overlay watch history into the
+    /// VortX account, so doc.vortx.* becomes the source of truth. Reuses the existing Stremio transport for the
+    /// READ only. Folds both classes NON-DESTRUCTIVELY: the roster is UNIONed (never shrinks, never drops a
+    /// local-only or Stremio-only profile) and each overlay is merged last-writer-wins per title (unioning
+    /// watched episodes), so a re-run can never lose a profile or a watch record. Then pushes the merged state
+    /// to VortX and, only once the VortX copy is confirmed (or there is no VortX account to import into yet),
+    /// stamps the per-account flag so it runs exactly once. The order is the data-safety rule: never mark the
+    /// import done while the data still lives only in Stremio.
+    private func importProfilesFromStremio(authKey: String) async {
+        // ORDER AFTER A VORTX PULL FIRST. On a reinstall the local delete-tombstone set is empty until a pull
+        // folds it, so pushing before folding could emit a doc that OMITS deletedProfiles and let a peer that
+        // still holds a deleted profile re-seed it into the cloud roster (the sync-wound resurrection). Pull
+        // first so the account's roster and its profile tombstones are folded into the local store before we
+        // merge Stremio in and push. Plain (not forced) so a genuine local edit made in the first seconds
+        // after launch, which arms a pending push, still defers this pull instead of being clobbered.
+        await VortXSyncManager.shared.syncDown()
+        // Read the legacy Stremio roster (do not merge yet: the overlays are folded first, below).
+        let remoteRoster = await ProfileSync.fetchRoster(authKey: authKey)
+        // Per-profile overlay watch, folded BEFORE the roster merge (last writer wins per title). Two reasons
+        // for the ordering: (1) collapseEmptyDuplicateSecondaries runs inside mergeInRoster and decides
+        // "empty" by reading the watch cache, so folding overlays first means a just-imported same-name
+        // secondary that HAS history is seen as history-bearing and is never dropped as an empty duplicate;
+        // (2) engine-backed (owner / own-account) profiles are skipped, since their history is the account
+        // library and applyRemoteOverlay refuses them anyway (the per-profile invariant). Reading the remote
+        // roster's own flags avoids depending on whether the profile is merged locally yet.
+        let overlayIDs = (remoteRoster?.profiles ?? []).filter { !$0.usesEngineHistory }.map(\.id)
+        for id in overlayIDs {
+            guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: authKey),
+                  !remote.isEmpty else { continue }
+            await MainActor.run { self.applyRemoteOverlay(profileID: id, entries: remote) }
+        }
+        // Roster: ADDITIVE union (incomingModified: nil). VortX is authoritative, so a shared profile keeps
+        // its VortX-owned fields (name, PIN, avatar, playback, isKids, disabledAddons) and Stremio only
+        // APPENDS profiles it alone has. Passing Stremio's real mtime here would let a stale frozen-Stremio
+        // record win a shared id wholesale and roll back a field the user changed on the new build, then
+        // propagate that revert on push. This matches every other mergeInRoster caller (all pass nil).
+        if let remoteRoster {
+            await MainActor.run { self.mergeInRoster(remoteRoster.profiles, incomingModified: nil) }
+        }
+        // Fold complete: push the merged roster + overlays into the VortX account so doc.vortx.* owns them.
+        // pushThisDevice() is syncUp(): it read-merges onto a freshly pulled account base (never clobbers
+        // another surface's keys, and vortxSummary unions the account's profile tombstones so the push can
+        // never shrink them) and reports whether the write landed.
+        let pushed = await VortXSyncManager.shared.pushThisDevice()
+        // STAMP THE FLAG ONLY once the VortX copy is confirmed, so the import is never marked done while the
+        // data lives only in Stremio. If there is no VortX account yet, there is nothing to confirm and
+        // nothing to strand (the data is already folded into the LOCAL store, and a later VortX sign-in pushes
+        // it up), so stamping is safe. A failed push while signed in leaves the flag unset, so the import
+        // retries next launch (idempotent), never leaving the Stremio data un-migrated.
+        let signedIntoVortx = await MainActor.run { VortXSyncManager.shared.isSignedIn }
+        if pushed || !signedIntoVortx {
+            Self.markStremioImportDone(authKey: authKey)
+        }
+    }
+
+    /// OPT-IN legacy Stremio roster sync (two-way), reached only when the user turns on "also sync to
+    /// Stremio". Mirrors the pre-independence behavior: adopt the account's roster when it is newer, else push
+    /// this device's roster to the Stremio datastore so the two stay in step for a user who keeps the mirror on.
+    private func syncRosterWithStremio(authKey: String) async {
+        if let remote = await ProfileSync.fetchRoster(authKey: authKey) {
+            let localModified = Date(timeIntervalSince1970:
+                UserDefaults.standard.double(forKey: Self.modifiedKey))
+            if remote.mtime > localModified {
+                await MainActor.run { self.adoptRemoteRoster(remote.profiles) }
+            } else if localModified > remote.mtime {
+                await ProfileSync.pushRoster(self.profiles, authKey: authKey)
+            }
+        } else if !profiles.isEmpty {
+            await ProfileSync.pushRoster(profiles, authKey: authKey)   // first device seeds the roster
         }
     }
 
@@ -1068,6 +1159,10 @@ final class ProfileStore: ObservableObject {
 
     private func schedulePushRoster() {
         pushRosterTask?.cancel()
+        // VortX authoritative: a roster edit already arms a debounced VortX syncUp (the persist() UserDefaults
+        // write fires the sync manager's observer), which carries the roster in doc.settings + doc.vortx.profiles.
+        // The legacy Stremio write is opt-in (default OFF), so it stays dormant unless the user turns on the mirror.
+        guard ProfileSync.alsoSyncToStremio else { return }
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         let snapshot = profiles
         pushRosterTask = Task {
@@ -1208,8 +1303,12 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
-    /// Background refresh from the account, so history follows the profile across devices.
+    /// Background refresh of the active overlay from the legacy Stremio datastore. VortX authoritative: the
+    /// overlay round-trips through doc.vortx.byProfile (syncDown -> applyRemoteOverlay), refreshed by the
+    /// realtime poll / WebSocket, so this reads Stremio ONLY when the opt-in "also sync to Stremio" mirror is
+    /// on. On the default path a profile switch reads the local cache, which the VortX sync keeps fresh.
     func refreshWatchFromServer() {
+        guard ProfileSync.alsoSyncToStremio else { return }
         guard let profile = active, !profile.usesEngineHistory,
               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
         let id = profile.id
@@ -1240,8 +1339,11 @@ final class ProfileStore: ObservableObject {
         pushWatchTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
+            // VortX authoritative: the overlay rides doc.vortx.byProfile, so always nudge the VortX sync.
             VortXSyncManager.shared.requestSyncSoon()
-            if let profile, !profile.usesEngineHistory,
+            // The legacy Stremio overlay write is opt-in (default OFF); it stays dormant unless the mirror is on.
+            if ProfileSync.alsoSyncToStremio,
+               let profile, !profile.usesEngineHistory,
                let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty {
                 await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key)
             }

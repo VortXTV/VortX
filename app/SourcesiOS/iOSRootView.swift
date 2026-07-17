@@ -158,7 +158,7 @@ struct iOSRootView: View {
     /// The launch "Who's watching?" picker is owed when the roster has more than one profile and none has
     /// been chosen this launch (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
     /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
-    /// brand splash lives one level up in StremioXiOSApp), so per the shared design it gates on needsPicker
+    /// brand splash lives one level up in VortXiOSApp), so per the shared design it gates on needsPicker
     /// alone here rather than inventing a splash flag.
     private var pickerOwed: Bool { profiles.needsPicker && !playbackGate.playerActive }
 

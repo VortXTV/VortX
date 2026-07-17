@@ -820,7 +820,7 @@ struct iOSSettingsView: View {
             get: { directLinksOnly },
             set: { value in
                 directLinksOnly = value
-                #if !STREMIOX_NO_EMBEDDED_SERVER
+                #if !VORTX_NO_EMBEDDED_SERVER
                 if !value, !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
                     NodeServer.startIfNeeded()
                 }

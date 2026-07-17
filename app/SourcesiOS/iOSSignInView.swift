@@ -23,7 +23,7 @@ struct iOSSignInView: View {
     @State private var showVortXEmail = false
     // The sign-in handoff below MUST run exactly once. `@Published` re-publishes on every assignment
     // (true→true included), so without this latch the handler's own work re-fired `$isSignedIn` and
-    // re-entered itself in an unbounded main-thread loop — the iOS/iPad "stuck on Signing in, dead
+    // re-entered itself in an unbounded main-thread loop, the iOS/iPad "stuck on Signing in, dead
     // buttons, phone lags, then crashes" hang. (macOS has no main-thread watchdog so it rode it out.)
     @State private var didHandleSignIn = false
 
@@ -74,15 +74,15 @@ struct iOSSignInView: View {
             // account / core objects it already uses).
             .navigationDestination(isPresented: $showVortXEmail) { SyncSettingsView() }
         }
-        // One place handles success for BOTH paths (password + QR/link): seed the engine with the
-        // freshly written authKey, then dismiss. CoreBridge booted signed-out at launch, so without
-        // signedInWithLegacyAuthKey() the Home rails (boardRows / continueWatching) stay empty until
-        // the next cold launch. Mirrors the proven tvOS LoginView handoff exactly.
+        // Stremio success handler. One place seeds the engine with the freshly written authKey, then
+        // dismisses. CoreBridge booted signed-out at launch, so without signedInWithLegacyAuthKey() the
+        // Home rails (boardRows / continueWatching) stay empty until the next cold launch. Mirrors the
+        // proven tvOS LoginView handoff exactly.
         //
         // Runs ONCE per presentation (didHandleSignIn latch): the handler must not write anything that
         // re-publishes `$isSignedIn`, or it re-enters itself forever. Both sign-in entry points
         // (signIn / signInWithAuthKey) already load add-ons + set the email, so reloadForActiveProfile()
-        // is redundant here — and it was the second `isSignedIn = true` write that armed the loop.
+        // is redundant here, and it was the second `isSignedIn = true` write that armed the loop.
         .onReceive(account.$isSignedIn) { signedIn in
             guard signedIn, !didHandleSignIn else { return }
             didHandleSignIn = true
