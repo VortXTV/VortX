@@ -14,9 +14,10 @@ import kotlin.math.roundToInt
  * .TrackPreferencesStore] mirrors Apple's `UserDefaults` keys). Persistence uses the shared
  * `vortx_settings` [android.content.SharedPreferences] file (the direct analogue of Apple `UserDefaults`).
  *
- * These are pure models + apply-hooks; the Settings UI that lets the viewer change them is a later round
- * (Round 6, `iOSSettingsView` tree). The engines read the persisted value at load time and apply it, so
- * a synced/backed-up choice takes effect even before the settings screen exists.
+ * Each model is a read side (`current(context)`) plus a symmetric write side used by the Round 6 Settings
+ * UI ([com.vortx.android.ui.screens.PlaybackSettingsScreen]). The engines read the persisted value at LOAD
+ * time and apply it, so a change made in Settings takes effect on the next play, and a synced/backed-up
+ * choice takes effect with no UI involved at all.
  */
 private const val SETTINGS_FILE = "vortx_settings"
 
@@ -124,6 +125,28 @@ data class SubtitleStyle(
 
         val SIZE_SCALE_RANGE = 0.60..1.80
 
+        /** Fine +/- step on top of the named size. Apple `SubtitleStyle.sizeScaleStep`. */
+        const val SIZE_SCALE_STEP = 0.10
+
+        // The choices surfaced in Settings, ported from Apple `SubtitleStyle.fonts/sizes/colors/backgrounds`.
+        // `id` is what persists, so these ids are Apple's and must not drift. Labels are Apple's copy.
+        // Note the Modern/Classic split is a treatment here, not a face: this port deliberately does not
+        // emit `sub-font` (see the divergence note on the class doc), so the ids still round-trip but the
+        // look comes from the outline + shadow treatment.
+        val fonts: List<Pair<String, String>> = listOf(
+            MODERN to "Modern",
+            "classic" to "Classic",
+        )
+        val sizes: List<Pair<String, String>> = listOf(
+            "s" to "Small", "m" to "Medium", "l" to "Large", "xl" to "Extra Large",
+        )
+        val colors: List<Pair<String, String>> = listOf(
+            "white" to "White", "yellow" to "Yellow", "soft" to "Soft",
+        )
+        val backgrounds: List<Pair<String, String>> = listOf(
+            "outline" to "Outline only", SHADED to "Shaded", BOX to "Solid box",
+        )
+
         /** Named base sizes -> mpv `sub-font-size` value (px on a ~1080p canvas), matching Apple. */
         private fun baseFontSize(id: String): Int = when (id) {
             "s" -> 40
@@ -165,6 +188,27 @@ data class SubtitleStyle(
                 colorId = p.getString(KEY_COLOR, DEFAULT_COLOR) ?: DEFAULT_COLOR,
                 backgroundId = p.getString(KEY_BACKGROUND, DEFAULT_BACKGROUND) ?: DEFAULT_BACKGROUND,
             )
+        }
+
+        /**
+         * Persist [style] under Apple's keys. The write side of [current], used by the Settings UI.
+         *
+         * [SubtitleStyle.sizeScale] is clamped to [SIZE_SCALE_RANGE] and rounded to 0.01 on the way IN,
+         * mirroring Apple's `subSizeScaleBinding` (iOSSettingsView.swift:1386) which clamps then rounds
+         * before storing. Doing it here rather than in the UI means a bad value cannot reach the engine
+         * regardless of which caller wrote it. [current] also clamps on read, so a value written by an
+         * older build or synced from another platform is still safe.
+         */
+        fun save(context: Context, style: SubtitleStyle) {
+            val clamped = style.sizeScale.coerceIn(SIZE_SCALE_RANGE.start, SIZE_SCALE_RANGE.endInclusive)
+            val rounded = (clamped * 100).roundToInt() / 100.0
+            prefs(context).edit()
+                .putString(KEY_FONT, style.fontId)
+                .putString(KEY_SIZE, style.sizeId)
+                .putFloat(KEY_SIZE_SCALE, rounded.toFloat())
+                .putString(KEY_COLOR, style.colorId)
+                .putString(KEY_BACKGROUND, style.backgroundId)
+                .apply()
         }
     }
 }
@@ -220,6 +264,11 @@ enum class AudioOutputMode(val storageValue: String, val label: String, val deta
         /** The persisted mode, defaulting to [AUTO] (Apple's default). */
         fun current(context: Context): AudioOutputMode =
             fromStorage(prefs(context).getString(KEY, null)) ?: AUTO
+
+        /** Persist [mode]. The write side of [current], used by the Settings UI. */
+        fun setCurrent(context: Context, mode: AudioOutputMode) {
+            prefs(context).edit().putString(KEY, mode.storageValue).apply()
+        }
     }
 }
 
@@ -380,5 +429,66 @@ object PerformanceMode {
         "reduced" -> true
         "full" -> false
         else -> isConstrainedDevice(context) // "auto" / unset
+    }
+
+    /**
+     * The three choices the Settings picker offers, in Apple's order (iOSSettingsView.swift:1221).
+     * [storageValue] matches Apple's picker tags, and [isReduced] above already reads those exact strings,
+     * so the override the UI writes is the one the engine honours.
+     */
+    enum class Override(val storageValue: String, val label: String) {
+        AUTO("auto", "Auto"),
+        FULL("full", "Full"),
+        REDUCED("reduced", "Reduced");
+
+        companion object {
+            /** Unknown/absent reads back as [AUTO], matching [isReduced]'s `else` branch. */
+            fun fromStorage(raw: String?): Override =
+                entries.firstOrNull { it.storageValue == raw } ?: AUTO
+        }
+    }
+
+    /** The persisted override (not the effective decision, which is [isReduced]). */
+    fun currentOverride(context: Context): Override =
+        Override.fromStorage(prefs(context).getString(OVERRIDE_KEY, null))
+
+    /** Persist the [Override] the viewer picked. */
+    fun setOverride(context: Context, override: Override) {
+        prefs(context).edit().putString(OVERRIDE_KEY, override.storageValue).apply()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// AutoAddLibrarySetting - Apple @AppStorage("stremiox.autoAddLibrary")
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * "Auto-add watched to Library": once playback of a title crosses ~60s it is added to the Library.
+ * Default ON, byte-for-byte Apple's key and default (`@AppStorage("stremiox.autoAddLibrary") = true`,
+ * app/Sources/PlayerScreen.swift:212 and app/SourcesTV/TVPlayerView.swift:50), so the value rides the same
+ * cross-device settings blob as the sibling `stremiox.*` keys in this file once `SettingsBackup` is ported.
+ *
+ * Apple surfaces this as a Toggle on BOTH of its settings surfaces (iOSSettingsView.swift:594 and
+ * SourcesTV/SettingsView.swift:92). Android READ this key at the 60s tick
+ * ([com.vortx.android.ui.StremioXApp]) while offering no control to write it, so the behaviour was
+ * permanently pinned to its default and a viewer could not turn it off. That is a settings-parity break,
+ * hence this object plus the Library toggle on [com.vortx.android.ui.screens.PlaybackSettingsScreen].
+ *
+ * It lives here, next to the other `stremiox.*` values, so the key string is defined EXACTLY once: the read
+ * side (the playback tick) and the write side (Settings) resolve to the same constant instead of two
+ * literals that can silently drift apart.
+ *
+ * Read at fire time rather than at composition, so a change made in Settings takes effect on the very next
+ * tick, which is the behaviour Apple gets for free from `@AppStorage` being an observed binding.
+ */
+object AutoAddLibrarySetting {
+    const val KEY = "stremiox.autoAddLibrary"
+
+    /** Whether auto-add is armed. Defaults to ON, matching Apple. */
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY, true)
+
+    /** Persist the viewer's choice. The write side of [isEnabled], used by the Settings UI. */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY, enabled).apply()
     }
 }

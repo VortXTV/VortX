@@ -199,6 +199,15 @@ dependencies {
     // aren't GPL-licensed), so this is a plain `implementation`, not flavor-scoped.
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
+
+    // WorkManager (Round 5): the offline-downloads transport. com.vortx.android.downloads.DownloadWorker runs one
+    // download as a foreground-service worker, which is what gives the Android port the two properties Apple gets
+    // from its two URLSessions at once: the transfer survives process death (WorkManager persists the work and
+    // re-runs it in a fresh process, where Apple's in-memory resumeData would be gone), and the app process stays
+    // alive while it runs (so a loopback torrent transfer keeps the in-process streaming server up, which is what
+    // Apple needs its foreground session + beginBackgroundTask assertion for). Both flavors need it -- downloads are
+    // not a licensing-boundary feature -- so this is a plain `implementation`, not flavor-scoped.
+    implementation(libs.work.runtime.ktx)
 }
 
 // =====================================================================================================

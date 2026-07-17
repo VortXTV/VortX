@@ -43,16 +43,24 @@ import kotlin.math.sqrt
  *   sha1("{imdb}:{season|0}:{episode|0}:{durationBucket}"),  durationBucket = floor(duration/10)*10.
  * Quality is deliberately NOT in the key; the duration bucket keeps different cuts from colliding.
  *
- * WIRING (follow-up, flagged per the parity assignment): this ships the CLIENT (content key + coverage +
- * fetch + upload + the tmdb->imdb resolver via [TmdbImdbResolver]). Two seams are NOT wired here and land
- * with a later player pass:
- *   - the SCRUBBER-PREVIEW read: the player scrubber calling [fetch] and cropping [Sheet.crop] onto the
- *     seek-bar thumbnail;
- *   - the CAPTURE feed: the player's local trickplay capture pipeline emitting [CapturedFrame]s into
- *     [buildAndUpload]. Android has no frame-capture pipeline yet, so nothing calls [buildAndUpload] until
- *     that lands.
- * Also NOT wired: the user setting gate + the RemoteConfig fleet kill-switch (`features.communityTrickplay`)
- * Apple reads; Android has neither surface yet, so [isEnabled] is a constant `true` (feature-on default).
+ * WIRING: this file is the CLIENT (content key + coverage + fetch + upload + the tmdb->imdb resolver via
+ * [TmdbImdbResolver]). It is DRIVEN by [TrickplaySession], which owns the per-title lifecycle (keying,
+ * the L1 fetch, frame buffering, the upload gates) and is itself driven by the player. The two seams this
+ * doc previously flagged as unwired are now wired:
+ *   - the SCRUBBER-PREVIEW read: `PlayerScreen` hands [TrickplaySession.previewAt] to `PlayerChrome`,
+ *     which crops [Sheet.crop] onto the seek-bar thumbnail while the viewer drags.
+ *   - the CAPTURE feed: `PlayerScreen`'s wall-clock capture driver pulls a frame off the live engine via
+ *     `PlayerEngine.captureFrameJpeg` and hands it to [TrickplaySession.recordFrame], which buffers
+ *     [CapturedFrame]s and calls [buildAndUpload].
+ * [isEnabled] now reads Apple's real setting key ([SETTING_KEY]). Still NOT wired: the RemoteConfig fleet
+ * kill-switch (`features.communityTrickplay`) Apple ANDs in, because Android has no remote-config dial;
+ * and no settings row WRITES [SETTING_KEY] yet, so it sits at its unset default (on).
+ *
+ * ANDROID CONTRIBUTION ASYMMETRY (does not exist on Apple, do not "fix" it in this file): capture needs a
+ * frame readback, and only the libmpv engine can attempt one. The ExoPlayer engine renders to a
+ * SurfaceView because Dolby Vision passthrough requires it, and a SurfaceView cannot be read back, so
+ * DV/Atmos titles FETCH and SERVE community previews but never CONTRIBUTE. See
+ * `ExoPlayerEngine.captureFrameJpeg` and `MpvPlayer.captureFrameJpeg`.
  *
  * Privacy: uploads ONLY the generated sprite + vtt + the content key/metadata (imdb / season / episode /
  * duration-bucket). NEVER an account token, user id, or any PII; none is referenced here.
@@ -69,11 +77,34 @@ object CommunityTrickplay {
     private const val BASE_URL = "https://trickplay.vortx.tv"
 
     /**
-     * Feature gate. Apple ANDs a user setting (default on) with a RemoteConfig fleet kill-switch; Android
-     * has neither surface yet (flagged above), so this is a plain feature-on default. Wire the setting +
-     * kill-switch here when they land, exactly as Apple's `isEnabled` does.
+     * The user-setting key, byte-for-byte Apple's `CommunityTrickplay.settingKey`. Same key on the same
+     * kind of store (Apple `UserDefaults` / Android [SharedPreferences]), per the repo's settings-parity
+     * rule and the `stremiox.*` convention the rest of the settings layer already follows (see
+     * `PlayerSettings`, whose keys are "byte-for-byte Apple's so a backup round-trips").
      */
-    const val isEnabled: Boolean = true
+    const val SETTING_KEY = "stremiox.communityTrickplay"
+
+    /** The prefs file every VortX setting lives in (the direct analogue of Apple `UserDefaults`). */
+    private const val SETTINGS_FILE = "vortx_settings"
+
+    /**
+     * Feature gate. Now reads the SAME user setting Apple's `isEnabled` reads, with the SAME
+     * default-on-when-unset semantics (Apple: `if UserDefaults.standard.object(forKey:) == nil { return
+     * true }`), so a fresh install contributes and a viewer who opts out is honored on both platforms.
+     *
+     * STILL MISSING vs Apple, and deliberately not faked here: (1) the RemoteConfig fleet kill-switch
+     * (`features.communityTrickplay`) Apple ANDs in -- Android has no remote-config dial at all yet, so
+     * there is nothing to AND; (2) a user-reachable control that WRITES this key. Android's settings
+     * screen has no trickplay row, so today the key is always its unset default (true) and this is
+     * behaviourally identical to the old `const val isEnabled = true`. Reading the real key now means the
+     * moment a settings row lands on this key it takes effect, with no second wiring pass and no window
+     * where the UI claims to control something that is not read.
+     */
+    fun isEnabled(context: Context): Boolean {
+        val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+        if (!prefs.contains(SETTING_KEY)) return true
+        return prefs.getBoolean(SETTING_KEY, true)
+    }
 
     // MARK: - Worker-mirrored constants (kept in sync with vortx-trickplay decision.ts + RemoteConfig defaults)
 
@@ -261,6 +292,7 @@ object CommunityTrickplay {
      * `CommunityTrickplay.buildAndUpload`.
      */
     suspend fun buildAndUpload(
+        context: Context,
         key: String,
         imdbId: String,
         season: Int?,
@@ -270,7 +302,9 @@ object CommunityTrickplay {
         intervalS: Double,
         frames: List<CapturedFrame>,
     ): UploadOutcome = withContext(Dispatchers.Default) {
-        if (!isEnabled) return@withContext UploadOutcome.Failed
+        // [context] exists solely for this gate: the setting is now a real stored value, not a constant,
+        // so the last line of defence before a POST has to read it.
+        if (!isEnabled(context)) return@withContext UploadOutcome.Failed
         val sorted = frames.sortedBy { it.time }
 
         // The sheet builder needs >= 2 tiles; clamp the effective lower bound to 2 so a 1-frame set is

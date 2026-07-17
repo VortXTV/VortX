@@ -12,6 +12,7 @@ import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryItemInfo
+import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibrarySortOption
 import com.vortx.android.model.LibraryTypeOption
 import com.vortx.android.model.MediaType
@@ -580,6 +581,58 @@ internal object EngineState {
         name = obj.optString("name"),
         poster = obj.optStringOrNull("poster"),
     )
+
+    /// Parse the SAME `library.catalog` array [parseLibrary] reads, but into the portable export shape
+    /// (`LibraryPortability.Item`) instead of a UI [MetaItem]. A separate parse rather than widening
+    /// [MetaItem]: the UI projection deliberately carries only what a poster grid draws, and every screen
+    /// that reads it would pay for fields only the exporter wants.
+    ///
+    /// It exists at all because the export needs three fields [parseLibraryItem] drops -- the entry's
+    /// `state` (resume position + the in-progress episode) and its `removed` / `temp` bookkeeping flags.
+    /// Mirrors Apple `ProfileStore.exportActiveLibraryItems`' engine branch, which reads the same catalog
+    /// off `CoreBridge.library` (`CoreCWItem`: `_id`/`type`/`name`/`poster`/`state`/`removed`/`temp`).
+    ///
+    /// The `removed != true && temp != true` filter is Apple's and is load-bearing, NOT defensive tidying:
+    /// a removed entry stays in the engine's bucket flagged `removed`, and a watched-from-catalog marker
+    /// is `temp`. Exporting either would put titles the viewer deleted (or never saved) into the file, and
+    /// the import on the other side would add them to a real library. "In the library" means neither flag.
+    ///
+    /// [now] is the export timestamp, stamped on every item: the engine's library entry carries a resume
+    /// state but no per-item last-watched clock, so Apple stamps `isoNow()` here too (`lastWatched` orders
+    /// the rail and drives the import's last-writer-wins merge).
+    fun parseLibraryPortable(json: String, now: String): List<LibraryPortability.Item> {
+        val root = json.toJsonObjectOrNull() ?: return emptyList()
+        val catalog = root.optJSONArray("catalog") ?: return emptyList()
+        val out = mutableListOf<LibraryPortability.Item>()
+        for (i in 0 until catalog.length()) {
+            val obj = catalog.optJSONObject(i) ?: continue
+            if (obj.optBoolean("removed", false) || obj.optBoolean("temp", false)) continue
+            val id = obj.optString("_id").ifEmpty { obj.optString("id") }
+            if (id.isEmpty()) continue
+            // `state` mirrors the engine's `LibraryItemState`; `video_id` keeps its Rust snake_case name in
+            // JSON (an explicit serde rename), exactly as [parseLibraryItemInfo] documents for the same
+            // struct reached through `meta_details.libraryItem`.
+            val state = obj.optJSONObject("state")
+            out += LibraryPortability.Item(
+                metaId = id,
+                // The wire format carries the engine's own type STRING ("movie"/"series"), not the parsed
+                // enum: it must round-trip to Apple verbatim, and [MediaType.fromId] coerces an unknown
+                // type to MOVIE, which would silently rewrite the id's real type in the exported file.
+                type = obj.optString("type", "movie"),
+                name = obj.optString("name"),
+                poster = obj.optStringOrNull("poster"),
+                videoId = state?.optStringOrNull("video_id"),
+                timeOffsetMs = (state?.optLong("timeOffset", 0L) ?: 0L).toInt(),
+                durationMs = (state?.optLong("duration", 0L) ?: 0L).toInt(),
+                lastWatched = now,
+                // The engine owns per-episode watched ticks in a WatchedBitField that is not serialized on
+                // this field, so it stays empty here -- the same gap Apple's engine branch leaves (it also
+                // exports `watchedVideoIds: []`), so the two platforms' exports agree.
+                watchedVideoIds = emptyList(),
+            )
+        }
+        return out
+    }
 
     private fun parseVideos(meta: JSONObject): List<Episode> {
         val videos = meta.optJSONArray("videos") ?: return emptyList()

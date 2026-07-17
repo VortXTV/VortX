@@ -11,6 +11,7 @@ import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.InstalledAddon
+import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -414,6 +415,17 @@ class EngineStremioRepository(
         val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
         LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
     } }
+
+    override suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
+        withContext(Dispatchers.Default) { runCatching {
+            // Same field + same dispatch as [library] above (a derived read of the persisted ctx.library
+            // bucket, no add-on HTTP, ready immediately), differing only in the parse: the portable shape
+            // keeps each entry's resume state and drops the engine's removed/temp bookkeeping entries.
+            // Always the DEFAULT selection (no requestJson): an export is the whole library, never the
+            // type/sort pivot the Library screen happens to be showing.
+            val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
+            EngineState.parseLibraryPortable(state, now)
+        } }
 
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
         // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is

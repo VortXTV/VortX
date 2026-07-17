@@ -298,6 +298,29 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         return stats
     }
 
+    /// Community-trickplay frame grab: a DOCUMENTED no-op on this engine, overridden explicitly rather
+    /// than inherited so the gap is visible at the call site instead of hidden behind a default. Same
+    /// shape as this engine's other honest no-ops ([setAudioDelay], [setAudioOutputMode]).
+    ///
+    /// WHY it cannot be implemented here. This engine renders through a Media3 [PlayerView] in
+    /// SURFACE_TYPE_SURFACE_VIEW mode (see [VideoSurface]). A `SurfaceView`'s buffers belong to the system
+    /// compositor and are never mapped into the app's address space, so there is no supported way to read
+    /// the rendered frame back; Media3 exposes no pixel-readback API either
+    /// (`setVideoFrameMetadataListener` delivers timing metadata, not pixels). The ONLY in-process
+    /// readback route is hosting the video on a `TextureView` and calling `getBitmap()`, and that is
+    /// exactly what [VideoSurface] rules out: SurfaceView is required for the HDR/Dolby Vision
+    /// passthrough this engine exists to provide. Trading the DV mandate for the trickplay mandate is not
+    /// a trade this seam is allowed to make, so this returns null and the title stays a fetch-only
+    /// consumer of the community pool.
+    ///
+    /// CONSEQUENCE, stated plainly: on Android, community trickplay CONTRIBUTES only from the libmpv
+    /// engine. Since [PlayerEngineRouter] sends Dolby Vision + Atmos streams here, those titles fetch and
+    /// serve community previews but never contribute their own. Closing this needs an out-of-band grab
+    /// (a second, capture-only decode of the source via `MediaMetadataRetriever`) that never touches the
+    /// DV render path; that is a separate piece of work with its own bandwidth cost to weigh, not
+    /// something to smuggle in behind this seam.
+    override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
+
     /// Map a sidecar subtitle URL to a Media3-parseable MIME by extension, or null when unknown (skip it).
     private fun subtitleMimeFromUrl(url: String): String? {
         val lower = url.substringBefore('?').lowercase()

@@ -665,7 +665,7 @@ class DetailViewModel(
         /// A cache-busting suffix appended to a decorated source's id (the score/quality caches key on the id).
         /// It carries no '#', so `id.substringBefore('#')` -- the handle the resolve + dedup paths read -- is
         /// unchanged.
-        const val CACHED_ID_SUFFIX = " cached"
+        const val CACHED_ID_SUFFIX = "\u0000cached"
     }
 }
 

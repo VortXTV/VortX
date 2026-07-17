@@ -43,6 +43,7 @@ import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
+import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.delay
 
@@ -178,6 +179,60 @@ fun PlayerScreen(
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
     }
 
+    // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
+    //   1. KEY + FETCH  -- below, once the engine reports a real duration.
+    //   2. CAPTURE      -- the wall-clock driver further down.
+    //   3. SERVE        -- [previewAt] handed to the chrome's scrubber.
+    // The session owns its own scope (it must outlive this composition to flush on exit), so it is only
+    // remembered here, never scoped to the composition.
+    val trickplay = remember(playable.url) { TrickplaySession(context) }
+
+    // KEY + FETCH. Gated on a real reported duration because the content key is
+    // sha1(imdb:season:episode:durationBucket) -- keying on 0 would compute the WRONG key and index a
+    // different pool row. This is the same `durationMs > 0` gate the skip-segment fetch above uses, so it
+    // is the established contract for "the engine now knows the title's real length".
+    //
+    // [TrickplaySession.configure] is idempotent and does the tmdb->imdb resolve itself: a hub/TMDB-catalog
+    // play arrives with mediaRef.imdb == null and only a numeric tmdb id, and a tt-only content key would
+    // silently drop it (the known past root cause of an account that contributed nothing from any device).
+    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
+        val durationMs = latestState.durationMs
+        if (durationMs <= 0L) return@LaunchedEffect
+        trickplay.configure(playable.mediaRef, durationMs / 1000.0)
+    }
+
+    // CAPTURE. A wall-clock driver, deliberately NOT a position-delta driver: Apple runs both (a timePos
+    // handler plus a timer) because a 4K/HDR debrid stream can coalesce or never emit position ticks, and
+    // the timer is the one that always fires. Android's [PlayerState] republishes position ~1s on both
+    // engines, but the timer is still the robust choice and needs no second code path.
+    //
+    // Gates mirror Apple's `maybeCaptureLocalTrickplay`: never grab while paused or buffering (a stalled
+    // frame is a duplicate at best, an unrendered black frame at worst), and never before a real duration
+    // (the session is not keyed yet, so the frame would be buffered against no title and thrown away).
+    // A null return is the normal, expected outcome on the ExoPlayer engine, which cannot read back a
+    // SurfaceView without breaking Dolby Vision -- see [PlayerEngine.captureFrameJpeg].
+    LaunchedEffect(engine, playable.url) {
+        while (true) {
+            delay((TrickplaySession.CAPTURE_INTERVAL_S * 1000).toLong())
+            val s = latestState
+            if (s.isPaused || s.isBuffering || s.durationMs <= 0L) continue
+            val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
+            // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank
+            // it with the frame. Doing it at teardown instead would mean a JNI property read against an
+            // engine that may already be released, which is a native crash, not a catchable one.
+            trickplay.recordFrame(jpeg, s.positionMs / 1000.0, videoHeightOf(engine))
+        }
+    }
+
+    // TEARDOWN FLUSH. The session pushes progressively during playback (Apple learned that a teardown may
+    // never fire: the title ends, the device sleeps, auto-advance takes over, or the process is killed), so
+    // this is the backstop that sends the final, fullest set. It survives this composition because the
+    // session owns a SupervisorJob scope rather than a remembered one, and it deliberately touches only
+    // session state, never the engine that is being released alongside it.
+    DisposableEffect(playable.url) {
+        onDispose { trickplay.finishAndFlush() }
+    }
+
     // When playback ends, hand control back to the detail page.
     LaunchedEffect(playerState.hasEnded) {
         if (playerState.hasEnded) currentOnBack()
@@ -297,6 +352,11 @@ fun PlayerScreen(
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
+            // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
+            // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null
+            // until (or unless) this title has a community sheet, and the scrubber then simply shows no
+            // thumbnail, exactly as it does today.
+            scrubPreview = trickplay::previewAt,
             modifier = Modifier.fillMaxSize(),
         )
 
@@ -370,7 +430,23 @@ private fun mpvSurfaceFailed(engine: PlayerEngine): Boolean {
     }.getOrDefault(false)
 }
 
+/// The source video height tagged onto an uploaded community sheet (the Worker's `src_height` metadata,
+/// which lets it prefer a set built from a better source). Derived from the engine-agnostic
+/// [PlayerEngine.playbackStats] "Resolution" entry ("1920x1080"), which BOTH engines already publish, so
+/// this needs no new engine API. Returns 0 when unknown, which the Worker accepts; Apple passes its
+/// `videoHeight` here. Never throws: an absent or unparseable entry is simply 0.
+private fun videoHeightOf(engine: PlayerEngine): Int {
+    val resolution = runCatching { engine.playbackStats() }.getOrNull()
+        ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
+    return resolution.substringAfter('x', "").toIntOrNull() ?: 0
+}
+
 internal val DefaultEmber = Color(0xFFD97706)
+
+/// Tile width for a captured trickplay frame, in pixels. 480 == the `maxWidth` Apple passes on both of its
+/// capture paths. The sheet builder downscales again to its own 320x180 tile, so this is only the
+/// intermediate that keeps a 4K grab from being carried around at full size.
+private const val TRICKPLAY_TILE_MAX_WIDTH = 480
 
 /// Progress writeback cadence: report the live position to the host every few seconds while playing. The
 /// host debounces the actual engine dispatch, so this only needs to be frequent enough that a save-on-

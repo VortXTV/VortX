@@ -7,6 +7,7 @@ import com.vortx.android.model.DiscoverTypeOption
 import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.LibraryFilters
+import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.LibrarySortOption
 import com.vortx.android.model.LibraryTypeOption
@@ -76,6 +77,17 @@ interface CatalogRepository {
     /// is null for the default (all types, last-watched), or a verbatim echo of a [LibraryFilters]
     /// type/sort option's `request`.
     suspend fun library(requestJson: String? = null): Result<LibraryResult>
+
+    /// The saved Library as PORTABLE export items: the same entries [library] returns, but carrying each
+    /// one's resume state and with the engine's `removed`/`temp` bookkeeping entries filtered out. Feeds
+    /// [com.vortx.android.library.LibraryTransfer]'s export; separate from [library] because the UI
+    /// projection ([MetaItem]) deliberately drops those fields.
+    ///
+    /// [now] is the ISO timestamp stamped on every exported item (the engine's entries carry a resume
+    /// state but no per-item last-watched clock). Default: an empty list, so a non-engine repository (the
+    /// Compose previews) reports "nothing to export" rather than pretending.
+    suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
+        Result.success(emptyList())
 
     /// Add a title to the Library (the "Save"/bookmark action from a poster's long-press menu or the
     /// detail page).

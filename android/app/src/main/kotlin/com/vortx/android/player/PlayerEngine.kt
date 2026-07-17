@@ -78,6 +78,29 @@ interface PlayerEngine {
     /// overlay. Both engines override with what their API exposes. Mirrors Apple `playbackStats`.
     fun playbackStats(): List<Pair<String, String>> = emptyList()
 
+    /// Grab the CURRENT video frame as JPEG bytes, downscaled so its width is at most [maxWidth]. This is
+    /// the capture primitive the community-trickplay pipeline feeds
+    /// ([com.vortx.android.trickplay.TrickplaySession]); it is the Android analogue of Apple's
+    /// `PlayerEngine.captureFrameJPEGData(maxWidth:completion:)`, re-shaped as a `suspend` function
+    /// because every Android caller is already a coroutine (Apple needs a completion handler only because
+    /// its libmpv grab is serviced asynchronously on the Metal VO thread).
+    ///
+    /// Returns null when this engine cannot read the frame back, which is NOT an error and must stay
+    /// fail-soft: the session simply captures nothing and the title stays a fetch-only consumer of the
+    /// community pool. The default is null so any future engine is safe by construction.
+    ///
+    /// PLATFORM REALITY, and why this is not symmetric with Apple. Apple reads pixels back in-process on
+    /// BOTH engines (a Metal texture blit off mpv's VO; `AVPlayerItemVideoOutput.copyPixelBuffer` off
+    /// AVPlayer). Neither Android engine has an equivalent that survives the DV mandate:
+    ///   - [ExoPlayerEngine] renders through a Media3 `PlayerView` in SURFACE_TYPE_SURFACE_VIEW mode. A
+    ///     `SurfaceView`'s buffers are owned by the compositor and are NOT readable by the app; the only
+    ///     readback route is `TextureView`, which the DV/HDR passthrough path explicitly rules out. So it
+    ///     returns null (a documented no-op, like its `setAudioDelay` / `setAudioOutputMode`).
+    ///   - The libmpv engine CAN ask mpv to write a screenshot, so it implements this. See
+    ///     `MpvPlayer.captureFrameJpeg` for the `hwdec=mediacodec` caveat that governs whether the grab
+    ///     actually yields a real frame on a given device.
+    suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
+
     /// Lifecycle. [onEnterBackground] drops video decode (and, per policy, pauses); [onEnterForeground]
     /// resumes. [release] tears the engine down; the instance is unusable afterward.
     fun onEnterBackground()
