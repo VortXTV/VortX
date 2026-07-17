@@ -54,6 +54,12 @@ struct PlaybackRequest: Identifiable {
     /// (so the source is identical, per the play-from-start invariant); only the start position differs. The
     /// stored resume point is left untouched. TVPlayerView reads it to skip its engine/account resume lookup.
     var startFromZero: Bool = false
+    /// An explicit start position in seconds: the same idea as `startFromZero` generalized past 0:00. Set by
+    /// the Trakt "Resume from <time>" chip, which offers a position another device reported to Trakt. Like
+    /// `startFromZero` it changes only WHERE this playback begins, never WHICH source plays, and it leaves
+    /// the stored resume point untouched: VortX remains the sole resume authority and re-records its own
+    /// position from here as playback proceeds. Takes precedence over `startFromZero` (a caller sets one).
+    var startAtSeconds: Double? = nil
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -107,7 +113,7 @@ struct RootView: View {
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
-                             startFromZero: req.startFromZero,
+                             startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
                              // Tear down the engine Player on a genuine exit so a stale Player from this session
                              // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
                              // the single user-exit choke point (leavePlayback routes through it); a request-id

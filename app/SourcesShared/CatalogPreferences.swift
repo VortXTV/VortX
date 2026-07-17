@@ -739,6 +739,15 @@ struct ImportedListCatalog: Codable, Hashable, Identifiable {
     let sourceURL: String
     var items: [ImportedListItem]
     var addedAt: Date
+    /// True when these titles were only readable through a signed-in session with `provider` (a private or
+    /// friends-only Trakt list). Such a row is scoped to the connection that produced it: disconnecting the
+    /// service drops it (`ImportedCatalogs.removeConnectionScoped`), so one account's private list can never
+    /// linger on-device into the next account that connects here, the same cross-account contamination rule
+    /// `TraktSyncEngine.reset()` already enforces for the watched shadow set.
+    ///
+    /// Optional on purpose: blobs written before this field existed decode to nil, which reads as "public,
+    /// never purge" and leaves every already-imported public row exactly as it was.
+    var requiresConnection: Bool? = nil
 
     /// The row's cards, ready for the same poster-rail path the curated/add-on rows use.
     var previews: [MetaPreview] { items.map(\.preview) }
@@ -793,6 +802,18 @@ final class ImportedCatalogs: ObservableObject {
     }
 
     func remove(id: String) { persist(catalogs.filter { $0.id != id }) }
+
+    /// Drop every row from `provider` whose titles were only readable while signed in to it (a private or
+    /// friends-only list). Called on disconnect. Public rows from the same provider survive: they were
+    /// readable without the connection and stay readable without it, so purging them would delete a browse
+    /// row the user built for themselves. Returns the number of rows dropped (0 is the common case).
+    @discardableResult
+    func removeConnectionScoped(provider: ImportedListProvider) -> Int {
+        let next = catalogs.filter { !($0.provider == provider && $0.requiresConnection == true) }
+        let dropped = catalogs.count - next.count
+        if dropped > 0 { persist(next) }
+        return dropped
+    }
 
     /// Rename an imported row (user-editable title). No-op when the id is unknown or the title is blank.
     func rename(id: String, to title: String) {

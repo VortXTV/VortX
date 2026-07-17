@@ -264,3 +264,147 @@ struct TraktCollectionEntry: Codable, Sendable {
         case collectedAt = "collected_at"
     }
 }
+
+// MARK: - Check-in
+
+/// Response from `POST /checkin` (HTTP 201). `expiresAt` is when Trakt auto-expires the check-in (the
+/// item's runtime measured from `watchedAt`); the account's single "watching" slot frees up then, and
+/// Trakt records the watch in the user's own history at that point.
+///
+/// That history write lands on TRAKT ONLY. It reaches VortX's read path solely through the existing
+/// opt-in `traktImportWatched` shadow cache, which is additive-read and never writes an engine
+/// `libraryItem`, so a check-in can never mutate VortX's own watched state.
+struct TraktCheckinResponse: Codable, Sendable {
+    let id: Int64?
+    let watchedAt: String?
+    let expiresAt: String?
+    let movie: TraktMovie?
+    let episode: TraktEpisode?
+    let show: TraktShow?
+
+    enum CodingKeys: String, CodingKey {
+        case id, movie, episode, show
+        case watchedAt = "watched_at"
+        case expiresAt = "expires_at"
+    }
+}
+
+/// Body of the HTTP 409 that `POST /checkin` answers with when the account is ALREADY watching
+/// something. Trakt keeps ONE watching slot per account, shared by check-ins and by live scrobbles, and
+/// refuses to overwrite it silently. `expiresAt` says when that prior watch frees the slot, so the app
+/// can tell the user exactly what is in the way rather than reporting a bare failure.
+struct TraktCheckinConflict: Codable, Sendable {
+    let expiresAt: String?
+
+    enum CodingKeys: String, CodingKey { case expiresAt = "expires_at" }
+}
+
+/// Timestamp parsing for the Trakt wire format ("2026-07-16T12:00:00.000Z"). Trakt sends fractional
+/// seconds; the plain form is accepted as a fallback so a format change degrades to "no expiry shown"
+/// instead of silently dropping the value. Reuses the shared `ISO8601DateFormatter` instances
+/// (formatters are costly to build and are not thread-safe to mutate, so these are never reconfigured).
+enum TraktDate {
+    static func parse(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        if let date = ISO8601DateFormatter.epgFractional.date(from: raw) { return date }
+        return ISO8601DateFormatter.epg.date(from: raw)
+    }
+}
+
+// MARK: - Ratings
+
+/// The `rated_at` timestamp shape Trakt uses: ISO8601 UTC with fractional seconds
+/// ("2014-09-01T09:10:11.000Z"). Carried as a `String` on the wire types so `TraktService`'s plain
+/// `JSONEncoder`/`JSONDecoder` keep their defaults for every other call (a date strategy set for
+/// ratings would otherwise silently reinterpret the `created_at` Int in `TraktToken`).
+///
+/// Parsing accepts BOTH the fractional and whole-second forms: Trakt documents the fractional shape
+/// but does not always send the `.000`, and an `ISO8601DateFormatter` configured `.withFractionalSeconds`
+/// returns nil on a whole-second string rather than tolerating it. A rating whose date failed to parse
+/// would fall back to `.distantPast` at the merge and could never win a newer-wins comparison, so both
+/// forms are tried before giving up.
+enum TraktRatedAt {
+    private static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let whole: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// Format a date the way Trakt expects on a ratings write.
+    static func string(from date: Date) -> String { fractional.string(from: date) }
+
+    /// Parse a Trakt `rated_at`, tolerating the whole-second form. nil when neither form matches.
+    static func date(from string: String) -> Date? {
+        fractional.date(from: string) ?? whole.date(from: string)
+    }
+}
+
+/// A movie carrying a rating, for `POST /sync/ratings`. `rating` is 1...10; it is optional because
+/// `POST /sync/ratings/remove` takes the same shape with the value omitted (the ids alone identify what
+/// to un-rate).
+struct TraktRatedMovie: Codable, Sendable, Equatable {
+    var ids: TraktIDs
+    var rating: Int?
+    var ratedAt: String?
+
+    init(ids: TraktIDs, rating: Int? = nil, ratedAt: String? = nil) {
+        self.ids = ids
+        self.rating = rating
+        self.ratedAt = ratedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ids, rating
+        case ratedAt = "rated_at"
+    }
+}
+
+/// A show carrying a rating, for `POST /sync/ratings`. Show-level (not season/episode), matching the
+/// title-level intent of the detail page's rating control and of `TraktProvider.titleItems`.
+struct TraktRatedShow: Codable, Sendable, Equatable {
+    var ids: TraktIDs
+    var rating: Int?
+    var ratedAt: String?
+
+    init(ids: TraktIDs, rating: Int? = nil, ratedAt: String? = nil) {
+        self.ids = ids
+        self.rating = rating
+        self.ratedAt = ratedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case ids, rating
+        case ratedAt = "rated_at"
+    }
+}
+
+/// Body for `POST /sync/ratings` and `POST /sync/ratings/remove`. Omit the array you are not using.
+struct TraktRatingItems: Codable, Sendable, Equatable {
+    var movies: [TraktRatedMovie]?
+    var shows: [TraktRatedShow]?
+
+    init(movies: [TraktRatedMovie]? = nil, shows: [TraktRatedShow]? = nil) {
+        self.movies = movies
+        self.shows = shows
+    }
+}
+
+/// One row from `GET /sync/ratings/{type}`: the rating the user gave, when, and which title it is on.
+struct TraktRatingEntry: Codable, Sendable {
+    let rating: Int
+    let ratedAt: String?
+    let type: String?
+    let movie: TraktMovie?
+    let show: TraktShow?
+
+    enum CodingKeys: String, CodingKey {
+        case rating, type, movie, show
+        case ratedAt = "rated_at"
+    }
+}

@@ -31,6 +31,10 @@ struct TVPlayerView: View {
     /// "Play from start" (backlog E): start at 0:00 regardless of any saved resume position. Skips the
     /// engine/account resume lookup below and pins resumeSeconds to 0, leaving the stored resume untouched.
     var startFromZero: Bool = false
+    /// An explicit start position in seconds (the Trakt "Resume from <time>" chip). Skips the engine/account
+    /// resume lookup exactly as `startFromZero` does and seeks here instead, leaving the stored resume point
+    /// untouched. The engine records its own position from here on, so VortX stays the sole authority.
+    var startAtSeconds: Double? = nil
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -490,7 +494,15 @@ struct TVPlayerView: View {
             }
             showInfo = true; selected = .play; scheduleHide(); startLoadTimeout()
             UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
-            if startFromZero {
+            if let explicit = startAtSeconds {
+                // Trakt "Resume from <time>": the viewer tapped a position another device reported. Seek there
+                // WITHOUT consulting the engine/account resume, and leave the stored resume point untouched:
+                // this is one playback's start position, not a new source of truth. From here the engine
+                // records its own position exactly as if the viewer had scrubbed to this spot by hand, so
+                // VortX's resume authority is never written by Trakt. Checked before startFromZero because a
+                // caller sets one or the other, never both.
+                resumeSeconds = explicit; maybeResume()
+            } else if startFromZero {
                 // "Play from start": begin at 0:00 without consulting the engine/account resume. The stored
                 // resume point is deliberately left untouched (only WHERE playback begins changes), so a later
                 // Resume still seeks to it. resumeSeconds = 0 makes maybeResume a no-op seek (its r > 5 guard).

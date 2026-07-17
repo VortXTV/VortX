@@ -172,6 +172,12 @@ struct iOSDetailView: View {
     @EnvironmentObject private var profiles: ProfileStore   // per-profile watched set + episode progress
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + badges/menu (#15)
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
+    /// Observed so the episode ticks repaint when an async Trakt shadow pull lands while this page is open.
+    /// The Trakt episode mirror is read synchronously from a non-observable cache, so without this the page
+    /// would show the pre-pull state until some unrelated event happened to re-evaluate it. WatchedIndex
+    /// republishes nothing when the set is unchanged and never rebuilds during playback, so this costs
+    /// nothing in the steady state.
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
     // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
     // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -626,6 +632,10 @@ struct iOSDetailView: View {
             if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name); refreshSourceIndex() }
         }
         .onAppear { if effectiveType != "series" { torboxSearch.refresh(imdbId: ratingsImdbID); mediaServers.refresh(imdb: ratingsImdbID, title: meta?.name); refreshSourceIndex() } }
+        // Warm the Trakt playback shadow so the "Resume from <time>" chip can decide off a cache rather
+        // than blocking the open on a network call. Internally throttled, opt-in gated, and a no-op when
+        // Trakt is unconfigured or disconnected, so this costs nothing for everyone else.
+        .onAppear { TraktPlaybackShadow.shared.refreshIfStale() }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
@@ -1483,14 +1493,28 @@ struct iOSDetailView: View {
 
     // MARK: Series — hero Resume/Play affordance (mirrors tvOS DetailView.seriesPrimaryEpisode)
 
-    /// The watched episode-id set for the open series: the engine's computed set for
+    /// VortX's OWN watched episode-id set for the open series: the engine's computed set for
     /// engine-history profiles, the profile overlay's set otherwise — the exact same
     /// invariant tvOS uses for its ticks, dimming, and primary-episode pick.
-    private var watchedSet: Set<String> {
+    ///
+    /// This is the AUTHORITATIVE set. Use it for any decision about the user's own place in the show
+    /// (resume). `watchedSet` below adds the optional Trakt mirror on top for display.
+    private var localWatchedSet: Set<String> {
         guard let m = meta else { return [] }
         return profiles.activeUsesEngineHistory
             ? (core.metaDetails?.watchedIds ?? [])
             : profiles.watchedVideoIds(forMeta: m.id)
+    }
+
+    /// `localWatchedSet` plus the episodes Trakt says are watched (opt-in import only, empty otherwise).
+    /// Additive: the union can only ADD a tick to an episode VortX has no record of, never remove one, so
+    /// the VortX account stays the authority on what you watched. Drives ticks, dimming, the first-unwatched
+    /// season, and the show rollup. NOT the resume decision (see `seriesPrimaryEpisode`).
+    private var watchedSet: Set<String> {
+        guard let m = meta else { return [] }
+        let local = localWatchedSet
+        guard let videos = m.videos, !videos.isEmpty else { return local }
+        return local.union(TraktEpisodeShadow.watchedVideoIDs(showIdentity: m.id, videos: videos))
     }
 
     /// Show-level watched rollup (issue #143): a series reads as watched once every AIRED, regular-season
@@ -1548,6 +1572,11 @@ struct iOSDetailView: View {
                 trailerButton
                 iOSLibraryChip()
                 iOSWatchlistChip()
+                ratingChip
+                // "I'm watching this" on Trakt, for a cinema or someone else's TV. A series checks into an
+                // EPISODE, so it passes the same episode the Play button above would start; the chip hides
+                // itself when none has resolved, since a whole show cannot be checked into.
+                TraktCheckinChip(season: primary?.video.season, episode: primary?.video.episode)
                 shareChip
             }
         }
@@ -1583,10 +1612,18 @@ struct iOSDetailView: View {
             let state = core.metaDetails?.libraryItem?.state
             return (state?.videoId, state?.timeOffset ?? 0)
         }()
+        // RESUME is decided against VortX's OWN watched set, never the Trakt-unioned one. The resume
+        // position and the local watched flag are two halves of one fact this device recorded: "you are
+        // partway through this episode". A Trakt watched flag on that same episode is a staler claim from
+        // an optional mirror (you finished it elsewhere, or on an account that scrobbles other devices),
+        // and if it were allowed to answer here it would suppress the Resume button and jump the user to
+        // the NEXT episode with their half-watched one silently abandoned. The VortX account is primary:
+        // it alone decides where you are. Trakt only contributes below, to skip episodes VortX has no
+        // record of at all.
         if resume.timeOffsetMs > 0,
            let videoId = resume.videoId,
            let video = sorted.first(where: { $0.id == videoId }),
-           !watched.contains(video.id) {
+           !localWatchedSet.contains(video.id) {
             return (video, true)
         }
         if let next = sorted.first(where: { !watched.contains($0.id) }) {
@@ -1749,6 +1786,20 @@ struct iOSDetailView: View {
                 .disabled(preparing)
             }
 
+            // "Resume from 41:23": a position Trakt holds from another device that is ahead of this one's.
+            // A SUGGESTION, never an override: the primary CTA above still plays from THIS device's own
+            // saved position, and tapping this only changes where this one playback begins (the same seam
+            // "Play from start" uses). Nothing here writes engine state, the account, or Trakt. Hidden
+            // unless the user opted in, and hidden while sources resolve so it can never be a dead press.
+            if movieReady, let suggestion = movieTraktSuggestionSeconds,
+               let stamp = resumeTimecode(suggestion) {
+                Button { Task { await playMovie(startAt: suggestion) } } label: {
+                    Label("Resume from \(stamp)", systemImage: "arrow.triangle.branch")
+                }
+                .buttonStyle(ChipButtonStyle())
+                .disabled(preparing)
+            }
+
             // Secondary actions wrap beneath the CTA. FlowLayout keeps each chip at its natural width and
             // drops overflow onto the next line under the hero's hard width cap.
             FlowLayout(spacing: Theme.Space.sm) {
@@ -1770,6 +1821,10 @@ struct iOSDetailView: View {
                 trailerButton
                 iOSLibraryChip()
                 iOSWatchlistChip()
+                ratingChip
+                // "I'm watching this" on Trakt, for a cinema or someone else's TV. A movie checks in whole,
+                // so there is no episode to pass.
+                TraktCheckinChip()
                 shareChip
             }
             // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
@@ -1892,6 +1947,23 @@ struct iOSDetailView: View {
     private var ratingsImdbID: String? {
         if let dv = meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
         return id.hasPrefix("tt") ? id : nil
+    }
+
+    /// The numeric TMDB id when this page was opened from a TMDB-keyed catalog ("tmdb:123",
+    /// "tmdb:movie:123"). Carried alongside `ratingsImdbID` so a title whose tt id has not resolved (or
+    /// does not exist) can still be rated, and so the rating stays findable once the tt id does arrive.
+    /// Same extraction rule as `ScrobbleCoordinator.numericTMDB`, applied to the catalog id.
+    private var ratingTMDBID: Int? {
+        guard id.lowercased().hasPrefix("tmdb") else { return nil }
+        return id.lowercased().split(separator: ":").compactMap { Int($0) }.first
+    }
+
+    /// "Your rating" chip. The SHARED control (SourcesShared/TraktRatingControl.swift), the same view the
+    /// Apple TV detail page mounts, so the two surfaces cannot drift. It renders nothing unless Trakt is
+    /// configured + connected and the ratings toggle is on, so this is a no-op on a credential-less build.
+    /// Series rate at the SHOW level, matching the title-level watchlist writes.
+    @ViewBuilder private var ratingChip: some View {
+        TraktRatingChip(imdb: ratingsImdbID, tmdb: ratingTMDBID, isSeries: effectiveType == "series")
     }
 
     /// The pool `content_key` for this title (P1). Movies key on the imdb id; a series detail keys on the
@@ -2227,6 +2299,26 @@ struct iOSDetailView: View {
         return secs >= 1 ? secs : nil
     }
 
+    /// The runtime used to turn Trakt's playback PERCENT into a timecode. Prefers the engine's real
+    /// duration (mpv-measured, present once this title has played here) and falls back to the meta's
+    /// PROVISIONAL `runtime` string. nil when neither is known, which suppresses the chip entirely: we
+    /// never render a timecode we cannot actually compute. (`state.duration` is milliseconds, like
+    /// `state.timeOffset`; see LibraryPortability's `durationMs: Int(state.duration)`.)
+    private var movieDurationSeconds: Double? {
+        if let d = core.metaDetails?.libraryItem?.state.duration, d > 0 { return d / 1000.0 }
+        return meta?.runtimeSeconds
+    }
+
+    /// A position Trakt holds from ANOTHER device that is worth offering, or nil. Read-only and advisory:
+    /// this is NOT consulted by `movieResumeSeconds` or by `playMovie`'s own `resume(_:)`, so the primary
+    /// Resume button is byte-identical with or without Trakt. All of the policy (toggle, staleness band,
+    /// clamps) lives in `TraktPlaybackShadow` so iOS and tvOS cannot drift apart on it.
+    private var movieTraktSuggestionSeconds: Double? {
+        TraktPlaybackShadow.shared.suggestionSeconds(for: moviePlaybackMeta,
+                                                     localSeconds: movieResumeSeconds,
+                                                     durationSeconds: movieDurationSeconds)
+    }
+
     /// #11: the selected source's spec line for the primary CTA ("4K · DV · Remux · Atmos · 24.5 GB"),
     /// from the SAME parse the source rows use, so the button never promises what a row wouldn't show.
     private func primarySourceDetail(_ s: CoreStream) -> String? {
@@ -2254,7 +2346,26 @@ struct iOSDetailView: View {
     /// at 0). Default false keeps the primary Play/Resume behaviour (same exact source, seek to the saved
     /// position). Play-from-start must NOT re-pick the source: it only changes WHERE playback begins, never
     /// WHICH source plays (owner: "it auto changed the source when I tried to play from start").
-    private func playMovie(fromStart: Bool = false) async {
+    ///
+    /// `startAt` is the same idea generalized: begin at an explicit second instead of 0 or the saved
+    /// position, still WITHOUT re-picking the source and still WITHOUT touching the stored resume point.
+    /// It exists for the Trakt "Resume from <time>" chip, and it is deliberately the ONLY way that feature
+    /// can influence playback: it chooses a start position for this one play, exactly as a manual scrub
+    /// would, and the engine then records its own position through its normal path. Nothing reads Trakt
+    /// inside this function. `startAt` wins over `fromStart` because a caller passes one or the other.
+    ///
+    /// The second to hand the player for this one play: an explicit `startAt` wins, then `fromStart` (0),
+    /// otherwise the saved resume point. Deliberately a statement chain and NOT
+    /// `startAt ?? (fromStart ? 0 : await resume(pm))`: `??`'s right operand is an `@autoclosure`, which
+    /// cannot contain `await`, so that spelling does not compile. The short-circuit is preserved either
+    /// way, so `resume(pm)` is still only awaited when neither caller-supplied value applies.
+    private func resolvedResumeSeconds(_ pm: PlaybackMeta, fromStart: Bool, startAt: Double?) async -> Double {
+        if let startAt { return startAt }
+        if fromStart { return 0 }
+        return await resume(pm)
+    }
+
+    private func playMovie(fromStart: Bool = false, startAt: Double? = nil) async {
         // A4b: no longer gated on `meta != nil` — a hub-opened title with nil/mismatched Cinemeta meta still
         // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
         guard !preparing, let stream = movieBest else { return }
@@ -2275,7 +2386,7 @@ struct iOSDetailView: View {
             if refreshed {
                 core.loadEnginePlayer(for: stream)
                 let pm = moviePlaybackMeta
-                let resumeSeconds = fromStart ? 0 : await resume(pm)
+                let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
                 presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: entry.headers,
                                                     resume: resumeSeconds, meta: pm,
                                                     qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
@@ -2307,7 +2418,7 @@ struct iOSDetailView: View {
             cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: stream) {
             core.loadEnginePlayer(for: win.stream)
             let pm = moviePlaybackMeta
-            let resumeSeconds = fromStart ? 0 : await resume(pm)
+            let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
             presentation = .player(PlayerLaunch(url: win.ref.url, title: pm.name, headers: win.stream.requestHeaders,
                                                 resume: resumeSeconds, meta: pm,
                                                 qualityText: StreamRanking.signature(win.stream),
@@ -2327,7 +2438,7 @@ struct iOSDetailView: View {
         let pm = moviePlaybackMeta
         // fromStart: hand the player resume 0 so it starts at the beginning. The stored resume point is NOT
         // cleared here - it stays until normal playback progress overwrites it (D10: play-from-start, not reset).
-        let resumeSeconds = fromStart ? 0 : await resume(pm)
+        let resumeSeconds = await resolvedResumeSeconds(pm, fromStart: fromStart, startAt: startAt)
         presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: stream.requestHeaders,
                                             resume: resumeSeconds, meta: pm,
                                             qualityText: StreamRanking.signature(stream),

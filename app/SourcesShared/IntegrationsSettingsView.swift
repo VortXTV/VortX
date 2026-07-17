@@ -11,6 +11,9 @@ import SwiftUI
 ///      nothing to sign into; the card just opens the paste-URL importer.
 ///   5. List import: paste a public Letterboxd / MDBList / Trakt list URL and browse it as a native Home
 ///      row (ListImportConnectCard, opens ListImportView). On-device only; never touches account/library.
+///   6. My Trakt lists: pick your OWN Trakt lists (private ones included) and the ones you liked, and show
+///      them as Home rows (TraktMyListsCard, opens TraktMyListsView). Read-only, and it sits right after
+///      list import because it is the same feature reached without pasting a URL.
 ///
 /// Cross-platform (iPhone / iPad / Mac / Apple TV): hosted here in SourcesShared and pushed from both the
 /// iOS and tvOS settings screens, so both surfaces get the same section by construction (settings parity).
@@ -35,6 +38,10 @@ struct IntegrationsSettingsView: View {
                 // 5. List import: paste a public Letterboxd / MDBList / Trakt list URL and browse it as a
                 //    native Home row (ListImport). Optional, on-device only, never touches account/library.
                 ListImportConnectCard()
+
+                // 6. My Trakt lists: the same Home-row mechanism, reached from your connected account rather
+                //    than from a pasted link, so private lists (which have no shareable public URL) work too.
+                TraktMyListsCard()
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
@@ -88,6 +95,32 @@ private struct ListImportConnectCard: View {
             .vortxSettingsCard()
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// "My Trakt lists" card for the Integrations screen: opens `TraktMyListsView`, the read-only picker that
+/// turns your own Trakt lists (and the ones you liked) into native Home rows. Hidden entirely when Trakt is
+/// not configured in this build, matching the Trakt/SIMKL cards' dormant-creds rule, so it never advertises
+/// a screen that could not work.
+private struct TraktMyListsCard: View {
+    var body: some View {
+        if TraktAuth.isConfigured {
+            NavigationLink { TraktMyListsView() } label: {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    HStack(spacing: Theme.Space.sm) {
+                        Text("My Trakt lists").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                        Spacer()
+                        Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+                    }
+                    Text("Show your own Trakt lists, and the ones you liked, as rows on Home. Read-only: your lists stay on Trakt and your VortX library stays yours.")
+                        .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .vortxSettingsCard()
+            }
+            .buttonStyle(.plain)
+        }
     }
 }
 
