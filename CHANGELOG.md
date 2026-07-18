@@ -4,7 +4,7 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.14 Beta 3 - pending
+## 0.3.14 Beta 3 - 2026-07-18
 
 The largest beta of the 0.3.14 line. It adds deep Trakt integration (check-in, ratings, a resume suggestion, and your lists), your SIMKL plan-to-watch on Home, an Apple TV Top Shelf, Match Frame Rate for smoother films, and a sync fix that stops one device from overwriting another. Android gains trickplay scrub-preview capture, a real settings surface, and library transfer.
 
