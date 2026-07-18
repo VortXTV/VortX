@@ -26,6 +26,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourcePreset
 import com.vortx.android.sources.SourceType
@@ -54,13 +56,10 @@ import java.util.Locale
 ///   - preferredAudioOnly               -> StreamRanking.kt:612
 ///   - maxFileSizeGB                    -> StreamRanking.kt:613-615
 ///
-/// DELIBERATELY NOT SURFACED, because nothing consumes them (a control over them would write a preference
-/// that changes nothing a viewer can observe, which is the defect this whole round removes):
-///   - `autoPickBest` (SourcePreferences.kt:226): it rides the snapshot (:347) and the cache tag (:114), but
-///     NO call site reads `prefs.autoPickBest` to auto-pick anything. It lands with the source-picker
-///     behavior that would honour it.
-///   - `defaultSourceSort` (SourcePreferences.kt:274): read by nothing at all in any source set. It lands
-///     with the Sources-list sort control that would remember it.
+///   - `autoPickBest`                   -> DetailViewModel.selectEpisode/loadSources (episode-tap
+///     auto-pick, once-latched) + DetailScreen's episode onClick (opens the list as the escape hatch)
+///   - `defaultSourceSort`              -> DetailScreen's SourcesSection sort chips (Best/Size/Seeders),
+///     remembered through DetailViewModel.setSourceSort
 ///
 /// A change here takes effect on the NEXT source list, with no restart: `EngineStremioRepository` builds a
 /// FRESH snapshot off this store and installs it on every load (EngineStremioRepository.kt:550-551), and the
@@ -70,6 +69,12 @@ import java.util.Locale
 fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
     val store = remember { SourcePreferencesStore(appContext) }
+    // The per-profile pin store, for the "Clear pinned sources" row. Same active-profile id provider the
+    // repository's own store uses, so this clears the pins the ranker actually reads.
+    val pins = remember {
+        SourcePinStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE }
+    }
+    var pinnedCount by remember { mutableStateOf(pins.pinnedCount) }
 
     // ONE snapshot of the store drives the whole screen, and every write re-reads it. This is deliberate
     // over ~15 independent state vars: `apply(preset)` mutates six fields at once, and `moveType` rewrites
@@ -280,6 +285,41 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     )
                 }
             }
+
+            SettingsSection(
+                title = "Smart selection",
+                footer = "Applies when you tap an episode. The hero Watch button always plays your best " +
+                    "source.",
+            ) {
+                // Apple's exact toggle wording (SourceFilterChipsView.swift:225-231), so the same setting
+                // reads the same on every platform.
+                ToggleRow(
+                    label = "Auto-pick my best source",
+                    detail = "Play the top-ranked source straight away instead of opening the source " +
+                        "list. Back out of the player any time to see the full source list.",
+                    checked = ui.autoPickBest,
+                    onCheckedChange = { value -> mutate { autoPickBest = value } },
+                )
+            }
+
+            // Pinned sources (#15): long-press a source on any title to pin it; this clears them all.
+            // Mirrors Apple iOSSettingsView.swift:953-956 (shown only when at least one pin exists).
+            if (pinnedCount > 0) {
+                SettingsSection(
+                    title = "Pinned sources",
+                    footer = "Long-press a source on any title to pin it to the top.",
+                ) {
+                    OptionRow(
+                        label = "Clear pinned sources ($pinnedCount)",
+                        detail = "Remove the pin from every title and the provider pin.",
+                        selected = false,
+                        onClick = {
+                            pins.clearAll()
+                            pinnedCount = pins.pinnedCount
+                        },
+                    )
+                }
+            }
         }
     }
 }
@@ -298,6 +338,7 @@ private data class SourcesPrefsUi(
     val preferKeywords: String,
     val keywordsAreRegex: Boolean,
     val avoidBehavior: String,
+    val autoPickBest: Boolean,
     val safetyMode: String,
     val instantOnly: Boolean,
     val hideDeadTorrents: Boolean,
@@ -318,6 +359,7 @@ private fun readPrefs(store: SourcePreferencesStore) = SourcesPrefsUi(
     preferKeywords = store.preferKeywords,
     keywordsAreRegex = store.keywordsAreRegex,
     avoidBehavior = store.avoidBehavior,
+    autoPickBest = store.autoPickBest,
     safetyMode = store.safetyMode,
     instantOnly = store.instantOnly,
     hideDeadTorrents = store.hideDeadTorrents,

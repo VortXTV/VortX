@@ -140,6 +140,10 @@ class SourcePinStore(
 
     fun entryPin(context: SourcePinContext): SourcePin? = entryPins[context.metaId]
 
+    /// The provider-wide pin, when one is set. Mirrors Apple's public `global` property: the pin menu
+    /// reads it to decide whether to offer "Unpin everywhere".
+    val global: SourcePin? get() = globalPin
+
     companion object {
         const val PREFS_FILE = "vortx_settings"
         const val DEFAULT_PROFILE = "default"

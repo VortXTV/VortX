@@ -198,6 +198,10 @@ object MediaServerRepository {
             quality = quality,
             isTorrent = false,
             isMediaServer = true,
+            // Apple's synthetic media-server stream carries the direct link in CoreStream.url, and the
+            // ranker's isCached shape test (`url != nil && infoHash == nil`) treats it instant (+8000
+            // within the media-server tier). Carry it here too so the Android ranker scores the same.
+            url = hit.streamUrl,
         )
     }
 

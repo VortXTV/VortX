@@ -66,6 +66,8 @@ import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
+import com.vortx.android.sources.SourcePinScope
+import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
@@ -108,6 +110,8 @@ fun DetailScreen(
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val mutationError by viewModel.mutationError.collectAsStateWithLifecycle()
+    val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
+    val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
 
     // Detail-local navigation for the cast/person feature, kept OUT of StremioXApp's own nav graph and
     // out of DetailViewModel (the media-servers wave owns those): a tapped cast tile opens the Person
@@ -240,6 +244,12 @@ fun DetailScreen(
                                 state = streamsState,
                                 resolving = resolving,
                                 failure = (playback as? Playback.Failed)?.message,
+                                sort = sourceSort,
+                                onSortChange = viewModel::setSourceSort,
+                                pin = pinUi,
+                                entryNoun = viewModel.pinEntryNoun,
+                                onPin = viewModel::pinSource,
+                                onUnpin = viewModel::unpinSource,
                                 onPlay = viewModel::play,
                             )
                         }
@@ -287,7 +297,13 @@ fun DetailScreen(
                             airDate = episode.released?.take(10),
                             watched = episode.id in m.data.watchedVideoIds,
                             progress = episodeProgress(episode, m.data),
-                            onClick = { viewModel.selectEpisode(episode.id) },
+                            onClick = {
+                                // With Smart auto-pick on, the tap plays the best source straight away;
+                                // opening the sources section under it is the escape hatch (backing out
+                                // of the player reveals the full list, Apple's exact wording).
+                                if (viewModel.autoPickEnabled) sourcesOpen = true
+                                viewModel.selectEpisode(episode.id)
+                            },
                             onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
                             thumb = { EpisodeThumb(episode) },
                             modifier = Modifier
@@ -828,17 +844,38 @@ private fun episodeProgress(episode: Episode, detail: MetaDetail): Float? {
     return lib.progress
 }
 
-/// The sources section: the raw per-add-on stream list the engine fans out (unranked -- S06 owns
-/// tiering/quality collapse). Mirrors the tvOS `CoreStreamList` hierarchy at the "everything" level:
-/// a header with the source count, then one [SourceRow] per stream. [resolving] dims the rows while a
-/// resolve is in flight, and [failure] surfaces a resolve error inline.
+/// How the streams inside each add-on group are ordered, mirroring Apple `iOSSourceList.SourceSort`
+/// exactly: Best leaves the engine ranking intact; Size and Seeders sort descending WITHIN each group
+/// (so the add-on grouping survives), with unknown values sinking to the bottom (sizeForSort 0,
+/// seedersForSort -1). Ids are the lowercase persistence keys `defaultSourceSort` stores.
+private val sourceSortOptions: List<Pair<String, String>> = listOf(
+    "best" to "Best",
+    "size" to "Size",
+    "seeders" to "Seeders",
+)
+
+/// The sources section: the assembled, ranked stream list. A header with the source count and the
+/// Best/Size/Seeders sort chips (remembered via `defaultSourceSort`), then one [SourceRow] per stream.
+/// [resolving] dims the rows while a resolve is in flight, and [failure] surfaces a resolve error inline.
+/// Long-pressing a row opens the pin menu (pin for this show/movie, pin everywhere, unpin), Apple's
+/// `.contextMenu { pinMenu(...) }`; the row whose stream the effective [pin] floats to the top wears a
+/// "Pinned" badge, computed with the SAME [SourcePinStore.matches] the ranker bonus uses.
 @Composable
 private fun SourcesSection(
     state: UiState<List<StreamGroup>>,
     resolving: Boolean,
     failure: String?,
+    sort: String,
+    onSortChange: (String) -> Unit,
+    pin: DetailViewModel.PinUi,
+    entryNoun: String,
+    onPin: (StreamSource, SourcePinScope) -> Unit,
+    onUnpin: (SourcePinScope) -> Unit,
     onPlay: (StreamSource) -> Unit,
 ) {
+    // The row whose long-press opened the pin menu (null = closed). Keyed by the stream id so the menu
+    // anchors to its own row and a recompose from a pin write closes it cleanly.
+    var pinMenuFor by remember { mutableStateOf<String?>(null) }
     Column(
         modifier = Modifier.padding(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
@@ -849,28 +886,74 @@ private fun SourcesSection(
             is UiState.Success -> {
                 val total = state.data.sumOf { it.streams.size }
                 Text(text = "Sources · $total", style = VortXTheme.type.sectionTitle)
+                if (total > 0) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+                        sourceSortOptions.forEach { (key, label) ->
+                            Chip(
+                                label = label,
+                                selected = key == sort,
+                                onClick = { onSortChange(key) },
+                            )
+                        }
+                    }
+                }
                 failure?.let {
                     Text(text = it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.danger))
                 }
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
                 }
-                // Groups + streams are already ranked best-first by CatalogRepository.streams(); here we
-                // derive the quality label, flavour tags, and size from the source's own tags via the same
-                // StreamRanking parse that scored them, so the picker shows a real "4K · HDR · Remux · 18 GB"
-                // line the viewer can choose from.
+                // Groups + streams are already ranked best-first by the assembly; here we derive the quality
+                // label, flavour tags, and size from the source's own tags via the same StreamRanking parse
+                // that scored them, so the picker shows a real "4K · HDR · Remux · 18 GB" line the viewer
+                // can choose from. The sort chips reorder WITHIN each group only (Apple `sortedStreams`).
                 state.data.forEach { group ->
-                    group.streams.forEach { source ->
-                        SourceRow(
-                            addon = source.addon,
-                            title = source.title,
-                            quality = StreamRanking.qualityLabel(source),
-                            isTorrent = source.isTorrent,
-                            flavorTags = StreamRanking.flavorTags(source),
-                            size = StreamRanking.sizeText(source),
-                            enabled = !resolving,
-                            onClick = { onPlay(source) },
-                        )
+                    val streams = when (sort) {
+                        "size" -> group.streams.sortedByDescending { StreamRanking.sizeForSort(it) }
+                        "seeders" -> group.streams.sortedByDescending { StreamRanking.seedersForSort(it) }
+                        else -> group.streams
+                    }
+                    streams.forEach { source ->
+                        val pinned = pin.resolved?.let { SourcePinStore.matches(source, group.addon, it) } == true
+                        Box {
+                            SourceRow(
+                                addon = source.addon,
+                                title = source.title,
+                                quality = StreamRanking.qualityLabel(source),
+                                isTorrent = source.isTorrent,
+                                flavorTags = StreamRanking.flavorTags(source),
+                                size = StreamRanking.sizeText(source),
+                                enabled = !resolving,
+                                pinned = pinned,
+                                onClick = { onPlay(source) },
+                                onLongClick = { pinMenuFor = source.id },
+                            )
+                            DropdownMenu(
+                                expanded = pinMenuFor == source.id,
+                                onDismissRequest = { pinMenuFor = null },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Pin for this $entryNoun") },
+                                    onClick = { pinMenuFor = null; onPin(source, SourcePinScope.ENTRY) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Pin everywhere") },
+                                    onClick = { pinMenuFor = null; onPin(source, SourcePinScope.GLOBAL) },
+                                )
+                                if (pin.hasEntry) {
+                                    DropdownMenuItem(
+                                        text = { Text("Unpin this $entryNoun") },
+                                        onClick = { pinMenuFor = null; onUnpin(SourcePinScope.ENTRY) },
+                                    )
+                                }
+                                if (pin.hasGlobal) {
+                                    DropdownMenuItem(
+                                        text = { Text("Unpin everywhere") },
+                                        onClick = { pinMenuFor = null; onUnpin(SourcePinScope.GLOBAL) },
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -626,7 +626,13 @@ class EngineStremioRepository(
         // stable copy off-thread, never the live store). Installing it also lets DetailViewModel's later
         // media-server re-rank + best-source pick inherit the same preferences. The effective pin for this
         // title (per-title, else provider) rides the rank so a pinned source floats to the top.
-        val snapshot = sourcePrefs.snapshot(trackPrefs.current.audioLanguages)
+        // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid words
+        // always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
+        // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
+        val snapshot = sourcePrefs.snapshot(
+            trackPrefs.current.audioLanguages,
+            isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+        )
         StreamRanking.installReading(snapshot)
         val pin = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
         StreamRanking.rankedGroups(EngineState.parseStreamGroups(state), prefs = snapshot, pin = pin)

@@ -91,6 +91,11 @@ class ProfileStore private constructor(context: Context) {
      */
     val activeProfileId: String get() = active?.id ?: UserProfile.OWNER_ID
 
+    /** Whether the ACTIVE profile is a Kids profile. Read at ranking-snapshot build time so the ranker's
+     *  Kids content guard (hard-hide adult/junk + Avoid words always DROP, never merely demote) engages,
+     *  mirroring Apple `ProfileStore.activeIsKids()` feeding `StreamRanking.passesUserFilters`. */
+    val activeIsKids: Boolean get() = active?.isKids == true
+
     /**
      * Whether the active profile reads/writes the engine (account) history (owner or own-account) or its
      * private overlay (every other shared profile). The split every watch path must respect. Mirrors

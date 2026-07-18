@@ -921,7 +921,13 @@ object StreamRanking {
             matches(text, """instant\s*(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)(?![a-z0-9])""") ||
             boundedMatch(technicalTags(text), "cached") || text.contains("🎫")
         ) return true
-        return !source.isTorrent
+        // Plain URL with no contrary marker = instant. EXACT Apple parity (StreamRanking.swift:1236
+        // `s.url != nil && s.infoHash == nil`), replacing the earlier `!source.isTorrent` shorthand which
+        // silently diverged three ways: a RESOLVED torrent (url + infoHash, no marker) read cached (+8000)
+        // where Apple keeps it uncached; an unmarked USENET .nzb (url == null) read cached, so it wrongly
+        // survived Instant-only and wore a "Cached" badge; and ytId/externalUrl streams read cached. The
+        // same-prefs cross-platform rank order must match Apple, so the shape test is now identical.
+        return source.url != null && source.infoHash == null
     }
 
     // ---- Text parsing ----

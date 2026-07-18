@@ -23,8 +23,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
+import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.SourcePinContext
+import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.torbox.TorBoxSearchSource
@@ -119,6 +121,43 @@ class DetailViewModel(
     private val _mutationError = MutableStateFlow<String?>(null)
     val mutationError: StateFlow<String?> = _mutationError.asStateFlow()
 
+    /// Pin state for the sources UI (#15): the resolved effective pin (entry-first, drives the per-row
+    /// "Pinned" badge via [SourcePinStore.matches]) plus whether an entry / global pin exists (drives which
+    /// Unpin items the long-press menu offers). Refreshed after every pin mutation, the StateFlow analogue
+    /// of Apple's `@ObservedObject pinStore` re-rendering the rows.
+    data class PinUi(
+        val resolved: ResolvedPin? = null,
+        val hasEntry: Boolean = false,
+        val hasGlobal: Boolean = false,
+    )
+
+    private val _pinUi = MutableStateFlow(PinUi())
+    val pinUi: StateFlow<PinUi> = _pinUi.asStateFlow()
+
+    /// The noun the pin menu uses for the entry scope ("show" / "movie"). Apple `SourcePinContext.entryNoun`.
+    val pinEntryNoun: String get() = if (type == MediaType.SERIES) "show" else "movie"
+
+    /// The sources-list sort ("best" / "size" / "seeders"), seeded from the remembered
+    /// [SourcePreferencesStore.defaultSourceSort] and persisted on change, so the list opens the way the
+    /// user last left it (Apple iOSDetailView `SourceSort` + `defaultSourceSort`, iOSDetailView.swift:4400).
+    private val _sourceSort = MutableStateFlow(sourcePrefs.defaultSourceSort)
+    val sourceSort: StateFlow<String> = _sourceSort.asStateFlow()
+
+    /// Whether Smart Source Selection auto-pick is on (Settings > Sources). The screen reads it to open the
+    /// sources section on an episode tap, so backing out of the auto-picked player reveals the full list
+    /// (Apple's escape hatch).
+    val autoPickEnabled: Boolean get() = sourcePrefs.autoPickBest
+
+    /// The last ranking context pushed to [sourceModel], kept so a pin edit can re-push the SAME scope
+    /// (episode/continuity/contentId) with only the pin + prefs refreshed, re-ranking the open list.
+    private var lastCtx: SourceListModel.Context? = null
+
+    /// Smart Source Selection auto-pick once-latch: armed when the viewer TAPS an episode while
+    /// [SourcePreferencesStore.autoPickBest] is on (never on the initial programmatic selection), consumed
+    /// exactly once when that episode's add-on groups land. Apple's `didAutoPick` latch inverted
+    /// (iOSDetailView.swift:3433: fires once per episode-page appearance, viewer opt-in only).
+    @Volatile private var pendingAutoPick = false
+
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
     /// long-press elsewhere, another Detail instance in the backstack -- not only this ViewModel's own
@@ -151,7 +190,10 @@ class DetailViewModel(
                 val primary = detail?.let { primaryEpisodeOf(it) }
                 if (primary != null) {
                     _selectedSeason.value = primary.first.season
-                    selectEpisode(primary.first.id)
+                    // Programmatic first selection: never arms the auto-pick latch (auto-playing on merely
+                    // OPENING a detail page would be aggressive; Apple fires only on the episode source
+                    // page the viewer navigated to).
+                    selectEpisode(primary.first.id, userTap = false)
                 } else {
                     loadSources(null)
                 }
@@ -166,9 +208,14 @@ class DetailViewModel(
 
     /// Reload sources scoped to a series [episodeId] (the engine `CoreVideo.id`). A no-op if the same episode
     /// is re-selected. Movies never call this. [loadSources] drives the Loading -> result transition.
-    fun selectEpisode(episodeId: String) {
+    /// [userTap] arms the Smart Source Selection auto-pick (viewer opt-in via Settings > Sources): a REAL
+    /// episode tap with the toggle on plays the best-ranked source straight away once its add-on groups
+    /// land, instead of making the viewer pick from the list. The init-time programmatic selection passes
+    /// false, so opening a detail page never auto-plays.
+    fun selectEpisode(episodeId: String, userTap: Boolean = true) {
         if (_selectedEpisodeId.value == episodeId) return
         _selectedEpisodeId.value = episodeId
+        pendingAutoPick = userTap && sourcePrefs.autoPickBest
         viewModelScope.launch {
             loadSources(episodeId)
         }
@@ -199,7 +246,10 @@ class DetailViewModel(
         // globally-installed reading) and merges every lane in one pass.
         torbox.refresh(imdb, season, episodeNum)
         singularity.refresh(SourceIndexClient.contentId(imdb, season, episodeNum), isSignedIn())
-        sourceModel.setContext(buildContext(episodeId, imdb, season, episodeNum))
+        val ctx = buildContext(episodeId, imdb, season, episodeNum)
+        lastCtx = ctx
+        sourceModel.setContext(ctx)
+        _pinUi.value = readPinUi()
         // Dormant + no network when no media server is connected (matches the pre-assembly guard).
         val serverGroups = if (MediaServerRepository.hasServers) mediaServerGroups(episodeId) else emptyList()
         sourceModel.setMediaServerGroups(serverGroups)
@@ -213,10 +263,20 @@ class DetailViewModel(
                     _streams.value = UiState.Success(raw)
                     sourceModel.setRawGroups(raw)
                     runCacheCheck(raw, episodeId, season, episodeNum)
+                    // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
+                    // best-ranked source of the FRESH raw groups straight away. Ranked directly (not via
+                    // [bestSource]) because the assembly coalescer may still hold the previous episode's
+                    // list at this instant; auto-playing a stale episode's source would be worse than no
+                    // auto-pick. Backing out of the player reveals the full source list (the escape hatch).
+                    if (pendingAutoPick) {
+                        pendingAutoPick = false
+                        StreamRanking.best(raw, prefs = ctx.prefs, pin = currentPin())?.let { play(it) }
+                    }
                 }
             },
             onFailure = {
                 if (episodeId == _selectedEpisodeId.value) {
+                    pendingAutoPick = false
                     _streams.value = UiState.Error(it.message ?: "Something went wrong loading your add-ons.")
                 }
             },
@@ -231,7 +291,13 @@ class DetailViewModel(
         SourceListModel.Context(
             metaId = id,
             streamId = episodeId,
-            prefs = sourcePrefs.snapshot(trackPrefs.current.audioLanguages),
+            // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid
+            // words always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
+            // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
+            prefs = sourcePrefs.snapshot(
+                trackPrefs.current.audioLanguages,
+                isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+            ),
             pin = currentPin(),
             contentId = SourceIndexClient.contentId(imdb, season, episodeNum),
         )
@@ -294,6 +360,53 @@ class DetailViewModel(
     /// The effective per-title (else provider) source pin, so a re-rank of the merged list floats a pinned
     /// source to the top exactly as the engine repo's first rank does.
     private fun currentPin(): ResolvedPin? = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
+
+    private fun pinContext(): SourcePinContext = SourcePinContext(id, type == MediaType.SERIES)
+
+    private fun readPinUi(): PinUi {
+        val ctx = pinContext()
+        return PinUi(
+            resolved = sourcePins.effectivePin(ctx),
+            hasEntry = sourcePins.entryPin(ctx) != null,
+            hasGlobal = sourcePins.global != null,
+        )
+    }
+
+    /// Pin [source] for this title ([SourcePinScope.ENTRY]) or every title ([SourcePinScope.GLOBAL]), from
+    /// the source row's long-press menu. A pin is a strong preference (it tops the list + the auto-pick),
+    /// never a hard lock; the player failover still hops off it if dead. Mirrors Apple's `pinMenu` actions.
+    fun pinSource(source: StreamSource, scope: SourcePinScope) {
+        sourcePins.pin(source, source.addon, scope, pinContext())
+        onPinsChanged()
+    }
+
+    /// Remove the entry / global pin. Mirrors Apple's Unpin menu actions.
+    fun unpinSource(scope: SourcePinScope) {
+        sourcePins.unpin(scope, pinContext())
+        onPinsChanged()
+    }
+
+    /// A pin edit changes rank order (pinBonus) and the row badges: refresh the pin UI and re-push the last
+    /// ranking context with the new effective pin so [SourceListModel] re-ranks the OPEN list (the store
+    /// already invalidated the memoized scores). The StateFlow analogue of Apple's `@ObservedObject
+    /// pinStore` + published-groups re-rank.
+    private fun onPinsChanged() {
+        _pinUi.value = readPinUi()
+        lastCtx?.let { ctx ->
+            val updated = ctx.copy(pin = currentPin())
+            lastCtx = updated
+            sourceModel.setContext(updated)
+        }
+    }
+
+    /// Remember the sources-list sort ("best" / "size" / "seeders") and persist it through
+    /// [SourcePreferencesStore.defaultSourceSort], so the list opens the way the user last left it
+    /// (Apple iOSDetailView.swift:4401's `onChange(of: sortMode)` write-through).
+    fun setSourceSort(key: String) {
+        if (_sourceSort.value == key) return
+        _sourceSort.value = key
+        sourcePrefs.defaultSourceSort = key
+    }
 
     /// Whether the account is signed in, gating the community Singularity SERVE lane. Reads the engine's live
     /// auth state (the engine repo is also the [AuthRepository]); false for the offline preview repo.
