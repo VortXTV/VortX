@@ -47,6 +47,7 @@ import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
 import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
+import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
@@ -106,6 +107,7 @@ fun StremioXApp(
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
+        var showProfiles by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
         val appContext = LocalContext.current.applicationContext
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
@@ -258,6 +260,16 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showProfiles) {
+            // Settings > Profiles: the "Who's watching?" switcher + create/rename/delete. Self-contained
+            // (it drives the ProfileStore singleton directly, whose select() fires the engine reload +
+            // Home-rebuild seams), so it needs no repository or ViewModel, matching the other settings
+            // overlays. Switching to a non-owner profile only swaps the active selection + its private
+            // overlay; the account library is never touched (the never-poison split lives in the store).
+            ProfilesScreen(onBack = { showProfiles = false })
+            return@VortXTheme
+        }
+
         if (showLibraryTransfer) {
             // Settings > Library: export / import the active profile's saved titles. UNLIKE the two screens
             // above it this one is NOT self-contained: export reads the account library and import writes to
@@ -335,6 +347,7 @@ fun StremioXApp(
                 Tab.SEARCH -> SearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, content)
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
+                    onProfilesClick = { showProfiles = true },
                     onAccountClick = { showAccount = true },
                     onAddonsClick = { showAddons = true },
                     onIntegrationsClick = { showIntegrations = true },

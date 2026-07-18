@@ -46,6 +46,7 @@ import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
 import com.vortx.android.player.AudioOutputMode
+import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
@@ -239,6 +240,7 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
 @Composable
 fun SettingsScreen(
     authState: AuthState,
+    onProfilesClick: () -> Unit,
     onAccountClick: () -> Unit,
     onAddonsClick: () -> Unit,
     onIntegrationsClick: () -> Unit,
@@ -278,10 +280,17 @@ fun SettingsScreen(
         val count = downloadRecords.size
         "${if (count == 1) "1 title" else "$count titles"}  ·  ${DownloadStore.formattedTotalSize()}"
     }
+    // The active profile name (with a Kids marker), read live rather than remembered so returning from the
+    // profile switcher shows the profile just picked. Falls back to "Default" before ProfileStore is up.
+    val activeProfile = ProfileStore.sharedOrNull()?.active
+    val profilesValue = activeProfile?.let { if (it.isKids) "${it.name}  ·  Kids" else it.name } ?: "Default"
     Column(
         modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
+        // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
+        // makes the whole multi-profile subsystem reachable.
+        SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
         SettingRow(VortXIcons.account, "Account", accountValue, onClick = onAccountClick)
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
         SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)

@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
@@ -20,8 +21,10 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.SwitchAccount
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Search
@@ -110,4 +113,14 @@ object VortXIcons {
 
     /// SF `server.rack` — a personal media server (Settings > Media servers: Plex / Jellyfin / Emby).
     val mediaServer: ImageVector = Icons.Filled.Dns
+
+    // Profiles (Settings > Profiles: the "Who's watching?" switcher). Same one-object discipline.
+    /// SF `person.2.crop.square.stack` — the multi-profile switcher entry + picker.
+    val profiles: ImageVector = Icons.Filled.SwitchAccount
+
+    /// SF `pencil` — edit the active profile from the picker.
+    val edit: ImageVector = Icons.Filled.Edit
+
+    /// SF `lock.fill` — a PIN-protected profile (picker badge + PIN gate).
+    val lock: ImageVector = Icons.Filled.Lock
 }
