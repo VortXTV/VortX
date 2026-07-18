@@ -140,11 +140,14 @@ fun StremioXApp(
             // BackHandler anywhere in the shell before; this is the minimum one, scoped to the player).
             BackHandler { playing = null }
             // Engine playback session: load the Player so progress attributes to the right library item,
-            // then end it (final tick + unload + watched-near-end) when the player closes.
+            // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
+            // the feature (it must not write a resume position, mark watched, or attribute progress to any
+            // library item), so it opens NO engine playback session -- exactly as Apple plays trailers through
+            // dedicated player instances that never touch the library.
             DisposableEffect(playable) {
-                appScope.launch { repo.beginPlaybackSession() }
+                if (!playable.isTrailer) appScope.launch { repo.beginPlaybackSession() }
                 onDispose {
-                    appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
+                    if (!playable.isTrailer) appScope.launch { repo.endPlaybackSession(lastProgress[0], lastProgress[1]) }
                 }
             }
             PlayerScreen(
@@ -154,6 +157,8 @@ fun StremioXApp(
                 onProgress = { pos, dur ->
                     lastProgress[0] = pos
                     lastProgress[1] = dur
+                    // A trailer reports no progress and never auto-adds to the library (it is not the feature).
+                    if (playable.isTrailer) return@PlayerScreen
                     appScope.launch { repo.reportProgress(pos, dur) }
                     // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                     // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978

@@ -22,6 +22,8 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
@@ -139,11 +141,39 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
+        // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
+        // (not a single .mpd). Merge them with a [MergingMediaSource] of two [ProgressiveMediaSource]s over a
+        // [DefaultHttpDataSource] whose UA is the MINTING client's UA -- the UA/URL lockstep googlevideo
+        // requires (a 403 otherwise). Both legs are already the loopback range-proxy's 127.0.0.1 URLs (the
+        // proxy is what defeats googlevideo's Range-403 for ExoPlayer's DefaultHttpDataSource, exactly as for
+        // libmpv), so this factory GETs 127.0.0.1 and the proxy replays the real UA upstream itself. Only a
+        // client-resolved adaptive trailer carries [audioUrl]; every other stream falls through below.
+        if (playable.audioUrl != null) {
+            val trailerHttp = DefaultHttpDataSource.Factory().apply {
+                playable.userAgent?.takeIf { it.isNotEmpty() }?.let { setUserAgent(it) }
+                setAllowCrossProtocolRedirects(true)
+            }
+            val videoSource = ProgressiveMediaSource.Factory(trailerHttp)
+                .createMediaSource(MediaItem.fromUri(playable.url))
+            val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
+                .createMediaSource(MediaItem.fromUri(playable.audioUrl))
+            player.setMediaSource(MergingMediaSource(videoSource, audioSource))
+            player.playWhenReady = true
+            if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
+            player.prepare()
+            return
+        }
+
         // Per-stream HTTP headers: some add-ons front CDNs needing a Referer / browser UA. Applied via a
-        // DefaultHttpDataSource factory so both the manifest and media requests carry them.
-        val mediaSourceFactory = if (playable.headers.isNotEmpty()) {
+        // DefaultHttpDataSource factory so both the manifest and media requests carry them. A muxed trailer /
+        // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
+        val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
+        val mediaSourceFactory = if (playable.headers.isNotEmpty() || trailerUa != null) {
             val http = DefaultHttpDataSource.Factory().apply {
-                setDefaultRequestProperties(playable.headers)
+                if (playable.headers.isNotEmpty()) setDefaultRequestProperties(playable.headers)
+                // A muxed googlevideo trailer (single proxied url) still needs the minting UA as the
+                // belt-and-suspenders fallback for the raw-URL path (UA/URL lockstep).
+                trailerUa?.let { setUserAgent(it) }
                 setAllowCrossProtocolRedirects(true)
             }
             DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)

@@ -132,6 +132,19 @@ class MpvPlayer private constructor(
             mpv.setOptionString(OPT_HTTP_HEADER_FIELDS, fields)
         }
 
+        // Trailer UA/URL lockstep (mirrors Apple loadFile's googlevideo branch). A client-resolved YouTube
+        // trailer's [url]/[audioUrl] were minted by a specific InnerTube client (ANDROID_VR / ANDROID / IOS /
+        // TVHTML5); googlevideo 403s a replay with any other UA. So OVERRIDE mpv's default UA with the minting
+        // UA BEFORE loadfile (it applies to the video URL AND the audio-add sidecar this load opens), and clear
+        // any per-stream header set so a reused engine instance never bleeds a prior stream's UA/Referer onto
+        // the trailer. Non-trailer streams (userAgent == null) keep the base [MpvConfig.USER_AGENT]. When the
+        // legs are already proxied to 127.0.0.1 this UA simply will not match that host (the proxy replays the
+        // real UA upstream itself), exactly as on Apple; it is the fallback for an unproxied raw googlevideo URL.
+        playable.userAgent?.let { ua ->
+            mpv.setPropertyString(PROP_USER_AGENT, ua)
+            mpv.setPropertyString(OPT_HTTP_HEADER_FIELDS, "")
+        }
+
         // Device-scaled forward cache cap, applied per file as a property (the Apple loadFile split).
         //   - Disk cache ON: hand mpv the large, free-disk-clamped budget so the on-disk cache actually
         //     fills (the cache-on-disk/cache-dir options are already armed pre-init). Recomputed per file
@@ -143,7 +156,10 @@ class MpvPlayer private constructor(
         val readAhead = when {
             DiskCacheSetting.diskCacheEnabled(appContext) ->
                 DiskCacheSetting.resolvedMaxBytes(appContext, reduced).toString()
-            playable.isTorrent || playable.viaStreamingServer -> READ_AHEAD_LOCAL
+            // A trailer is a short clip (proxied to 127.0.0.1, or the small remote worker host), so it takes
+            // the tight local read-ahead too -- the big remote buffer just wastes RAM on it. Mirrors Apple
+            // loadFile giving the trailer host the small read-ahead.
+            playable.isTorrent || playable.viaStreamingServer || playable.isTrailer -> READ_AHEAD_LOCAL
             reduced -> READ_AHEAD_LOCAL
             else -> READ_AHEAD_REMOTE
         }
@@ -151,6 +167,15 @@ class MpvPlayer private constructor(
 
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
         mpv.command(arrayOf("loadfile", playable.url, "replace"))
+
+        // yt-direct adaptive trailer: mount the separate audio-only leg so mpv merges it with the video-only
+        // file (the Android analogue of Apple's `--audio-files`/`change-list append`). argv form so a URL with
+        // mpv's list/escape chars stays ONE argument. `audio-add` defaults to selecting the added track. Only a
+        // client-resolved adaptive trailer carries [audioUrl]; a muxed trailer / worker fallback / any other
+        // stream has none and plays as a single file.
+        playable.audioUrl?.let { audio ->
+            mpv.command(arrayOf("audio-add", audio))
+        }
 
         // Mount external sidecar subtitles after load (sub-add takes effect on the loaded file).
         for (sub in playable.externalSubtitles) {
@@ -434,6 +459,8 @@ class MpvPlayer private constructor(
         private const val PROP_PANSCAN = "panscan"
         private const val PROP_VOLUME = "volume"
         private const val PROP_MUTE = "mute"
+        // Per-file User-Agent override (the trailer UA/URL lockstep); the base UA is a pre-init option.
+        private const val PROP_USER_AGENT = "user-agent"
         private const val PROP_CHAPTER_COUNT = "chapter-list/count"
         private const val PROP_SCREENSHOT_JPEG_QUALITY = "screenshot-jpeg-quality"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
