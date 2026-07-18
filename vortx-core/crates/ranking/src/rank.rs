@@ -102,6 +102,25 @@ const LANG_FOREIGN: i64 = -500;
 /// fires ONLY for the Audio profile; the Video/Live paths never see it (byte-identical).
 const LOSSLESS_BONUS: i64 = 100;
 
+/// LT5 LIVE stream-health weights. A live channel/stream carries none of the VOD ladder (no resolution tier,
+/// no seeders, no size), so it is ranked on the fields a live source actually has: measured UPTIME
+/// (reliability), video BITRATE, and audio LANGUAGE-match. The sizing keeps the existing within-tier
+/// philosophy: UPTIME is the top health signal, BITRATE a diminishing-returns refiner beneath it, and LANGUAGE
+/// (reusing [`LANG_MATCH`]) stays the strongest of the three, exactly as it is above the AV band on the video
+/// path. The whole health band (<= 700 human-points) stays FAR below the 15000 resolution-tier step, so on the
+/// rare live stream that does declare a resolution the tier still dominates and health only refines within it
+/// (the same discipline as "seeders never jump the resolution tier"). Every input is optional/neutral, so the
+/// scorer is FAIL-OPEN: a bare live stream gains 0 and keeps its frozen base order. All integer / total-order.
+///
+/// Uptime (permille, 0..=1000 clamped) scales linearly by integer division to at most this many human-points.
+const UPTIME_CAP: i64 = 400;
+/// Below 2^BITRATE_FLOOR_LOG2 kbps (256) the bitrate signal is 0; each doubling above it adds a fixed step.
+const BITRATE_FLOOR_LOG2: i64 = 8;
+/// Human-points per doubling of bitrate above the floor (integer log2 via `leading_zeros`, no float).
+const BITRATE_PER_DOUBLING: i64 = 50;
+/// Bitrate saturates here (~2^14 = 16 Mbps and up), keeping it a bounded within-band refiner below uptime.
+const BITRATE_CAP: i64 = 300;
+
 fn resolution_tier_score(r: Resolution) -> i64 {
     match r {
         Resolution::P2160 => 60_000,
@@ -197,6 +216,111 @@ fn language_points(stream_langs: &[String], preferred: &[String]) -> i64 {
         LANG_MATCH
     } else {
         LANG_FOREIGN
+    }
+}
+
+/// Whether a live channel's declared audio languages matched the user's preference, for the standalone
+/// [`ChannelHealthFact`] scorer. Mirrors the base ranker's [`language_points`] tri-state exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LangMatch {
+    /// A preferred language is present (`+LANG_MATCH`).
+    Preferred,
+    /// The stream declares languages but none preferred (`LANG_FOREIGN` demotion).
+    Foreign,
+    /// Unknown: no preference set, or no declared languages -> neutral (fail-open).
+    #[default]
+    Unknown,
+}
+
+impl LangMatch {
+    /// The language contribution in human-points, identical to [`language_points`]'s output.
+    fn points(self) -> i64 {
+        match self {
+            LangMatch::Preferred => LANG_MATCH,
+            LangMatch::Foreign => LANG_FOREIGN,
+            LangMatch::Unknown => 0,
+        }
+    }
+
+    /// Derive the match state from a stream's declared languages and the user's preferences, using the SAME
+    /// case-insensitive, fail-open semantics as the base ranker (empty on either side -> [`LangMatch::Unknown`]).
+    pub fn from_languages(stream_langs: &[String], preferred: &[String]) -> LangMatch {
+        match language_points(stream_langs, preferred) {
+            LANG_MATCH => LangMatch::Preferred,
+            LANG_FOREIGN => LangMatch::Foreign,
+            _ => LangMatch::Unknown,
+        }
+    }
+}
+
+/// The pure input to the LT5 LIVE stream-health scorer: the fields a live channel/stream actually has.
+/// Deliberately NO size / seeders / torrent fields (live has none) and NO resolution tier (live is ranked on
+/// health, not the VOD ladder). Every field is optional/neutral, so [`channel_health_score`] is FAIL-OPEN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChannelHealthFact {
+    /// Video bitrate in kbps (`None` = unknown -> 0). A diminishing-returns refiner.
+    pub bitrate_kbps: Option<i64>,
+    /// Measured uptime / reliability in permille, 0..=1000 clamped (`None` = unknown -> 0). Top health signal.
+    pub uptime_permille: Option<i64>,
+    /// Audio language-match vs the user's preference ([`LangMatch::Unknown`] = neutral / fail-open).
+    pub language: LangMatch,
+}
+
+/// Uptime permille (0..=1000, clamped) -> 0..=[`UPTIME_CAP`] human-points by integer division. `None`, `0`, or
+/// a malformed negative -> 0 (fail-open); a malformed value above 1000 clamps to the cap. No float.
+fn uptime_points(uptime_permille: Option<i64>) -> i64 {
+    match uptime_permille {
+        Some(p) if p > 0 => (p.min(1000) * UPTIME_CAP) / 1000,
+        _ => 0,
+    }
+}
+
+/// Bitrate kbps -> a diminishing-returns health bonus in human-points: `floor(log2(kbps))` above
+/// [`BITRATE_FLOOR_LOG2`], times [`BITRATE_PER_DOUBLING`], saturating at [`BITRATE_CAP`]. `None`, `0`, or a
+/// malformed negative -> 0 (fail-open). `floor(log2)` is `63 - leading_zeros` (integer, byte-reproducible).
+fn bitrate_points(bitrate_kbps: Option<i64>) -> i64 {
+    match bitrate_kbps {
+        Some(k) if k > 0 => {
+            let log2 = 63 - (k as u64).leading_zeros() as i64;
+            let steps = (log2 - BITRATE_FLOOR_LOG2).max(0);
+            (steps * BITRATE_PER_DOUBLING).min(BITRATE_CAP)
+        }
+        _ => 0,
+    }
+}
+
+/// The LIVE-EXCLUSIVE health delta in human-points: the health signals the frozen base [`rank`] does NOT
+/// already score, i.e. bitrate + uptime. Language-match is EXCLUDED here because the shared base already scores
+/// it identically for a live stream (via [`language_points`] on `vortx.languages`); re-adding it would
+/// double-count. [`rank_live`] applies THIS as its post-pass; [`channel_health_score`] is the full standalone
+/// scorer that also folds in language.
+fn live_health_delta(bitrate_kbps: Option<i64>, uptime_permille: Option<i64>) -> i64 {
+    bitrate_points(bitrate_kbps) + uptime_points(uptime_permille)
+}
+
+/// The complete, standalone LT5 channel-health score over a [`ChannelHealthFact`]: bitrate + uptime +
+/// language-match, in human-points, all integer / total-order and FAIL-OPEN on missing fields. A host that
+/// ranks channels WITHOUT the full stream ranker can call this directly. Inside the engine's [`rank_live`] the
+/// language term is contributed by the shared frozen base instead (see [`live_health_delta`]), so each signal
+/// is counted exactly once; the bitrate + uptime terms are byte-identical in both paths.
+pub fn channel_health_score(fact: &ChannelHealthFact) -> i64 {
+    live_health_delta(fact.bitrate_kbps, fact.uptime_permille) + fact.language.points()
+}
+
+/// Derive a [`ChannelHealthFact`] from a stream's typed `vortx` side-channel and the user's language
+/// preference. Bitrate / uptime come ONLY from the typed channel (never regex-parsed from a title), so live
+/// health is byte-reproducible across platforms like the rest of the ranker; a plain stream (no typed object)
+/// yields an all-neutral fact (health 0, fail-open).
+fn channel_health_of(s: &Stream, prefs: &RankingPrefs) -> ChannelHealthFact {
+    let v = vortx(s);
+    let empty: &[String] = &[];
+    ChannelHealthFact {
+        bitrate_kbps: v.and_then(|v| v.bitrate_kbps),
+        uptime_permille: v.and_then(|v| v.uptime_permille),
+        language: LangMatch::from_languages(
+            v.map(|v| v.languages.as_slice()).unwrap_or(empty),
+            &prefs.preferred_languages,
+        ),
     }
 }
 
@@ -304,10 +428,10 @@ pub fn rank(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<Ra
 }
 
 /// The scoring profile a ranking runs under, selected by content class. `Video` is the FROZEN current ranker
-/// (every existing vector + the plain [`rank`] entry are byte-identical under it). `Live` and `Audio`
-/// currently reuse the video scoring as placeholders and are specialized in later chunks (a live
-/// stream-health profile; `rank_audio` for lossless/bitrate). The selection point exists now so those chunks
-/// slot in without changing callers.
+/// (every existing vector + the plain [`rank`] entry are byte-identical under it). `Live` is the LT5 live
+/// stream-health profile ([`rank_live`]: the frozen base + a bitrate/uptime health post-pass), and `Audio`
+/// is the lossless-preference profile ([`rank_audio`]). Both are pure post-passes over [`rank`], so `Video`
+/// stays byte-identical. The selection point routes each content class to its profile without changing callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RankProfile {
     Video,
@@ -327,10 +451,9 @@ impl RankProfile {
 }
 
 /// Rank `streams` under the profile selected by `kind`. The `Video` profile is the byte-identical current
-/// [`rank`] (so `rank_for(Movie, ..)` equals `rank(..)` exactly, forever). `Live` and `Audio` reuse it as
-/// placeholders until their dedicated profiles land; the per-kind branch is structured here so those chunks
-/// slot in without touching callers. Each arm is intentionally the same scoring for now.
-#[allow(clippy::match_same_arms)]
+/// [`rank`] (so `rank_for(Movie, ..)` equals `rank(..)` exactly, forever). `Live` routes to [`rank_live`] (the
+/// LT5 stream-health profile) and `Audio` to [`rank_audio`] (lossless preference); both are pure post-passes
+/// over [`rank`], so the video path is provably untouched.
 pub fn rank_for(
     kind: ContentKind,
     streams: &[Stream],
@@ -339,8 +462,7 @@ pub fn rank_for(
 ) -> Vec<RankedStream> {
     match RankProfile::for_kind(kind) {
         RankProfile::Video => rank(streams, prefs, cached),
-        // placeholder: a live stream-health profile (no resolution tiers, bitrate/uptime first) lands in LT.
-        RankProfile::Live => rank(streams, prefs, cached),
+        RankProfile::Live => rank_live(streams, prefs, cached),
         RankProfile::Audio => rank_audio(streams, prefs, cached),
     }
 }
@@ -357,6 +479,35 @@ pub fn rank_audio(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> 
             r.score += LOSSLESS_BONUS * SCALE;
             r.reasons
                 .push(format!("lossless audio (+{LOSSLESS_BONUS})"));
+        }
+    }
+    out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
+    out
+}
+
+/// The LT5 LIVE scoring profile: the frozen [`rank`] base plus a live stream-health post-pass. Built as a pure
+/// post-pass over [`rank`] (NOT a fork of the scorer), so the shared base stays the single source of truth and
+/// the Video / Audio paths are provably untouched (byte-identical). For each surviving stream it adds the
+/// LIVE-EXCLUSIVE health signals the base lacks: [`bitrate_points`] + [`uptime_points`] (each fully typed, from
+/// the `vortx` side-channel, never a title). Language-match is already scored by the base for a live stream, so
+/// it is counted exactly once (see [`live_health_delta`]). Both terms are `>= 0`, so a live stream's score is
+/// always `>= ` its base score, and the surviving set is unchanged; the whole health band stays below the
+/// resolution-tier step, so a live stream that declares a resolution keeps its tier. FAIL-OPEN: a stream with
+/// no typed bitrate / uptime gains 0 and keeps its base score. The list is then re-sorted with the same stable
+/// total order (score descending, then original index).
+pub fn rank_live(streams: &[Stream], prefs: &RankingPrefs, cached: &[bool]) -> Vec<RankedStream> {
+    let mut out = rank(streams, prefs, cached);
+    for r in &mut out {
+        let fact = channel_health_of(&streams[r.raw_index], prefs);
+        let bp = bitrate_points(fact.bitrate_kbps);
+        if bp != 0 {
+            r.score += bp * SCALE;
+            r.reasons.push(format!("bitrate (+{bp})"));
+        }
+        let up = uptime_points(fact.uptime_permille);
+        if up != 0 {
+            r.score += up * SCALE;
+            r.reasons.push(format!("uptime (+{up})"));
         }
     }
     out.sort_by(|a, b| b.score.cmp(&a.score).then(a.raw_index.cmp(&b.raw_index)));
@@ -924,5 +1075,186 @@ mod tests {
         };
         let ranked = rank_for(ContentKind::MusicTrack, &[s], &prefs, &[false]);
         assert!(ranked[0].reasons.iter().any(|r| r.contains("lossless")));
+    }
+
+    // ---- LT5: live stream-health ranking ----
+
+    /// A live stream whose typed vortx channel carries bitrate / uptime / languages (label is neutral, so the
+    /// base parses to Unknown tier and the health signals drive the ordering).
+    fn live_stream(bitrate: Option<i64>, uptime: Option<i64>, langs: &[&str]) -> Stream {
+        Stream {
+            name: Some("Channel".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    bitrate_kbps: bitrate,
+                    uptime_permille: uptime,
+                    languages: langs.iter().map(|l| l.to_string()).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A live stream that ALSO declares a resolution (so the base gives it a real tier), plus optional health.
+    fn live_stream_res(res: &str, bitrate: Option<i64>, uptime: Option<i64>) -> Stream {
+        Stream {
+            name: Some("Channel".to_string()),
+            behavior_hints: Some(StreamBehaviorHints {
+                vortx: Some(VortxStreamHints {
+                    resolution: Some(res.to_string()),
+                    bitrate_kbps: bitrate,
+                    uptime_permille: uptime,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn live_event_maps_to_the_live_profile() {
+        assert_eq!(
+            RankProfile::for_kind(ContentKind::LiveEvent),
+            RankProfile::Live
+        );
+    }
+
+    #[test]
+    fn live_uptime_orders_channels() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            live_stream(None, Some(500), &[]),
+            live_stream(None, Some(900), &[]),
+        ];
+        let ranked = rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // the more reliable channel (uptime 900) wins
+        assert_eq!(ranked[0].score, 360_000); // uptime_points(900) = 360
+        assert_eq!(ranked[1].score, 200_000); // uptime_points(500) = 200
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("uptime")));
+    }
+
+    #[test]
+    fn live_bitrate_refines_within_equal_uptime() {
+        let prefs = RankingPrefs::default();
+        let streams = [
+            live_stream(Some(2048), Some(1000), &[]),
+            live_stream(Some(8192), Some(1000), &[]),
+        ];
+        let ranked = rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 1); // higher bitrate breaks the equal-uptime tie
+        assert_eq!(ranked[0].score, 650_000); // uptime 400 + bitrate 250
+        assert_eq!(ranked[1].score, 550_000); // uptime 400 + bitrate 150
+        assert!(ranked[0].reasons.iter().any(|r| r.contains("bitrate")));
+    }
+
+    #[test]
+    fn live_health_is_fail_open_for_a_plain_stream() {
+        // A plain live stream (no typed health) is byte-identical to the frozen base under the Live profile.
+        let prefs = RankingPrefs::default();
+        let streams = [stream("Some Channel")];
+        let base = rank(&streams, &prefs, &[false]);
+        let live = rank_for(ContentKind::Channel, &streams, &prefs, &[false]);
+        assert_eq!(live, base);
+    }
+
+    #[test]
+    fn live_language_is_owned_by_the_base_and_not_double_counted() {
+        // With a language preference, the base scores language (+/-500) and the post-pass adds uptime. The
+        // pinned scores prove language is counted EXACTLY ONCE (a double count would be 1_400_000, not 900_000).
+        let prefs = RankingPrefs {
+            preferred_languages: vec!["en".to_string()],
+            ..Default::default()
+        };
+        let streams = [
+            live_stream(None, Some(1000), &["en"]),
+            live_stream(None, Some(1000), &["ja"]),
+        ];
+        let ranked = rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 0); // preferred language
+        assert_eq!(ranked[0].score, 900_000); // +500 language (base) + 400 uptime (post-pass)
+        assert_eq!(ranked[1].score, -100_000); // -500 foreign (base) + 400 uptime (post-pass)
+    }
+
+    #[test]
+    fn live_health_never_jumps_the_resolution_tier() {
+        // An FHD channel with ZERO health still beats an SD channel with MAX health: the health band (<= 700
+        // human-points) can never cross the 15000 resolution-tier step.
+        let prefs = RankingPrefs::default();
+        let streams = [
+            live_stream_res("1080p", None, None), // FHD, no health
+            live_stream_res("480p", Some(1_000_000), Some(1000)), // SD, saturated health
+        ];
+        let ranked = rank_for(ContentKind::Channel, &streams, &prefs, &[false, false]);
+        assert_eq!(ranked[0].raw_index, 0); // FHD tier dominates
+        assert_eq!(ranked[0].score, 45_000_000); // FHD tier, no health
+        assert_eq!(ranked[1].score, 15_700_000); // SD tier (15_000_000) + health 700_000
+    }
+
+    #[test]
+    fn live_health_fields_never_touch_the_video_profile() {
+        // A stream carrying live bitrate / uptime, ranked as a Movie, is byte-identical to the frozen rank().
+        let prefs = RankingPrefs::default();
+        let streams = [live_stream_res("1080p", Some(1_000_000), Some(1000))];
+        assert_eq!(
+            rank_for(ContentKind::Movie, &streams, &prefs, &[false]),
+            rank(&streams, &prefs, &[false])
+        );
+    }
+
+    #[test]
+    fn channel_health_score_is_a_pure_fail_open_sum() {
+        assert_eq!(channel_health_score(&ChannelHealthFact::default()), 0); // all neutral -> 0
+        let full = ChannelHealthFact {
+            bitrate_kbps: Some(8192),
+            uptime_permille: Some(1000),
+            language: LangMatch::Preferred,
+        };
+        assert_eq!(channel_health_score(&full), 250 + 400 + 500); // bitrate + uptime + language
+        let foreign = ChannelHealthFact {
+            language: LangMatch::Foreign,
+            ..Default::default()
+        };
+        assert_eq!(channel_health_score(&foreign), -500);
+    }
+
+    #[test]
+    fn uptime_and_bitrate_points_clamp_and_floor() {
+        // Uptime: fail-open on missing / non-positive, linear to the cap, clamps above 1000.
+        assert_eq!(uptime_points(None), 0);
+        assert_eq!(uptime_points(Some(-5)), 0);
+        assert_eq!(uptime_points(Some(0)), 0);
+        assert_eq!(uptime_points(Some(500)), 200);
+        assert_eq!(uptime_points(Some(1000)), 400);
+        assert_eq!(uptime_points(Some(5000)), 400); // clamped to the cap
+                                                    // Bitrate: 0 below the floor, +50 per doubling above it, saturating at the cap.
+        assert_eq!(bitrate_points(None), 0);
+        assert_eq!(bitrate_points(Some(-1)), 0);
+        assert_eq!(bitrate_points(Some(256)), 0); // at the floor
+        assert_eq!(bitrate_points(Some(512)), 50);
+        assert_eq!(bitrate_points(Some(2048)), 150);
+        assert_eq!(bitrate_points(Some(16384)), 300); // cap
+        assert_eq!(bitrate_points(Some(1_000_000)), 300); // saturated
+    }
+
+    #[test]
+    fn langmatch_mirrors_the_base_language_semantics() {
+        let en = vec!["en".to_string()];
+        let ja = vec!["ja".to_string()];
+        assert_eq!(
+            LangMatch::from_languages(&en, &["EN".to_string()]),
+            LangMatch::Preferred // case-insensitive
+        );
+        assert_eq!(
+            LangMatch::from_languages(&ja, &["en".to_string()]),
+            LangMatch::Foreign
+        );
+        assert_eq!(
+            LangMatch::from_languages(&[], &["en".to_string()]),
+            LangMatch::Unknown
+        ); // fail-open
+        assert_eq!(LangMatch::from_languages(&en, &[]), LangMatch::Unknown); // no preference
     }
 }

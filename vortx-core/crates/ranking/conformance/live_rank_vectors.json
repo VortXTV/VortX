@@ -1,0 +1,46 @@
+{
+  "description": "Cross-language conformance for the LT5 LIVE ranking profile (rank_for(live kind) = the frozen base rank() + an integer stream-health post-pass). A live stream has no resolution tier / seeders / size, so health is scored on the fields it does carry: measured UPTIME (permille 0..=1000 -> 0..=400 human-points, linear), video BITRATE (floor(log2 kbps) above 256, +50 per doubling, cap 300), and audio LANGUAGE-match (owned by the base's +/-500 term, counted once). The whole health band (<= 700 human-points = 700000 milli) stays below the 15000 resolution-tier step. FAIL-OPEN: an absent field contributes 0. The VIDEO profile is unaffected (rank_for(movie) == rank(), asserted per case). Scores are integer milli-points; a port must reproduce them byte-for-byte.",
+  "cases": [
+    {
+      "name": "uptime_orders_two_channels",
+      "streams": [
+        { "label": "Alpha", "vortx": { "uptimePermille": 500 } },
+        { "label": "Bravo", "vortx": { "uptimePermille": 900 } }
+      ],
+      "expect": [ { "raw_index": 1, "score": 360000 }, { "raw_index": 0, "score": 200000 } ]
+    },
+    {
+      "name": "bitrate_refines_within_equal_uptime",
+      "streams": [
+        { "label": "Alpha", "vortx": { "bitrateKbps": 2048, "uptimePermille": 1000 } },
+        { "label": "Bravo", "vortx": { "bitrateKbps": 8192, "uptimePermille": 1000 } }
+      ],
+      "expect": [ { "raw_index": 1, "score": 650000 }, { "raw_index": 0, "score": 550000 } ]
+    },
+    {
+      "name": "unknown_health_is_neutral_failopen",
+      "streams": [
+        { "label": "Alpha" },
+        { "label": "Bravo", "vortx": { "uptimePermille": 800 } }
+      ],
+      "expect": [ { "raw_index": 1, "score": 320000 }, { "raw_index": 0, "score": 0 } ]
+    },
+    {
+      "name": "language_owned_by_base_not_double_counted",
+      "prefs": { "preferred_languages": ["en"] },
+      "streams": [
+        { "label": "Alpha", "vortx": { "uptimePermille": 1000, "languages": ["en"] } },
+        { "label": "Bravo", "vortx": { "uptimePermille": 1000, "languages": ["ja"] } }
+      ],
+      "expect": [ { "raw_index": 0, "score": 900000 }, { "raw_index": 1, "score": -100000 } ]
+    },
+    {
+      "name": "health_never_jumps_the_resolution_tier",
+      "streams": [
+        { "label": "Alpha", "vortx": { "resolution": "1080p" } },
+        { "label": "Bravo", "vortx": { "resolution": "480p", "bitrateKbps": 1000000, "uptimePermille": 1000 } }
+      ],
+      "expect": [ { "raw_index": 0, "score": 45000000 }, { "raw_index": 1, "score": 15700000 } ]
+    }
+  ]
+}

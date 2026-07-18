@@ -382,6 +382,24 @@ pub struct VortxStreamHints {
     /// NZB MD5, for the on-device usenet resolver (`nzb` kind only).
     #[serde(default, rename = "nzbHash", skip_serializing_if = "Option::is_none")]
     pub nzb_hash: Option<String>,
+    /// LIVE stream video bitrate in kbps (LT5 stream-health ranking input). A live source has no resolution
+    /// tier / seeders / size ladder, so bitrate is a health signal the ranker reads here rather than parsing
+    /// a title. `None` on VOD (which ranks by the frozen resolution ladder instead); absent -> fail-open.
+    #[serde(
+        default,
+        rename = "bitrateKbps",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bitrate_kbps: Option<i64>,
+    /// LIVE channel measured uptime / reliability in PERMILLE (0..=1000, clamped; LT5 stream-health input).
+    /// Higher = more reliable. Kept an integer permille (not a float) so it stays on the byte-reproducible
+    /// ordering path. `None` = unknown -> fail-open (no effect); not applicable to VOD.
+    #[serde(
+        default,
+        rename = "uptimePermille",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub uptime_permille: Option<i64>,
 }
 
 /// A subtitle track.
