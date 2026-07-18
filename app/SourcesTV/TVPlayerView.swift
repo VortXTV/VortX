@@ -617,6 +617,16 @@ struct TVPlayerView: View {
         // A yt-direct adaptive pair NEEDS libmpv (the audio sidecar rides mpv --audio-files; AVPlayer
         // would play the video-only stream silent), so it bypasses AVPlayer routing entirely.
         if audioSidecarURL != nil { return false }
+        // V2 (trailerClientResolverV2): the resolver's HLS-master fallback hands a googlevideo manifest as the
+        // trailer URL with NO sidecar, and router rule (4) below would divert any remote .m3u8 to AVPlayer,
+        // which replays it under its own UA (googlevideo 403s a UA that does not match the minting client) and
+        // bypasses the mpv trailer pipeline. So under the flag pin EVERY trailer to libmpv (identical to what
+        // rule (5) already picks for today's mp4 trailer URLs). Inert when the flag is off. Mirrors
+        // PlayerScreen.routedToAVPlayer on iOS/macOS.
+        if isTrailer, YouTubeDirectResolver.isV2Enabled { return false }
+        // Hard invariant: a trailer manifest must NEVER reach the router's AVPlayer HLS diversion. Debug-only.
+        assert(!(isTrailer && PlayerEngineRouter.isHLS(url)),
+               "trailer manifest must route to libmpv, never AVPlayer")
         let loopback = url.host == "127.0.0.1" || url.host == "localhost"
         let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
         // tvOS: DVDisplaySupport.isCapable is constant true (the Apple TV negotiates DV over HDMI), so the DV

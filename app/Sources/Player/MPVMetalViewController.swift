@@ -977,14 +977,29 @@ final class MPVMetalViewController: PlatformViewController {
         // playback keeps its own UA.
         let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
         if isGoogleVideo(url) || isGoogleVideo(audioSidecar) {
+            // UA lockstep (trailerClientResolverV2): googlevideo binds each issued URL to the InnerTube client
+            // that MINTED it, so ask the resolver for the UA recorded against this exact URL. mpv's
+            // `user-agent` option applies to every stream this load opens (video + the --audio-files sidecar),
+            // and both legs always come from the same minting client, so one lookup covers both. With the flag
+            // off the registry is empty and the lookup returns the IOS constant, byte-identical to before.
+            let requiredUA = YouTubeDirectResolver.requiredUserAgent(for: (isGoogleVideo(url) ? url : audioSidecar) ?? url)
             if isGoogleVideo(url) {
-                playURL = VXTrailerProxy.shared.proxied(url, mime: "video/mp4") ?? url
+                if YouTubeDirectResolver.isManifestURL(url) {
+                    // V2 HLS-master fallback: mpv opens the manifest DIRECTLY. The range-proxy cannot serve it
+                    // (it needs the `clen`/`&range=` mechanics of a bare media URL, which a manifest lacks),
+                    // and manifests + their segment fetches are plain GETs, so there is no Range shape to fix;
+                    // only the UA force below matters. This branch never fires with the flag off (the resolver
+                    // then never returns a manifest URL).
+                    playURL = url
+                } else {
+                    playURL = VXTrailerProxy.shared.proxied(url, mime: "video/mp4") ?? url
+                }
             }
             if let audioSidecar, isGoogleVideo(audioSidecar) {
                 sidecar = VXTrailerProxy.shared.proxied(audioSidecar, mime: "audio/mp4") ?? audioSidecar
             }
             args[0] = playURL.absoluteString
-            setString("user-agent", YouTubeDirectResolver.googlevideoUserAgent)
+            setString("user-agent", requiredUA)
             // Referer/extra headers from a browser context would only confuse googlevideo's UA binding.
             setString("referrer", "")
             setString("http-header-fields", "")
@@ -1000,7 +1015,7 @@ final class MPVMetalViewController: PlatformViewController {
             }
             NSLog("[trailer] loadFile googlevideo: proxying via 127.0.0.1 playHost=%@ sidecar=%@ alang=%@ ua=%@",
                   playURL.host ?? "?", sidecar == nil ? "none" : (sidecar!.host ?? "?"),
-                  trailerAlang.joined(separator: ","), YouTubeDirectResolver.googlevideoUserAgent)
+                  trailerAlang.joined(separator: ","), requiredUA)
         }
 
         // yt-direct adaptive pair: mount the external audio stream so mpv merges it with the video-only
@@ -1027,6 +1042,10 @@ final class MPVMetalViewController: PlatformViewController {
             // host) otherwise takes the full 256 MiB remote buffer and contributes to the tvOS jetsam that the
             // owner sees as "the server died". Give the trailer host the small read-ahead too.
             || (playURL.host?.contains("trailer.vortx.tv") ?? false)
+            // V2 HLS-master trailer fallback: also a short clip, opened directly on its remote googlevideo
+            // manifest host (never proxied), so give it the small read-ahead for the same jetsam reason.
+            // Never true with the flag off (no manifest URLs exist then).
+            || (isGoogleVideo(playURL) && YouTubeDirectResolver.isManifestURL(playURL))
         configureLiveMode(live)
         let readAhead: String
         if live {

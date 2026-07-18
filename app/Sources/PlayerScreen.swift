@@ -559,6 +559,18 @@ struct PlayerScreen: View {
         // A yt-direct adaptive pair NEEDS libmpv (the audio sidecar rides mpv --audio-files; AVPlayer
         // would play the video-only stream silent), so it bypasses AVPlayer routing entirely.
         if audioSidecarURL != nil { return false }
+        // V2 (trailerClientResolverV2): the resolver's HLS-master fallback hands a googlevideo manifest as the
+        // trailer URL with NO sidecar, and router rule (4) below would divert any remote .m3u8 to AVPlayer,
+        // which replays it under its own UA (googlevideo 403s a UA that does not match the minting client) and
+        // bypasses the mpv trailer pipeline. Trailers always play on libmpv in practice already (today's mp4
+        // trailer URLs take router rule (5) there), so under the flag pin EVERY trailer to libmpv. Inert when
+        // the flag is off: the resolver then never returns a manifest and the pin is skipped.
+        if isTrailer, YouTubeDirectResolver.isV2Enabled { return false }
+        // Hard invariant: a trailer manifest must NEVER reach the router's AVPlayer HLS diversion (it would
+        // drop the mpv path and 403 on the UA binding). Trips in debug if a .m3u8 trailer ever falls through
+        // to the router below; compiled out of release builds.
+        assert(!(isTrailer && PlayerEngineRouter.isHLS(url)),
+               "trailer manifest must route to libmpv, never AVPlayer")
         let loopback = url.host == "127.0.0.1" || url.host == "localhost"
         let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
         // Pass this display's DV capability so the DV mandate holds on macOS too (DV -> the remux->AVPlayer
