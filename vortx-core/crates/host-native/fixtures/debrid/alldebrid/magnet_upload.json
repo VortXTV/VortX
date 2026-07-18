@@ -1,0 +1,16 @@
+{
+	"status": "success",
+	"data": {
+		"magnets": [
+			{
+				"magnet": "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+				"hash": "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+				"name": "Show.S01E01.2160p.WEB-DL.mkv",
+				"filename_original": "",
+				"size": 4831838208,
+				"ready": true,
+				"id": 186112901
+			}
+		]
+	}
+}

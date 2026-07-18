@@ -10,6 +10,8 @@ publish = false
 vortx-engine = { path = "../engine" }
 vortx-source = { path = "../source" }
 vortx-protocol = { path = "../protocol" }
+# Phase 2: the live DebridStore HTTP clients live HERE (the kernel debrid crate stays pure).
+vortx-debrid = { path = "../debrid" }
 serde.workspace = true
 serde_json.workspace = true
 percent-encoding.workspace = true

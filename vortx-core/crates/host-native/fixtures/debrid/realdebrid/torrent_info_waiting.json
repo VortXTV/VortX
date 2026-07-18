@@ -1,0 +1,28 @@
+{
+	"id": "RDNEW0000001",
+	"filename": "Show.S01E02.2160p.WEB-DL.mkv",
+	"original_filename": "Show.S01E02.2160p.WEB-DL.mkv",
+	"hash": "DD8255ECDC7CA55FB0BBF81323D87062DB1F6D1C",
+	"bytes": 0,
+	"original_bytes": 4831838208,
+	"host": "real-debrid.com",
+	"split": 2000,
+	"progress": 0,
+	"status": "waiting_files_selection",
+	"added": "2026-07-18T08:00:00.000Z",
+	"files": [
+		{
+			"id": 1,
+			"path": "/Show.S01E02.2160p.WEB-DL.mkv",
+			"bytes": 4831838208,
+			"selected": 0
+		},
+		{
+			"id": 2,
+			"path": "/Sample/sample.mkv",
+			"bytes": 52428800,
+			"selected": 0
+		}
+	],
+	"links": []
+}

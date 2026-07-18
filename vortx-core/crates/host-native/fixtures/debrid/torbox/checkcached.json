@@ -1,0 +1,12 @@
+{
+	"success": true,
+	"error": null,
+	"detail": "Successfully checked cached torrents",
+	"data": {
+		"dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c": {
+			"name": "Show.S01E01.2160p.WEB-DL.mkv",
+			"size": 4831838208,
+			"hash": "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+		}
+	}
+}

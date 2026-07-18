@@ -1,0 +1,16 @@
+{
+	"status": "success",
+	"data": {
+		"user": {
+			"username": "vortxtester",
+			"email": "tester@example.com",
+			"isPremium": true,
+			"isSubscribed": true,
+			"isTrial": false,
+			"premiumUntil": 1788220800,
+			"lang": "en",
+			"preferedDomain": "com",
+			"fidelityPoints": 120
+		}
+	}
+}

@@ -1,0 +1,6 @@
+{
+	"success": true,
+	"error": null,
+	"detail": "Successfully generated download link",
+	"data": "https://store-031.wnam.tb-cdn.example/torrents/42421337/Show.S01E01.2160p.WEB-DL.mkv?token=presigned-cdn-grant&expires=1789000000"
+}

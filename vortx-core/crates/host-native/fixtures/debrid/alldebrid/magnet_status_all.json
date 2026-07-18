@@ -1,0 +1,37 @@
+{
+	"status": "success",
+	"data": {
+		"magnets": [
+			{
+				"id": 186112901,
+				"filename": "Show.S01E01.2160p.WEB-DL.mkv",
+				"size": 4831838208,
+				"hash": "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+				"status": "Ready",
+				"statusCode": 4,
+				"downloaded": 4831838208,
+				"uploaded": 0,
+				"seeders": 0,
+				"downloadSpeed": 0,
+				"uploadSpeed": 0,
+				"uploadDate": 1752900000,
+				"completionDate": 1752900120
+			},
+			{
+				"id": 186112902,
+				"filename": "Movie.2026.1080p.BluRay.mkv",
+				"size": 2147483648,
+				"hash": "aaaa5555ecdc7ca55fb0bbf81323d87062db1f6d",
+				"status": "Downloading",
+				"statusCode": 1,
+				"downloaded": 858993459,
+				"uploaded": 0,
+				"seeders": 14,
+				"downloadSpeed": 34952533,
+				"uploadSpeed": 0,
+				"uploadDate": 1752938000,
+				"completionDate": 0
+			}
+		]
+	}
+}
