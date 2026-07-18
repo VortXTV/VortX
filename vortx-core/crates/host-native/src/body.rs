@@ -12,7 +12,8 @@
 //! which is deterministic, so item keys are byte-stable across hosts for identical bodies.
 
 use vortx_protocol::{
-    parse_addon_catalog, parse_catalog, parse_meta, parse_stream, parse_subtitles,
+    decode_repair_catalog, decode_repair_meta, decode_repair_stream, decode_repair_subtitles,
+    parse_addon_catalog, parse_catalog, parse_meta, parse_stream, parse_subtitles, DecodeReport,
 };
 
 /// The response-body shapes this host can validate, inferred from the planned resource URL. Mirrors
@@ -80,22 +81,68 @@ fn url_path(url: &str) -> &str {
 /// Turn a 2xx response body into the validated item keys the kernel's settle phase consumes.
 /// `None` means the body is schema-invalid for the resource the URL names (or the URL names no known
 /// resource at all): the caller settles the fetch as `Malformed`, charging the addon's breaker.
+///
+/// Postel: each resource is decoded STRICTLY first, so a clean body produces byte-identical item keys. Only
+/// when the strict decode fails does the lenient `vortx-protocol` repair layer run (BOM strip, HTML unwrap,
+/// stringified-number coercion, relative-URL resolution against the fetch URL, malformed-magnet extraction),
+/// which is what lets VortX serve add-ons other clients hard-reject. The repairs it applied are discarded here
+/// (the host boundary carries only item keys); [`body_to_items_reported`] returns them for observability.
 pub fn body_to_items(url: &str, body: &str) -> Option<Vec<String>> {
-    let kind = infer_kind(url)?;
+    body_to_items_reported(url, body).map(|(items, _)| items)
+}
+
+/// [`body_to_items`] plus the lenient-decode report (empty on the strict path). The report names every repair
+/// that recovered an otherwise-rejected body, so a host can log or down-rank a source that needed patching.
+pub fn body_to_items_reported(url: &str, body: &str) -> Option<(Vec<String>, DecodeReport)> {
+    let empty = DecodeReport::default();
+    // An IPTV source (SourceKind::Iptv) is fetched at its raw playlist endpoint, which is NOT a Stremio
+    // `/resource/type/id.json` URL, so `infer_kind` returns None. Detect an M3U playlist body and map its
+    // entries into protocol-stream item keys via the pure vortx_live VOD mapping, so IPTV VOD joins the same
+    // ranked stream list. (Xtream VOD JSON needs the host's portal creds to build playable URLs, so the host
+    // maps it directly with `vortx_live::xtream_vod_to_streams`; see the report notes.)
+    let Some(kind) = infer_kind(url) else {
+        return m3u_body_to_items(body).map(|items| (items, empty));
+    };
     match kind {
-        BodyKind::Catalog => parse_catalog(body).ok().map(|r| serialize_all(&r.metas)),
-        BodyKind::Meta => parse_meta(body)
-            .ok()
-            .and_then(|r| serde_json::to_string(&r.meta).ok())
-            .map(|item| vec![item]),
-        BodyKind::Stream => parse_stream(body).ok().map(|r| serialize_all(&r.streams)),
-        BodyKind::Subtitles => parse_subtitles(body)
-            .ok()
-            .map(|r| serialize_all(&r.subtitles)),
+        BodyKind::Catalog => match parse_catalog(body) {
+            Ok(r) => Some((serialize_all(&r.metas), empty)),
+            Err(_) => decode_repair_catalog(body, Some(url))
+                .map(|(r, rep)| (serialize_all(&r.metas), rep)),
+        },
+        BodyKind::Meta => match parse_meta(body) {
+            Ok(r) => serde_json::to_string(&r.meta).ok().map(|i| (vec![i], empty)),
+            Err(_) => decode_repair_meta(body, Some(url))
+                .and_then(|(r, rep)| serde_json::to_string(&r.meta).ok().map(|i| (vec![i], rep))),
+        },
+        BodyKind::Stream => match parse_stream(body) {
+            Ok(r) => Some((serialize_all(&r.streams), empty)),
+            Err(_) => decode_repair_stream(body, Some(url))
+                .map(|(r, rep)| (serialize_all(&r.streams), rep)),
+        },
+        BodyKind::Subtitles => match parse_subtitles(body) {
+            Ok(r) => Some((serialize_all(&r.subtitles), empty)),
+            Err(_) => decode_repair_subtitles(body, Some(url))
+                .map(|(r, rep)| (serialize_all(&r.subtitles), rep)),
+        },
+        // An addon_catalog (add-on discovery) embeds full nested manifests; it is left strict-only.
         BodyKind::AddonCatalog => parse_addon_catalog(body)
             .ok()
-            .map(|r| serialize_all(&r.addons)),
+            .map(|r| (serialize_all(&r.addons), empty)),
     }
+}
+
+/// Decode an M3U/M3U8 playlist body (an IPTV source's raw endpoint) into protocol-stream item keys via the
+/// pure `vortx_live` VOD mapping. `None` when the body is not an M3U playlist, so a non-IPTV unknown-resource
+/// URL still settles as `Malformed` exactly as before (no false positives on arbitrary bodies).
+fn m3u_body_to_items(body: &str) -> Option<Vec<String>> {
+    if !body.trim_start().starts_with("#EXTM3U") {
+        return None;
+    }
+    let playlist = vortx_live::parse_m3u(body);
+    if playlist.entries.is_empty() {
+        return None;
+    }
+    Some(serialize_all(&vortx_live::m3u_vod_to_streams(&playlist)))
 }
 
 /// Serialize each element to one compact JSON item key, dropping any element serde cannot encode
@@ -195,6 +242,52 @@ mod tests {
             body_to_items("https://x.example/manifest.json", r#"{}"#),
             None
         );
+    }
+
+    #[test]
+    fn a_body_other_clients_reject_is_recovered_by_the_repair_layer() {
+        // BOM prefix + stringified fileIdx: strict clients (and the strict parse) reject the whole body; the
+        // Postel layer recovers it, so VortX can serve an add-on other clients hard-fail on.
+        let url = "https://addon.example/stream/movie/tt1.json";
+        let body = "\u{feff}{\"streams\":[{\"name\":\"A 1080p\",\"infoHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"fileIdx\":\"0\"}]}";
+        assert!(vortx_protocol::parse_stream(body).is_err(), "strict must reject");
+        let (items, report) = body_to_items_reported(url, body).expect("repair recovers the body");
+        assert_eq!(items.len(), 1);
+        assert!(parse_stream_item(&items[0]).is_some());
+        assert!(!report.is_empty());
+        use vortx_protocol::RepairKind;
+        assert!(report.contains(RepairKind::BomPrefix));
+        assert!(report.contains(RepairKind::StringifiedNumber));
+    }
+
+    #[test]
+    fn an_m3u_iptv_body_becomes_ranked_ready_stream_item_keys() {
+        // An IPTV source's raw endpoint isn't a Stremio resource URL, so infer_kind returns None; the M3U body
+        // is mapped into protocol-stream item keys that the kernel's own settle parser accepts.
+        let url = "http://iptv.example/get.php?type=m3u_plus";
+        let body = "#EXTM3U\n#EXTINF:-1 tvg-name=\"The Movie 1080p\",The Movie 1080p\nhttp://vod/movie/1.mkv\n";
+        let items = body_to_items(url, body).expect("m3u body maps to stream items");
+        assert_eq!(items.len(), 1);
+        let s = parse_stream_item(&items[0]).expect("kernel parses the mapped item");
+        assert_eq!(s.url.as_deref(), Some("http://vod/movie/1.mkv"));
+        assert_eq!(s.name.as_deref(), Some("The Movie 1080p"));
+    }
+
+    #[test]
+    fn an_unknown_resource_url_with_a_non_m3u_body_is_still_malformed() {
+        // Guard: the IPTV fallback must not swallow arbitrary non-M3U bodies at a non-resource URL.
+        assert_eq!(body_to_items("http://x/manifest.json", "{}"), None);
+        assert_eq!(body_to_items("http://x/whatever", "not a playlist"), None);
+    }
+
+    #[test]
+    fn a_clean_body_reports_no_repairs_and_is_byte_identical() {
+        // The strict path is untouched: a clean body produces the same keys with an empty report.
+        let url = "https://addon.example/stream/movie/tt1.json";
+        let body = r#"{"streams":[{"name":"A 2160p","url":"https://cdn.example/a.mp4"}]}"#;
+        let (items, report) = body_to_items_reported(url, body).unwrap();
+        assert_eq!(items, body_to_items(url, body).unwrap());
+        assert!(report.is_empty());
     }
 
     #[test]

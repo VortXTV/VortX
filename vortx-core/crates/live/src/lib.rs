@@ -23,13 +23,21 @@ mod guide;
 mod hash;
 mod m3u;
 mod secret;
+mod vodstream;
 mod xtream;
 
 pub use bind::{bind_epg, epg_channel_id_for};
 pub use catchup::{catchup_url_for, render_catchup, CatchupCtx, CivilTime};
 pub use channel::{build_channels, ChannelFeed, ChannelModel, ProviderPlaylist};
 pub use epg::{parse_xmltv, parse_xmltv_time, Epg, EpgChannel, EpisodeNum, Program};
-pub use guide::{grid, now_next, ChannelGrid, EpgWindow, GridProgram, NowNext};
+pub use guide::{
+    grid, grid_filled, now_next, ChannelGrid, EpgWindow, FilledChannelGrid, GridProgram, GridSlot,
+    NowNext,
+};
 pub use m3u::{parse_m3u, M3uEntry, Playlist};
 pub use secret::Secret;
+pub use vodstream::{
+    m3u_entry_to_stream, m3u_vod_to_streams, parse_xtream_vod, xtream_vod_to_stream,
+    xtream_vod_to_streams, XtreamVodStream,
+};
 pub use xtream::{StreamKind, XtreamPortal};

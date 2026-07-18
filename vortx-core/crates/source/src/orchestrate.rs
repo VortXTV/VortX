@@ -14,13 +14,17 @@
 //! validated stream JSON strings, so [`parse_stream_item`] deserializes every key the same way regardless of
 //! source kind, and a malformed key is dropped rather than poisoning the batch.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use vortx_protocol::{MetaDetail, MetaPreview, Stream};
+use vortx_protocol::{
+    repair_catalog_item, repair_meta_item, repair_stream_item, DecodeReport, MetaDetail,
+    MetaPreview, Stream,
+};
 
 use crate::fanout::{Aggregate, BreakerRegistry, CircuitConfig, FailedAddon};
 use crate::registry::SourceRegistry;
 use crate::request::ResourceRequest;
-use crate::transport::{run_fanout, settle_fanout, Fetch, FetchOutcome, FetchRequest};
+use crate::transport::{run_fanout, settle_fanout, source_base, Fetch, FetchOutcome, FetchRequest};
 
 /// The result of resolving a request across the matching sources: the parsed streams (the union of every
 /// surviving source, in the fan-out's deterministic sorted-addon-id order), plus which sources survived and
@@ -31,11 +35,20 @@ pub struct ResolvedStreams {
     pub streams: Vec<Stream>,
     pub survivors: Vec<String>,
     pub failed: Vec<FailedAddon>,
+    /// The Postel lenient-decode report: every repair applied while recovering an item that failed the strict
+    /// parse (a stringified number coerced, a BOM stripped, a relative URL resolved, ...). Empty (and skip-
+    /// serialized) on the common all-strict path, so an unrepaired settle stays byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "DecodeReport::is_empty")]
+    pub repairs: DecodeReport,
 }
 
 /// Parse one host-returned item key into a typed [`Stream`]. The fan-out's item-key contract is uniform:
 /// the host turned a 2xx body into individual validated stream JSON strings, so the kernel parses each the
 /// same way regardless of source kind. A malformed key yields `None` (dropped), never a panic.
+///
+/// STRICT: this is the byte-identical strict parse. The lenient repair fallback is applied one layer up in the
+/// settle path ([`repair_ok_outcomes`]) so it only fires when this strict parse fails, and the repair is
+/// recorded in [`ResolvedStreams::repairs`] rather than guessed silently.
 pub fn parse_stream_item(item: &str) -> Option<Stream> {
     serde_json::from_str::<Stream>(item).ok()
 }
@@ -61,7 +74,9 @@ pub fn resolve_streams<F: Fetch + ?Sized>(
         .map(|fr| (fr.addon_id, fr.url))
         .collect();
     let agg: Aggregate = run_fanout(fetcher, &candidates, breakers, cfg, now, budget_ms);
-    resolved_from(agg)
+    // The end-to-end convenience path stays strict (the real host path is plan -> settle_streams, which runs
+    // the Postel pass); an empty report keeps this byte-identical to its prior behavior.
+    resolved_from(agg, DecodeReport::default())
 }
 
 /// Settle the host's outcomes for an already-issued [`FetchRequest`] plan into typed streams (the SETTLE half
@@ -77,18 +92,88 @@ pub fn settle_streams(
     cfg: &CircuitConfig,
     now: u64,
 ) -> ResolvedStreams {
-    resolved_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+    // Postel pass: strict-parse each item first; a strict failure falls back to the protocol repair layer,
+    // recording every fix. Strict-valid items are byte-untouched, so a clean settle is byte-identical.
+    let (repaired, repairs) = repair_ok_outcomes(plan, outcomes, repair_stream_item);
+    resolved_from(settle_fanout(plan, &repaired, breakers, cfg, now), repairs)
 }
 
 /// Parse a settled [`Aggregate`] (the merged item keys + survivor/failure attribution) into typed streams.
 /// Shared by the end-to-end [`resolve_streams`] and the settle-only [`settle_streams`] so both agree on the
-/// uniform item-key parse contract.
-fn resolved_from(agg: Aggregate) -> ResolvedStreams {
+/// uniform item-key parse contract. `repairs` is the lenient-decode report carried from the settle pass.
+fn resolved_from(agg: Aggregate, repairs: DecodeReport) -> ResolvedStreams {
     ResolvedStreams {
         streams: agg.items.iter().filter_map(|k| parse_stream_item(k)).collect(),
         survivors: agg.survivors,
         failed: agg.failed,
+        repairs,
     }
+}
+
+/// The Postel pre-pass shared by every typed settle. For each successful outcome's items, try the STRICT parse
+/// first (`T`); an item that parses strictly is passed through byte-for-byte, so the aggregate is byte-identical
+/// on the all-strict path. An item that fails strict is handed to `repair_item`; a recovered item is
+/// re-serialized to a normalized key (which the downstream strict parse then accepts) and its repairs are folded
+/// into the report; an unrecoverable item is dropped (exactly as the strict `filter_map` would have). Failure
+/// outcomes (Malformed/Timeout/Error) pass through untouched. Deterministic: outcomes are processed in sorted
+/// addon-id order so the merged report is stable across platforms. The per-addon base (the fetch URL) resolves
+/// relative resource URLs.
+fn repair_ok_outcomes<T, F>(
+    plan: &[FetchRequest],
+    outcomes: &[(String, FetchOutcome)],
+    repair_item: F,
+) -> (Vec<(String, FetchOutcome)>, DecodeReport)
+where
+    T: DeserializeOwned + Serialize,
+    F: Fn(&str, Option<&str>) -> Option<(T, DecodeReport)>,
+{
+    let base_by_addon: std::collections::BTreeMap<&str, &str> = plan
+        .iter()
+        .map(|r| (r.addon_id.as_str(), source_base(&r.url)))
+        .collect();
+
+    let mut sorted: Vec<&(String, FetchOutcome)> = outcomes.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut report = DecodeReport::default();
+    let repaired: Vec<(String, FetchOutcome)> = sorted
+        .into_iter()
+        .map(|(addon_id, outcome)| {
+            let out = match outcome {
+                FetchOutcome::Ok { items } => {
+                    let base = base_by_addon.get(addon_id.as_str()).copied();
+                    let items = items
+                        .iter()
+                        .filter_map(|item| repair_one(item, base, &repair_item, &mut report))
+                        .collect();
+                    FetchOutcome::Ok { items }
+                }
+                other => other.clone(),
+            };
+            (addon_id.clone(), out)
+        })
+        .collect();
+    (repaired, report)
+}
+
+/// Strict-first repair of a single item key. Returns the untouched key on a strict parse, a re-serialized
+/// normalized key on a repair (folding its repairs into `report`), or `None` when unrecoverable.
+fn repair_one<T, F>(
+    item: &str,
+    base: Option<&str>,
+    repair_item: &F,
+    report: &mut DecodeReport,
+) -> Option<String>
+where
+    T: DeserializeOwned + Serialize,
+    F: Fn(&str, Option<&str>) -> Option<(T, DecodeReport)>,
+{
+    if serde_json::from_str::<T>(item).is_ok() {
+        return Some(item.to_string()); // strict success: byte-identical passthrough
+    }
+    let (typed, item_report) = repair_item(item, base)?;
+    report.merge(&item_report);
+    serde_json::to_string(&typed).ok()
 }
 
 /// The result of a CATALOG LOAD: the parsed catalog rows (the deterministic union of every surviving
@@ -99,6 +184,10 @@ pub struct ResolvedCatalog {
     pub metas: Vec<MetaPreview>,
     pub survivors: Vec<String>,
     pub failed: Vec<FailedAddon>,
+    /// The Postel lenient-decode report (see [`ResolvedStreams::repairs`]). Empty and skip-serialized when the
+    /// catalog settled with no repair.
+    #[serde(default, skip_serializing_if = "DecodeReport::is_empty")]
+    pub repairs: DecodeReport,
 }
 
 /// Parse one host-returned item key into a typed [`MetaPreview`] (a catalog row). Same uniform item-key
@@ -119,15 +208,17 @@ pub fn settle_catalog(
     cfg: &CircuitConfig,
     now: u64,
 ) -> ResolvedCatalog {
-    resolved_catalog_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+    let (repaired, repairs) = repair_ok_outcomes(plan, outcomes, repair_catalog_item);
+    resolved_catalog_from(settle_fanout(plan, &repaired, breakers, cfg, now), repairs)
 }
 
 /// Parse a settled [`Aggregate`] into catalog rows (the catalog twin of [`resolved_from`]).
-fn resolved_catalog_from(agg: Aggregate) -> ResolvedCatalog {
+fn resolved_catalog_from(agg: Aggregate, repairs: DecodeReport) -> ResolvedCatalog {
     ResolvedCatalog {
         metas: agg.items.iter().filter_map(|k| parse_catalog_item(k)).collect(),
         survivors: agg.survivors,
         failed: agg.failed,
+        repairs,
     }
 }
 
@@ -139,6 +230,10 @@ pub struct ResolvedMeta {
     pub meta: Option<MetaDetail>,
     pub survivors: Vec<String>,
     pub failed: Vec<FailedAddon>,
+    /// The Postel lenient-decode report (see [`ResolvedStreams::repairs`]). Empty and skip-serialized when the
+    /// meta settled with no repair.
+    #[serde(default, skip_serializing_if = "DecodeReport::is_empty")]
+    pub repairs: DecodeReport,
 }
 
 /// Parse one host-returned item key into a typed [`MetaDetail`]. Same uniform item-key contract as the
@@ -159,16 +254,18 @@ pub fn settle_meta(
     cfg: &CircuitConfig,
     now: u64,
 ) -> ResolvedMeta {
-    resolved_meta_from(settle_fanout(plan, outcomes, breakers, cfg, now))
+    let (repaired, repairs) = repair_ok_outcomes(plan, outcomes, repair_meta_item);
+    resolved_meta_from(settle_fanout(plan, &repaired, breakers, cfg, now), repairs)
 }
 
 /// Parse a settled [`Aggregate`] into a singular meta detail: the first parseable item wins (highest-priority
 /// source that answered, since items are merged in sorted-addon-id order).
-fn resolved_meta_from(agg: Aggregate) -> ResolvedMeta {
+fn resolved_meta_from(agg: Aggregate, repairs: DecodeReport) -> ResolvedMeta {
     ResolvedMeta {
         meta: agg.items.iter().find_map(|k| parse_meta_item(k)),
         survivors: agg.survivors,
         failed: agg.failed,
+        repairs,
     }
 }
 
@@ -577,5 +674,74 @@ mod tests {
         assert_eq!(out.survivors, vec!["alpha", "zeta"]);
         assert_eq!(out.failed.len(), 1);
         assert_eq!(out.failed[0].addon_id, "down");
+    }
+
+    // ---- Postel lenient-decode pass (Feature A) ----
+
+    #[test]
+    fn a_clean_settle_records_no_repairs_and_is_byte_identical() {
+        // Strict-valid items are passed through untouched: the repair report is empty (skip-serialized), so a
+        // clean settle is byte-identical to the pre-repair behavior.
+        let plan = vec![FetchRequest {
+            addon_id: "a".into(),
+            url: "http://a/stream/movie/tt1.json".into(),
+            budget_ms: 5000,
+        }];
+        let outcomes = vec![(
+            "a".to_string(),
+            FetchOutcome::Ok {
+                items: vec![stream_item("http://a/1")],
+            },
+        )];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_streams(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        assert_eq!(out.streams.len(), 1);
+        assert!(out.repairs.is_empty());
+        assert_eq!(serde_json::to_string(&out.repairs).unwrap(), "{}");
+    }
+
+    #[test]
+    fn settle_streams_repairs_a_broken_item_and_records_it() {
+        // A source emits a stringified fileIdx (strict-invalid) plus a site-relative url. The settle repairs
+        // both, keeps the stream, and records the repairs against the fan-out report.
+        let plan = vec![FetchRequest {
+            addon_id: "iptv".into(),
+            url: "https://iptv.example/stream/movie/tt1.json".into(),
+            budget_ms: 5000,
+        }];
+        let broken = r#"{"name":"A 1080p","url":"/dl/x.mkv","fileIdx":"0"}"#.to_string();
+        let outcomes = vec![("iptv".to_string(), FetchOutcome::Ok { items: vec![broken] })];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_streams(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        assert_eq!(out.streams.len(), 1); // recovered rather than dropped
+        assert_eq!(out.streams[0].file_idx, Some(0));
+        assert_eq!(out.streams[0].url.as_deref(), Some("https://iptv.example/dl/x.mkv"));
+        assert_eq!(out.survivors, vec!["iptv"]); // the source still survives
+        assert!(!out.repairs.is_empty());
+        use vortx_protocol::RepairKind;
+        assert!(out.repairs.contains(RepairKind::StringifiedNumber));
+        assert!(out.repairs.contains(RepairKind::RelativeUrl));
+    }
+
+    #[test]
+    fn an_unrecoverable_item_is_still_dropped_after_repair() {
+        // Repair only recovers items backed by a fixture shape; pure garbage is still dropped (source survives).
+        let plan = vec![FetchRequest {
+            addon_id: "s".into(),
+            url: "http://s/stream/movie/tt1.json".into(),
+            budget_ms: 5000,
+        }];
+        let outcomes = vec![(
+            "s".to_string(),
+            FetchOutcome::Ok {
+                items: vec!["not json at all".into(), stream_item("http://s/1")],
+            },
+        )];
+        let mut breakers = BreakerRegistry::new();
+        let out = settle_streams(&plan, &outcomes, &mut breakers, &CircuitConfig::default(), 1000);
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].url.as_deref(), Some("http://s/1"));
+        assert_eq!(out.survivors, vec!["s"]);
+        assert!(out.repairs.is_empty()); // garbage produced no repair record
     }
 }

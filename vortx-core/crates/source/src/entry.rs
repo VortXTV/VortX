@@ -73,9 +73,22 @@ pub fn plan_streams(
         // providers-repo base, not a Stremio transport, so building a resource URL from it would be
         // garbage. Every other kind keeps the HTTP path unchanged.
         .filter(|e| e.kind != SourceKind::NuvioProvider && e.supports(req))
-        .map(|e| (e.id.clone(), ResourcePath::from(req).to_url(source_base(&e.url))))
+        .map(|e| (e.id.clone(), fetch_url_for(e, req)))
         .collect();
     plan_fanout(&candidates, breakers, cfg, now, budget_ms)
+}
+
+/// The host fetch URL for one snapshot entry. A Stremio/native/HTTP source gets the byte-exact Stremio resource
+/// grammar (`{base}/{resource}/{type}/{id}.json`). An [`SourceKind::Iptv`] source is fetched at its `url`
+/// VERBATIM: that url is the raw M3U playlist / Xtream `get_vod_streams` endpoint (which the host built, creds
+/// baked in), NOT a Stremio transport, so rewriting it into a resource path would be garbage. The IPTV body the
+/// host gets back is mapped to protocol streams by the pure `vortx_live` VOD mapping, then rides the same
+/// settle -> rank path as every other source.
+fn fetch_url_for(entry: &SourceEntry, req: &ResourceRequest) -> String {
+    match entry.kind {
+        SourceKind::Iptv => entry.url.clone(),
+        _ => ResourcePath::from(req).to_url(source_base(&entry.url)),
+    }
 }
 
 /// Plan the JS-provider half of the fan-out for `req` over the same snapshot: the exec twin of
@@ -218,6 +231,47 @@ mod tests {
         // now=1100 -> 100s < 300 cooldown -> "bad" skipped.
         let plan = plan_streams(&entries, &stream_req(), &breakers, &cfg, 1100, 5000);
         assert_eq!(plan.iter().map(|r| r.addon_id.as_str()).collect::<Vec<_>>(), vec!["good"]);
+    }
+
+    #[test]
+    fn an_iptv_source_plans_a_fetch_to_its_raw_endpoint_not_a_stremio_resource_path() {
+        // An Xtream/M3U source's VOD competes in the ranked list: it is planned like an HTTP source, but its
+        // fetch URL is the raw playlist/get_vod_streams endpoint, not a rewritten /stream/type/id.json path.
+        let iptv = SourceEntry {
+            id: "xtream".to_string(),
+            url: "http://host:8080/player_api.php?username=u&password=p&action=get_vod_streams"
+                .to_string(),
+            kind: SourceKind::Iptv,
+            capabilities: vec![ResourceKind::Stream],
+            types: vec!["movie".to_string()],
+            id_prefixes: vec!["tt".to_string()],
+            script_hash: None,
+            permissions: Vec::new(),
+        };
+        let http = entry(
+            "http",
+            "https://h.tv/manifest.json",
+            &[ResourceKind::Stream],
+            &["movie"],
+            &["tt"],
+        );
+        let plan = plan_streams(
+            &[iptv, http],
+            &stream_req(),
+            &BreakerRegistry::new(),
+            &CircuitConfig::default(),
+            1000,
+            5000,
+        );
+        // Both are planned (IPTV VOD competes with the HTTP addon); sorted by addon id -> http, xtream.
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].addon_id, "http");
+        assert_eq!(plan[0].url, "https://h.tv/stream/movie/tt0111161.json");
+        assert_eq!(plan[1].addon_id, "xtream");
+        assert_eq!(
+            plan[1].url,
+            "http://host:8080/player_api.php?username=u&password=p&action=get_vod_streams"
+        );
     }
 
     #[test]

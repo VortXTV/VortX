@@ -12,6 +12,9 @@ vortx-source = { path = "../source" }
 vortx-protocol = { path = "../protocol" }
 # Phase 2: the live DebridStore HTTP clients live HERE (the kernel debrid crate stays pure).
 vortx-debrid = { path = "../debrid" }
+# IPTV VOD promotion: the pure M3U -> protocol Stream mapping turns a fetched playlist body into ranked-ready
+# stream item keys (the Xtream mapping needs host-held creds and is applied by the host with its portal).
+vortx-live = { path = "../live" }
 serde.workspace = true
 serde_json.workspace = true
 percent-encoding.workspace = true

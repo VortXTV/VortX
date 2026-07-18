@@ -15,11 +15,17 @@
 mod audio;
 mod content;
 mod manifest;
+mod repair;
 mod resource;
 mod transport;
 
 pub use audio::{Artist, AudioAlbum, AudioCodec, AudioTrack};
 pub use content::{ContentClass, ContentKind};
+pub use repair::{
+    decode_repair_catalog, decode_repair_manifest, decode_repair_meta, decode_repair_stream,
+    decode_repair_subtitles, repair_catalog_item, repair_meta_item, repair_stream_item,
+    repair_subtitle_item, DecodeReport, Repair, RepairKind,
+};
 pub use manifest::{
     Manifest, ManifestBehaviorHints, ManifestCatalog, ManifestExtra, ManifestResource,
 };

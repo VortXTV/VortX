@@ -8,8 +8,11 @@ publish = false
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+# The IPTV VOD -> protocol Stream mapping (vodstream) lets M3U/Xtream VOD compete in the same ranked stream
+# list as every other source. protocol has no dep on live, so this adds no cycle.
+vortx-protocol = { path = "../protocol" }
 
 [dev-dependencies]
-serde_json.workspace = true
 proptest = "1"

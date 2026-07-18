@@ -140,6 +140,100 @@ pub fn grid<'a>(
         .collect()
 }
 
+/// One slot in a GAP-FILLED grid row: either a real programme (clamped to the window) or a synthesized filler
+/// covering a hole where the EPG has no listing. A gap is NOT a programme (no title/metadata), so it is a
+/// distinct variant the UI renders as "No information" rather than a fake show. Half-open `[start, stop)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GridSlot<'a> {
+    /// A real programme placed on the grid, clamped to the queried window.
+    Program(GridProgram<'a>),
+    /// A synthesized filler over `[start_ms, stop_ms)` where the schedule has no programme.
+    Gap { start_ms: i64, stop_ms: i64 },
+}
+
+impl GridSlot<'_> {
+    /// The slot's window-clamped start.
+    pub fn start_ms(&self) -> i64 {
+        match self {
+            GridSlot::Program(p) => p.clamped_start_ms,
+            GridSlot::Gap { start_ms, .. } => *start_ms,
+        }
+    }
+
+    /// The slot's window-clamped stop.
+    pub fn stop_ms(&self) -> i64 {
+        match self {
+            GridSlot::Program(p) => p.clamped_stop_ms,
+            GridSlot::Gap { stop_ms, .. } => *stop_ms,
+        }
+    }
+
+    /// Whether this slot is a synthesized gap filler.
+    pub fn is_gap(&self) -> bool {
+        matches!(self, GridSlot::Gap { .. })
+    }
+}
+
+/// One channel's GAP-FILLED row: slots that TILE the whole window with no holes and no overlaps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FilledChannelGrid<'a> {
+    pub channel_id: String,
+    pub slots: Vec<GridSlot<'a>>,
+}
+
+/// The gap-synthesized grid for `channel_ids` over `window`: like [`grid`], but every hole between programmes
+/// (and the head/tail of the window) is filled with a synthesized [`GridSlot::Gap`], so a guide UI never shows
+/// a blank cell it has to special-case. Interval algebra: for each channel, the window-clamped programmes are
+/// swept in time order and a gap is emitted wherever a cursor falls behind the next programme's start; a
+/// programme starting before the cursor (overlapping bad data) is clamped forward so slots never overlap. An
+/// empty channel becomes one full-window gap. The output tiles `[window.start, window.end)` exactly.
+pub fn grid_filled<'a>(
+    programs: &'a [Program],
+    channel_ids: &[&str],
+    window: &EpgWindow,
+) -> Vec<FilledChannelGrid<'a>> {
+    grid(programs, channel_ids, window)
+        .into_iter()
+        .map(|row| FilledChannelGrid {
+            slots: fill_row(&row.programs, window),
+            channel_id: row.channel_id,
+        })
+        .collect()
+}
+
+/// Fill one channel row's programmes into a hole-free slot list over `window`. Programmes arrive already
+/// window-clamped and time-sorted (from [`grid`]); this only inserts gap fillers and forward-clamps any
+/// overlap so the result tiles the window with no holes and no overlaps.
+fn fill_row<'a>(programs: &[GridProgram<'a>], window: &EpgWindow) -> Vec<GridSlot<'a>> {
+    let mut slots: Vec<GridSlot<'a>> = Vec::new();
+    let mut cursor = window.start_utc_ms;
+    for gp in programs {
+        // Forward-clamp a programme that starts before the cursor (overlap in bad data): slots never overlap.
+        let start = gp.clamped_start_ms.max(cursor);
+        let stop = gp.clamped_stop_ms.max(start);
+        if start >= window.end_utc_ms {
+            break;
+        }
+        if start > cursor {
+            slots.push(GridSlot::Gap { start_ms: cursor, stop_ms: start });
+        }
+        if stop > start {
+            slots.push(GridSlot::Program(GridProgram {
+                program: gp.program,
+                clamped_start_ms: start,
+                clamped_stop_ms: stop,
+            }));
+            cursor = stop;
+        }
+    }
+    // Tail gap: from the last programme's end (or the whole window when empty) to the window end.
+    if cursor < window.end_utc_ms {
+        slots.push(GridSlot::Gap { start_ms: cursor, stop_ms: window.end_utc_ms });
+    }
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +332,74 @@ mod tests {
         let progs = vec![prog("c", 0, 300, "long"), prog("c", 100, 200, "short")];
         let nn = now_next(&progs, "c", 150);
         assert_eq!(nn.now.unwrap().title, "short");
+    }
+
+    // ---- EPG gap synthesis (Feature B) ----
+
+    /// The slots of a filled row must tile the window exactly: contiguous, no holes, no overlaps, covering
+    /// `[window.start, window.end)`.
+    fn assert_tiles(slots: &[GridSlot], window: &EpgWindow) {
+        assert!(!slots.is_empty(), "a window is never empty after filling");
+        assert_eq!(slots.first().unwrap().start_ms(), window.start_utc_ms);
+        assert_eq!(slots.last().unwrap().stop_ms(), window.end_utc_ms);
+        for pair in slots.windows(2) {
+            assert_eq!(pair[0].stop_ms(), pair[1].start_ms(), "hole or overlap between slots");
+        }
+    }
+
+    #[test]
+    fn a_mid_schedule_hole_becomes_a_gap_slot() {
+        let progs = vec![prog("c", 0, 100, "A"), prog("c", 200, 300, "C")]; // hole at [100,200)
+        let w = EpgWindow::new(0, 300);
+        let g = grid_filled(&progs, &["c"], &w);
+        assert_eq!(g.len(), 1);
+        let slots = &g[0].slots;
+        assert_tiles(slots, &w);
+        assert_eq!(slots.len(), 3); // A, gap, C
+        assert!(!slots[0].is_gap());
+        assert_eq!(slots[1], GridSlot::Gap { start_ms: 100, stop_ms: 200 });
+        assert!(!slots[2].is_gap());
+    }
+
+    #[test]
+    fn head_and_tail_gaps_pad_the_window_edges() {
+        // A single programme in the middle: the window head and tail both become gaps.
+        let progs = vec![prog("c", 100, 200, "B")];
+        let w = EpgWindow::new(0, 300);
+        let slots = grid_filled(&progs, &["c"], &w).remove(0).slots;
+        assert_tiles(&slots, &w);
+        assert_eq!(slots[0], GridSlot::Gap { start_ms: 0, stop_ms: 100 });
+        assert!(matches!(slots[1], GridSlot::Program(_)));
+        assert_eq!(slots[2], GridSlot::Gap { start_ms: 200, stop_ms: 300 });
+    }
+
+    #[test]
+    fn an_empty_channel_is_one_full_window_gap() {
+        let progs = vec![prog("a", 0, 100, "A")];
+        let w = EpgWindow::new(0, 100);
+        let g = grid_filled(&progs, &["a", "b"], &w);
+        assert_eq!(g[1].channel_id, "b");
+        assert_eq!(g[1].slots, vec![GridSlot::Gap { start_ms: 0, stop_ms: 100 }]);
+        assert_tiles(&g[1].slots, &w);
+    }
+
+    #[test]
+    fn a_fully_scheduled_window_has_no_gap_slots() {
+        let progs = vec![prog("c", 0, 100, "A"), prog("c", 100, 200, "B")];
+        let w = EpgWindow::new(0, 200);
+        let slots = grid_filled(&progs, &["c"], &w).remove(0).slots;
+        assert_tiles(&slots, &w);
+        assert!(slots.iter().all(|s| !s.is_gap()));
+        assert_eq!(slots.len(), 2);
+    }
+
+    #[test]
+    fn overlapping_programmes_are_forward_clamped_so_slots_never_overlap() {
+        // Bad data: B starts inside A. The filler clamps B forward to A's end; slots still tile with no overlap.
+        let progs = vec![prog("c", 0, 150, "A"), prog("c", 100, 250, "B")];
+        let w = EpgWindow::new(0, 250);
+        let slots = grid_filled(&progs, &["c"], &w).remove(0).slots;
+        assert_tiles(&slots, &w);
+        assert!(slots.iter().all(|s| !s.is_gap()));
     }
 }

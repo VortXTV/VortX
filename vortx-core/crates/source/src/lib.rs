@@ -21,6 +21,7 @@ mod entry;
 mod exit;
 mod fanout;
 mod identity;
+mod iptv;
 mod manifest;
 mod native;
 mod orchestrate;
@@ -47,6 +48,7 @@ pub use fanout::{
     CircuitConfig, FailedAddon, FailureKind, Outcome,
 };
 pub use identity::{reconcile, CanonicalId, ExternalId, IdSet, Namespace};
+pub use iptv::IptvSource;
 pub use manifest::{
     ConfigCapability, DebridCapability, HiveCapability, ManifestSignature, RankingCapability,
     VortxAddonManifest, VortxTransport, NATIVE_SCHEMA,

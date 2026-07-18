@@ -16,7 +16,7 @@ use vortx_debrid::{
 };
 use vortx_exec::{ExecOutcome, ExecRequest};
 use vortx_live::{parse_xmltv, Epg};
-use vortx_protocol::{ContentKind, MetaDetail, MetaPreview, Stream};
+use vortx_protocol::{ContentKind, DecodeReport, MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, rank_for, RankedStream, RankingPrefs};
 use vortx_reco::{
     build_home_feed, build_taste, visible_catalog, watch_log_from_library, AllEligible, AllOf,
@@ -318,6 +318,11 @@ pub enum ResolveResponse {
         ranked: Vec<RankedStream>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
+        /// The Postel lenient-decode report: every repair the settle applied to recover a strict-invalid stream
+        /// item (the "serve add-ons other clients hard-fail on" path). Additive + skip-serialized when empty, so
+        /// a clean settle is byte-identical on the wire; a host reads it to log or down-rank a patched source.
+        #[serde(rename = "repairs", skip_serializing_if = "DecodeReport::is_empty")]
+        repairs: DecodeReport,
     },
     /// The fetch plan for a catalog LOAD (circuit-open sources skipped, sorted by addon id).
     CatalogLoadPlan { requests: Vec<FetchRequest> },
@@ -328,6 +333,9 @@ pub enum ResolveResponse {
         metas: Vec<MetaPreview>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
+        /// Lenient-decode report (see [`ResolveResponse::SettledStreams`]); skip-serialized when empty.
+        #[serde(rename = "repairs", skip_serializing_if = "DecodeReport::is_empty")]
+        repairs: DecodeReport,
     },
     /// The fetch plan for a meta LOAD (circuit-open sources skipped, sorted by addon id).
     MetaLoadPlan { requests: Vec<FetchRequest> },
@@ -337,6 +345,9 @@ pub enum ResolveResponse {
         meta: Option<Box<MetaDetail>>,
         #[serde(rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
+        /// Lenient-decode report (see [`ResolveResponse::SettledStreams`]); skip-serialized when empty.
+        #[serde(rename = "repairs", skip_serializing_if = "DecodeReport::is_empty")]
+        repairs: DecodeReport,
     },
     /// The fetch plan for a subtitles LOAD (circuit-open sources skipped, sorted by addon id).
     SubtitlesLoadPlan { requests: Vec<FetchRequest> },
@@ -479,6 +490,7 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             ResolveResponse::SettledStreams {
                 ranked,
                 circuit_snapshot,
+                repairs: resolved.repairs,
             }
         }
         ResolveRequest::CatalogLoad {
@@ -524,6 +536,7 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             ResolveResponse::SettledCatalog {
                 metas,
                 circuit_snapshot,
+                repairs: resolved.repairs,
             }
         }
         ResolveRequest::MetaLoad {
@@ -565,6 +578,7 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             ResolveResponse::SettledMeta {
                 meta: allowed.then(|| resolved.meta.map(Box::new)).flatten(),
                 circuit_snapshot,
+                repairs: resolved.repairs,
             }
         }
         ResolveRequest::SubtitlesLoad {
@@ -867,6 +881,94 @@ mod tests {
             panic!("expected streams responses");
         };
         assert_eq!(a, b); // video profile == frozen default
+    }
+
+    #[test]
+    fn iptv_vod_is_planned_and_competes_in_the_ranked_stream_list() {
+        // Feature B end-to-end: an Iptv source is installed as a registry snapshot entry alongside an HTTP
+        // addon. PLAN routes both (the Iptv one to its RAW endpoint, not a Stremio resource path); SETTLE fuses
+        // an IPTV VOD stream (2160p) with the HTTP addon's stream (1080p) into ONE ranked list where the higher
+        // tier wins, with zero IPTV-specific ranking code.
+        let engine = init_runtime("owner", "Owner");
+
+        // 1. PLAN over a mixed snapshot.
+        let plan_req = r#"{"kind":"stream_load","req":{"kind":"stream","type":"movie","id":"tt1"},
+            "registrySnapshot":[
+              {"id":"xtream","url":"http://host/player_api.php?action=get_vod_streams","kind":"iptv","capabilities":["stream"],"types":["movie"],"idPrefixes":["tt"]},
+              {"id":"http","url":"https://addon.tv/manifest.json","kind":"stremio_addon","capabilities":["stream"],"types":["movie"],"idPrefixes":["tt"]}
+            ],"now":0}"#;
+        let plan_out = resolve_json(&engine, plan_req);
+        let plan_v: serde_json::Value = serde_json::from_str(&plan_out).unwrap();
+        assert_eq!(plan_v["kind"], "stream_load_plan");
+        let reqs = plan_v["requests"].as_array().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let by_id: std::collections::BTreeMap<&str, &str> = reqs
+            .iter()
+            .map(|r| (r["addon_id"].as_str().unwrap(), r["url"].as_str().unwrap()))
+            .collect();
+        // The IPTV source is fetched at its raw endpoint verbatim; the HTTP addon at the Stremio resource path.
+        assert_eq!(by_id["xtream"], "http://host/player_api.php?action=get_vod_streams");
+        assert_eq!(by_id["http"], "https://addon.tv/stream/movie/tt1.json");
+
+        // 2. SETTLE: the host mapped the IPTV body to a 2160p protocol stream; the HTTP addon returned 1080p.
+        let settle_req = r#"{"kind":"settle_streams",
+            "plan":[
+              {"addon_id":"xtream","url":"http://host/player_api.php?action=get_vod_streams","budgetMs":5000},
+              {"addon_id":"http","url":"https://addon.tv/stream/movie/tt1.json","budgetMs":5000}
+            ],
+            "outcomes":{
+              "xtream":{"status":"ok","items":["{\"name\":\"Movie 2160p\",\"url\":\"http://host/movie/u/p/9.mkv\",\"behaviorHints\":{\"vortx\":{\"kind\":\"http\"}}}"]},
+              "http":{"status":"ok","items":["{\"name\":\"Movie 1080p WEB-DL\",\"url\":\"https://cdn/1080.mkv\"}"]}
+            },"now":0}"#;
+        let settle_out = resolve_json(&engine, settle_req);
+        let sv: serde_json::Value = serde_json::from_str(&settle_out).unwrap();
+        assert_eq!(sv["kind"], "settled_streams");
+        let ranked = sv["ranked"].as_array().unwrap();
+        assert_eq!(ranked.len(), 2, "both sources compete in one list");
+        // Items merge in sorted-addon-id order (http=0, xtream=1), so the IPTV VOD stream is raw_index 1. It is
+        // 2160p, so it outranks the 1080p HTTP stream: the IPTV VOD wins the ranked list with no IPTV-special code.
+        assert_eq!(ranked[0]["raw_index"], 1, "the 2160p IPTV VOD stream ranks first");
+        assert_eq!(ranked[1]["raw_index"], 0);
+        assert!(
+            ranked[0]["score"].as_i64().unwrap() > ranked[1]["score"].as_i64().unwrap(),
+            "the higher-tier IPTV VOD stream must rank first"
+        );
+    }
+
+    #[test]
+    fn settle_streams_surfaces_the_repair_report_for_a_broken_item() {
+        // A source returns a stringified fileIdx (strict-invalid). The engine settle repairs it, ranks the
+        // recovered stream, AND surfaces the lenient-decode report on the wire.
+        let engine = init_runtime("owner", "Owner");
+        let req = r#"{"kind":"settle_streams",
+            "plan":[{"addon_id":"iptv","url":"https://iptv.example/stream/movie/tt1.json","budgetMs":5000}],
+            "outcomes":{"iptv":{"status":"ok","items":["{\"name\":\"A 1080p\",\"url\":\"/dl/x.mkv\",\"fileIdx\":\"0\"}"]}},
+            "now":0}"#;
+        let out = resolve_json(&engine, req);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["kind"], "settled_streams");
+        assert_eq!(v["ranked"].as_array().unwrap().len(), 1); // recovered, not dropped
+        // The repair report is present and names the repairs applied.
+        let kinds: Vec<String> = v["repairs"]["repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert!(kinds.contains(&"stringified_number".to_string()), "{kinds:?}");
+        assert!(kinds.contains(&"relative_url".to_string()), "{kinds:?}");
+    }
+
+    #[test]
+    fn a_clean_settle_omits_the_repairs_field_entirely() {
+        // Byte-frozen wire: a strict-valid settle emits no `repairs` key at all.
+        let engine = init_runtime("owner", "Owner");
+        let req = r#"{"kind":"settle_streams",
+            "plan":[{"addon_id":"a","url":"http://a/stream/movie/tt1.json","budgetMs":5000}],
+            "outcomes":{"a":{"status":"ok","items":["{\"name\":\"720p WEB-DL\",\"url\":\"http://a/1\"}"]}},
+            "now":0}"#;
+        let out = resolve_json(&engine, req);
+        assert!(!out.contains("\"repairs\""), "clean settle must not emit repairs: {out}");
     }
 
     #[test]
