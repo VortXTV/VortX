@@ -231,6 +231,15 @@ final class SourceListModel: ObservableObject {
                 self.tiers = rankedTiers
                 self.resolutionOptions = rankedResOpts
             }
+
+            // Phase 7 SHADOW (flag `vortxShadowRanking`, default OFF): rank the SAME assembled
+            // inputs through the vortx-core engine and log any ordering divergence vs the Swift
+            // rank published above. Pure observation, run strictly AFTER the live publish: flag
+            // OFF is a single boolean read, flag ON spawns its own detached utility task, and in
+            // neither case can it touch `groups`/`best` or delay this rebuild.
+            VortxShadowRanking.observe(groups: assembled, continuity: ctx.continuity, pin: ctx.pin,
+                                       cachedHashes: cachedHashes, prefs: prefsSnapshot,
+                                       metaId: ctx.metaId)
         }
     }
 }

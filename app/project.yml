@@ -265,10 +265,23 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework, iOS slices), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # Phase 7 cutover slice 1: the vortx-core engine ABI (vortx-ffi staticlib xcframework;
+      # iOS device + simulator + macOS slices, built by vortx-core/scripts, kernel-only, with all
+      # non-vortx_* globals localized so it link-coexists with StremioXCore and Libdovi). Linked
+      # into THIS target only for now; it drives the flag-gated shadow ranking diff
+      # (SourcesShared/VortxBridge.swift). The live StreamRanking/CoreBridge path is untouched and
+      # the `vortxShadowRanking` default is OFF.
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        # VortxEngine module discovery. The vortx-ffi xcframework nests its header + module.modulemap
+        # under Headers/vortx/ (a flat Headers/ would collide with StremioXCore's module.modulemap in
+        # the shared Products/include/ copy step: "Multiple commands produce .../module.modulemap").
+        # Swift finds the nested module through this include path instead.
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "183"
         TARGETED_DEVICE_FAMILY: "1,2"
