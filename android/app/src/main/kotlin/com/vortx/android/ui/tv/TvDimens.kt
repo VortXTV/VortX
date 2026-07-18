@@ -29,4 +29,9 @@ object TvDimens {
 
     /// Focus ring width drawn around the focused tile (accent-bright border on focus).
     val focusBorder = 3.dp
+
+    /// Width of the left navigation rail (Home / Discover / Library / Search / Settings). Wide enough for
+    /// the longest label ("Discover") beside its glyph at 10-foot legibility, without eating the browse
+    /// wall to its right.
+    val railWidth = 232.dp
 }

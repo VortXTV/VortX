@@ -22,7 +22,6 @@ import com.vortx.android.model.Playable
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
-import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import kotlinx.coroutines.launch
 
@@ -113,8 +112,11 @@ fun TvApp(
                     onPlay = { playing = it },
                 )
             } else {
-                val homeVm: HomeViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
-                TvHomeScreen(viewModel = homeVm, onItem = { detail = it })
+                // The browse layer: the left-rail shell over the five top-level surfaces (Home / Discover /
+                // Library / Search / Settings). It sits UNDER this detail/player block, so opening a title
+                // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
+                // Play flow is unchanged.
+                TvShell(repo = repo, auth = auth, onItem = { detail = it })
             }
         }
     }
