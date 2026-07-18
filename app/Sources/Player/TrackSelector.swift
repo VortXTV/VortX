@@ -88,6 +88,23 @@ enum TrackSelector {
         return !ca.isEmpty && ca == canonical(b)
     }
 
+    /// Filter an external-subtitle list to the preferred subtitle languages when the opt-in
+    /// `TrackPreferences.subtitlesOnlyPreferred` toggle is on; a no-op (returns `items` unchanged) otherwise.
+    /// Unknown/undetermined languages ("", "und", "unknown") are ALWAYS kept so the filter can never hide every
+    /// option (add-on and embedded-upload subs frequently report no language). Uses the tolerant `matches`, so
+    /// "tur"/"tr-TR" still satisfy a "tr" preference. Generic over the row type via a `language` accessor so
+    /// both the add-on rows (`AddonSubtitle`) and the community-pooled rows share one path.
+    static func keepingPreferredSubtitleLanguages<T>(_ items: [T], language: (T) -> String) -> [T] {
+        guard TrackPreferences.subtitlesOnlyPreferred else { return items }
+        let prefs = TrackPreferences.current.subtitleLanguages
+        guard !prefs.isEmpty else { return items }
+        return items.filter { item in
+            let raw = language(item).trimmingCharacters(in: .whitespaces).lowercased()
+            if raw.isEmpty || raw == "und" || raw == "unknown" { return true }
+            return prefs.contains { matches(language(item), $0) }
+        }
+    }
+
     /// Reduce a language code to a canonical 2-letter form (eng → en, en-US → en, ja → ja).
     static func canonical(_ code: String) -> String {
         let base = code.lowercased().split(separator: "-").first.map(String.init) ?? ""

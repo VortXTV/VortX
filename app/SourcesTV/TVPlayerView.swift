@@ -1432,10 +1432,12 @@ struct TVPlayerView: View {
                 let lang = subtitleTracks.first { $0.id == id }.map { langName($0.lang) } ?? "\(id)"
                 VXProbe.event("subs", "subs selected \(lang)")
             }
-            // External subtitles from the account's subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
+            // External subtitles from the installed subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
             // the downloaded file (it joins the embedded list above); AVPlayer parses it and renders the cues
-            // over the video itself.
-            let available = addonSubs.filter { !addedSubURLs.contains($0.url) }
+            // over the video itself. When the opt-in "only preferred languages" toggle is on, non-preferred
+            // languages are hidden (unknown-language subs always kept so the list never empties).
+            let available = TrackSelector.keepingPreferredSubtitleLanguages(
+                addonSubs.filter { !addedSubURLs.contains($0.url) }, language: { $0.lang })
             if !available.isEmpty {
                 rows.append(OptionRow(label: String(localized: "From add-ons"), isHeader: true))
                 for sub in available.prefix(30) {
@@ -1460,8 +1462,10 @@ struct TVPlayerView: View {
             }
             // Community-pooled subtitles (P2): other users' extracted subs for this title, in the SAME list.
             // No add-on wording — labeled by language with a subtle "Community" provenance. Work on BOTH engines
-            // now (AVPlayer renders the downloaded file over the video, same as the add-on rows above).
-            let pooled = pooledSubs.filter { !addedPooledIDs.contains($0.id) }
+            // now (AVPlayer renders the downloaded file over the video, same as the add-on rows above). Same
+            // opt-in preferred-language filter as the add-on rows above.
+            let pooled = TrackSelector.keepingPreferredSubtitleLanguages(
+                pooledSubs.filter { !addedPooledIDs.contains($0.id) }, language: { $0.lang })
             if !pooled.isEmpty {
                 rows.append(OptionRow(label: String(localized: "Community"), isHeader: true))
                 for sub in pooled.prefix(30) {
@@ -3055,11 +3059,13 @@ struct TVPlayerView: View {
     /// once per episode. Movies query by their id; episodes by id:season:episode.
     private func fetchAddonSubtitles() {
         guard let m = curMeta else { return }
-        // The account's add-on collection loads async at app start; latching an empty list here would hide
-        // add-on subtitles for the whole session. Bail before touching the key so a later call (playback start /
-        // panel open) fetches once the add-ons have arrived.
-        let addons = account.addons
-        guard !addons.isEmpty else { return }
+        // Subtitle add-ons come from the ENGINE's installed set (`core.addons`, the source of truth since VortX
+        // went account-primary), unioned with the legacy Stremio collection (`account.addons`) as a fallback.
+        // Reading account.addons alone showed NO add-on subtitles on a VortX-primary device (#148). Both load
+        // async, so latching an empty union here would hide add-on subtitles for the whole session: bail before
+        // touching the key so a later call (playback start / panel open) fetches once the add-ons have arrived.
+        let sources = SubtitleAddonService.installedSources(engine: core.addons, account: account.addons)
+        guard !sources.isEmpty else { return }
         // A hub / TMDB-catalog play carries a `tmdb:` library id that OpenSubtitles-class add-ons cannot answer,
         // so the raw id returns nothing and add-on subtitles never appear. Resolve tmdb -> tt ONCE (the same
         // persistent trickplay resolver), then re-enter with the tt id. A failed resolve falls through to the
@@ -3089,7 +3095,7 @@ struct TVPlayerView: View {
         addonSubs = []
         addedSubURLs = []
         Task { @MainActor in
-            let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: effectiveVideoId)
+            let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId)
             guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
             addonSubs = subs
             if showOptions, panelKind == .subtitles { panelRows = optionRows }

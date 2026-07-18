@@ -308,6 +308,10 @@ struct CoreDescriptor: Decodable, Identifiable {
     var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
     var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
     var providesSubtitles: Bool { (manifest.resources ?? []).contains { $0.name == "subtitles" } }
+    /// Base URL for resource requests: the transport URL minus the trailing `/manifest.json` (mirrors
+    /// `AddonDescriptor.baseUrl`). The engine's installed add-ons became the source of truth once VortX went
+    /// account-primary, so the subtitle fetch hits `\(baseUrl)/subtitles/…` off this.
+    var baseUrl: String { transportUrl.replacingOccurrences(of: "/manifest.json", with: "") }
     var hasCatalogs: Bool { !manifest.catalogs.isEmpty }
     /// Host only (the full transportUrl can embed a debrid config token).
     var host: String { URL(string: transportUrl)?.host ?? transportUrl }
