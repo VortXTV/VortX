@@ -5,6 +5,8 @@
 //!
 //! - [`init_runtime`] builds an [`Engine`] over the first-class multi-profile `VortxStore` (the structural
 //!   break from stremio-core's single account `Ctx`).
+//! - [`init_from_state_json`] rebuilds an [`Engine`] from a state JSON previously captured with
+//!   [`get_state_json`] (the cold-load hydration path; an additive input, the output wire is untouched).
 //! - [`dispatch_json`] applies one JSON [`Action`] and returns a JSON [`DispatchResult`] with the
 //!   [`EngineEvent`]s it produced. A malformed action yields a clean `{ ok: false, error }`, never a panic.
 //! - [`get_state_json`] serializes the current state as the host's read model.
@@ -21,8 +23,8 @@ mod resolve;
 
 pub use action::{Action, DispatchResult, EngineEvent};
 pub use engine::{
-    dispatch, dispatch_json, get_state_delta_json, get_state_json, init_runtime, take_state_delta,
-    Engine, StateDelta,
+    dispatch, dispatch_json, get_state_delta_json, get_state_json, init_from_state_json,
+    init_runtime, take_state_delta, Engine, StateDelta,
 };
 pub use env::{Env, InMemoryEnv};
 pub use resolve::{resolve, resolve_json, ResolveRequest, ResolveResponse};

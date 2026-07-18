@@ -17,7 +17,18 @@
 //! void  vortx_engine_free(VortxEngine*);
 //! ```
 //!
-//! These seven symbols are DEFINED once, in [`vortx_engine::ffi`] (the kernel's own extern C
+//! Plus the ADDITIVE cold-load hydration entry (an input path only; the 7 contract symbols above
+//! and their output bytes are untouched):
+//!
+//! ```c
+//! VortxEngine* vortx_init_from_state_json(const char* state_json); /* NULL on bad input */
+//! ```
+//!
+//! It rebuilds a runtime from a state document previously captured with `vortx_get_state_json`, so
+//! a host restart reconstructs persisted state instead of seeding a fresh store (byte-identical
+//! round trip, empty first delta, no events).
+//!
+//! These symbols are DEFINED once, in [`vortx_engine::ffi`] (the kernel's own extern C
 //! marshalling layer, conformance-pinned against the pure JSON contracts), and re-exported here.
 //! They are deliberately not redefined in this crate: two `#[no_mangle]` definitions of the same
 //! symbol in one crate graph are a duplicate-symbol link error, and the kernel keeps its ABI next
@@ -80,7 +91,7 @@ pub mod host;
 // `#[no_mangle]` definitions stay with the kernel contracts they marshal.
 pub use vortx_engine::ffi::{
     vortx_dispatch_json, vortx_engine_free, vortx_get_state_delta_json, vortx_get_state_json,
-    vortx_init_runtime, vortx_resolve_json, vortx_string_free,
+    vortx_init_from_state_json, vortx_init_runtime, vortx_resolve_json, vortx_string_free,
 };
 pub use vortx_engine::Engine;
 

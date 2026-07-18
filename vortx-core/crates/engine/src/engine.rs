@@ -81,6 +81,25 @@ pub fn init_runtime(owner_id: &str, owner_name: &str) -> Engine {
     }
 }
 
+/// Rebuild a runtime from a state JSON previously captured with [`get_state_json`]: the cold-load
+/// hydration path, so a host restart reconstructs the engine from persisted state instead of seeding a
+/// fresh (empty) store. The store deserializes verbatim: whatever profile ids, library records, and
+/// watch documents the capture carries pass through untouched, and any field a newer kernel added since
+/// the capture fills in through its serde default (the same forward-migration rule the sync documents
+/// already rely on). Purely an INPUT path: no event fires and the dirty set starts EMPTY, exactly as
+/// after [`init_runtime`], because the host already holds the very state it handed in (per the cold-load
+/// contract on [`Dirty`]). The Continue Watching rail, resume points, and watched sets are part of the
+/// serialized library, so they are seeded directly by deserialization, not re-derived. A capture from
+/// [`get_state_json`] round-trips byte-identically: hydrating it and serializing again yields the same
+/// bytes (pinned by the round-trip identity test).
+pub fn init_from_state_json(state_json: &str) -> Result<Engine, serde_json::Error> {
+    let store: VortxStore = serde_json::from_str(state_json)?;
+    Ok(Engine {
+        store,
+        dirty: Dirty::default(),
+    })
+}
+
 /// Apply one typed action to the engine. Pure over `(state, action, env)`; never panics.
 pub fn dispatch(engine: &mut Engine, action: Action, env: &dyn Env) -> DispatchResult {
     match action {
@@ -492,5 +511,158 @@ mod tests {
         let json = get_state_json(&engine);
         let back: VortxStore = serde_json::from_str(&json).unwrap();
         assert_eq!(&back, engine.store());
+    }
+
+    /// Build a populated engine: multiple profiles, a switch, in-progress titles (Continue Watching),
+    /// a finished episode (watched + history), a dismissal tombstone, and a merged remote watch doc.
+    fn populated_engine() -> Engine {
+        use vortx_state::{WatchLog, WatchState};
+        let mut engine = init_runtime("owner", "Owner");
+        for (action, at) in [
+            (
+                Action::AddProfile {
+                    id: "kid".into(),
+                    name: "Kid".into(),
+                },
+                1000,
+            ),
+            (
+                Action::SetParental {
+                    id: "kid".into(),
+                    kids: true,
+                    maturity_ceiling: Some(7),
+                },
+                1001,
+            ),
+            (
+                Action::ReportProgress {
+                    meta_id: "tt1".into(),
+                    video_id: None,
+                    name: "A Movie".into(),
+                    position_ms: 300_000,
+                    duration_ms: 600_000,
+                    content_kind: None,
+                },
+                1002,
+            ),
+            (
+                Action::ReportProgress {
+                    meta_id: "tt2".into(),
+                    video_id: Some("tt2:1:1".into()),
+                    name: "A Series".into(),
+                    position_ms: 60_000,
+                    duration_ms: 600_000,
+                    content_kind: None,
+                },
+                1003,
+            ),
+            (
+                Action::MarkWatched {
+                    meta_id: "tt3".into(),
+                    video_id: Some("tt3:1:1".into()),
+                },
+                1004,
+            ),
+            (
+                Action::RemoveFromContinueWatching {
+                    meta_id: "tt2".into(),
+                },
+                1005,
+            ),
+            (Action::SwitchProfile { id: "kid".into() }, 1006),
+            (
+                Action::ReportProgress {
+                    meta_id: "kt1".into(),
+                    video_id: None,
+                    name: "Kid Show".into(),
+                    position_ms: 30_000,
+                    duration_ms: 600_000,
+                    content_kind: None,
+                },
+                1007,
+            ),
+        ] {
+            let r = dispatch(&mut engine, action, &InMemoryEnv::new(at));
+            assert!(r.ok, "populate step failed: {:?}", r.error);
+        }
+        // A remote device's watch doc merged into the owner profile (exercises the CRDT in state).
+        let mut remote = WatchLog::new();
+        remote.insert("tt4".into(), WatchState::finished(2000));
+        let r = dispatch(
+            &mut engine,
+            Action::MergeWatchState {
+                profile_id: "owner".into(),
+                log: remote,
+            },
+            &InMemoryEnv::new(1008),
+        );
+        assert!(r.ok);
+        engine
+    }
+
+    #[test]
+    fn hydration_round_trip_is_byte_identical() {
+        // THE cold-load identity proof: get_state_json OUT -> init_from_state_json IN ->
+        // get_state_json again must be BYTE-EQUAL, so a host restart can never lose or mutate state.
+        let engine = populated_engine();
+        let captured = get_state_json(&engine);
+
+        let hydrated = init_from_state_json(&captured).expect("captured state hydrates");
+        let recaptured = get_state_json(&hydrated);
+        assert_eq!(
+            captured, recaptured,
+            "hydration round trip must be byte-equal"
+        );
+
+        // The stores are semantically equal too (not just their serializations).
+        assert_eq!(hydrated.store(), engine.store());
+    }
+
+    #[test]
+    fn hydration_seeds_continue_watching_without_dirty_or_events() {
+        let captured = get_state_json(&populated_engine());
+        let mut hydrated = init_from_state_json(&captured).unwrap();
+
+        // Continue Watching came back seeded straight from state (kid profile is active).
+        assert_eq!(hydrated.store().active_profile_id, ProfileId::new("kid"));
+        let kid_cw = &hydrated.store().active_library().unwrap().continue_watching;
+        assert_eq!(kid_cw.len(), 1);
+        assert_eq!(kid_cw[0].id, "kt1");
+        let owner_lib = hydrated.store().library(&ProfileId::new("owner")).unwrap();
+        assert_eq!(owner_lib.continue_watching.len(), 1); // tt1 in progress, tt2 dismissed
+        assert!(owner_lib.watch_log["tt2"].is_removed()); // the dismissal tombstone survived
+        assert!(owner_lib.watch_log["tt4"].is_watched()); // the merged remote doc survived
+
+        // No state-change side effects: nothing dirty, so the first delta is empty.
+        assert!(!hydrated.has_pending_changes());
+        assert_eq!(get_state_delta_json(&mut hydrated), "{}");
+    }
+
+    #[test]
+    fn hydrated_engine_keeps_dispatching_and_deltas_stay_incremental() {
+        let captured = get_state_json(&populated_engine());
+        let mut hydrated = init_from_state_json(&captured).unwrap();
+
+        // A post-hydration edit dispatches normally and the delta carries ONLY that change.
+        let r = dispatch(
+            &mut hydrated,
+            Action::AddProfile {
+                id: "guest".into(),
+                name: "Guest".into(),
+            },
+            &env(),
+        );
+        assert!(r.ok);
+        let delta = take_state_delta(&mut hydrated);
+        assert_eq!(delta.profiles.len(), 1);
+        assert_eq!(delta.profiles[0].id, ProfileId::new("guest"));
+        assert!(delta.libraries.is_empty());
+    }
+
+    #[test]
+    fn hydration_rejects_malformed_state_cleanly() {
+        assert!(init_from_state_json("not json").is_err());
+        assert!(init_from_state_json("{}").is_err()); // no activeProfileId: not a state document
+        assert!(init_from_state_json(r#"{"activeProfileId":42}"#).is_err()); // wrong shape
     }
 }

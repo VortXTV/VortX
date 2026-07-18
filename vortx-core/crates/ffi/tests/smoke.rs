@@ -10,7 +10,7 @@ use std::ptr;
 use serde_json::Value;
 use vortx_ffi::{
     vortx_dispatch_json, vortx_engine_free, vortx_get_state_delta_json, vortx_get_state_json,
-    vortx_init_runtime, vortx_resolve_json, vortx_string_free,
+    vortx_init_from_state_json, vortx_init_runtime, vortx_resolve_json, vortx_string_free,
 };
 
 /// Build a NUL-terminated C string for a call argument.
@@ -74,6 +74,40 @@ fn c_abi_round_trip_dispatch_state_delta_resolve() {
         assert_eq!(streams["kind"], "streams");
 
         vortx_engine_free(engine);
+    }
+}
+
+#[test]
+fn c_abi_cold_load_hydration_round_trip_is_byte_identical() {
+    // The cold-load path a real host restart takes: capture the full state, free the engine, then
+    // rebuild from the captured document and prove the state came back byte-for-byte with an empty
+    // first delta (hydration marks nothing dirty and fires no events).
+    unsafe {
+        let engine = vortx_init_runtime(cs("owner").as_ptr(), cs("Owner").as_ptr());
+        let add = cs(r#"{"type":"add_profile","id":"kid","name":"Kid"}"#);
+        assert!(read_and_free(vortx_dispatch_json(engine, add.as_ptr(), 1000)).contains("true"));
+        let prog = cs(
+            r#"{"type":"report_progress","metaId":"tt1","name":"A Movie","positionMs":300000,"durationMs":600000}"#,
+        );
+        assert!(read_and_free(vortx_dispatch_json(engine, prog.as_ptr(), 1001)).contains("true"));
+
+        let captured = read_and_free(vortx_get_state_json(engine));
+        vortx_engine_free(engine); // the process "restarts": only the captured bytes survive
+
+        let hydrated = vortx_init_from_state_json(cs(&captured).as_ptr());
+        assert!(!hydrated.is_null(), "captured state must hydrate");
+        let recaptured = read_and_free(vortx_get_state_json(hydrated));
+        assert_eq!(
+            captured, recaptured,
+            "cold-load hydration must be byte-equal"
+        );
+        assert_eq!(read_and_free(vortx_get_state_delta_json(hydrated)), "{}");
+
+        // Bad input is a NULL handle, never a crash or a half-built engine.
+        assert!(vortx_init_from_state_json(ptr::null()).is_null());
+        assert!(vortx_init_from_state_json(cs("not a state doc").as_ptr()).is_null());
+
+        vortx_engine_free(hydrated);
     }
 }
 

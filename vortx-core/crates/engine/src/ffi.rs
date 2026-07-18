@@ -14,6 +14,11 @@
 //! char*   vortx_get_state_delta_json(Engine*);     // owned JSON: changed records only, clears dirty
 //! void    vortx_string_free(char*);    // free a char* returned above
 //! void    vortx_engine_free(Engine*);  // free the runtime
+//!
+//! // Additive (input path only; the 7 contract symbols above are byte-frozen and untouched):
+//! Engine* vortx_init_from_state_json(const char* state_json);  // hydrate from a captured
+//!                                                              // vortx_get_state_json document;
+//!                                                              // NULL on bad input
 //! ```
 //!
 //! Ownership rules: every `char*` returned is heap-owned by the engine and MUST be freed exactly once with
@@ -24,8 +29,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
 use crate::{
-    dispatch_json, get_state_delta_json, get_state_json, init_runtime, resolve_json, Engine,
-    InMemoryEnv,
+    dispatch_json, get_state_delta_json, get_state_json, init_from_state_json, init_runtime,
+    resolve_json, Engine, InMemoryEnv,
 };
 
 /// Borrow a C string as `&str`. `None` on null or non-UTF-8.
@@ -61,6 +66,29 @@ pub unsafe extern "C" fn vortx_init_runtime(
         return ptr::null_mut();
     };
     Box::into_raw(Box::new(init_runtime(id, name)))
+}
+
+/// Rebuild a runtime from a state JSON previously captured with [`vortx_get_state_json`]: the cold-load
+/// hydration entry, so a host restart reconstructs persisted state instead of seeding a fresh store.
+/// ADDITIVE input path only; the 7 contract symbols and their output bytes are untouched. Returns NULL
+/// if `state_json` is null, non-UTF-8, or does not parse as a state document (the host then falls back
+/// to [`vortx_init_runtime`] or surfaces the corrupt persisted state; it never gets a half-built
+/// engine). Hydration fires no events and marks nothing dirty: the first
+/// [`vortx_get_state_delta_json`] after hydration is `{}`, and [`vortx_get_state_json`] returns the
+/// captured document byte-identically.
+///
+/// # Safety
+/// `state_json` must be null or a valid NUL-terminated C string. A non-null return is an owned handle
+/// that must be freed exactly once with [`vortx_engine_free`].
+#[no_mangle]
+pub unsafe extern "C" fn vortx_init_from_state_json(state_json: *const c_char) -> *mut Engine {
+    let Some(json) = cstr(state_json) else {
+        return ptr::null_mut();
+    };
+    match init_from_state_json(json) {
+        Ok(engine) => Box::into_raw(Box::new(engine)),
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 /// Apply one JSON action at host time `now`. Returns an owned JSON `DispatchResult` string (a null engine
@@ -186,7 +214,8 @@ mod tests {
             assert!(out.contains("\"ok\":true"));
             assert!(out.contains("profile_added"));
 
-            let req = cs(r#"{"kind":"streams","streams":[{"name":"2160p WEB-DL"}],"cached":[true]}"#);
+            let req =
+                cs(r#"{"kind":"streams","streams":[{"name":"2160p WEB-DL"}],"cached":[true]}"#);
             let res = read_and_free(vortx_resolve_json(eng, req.as_ptr()));
             assert!(res.contains("\"kind\":\"streams\""));
 
@@ -213,6 +242,49 @@ mod tests {
             assert!(res.contains("null engine"));
             vortx_string_free(ptr::null_mut()); // no-op, must not crash
             vortx_engine_free(ptr::null_mut()); // no-op, must not crash
+        }
+    }
+
+    #[test]
+    fn init_from_state_json_round_trips_byte_identical_through_c() {
+        unsafe {
+            // Populate a runtime through the C surface: a profile and an in-progress title (CW).
+            let eng = vortx_init_runtime(cs("owner").as_ptr(), cs("Owner").as_ptr());
+            let add = cs(r#"{"type":"add_profile","id":"kid","name":"Kid"}"#);
+            assert!(
+                read_and_free(vortx_dispatch_json(eng, add.as_ptr(), 1000)).contains("\"ok\":true")
+            );
+            let prog = cs(
+                r#"{"type":"report_progress","metaId":"tt1","name":"A Movie","positionMs":300000,"durationMs":600000}"#,
+            );
+            assert!(read_and_free(vortx_dispatch_json(eng, prog.as_ptr(), 1001))
+                .contains("\"ok\":true"));
+
+            // Capture OUT -> hydrate IN -> capture again: BYTE-EQUAL.
+            let captured = read_and_free(vortx_get_state_json(eng));
+            let hydrated = vortx_init_from_state_json(cs(&captured).as_ptr());
+            assert!(!hydrated.is_null(), "captured state must hydrate");
+            let recaptured = read_and_free(vortx_get_state_json(hydrated));
+            assert_eq!(captured, recaptured, "hydration must be byte-equal");
+            assert!(recaptured.contains("continueWatching")); // CW seeded straight from state
+
+            // Hydration is side-effect free: the first delta is empty (nothing dirty, no events).
+            assert_eq!(read_and_free(vortx_get_state_delta_json(hydrated)), "{}");
+
+            vortx_engine_free(eng);
+            vortx_engine_free(hydrated);
+        }
+    }
+
+    #[test]
+    fn init_from_state_json_null_and_bad_inputs_yield_null() {
+        unsafe {
+            assert!(vortx_init_from_state_json(ptr::null()).is_null());
+            assert!(vortx_init_from_state_json(cs("not json").as_ptr()).is_null());
+            // Well-formed JSON that is not a state document (no activeProfileId).
+            assert!(vortx_init_from_state_json(cs("{}").as_ptr()).is_null());
+            let bad_utf8 = CString::new(vec![0xffu8, 0xfe]).unwrap();
+            assert!(vortx_init_from_state_json(bad_utf8.as_ptr()).is_null());
         }
     }
 
