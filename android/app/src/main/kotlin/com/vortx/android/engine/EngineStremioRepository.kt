@@ -11,6 +11,7 @@ import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.InstalledAddon
+import com.vortx.android.model.LibraryItemInfo
 import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MediaType
@@ -163,6 +164,47 @@ class EngineStremioRepository(
             sourcePrefs.reload()
             sourcePins.reload()
         }
+        // Home is per-profile (the CW rail swaps between the engine rail and the overlay rail on a
+        // switch, and a per-profile prefs apply can change what the board shows). Mirrors the tail of
+        // Apple `applyPlayback` calling `CoreBridge.rebuildBoardRows()`: a switch/fold re-dispatches the
+        // board load so homeUpdates converges immediately instead of riding the 3s safety poll.
+        ProfileStore.sharedOrNull()?.onRebuildBoard = { runCatching { dispatchHomeLoad() } }
+    }
+
+    // ---- Per-profile watch gate (Apple `ProfileStore.activeUsesEngineHistory`, Profiles.swift:275) ----
+
+    /// The profile store when an OVERLAY profile is active (a non-owner shared profile that keeps its
+    /// own PRIVATE watch history), else null (the owner and own-account profiles use the engine/account
+    /// library, exactly like before profiles existed). Every watch read/write in this repository
+    /// consults this FIRST — the Android mirror of Apple CoreBridge routing through
+    /// `ProfileStore.activeUsesEngineHistory`. The invariant it enforces: an overlay profile can never
+    /// READ the account's Continue Watching / library / watched ticks, and can never WRITE its progress
+    /// or marks into the account library (the never-poison rule from the documented sync incident).
+    private fun overlayProfiles(): ProfileStore? =
+        ProfileStore.sharedOrNull()?.takeIf { !it.activeUsesEngineHistory }
+
+    /// Re-shape an engine [MetaDetail] for an overlay profile: the per-ACCOUNT fields (saved-to-library
+    /// state, resume position, watched episode ticks) are replaced with the active profile's private
+    /// overlay state, so Detail/resume/ticks are per-profile with zero screen changes. Engine-backed
+    /// profiles get the detail back untouched.
+    private fun withOverlayState(detail: MetaDetail): MetaDetail {
+        val store = overlayProfiles() ?: return detail
+        val entry = store.watch[detail.id]
+        val libraryItem = entry?.let {
+            LibraryItemInfo(
+                id = detail.id,
+                removed = false,
+                temp = false,
+                videoId = it.videoId,
+                timeOffsetMs = it.timeOffsetMs.toLong(),
+                durationMs = it.durationMs.toLong(),
+                // A movie is watched in the overlay when its OWN meta id is in watchedVideoIds (that is
+                // exactly what markWatched appends and what Apple `cwItems`' finished-movie prune keys on).
+                timesWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+                flaggedWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+            )
+        }
+        return detail.copy(libraryItem = libraryItem, watchedVideoIds = store.watchedVideoIds(detail.id))
     }
 
     /// Initialize the engine once. Idempotent; safe to call from multiple repositories (the native
@@ -360,10 +402,14 @@ class EngineStremioRepository(
         // engine quirk, not a race), so trusting it here would render a signed-out Home with another
         // account's "Continue Watching" posters. Board rows are unaffected (Logout correctly drives a
         // real reload) so they still render live.
-        val continueWatching = if (suppressHomeUntilFreshLoad) {
-            emptyList()
-        } else {
-            runCatching {
+        // Per-profile gate: an OVERLAY profile's Continue Watching is its private overlay, never the
+        // account's engine rail (Apple `ProfileStore.cwItems` vs the engine preview — the
+        // activeUsesEngineHistory split).
+        val overlayStore = overlayProfiles()
+        val continueWatching = when {
+            overlayStore != null -> runCatching { overlayStore.continueWatching() }.getOrDefault(emptyList())
+            suppressHomeUntilFreshLoad -> emptyList()
+            else -> runCatching {
                 EngineState.parseContinueWatching(StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()))
             }.getOrDefault(emptyList())
         }
@@ -411,6 +457,12 @@ class EngineStremioRepository(
         // the default (all types, last-watched); non-null = a verbatim echo of a
         // [com.vortx.android.model.LibraryTypeOption]/[com.vortx.android.model.LibrarySortOption]'s
         // `request`, mirroring Discover's selection contract.
+        // Per-profile gate: an OVERLAY profile's Library is its private overlay (every title it has
+        // watched or saved), never the account's engine library (Apple `ProfileStore.libraryItems`).
+        // Slice note: the overlay list ignores the type/sort chips for now (no pivot row renders).
+        overlayProfiles()?.let { store ->
+            return@runCatching LibraryResult(items = store.libraryItems())
+        }
         val dispatchAction = if (requestJson != null) EngineActions.loadLibrarySelect(requestJson) else EngineActions.loadLibrary()
         val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
         LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
@@ -428,6 +480,13 @@ class EngineStremioRepository(
         } }
 
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
+        // Per-profile gate: an overlay profile saves into its PRIVATE overlay, never the account
+        // library (Apple `ProfileStore.addLibraryEntry`; the never-poison invariant).
+        val store = overlayProfiles()
+        if (store != null) {
+            store.addLibraryEntry(metaId = item.id, name = item.name, type = item.type.id, poster = item.poster)
+            return@runCatching
+        }
         // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is
         // enough; the caller re-pulls [library] afterward to see the change (same pattern [signOut] uses
         // for its own synchronous ctx mutation).
@@ -435,6 +494,11 @@ class EngineStremioRepository(
     }
 
     override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
+        val store = overlayProfiles()
+        if (store != null) {
+            store.removeWatchEntry(id)
+            return@runCatching
+        }
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
     }
 
@@ -530,8 +594,11 @@ class EngineStremioRepository(
         val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id)) {
             EngineState.parseMetaDetail(it) != null
         }
-        EngineState.parseMetaDetail(state)
+        val detail = EngineState.parseMetaDetail(state)
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
+        // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
+        // overlay profile (no-op for engine-backed profiles).
+        withOverlayState(detail)
     } }
 
     override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
@@ -625,8 +692,36 @@ class EngineStremioRepository(
     @Volatile private var playbackType: String? = null
     @Volatile private var playbackVideoId: String? = null
 
+    /// Overlay-profile playback context, captured at [beginPlaybackSession] so the per-profile
+    /// progress/watched writes in [reportProgress]/[endPlaybackSession] know WHICH title to record
+    /// against without an interface change (the engine path carries this inside the engine's own
+    /// `player` model instead). Null whenever the active profile is engine-backed.
+    @Volatile private var overlayMetaId: String? = null
+    @Volatile private var overlayName: String? = null
+    @Volatile private var overlayPoster: String? = null
+
     override suspend fun beginPlaybackSession(): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        val selected = buildPlayerSelected() ?: run {
+        overlayMetaId = null
+        overlayName = null
+        overlayPoster = null
+        val selected = buildPlayerSelected()
+        // Per-profile gate: an OVERLAY profile must NEVER load the engine Player — its TimeChanged
+        // ticks and watched marks write the ACCOUNT library (the shared history). Capture the meta
+        // context instead, so reportProgress/endPlaybackSession write the profile's PRIVATE overlay
+        // (Apple: StremioAccount/CoreBridge route to `ProfileStore.recordProgress` when
+        // `activeUsesEngineHistory` is false).
+        if (overlayProfiles() != null) {
+            val detail = currentMetaDetail()
+            playbackType = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("type")?.ifBlank { null }
+                ?: detail?.type?.id
+            playbackVideoId = selected?.optJSONObject("streamRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
+            overlayMetaId = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
+                ?: detail?.id
+            overlayName = detail?.name
+            overlayPoster = detail?.poster
+            return@runCatching
+        }
+        if (selected == null) {
             playbackType = null
             playbackVideoId = null
             return@runCatching
@@ -641,10 +736,53 @@ class EngineStremioRepository(
 
     override suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
         if (durationMs <= 0L || positionMs < 0L) return@runCatching
+        // Per-profile gate: overlay progress goes to the profile's private overlay, never the engine.
+        val store = overlayProfiles()
+        if (store != null) {
+            val metaId = overlayMetaId ?: return@runCatching
+            store.recordProgress(
+                metaId = metaId,
+                videoId = playbackVideoId ?: metaId,   // a movie's video id IS its meta id (Apple PlaybackMeta)
+                positionSeconds = positionMs / 1000.0,
+                durationSeconds = durationMs / 1000.0,
+                name = overlayName ?: "",
+                type = playbackType ?: MediaType.MOVIE.id,
+                poster = overlayPoster,
+            )
+            return@runCatching
+        }
         StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
     } }
 
     override suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        // Per-profile gate: final overlay write + near-end watched mark, then clear the context. The
+        // engine Player was never loaded for an overlay profile, so there is nothing to unload.
+        val store = overlayProfiles()
+        if (store != null) {
+            val metaId = overlayMetaId
+            if (metaId != null && durationMs > 0L && positionMs >= 0L) {
+                val videoId = playbackVideoId ?: metaId
+                val type = playbackType ?: MediaType.MOVIE.id
+                store.recordProgress(
+                    metaId = metaId, videoId = videoId,
+                    positionSeconds = positionMs / 1000.0, durationSeconds = durationMs / 1000.0,
+                    name = overlayName ?: "", type = type, poster = overlayPoster,
+                )
+                if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                    // Near-end: a series marks the EPISODE id watched; a movie marks its OWN meta id
+                    // (exactly what Apple `markWatched(meta:)` appends and what the finished-movie
+                    // Continue Watching prune keys on), then zeroes the offset (`finishedWatching`).
+                    store.markWatched(metaId, videoId, overlayName ?: "", type, overlayPoster)
+                    if (type != MediaType.SERIES.id) store.finishedWatching(metaId)
+                }
+            }
+            playbackType = null
+            playbackVideoId = null
+            overlayMetaId = null
+            overlayName = null
+            overlayPoster = null
+            return@runCatching
+        }
         if (durationMs > 0L && positionMs >= 0L) {
             StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
             // Watched-near-end: past the threshold, mark the finished item watched so it leaves Continue
@@ -726,6 +864,14 @@ class EngineStremioRepository(
         EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()))
 
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        // Per-profile gate: an overlay profile's aggregate (movie-level) watched mark toggles its OWN
+        // meta id in the private overlay (Apple routes this to `ProfileStore.setWatched`), never the
+        // engine's MarkAsWatched (which would mutate the account library).
+        overlayProfiles()?.let { store ->
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+            store.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
@@ -738,23 +884,44 @@ class EngineStremioRepository(
         episode: Int?,
         isWatched: Boolean,
     ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        overlayProfiles()?.let { store ->
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+            store.setWatched(isWatched, id, listOf(videoId), detail.name, type.id, detail.poster)
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
+            overlayProfiles()?.let { store ->
+                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+                val ids = detail.videos.filter { it.season == season }.map { it.id }
+                store.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
+                return@runCatching withOverlayState(detail)
+            }
             StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
         } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
+            overlayProfiles()?.let { store ->
+                store.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
+                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
+                return@runCatching withOverlayState(detail)
+            }
             StremioCoreNative.dispatch(EngineActions.addToLibrary(id, type.id, name, poster))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
         } }
 
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        overlayProfiles()?.let { store ->
+            store.removeWatchEntry(id)
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
     } }
@@ -766,7 +933,7 @@ class EngineStremioRepository(
     // withContext(Dispatchers.Default): called on every ctxUpdates tick, so its getState + parse
     // (via currentMetaDetail) must stay off the collector's (Main) context.
     override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = withContext(Dispatchers.Default) {
-        currentMetaDetail()?.takeIf { it.id == id }
+        currentMetaDetail()?.takeIf { it.id == id }?.let { withOverlayState(it) }
     }
 
     // ---- AuthRepository ----
