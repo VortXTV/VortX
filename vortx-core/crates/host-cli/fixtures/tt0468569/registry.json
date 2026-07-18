@@ -1,0 +1,18 @@
+[
+  {
+    "id": "fixture-direct",
+    "url": "https://direct.fixture.invalid/manifest.json",
+    "kind": "stremio_addon",
+    "capabilities": ["stream"],
+    "types": ["movie"],
+    "idPrefixes": ["tt"]
+  },
+  {
+    "id": "fixture-hive",
+    "url": "https://hive.fixture.invalid/manifest.json",
+    "kind": "stremio_addon",
+    "capabilities": ["stream"],
+    "types": ["movie"],
+    "idPrefixes": ["tt"]
+  }
+]

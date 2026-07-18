@@ -1,0 +1,18 @@
+{
+  "streams": [
+    {
+      "name": "VortX HTTP 1080p",
+      "title": "The Dark Knight (2008) 1080p WEB-DL",
+      "url": "https://cdn.fixture.invalid/vod/tt0468569/1080p.mp4",
+      "behaviorHints": {
+        "filename": "the-dark-knight-2008-1080p-webdl.mp4",
+        "vortx": {
+          "kind": "http",
+          "resolution": "1080p",
+          "languages": ["en"],
+          "sizeBytes": 9663676416
+        }
+      }
+    }
+  ]
+}

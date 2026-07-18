@@ -1,0 +1,26 @@
+[package]
+name = "vortx-host-cli"
+description = "The Phase 3 PROOF binary: a dev-only headless host that wires the vortx-host-native substrate (Fetch + Env + Storage) to the kernel's resolve query surface and prints a ranked, byte-stable stream resolution as JSON. `vortx-host-cli resolve --meta tt0468569` plans the stream fan-out through the engine (`stream_load`), realizes it through NativeFetcher (or a recorded fixture, hermetically), settles + ranks through the engine (`settle_streams`), and emits every ranked stream with its structured cacheStatus. Two runs with the same fixed `now` and the same fetched bodies are BYTE-IDENTICAL, which is the cross-platform determinism claim made executable. Never shipped; never linked by a platform bridge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "vortx-host-cli"
+path = "src/main.rs"
+
+[dependencies]
+vortx-engine = { path = "../engine" }
+vortx-source = { path = "../source" }
+vortx-ranking = { path = "../ranking" }
+vortx-debrid = { path = "../debrid" }
+vortx-protocol = { path = "../protocol" }
+vortx-host-native = { path = "../host-native" }
+serde.workspace = true
+serde_json.workspace = true
+# The record path (a dev capture utility) needs raw response bodies, which the NativeFetcher
+# boundary deliberately does not expose (it returns classified outcomes). Same crates + features
+# as host-native, so the lockfile gains nothing and the offline build stays offline.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

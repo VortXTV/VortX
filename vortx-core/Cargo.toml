@@ -26,6 +26,7 @@ members = [
     "crates/nzb",
     "crates/live",
     "crates/host-native",
+    "crates/host-cli",
 ]
 
 [workspace.package]

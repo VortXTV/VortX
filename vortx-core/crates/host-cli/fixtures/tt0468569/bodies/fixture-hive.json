@@ -1,0 +1,55 @@
+{
+  "streams": [
+    {
+      "name": "VortX 4K",
+      "title": "The.Dark.Knight.2008.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos",
+      "infoHash": "3f8d2c91a6e05b74d1c8290fb3a7e6d4c5019b82",
+      "fileIdx": 0,
+      "behaviorHints": {
+        "filename": "The.Dark.Knight.2008.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos.mkv",
+        "videoSize": 58472157286,
+        "vortx": {
+          "kind": "torrent",
+          "cachedServices": ["realdebrid", "torbox"],
+          "seeders": 184,
+          "sizeBytes": 58472157286,
+          "resolution": "2160p",
+          "languages": ["en"],
+          "tags": ["remux", "hdr", "atmos"],
+          "sources": 3
+        }
+      }
+    },
+    {
+      "name": "VortX 1080p",
+      "title": "The.Dark.Knight.2008.1080p.BluRay.x264.DTS",
+      "infoHash": "9b41e7a2d05c83f6b29d174ce8a05f3b6d2c4e17",
+      "behaviorHints": {
+        "filename": "The.Dark.Knight.2008.1080p.BluRay.x264.DTS.mkv",
+        "vortx": {
+          "kind": "torrent",
+          "cachedServices": ["torbox"],
+          "seeders": 412,
+          "sizeBytes": 12079595520,
+          "resolution": "1080p",
+          "languages": ["en"],
+          "sources": 2
+        }
+      }
+    },
+    {
+      "name": "VortX 720p",
+      "title": "The.Dark.Knight.2008.720p.BluRay.x264",
+      "infoHash": "c57d0f92ab34e816d90c2b5fe7a4d3618c05f24a",
+      "behaviorHints": {
+        "vortx": {
+          "kind": "torrent",
+          "seeders": 97,
+          "sizeBytes": 4724464025,
+          "resolution": "720p",
+          "languages": ["en"]
+        }
+      }
+    }
+  ]
+}
