@@ -10,9 +10,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
+use vortx_adapters::{scraper_streams_to_protocol, NuvioStream};
 use vortx_debrid::{
     DebridService, ResolvePlanner, ResolveSource, ResolveStep, StaticCacheView,
 };
+use vortx_exec::{ExecOutcome, ExecRequest};
 use vortx_live::{parse_xmltv, Epg};
 use vortx_protocol::{ContentKind, MetaDetail, MetaPreview, Stream};
 use vortx_ranking::{rank, rank_for, RankedStream, RankingPrefs};
@@ -21,8 +23,9 @@ use vortx_reco::{
     AvailabilitySet, EligibilityFilter, HomeFeedInput, HomeFeedPrefs, Lane, MaturityGate,
 };
 use vortx_source::{
-    cached_vector, plan_streams, settle_catalog, settle_items, settle_meta, settle_streams,
-    BreakerRegistry, CircuitConfig, FetchOutcome, FetchRequest, ResourceRequest, SourceEntry,
+    cached_vector, plan_exec, plan_streams, settle_catalog, settle_items, settle_meta,
+    settle_streams, BreakerRegistry, CircuitConfig, FetchOutcome, FetchRequest, ResourceRequest,
+    SourceEntry,
 };
 use vortx_state::{maturity_allows_raw, parse_certification, MaturityRating};
 use vortx_subtitles::{select as select_subtitle, SubtitlePrefs, SubtitleSelection, SubtitleTrack};
@@ -87,6 +90,16 @@ pub enum ResolveRequest {
         /// Timeout (partial-result settlement).
         #[serde(default)]
         outcomes: BTreeMap<String, FetchOutcome>,
+        /// The JS-provider half of the plan (the `execRequests` the PLAN phase emitted). Additive and
+        /// defaulted, so every existing settle request is byte-unchanged. Settled through the SAME
+        /// machinery as `plan`: a provider's `Ok { json }` maps through the Nuvio adapter into protocol
+        /// streams, every failure feeds the same breaker registry, and a planned exec with no outcome
+        /// settles as Timeout.
+        #[serde(default, rename = "execPlan")]
+        exec_plan: Vec<ExecRequest>,
+        /// Per-provider exec outcomes the host executed, keyed by provider id.
+        #[serde(default, rename = "execOutcomes")]
+        exec_outcomes: BTreeMap<String, ExecOutcome>,
         #[serde(default, rename = "circuitSnapshot")]
         circuit_snapshot: BreakerRegistry,
         #[serde(default, rename = "circuitCfg")]
@@ -290,7 +303,14 @@ pub enum ResolveResponse {
     Streams { ranked: Vec<RankedStream> },
     /// The fetch plan for a stream LOAD: the deadline-stamped requests the host should perform (circuit-open
     /// sources skipped, sorted by addon id). The host fetches these, then settles via the host-side settle.
-    StreamLoadPlan { requests: Vec<FetchRequest> },
+    /// `exec_requests` is the JS-provider half of the same plan (pinned scripts the host should execute
+    /// through its `JsExec` boundary); it is skip-serialized when empty, so a registry without JS providers
+    /// produces the byte-identical pre-exec wire.
+    StreamLoadPlan {
+        requests: Vec<FetchRequest>,
+        #[serde(rename = "execRequests", skip_serializing_if = "Vec::is_empty")]
+        exec_requests: Vec<ExecRequest>,
+    },
     /// The settled stream LOAD: the ranked player-ready order, plus the updated circuit-breaker snapshot the
     /// host upserts (the engine holds no breaker state). Kept distinct from `Streams` so the host can pick up
     /// the breaker snapshot from the LOAD path without changing the one-shot rank response shape.
@@ -386,9 +406,19 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
         } => {
             // Pure stateless planning: route the request over the host's source snapshot and circuit-filter
             // it. The engine owns the WHICH/HOW decision; the host owns the bytes, the breaker state, and the
-            // clock. No engine state is read or mutated.
+            // clock. No engine state is read or mutated. JS providers plan through the exec seam beside the
+            // HTTP fetches: same snapshot, same circuit filter, same sorted determinism; the kernel decides
+            // WHICH scripts run under WHAT policy but never executes one.
             ResolveResponse::StreamLoadPlan {
                 requests: plan_streams(
+                    &registry_snapshot,
+                    &req,
+                    &circuit_snapshot,
+                    &circuit_cfg,
+                    now,
+                    budget_ms,
+                ),
+                exec_requests: plan_exec(
                     &registry_snapshot,
                     &req,
                     &circuit_snapshot,
@@ -399,8 +429,10 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             }
         }
         ResolveRequest::SettleStreams {
-            plan,
+            mut plan,
             outcomes,
+            exec_plan,
+            exec_outcomes,
             mut circuit_snapshot,
             circuit_cfg,
             now,
@@ -411,7 +443,18 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             // Settle the host's outcomes into typed streams (failures isolated; missing -> Timeout), updating
             // the breaker snapshot on a LOCAL copy that is returned for the host to upsert. The engine holds
             // no breaker state, so this stays a pure (snapshot_in, outcomes) -> (ranked, snapshot_out) query.
-            let outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            //
+            // The exec half BRIDGES into the same settle: each planned script execution becomes a synthetic
+            // plan entry keyed by provider id, and its outcome maps onto the Fetch outcome vocabulary (an
+            // Ok json routes through the Nuvio adapter into protocol-stream item keys; Threw/Denied/Oom are
+            // failures; a missing outcome settles as Timeout). One settle over the union means ranking,
+            // dedup, antifraud, and the breakers need ZERO changes: a misbehaving provider trips its
+            // circuit exactly like a dead HTTP addon.
+            let mut outcomes: Vec<(String, FetchOutcome)> = outcomes.into_iter().collect();
+            let (exec_fetch_plan, exec_fetch_outcomes) =
+                bridge_exec_settle(&exec_plan, &exec_outcomes);
+            plan.extend(exec_fetch_plan);
+            outcomes.extend(exec_fetch_outcomes);
             let resolved = settle_streams(
                 &plan,
                 &outcomes,
@@ -694,6 +737,60 @@ pub fn resolve(engine: &Engine, req: ResolveRequest) -> ResolveResponse {
             let filters: [&dyn EligibilityFilter; 2] = [avail.as_ref(), &gate];
             let feed = build_home_feed(&input, &AllOf(&filters), &HomeFeedPrefs::default());
             ResolveResponse::HomeFeed { lanes: feed.lanes }
+        }
+    }
+}
+
+/// Bridge the exec half of a stream LOAD onto the Fetch settle vocabulary, so ONE `settle_streams` call
+/// settles HTTP fetches and JS executions identically. Each planned [`ExecRequest`] becomes a synthetic
+/// plan entry keyed by its provider id (the synthetic `vortx-exec://<hash>` URL exists only inside this
+/// settle; it never serializes back out), and each outcome maps via [`bridge_exec_outcome`]. A planned
+/// exec with NO outcome gets no entry, so the shared settle applies its missing -> Timeout rule, byte-
+/// identical to a slow HTTP source. Pure.
+fn bridge_exec_settle(
+    exec_plan: &[ExecRequest],
+    exec_outcomes: &BTreeMap<String, ExecOutcome>,
+) -> (Vec<FetchRequest>, Vec<(String, FetchOutcome)>) {
+    let plan = exec_plan
+        .iter()
+        .map(|req| FetchRequest {
+            addon_id: req.provider_id.clone(),
+            url: format!("vortx-exec://{}", req.script_hash),
+            budget_ms: req.budget_ms,
+        })
+        .collect();
+    let outcomes = exec_plan
+        .iter()
+        .filter_map(|req| {
+            exec_outcomes
+                .get(&req.provider_id)
+                .map(|o| (req.provider_id.clone(), bridge_exec_outcome(o)))
+        })
+        .collect();
+    (plan, outcomes)
+}
+
+/// Map one host [`ExecOutcome`] onto the Fetch outcome vocabulary. `Ok { json }` is the provider's raw
+/// `getStreams()` return: it parses as a Nuvio stream array, maps through the EXISTING
+/// `vortx_adapters::scraper_streams_to_protocol`, and each protocol stream becomes one item key (the
+/// uniform item-key contract the shared settle already parses); an unparseable return is `Malformed`,
+/// exactly like an HTTP addon answering garbage. `Threw` / `Denied` / `Oom` are provider failures
+/// (`Error`), and `Timeout` stays `Timeout`, so every classification feeds the breakers the same way a
+/// fetch failure does.
+fn bridge_exec_outcome(outcome: &ExecOutcome) -> FetchOutcome {
+    match outcome {
+        ExecOutcome::Ok { json } => match serde_json::from_str::<Vec<NuvioStream>>(json) {
+            Ok(raw) => FetchOutcome::Ok {
+                items: scraper_streams_to_protocol(&raw)
+                    .iter()
+                    .filter_map(|s| serde_json::to_string(s).ok())
+                    .collect(),
+            },
+            Err(_) => FetchOutcome::Malformed,
+        },
+        ExecOutcome::Timeout => FetchOutcome::Timeout,
+        ExecOutcome::Threw { .. } | ExecOutcome::Denied { .. } | ExecOutcome::Oom => {
+            FetchOutcome::Error
         }
     }
 }

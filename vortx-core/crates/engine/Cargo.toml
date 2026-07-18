@@ -20,6 +20,10 @@ vortx-reco = { path = "../reco" }
 vortx-debrid = { path = "../debrid" }
 vortx-source = { path = "../source" }
 vortx-live = { path = "../live" }
+# The exec seam: the engine PLANS JS-provider executions and SETTLES their outcomes through the
+# same machinery as HTTP fetches. Both crates are pure (zero JS runtime in the kernel).
+vortx-exec = { path = "../exec" }
+vortx-adapters = { path = "../adapters" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -1,0 +1,11 @@
+[package]
+name = "vortx-exec"
+description = "The JS-execution seam of the vortx-core kernel: the pure plan/outcome contract that lets the engine ORCHESTRATE a JS provider (Nuvio getStreams scrapers) exactly like it orchestrates an HTTP fetch, while executing ZERO JavaScript itself. ExecRequest / ExecOutcome mirror the Fetch seam's FetchRequest / FetchOutcome deliberately, so the plan->settle machinery, circuit breakers, and ranking treat a JS provider and an HTTP addon identically. NetPolicy is derived purely from a pack's declared manifest permissions; the real executor (rquickjs) lives host-side behind the JsExec trait. Pure: no I/O, no JS runtime, no clock."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

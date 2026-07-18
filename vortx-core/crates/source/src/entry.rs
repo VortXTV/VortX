@@ -9,6 +9,7 @@
 //! is the stateless half of the LOAD effect model: plan (here, pure) then settle (host-applied).
 
 use serde::{Deserialize, Serialize};
+use vortx_exec::{stream_args_json, ExecRequest, NetPolicy, ENTRYPOINT_GET_STREAMS};
 use vortx_protocol::ResourcePath;
 
 use crate::fanout::{BreakerRegistry, CircuitConfig};
@@ -20,6 +21,11 @@ use crate::transport::{plan_fanout, source_base, FetchRequest};
 /// id-space) and PLAN its fetch URL, without the full `Source` object. The host snapshots its registry as
 /// these so the pure engine can plan a fan-out with no state of its own. `url` is the source's transport (or
 /// manifest) URL; the resource URL is built from it with the byte-exact Stremio grammar.
+///
+/// A JS provider (`kind = nuvio_provider`) additionally carries `script_hash` (the sha256 the host pinned
+/// its provider source at) and its declared manifest `permissions` (which derive the [`NetPolicy`] its
+/// executions run under). Both are additive + default-skipped, so every existing snapshot stays
+/// byte-identical on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceEntry {
     pub id: String,
@@ -31,6 +37,14 @@ pub struct SourceEntry {
     pub types: Vec<String>,
     #[serde(default, rename = "idPrefixes")]
     pub id_prefixes: Vec<String>,
+    /// sha256 (hex) of the provider script the host pinned at install time; only a JS provider
+    /// (`nuvio_provider`) carries one. An entry without a hash can never be exec-planned.
+    #[serde(default, rename = "scriptHash", skip_serializing_if = "Option::is_none")]
+    pub script_hash: Option<String>,
+    /// The pack's declared manifest permissions (`net:<host>` grants network); derives the
+    /// [`NetPolicy`] stamped onto every planned [`ExecRequest`]. Empty = deny-all network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
 }
 
 impl SourceEntry {
@@ -55,10 +69,55 @@ pub fn plan_streams(
 ) -> Vec<FetchRequest> {
     let candidates: Vec<(String, String)> = entries
         .iter()
-        .filter(|e| e.supports(req))
+        // A JS provider answers over the EXEC seam ([`plan_exec`]), never the HTTP one: its `url` is a
+        // providers-repo base, not a Stremio transport, so building a resource URL from it would be
+        // garbage. Every other kind keeps the HTTP path unchanged.
+        .filter(|e| e.kind != SourceKind::NuvioProvider && e.supports(req))
         .map(|e| (e.id.clone(), ResourcePath::from(req).to_url(source_base(&e.url))))
         .collect();
     plan_fanout(&candidates, breakers, cfg, now, budget_ms)
+}
+
+/// Plan the JS-provider half of the fan-out for `req` over the same snapshot: the exec twin of
+/// [`plan_streams`], mirroring it exactly. Routes only `nuvio_provider` entries that pass the SAME
+/// capability + id-space gate AND carry a pinned `script_hash` (an unpinned provider is never planned:
+/// the kernel refuses to orchestrate a script it cannot name by digest). Circuit-open providers still
+/// cooling are SKIPPED via the same `should_attempt`, sorted by provider id, and each request is stamped
+/// with the budget and the [`NetPolicy`] derived purely from the entry's declared permissions. PURE and
+/// deterministic; the kernel executes no JS, it only decides WHICH scripts the host should run and under
+/// WHAT policy. The host realizes these through the `vortx_exec::JsExec` boundary, then settles them into
+/// the same breaker registry as HTTP outcomes.
+pub fn plan_exec(
+    entries: &[SourceEntry],
+    req: &ResourceRequest,
+    breakers: &BreakerRegistry,
+    cfg: &CircuitConfig,
+    now: u64,
+    budget_ms: u64,
+) -> Vec<ExecRequest> {
+    let mut providers: Vec<&SourceEntry> = entries
+        .iter()
+        .filter(|e| e.kind == SourceKind::NuvioProvider && e.supports(req))
+        .filter(|e| e.script_hash.is_some())
+        .filter(|e| {
+            breakers
+                .get(&e.id)
+                .map(|b| b.should_attempt(cfg, now))
+                .unwrap_or(true)
+        })
+        .collect();
+    providers.sort_by(|a, b| a.id.cmp(&b.id));
+    providers
+        .into_iter()
+        .map(|e| ExecRequest {
+            provider_id: e.id.clone(),
+            script_hash: e.script_hash.clone().unwrap_or_default(),
+            entrypoint: ENTRYPOINT_GET_STREAMS.to_string(),
+            args_json: stream_args_json(&req.type_, &req.id),
+            budget_ms,
+            net_policy: NetPolicy::from_permissions(&e.permissions),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -74,6 +133,21 @@ mod tests {
             capabilities: caps.to_vec(),
             types: types.iter().map(|t| t.to_string()).collect(),
             id_prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            script_hash: None,
+            permissions: Vec::new(),
+        }
+    }
+
+    fn provider(id: &str, hash: Option<&str>, perms: &[&str], types: &[&str]) -> SourceEntry {
+        SourceEntry {
+            id: id.to_string(),
+            url: "https://repo.example/nuvio".to_string(),
+            kind: SourceKind::NuvioProvider,
+            capabilities: vec![ResourceKind::Stream],
+            types: types.iter().map(|t| t.to_string()).collect(),
+            id_prefixes: Vec::new(),
+            script_hash: hash.map(|h| h.to_string()),
+            permissions: perms.iter().map(|p| p.to_string()).collect(),
         }
     }
 
@@ -144,5 +218,99 @@ mod tests {
         // now=1100 -> 100s < 300 cooldown -> "bad" skipped.
         let plan = plan_streams(&entries, &stream_req(), &breakers, &cfg, 1100, 5000);
         assert_eq!(plan.iter().map(|r| r.addon_id.as_str()).collect::<Vec<_>>(), vec!["good"]);
+    }
+
+    #[test]
+    fn a_js_provider_is_never_http_planned() {
+        // The exec seam owns nuvio providers; the HTTP planner must not build a bogus URL for one.
+        let entries = vec![
+            provider("vidfast", Some("aa"), &["net:api.example"], &["movie"]),
+            entry("http", "https://h.tv/manifest.json", &[ResourceKind::Stream], &[], &["tt"]),
+        ];
+        let plan = plan_streams(
+            &entries,
+            &stream_req(),
+            &BreakerRegistry::new(),
+            &CircuitConfig::default(),
+            1000,
+            5000,
+        );
+        assert_eq!(plan.iter().map(|r| r.addon_id.as_str()).collect::<Vec<_>>(), vec!["http"]);
+    }
+
+    #[test]
+    fn plan_exec_routes_pinned_providers_sorted_with_policy_and_budget() {
+        let entries = vec![
+            provider("zeta", Some("hz"), &[], &["movie"]),
+            provider("alpha", Some("ha"), &["net:api.vidfast.example", "net:*.cdn.example"], &["movie"]),
+            // No pinned script -> never planned.
+            provider("unpinned", None, &["net:x.example"], &["movie"]),
+            // Wrong type -> routed out by the same id-space gate as HTTP.
+            provider("tv-only", Some("ht"), &[], &["tv"]),
+            // An HTTP addon never exec-plans.
+            entry("http", "https://h.tv/manifest.json", &[ResourceKind::Stream], &[], &["tt"]),
+        ];
+        let plan = plan_exec(
+            &entries,
+            &stream_req(),
+            &BreakerRegistry::new(),
+            &CircuitConfig::default(),
+            1000,
+            4000,
+        );
+        assert_eq!(
+            plan.iter().map(|r| r.provider_id.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(plan[0].script_hash, "ha");
+        assert_eq!(plan[0].entrypoint, "getStreams");
+        assert_eq!(plan[0].args_json, r#"["tt0111161","movie"]"#);
+        assert_eq!(plan[0].budget_ms, 4000);
+        assert_eq!(
+            plan[0].net_policy.host_allowlist,
+            vec!["*.cdn.example", "api.vidfast.example"]
+        );
+        // No permissions -> deny-all policy, still planned (the script may be pure compute).
+        assert!(plan[1].net_policy.host_allowlist.is_empty());
+    }
+
+    #[test]
+    fn plan_exec_skips_a_circuit_open_provider_still_cooling() {
+        let cfg = CircuitConfig {
+            failure_threshold: 3,
+            cooldown_secs: 300,
+        };
+        let mut breakers = BreakerRegistry::new();
+        breakers.insert(
+            "bad".into(),
+            CircuitBreaker {
+                consecutive_failures: 3,
+                state: BreakerState::Open,
+                opened_at: 1000,
+            },
+        );
+        let entries = vec![
+            provider("good", Some("hg"), &[], &["movie"]),
+            provider("bad", Some("hb"), &[], &["movie"]),
+        ];
+        // now=1100 -> still cooling -> skipped, exactly like an HTTP source.
+        let plan = plan_exec(&entries, &stream_req(), &breakers, &cfg, 1100, 5000);
+        assert_eq!(plan.iter().map(|r| r.provider_id.as_str()).collect::<Vec<_>>(), vec!["good"]);
+        // Cooled down -> the one trial is allowed again.
+        let plan2 = plan_exec(&entries, &stream_req(), &breakers, &cfg, 1301, 5000);
+        assert_eq!(plan2.len(), 2);
+    }
+
+    #[test]
+    fn source_entry_wire_stays_frozen_without_exec_fields() {
+        // The additive fields are default-skipped: an entry without them serializes byte-identically
+        // to the pre-exec wire, so every existing registry snapshot vector is untouched.
+        let plain = entry("a", "https://a.tv/manifest.json", &[ResourceKind::Stream], &[], &["tt"]);
+        let wire = serde_json::to_string(&plain).unwrap();
+        assert!(!wire.contains("scriptHash"), "{wire}");
+        assert!(!wire.contains("permissions"), "{wire}");
+        // And an old snapshot (no exec fields) still deserializes.
+        let back: SourceEntry = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, plain);
     }
 }

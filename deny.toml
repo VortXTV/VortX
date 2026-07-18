@@ -52,6 +52,10 @@ ignore = [
 #     reqwest(rustls) pulls in: ring ("Apache-2.0 AND ISC"), rustls-webpki, and untrusted.
 #   * CDLA-Permissive-2.0 covers the Mozilla CA certificate DATA bundled by webpki-roots (same
 #     stack); it is a permissive data license, not a code copyleft.
+#   * Zlib is required by foldhash, pulled in TRANSITIVELY by the QuickJS exec host
+#     (vortx-host-native's rquickjs -> hashbrown -> foldhash). The zlib License is a permissive,
+#     OSI-approved, FSF-approved, GPL-compatible license (no copyleft), so it is safe alongside our
+#     GPL-3.0-or-later first-party crates.
 # Dual/multi-licensed crates whose expression includes a non-listed license (fiat-crypto's
 # "MIT OR Apache-2.0 OR BSD-1-Clause", memchr's "Unlicense OR MIT") are satisfied by MIT or
 # Apache-2.0 above, so BSD-1-Clause and Unlicense do not need their own entries.
@@ -64,4 +68,5 @@ allow = [
   "Unicode-3.0",
   "ISC",
   "CDLA-Permissive-2.0",
+  "Zlib",
 ]

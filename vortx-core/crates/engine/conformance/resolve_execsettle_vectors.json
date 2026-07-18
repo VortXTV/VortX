@@ -1,0 +1,154 @@
+{
+  "comment": "Pinned exec-seam settle vectors: a FIXED recorded Nuvio getStreams() JSON output (and fixed failure outcomes) fed through the settle_streams query must produce exactly this ranked projection + breaker snapshot on every platform. These pin the JS-provider half of the stream LOAD; the HTTP half's vectors (resolve_settlestreams_vectors.json) are untouched.",
+  "cases": [
+    {
+      "name": "recorded_getstreams_output_ranks_2160_1080_720",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [],
+        "outcomes": {},
+        "execPlan": [
+          {
+            "provider_id": "vidfast",
+            "script_hash": "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+            "entrypoint": "getStreams",
+            "args_json": "[\"tt0468569\",\"movie\"]",
+            "budgetMs": 5000,
+            "net_policy": {
+              "host_allowlist": ["api.vidfast.example"],
+              "max_requests": 32,
+              "max_total_bytes": 8388608
+            }
+          }
+        ],
+        "execOutcomes": {
+          "vidfast": {
+            "status": "ok",
+            "json": "[{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 720p\",\"quality\":\"720p\",\"size\":\"1.1 GB\",\"title\":\"The Dark Knight 720p WEB-DL\",\"url\":\"https://cdn.vidfast.example/tt0468569/720.mp4\"},{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 2160p\",\"quality\":\"2160p\",\"size\":\"8.2 GB\",\"title\":\"The Dark Knight 2160p WEB-DL HDR\",\"url\":\"https://cdn.vidfast.example/tt0468569/2160.mp4\"},{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 1080p\",\"quality\":\"1080p\",\"size\":\"2.3 GB\",\"title\":\"The Dark Knight 1080p WEB-DL\",\"url\":\"https://cdn.vidfast.example/tt0468569/1080.mp4\"}]"
+          }
+        },
+        "now": 1000
+      },
+      "ranked": [
+        { "raw_index": 1, "score": 60150000 },
+        { "raw_index": 2, "score": 45090000 },
+        { "raw_index": 0, "score": 30090000 }
+      ],
+      "circuitSnapshot": {
+        "vidfast": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 }
+      }
+    },
+    {
+      "name": "exec_streams_merge_with_http_streams_in_one_settle",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [
+          { "addon_id": "http-addon", "url": "https://h.tv/stream/movie/tt0468569.json", "budgetMs": 5000 }
+        ],
+        "outcomes": {
+          "http-addon": {
+            "status": "ok",
+            "items": ["{\"url\":\"https://direct.example/dk-1080.mkv\",\"name\":\"Torrentio 1080p BluRay\"}"]
+          }
+        },
+        "execPlan": [
+          {
+            "provider_id": "vidfast",
+            "script_hash": "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+            "entrypoint": "getStreams",
+            "args_json": "[\"tt0468569\",\"movie\"]",
+            "budgetMs": 5000,
+            "net_policy": {
+              "host_allowlist": ["api.vidfast.example"],
+              "max_requests": 32,
+              "max_total_bytes": 8388608
+            }
+          }
+        ],
+        "execOutcomes": {
+          "vidfast": {
+            "status": "ok",
+            "json": "[{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 720p\",\"quality\":\"720p\",\"size\":\"1.1 GB\",\"title\":\"The Dark Knight 720p WEB-DL\",\"url\":\"https://cdn.vidfast.example/tt0468569/720.mp4\"},{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 2160p\",\"quality\":\"2160p\",\"size\":\"8.2 GB\",\"title\":\"The Dark Knight 2160p WEB-DL HDR\",\"url\":\"https://cdn.vidfast.example/tt0468569/2160.mp4\"},{\"headers\":{\"Referer\":\"https://vidfast.example/\"},\"name\":\"VidFast 1080p\",\"quality\":\"1080p\",\"size\":\"2.3 GB\",\"title\":\"The Dark Knight 1080p WEB-DL\",\"url\":\"https://cdn.vidfast.example/tt0468569/1080.mp4\"}]"
+          }
+        },
+        "now": 1000
+      },
+      "ranked": [
+        { "raw_index": 2, "score": 60150000 },
+        { "raw_index": 0, "score": 45150000 },
+        { "raw_index": 3, "score": 45090000 },
+        { "raw_index": 1, "score": 30090000 }
+      ],
+      "circuitSnapshot": {
+        "http-addon": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 },
+        "vidfast": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 }
+      }
+    },
+    {
+      "name": "a_provider_that_threw_is_isolated_and_breaker_recorded",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [
+          { "addon_id": "http-addon", "url": "https://h.tv/stream/movie/tt0468569.json", "budgetMs": 5000 }
+        ],
+        "outcomes": {
+          "http-addon": {
+            "status": "ok",
+            "items": ["{\"url\":\"https://direct.example/dk-1080.mkv\",\"name\":\"Torrentio 1080p BluRay\"}"]
+          }
+        },
+        "execPlan": [
+          {
+            "provider_id": "vidfast",
+            "script_hash": "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+            "entrypoint": "getStreams",
+            "args_json": "[\"tt0468569\",\"movie\"]",
+            "budgetMs": 5000,
+            "net_policy": {
+              "host_allowlist": ["api.vidfast.example"],
+              "max_requests": 32,
+              "max_total_bytes": 8388608
+            }
+          }
+        ],
+        "execOutcomes": {
+          "vidfast": { "status": "threw", "message": "TypeError: cannot read hoster page" }
+        },
+        "now": 1000
+      },
+      "ranked": [{ "raw_index": 0, "score": 45150000 }],
+      "circuitSnapshot": {
+        "http-addon": { "consecutive_failures": 0, "state": "closed", "opened_at": 0 },
+        "vidfast": { "consecutive_failures": 1, "state": "closed", "opened_at": 0 }
+      }
+    },
+    {
+      "name": "a_planned_exec_with_no_outcome_settles_as_timeout",
+      "request": {
+        "kind": "settle_streams",
+        "plan": [],
+        "outcomes": {},
+        "execPlan": [
+          {
+            "provider_id": "vidfast",
+            "script_hash": "f00df00df00df00df00df00df00df00df00df00df00df00df00df00df00df00d",
+            "entrypoint": "getStreams",
+            "args_json": "[\"tt0468569\",\"movie\"]",
+            "budgetMs": 5000,
+            "net_policy": {
+              "host_allowlist": ["api.vidfast.example"],
+              "max_requests": 32,
+              "max_total_bytes": 8388608
+            }
+          }
+        ],
+        "execOutcomes": {},
+        "now": 1000
+      },
+      "ranked": [],
+      "circuitSnapshot": {
+        "vidfast": { "consecutive_failures": 1, "state": "closed", "opened_at": 0 }
+      }
+    }
+  ]
+}

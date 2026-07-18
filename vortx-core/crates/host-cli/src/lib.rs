@@ -120,6 +120,8 @@ pub fn run(cli: &Cli) -> Result<String, CliError> {
                 capabilities: vec![ResourceKind::Stream],
                 types: Vec::new(),
                 id_prefixes: Vec::new(),
+                script_hash: None,
+                permissions: Vec::new(),
             })
             .collect(),
     };

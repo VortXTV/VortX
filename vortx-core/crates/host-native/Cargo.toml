@@ -20,3 +20,20 @@ thiserror.workspace = true
 # (the workspace invariant: zero tokio/reqwest/hyper/axum in the pure crates).
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The exec seam: the kernel's pure plan/outcome contract (vortx-exec, always on) is realized HERE.
+vortx-exec = { path = "../exec" }
+# The real QuickJS executor is FEATURE-GATED (default-on `quickjs`). rquickjs (QuickJS-NG, no JIT)
+# and sha2 (which pins provider scripts by digest) are OPTIONAL and pulled in ONLY by `quickjs`, so
+# a host that supplies its own JsExec (the Apple xcframework uses system JavaScriptCore) builds
+# host-native with `--no-default-features` and links NEITHER. rquickjs is a HOST-ONLY dependency by
+# hard invariant: zero JS-runtime deps in any pure kernel crate.
+rquickjs = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[features]
+# `quickjs` is on by default so the desktop / Android / CLI hosts get the bundled QuickJS executor
+# with no extra flags. An Apple (JavaScriptCore) build opts OUT with `--no-default-features`, which
+# drops rquickjs + sha2 entirely while keeping every other host seam (Fetch / Env / Storage / Debrid)
+# and the pure JsExec trait + ExecNet/RecordedNet/HttpNet transports.
+default = ["quickjs"]
+quickjs = ["dep:rquickjs", "dep:sha2"]

@@ -2,6 +2,7 @@
 //! sees `dyn Source`.
 
 use serde::{Deserialize, Serialize};
+use vortx_exec::ExecRequest;
 use vortx_protocol::Stream;
 
 use crate::request::{ResourceKind, ResourceRequest};
@@ -46,6 +47,15 @@ pub trait Source {
     /// The orchestrator drives every source's plan through the host [`crate::Fetch`] boundary, so this is
     /// the per-source half of the deadline-bounded fan-out. Default: `None` (the source does no network).
     fn plan(&self, _req: &ResourceRequest, _budget_ms: u64) -> Option<FetchRequest> {
+        None
+    }
+
+    /// Plan the host SCRIPT EXECUTION this source would issue for `req`, or `None` if the source does
+    /// not answer by running JavaScript (every non-JS kind). The exec twin of [`plan`](Source::plan):
+    /// PURE, it builds the [`ExecRequest`] (pinned script hash + entrypoint + args + budget + the
+    /// manifest-derived net policy), it does NOT run the script. The host realizes it through the
+    /// `vortx_exec::JsExec` boundary; the kernel never executes a byte of JS. Default: `None`.
+    fn plan_exec(&self, _req: &ResourceRequest, _budget_ms: u64) -> Option<ExecRequest> {
         None
     }
 
