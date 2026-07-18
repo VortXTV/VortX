@@ -4,6 +4,19 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 4 - pending
+
+Fixes from the Beta 3 field reports. Thank you ozdek and konrepo for the detailed logs.
+
+### Fixed
+
+- **Continue Watching is back on every device (#149, and the slowness in #147).** After VortX moved to keeping your library and resume points in your own account, the Home Continue Watching rail read only from the local playback engine, which starts empty on a freshly migrated or reinstalled device, so the rail could be blank. It now assembles directly from your synced resume data, so it fills in right away, and paints from local data instead of waiting on network calls, which also removes the slowness. Apple TV, iPhone, iPad, and Mac.
+- **Add-on subtitles come back, with an optional my-languages filter (#148).** The subtitle panel was still looking for add-on subtitles (OpenSubtitles and the rest) in the old sign-in list, which is empty now that VortX signs in with your VortX account first, so only the community pool showed. It now reads your actually installed add-ons, so OpenSubtitles returns. A new opt-in setting, Only show subtitles in my languages, hides other-language results from the in-player list. Apple TV, iPhone, iPad, and Mac.
+- **Dolby Vision holds instead of dropping to HDR10 (#148).** On most Dolby Vision titles the player briefly switched the TV into Dolby Vision and then fell back to HDR10 at the very start of play. It was a timing race: we released playback the instant the TV reported its display switch finished, a hair before the video pipeline was provably in HDR, which let the wrong stream variant get picked and rejected. A short settle delay now lets the correct Dolby Vision variant play. Apple TV especially, plus iPhone, iPad, and Mac.
+- **No more washed-out colour flash when a title falls back (#148).** On the rare title that does fall back to the built-in engine, the first frames were briefly tagged standard range before the stream was read as HDR, which showed as a flash of wrong colour. HDR is now seeded up front on that path. Apple TV, iPhone, iPad, and Mac.
+- **Picture-in-Picture: a non-Dolby-Vision file no longer takes a failing detour (#147).** With Player Engine set to Prefer AVPlayer, a plain MKV that carries no Dolby Vision was still being sent down the Dolby Vision path, which failed and fell back to the built-in engine, losing Picture-in-Picture. It now checks the real Dolby Vision signal first, so a non-Dolby-Vision file plays straight through with Picture-in-Picture intact. Apple TV, iPhone, iPad, and Mac.
+- **Faster recovery when a Dolby Vision title's packaging stalls (#148).** On a few Atmos titles the Dolby Vision packaging could stall waiting on a piece of the file, which showed as a cache-then-rebuffer, and the wait to fall back was around fifteen seconds. That wait is now a few seconds. Apple TV especially, plus iPhone, iPad, and Mac.
+
 ## 0.3.14 Beta 3 - 2026-07-18
 
 The largest beta of the 0.3.14 line. It adds deep Trakt integration (check-in, ratings, a resume suggestion, and your lists), your SIMKL plan-to-watch on Home, an Apple TV Top Shelf, Match Frame Rate for smoother films, and a sync fix that stops one device from overwriting another. Android gains trickplay scrub-preview capture, a real settings surface, and library transfer.
