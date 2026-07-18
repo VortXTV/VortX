@@ -60,12 +60,15 @@ object DownloadManager {
     private const val PREFS = "vortx.downloads"
     const val MAX_CONCURRENT_KEY = "vortx.downloads.maxConcurrent"
     /**
-     * Gates the Settings > Downloads row. The download subsystem is fully built (manager, worker, store,
-     * notifications, screen) but has no CREATE entry point yet: nothing calls [download], so the screen can
-     * only ever show "No downloads yet". The row is hidden until a Download action (on the streams or detail
-     * screen) actually calls [download]; flip this to true in the same change that wires that action.
+     * Gates the Settings > Downloads row. The download subsystem (manager, worker, store, notifications,
+     * screen) is fully built AND now has a live CREATE entry point: the detail-screen source-row long-press
+     * "Download" action resolves the chosen source through the same [com.vortx.android.data.CatalogRepository.resolve]
+     * the player uses and calls [download] (see [com.vortx.android.ui.viewmodel.DetailViewModel.download]). So
+     * the row is shown: a tester can fill the screen. A raw torrent with no debrid key still cannot be turned
+     * into a direct URL (torrent-to-disk needs the not-yet-wired streaming server), so it surfaces the
+     * resolver's own message instead of enqueuing; direct / debrid / HTTP sources download for real.
      */
-    const val CREATE_PATH_WIRED = false
+    const val CREATE_PATH_WIRED = true
     private const val QUEUE_ORDER_KEY = "vortx.downloads.queueOrder"
     private const val AWAITING_UNLOCK_KEY = "vortx.downloads.awaitingUnlock"
 

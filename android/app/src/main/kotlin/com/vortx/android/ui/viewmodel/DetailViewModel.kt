@@ -8,6 +8,7 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.debrid.DebridCoordinator
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
+import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
@@ -16,6 +17,8 @@ import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaRef
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.DownloadRecord
+import com.vortx.android.model.DownloadState
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
@@ -121,6 +124,14 @@ class DetailViewModel(
     /// (call [clearMutationError]) once shown.
     private val _mutationError = MutableStateFlow<String?>(null)
     val mutationError: StateFlow<String?> = _mutationError.asStateFlow()
+
+    /// A short, transient status line for the offline-download action (the source-row long-press "Download"):
+    /// "Queued for download", the resolver's failure message, and so on. The screen renders it inline under the
+    /// sources list and read-and-clears it ([clearDownloadNotice]) after a beat, so it never sticks. Kept
+    /// separate from [_mutationError] (which is for watched/library writes) so a download message and a library
+    /// message can never overwrite each other.
+    private val _downloadNotice = MutableStateFlow<String?>(null)
+    val downloadNotice: StateFlow<String?> = _downloadNotice.asStateFlow()
 
     /// Pin state for the sources UI (#15): the resolved effective pin (entry-first, drives the per-row
     /// "Pinned" badge via [SourcePinStore.matches]) plus whether an entry / global pin exists (drives which
@@ -461,6 +472,72 @@ class DetailViewModel(
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
         }
+    }
+
+    /// Save a chosen source for OFFLINE viewing. This is the download subsystem's create entry point (the one
+    /// [DownloadManager.CREATE_PATH_WIRED] gates on): it resolves the source to a concrete URL through the SAME
+    /// [repo.resolve] the play path uses -- so a debrid torrent is unlocked to its direct link and a direct /
+    /// HTTP source passes straight through -- then hands that URL to [DownloadManager.download], which enqueues
+    /// the [com.vortx.android.downloads.DownloadWorker]. A finished download plays from the local file with no
+    /// network (see [com.vortx.android.ui.screens.DownloadsScreen]).
+    ///
+    /// The record's ids ([contentId] / [videoId] / [type] / [season] / [episode]) are the SAME ones the play
+    /// path threads, so a downloaded title lands in the right per-show folder and (once PlaybackMeta is ported)
+    /// records progress against the same library item as a streamed play. For a series the download targets the
+    /// currently-selected episode -- the sources list is already scoped to it -- so the episode's own id/season/
+    /// number ride the record; for a movie the meta id is both the content and video id.
+    ///
+    /// Fail-soft, honestly: a raw torrent with no debrid key cannot be resolved to a direct URL on Android
+    /// (torrent-to-disk needs the streaming server, not yet wired), so [repo.resolve] throws and its message is
+    /// shown on [_downloadNotice] rather than silently doing nothing. An HLS / non-media source is caught inside
+    /// [DownloadManager.download] (it returns a FAILED record whose error text the notice surfaces).
+    fun download(source: StreamSource) {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return
+        val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
+        _downloadNotice.value = "Preparing download…"
+        viewModelScope.launch {
+            repo.resolve(source).fold(
+                onSuccess = { playable ->
+                    val record = DownloadManager.download(
+                        stream = source,
+                        // contentId is the library id: the series id for an episode, the movie id for a movie
+                        // (which equals videoId). videoId is the engine CoreVideo id (imdbId:season:episode) for
+                        // an episode, or the movie id. Same identities the play path uses.
+                        contentId = id,
+                        videoId = episode?.id ?: id,
+                        type = if (type == MediaType.SERIES) "series" else "movie",
+                        name = detail.name,
+                        poster = detail.poster,
+                        season = episode?.season?.takeIf { it > 0 },
+                        episode = episode?.episode?.takeIf { it > 0 },
+                        resolvedUrl = playable.url,
+                        sourceName = source.addon,
+                        qualityText = StreamRanking.qualityLabel(source),
+                        // Forward the resolved request headers so a header-gated CDN serves the download (empty
+                        // today until the engine decodes proxyHeaders, harmless when so; see DownloadManager.download).
+                        requestHeaders = playable.headers.takeIf { it.isNotEmpty() },
+                    )
+                    _downloadNotice.value = downloadNoticeFor(record)
+                },
+                onFailure = { _downloadNotice.value = it.message ?: "Couldn't start this download." },
+            )
+        }
+    }
+
+    /// The transient status line for a just-created download, read off the record [DownloadManager.download]
+    /// returned: a FAILED record (HLS / non-media, caught inside the manager) shows its own honest reason; a
+    /// completed / in-flight duplicate says so; a fresh one reports queued vs downloading.
+    private fun downloadNoticeFor(record: DownloadRecord): String = when (record.state) {
+        DownloadState.FAILED -> record.errorText ?: "This source can't be downloaded."
+        DownloadState.COMPLETED -> "Already downloaded — find it in Settings › Downloads."
+        DownloadState.QUEUED -> "Queued — starting when a download slot frees up."
+        DownloadState.PAUSED -> "Resuming this download."
+        DownloadState.DOWNLOADING -> "Downloading — track it in Settings › Downloads."
+    }
+
+    /// Read-and-clear the download notice (the screen calls this after showing it for a beat).
+    fun clearDownloadNotice() {
+        _downloadNotice.value = null
     }
 
     /// Play the meta's YouTube trailer (the detail/hero Trailer affordance). Resolves the trailer id through

@@ -291,9 +291,9 @@ fun SettingsScreen(
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.
-        // Hidden for Beta 3 (DownloadManager.CREATE_PATH_WIRED): the download subsystem is built but has no
-        // create entry point yet, so this row would open a screen a tester can never fill. It returns the moment
-        // a Download action wires DownloadManager.download().
+        // Shown now that DownloadManager.CREATE_PATH_WIRED is true: the detail-screen source-row "Download for
+        // offline" action calls DownloadManager.download(), so a tester can actually fill this screen. The gate
+        // is kept as a guard so the row and its create-path flip together in one place if it is ever revisited.
         if (DownloadManager.CREATE_PATH_WIRED) {
             SettingRow(VortXIcons.download, "Downloads", downloadsValue, onClick = onDownloadsClick)
         }

@@ -110,8 +110,19 @@ fun DetailScreen(
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val mutationError by viewModel.mutationError.collectAsStateWithLifecycle()
+    val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+
+    // The download status line is a transient confirmation, not a persistent state: show it for a beat then
+    // clear it (the live queue/progress lives on the Downloads screen). Keyed on the notice text so each new
+    // message restarts the timer; a null notice cancels cleanly.
+    LaunchedEffect(downloadNotice) {
+        if (downloadNotice != null) {
+            kotlinx.coroutines.delay(4_000)
+            viewModel.clearDownloadNotice()
+        }
+    }
 
     // Detail-local navigation for the cast/person feature, kept OUT of StremioXApp's own nav graph and
     // out of DetailViewModel (the media-servers wave owns those): a tapped cast tile opens the Person
@@ -246,6 +257,7 @@ fun DetailScreen(
                                 state = streamsState,
                                 resolving = resolving,
                                 failure = (playback as? Playback.Failed)?.message,
+                                downloadNotice = downloadNotice,
                                 sort = sourceSort,
                                 onSortChange = viewModel::setSourceSort,
                                 pin = pinUi,
@@ -253,6 +265,7 @@ fun DetailScreen(
                                 onPin = viewModel::pinSource,
                                 onUnpin = viewModel::unpinSource,
                                 onPlay = viewModel::play,
+                                onDownload = viewModel::download,
                             )
                         }
                     }
@@ -879,6 +892,7 @@ private fun SourcesSection(
     state: UiState<List<StreamGroup>>,
     resolving: Boolean,
     failure: String?,
+    downloadNotice: String?,
     sort: String,
     onSortChange: (String) -> Unit,
     pin: DetailViewModel.PinUi,
@@ -886,6 +900,7 @@ private fun SourcesSection(
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
     onPlay: (StreamSource) -> Unit,
+    onDownload: (StreamSource) -> Unit,
 ) {
     // The row whose long-press opened the pin menu (null = closed). Keyed by the stream id so the menu
     // anchors to its own row and a recompose from a pin write closes it cleanly.
@@ -913,6 +928,11 @@ private fun SourcesSection(
                 }
                 failure?.let {
                     Text(text = it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.danger))
+                }
+                // The offline-download status line (long-press a source -> Download): a transient confirmation
+                // or the resolver's honest failure, in the accent tone so it reads as info, not error.
+                downloadNotice?.let {
+                    Text(text = it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.accent))
                 }
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
@@ -946,6 +966,13 @@ private fun SourcesSection(
                                 expanded = pinMenuFor == source.id,
                                 onDismissRequest = { pinMenuFor = null },
                             ) {
+                                // The download create-path entry point (DownloadManager.CREATE_PATH_WIRED): save
+                                // this source for offline viewing. First item because it is the reason the menu
+                                // most often gets opened now.
+                                DropdownMenuItem(
+                                    text = { Text("Download for offline") },
+                                    onClick = { pinMenuFor = null; onDownload(source) },
+                                )
                                 DropdownMenuItem(
                                     text = { Text("Pin for this $entryNoun") },
                                     onClick = { pinMenuFor = null; onPin(source, SourcePinScope.ENTRY) },
