@@ -1,0 +1,30 @@
+{
+  "captured_from": "server.js v4.21.0, live run 2026-07-18, torrent 08ada5a7a6183aae1e09d831df6748d566095a10 (Sintel)",
+  "stats_top_level_keys": [
+    "infoHash", "name", "peers", "unchoked", "queued", "unique",
+    "connectionTries", "swarmPaused", "swarmConnections", "swarmSize",
+    "selections", "wires", "files", "downloaded", "uploaded",
+    "downloadSpeed", "uploadSpeed", "sources", "peerSearchRunning", "opts"
+  ],
+  "app_required_stats_keys": [
+    "peers", "swarmConnections", "connectionTries", "peerSearchRunning",
+    "downloaded", "downloadSpeed"
+  ],
+  "file_entry_keys": ["path", "name", "length", "offset"],
+  "create_response_app_required": { "files": [{ "name": "string", "length": "number" }] },
+  "settings_top_level_keys": ["options", "values", "baseUrl"],
+  "settings_values_keys": [
+    "serverVersion", "appPath", "cacheRoot", "cacheSize", "btMaxConnections",
+    "btHandshakeTimeout", "btRequestTimeout", "btDownloadSpeedSoftLimit",
+    "btDownloadSpeedHardLimit", "btMinPeersForStable", "remoteHttps",
+    "localAddonEnabled", "transcodeHorsepower", "transcodeMaxBitRate",
+    "transcodeConcurrency", "transcodeTrackConcurrency",
+    "transcodeHardwareAccel", "transcodeProfile", "allTranscodeProfiles",
+    "transcodeMaxWidth", "proxyStreamsEnabled"
+  ],
+  "post_settings_response": { "success": true },
+  "remove_response": {},
+  "unknown_hash_stats_body": "null",
+  "port_file_name": "stremio-server.port",
+  "port_range": [11470, 11474]
+}

@@ -28,6 +28,7 @@ members = [
     "crates/live",
     "crates/host-native",
     "crates/host-cli",
+    "crates/streaming-server",
     "crates/ffi",
 ]
 

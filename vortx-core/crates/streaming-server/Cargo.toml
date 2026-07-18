@@ -1,0 +1,47 @@
+# The native Rust streaming server that replaces the bundled Stremio server.js
+# (nodejs-mobile) for TORRENT playback. It speaks the EXACT HTTP contract the
+# VortX app + libmpv already depend on -- captured byte-exact in
+# contract/GOLDEN.md from the app call sites AND a live server.js v4.21.0 run.
+# Torrent playback is its only job: direct/debrid/HLS streams play client-side.
+#
+# This is a HOST bin crate: rqbit (the torrent engine), tokio, axum, and
+# reqwest live HERE and only here. The pure kernel crates stay runtime-free.
+[package]
+name = "vortx-streaming-server"
+description = "VortX native streaming server: rqbit-backed torrent HTTP endpoints (settings/create/stats/file/remove) plus the /proxy header-forwarder + HLS rewriter, on the server.js contract."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "vortx-streaming-server"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "fs", "signal", "sync"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+# The /proxy upstream client. rustls so no OpenSSL; TLS verification ON by
+# default (server.js ships rejectUnauthorized:false -- deliberately not copied;
+# VORTX_PROXY_INSECURE_TLS=1 opts back in per deployment).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+url = "2"
+percent-encoding.workspace = true
+# The torrent engine.
+librqbit = "8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
