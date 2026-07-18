@@ -1,0 +1,20 @@
+[package]
+name = "vortx-host-native"
+description = "The native HOST substrate for the vortx-core kernel: the real-world implementations of the kernel's I/O seams. Fetch over tokio + reqwest(rustls) realizes the kernel's FetchRequest plans in parallel under per-request budgets; SystemEnv supplies the wall clock behind Env; Storage + FileStorage persist the JSON buckets the kernel emits through get_state_delta_json. The kernel stays pure and runtime-free; everything async or effectful lives here, host-side."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortx-engine = { path = "../engine" }
+vortx-source = { path = "../source" }
+vortx-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+percent-encoding.workspace = true
+thiserror.workspace = true
+# The async runtime + HTTP client live ONLY in this host crate, never in the kernel
+# (the workspace invariant: zero tokio/reqwest/hyper/axum in the pure crates).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

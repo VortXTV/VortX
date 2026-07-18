@@ -25,6 +25,7 @@ members = [
     "crates/subtitles",
     "crates/nzb",
     "crates/live",
+    "crates/host-native",
 ]
 
 [workspace.package]
