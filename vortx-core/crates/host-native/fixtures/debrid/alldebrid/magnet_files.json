@@ -1,0 +1,27 @@
+{
+	"status": "success",
+	"data": {
+		"magnets": [
+			{
+				"id": 186112901,
+				"files": [
+					{
+						"n": "Show.S01E01.2160p.WEB-DL.mkv",
+						"s": 4831838208,
+						"l": "https://uptobox.example/dl/ADRESTRICTED01"
+					},
+					{
+						"n": "Subs",
+						"e": [
+							{
+								"n": "eng.srt",
+								"s": 65536,
+								"l": "https://uptobox.example/dl/ADRESTRICTED02"
+							}
+						]
+					}
+				]
+			}
+		]
+	}
+}

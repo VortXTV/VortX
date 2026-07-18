@@ -1,0 +1,24 @@
+{
+	"status": "success",
+	"content": [
+		{
+			"id": "pmfile01",
+			"name": "Show.S01E01.2160p.WEB-DL.mkv",
+			"type": "file",
+			"size": 4831838208,
+			"created_at": 1752900000,
+			"mime_type": "video/x-matroska",
+			"transcode_status": "finished",
+			"link": "https://blizzard.pm-cdn.example/dl/pmfile01/Show.S01E01.2160p.WEB-DL.mkv",
+			"stream_link": "https://blizzard.pm-cdn.example/stream/pmfile01.mp4"
+		},
+		{
+			"id": "pmsub01",
+			"name": "Subs",
+			"type": "folder"
+		}
+	],
+	"name": "Show.S01E01.2160p.WEB-DL",
+	"parent_id": "root",
+	"folder_id": "pmfolder01"
+}

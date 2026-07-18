@@ -1,0 +1,17 @@
+{
+	"status": "success",
+	"content": [
+		{
+			"id": "pmfile02",
+			"name": "eng.srt",
+			"type": "file",
+			"size": 65536,
+			"created_at": 1752900000,
+			"mime_type": "application/x-subrip",
+			"link": "https://blizzard.pm-cdn.example/dl/pmfile02/eng.srt"
+		}
+	],
+	"name": "Subs",
+	"parent_id": "pmfolder01",
+	"folder_id": "pmsub01"
+}

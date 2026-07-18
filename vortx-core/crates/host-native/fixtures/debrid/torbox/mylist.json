@@ -1,0 +1,39 @@
+{
+	"success": true,
+	"error": null,
+	"detail": "Successfully retrieved torrents",
+	"data": {
+		"id": 42421337,
+		"auth_id": "auth0|vortxtest",
+		"server": 12,
+		"hash": "DD8255ECDC7CA55FB0BBF81323D87062DB1F6D1C",
+		"name": "Show.S01E01.2160p.WEB-DL.mkv",
+		"magnet": "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+		"size": 4884070400,
+		"active": true,
+		"created_at": "2026-07-18T08:00:00Z",
+		"updated_at": "2026-07-18T08:04:00Z",
+		"download_state": "completed",
+		"download_finished": true,
+		"download_present": true,
+		"progress": 1.0,
+		"files": [
+			{
+				"id": 0,
+				"md5": null,
+				"name": "Show.S01E01.2160p.WEB-DL/Show.S01E01.2160p.WEB-DL.mkv",
+				"short_name": "Show.S01E01.2160p.WEB-DL.mkv",
+				"size": 4831838208,
+				"mimetype": "video/x-matroska"
+			},
+			{
+				"id": 1,
+				"md5": null,
+				"name": "Show.S01E01.2160p.WEB-DL/Subs/eng.srt",
+				"short_name": "eng.srt",
+				"size": 65536,
+				"mimetype": "application/x-subrip"
+			}
+		]
+	}
+}

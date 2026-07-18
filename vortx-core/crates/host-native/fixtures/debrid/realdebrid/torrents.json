@@ -1,0 +1,28 @@
+[
+	{
+		"id": "RDLIB000001",
+		"filename": "Show.S01E01.2160p.WEB-DL.mkv",
+		"hash": "dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c",
+		"bytes": 4831838208,
+		"host": "real-debrid.com",
+		"split": 2000,
+		"progress": 100,
+		"status": "downloaded",
+		"added": "2026-07-01T09:30:00.000Z",
+		"links": [
+			"https://real-debrid.com/d/RDRESTRICTED01"
+		]
+	},
+	{
+		"id": "RDLIB000002",
+		"filename": "Movie.2026.1080p.BluRay.mkv",
+		"hash": "aaaa5555ecdc7ca55fb0bbf81323d87062db1f6d",
+		"bytes": 2147483648,
+		"host": "real-debrid.com",
+		"split": 2000,
+		"progress": 42,
+		"status": "downloading",
+		"added": "2026-07-17T21:00:00.000Z",
+		"links": []
+	}
+]

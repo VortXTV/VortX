@@ -1,0 +1,25 @@
+{
+	"status": "success",
+	"transfers": [
+		{
+			"id": "pmtransfer01",
+			"name": "Show.S01E01.2160p.WEB-DL",
+			"message": null,
+			"status": "finished",
+			"progress": 1,
+			"folder_id": "pmfolder01",
+			"file_id": null,
+			"src": "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c"
+		},
+		{
+			"id": "pmtransfer02",
+			"name": "Movie.2026.1080p.BluRay",
+			"message": "Downloading at 32.4 MB/s",
+			"status": "running",
+			"progress": 0.4,
+			"folder_id": null,
+			"file_id": null,
+			"src": "magnet:?xt=urn:btih:aaaa5555ecdc7ca55fb0bbf81323d87062db1f6d"
+		}
+	]
+}

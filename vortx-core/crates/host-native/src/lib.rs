@@ -12,12 +12,17 @@
 //! - **Storage** ([`Storage`] / [`FileStorage`]): the persistence seam for the JSON buckets the
 //!   kernel emits through `get_state_delta_json`, shaped like stremio-core's persisted buckets and
 //!   round-tripping byte-equal.
+//! - **Debrid** ([`debrid`]): Phase 2 of the cutover, the live HTTP implementations of the
+//!   kernel's [`vortx_debrid::DebridStore`] contract (RealDebrid / AllDebrid / TorBox /
+//!   Premiumize), behind the same one-runtime `block_on` bridge as `NativeFetcher` and a
+//!   record-or-replay transport seam for hermetic tests.
 //!
 //! The kernel invariant this crate protects: zero `tokio`/`reqwest`/`hyper`/`axum` in the pure
 //! crates. Everything async or effectful lives here, host-side, behind the kernel's own traits. No
 //! kernel API changed to build this crate.
 
 mod body;
+pub mod debrid;
 mod env;
 mod fetch;
 mod storage;

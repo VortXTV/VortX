@@ -106,7 +106,7 @@ proptest! {
     }
 
     // The audio profile only ADDS to base scores (never subtracts), is a permutation of the base result, and
-    // is deterministic. A lossless-tagged stream gains exactly the bonus over its base score.
+    // is deterministic. A stream that resolves lossless gains exactly the bonus over its base score.
     #[test]
     fn audio_profile_adds_lossless_bonus_only(
         specs in prop::collection::vec(
@@ -130,12 +130,21 @@ proptest! {
         audio_idx.sort_unstable();
         prop_assert_eq!(&base_idx, &audio_idx);
 
-        // Per stream: audio score >= base score, and a flac-tagged stream gains exactly 100*1000.
+        // Per stream: audio score >= base score, and a lossless-resolving stream gains exactly 100*1000.
+        // The model mirrors the documented resolution rule: the typed tag wins when it resolves to a known
+        // codec; otherwise LABEL tokens are scanned and lossless wins (so a random label that happens to
+        // spell a lossless codec token, e.g. "Dsd", legitimately earns the bonus).
         for b in &base {
             let a = audio.iter().find(|r| r.raw_index == b.raw_index).unwrap();
             prop_assert!(a.score >= b.score);
-            let is_flac = specs[b.raw_index].1 == Some("flac");
-            let expected = if is_flac { b.score + 100_000 } else { b.score };
+            let (label, tag) = &specs[b.raw_index];
+            let is_lossless = match tag {
+                Some(t) => vortx_protocol::AudioCodec::from_wire(t).is_lossless(),
+                None => label
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|tok| vortx_protocol::AudioCodec::from_wire(tok).is_lossless()),
+            };
+            let expected = if is_lossless { b.score + 100_000 } else { b.score };
             prop_assert_eq!(a.score, expected);
         }
     }

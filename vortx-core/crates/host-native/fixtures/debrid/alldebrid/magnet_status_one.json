@@ -1,0 +1,20 @@
+{
+	"status": "success",
+	"data": {
+		"magnets": {
+			"id": 186112901,
+			"filename": "Show.S01E01.2160p.WEB-DL.mkv",
+			"size": 4831838208,
+			"hash": "DD8255ECDC7CA55FB0BBF81323D87062DB1F6D1C",
+			"status": "Ready",
+			"statusCode": 4,
+			"downloaded": 4831838208,
+			"uploaded": 0,
+			"seeders": 0,
+			"downloadSpeed": 0,
+			"uploadSpeed": 0,
+			"uploadDate": 1752900000,
+			"completionDate": 1752900120
+		}
+	}
+}

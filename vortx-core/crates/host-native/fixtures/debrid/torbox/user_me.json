@@ -1,0 +1,20 @@
+{
+	"success": true,
+	"error": null,
+	"detail": "Successfully retrieved user data",
+	"data": {
+		"id": 987654,
+		"created_at": "2025-11-02T18:22:09Z",
+		"updated_at": "2026-07-01T10:00:00Z",
+		"email": "tester@example.com",
+		"plan": 2,
+		"total_downloaded": 128849018880,
+		"customer": "cus_vortxtest",
+		"is_subscribed": true,
+		"premium_expires_at": "2026-09-01T00:00:00+00:00",
+		"cooldown_until": null,
+		"auth_id": "auth0|vortxtest",
+		"user_referral": "vortx-ref",
+		"base_email": "tester@example.com"
+	}
+}
