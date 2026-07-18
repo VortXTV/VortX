@@ -1,6 +1,8 @@
 package com.vortx.android
 
+import android.app.Activity
 import android.app.Application
+import android.os.Bundle
 import android.util.Log
 import coil3.ImageLoader
 import coil3.PlatformContext
@@ -18,6 +20,7 @@ import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.engine.EngineStremioRepository
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sync.VortXSyncManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -74,6 +77,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        // Activate the (until-now dormant) VortX account sync engine now that the roster + watch overlay it
+        // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
+        // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.
+        wireAccountSync()
         runCatching { MediaServerRepository.init(this) }
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
         initDownloads()
@@ -114,6 +121,71 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 Log.w(TAG, "Download reconcile failed; in-flight rows stay as they are and remain resumable", it)
             }
         }
+    }
+
+    /// The process-lifetime VortX account sync engine, or null when it could not be stood up (a
+    /// [ProfileStore] init failure, or a keystore problem building its session store). Held here for the same
+    /// reason [EngineStremioRepository] is -- one instance keyed to the [Application], never per Activity --
+    /// so its debounced auto-push scope and the roster/overlay seams it installed on [ProfileStore] live for
+    /// the whole process. Nullable + fail-soft: sync is OFF the critical launch path (VortX works fully
+    /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
+    var syncManager: VortXSyncManager? = null
+        private set
+
+    /**
+     * Activate the account sync engine: construct the (dormant-until-now) [VortXSyncManager], wire its push
+     * seams onto the profile roster + watch overlay via [VortXSyncManager.attachSyncSeams], and register a
+     * process-wide foreground hook that PULLS the account doc on every foreground.
+     *
+     * This is the Android analogue of Apple building `VortXSyncManager.shared` and its
+     * `.onChange(of: scenePhase) { if .active { syncDown() } }` root hook (VortXiOSApp.swift:88 /
+     * VortXTVApp.swift:94): a change made on another device pulls DOWN when this device comes forward. The
+     * engine itself is UNCHANGED -- this only WIRES the already-reviewed manager, whose #145 guards
+     * (tri-state pull, never-shrink / never-zero, tombstone-first fold, per-account version-wins) all live
+     * inside [VortXSyncManager] + [com.vortx.android.sync.VortXSyncDoc]. No merge logic is added here.
+     *
+     * The foreground hook uses [registerActivityLifecycleCallbacks] (not ProcessLifecycleOwner) so it needs
+     * no new dependency and covers BOTH launcher activities from the one process -- the phone [MainActivity]
+     * and the TV [com.vortx.android.ui.tv.TvActivity] -- with a single started-activity counter. The 0 -> 1
+     * started transition IS "the app came to the foreground" (cold launch OR return from background),
+     * matching Apple's scenePhase == .active; [VortXSyncManager.syncDownSoon] is the manager's own documented
+     * foreground / "Sync now" pull entry point (the realtime WebSocket channel is a later Android round).
+     * Rotation does not recreate the launcher activities (they declare configChanges), and a pull is
+     * version-guarded and defers to any queued local push, so even a rare spurious foreground tick (an
+     * uncovered config-change recreation) is a cheap, safe no-op rather than a wipe risk.
+     */
+    private fun wireAccountSync() {
+        val store = ProfileStore.sharedOrNull() ?: return   // ProfileStore init failed: leave sync dormant
+        val manager = runCatching { VortXSyncManager(this).also { it.attachSyncSeams(store) } }
+            .getOrElse {
+                Log.w(TAG, "Account sync unavailable; cross-device sync stays dormant this launch", it)
+                return
+            }
+        syncManager = manager
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            /// Count of currently-started activities. Touched only from the main thread (every
+            /// ActivityLifecycleCallbacks callback is delivered on the main looper), so a plain Int is safe.
+            private var startedActivities = 0
+
+            override fun onActivityStarted(activity: Activity) {
+                // 0 -> 1: the app is now in the foreground. Pull the account doc so a remote edit applies,
+                // mirroring Apple's scenePhase == .active syncDown. syncDownSoon() is fail-soft + a no-op
+                // when signed out, and the pull is version-guarded (applies only a strictly-newer remote and
+                // defers while a local push is queued), so it never clobbers local state.
+                if (startedActivities == 0) manager.syncDownSoon()
+                startedActivities++
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                if (startedActivities > 0) startedActivities--
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
+            override fun onActivityResumed(activity: Activity) {}
+            override fun onActivityPaused(activity: Activity) {}
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) {}
+            override fun onActivityDestroyed(activity: Activity) {}
+        })
     }
 
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
