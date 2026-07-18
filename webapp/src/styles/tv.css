@@ -1,0 +1,93 @@
+/* 10-foot presentation for the LG webOS + Samsung Tizen packages. Every rule is scoped under `html.tv`,
+   a class tvnav.ts adds ONLY on a TV (or a forced `?tv=1` test session), so this stylesheet is inert on
+   the browser build even though Vite bundles it. The web target at web.vortx.tv is unchanged.
+
+   Goals: overscan-safe margins so nothing sits in the TV's cropped border, a bigger base type for couch
+   viewing distance, and a bold, always-on focus ring (a TV drives focus with the D-pad, so we cannot rely
+   on :focus-visible's pointer heuristic the way the browser build does). The HTML5 <video> player chrome
+   is left as-is: it already reads well full-screen and takes the same keys on a remote. */
+
+/* Larger root rem for 10-foot legibility (posters are vw-based, so they scale on their own). */
+html.tv {
+  font-size: calc(clamp(17px, 15px + 0.45vw, 22px) * var(--text-scale, 1));
+  scroll-behavior: smooth;
+}
+
+/* ---- Overscan-safe layout (~5% title-safe inset on 1080p) ---- */
+.tv .brandbar {
+  height: calc(var(--brandbar-h) + 2vh);
+  padding-left: max(var(--space-page), 5vw);
+  padding-right: max(var(--space-page), 5vw);
+}
+.tv .content {
+  padding-top: calc(var(--brandbar-h) + 3vh);
+  padding-left: max(var(--space-page), 5vw);
+  padding-right: max(var(--space-page), 5vw);
+  padding-bottom: calc(var(--tabbar-h) + 7vh);
+}
+.tv .tabbar {
+  bottom: max(24px, 4vh);
+}
+
+/* Keep a D-pad-focused element clear of the fixed brand/tab bars when it is scrolled into view. */
+.tv a,
+.tv button,
+.tv input,
+.tv select,
+.tv .poster {
+  scroll-margin: calc(var(--brandbar-h) + 5vh) 6vw calc(var(--tabbar-h) + 7vh) 6vw;
+}
+
+/* ---- Always-on focus ring (D-pad focus, not pointer focus) ---- */
+.tv :focus {
+  outline: none; /* reset, then paint the strong ring on the interactive roles below */
+}
+.tv a:focus,
+.tv button:focus,
+.tv input:focus,
+.tv select:focus,
+.tv [tabindex]:focus {
+  outline: 3px solid var(--accent-bright);
+  outline-offset: 3px;
+  border-radius: var(--radius-control);
+}
+
+/* Poster cards: reuse the existing hover lift/glow as the focus state so a focused card reads clearly. */
+.tv .poster:focus {
+  transform: translateY(-6px) scale(1.06);
+  outline: 3px solid var(--accent-bright);
+  outline-offset: 4px;
+  border-radius: var(--radius-card);
+  z-index: 2;
+}
+.tv .poster:focus .poster-art {
+  box-shadow: var(--elev-focus), var(--glow-accent);
+}
+.tv .poster:focus .poster-name {
+  color: var(--text);
+}
+
+/* Tabs: a filled focus pill so the current tab is obvious from across the room. */
+.tv .tab:focus {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+  outline: 3px solid var(--accent-bright);
+  outline-offset: 2px;
+}
+.tv .tab.active:focus {
+  color: var(--on-accent);
+  background: var(--accent);
+}
+
+/* Slightly larger rail titles + poster names for couch legibility. */
+.tv .rail-title {
+  font-size: 1.25rem;
+}
+.tv .poster-name {
+  font-size: 0.95rem;
+}
+
+/* Smooth horizontal rail travel as the D-pad walks along a row. */
+.tv .rail {
+  scroll-behavior: smooth;
+}
