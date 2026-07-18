@@ -1,0 +1,25 @@
+[package]
+name = "vortx-ffi"
+description = "The Phase 4 linkable C ABI for the vortx-core engine: the ONE artifact the platform apps link. Packages the kernel's frozen 7-symbol extern C surface (vortx_init_runtime / vortx_dispatch_json / vortx_resolve_json / vortx_get_state_json / vortx_get_state_delta_json / vortx_string_free / vortx_engine_free, defined once in vortx-engine::ffi and re-exported here) as a staticlib (Apple xcframework slices) and a cdylib (Android JNI, desktop). The `host` feature adds vortx_host_resolve_json, the C entry that initializes the Phase 1 host seams (NativeFetcher Fetch, SystemEnv clock, FileStorage persistence) and runs the full plan -> fetch -> settle -> rank resolve round the Phase 3 proof pinned byte-stable. Disable `host` for targets without the native substrate (wasm32)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# rlib keeps `cargo test` + intra-workspace use working; staticlib feeds the Apple
+# xcframework slices; cdylib is the Android JNI / desktop shared object.
+[lib]
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[features]
+default = ["host"]
+# The host seam layer: NativeFetcher (tokio + reqwest) + SystemEnv + FileStorage behind
+# vortx_host_resolve_json. Off for targets with no native host substrate (wasm32), which
+# keeps this crate down to the pure 7-symbol kernel ABI there.
+host = ["dep:vortx-host-cli"]
+
+[dependencies]
+vortx-engine = { path = "../engine" }
+vortx-host-cli = { path = "../host-cli", optional = true }
+serde.workspace = true
+serde_json.workspace = true
