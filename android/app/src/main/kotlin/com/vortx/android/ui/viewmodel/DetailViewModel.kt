@@ -23,6 +23,7 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
+import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.SourcePinContext
@@ -459,6 +460,32 @@ class DetailViewModel(
                 },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
+        }
+    }
+
+    /// Play the meta's YouTube trailer (the detail/hero Trailer affordance). Resolves the trailer id through
+    /// [TrailerCoordinator] -- the on-device client resolver (free 1080p from the user's IP, flag-gated) FIRST,
+    /// with the worker fallback on a miss, the whole resolve internally bounded so a slow InnerTube ladder never
+    /// hangs the tap -- then posts the resulting [Playable] through the SAME [_playback] -> onPlay pipeline every
+    /// source uses. The trailer [Playable] carries no [MediaRef] (a trailer never scrobbles) and `isTrailer =
+    /// true` (the shell skips library/progress side effects). No-op when the meta carries no trailer id or a
+    /// resolve/play is already running.
+    fun playTrailer() {
+        if (_playback.value is Playback.Resolving) return
+        val detail = (_meta.value as? UiState.Success)?.data ?: return
+        val ytId = detail.trailerYouTubeId ?: return
+        _playback.value = Playback.Resolving
+        viewModelScope.launch {
+            val playable = TrailerCoordinator.trailerPlayable(
+                context = app,
+                youTubeId = ytId,
+                title = detail.name,
+                imdbId = id.takeIf { it.startsWith("tt") },
+                year = detail.releaseInfo?.take(4),
+                mediaType = if (type == MediaType.SERIES) "series" else "movie",
+            )
+            _playback.value = playable?.let { Playback.Ready(it) }
+                ?: Playback.Failed("This trailer isn't available right now.")
         }
     }
 

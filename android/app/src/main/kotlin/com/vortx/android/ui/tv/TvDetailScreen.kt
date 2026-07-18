@@ -179,6 +179,17 @@ private fun TvDetailContent(
                             modifier = Modifier.height(28.dp).width(28.dp),
                         )
                     }
+                    // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
+                    // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
+                    // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).
+                    if (detail.trailerYouTubeId != null) {
+                        Spacer(Modifier.width(VortXTheme.spacing.md))
+                        TvFilterChip(
+                            label = "Trailer",
+                            selected = false,
+                            onClick = { viewModel.playTrailer() },
+                        )
+                    }
                 }
                 (playback as? Playback.Failed)?.let {
                     Text(

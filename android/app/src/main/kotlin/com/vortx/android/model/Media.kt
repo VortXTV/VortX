@@ -511,6 +511,25 @@ data class Playable(
     /// meta id + chosen episode); [com.vortx.android.integrations.ScrobbleService] consumes it on the
     /// play/pause/stop transitions. Mirrors the Apple `ExternalMediaRef`.
     val mediaRef: MediaRef? = null,
+    /// A SECOND, audio-only URL to merge with [url] at load, non-null ONLY for a client-resolved YouTube
+    /// trailer whose modern InnerTube answer is ADAPTIVE (a video-only leg + a separate audio leg, the
+    /// norm at every height on the app clients). The mpv engine mounts it via `audio-add`; the ExoPlayer
+    /// engine merges it via `MergingMediaSource`. Null for every other source (a muxed trailer, the worker
+    /// fallback, and every non-trailer stream carry a single [url]). Mirrors Apple `Resolved.audioURL` /
+    /// the `MPVMetalViewController` `--audio-files` sidecar.
+    val audioUrl: String? = null,
+    /// The exact User-Agent googlevideo bound the trailer URLs to (the InnerTube client that MINTED them:
+    /// ANDROID_VR / ANDROID / IOS / TVHTML5). googlevideo answers 403 if [url]/[audioUrl] is replayed with
+    /// a different UA, so BOTH engines and the loopback range-proxy MUST send this exact UA for both legs.
+    /// Non-null only for a client-resolved (googlevideo) trailer; null lets each engine keep its own default
+    /// UA. This is the UA/URL lockstep the trailer path depends on. Mirrors Apple
+    /// `YouTubeDirectResolver.googlevideoUserAgent`, but per-resolve (the winning client varies on Android).
+    val userAgent: String? = null,
+    /// True for a trailer (client-resolved OR worker fallback). A trailer must NOT scrobble, auto-add to
+    /// the library, or write a resume position (it is not the feature), so the shell gates those side
+    /// effects on `!isTrailer`. It also gives the mpv engine the short read-ahead a trailer wants. Mirrors
+    /// the Apple trailer player, which plays trailers through dedicated (non-library) player instances.
+    val isTrailer: Boolean = false,
 )
 
 /// Provider-agnostic description of the title being scrobbled, resolved ONCE at play time and handed to

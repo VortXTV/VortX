@@ -224,6 +224,8 @@ fun DetailScreen(
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
+                        hasTrailer = m.data.trailerYouTubeId != null,
+                        onTrailer = { viewModel.playTrailer() },
                     )
                 }
                 // VortX cross-provider critic scores under the hero actions (only when the ratings service
@@ -558,6 +560,8 @@ private fun ActionsCluster(
     onToggleSources: () -> Unit,
     onToggleLibrary: () -> Unit,
     onToggleWatched: () -> Unit,
+    hasTrailer: Boolean,
+    onTrailer: () -> Unit,
 ) {
     val watchLabel = when {
         resolving -> "Starting…"
@@ -596,6 +600,16 @@ private fun ActionsCluster(
                 leadingIcon = VortXIcons.listBullet,
                 onClick = onToggleSources,
             )
+            // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a miss).
+            // Shown only when the meta carries a YouTube trailer id. Plays through the shared player pipeline.
+            if (hasTrailer) {
+                Chip(
+                    label = "Trailer",
+                    selected = false,
+                    leadingIcon = VortXIcons.playRectangle,
+                    onClick = onTrailer,
+                )
+            }
             // Movie-level watched toggle (a series marks watched per-episode/season via the
             // SeasonSelector's chips instead, since there's no single "the" episode here).
             if (m.videos.isEmpty()) {
