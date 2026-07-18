@@ -133,13 +133,15 @@ final class CoreBridge: ObservableObject {
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
     private func seedInitialState() {
-        let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
         let rows = buildBoardRows()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if !items.isEmpty { self.continueWatching = items }
             if !rows.isEmpty { self.boardRows = rows }
         }
+        // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
+        // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
+        // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
+        rebuildContinueWatching()
         refreshAddons()
     }
 
@@ -1410,6 +1412,66 @@ final class CoreBridge: ObservableObject {
         items.filter { !$0.isFinished }
     }
 
+    /// Recompute + publish the owner Continue Watching rail as the engine's own `continue_watching_preview`
+    /// UNIONED with owner-library titles the engine currently holds at time 0 whose saved resume offset is
+    /// cached in `OwnerResumeStore`.
+    ///
+    /// A device migrated off Stremio (the default) or cold-installed against a VortX account re-adds its owner
+    /// library through `AddToLibrary` at time 0 (stremio-core exposes no action to inject a saved offset), so
+    /// the engine's `continue_watching_preview` (membership is purely `time_offset > 0`) comes back EMPTY and
+    /// the Home rail hides (#149) even though every resume position is already synced into `OwnerResumeStore`.
+    /// Those offsets were previously consulted ONLY at play time (`vortxOwnedResumeSeconds`), never surfaced
+    /// into the rail. This paints them from the LOCAL cache immediately, before any per-title Cinemeta re-add
+    /// or network round trip settles, which also fixes the #147 "CW slower / flashes then disappears" report.
+    ///
+    /// Owner-profile only: an overlay profile rides `profiles.cwItems` and ignores this published value, so for
+    /// a non-owner profile this stays EXACTLY `pruneFinished(engine preview)` (unchanged behaviour). Decodes off
+    /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
+    /// synthesizes + publishes on main.
+    func rebuildContinueWatching() {
+        let engine = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
+        let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let items = ProfileStore.shared.activeUsesEngineHistory
+                ? Self.unionOwnerContinueWatching(engine: engine, library: library)
+                : engine
+            VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
+            self.continueWatching = items
+        }
+    }
+
+    /// Merge the engine's live-offset preview with SYNTHESIZED entries for owner-library titles the engine
+    /// holds at time 0 whose saved offset is cached in `OwnerResumeStore`. Engine items come FIRST (they are
+    /// authoritative and already recency-sorted) and win any id present in both, so a title is never
+    /// double-counted (the engine's live position also wins the resume read, `vortxOwnedResumeSeconds`).
+    /// Synthesized items follow in library order (the library's default `lastwatched` sort, so still
+    /// recency-leaning) and are pruned of finished titles. Pure + owner-only; the caller gates on
+    /// `activeUsesEngineHistory`.
+    static func unionOwnerContinueWatching(engine: [CoreCWItem], library: [CoreCWItem]) -> [CoreCWItem] {
+        var seen = Set(engine.map(\.id))
+        var synthesized: [CoreCWItem] = []
+        for item in library {
+            // Real saved titles only: skip removed / temp markers, and skip anything the engine already
+            // surfaces with a live offset (dedup, engine wins).
+            guard !(item.removed ?? false), !(item.temp ?? false), !seen.contains(item.id) else { continue }
+            // Only titles with a positive CACHED offset are resumable; a finished/rewound title caches t == 0
+            // (a finish that propagated) and is correctly excluded, so it never resurrects here.
+            guard let entry = OwnerResumeStore.entry(forId: item.id), entry.t > 0 else { continue }
+            // Overlay the cached offset (seconds -> ms) onto the library item's own display fields. Watched
+            // counts are left at 0 (as the overlay-profile builder does): the title HAS a resume position, so
+            // it should show unless its own progress is at/past the 0.9 finished ceiling, which pruneFinished
+            // below still enforces. The resume video id falls back to the library item's when the cache has
+            // none (a movie).
+            let overlaid = CoreLibState(timeOffset: entry.t * 1000, duration: entry.d * 1000,
+                                        videoId: entry.v ?? item.state.videoId)
+            synthesized.append(CoreCWItem(id: item.id, type: item.type, name: item.name,
+                                          poster: item.poster, state: overlaid))
+            seen.insert(item.id)
+        }
+        return engine + pruneFinished(synthesized)
+    }
+
     /// Drop a finished title (a movie, or the last episode of a series) out of Continue Watching by
     /// rewinding its saved position to zero. `is_in_continue_watching()` is just `time_offset > 0`, so a
     /// title finished at its end position would otherwise linger forever. Rewind keeps the library entry
@@ -1862,9 +1924,9 @@ final class CoreBridge: ObservableObject {
 
         // Decode the changed screens off the main thread, then publish on main.
         if fields.contains("continue_watching_preview") {
-            let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
-            VXProbe.log("engine", "continueWatching changed n=\(items.count)")
-            DispatchQueue.main.async { [weak self] in self?.continueWatching = items }
+            // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
+            // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
+            rebuildContinueWatching()
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
         // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
@@ -1913,6 +1975,13 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.library = value }
+            // A library change can change which owner titles belong in Continue Watching: the cold-recovery
+            // re-add lands at time 0 and NEVER fires a continue_watching_preview event, and a newly-synced
+            // offset (refreshOwnerResumeCache) can qualify a title. Rebuild the rail from the engine preview
+            // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
+            // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
+            // while sparing the ~20s progress-save churn (#147).
+            if !playerActive { rebuildContinueWatching() }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.

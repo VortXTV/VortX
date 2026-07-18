@@ -1462,6 +1462,12 @@ final class VortXSyncManager: ObservableObject {
         // prior hydrate already did it, or while the installed set is still empty).
         baselineInstalledAddonsOnce()
         await recoverOwnerLibraryIfEmpty(from: doc)
+        // recoverOwnerLibraryIfEmpty just refreshed OwnerResumeStore (and, on a cold device, re-added the owner
+        // library at time 0). Paint Continue Watching once here from the engine preview UNION those cached
+        // offsets, so the rail fills immediately on a cold / migrated launch (#149) even for a warm device that
+        // skipped the re-add but converged new offsets. The per-title re-add library events also rebuild, but
+        // this final pass guarantees a consistent rail regardless of event coalescing.
+        CoreBridge.shared.rebuildContinueWatching()
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
