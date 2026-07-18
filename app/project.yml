@@ -340,6 +340,19 @@ targets:
         name: Fetch node binary (macOS streaming server)
         outputFiles:
           - "$(SRCROOT)/Resources/node-darwin-arm64"
+    postBuildScripts:
+      # Embed the NATIVE Rust streaming server copy-if-present. The binary is a gitignored,
+      # script-produced artifact (app/Vendor/vortx-streaming-server, from ../scripts/
+      # build-mac-server.sh, which needs the engine checkout like the core xcframework build),
+      # so a checkout that never ran the script still builds and ships exactly the node path;
+      # MacNodeServer runs the binary only behind the vortxNativeServer flag (default OFF).
+      - script: |
+          if [ -f "${SRCROOT}/Vendor/vortx-streaming-server" ]; then
+            cp -f "${SRCROOT}/Vendor/vortx-streaming-server" "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/vortx-streaming-server"
+            chmod +x "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/vortx-streaming-server"
+          fi
+        name: Embed native streaming server (optional)
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
