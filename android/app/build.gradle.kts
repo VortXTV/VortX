@@ -102,11 +102,9 @@ android {
         disable += setOf(
             "MissingTranslation", // localeConfig ships English only for now (S01); see res/xml/locales_config.xml
             "ExtraTranslation",
-            // The LEANBACK_LAUNCHER intent-filter (AndroidManifest.xml, pre-S01) makes lint want a TV
-            // banner now. ANDROID-PLAN.md §0 "Form factors & packaging" explicitly schedules the TV
-            // banner + the rest of the TV manifest work for S13, not S01 -- don't fail every PR in the
-            // meantime for a deferred, already-planned requirement. Re-enable when S13 adds the banner.
-            "MissingTvBanner",
+            // MissingTvBanner is no longer suppressed: S13 landed the LEANBACK entry (TvActivity) with a
+            // real `android:banner` (res/drawable/tv_banner.xml) on both <application> and the TV activity,
+            // so the check now passes on its own merits rather than being silenced.
         )
         checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
         abortOnError = true
@@ -172,6 +170,15 @@ dependencies {
     implementation(libs.media3.exoplayer.hls)
     implementation(libs.media3.ui)
     implementation(libs.media3.session)
+
+    // androidx.tv Compose-for-TV (S13): the Android TV 10-foot surface (com.vortx.android.ui.tv.*).
+    // Provides the focus-first `androidx.tv.material3.Surface`/`Text`/`MaterialTheme` the D-pad browse +
+    // detail tiles are built on. NOT flavor-scoped (no GPL native code), so both `full` and `play` carry
+    // it. Version + forward-metadata-compat rationale in gradle/libs.versions.toml (tvMaterial). The TV
+    // surface reuses the SAME repositories/ViewModels as the phone shell (HomeViewModel / DetailViewModel
+    // via StremioXViewModelFactory) -- this dependency only supplies the 10-foot presentation layer, never
+    // a parallel data path.
+    implementation(libs.tv.material)
 
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME

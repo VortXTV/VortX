@@ -32,12 +32,21 @@
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
+        android:banner="@drawable/tv_banner"
         android:localeConfig="@xml/locales_config"
         android:enableOnBackInvokedCallback="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.VortX"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/data_extraction_rules">
+
+        <!-- PHONE / touch entry. MainActivity keeps the ordinary MAIN + LAUNCHER filter (the touch shell,
+             com.vortx.android.ui.StremioXApp). It NO LONGER carries LEANBACK_LAUNCHER: the 10-foot D-pad
+             surface is a distinct activity (TvActivity, below) so the two entrypoints can diverge in
+             layout/focus while sharing one process, one repository, and the same ViewModels. On a phone
+             only LAUNCHER activities appear; on a TV only LEANBACK_LAUNCHER ones do, so a single APK still
+             serves both form factors (the uses-feature leanback/touchscreen required=false above is what
+             lets that one APK install on each). -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -46,7 +55,26 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-                <!-- Android TV launcher entry -->
+            </intent-filter>
+        </activity>
+
+        <!-- ANDROID TV / 10-foot entry (S13). The LEANBACK_LAUNCHER category is what the TV launcher lists;
+             this activity lands on the D-pad browse shell (com.vortx.android.ui.tv.TvApp). It reuses the
+             SAME VortXApplication-owned repository + the SAME HomeViewModel / DetailViewModel as the phone
+             shell (via StremioXViewModelFactory) and hands playback to the SAME PlayerScreen, with no
+             forked business logic and no parallel data path; only the presentation layer differs. The
+             `android:banner`
+             is inherited from <application>; it is repeated here so the launcher tile resolves even on
+             launchers that read the per-activity banner first. Same splash theme + configChanges as
+             MainActivity so a TV cold start shows the identical brand splash. -->
+        <activity
+            android:name=".ui.tv.TvActivity"
+            android:exported="true"
+            android:banner="@drawable/tv_banner"
+            android:theme="@style/Theme.VortX.Splash"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>

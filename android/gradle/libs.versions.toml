@@ -57,6 +57,17 @@ securityCrypto = "1.1.0"
 # over the JDK's javax.crypto, so this is the only crypto library the account crypto pulls.
 tink = "1.8.0"
 mpvLibmpv = "1.0.0"
+# androidx.tv Compose-for-TV (S13 Android TV 10-foot slice). 1.0.0 is the FIRST stable release of the
+# Compose-for-TV library and is pinned deliberately on the SAME forward-metadata-compat rule the whole
+# catalog follows (see composeBom/coil/work notes above): its POM declares kotlin-stdlib 1.8.22, so its
+# .kotlin_module metadata is Kotlin 1.8 -- read with a huge margin by the pinned 2.2.10 compiler (the
+# forward-only reader rule this file keeps flagging), where the newer 1.1.0 line would be chasing the
+# tip for no gain here. Its transitive Compose deps are declared at 1.6.8 but resolve UP to the
+# compose-bom 2025.09.01 (Compose 1.9) versions the app already pulls -- the BOM constrains every
+# androidx.compose.* coordinate, and tv-material's 1.6-compiled bytecode runs against 1.9 unchanged
+# (Compose is backward-compatible within its stable API). tv-material is NOT a licensing-boundary
+# dependency (it carries no GPL native code), so it is a plain `implementation` in BOTH flavors.
+tvMaterial = "1.0.0"
 coil = "3.3.0"
 # WorkManager: the offline-downloads transport (com.vortx.android.downloads.DownloadWorker). It is the Android
 # mechanism with the contract Apple gets from a `.background` URLSession -- work persisted in its own database and
@@ -94,6 +105,8 @@ media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "medi
 media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
 
 mpv-libmpv = { group = "dev.jdtech.mpv", name = "libmpv", version.ref = "mpvLibmpv" }
+
+tv-material = { group = "androidx.tv", name = "tv-material", version.ref = "tvMaterial" }
 
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
