@@ -1210,6 +1210,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     hlsFinalizeInit(moovStart: pos, moovSize: size)
                 } else {
                     hlsMoovLocatedAt = Date()   // start the init-starve clock (#76): finalize must land soon
+                    armInitStarveTimeout()      // #148: wall-clock backstop, fires even if packets go quiet
                     DiagnosticsLog.log("dv", "hls init: moov located at byte \(pos), awaiting size backpatch (placeholder size field=\(size))")
                 }
                 return
@@ -1451,6 +1452,34 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// FIX A (#148): wall-clock backstop for the backpatch-starve trip above. `hlsInitStarved()` is evaluated
+    /// ONLY between packets in the mux loop, so a moov placeholder that wedges while the source goes QUIET
+    /// right after it (the Housemaid EAC3 profile=-99 half-moov orphan) is never re-checked and the demote
+    /// falls through to the ~15s progress-aware start watchdog. Armed ONCE when the placeholder is located
+    /// (hlsIndexHead's `hlsMoovStart == nil` guard makes that branch fire at most once), this fires the demote
+    /// ~hlsInitStarveSecs later even with zero further packets, cutting the visible cache-gone/rebuffer gap
+    /// ~3x. Self-contained: dispatched on a global queue with a weak self, and `failIfInitStarved` re-reads
+    /// PUBLISHED state under hlsLock (race-free) before failing the buffer.
+    private func armInitStarveTimeout() {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + Self.hlsInitStarveSecs) { [weak self] in
+            self?.failIfInitStarved()
+        }
+    }
+
+    /// Fail the buffer iff the located moov placeholder still has not published its init segment. Callable from
+    /// ANY thread: `isCancelled` is atomic, `hlsSnapshot()` reads published state under hlsLock, and
+    /// `buffer.fail` is any-thread-safe and idempotent (a no-op once the buffer already failed/ended). No-ops
+    /// when the init published (initData != nil) or the stream ended, so a healthy mount is never demoted; a
+    /// still-nil init this far past the placeholder is the exact wedged state the packet-driven guard treats
+    /// as fatal, so the two paths agree on the same 4s threshold.
+    private func failIfInitStarved() {
+        guard !isCancelled else { return }
+        let snap = hlsSnapshot()
+        guard snap.initData == nil, !snap.ended else { return }
+        buffer.fail("init starved: moov size backpatch never landed (time-based backstop, source went quiet)")
+        DiagnosticsLog.log("dv", "hls init-starve backstop fired: moov placeholder never finalized within \(Self.hlsInitStarveSecs)s and packets stopped; demoting to libmpv")
     }
 
     /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the

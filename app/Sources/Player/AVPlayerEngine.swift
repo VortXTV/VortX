@@ -208,7 +208,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // `forceRemux` (set by the hev1/dvhe post-attach repair) overrides the router's container gate, which
         // rejects mp4/mov: an AVPlayer-incompatible DV MP4 still routes into the container-agnostic remux lane.
         // Consumed here so it applies to exactly this load.
-        let wantsRemux = forceRemux || PlayerEngineRouter.shouldDVRemux(url: url)
+        // Gate the auto-remux on an actual Dolby Vision signal (#147): shouldDVRemux checks only container
+        // candidacy + a DV-capable display, never DV itself, on the false assumption (its docstring) that
+        // "only DV sources reach the AVPlayer remux lane under Auto". That holds under Auto, but the "Prefer
+        // AVPlayer" override (PlayerEngineRouter rule 2) sends ANY non-torrent URL here, so a plain non-DV MKV
+        // was mounted on the DV remux, failed fast (dvProfile=-1 -> HDR10 404), and demoted to libmpv, losing
+        // Picture in Picture after a ~2s detour. `contentIsDolbyVision` is set from the same
+        // StreamRanking.isDolbyVision signal the router routes on, BEFORE this loadFile (and re-set before a
+        // source-switch loadFile), so a genuine DV source under Auto still remuxes; `forceRemux` still covers
+        // the DV-only hev1/dvhe post-attach repair regardless of the flag.
+        let wantsRemux = forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url))
         forceRemux = false
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
            let mounted = VortXRemuxHLSServer.make(input: url, headers: headers) {

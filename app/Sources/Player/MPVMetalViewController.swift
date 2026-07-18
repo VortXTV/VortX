@@ -1282,6 +1282,15 @@ final class MPVMetalViewController: PlatformViewController {
             range = .hlg
         } else if gamma == "pq" || sigPeak > 1.0 {
             range = .hdr10
+        } else if contentIsDolbyVision && gamma.isEmpty && sigPeak <= 1.0 {
+            // Demote-to-libmpv edge (#148): a DV/HDR title that just fell back from the AVPlayer remux lane
+            // runs this the FIRST time before mpv has probed the stream (the first videoParamsSigPeak observer
+            // fires with sigPeak=0.0 and gamma still empty). Classifying that unprobed instant as .sdr tags the
+            // layer SDR + EDR-off and, on tvOS, drives the panel DV -> SDR while genuine PQ pixels present: the
+            // washed-out wrong-colour flash. The frames ARE PQ, so seed HDR10 up front instead. The later
+            // real-params apply (gamma=pq, sigPeak~4.9) resolves to the same .hdr10 and no-ops on the
+            // `range != appliedDynamicRange` guard below, so there is no second mode switch.
+            range = .hdr10
         } else {
             range = .sdr
         }

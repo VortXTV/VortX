@@ -96,6 +96,16 @@ enum HDRDisplayMode {
     /// this value instead of the 6s serveMaster fail-open.
     private static let noSwitchSettleSeconds: TimeInterval = 1.0
 
+    /// How long the master gate is held PAST `AVDisplayManagerModeSwitchEnd` before it settles (#148). The
+    /// panel switch has finished when End posts, but AVFoundation's internal pipeline-HDR state lags that
+    /// notification by a variable margin (tens of ms observed: a working case latched the DV variant +94ms
+    /// after End, a failing case latched the range-less lifeboat +65ms after End). Releasing the gate the
+    /// instant End posts (zero dwell) let the master be parsed before the pipeline was provably HDR, so
+    /// AVFoundation dropped the explicit-PQ DV variant and latched the lifeboat -> CoreMedia -12927 on
+    /// /init-hdr.mp4. A short dwell past End lets the pipeline reach provably-HDR first; well under the 6s
+    /// serveMaster fail-open so a wedged switch still yields a playable variant.
+    private static let modeSwitchSettleDwellSeconds: TimeInterval = 0.3
+
     @MainActor
     private static func installModeSwitchObservers() {
         guard !observersInstalled else { return }
@@ -109,9 +119,20 @@ enum HDRDisplayMode {
             DiagnosticsLog.logSync("hdr", "display mode switch STARTED (system notification)")
         }
         center.addObserver(forName: .AVDisplayManagerModeSwitchEnd, object: nil, queue: .main) { _ in
-            cancelNoSwitchTimeout()   // switch finished; a lingering no-switch timer must not re-fire
-            setSwitchSettled(true)   // release the HLS master gate: the pipeline is now provably HDR
-            DiagnosticsLog.logSync("hdr", "display mode switch ENDED (system notification)")
+            // The panel switch has ENDED, but AVFoundation's pipeline-HDR state lags this notification by a
+            // variable margin, so releasing the master gate here with ZERO dwell let the master be parsed a
+            // hair before the pipeline was provably HDR: AVFoundation dropped the explicit-PQ DV variant and
+            // latched the range-less lifeboat -> -12927 on ~7/9 DV titles (#148). Hold the gate a short DWELL
+            // past ModeSwitchEnd instead, reusing the SAME epoch/timer machinery as the no-switch settle so a
+            // newer request() (or reset()) supersedes this pending settle by advancing the epoch.
+            // beginNoSwitchWindow() cancels any lingering no-switch timer and advances the epoch exactly as
+            // the old cancelNoSwitchTimeout() did; `switchSettled` stays false (set in request) until the
+            // dwell fires, and the 6s serveMaster fail-open still bounds the total wait.
+            let epoch = beginNoSwitchWindow()
+            let dwellTimer = DispatchWorkItem { settleSwitchEndIfCurrent(epoch: epoch) }
+            armNoSwitchTimer(dwellTimer)
+            DispatchQueue.main.asyncAfter(deadline: .now() + modeSwitchSettleDwellSeconds, execute: dwellTimer)
+            DiagnosticsLog.logSync("hdr", "display mode switch ENDED (system notification); settling master gate in \(modeSwitchSettleDwellSeconds)s")
         }
     }
 
@@ -153,6 +174,23 @@ enum HDRDisplayMode {
         switchLock.unlock()
         if current {
             note("display switch: no ModeSwitchStart within \(noSwitchSettleSeconds)s, panel already in target mode; master gate settled")
+        }
+    }
+
+    /// The post-ModeSwitchEnd dwell timer fired (#148): settle the master gate only if no later request or
+    /// reset superseded this timer (the same epoch guard as `settleNoSwitchIfCurrent`). Holding the gate a
+    /// short dwell past ModeSwitchEnd lets AVFoundation's pipeline reach provably-HDR before it parses the HLS
+    /// master, so it latches the DV variant instead of the range-less lifeboat that -12927s on /init-hdr.mp4.
+    private static func settleSwitchEndIfCurrent(epoch: UInt64) {
+        switchLock.lock()
+        let current = (epoch == switchEpoch)
+        if current {
+            switchSettled = true
+            noSwitchTimeout = nil
+        }
+        switchLock.unlock()
+        if current {
+            note("display switch settled \(modeSwitchSettleDwellSeconds)s after ModeSwitchEnd; master gate released")
         }
     }
 
