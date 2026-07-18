@@ -27,6 +27,7 @@ members = [
     "crates/live",
     "crates/host-native",
     "crates/host-cli",
+    "crates/ffi",
 ]
 
 [workspace.package]
