@@ -9,8 +9,8 @@
 #
 #   ios-arm64            SERVER-INCLUSIVE (kernel ABI + vortx_server_start/port/base_url/stop)
 #   ios-arm64-simulator  SERVER-INCLUSIVE
-#   tvos-arm64           KERNEL-ONLY (see the tier-3 note below)
-#   tvos-arm64-simulator KERNEL-ONLY
+#   tvos-arm64           SERVER-INCLUSIVE (unwalled by the engine's librqbit rust-tls swap; below)
+#   tvos-arm64-simulator SERVER-INCLUSIVE
 #   macos-arm64          KERNEL-ONLY (macOS runs the server as a spawned child; the desktop
 #                        cutover branch owns that lane, so nothing here consumes a mac server)
 #
@@ -21,18 +21,20 @@
 # aarch64-apple-ios.rs"), and no Apple app target calls vortx_host_resolve_json anyway. Kernel +
 # server is exactly the ABI the app links.
 #
-# tvOS tier-3 verdict (2026-07-19, honest record): the SERVER feature does NOT cross-compile to
-# aarch64-apple-tvos / aarch64-apple-tvos-sim. The wall is openssl-sys v0.9.117, reached via
+# tvOS tier-3 history (resolved): the SERVER feature originally did NOT cross-compile to
+# aarch64-apple-tvos / aarch64-apple-tvos-sim. The wall was openssl-sys v0.9.117, reached via
 #   librqbit v8.1.1 -> librqbit-sha1-wrapper v4.1.0 (default feature `sha1-crypto-hash`)
 #     -> crypto-hash v0.3.4 -> openssl v0.10.81 -> openssl-sys v0.9.117
-# crypto-hash selects CommonCrypto only for target_os = macos/ios and falls back to OpenSSL for
+# (crypto-hash selects CommonCrypto only for target_os = macos/ios and falls back to OpenSSL for
 # every other unix; tvOS is "other unix" to it and has no OpenSSL sysroot, so the build script
-# aborts ("Could not find directory of OpenSSL installation", exit 101). The fix is engine-side:
-# declare librqbit with default-features = false and its `rust-tls` set (reqwest/rustls-tls +
-# sha1-ring) in vortx-streaming-server/Cargo.toml, then re-verify the rest of the tree (aws-lc-rs
-# on tvOS is the next unknown). Until that lands, tvOS ships kernel-only slices and the app's
-# server manager compiles to inert stubs there (no VORTX_ENGINE_SERVER condition on VortXTV).
-# The KERNEL cross-compiles to both tvOS targets cleanly (verified Finished/exit 0).
+# aborted with "Could not find directory of OpenSSL installation", exit 101). FIXED engine-side
+# (engine/vortx-core 5314577): crates/streaming-server declares librqbit with
+# default-features = false and its `rust-tls` set (reqwest/rustls-tls + sha1-ring), keeping the
+# whole TLS/SHA-1 stack pure-Rust (ring), so `--no-default-features --features server` now
+# cross-compiles cleanly to BOTH tvOS triples. tvOS therefore ships SERVER-INCLUSIVE slices and
+# VortXTV carries the VORTX_ENGINE_SERVER condition in project.yml (the real VortxNativeServer
+# body compiles there, not the stubs). The `vortxNativeServer` runtime flag stays default OFF:
+# nodejs-mobile keeps serving until the device-gated flip.
 #
 # Both tvOS targets are TIER 3 (no prebuilt std), which is why every slice here builds with
 # `-Z build-std=std,panic_abort` from rust-src - the same flag the panic-abort C-boundary
@@ -50,7 +52,7 @@
 #     at $(BUILT_PRODUCTS_DIR)/include/vortx to discover the nested module instead.
 #
 # Usage:
-#   build-ffi-xcframework.sh              # the Phase 8 layout above (server on the iOS slices)
+#   build-ffi-xcframework.sh              # the Phase 8 layout above (server on the iOS + tvOS slices)
 #   build-ffi-xcframework.sh --no-server  # EVERY slice kernel-only: the JSCore/wasm-shaped
 #                                         # fallback route. Same slice set, no server symbols
 #                                         # anywhere; a target built against it must NOT define
@@ -109,14 +111,16 @@ build_slice() { # <triple> <sdk> <kernel|server>
         -p vortx-ffi $features --release --target "$1"
 }
 
-# What each slice carries in THIS mode (kernel mode strips the server everywhere).
+# What each slice carries in THIS mode (kernel mode strips the server everywhere; the --no-server
+# fallback must stay able to produce an all-kernel artifact for the JSCore/wasm-shaped route).
 IOS_KIND=server
-[ "$MODE" = kernel ] && IOS_KIND=kernel
+TV_KIND=server
+if [ "$MODE" = kernel ]; then IOS_KIND=kernel; TV_KIND=kernel; fi
 
 build_slice aarch64-apple-ios       iphoneos          "$IOS_KIND"
 build_slice aarch64-apple-ios-sim   iphonesimulator   "$IOS_KIND"
-build_slice aarch64-apple-tvos      appletvos         kernel
-build_slice aarch64-apple-tvos-sim  appletvsimulator  kernel
+build_slice aarch64-apple-tvos      appletvos         "$TV_KIND"
+build_slice aarch64-apple-tvos-sim  appletvsimulator  "$TV_KIND"
 build_slice aarch64-apple-darwin    macosx            kernel
 
 # Localize every non-vortx_* global. Two other Rust staticlibs live in the same binaries
@@ -178,4 +182,4 @@ for slice in ios-arm64 ios-arm64-simulator tvos-arm64 tvos-arm64-simulator macos
     if echo "$syms" | grep -q '^_vortx_server_start$'; then kind=server-inclusive; else kind=kernel-only; fi
     echo "  $slice [$kind]: $(echo "$syms" | tr '\n' ' ')"
 done
-echo "OK: $OUT (iOS device+sim $IOS_KIND, tvOS device+sim kernel-only, macOS kernel-only; vortx_*-only exports)"
+echo "OK: $OUT (iOS device+sim $IOS_KIND, tvOS device+sim $TV_KIND, macOS kernel-only; vortx_*-only exports)"

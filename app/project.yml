@@ -288,7 +288,10 @@ targets:
         # symbols, only the module, so this condition is the per-target statement "the linked slice
         # carries the server ABI"; SourcesShared/VortxNativeServer.swift compiles its real body
         # under `canImport(VortxEngine) && VORTX_ENGINE_SERVER` and inert stubs elsewhere. Do NOT
-        # copy this to a target whose slice is kernel-only (tvOS today): it would fail at link.
+        # copy this to a target whose slice is kernel-only (an artifact from the script's
+        # --no-server fallback): it would fail at link. VortXTV carries it too now that the tvOS
+        # slices are server-inclusive (the engine's librqbit rust-tls swap unwalled the tier-3
+        # cross-compile).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "183"
@@ -442,6 +445,15 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # Phase 8 tvOS: the vortx-core engine ABI, SERVER-INCLUSIVE tvos-arm64 / tvos-arm64-simulator
+      # slices (kernel + vortx_server_start/port/base_url/stop; the engine's librqbit rust-tls swap
+      # unwalled the tier-3 server cross-compile). Linked, not embedded, exactly like
+      # VortXiOSNative's iOS slices; all non-vortx_* globals are localized so it link-coexists with
+      # StremioXCore and Libdovi. Drives the flag-gated in-process engine server
+      # (SourcesShared/VortxNativeServer.swift); the `vortxNativeServer` default stays OFF, so
+      # nodejs-mobile keeps serving until the device-gated flip.
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
       # AVKit must be an explicit link: the only thing used from it is the
       # UIWindow.avDisplayManager CATEGORY (no link-time symbols), so autolink
       # plus the dead-stripping linker silently dropped the framework, the
@@ -456,6 +468,15 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        # VortxEngine module discovery, same as VortXiOSNative: the xcframework nests its header +
+        # module.modulemap under Headers/vortx/ (a flat Headers/ would collide with StremioXCore's
+        # module.modulemap in the shared Products/include/ copy step).
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # The linked tvOS VortxEngine slices are SERVER-INCLUSIVE, so this target compiles the REAL
+        # VortxNativeServer body (see the VortXiOSNative note for the two-layer gating). The
+        # `vortxNativeServer` @AppStorage flag stays default OFF (device-gated flip); with the
+        # condition set, the tvOS Settings toggle renders (VortxNativeServerFlag.isSupported).
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "183"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
