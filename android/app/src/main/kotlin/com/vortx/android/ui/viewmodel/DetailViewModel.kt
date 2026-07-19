@@ -501,6 +501,7 @@ class DetailViewModel(
                         playable.copy(
                             startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
                             mediaRef = ref,
+                            expectedDurationMs = expectedRuntimeMs(),
                         ),
                     )
                 },
@@ -651,6 +652,7 @@ class DetailViewModel(
                         playable.copy(
                             startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
                             mediaRef = ref,
+                            expectedDurationMs = expectedRuntimeMs(),
                         ),
                     )
                 },
@@ -728,7 +730,20 @@ class DetailViewModel(
             isAtmos = StreamRanking.isAtmos(source),
             startPositionMs = resumeMs,
             mediaRef = ref,
+            expectedDurationMs = expectedRuntimeMs(),
         )
+
+    /// The title's expected runtime (ms) from the loaded catalog metadata, riding every resolved
+    /// [Playable] as [Playable.expectedDurationMs] so the player's bad-source (runtime-mismatch)
+    /// verdict has a ground truth to compare the file's real duration against. 0 when the meta is
+    /// not loaded or carries no parseable runtime, which the player treats as "unknown" and falls
+    /// back to its conservative absolute junk floor. Show-level runtime for a series (Cinemeta's
+    /// per-episode runtime is not modeled on [Episode]), which is the right granularity for the
+    /// "10-second file is not a 45-minute episode" check.
+    private fun expectedRuntimeMs(): Long {
+        val seconds = (_meta.value as? UiState.Success)?.data?.runtimeSeconds ?: return 0L
+        return (seconds * 1000.0).toLong().coerceAtLeast(0L)
+    }
 
     /// The external-sync media identity for the source about to play: the movie/show IMDb (or TMDB) id from
     /// the meta id, plus the chosen episode's season/number for a series. Null before meta loads or for an
@@ -806,6 +821,74 @@ class DetailViewModel(
         pendingAutoPick = true
         viewModelScope.launch { loadSources(next.id) }
     }
+
+    // ---- Bad-source retry ladder (the trust fix) ----
+    //
+    // "The file ended" must never mean "the episode was watched": when the player judges the live
+    // source BAD (engine error, stall watchdog, or the runtime-mismatch verdict -- a ~10s junk file
+    // standing in for a removed episode), the shell calls [retryNextSource] and the ladder tries the
+    // NEXT distinct source from the SAME ranked list the visible source rows use, carrying the failed
+    // play's continuity/binge hints so the retry stays on the closest release family. After
+    // [MAX_SOURCE_ATTEMPTS] distinct sources fail for the same play target, it stops and the shell
+    // surfaces manual selection ([manualSourceOptions]) instead: never silently give up, never advance.
+
+    /// Failed playable handles per play target (episode id, or the movie id) for this ViewModel's
+    /// lifetime, so a retry never re-picks a source that already failed this session and the ladder's
+    /// attempt cap is per EPISODE, not per player instance. Handle = `id.substringBefore('#')`, the
+    /// same identity [StreamRanking]'s de-dup and the resolve paths key on.
+    private val failedHandlesByTarget = HashMap<String, MutableSet<String>>()
+
+    /// Record the just-failed play (the last source this ViewModel resolved) against the current play
+    /// target and start the next-ranked source, WITHOUT bouncing the viewer out of the player: the
+    /// resolve posts through [playback] exactly like a manual play and the shell swaps the player's
+    /// [Playable] on Ready. Returns false when the ladder is exhausted ([MAX_SOURCE_ATTEMPTS] distinct
+    /// sources failed) or no untried candidate exists, in which case the caller must surface MANUAL
+    /// selection. (The hive-mind failure-report hook (#80) would attach here: target id + failed
+    /// handle + attempt count are all in scope. Not built in this change.)
+    fun retryNextSource(): Boolean {
+        val targetId = _selectedEpisodeId.value ?: id
+        val failed = failedHandlesByTarget.getOrPut(targetId) { mutableSetOf() }
+        // No record of what just failed means the ledger cannot grow and the attempt cap could never
+        // trip: surface manual selection rather than risk retrying the same dead source forever.
+        val failedSource = lastPlayedSource ?: return false
+        failed.add(handleOf(failedSource))
+        if (failed.size >= MAX_SOURCE_ATTEMPTS) return false
+        val groups = (_streams.value as? UiState.Success)?.data ?: return false
+        val ctx = lastCtx ?: return false
+        // Ranked EXACTLY as the visible list / auto-pick ranks (score + continuity + binge + pin +
+        // the user's filter prefs), so the retry order matches what the viewer would pick by hand,
+        // hinted toward the failed play's release family (same quality tier, same binge group).
+        val ranked = StreamRanking.rankedCandidates(
+            groups,
+            continuity = StreamRanking.signature(failedSource),
+            binge = failedSource.bingeGroup,
+            pin = currentPin(),
+            prefs = ctx.prefs,
+        )
+        val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
+        play(next)
+        return true
+    }
+
+    /// The ranked source list for the shell's manual-pick fallback (shown after the auto-retry ladder
+    /// exhausts): best-first, de-duplicated, ranked with the same prefs/pin as the detail rows.
+    /// Deliberately NOT filtered by the failed set -- the viewer may knowingly re-try one -- and capped
+    /// so the overlay stays scannable. Empty before sources load (the shell then exits to Detail).
+    fun manualSourceOptions(limit: Int = MANUAL_PICK_LIMIT): List<StreamSource> {
+        val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
+        val prefs = lastCtx?.prefs
+        val ranked = if (prefs != null) {
+            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin(), prefs = prefs)
+        } else {
+            StreamRanking.rankedCandidates(groups, continuity = null, pin = currentPin())
+        }
+        return ranked.take(limit)
+    }
+
+    /// The playable-handle identity used by the failed-source ledger: the id up to the first '#'
+    /// (mirrors [StreamRanking]'s private handleOf and the resolve/dedup convention documented on
+    /// [CACHED_ID_SUFFIX]).
+    private fun handleOf(source: StreamSource): String = source.id.substringBefore('#')
 
     // ---- S05: resume targeting ----
 
@@ -951,6 +1034,14 @@ class DetailViewModel(
     )
 
     private companion object {
+        /// How many DISTINCT sources the bad-source ladder may burn per play target before it stops
+        /// auto-retrying and the shell surfaces manual selection (the CEO's "after 3 failures, ask").
+        const val MAX_SOURCE_ATTEMPTS = 3
+
+        /// Manual-pick overlay cap: enough to always include every realistic quality tier without
+        /// rendering a thousand-row list inside the player.
+        const val MANUAL_PICK_LIMIT = 30
+
         /// The text marker folded into an account-cached source's description so the text-based [StreamRanking]
         /// lights the cache badge + applies the +cache bonus (it looks for a bolt / "cached").
         const val CACHED_MARKER = "⚡ Cached"

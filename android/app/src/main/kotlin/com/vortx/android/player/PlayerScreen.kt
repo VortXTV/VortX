@@ -111,6 +111,13 @@ fun PlayerScreen(
     /// Defaults to [onBack] so a host without an auto-advance flow keeps the old exit-to-detail
     /// behavior; the phone shell wires it to the series Up Next auto-advance instead.
     onEnded: () -> Unit = onBack,
+    /// Called ONCE when the live source is judged BAD -- the engine's own hasError, the stall
+    /// watchdog, or the runtime-mismatch verdict below (a file implausibly shorter than the title's
+    /// expected runtime, e.g. a ~10s junk file standing in for a removed episode). The host is
+    /// expected to auto-retry the next ranked source (the phone shell's bad-source ladder) WITHOUT
+    /// bouncing the viewer out. Null (the default) keeps the pre-existing behavior exactly: the
+    /// error overlay with its manual "Choose another source" action (the TV shell today).
+    onSourceFailed: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -118,6 +125,7 @@ fun PlayerScreen(
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
+    val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
     // current playback speed reflected in the speed control.
@@ -322,9 +330,56 @@ fun PlayerScreen(
             if (now - lastProgressAt >= bound) stallError = true
         }
     }
+    // RUNTIME-MISMATCH = BAD SOURCE (the trust fix). "The file ended" must not mean "the episode was
+    // watched": a removed/not-in-debrid episode often resolves to a ~10s junk/sample file that plays
+    // cleanly to EOF, which used to mark the episode watched and auto-advance past it. The ground
+    // truth is [Playable.expectedDurationMs] (the catalog metadata runtime, attached at resolve
+    // time); the file's own demuxed duration is compared against it via [isJunkDuration]:
+    //   - EARLY: the moment the engine reports a real duration (available once demuxed, well before
+    //     the junk finishes playing), an implausibly short file is condemned on the spot -- the 10s
+    //     ideally never really plays. The engine is paused so the junk can't keep rolling (and can't
+    //     reach EOF) while the host swaps sources.
+    //   - EOF BACKSTOP: inside the ended dispatch below -- an EOF whose playhead sits far below the
+    //     expected runtime (a file that LIED about its duration, then ended early) is the same
+    //     verdict, applied before the ended signal can reach the host.
+    // With NO expected runtime (ad-hoc plays, downloads, live) the check falls back to a conservative
+    // absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS]. Trailers are exempt
+    // (short by design), and a live stream never reports a positive duration, so neither can trip it.
+    // The verdict is terminal for this file by construction (metadata and the demuxed length cannot
+    // change), so unlike [stallError] it never self-clears. A [Playable.userForcedSource] play (the
+    // viewer's own pick off the manual fallback) is exempt from the VERDICT -- their warned, explicit
+    // choice must play -- while the never-poison writeback gates below stay in force regardless.
+    var runtimeMismatch by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playerState.durationMs, playable.url) {
+        if (runtimeMismatch || playable.userForcedSource) return@LaunchedEffect
+        val fileMs = latestState.durationMs
+        if (fileMs <= 0L) return@LaunchedEffect
+        if (isJunkDuration(fileMs, playable)) runtimeMismatch = true
+    }
+    // Stop the condemned file immediately: pausing keeps it from playing (or EOF-ing) under the
+    // error surface while the host's retry ladder resolves the next source. Only the mismatch pauses
+    // here -- an engine error is already dead, and a stall verdict may still self-heal (see the
+    // watchdog above), so neither is touched (the #76 semantics stay exactly as they were).
+    LaunchedEffect(runtimeMismatch) {
+        if (runtimeMismatch) runCatching { engine.pause() }
+    }
+
     // The one error verdict everything downstream renders and gates on: the engine's own hasError OR
-    // the watchdog's stall verdict.
-    val effectiveError = playerState.hasError || stallError
+    // the watchdog's stall verdict OR the runtime-mismatch verdict.
+    val effectiveError = playerState.hasError || stallError || runtimeMismatch
+
+    // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
+    // Every bad-source class funnels through here -- a dead link (hasError), a silent stall
+    // (stallError), a wrong/junk file (runtimeMismatch) -- so the ladder is the single recovery
+    // path. With no [onSourceFailed] wired (the TV shell) this is inert and the chrome's error
+    // overlay + manual "Choose another source" behavior is byte-identical to before.
+    var sourceFailureDispatched by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(effectiveError) {
+        if (!effectiveError || sourceFailureDispatched) return@LaunchedEffect
+        val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
+        sourceFailureDispatched = true
+        dispatch()
+    }
 
     // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
     // Paused, buffering, or errored playback keeps the controls on screen (hiding them over a stall or a
@@ -444,7 +499,9 @@ fun PlayerScreen(
     // silently drop it (the known past root cause of an account that contributed nothing from any device).
     LaunchedEffect(playable.url, playerState.durationMs > 0L) {
         val durationMs = latestState.durationMs
-        if (durationMs <= 0L) return@LaunchedEffect
+        // A junk-length file must never key (or feed) the SHARED community pool: its duration bucket
+        // is the wrong file's, not the episode's. Same never-poison rule as the progress writes.
+        if (durationMs <= 0L || isJunkDuration(durationMs, playable)) return@LaunchedEffect
         trickplay.configure(playable.mediaRef, durationMs / 1000.0)
     }
 
@@ -462,7 +519,9 @@ fun PlayerScreen(
         while (true) {
             delay((TrickplaySession.CAPTURE_INTERVAL_S * 1000).toLong())
             val s = latestState
-            if (s.isPaused || s.isBuffering || s.durationMs <= 0L) continue
+            // The runtimeMismatch gate keeps a condemned file's frames out of the shared pool (the
+            // configure above already refused to key the session on a junk duration).
+            if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch) continue
             val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
             // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank
             // it with the frame. Doing it at teardown instead would mean a JNI property read against an
@@ -486,8 +545,25 @@ fun PlayerScreen(
     // surface the error overlay, never fire the next-episode auto-advance (the audit's wrong-auto-
     // advance defect). The mpv engine now keeps hasEnded/hasError mutually exclusive at the source;
     // this is the belt-and-suspenders at the dispatch seam, and it also covers the watchdog's verdict.
+    //
+    // EOF BACKSTOP (the runtime-mismatch second gate): only a GENUINE completion -- the playhead got
+    // through most of the expected runtime -- may reach [onEnded]. An EOF whose playhead sits
+    // implausibly short of the expected runtime means the FILE was wrong even though its duration
+    // header looked sane (or was never judged), so it is converted into the runtime-mismatch verdict
+    // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
+    // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
+    // auto-advance, whichever engine reported the EOF.
     LaunchedEffect(playerState.hasEnded) {
-        if (playerState.hasEnded && !latestState.hasError && !stallError) currentOnEnded()
+        val s = latestState
+        if (!playerState.hasEnded || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        // A userForcedSource play skips the conversion (the viewer chose this exact file off the
+        // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
+        // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
+        if (!playable.userForcedSource && isJunkEof(s.positionMs, s.durationMs, playable)) {
+            runtimeMismatch = true
+            return@LaunchedEffect
+        }
+        currentOnEnded()
     }
 
     // Fail-soft watchdog: if the mpv engine flagged a surface-attach failure, rebuild on ExoPlayer. Only
@@ -500,20 +576,33 @@ fun PlayerScreen(
     // Periodic progress writeback while playing, so Continue Watching updates live. The engine's state
     // position advances ~1s on both engines (mpv's time-pos observer, ExoPlayer's position ticker), so a
     // throttled read here is accurate; the host debounces the engine dispatch.
+    //
+    // NEVER-POISON GATE: a junk-length file must not attribute progress to the real episode -- a tick
+    // of (pos~=10s, dur~=10s) reads as a NEAR-END ratio and the repo's end-of-session write would mark
+    // the episode WATCHED off it. Gated on the [runtimeMismatch] verdict AND the synchronous
+    // [isJunkDuration] read of the same snapshot, so even the first tick after the duration lands can
+    // never race the verdict state and slip a poisoned ratio through. A genuine mid-play error is NOT
+    // gated (a real 30-minute watch that then dies still deserves its resume point).
     LaunchedEffect(engine) {
         while (true) {
             delay(PROGRESS_REPORT_MS)
             val s = latestState
-            if (!s.isPaused && s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+                currentOnProgress(s.positionMs, s.durationMs)
+            }
         }
     }
 
     // Save-on-exit: emit the freshest position when the player leaves composition, so the host's
-    // end-of-session write records where the viewer actually stopped.
+    // end-of-session write records where the viewer actually stopped. Same never-poison gate as the
+    // periodic tick above: a condemned file's final (pos, dur) pair is the exact write that used to
+    // mark a 10-second junk file watched, so it is dropped entirely.
     DisposableEffect(engine) {
         onDispose {
             val s = latestState
-            if (s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+            if (s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+                currentOnProgress(s.positionMs, s.durationMs)
+            }
         }
     }
 
@@ -530,9 +619,12 @@ fun PlayerScreen(
     var scrobblePauseSent by remember(playable.url) { mutableStateOf(false) }
     LaunchedEffect(playerState.isPaused, playerState.durationMs > 0L, playerState.hasEnded) {
         val ref = scrobbleRef ?: return@LaunchedEffect
+        // Never start scrobbling a condemned junk file (the mismatch verdict lands with the duration
+        // report, before or alongside the first possible start here).
+        if (runtimeMismatch) return@LaunchedEffect
         ScrobbleService.init(context.applicationContext)
         val s = latestState
-        if (s.durationMs <= 0L || s.hasEnded) return@LaunchedEffect
+        if (s.durationMs <= 0L || s.hasEnded || isJunkDuration(s.durationMs, playable)) return@LaunchedEffect
         val progress = s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
         if (!s.isPaused) {
             // First play, or a resume: Trakt uses `start` for both.
@@ -549,7 +641,15 @@ fun PlayerScreen(
             val ref = scrobbleRef
             if (ref != null && scrobbleStarted) {
                 val s = latestState
-                val progress = if (s.durationMs > 0L) s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0 else 0.0
+                // NEVER-POISON GATE: a junk-length file's EOF ratio is ~100%, which Trakt records as
+                // WATCHED (>= 80%) and SIMKL writes to history. A condemned source therefore stops at
+                // 0% -- the session still closes cleanly server-side, but records nothing watched.
+                val junk = runtimeMismatch || isJunkDuration(s.durationMs, playable)
+                val progress = if (s.durationMs > 0L && !junk) {
+                    s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
+                } else {
+                    0.0
+                }
                 // Stop records the watch server-side (Trakt at >= 80%, plus a SIMKL history write).
                 ScrobbleService.stop(ref, progress)
             }
@@ -656,9 +756,16 @@ fun PlayerScreen(
 
         PlayerChrome(
             playable = playable,
-            // The watchdog's stall verdict rides the same hasError the engines publish, so the chrome
-            // has exactly one error surface (the overlay + "Choose another source" retry path).
-            state = if (stallError) playerState.copy(hasError = true) else playerState,
+            // The watchdog's stall verdict and the runtime-mismatch verdict both ride the same
+            // hasError the engines publish, so the chrome has exactly one error surface (the overlay
+            // + "Choose another source" retry path). A mismatch additionally clears hasEnded: the
+            // junk file may genuinely have EOF'd, but presenting "ended" for a wrong file would be
+            // the exact lie this fix removes.
+            state = when {
+                runtimeMismatch -> playerState.copy(hasError = true, hasEnded = false)
+                stallError -> playerState.copy(hasError = true)
+                else -> playerState
+            },
             dolbyVisionAvailable = displaySupportsDolbyVision(context),
             emberAccent = emberAccent,
             speed = speed,
@@ -858,6 +965,50 @@ private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
 /// stalled. Tighter than the start bound: mid-stream the pipeline is proven, so a long freeze is a
 /// dead connection, and the verdict self-clears if the stream recovers.
 private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
+
+/// Whether the FILE's demuxed duration is implausibly short for the title being played, i.e. the
+/// source resolved to the WRONG file (a removed episode's ~10s debrid junk/sample). With a known
+/// expected runtime ([Playable.expectedDurationMs], from catalog metadata) the file is junk when it
+/// runs under `min(expected/2, expected - 10min)`: half-length catches a sample/clip against any
+/// feature runtime, while the 10-minute slack keeps a legitimately shorter cut of a short episode
+/// out of the verdict (for anything under ~20 minutes expected, the slack term shrinks the
+/// threshold toward zero, so only truly tiny files are condemned). With NO expected runtime the
+/// only safe signal is the absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS].
+/// Trailers are exempt (short by design); a non-positive duration is "not demuxed yet", never junk.
+private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
+    if (playable.isTrailer || fileDurationMs <= 0L) return false
+    val expectedMs = playable.expectedDurationMs
+    if (expectedMs > 0L) {
+        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
+        return fileDurationMs < threshold
+    }
+    return fileDurationMs < JUNK_DURATION_FLOOR_MS
+}
+
+/// The EOF-side twin of [isJunkDuration]: whether an END-of-file arrived with the playhead
+/// implausibly short of the expected runtime. Catches the file that LIED about its duration (a sane
+/// header, a 10-second payload): the early duration check passed, but the EOF position tells the
+/// truth. Judged on the playhead (never the claimed duration) because the playhead is where playback
+/// REALLY got to. With no expected runtime, an EOF under the absolute floor of BOTH playhead and
+/// claimed duration is junk (a genuinely short file watched to its end); anything longer is trusted.
+private fun isJunkEof(positionMs: Long, fileDurationMs: Long, playable: Playable): Boolean {
+    if (playable.isTrailer) return false
+    val expectedMs = playable.expectedDurationMs
+    if (expectedMs > 0L) {
+        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
+        return positionMs < threshold
+    }
+    return positionMs < JUNK_DURATION_FLOOR_MS && fileDurationMs < JUNK_DURATION_FLOOR_MS
+}
+
+/// Slack subtracted from the expected runtime for the mismatch threshold, so credit-less cuts,
+/// ad-padded metadata runtimes, and slightly-off catalog numbers never condemn a real file.
+private const val EXPECTED_RUNTIME_SLACK_MS = 10 * 60_000L
+
+/// Conservative absolute junk floor when NO expected runtime is known: no real episode or movie
+/// file is under 2 minutes, but plenty of legitimate short content sits just above it, so this only
+/// catches outright samples/stubs. (Trailers never reach the check at all.)
+private const val JUNK_DURATION_FLOOR_MS = 2 * 60_000L
 
 internal val DefaultEmber = Color(0xFFD97706)
 

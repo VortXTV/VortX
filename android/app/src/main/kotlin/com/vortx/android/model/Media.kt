@@ -540,6 +540,22 @@ data class Playable(
     /// effects on `!isTrailer`. It also gives the mpv engine the short read-ahead a trailer wants. Mirrors
     /// the Apple trailer player, which plays trailers through dedicated (non-library) player instances.
     val isTrailer: Boolean = false,
+    /// The EXPECTED runtime of the title being played, in milliseconds, read from catalog metadata
+    /// ([MetaDetail.runtimeSeconds], the parsed Cinemeta/TMDB "45 min" / "2h 08m" string) at resolve
+    /// time by [com.vortx.android.ui.viewmodel.DetailViewModel]. 0 = unknown (ad-hoc plays, local
+    /// downloads, live streams, trailers). The player's bad-source verdict compares the FILE's real
+    /// demuxed duration against this: a file implausibly shorter than the expected runtime (a removed
+    /// episode's ~10s debrid junk/sample file) is a WRONG FILE, never a finished episode, so reaching
+    /// its EOF must not mark the episode watched or fire the next-episode auto-advance.
+    val expectedDurationMs: Long = 0L,
+    /// True when the viewer EXPLICITLY picked this exact source from the bad-source MANUAL fallback
+    /// (the splash shown after the auto-retry ladder exhausted). A deliberate, warned choice must
+    /// PLAY, so the player suppresses the runtime-mismatch auto-verdict (the pause + error surface +
+    /// another ladder round) for it -- otherwise a title whose catalog runtime overshoots the real
+    /// file (a short special under a "45 min" show) could never be played at all. The never-poison
+    /// gates are NOT suppressed: a junk-length file still cannot mark watched, scrobble a watch, or
+    /// feed the community pool, forced or not.
+    val userForcedSource: Boolean = false,
 )
 
 /// Provider-agnostic description of the title being scrobbled, resolved ONCE at play time and handed to
