@@ -1,4 +1,0 @@
-# tvOS is a tier-3 Rust target, needs nightly + rust-src to build std from source (-Z build-std).
-[toolchain]
-channel = "nightly"
-components = ["rust-src"]
