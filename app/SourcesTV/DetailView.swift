@@ -1404,9 +1404,15 @@ struct CoreSeasonedEpisodes: View {
         // then focus that row (tvOS auto-scrolls focus into view) so Back returns to the CURRENT episode, not
         // the one originally launched. Async so the row exists after a season switch and the shell is frontmost.
         .onChange(of: presenter.request == nil) {
-            guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
-            if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
-            DispatchQueue.main.async { focusedEpisode = id }
+            reanchorGridToEngineEpisode()
+        }
+        // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This page can
+        // sit in the nav stack across a background boundary with no dismissal event (the player is not
+        // torn down on background), so returning to the app used to find the grid frozen on the episode
+        // it launched from. Same guarded re-point as the dismissal path; a live player keeps input focus
+        // (the guard inside skips while the cover is up - dismissal then re-points as before).
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            reanchorGridToEngineEpisode()
         }
         .onChange(of: season) {
             // A manual tap or the programmatic preferred-season apply locks the auto-pick, so a later
@@ -1421,6 +1427,17 @@ struct CoreSeasonedEpisodes: View {
         // on first appear can be stale or empty, and the initial-season hint (from Continue Watching) may not
         // resolve until they arrive. Re-run the resolver when the videos array grows so the hint still lands.
         .onChange(of: videos.count) { applyPreferredSeason() }
+    }
+
+    /// #7 return-to-episode, shared by BOTH triggers (player dismissal + app foreground): jump the grid to
+    /// the episode the engine now resumes at - switch season if it moved, then focus that row (tvOS
+    /// auto-scrolls focus into view) so Back returns to the CURRENT episode, not the one originally
+    /// launched. Guarded on the player being down (never steal focus from a live player; the dismissal
+    /// trigger re-points the moment it closes) and on the engine naming a known episode.
+    private func reanchorGridToEngineEpisode() {
+        guard presenter.request == nil, let id = resumeVideoId, videos.contains(where: { $0.id == id }) else { return }
+        if let s = resumeSeason, s != season, seasons.contains(s) { season = s }
+        DispatchQueue.main.async { focusedEpisode = id }
     }
 
     /// Resolve and apply the preferred season, re-applying the Continue-Watching `initialSeason` hint until it
@@ -1652,11 +1669,29 @@ struct CoreEpisodeStreams: View {
         // resolves + plays THAT episode's streams. Guarded on a real move to a known episode, so a no-op close
         // (paused, same episode) leaves the page untouched.
         .onChange(of: presenter.request == nil) {
-            guard presenter.request == nil, let id = resumeVideoId, id != currentVideo.id,
-                  let moved = episodes.first(where: { $0.id == id }) else { return }
-            currentVideo = moved
-            core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: moved.id)
+            reanchorPageToEngineEpisode()
         }
+        // Binge-desync fix #4: ALSO re-derive on app foreground, not just player dismissal. This pushed
+        // page stays mounted behind the player across a background boundary (no dismissal event fires),
+        // so returning to the app used to find it - and the Back target it IS - frozen on the launch
+        // episode. Guarded inside: while the player cover is still up nothing moves (its dismissal
+        // re-points as before), so the live player's engine slot is never reloaded from under it.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            reanchorPageToEngineEpisode()
+        }
+    }
+
+    /// Binge-advance re-point, shared by BOTH triggers (player dismissal + app foreground): follow the
+    /// engine's resume episode so the page (title, backdrop, meta, and the Watch-Now PlaybackMeta) shows
+    /// the CURRENT episode, and re-point meta_details at it so a second Watch-Now resolves + plays THAT
+    /// episode's streams. Guarded on the player being down (a foreground with the cover still up leaves
+    /// the live player's engine slot alone) and on a real move to a known episode, so a no-op close
+    /// (paused, same episode) leaves the page untouched.
+    private func reanchorPageToEngineEpisode() {
+        guard presenter.request == nil, let id = resumeVideoId, id != currentVideo.id,
+              let moved = episodes.first(where: { $0.id == id }) else { return }
+        currentVideo = moved
+        core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: moved.id)
     }
 
     /// Season/episode, air date, then the show-level facts (runtime, rating, genres) for context.
