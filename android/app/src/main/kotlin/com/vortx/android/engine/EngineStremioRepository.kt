@@ -663,7 +663,19 @@ class EngineStremioRepository(
         val isDolbyVision = StreamRanking.isDolbyVision(source)
         val isAtmos = StreamRanking.isAtmos(source)
         if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
-            Playable(url = handle, title = source.title, viaStreamingServer = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
+            // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a
+            // Referer / User-Agent requirement) actually plays: both engines already apply
+            // [Playable.headers] (mpv http-header-fields, ExoPlayer data-source factory), and the
+            // download path forwards them off the same Playable. Direct-URL streams only: a
+            // debrid-resolved link below is a DIFFERENT host the add-on's headers were never meant for.
+            Playable(
+                url = handle,
+                title = source.title,
+                viaStreamingServer = false,
+                isDolbyVision = isDolbyVision,
+                isAtmos = isAtmos,
+                headers = source.requestHeaders,
+            )
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent
             // url == null, so the id-handle is the infoHash). If the user has a debrid key configured,

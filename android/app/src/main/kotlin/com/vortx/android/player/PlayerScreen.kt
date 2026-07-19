@@ -8,6 +8,7 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -30,8 +31,15 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -88,17 +96,37 @@ fun PlayerScreen(
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
     /// to [onBack] (return to the detail page, which shows the sources).
     onError: () -> Unit = onBack,
+    /// Called once when playback reaches the natural END of the stream (never for a user back-out).
+    /// Defaults to [onBack] so a host without an auto-advance flow keeps the old exit-to-detail
+    /// behavior; the phone shell wires it to the series Up Next auto-advance instead.
+    onEnded: () -> Unit = onBack,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val currentOnBack by rememberUpdatedState(onBack)
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
+    val currentOnEnded by rememberUpdatedState(onEnded)
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
     // current playback speed reflected in the speed control.
     var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
     var speed by remember(playable.url) { mutableStateOf(1.0f) }
+
+    // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
+    // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
+    // [CONTROLS_AUTO_HIDE_MS] of playback, re-shown (with the timer reset) by any interaction -- a tap on
+    // bare video toggles it, the double-tap seek re-shows it, every transport/track action re-arms it, and
+    // on TV any D-pad press while hidden re-reveals (consumed, so a blind press never fires an invisible
+    // control). The error overlay and the selection sheets are NOT gated (see PlayerChrome).
+    var controlsVisible by remember(playable.url) { mutableStateOf(true) }
+    // Monotonic interaction counter: bumping it restarts the auto-hide countdown without toggling
+    // visibility (the timer effect keys on it).
+    var controlsInteractionTick by remember(playable.url) { mutableStateOf(0) }
+    fun showControls() {
+        controlsVisible = true
+        controlsInteractionTick++
+    }
 
     // Force-to-ExoPlayer latch: flipped when the mpv engine reports a surface failure, so the remember
     // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playable url so a new
@@ -161,6 +189,15 @@ fun PlayerScreen(
 
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+
+    // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
+    // Paused, buffering, or errored playback keeps the controls on screen (hiding them over a stall or a
+    // dead frame would look like a hang); any state flip or interaction tick restarts the countdown.
+    LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, playerState.hasError) {
+        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || playerState.hasError) return@LaunchedEffect
+        delay(CONTROLS_AUTO_HIDE_MS)
+        controlsVisible = false
+    }
 
     // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
     // reports its track list, pick the audio + subtitle track per the persisted TrackPreferences, exactly
@@ -265,9 +302,11 @@ fun PlayerScreen(
         onDispose { trickplay.finishAndFlush() }
     }
 
-    // When playback ends, hand control back to the detail page.
+    // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
+    // Next auto-advance for a series episode with a successor, or a plain return to the detail page
+    // otherwise ([onEnded] defaults to [onBack]).
     LaunchedEffect(playerState.hasEnded) {
-        if (playerState.hasEnded) currentOnBack()
+        if (playerState.hasEnded) currentOnEnded()
     }
 
     // Fail-soft watchdog: if the mpv engine flagged a surface-attach failure, rebuild on ExoPlayer. Only
@@ -361,21 +400,53 @@ fun PlayerScreen(
         onDispose { audioManager?.abandonAudioFocusRequest(request) }
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    // TV re-reveal path: when the chrome hides, its focusable buttons leave composition and D-pad input
+    // would dead-end. Parking focus on the root box lets the next key press land in [onKeyEvent] below,
+    // which consumes it and re-shows the controls (Back/Escape excepted, so Back still exits the player).
+    val rootFocus = remember { FocusRequester() }
+    LaunchedEffect(controlsVisible) {
+        if (!controlsVisible) runCatching { rootFocus.requestFocus() }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .focusRequester(rootFocus)
+            .onKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                if (!controlsVisible) {
+                    // Back must keep meaning "leave the player", never be swallowed into a reveal.
+                    if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
+                    showControls()
+                    true
+                } else {
+                    // A key travelling through while the chrome is up (D-pad focus moves between the
+                    // buttons bubble up here unconsumed) counts as interaction: re-arm the hide timer.
+                    controlsInteractionTick++
+                    false
+                }
+            }
+            .focusable(),
+    ) {
         engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb(), scaleMode = scaleMode)
 
-        // Double-tap seek: right half = +10s, left half = -10s (the standard mobile-player gesture).
+        // Tap layer: single tap toggles the chrome; double-tap seeks (right half = +10s, left half =
+        // -10s, the standard mobile-player gesture) and re-shows the chrome so the seek is visible.
         // Layered OVER the video surface and UNDER the chrome, so the chrome's own controls keep their
-        // taps (they hit-test first) and only bare-video double-taps land here. Keyed on the engine so a
+        // taps (they hit-test first) and only bare-video taps land here. Keyed on the engine so a
         // mid-session ExoPlayer fallback rebinds the gesture to the live engine.
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(engine) {
                     detectTapGestures(
+                        onTap = {
+                            if (controlsVisible) controlsVisible = false else showControls()
+                        },
                         onDoubleTap = { offset ->
                             val forward = offset.x >= size.width / 2
                             engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
+                            showControls()
                         },
                     )
                 },
@@ -388,17 +459,23 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
+            controlsVisible = controlsVisible,
+            // Continuous interactions the chrome owns internally (scrubber drags, sheet opens) re-arm
+            // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
+            onInteraction = { showControls() },
             onBack = currentOnBack,
-            onTogglePause = engine::togglePause,
-            onSeek = engine::seekTo,
-            onSeekBy = engine::seekBy,
-            onSelectAudio = engine::selectAudioTrack,
-            onSelectSubtitle = engine::selectSubtitleTrack,
+            onTogglePause = { showControls(); engine.togglePause() },
+            onSeek = { showControls(); engine.seekTo(it) },
+            onSeekBy = { showControls(); engine.seekBy(it) },
+            onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
+            onSelectSubtitle = { showControls(); engine.selectSubtitleTrack(it) },
             onSetSpeed = { newSpeed ->
+                showControls()
                 speed = newSpeed
                 engine.setPlaybackSpeed(newSpeed)
             },
             onToggleScaleMode = {
+                showControls()
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
@@ -502,6 +579,10 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 
 /// The double-tap relative-seek step (ms). Matches the transport bar's Replay10/Forward10 buttons.
 private const val DOUBLE_TAP_SEEK_MS = 10_000L
+
+/// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
+/// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.
+private const val CONTROLS_AUTO_HIDE_MS = 3_500L
 
 internal val DefaultEmber = Color(0xFFD97706)
 

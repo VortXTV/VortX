@@ -172,14 +172,12 @@ object DownloadManager {
      * existing record if this exact video is already downloaded / downloading; a PAUSED record resumes instead of
      * being returned unchanged (which would read as a silent no-op), matching Apple.
      *
-     * [requestHeaders] is an explicit parameter rather than being read off [stream], which is where Apple gets it
-     * (`stream.requestHeaders`, derived from `behaviorHints.proxyHeaders.request`). The reason is a real gap in the
-     * Android model, not a preference: [StreamSource] does not decode `proxyHeaders` at all. The field exists only on
-     * the resolved [com.vortx.android.model.Playable] (`Playable.headers`, model/Media.kt), and NOTHING in the tree
-     * currently populates even that one -- so header-gated add-ons are unserved on Android generally, for playback as
-     * much as for downloads. Fixing that belongs to the engine decode, not to this subsystem. Passing the headers in
-     * keeps the record schema and the worker correct NOW (both already apply them), so the day the decode lands the
-     * caller has one argument to fill and nothing here changes.
+     * [requestHeaders] is an explicit parameter rather than being read off [stream], mirroring how the caller
+     * already holds the RESOLVED [com.vortx.android.model.Playable] whose `headers` carry the stream's declared
+     * `behaviorHints.proxyHeaders.request` (decoded by EngineState.parseStream into [StreamSource.requestHeaders]
+     * and attached at resolve time by EngineStremioRepository.resolve). DetailViewModel.download forwards
+     * `playable.headers` here, so a header-gated CDN (Referer / User-Agent requirement) serves the download the
+     * same way it serves playback.
      */
     fun download(
         stream: StreamSource,

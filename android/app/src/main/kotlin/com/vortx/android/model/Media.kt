@@ -423,6 +423,11 @@ data class StreamSource(
     val bingeGroup: String? = null,
     val filename: String? = null,
     val notWebReady: Boolean? = null,
+    /// Per-stream HTTP request headers (`behaviorHints.proxyHeaders.request`): some add-ons front CDNs
+    /// that 403 without a specific Referer / User-Agent. Decoded by the engine stream mapping
+    /// (EngineState.parseStream) and carried onto [Playable.headers] at resolve time so both player
+    /// engines and the download worker send them. Mirrors Apple `CoreStream.requestHeaders`.
+    val requestHeaders: Map<String, String> = emptyMap(),
 ) {
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually

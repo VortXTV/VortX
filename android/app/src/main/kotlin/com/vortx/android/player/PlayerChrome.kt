@@ -73,6 +73,14 @@ fun PlayerChrome(
     emberAccent: Color,
     speed: Float,
     scaleMode: VideoScaleMode,
+    /// Whether the top scrim + control cluster and the bottom transport bar are drawn. The selection
+    /// sheets and the error overlay are NOT gated on it: a sheet the viewer opened must survive an
+    /// auto-hide tick, and an error must always be visible. The host owns the show/hide/auto-hide
+    /// policy; defaults to always-visible so the chrome stays usable in isolation.
+    controlsVisible: Boolean = true,
+    /// Reported for chrome-internal continuous interactions (scrubber drags, sheet opens) so the host
+    /// can re-arm its auto-hide timer. No-op by default.
+    onInteraction: () -> Unit = {},
     onBack: () -> Unit,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -97,7 +105,8 @@ fun PlayerChrome(
 
     Box(modifier = modifier) {
         // Top scrim so the title, back button, and controls stay legible over bright video.
-        Column(
+        // Gated (with the transport bar below) on [controlsVisible]: this pair is what auto-hides.
+        if (controlsVisible) Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
@@ -128,11 +137,12 @@ fun PlayerChrome(
                         .padding(start = 4.dp),
                 )
                 // Control cluster: audio (when >1 track), subtitles (always, includes Off), speed, aspect.
+                // Opening a sheet counts as interaction so the host's auto-hide timer re-arms.
                 if (state.audioTracks.size > 1) {
-                    ChromeIcon(Icons.Filled.Audiotrack, "Audio track") { openSheet = ControlSheet.AUDIO }
+                    ChromeIcon(Icons.Filled.Audiotrack, "Audio track") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 }
-                ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { openSheet = ControlSheet.SUBTITLE }
-                ChromeIcon(Icons.Filled.Speed, "Playback speed") { openSheet = ControlSheet.SPEED }
+                ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
+                ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
@@ -146,12 +156,13 @@ fun PlayerChrome(
         }
 
         // Bottom transport: play/pause + scrubber, driven entirely by [state] (engine-agnostic).
-        TransportBar(
+        if (controlsVisible) TransportBar(
             state = state,
             emberAccent = emberAccent,
             onTogglePause = onTogglePause,
             onSeek = onSeek,
             onSeekBy = onSeekBy,
+            onInteraction = onInteraction,
             scrubPreview = scrubPreview,
             modifier = Modifier
                 .fillMaxWidth()
@@ -323,6 +334,9 @@ private fun TransportBar(
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
     onSeekBy: (Long) -> Unit,
+    /// Reported on every scrub drag frame so the host's auto-hide timer cannot expire mid-gesture and
+    /// yank the slider out from under the finger. No-op by default.
+    onInteraction: () -> Unit = {},
     scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
@@ -403,6 +417,7 @@ private fun TransportBar(
             Slider(
                 value = sliderValue,
                 onValueChange = {
+                    onInteraction()
                     scrubbing = true
                     scrubValue = it
                 },

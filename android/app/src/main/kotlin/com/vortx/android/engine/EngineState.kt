@@ -758,7 +758,23 @@ internal object EngineState {
             } else {
                 null
             },
+            requestHeaders = parseProxyRequestHeaders(behaviorHints),
         )
+    }
+
+    /// `behaviorHints.proxyHeaders.request` -> the per-stream HTTP request headers some add-ons declare
+    /// (a CDN behind them 403s without the given Referer / User-Agent). Only the `request` map is
+    /// consumed: `response` headers are a server-proxy instruction with no client-side meaning here.
+    /// Fail-soft: absent / malformed hints, or non-string values, yield an empty map, leaving every
+    /// other stream exactly as before. Mirrors Apple `CoreStream.requestHeaders`.
+    private fun parseProxyRequestHeaders(behaviorHints: JSONObject?): Map<String, String> {
+        val request = behaviorHints?.optJSONObject("proxyHeaders")?.optJSONObject("request") ?: return emptyMap()
+        val out = mutableMapOf<String, String>()
+        for (key in request.keys()) {
+            val value = request.optStringOrNull(key) ?: continue
+            if (key.isNotBlank()) out[key] = value
+        }
+        return out
     }
 
     // ---- request -> human label helpers ----

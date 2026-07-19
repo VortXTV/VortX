@@ -23,6 +23,7 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.singularity.SourceIndexServeSource
@@ -168,7 +169,19 @@ class DetailViewModel(
     /// [SourcePreferencesStore.autoPickBest] is on (never on the initial programmatic selection), consumed
     /// exactly once when that episode's add-on groups land. Apple's `didAutoPick` latch inverted
     /// (iOSDetailView.swift:3433: fires once per episode-page appearance, viewer opt-in only).
+    /// [playNextEpisode] arms the SAME latch (unconditionally: an accepted auto-advance must play whether
+    /// or not the Smart Source setting is on), together with [pendingAdvanceHint] below.
     @Volatile private var pendingAutoPick = false
+
+    /// The source of the last play kicked from this page, remembered so an auto-advance can carry its
+    /// quality signature + bingeGroup into the NEXT episode's pick (the ranking's continuity/binge
+    /// bonuses: same release family, no quality jump mid-binge). Never read outside auto-advance.
+    @Volatile private var lastPlayedSource: StreamSource? = null
+
+    /// One-shot next-episode ranking hint (continuity signature to bingeGroup of the just-finished play),
+    /// consumed with [pendingAutoPick] when the advanced-to episode's add-on groups land. Null for a
+    /// Smart-Source episode tap, whose auto-pick stays exactly as it was.
+    @Volatile private var pendingAdvanceHint: Pair<String?, String?>? = null
 
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -280,15 +293,36 @@ class DetailViewModel(
                     // [bestSource]) because the assembly coalescer may still hold the previous episode's
                     // list at this instant; auto-playing a stale episode's source would be worse than no
                     // auto-pick. Backing out of the player reveals the full source list (the escape hatch).
+                    //
+                    // An auto-ADVANCE pick additionally carries the just-finished play's continuity
+                    // signature + bingeGroup so the ranking's next-episode bonuses keep the binge on the
+                    // same release family; it also reports a no-source dead end through [_playback] so
+                    // the shell's Up Next overlay can bail instead of sitting on "Starting…" forever.
                     if (pendingAutoPick) {
                         pendingAutoPick = false
-                        StreamRanking.best(raw, prefs = ctx.prefs, pin = currentPin())?.let { play(it) }
+                        val hint = pendingAdvanceHint
+                        pendingAdvanceHint = null
+                        val pick = if (hint != null) {
+                            StreamRanking.best(raw, continuity = hint.first, binge = hint.second, pin = currentPin(), prefs = ctx.prefs)
+                        } else {
+                            StreamRanking.best(raw, prefs = ctx.prefs, pin = currentPin())
+                        }
+                        when {
+                            pick != null -> play(pick)
+                            hint != null -> _playback.value = Playback.Failed("No playable source for the next episode.")
+                        }
                     }
                 }
             },
             onFailure = {
                 if (episodeId == _selectedEpisodeId.value) {
+                    // An auto-advance load failure must reach the shell's Up Next overlay (it observes
+                    // [playback], not [streams]); a Smart-Source tap keeps today's streams-Error surface.
+                    if (pendingAutoPick && pendingAdvanceHint != null) {
+                        _playback.value = Playback.Failed(it.message ?: "Couldn't load the next episode's sources.")
+                    }
                     pendingAutoPick = false
+                    pendingAdvanceHint = null
                     _streams.value = UiState.Error(it.message ?: "Something went wrong loading your add-ons.")
                 }
             },
@@ -452,6 +486,7 @@ class DetailViewModel(
     /// silently doing nothing.
     fun play(source: StreamSource) {
         if (_playback.value is Playback.Resolving) return
+        lastPlayedSource = source
         _playback.value = Playback.Resolving
         val resumeMs = resumeOffsetMs()
         // Resolve the external-sync identity ONCE here, the one place that knows the meta id + the chosen
@@ -513,8 +548,8 @@ class DetailViewModel(
                         resolvedUrl = playable.url,
                         sourceName = source.addon,
                         qualityText = StreamRanking.qualityLabel(source),
-                        // Forward the resolved request headers so a header-gated CDN serves the download (empty
-                        // today until the engine decodes proxyHeaders, harmless when so; see DownloadManager.download).
+                        // Forward the resolved request headers (the stream's behaviorHints.proxyHeaders.request,
+                        // decoded by the engine mapping) so a header-gated CDN serves the download too.
                         requestHeaders = playable.headers.takeIf { it.isNotEmpty() },
                     )
                     _downloadNotice.value = downloadNoticeFor(record)
@@ -582,6 +617,7 @@ class DetailViewModel(
         if (_playback.value is Playback.Resolving) return
         val groups = (_streams.value as? UiState.Success)?.data ?: return
         val best = bestSource() ?: return
+        lastPlayedSource = best
         _playback.value = Playback.Resolving
         val resumeMs = resumeOffsetMs()
         val ref = currentMediaRef()
@@ -729,6 +765,46 @@ class DetailViewModel(
 
     fun clearMutationError() {
         _mutationError.value = null
+    }
+
+    // ---- Up Next auto-advance ----
+
+    /// The episode that FOLLOWS the current play target in cross-season order
+    /// ([orderedBySeasonEpisode]: a season's last episode rolls into the next season's first), or null
+    /// for a movie, before an episode is selected, or at the very last episode. The shell reads this
+    /// when a playback ends to decide whether to offer Up Next instead of exiting to Detail.
+    fun nextEpisode(): Episode? {
+        if (type != MediaType.SERIES) return null
+        val detail = (_meta.value as? UiState.Success)?.data ?: return null
+        val currentId = _selectedEpisodeId.value ?: return null
+        val ordered = detail.videos.orderedBySeasonEpisode
+        val idx = ordered.indexOfFirst { it.id == currentId }
+        if (idx < 0 || idx + 1 >= ordered.size) return null
+        return ordered[idx + 1]
+    }
+
+    /// Auto-advance to [nextEpisode]: select it and play its best-ranked source the moment its add-on
+    /// groups land, via the same consume-once latch a Smart-Source episode tap uses -- but armed
+    /// UNCONDITIONALLY (an Up Next the viewer accepted, or let count down, must play whether or not the
+    /// Smart Source setting is on) and carrying the just-finished play's quality signature + bingeGroup
+    /// so the ranking's continuity/binge bonuses keep the binge on the same release family. Resolution
+    /// posts through [playback] exactly like a manual play; the shell's Up Next layer collects
+    /// Ready/Failed from there. No-op when there is no next episode or a resolve is already running.
+    fun playNextEpisode() {
+        if (_playback.value is Playback.Resolving) return
+        val next = nextEpisode() ?: return
+        pendingAdvanceHint = lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }
+        // Keep the episode browser in step so backing out of the advanced play shows the RIGHT season.
+        _selectedSeason.value = next.season
+        if (_selectedEpisodeId.value == next.id) {
+            // Already scoped to the target (a countdown double-fire, or a re-offer): play what is loaded.
+            pendingAdvanceHint = null
+            playBest()
+            return
+        }
+        _selectedEpisodeId.value = next.id
+        pendingAutoPick = true
+        viewModelScope.launch { loadSources(next.id) }
     }
 
     // ---- S05: resume targeting ----
