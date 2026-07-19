@@ -262,7 +262,15 @@ struct TVDecadeTile: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let cover, !cover.isEmpty { RemoteCover(url: cover) }
+            // The cover is a PORTRAIT poster; an unbounded `.fill` child grows the ZStack to the poster's
+            // filled height (360x540), the outer 360x187 frame then centers that oversized stack, and the
+            // bottom-anchored decade label lands OUTSIDE the visible clip (the "image but no name" tile).
+            // Bounding the image to the tile frame keeps the stack, scrim and label inside the card.
+            if let cover, !cover.isEmpty {
+                RemoteCover(url: cover)
+                    .frame(width: kHubCardWidth, height: kHubCardWidth * 0.52)
+                    .clipped()
+            }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: Theme.Space.sm) {
                 Image(systemName: decade.symbol).font(.system(size: 22, weight: .semibold)).foregroundStyle(.white)
