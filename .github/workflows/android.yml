@@ -31,11 +31,13 @@ permissions:
 
 jobs:
   build-android:
-    # Environment gate for the token-bearing job (trust boundary): `engine-ci` carries a deployment
-    # branch policy (beta, main, claude/ci-engine-token), so a push to any OTHER branch -- e.g. the
-    # android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this gate
-    # before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches. The
-    # claude/ci-engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
+    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
+    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
+    # plus a `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever
+    # runs on branch refs, which enter via the branch entries). A push to any OTHER branch -- e.g.
+    # the android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this
+    # gate before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches.
+    # The ci/engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
     # is removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
     # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-branch jobs
     # from ever reaching the fetch steps that read it.

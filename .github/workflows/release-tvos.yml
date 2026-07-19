@@ -36,25 +36,32 @@ on:
         required: false
         default: ""
 
+# Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
+# app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
+# The ONLY contents:write consumer is the isolated `attach-release` job below, which overrides
+# this default for itself alone, runs no repo-controlled code, and holds no environment.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-tvos:
-    # Environment gate for the token-bearing job (trust boundary): `engine-ci` carries a deployment
-    # branch policy (beta, main, claude/ci-engine-token), so a run started from any OTHER ref blocks
-    # at this gate before any step executes, making ENGINE_REPO_TOKEN unreachable outside those
-    # refs. The claude/ci-engine-token entry is TEMPORARY, for proof runs on the CI branch, and is
-    # removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
-    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-ref jobs
-    # from ever reaching the fetch steps that read it. Note: release events run on the tag's ref;
-    # gating releases to the policy's branches is intended (tags cut from beta/main pass).
+    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
+    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
+    # PLUS a `v*` TAG policy. Environment policies match REFS, and a branch entry never matches a
+    # tag ref, so the two entry lanes are distinct: branch-ref runs (push / dispatch on a listed
+    # branch) enter via the branch entries, while release-event runs, which execute on the tag's
+    # ref, enter via the `v*` tag policy. A run started from any OTHER ref blocks at this gate
+    # before any step executes, making ENGINE_REPO_TOKEN unreachable outside those refs. The
+    # ci/engine-token branch entry is TEMPORARY, for proof runs on the CI branch, and is removed at
+    # integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment (value re-entry)
+    # is a queued owner step; until then the gate still stops arbitrary-ref jobs from ever reaching
+    # the fetch steps that read it.
     #
-    # Read-only-build vs release-write split (reviewer note): the only contents:write consumer is
-    # the final release-attach step, and it already runs ONLY on release events / an explicit
-    # release_tag dispatch (see its `if:`). Splitting it into its own minimal-permission job needs
-    # an artifact handoff of every IPA/dmg plus a second runner and env replumbing -- deferred to
-    # the planned SECRETLESS PR-validation workflow lane rather than bloating this commit.
+    # Read-only-build vs release-write split: this job runs under the workflow-default
+    # `contents: read`, so none of the repo-controlled build code it executes can touch the repo or
+    # its releases. Release-asset attachment lives in the separate `attach-release` job below,
+    # which alone gets `contents: write` and consumes this job's output strictly through the
+    # artifact handoff.
     environment: engine-ci
     # Pinned explicit runner label: `macos-latest` is a MOVING alias (it means the macOS 15 arm64
     # image today, per actions/runner-images), and a silent alias flip -- e.g. to the macOS 26
@@ -409,8 +416,11 @@ jobs:
           hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
-      - name: Upload artifact (manual runs)
-        if: github.event_name == 'workflow_dispatch'
+      # Upload on manual runs (inspection artifact) AND on release events, where it is the ONLY
+      # handoff to the attach-release job below: the read-only build job never touches the release
+      # itself, so everything the write job attaches must travel through this artifact.
+      - name: Upload artifact (manual runs + handoff to attach-release)
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-tvOS-ci
@@ -421,10 +431,84 @@ jobs:
             out/VortX-macOS-ci.dmg
             out/SHA256SUMS-ci.txt
 
-      - name: Attach the CI builds to the release
-        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+  # Isolated release-write job: the ONLY job in this workflow with `contents: write`. Least
+  # privilege by construction: it does NOT check out the repo (so it executes no repo-controlled
+  # code with write authority), it carries NO environment (so it can never read ENGINE_REPO_TOKEN
+  # or the build secrets the engine-ci environment will hold), and it consumes the build strictly
+  # through the artifact handoff from the read-only build job above. Asset upload needs no macOS,
+  # so this runs on the cheap pinned Linux image.
+  attach-release:
+    needs: [build-tvos]
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Download the built apps (handoff from the build job)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (resolved read-only via git ls-remote)
+        with:
+          name: VortX-tvOS-ci
+          path: out
+
+      # Tag-commit binding (fail closed): a tag NAME is an operator/event string, never authority.
+      # Before anything is written, prove that (a) the tag belongs to an EXISTING release (for
+      # workflow_dispatch this is what stops a free-text release_tag from minting a write; for
+      # release events it is trivially true) and (b) the tag's ref, peeled through any annotated
+      # tag objects to its ultimate commit, points at EXACTLY the commit this run built
+      # (github.sha). This also catches a tag force-moved between the trigger and this job. Any
+      # resolution failure or mismatch aborts before the upload step can run.
+      - name: Verify the release tag points at the built commit (fail closed)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::no tag name available (empty release_tag / missing release tag_name)"
+            exit 1
+          fi
+          # Constrain the string's shape before it ever reaches an API path (no slashes, no
+          # spaces, no traversal): validation happens against the resolved objects, not the name.
+          case "$TAG" in
+            *[!A-Za-z0-9._-]*)
+              echo "::error::release tag '$TAG' has an unexpected shape; refusing to resolve it"
+              exit 1 ;;
+          esac
+          # (a) The tag must name an EXISTING release, not just any git tag.
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .tag_name >/dev/null; then
+            echo "::error::no existing release found for tag '$TAG'; refusing to create or write anything"
+            exit 1
+          fi
+          # (b) Resolve the tag ref and peel annotated tag objects (an annotated tag's ref points
+          # at a tag OBJECT, not the commit; nested tag objects are legal, so peel with a bound).
+          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
+          sha="$(jq -r '.object.sha' <<<"$ref_json")"
+          otype="$(jq -r '.object.type' <<<"$ref_json")"
+          hops=0
+          while [ "$otype" = "tag" ]; do
+            hops=$((hops + 1))
+            if [ "$hops" -gt 5 ]; then
+              echo "::error::tag '$TAG' nests more than 5 tag objects; refusing"
+              exit 1
+            fi
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+            sha="$(jq -r '.object.sha' <<<"$tag_json")"
+            otype="$(jq -r '.object.type' <<<"$tag_json")"
+          done
+          if [ "$otype" != "commit" ]; then
+            echo "::error::tag '$TAG' ultimately points at a '$otype' object, not a commit; refusing"
+            exit 1
+          fi
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::tag '$TAG' points at commit $sha but this run built $GITHUB_SHA; refusing to attach assets built from a different commit"
+            exit 1
+          fi
+          echo "tag-commit binding verified: $TAG peels to $sha == github.sha"
+
+      - name: Attach the CI builds to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
