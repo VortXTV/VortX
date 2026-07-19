@@ -25,6 +25,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
@@ -92,6 +93,17 @@ fun PlayerChrome(
     onSetSpeed: (Float) -> Unit,
     onToggleScaleMode: () -> Unit,
     onErrorRetry: () -> Unit,
+    /// Player Lock: engages the host's touch-lock (controls hidden, taps/gestures ignored until the
+    /// unlock affordance is used). Null hides the lock control entirely, keeping the chrome usable
+    /// in isolation and on hosts that opt out (the TV shell, where D-pad focus makes a touch-lock
+    /// meaningless).
+    onLock: (() -> Unit)? = null,
+    /// External subtitles offered by the installed subtitle add-ons for THIS title (the Apple
+    /// `SubtitleAddons` union, fetched by the host once per load). Listed in the subtitle sheet
+    /// under the file's embedded tracks; picking one mounts + selects it on the live engine via
+    /// [onSelectAddonSubtitle]. Empty (the default) leaves the sheet exactly as before.
+    addonSubtitles: List<AddonSubtitle> = emptyList(),
+    onSelectAddonSubtitle: (AddonSubtitle) -> Unit = {},
     /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
     /// no community sheet (the common case for a title nobody has contributed yet, and always so while
     /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
@@ -144,6 +156,11 @@ fun PlayerChrome(
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
+                // Player Lock: hides the chrome and freezes touch input so nothing mid-film seeks or
+                // pauses by accident; the host draws the unlock affordance while locked.
+                onLock?.let { lock ->
+                    ChromeIcon(Icons.Filled.Lock, "Lock player controls") { lock() }
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
                 if (playable.viaStreamingServer) ChromeBadge("SOURCE", emberAccent)
@@ -182,6 +199,12 @@ fun PlayerChrome(
                 options = buildList {
                     add(SheetOption("Off", state.subtitleTracks.none { it.selected }) { onSelectSubtitle(null) })
                     state.subtitleTracks.forEach { t -> add(SheetOption(trackLabel(t.title, t.lang), t.selected) { onSelectSubtitle(t.id) }) }
+                    // Add-on subtitles, after the embedded tracks (Apple lists them the same way):
+                    // picking one mounts it on the live engine, after which it also appears above as
+                    // a regular (selected) track.
+                    addonSubtitles.forEach { sub ->
+                        add(SheetOption("${sub.lang} · ${sub.addonName}", false) { onSelectAddonSubtitle(sub) })
+                    }
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },

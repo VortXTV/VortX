@@ -56,6 +56,10 @@ fun RailHeader(title: String, eyebrow: String? = null, modifier: Modifier = Modi
     }
 }
 
+/// The Continue Watching rail's stable id (the repository's `homeSnapshot` contract: id =
+/// "continue" is the CW rail, everything else is an add-on catalog row).
+private const val CONTINUE_WATCHING_ROW_ID = "continue"
+
 /// A titled horizontal rail of [PosterCard]s, the core building block of Home and Discover. [eyebrow]
 /// adds the editorial kicker over the title (e.g. "Pick up where you left off" on Continue Watching).
 @Composable
@@ -76,6 +80,11 @@ fun PosterRail(
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).
                     progress = item.progress,
+                    // Long-press quick actions (Mark as Watched / Unwatched, Add to Library) on
+                    // CATALOG cards only, mirroring Apple's `PosterContextMenu.catalog`
+                    // (iOSRootView.swift:4253): the Continue Watching rail's Apple menu is a
+                    // different action set (Details / Remove), so it attaches none here.
+                    menuItem = if (catalog.id == CONTINUE_WATCHING_ROW_ID) null else item,
                     art = { PosterArt(item.poster, item.name) },
                     modifier = Modifier.width(124.dp).padding(end = VortXTheme.spacing.sm),
                 )

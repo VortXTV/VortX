@@ -84,4 +84,25 @@ class AddonsViewModel(private val repo: CatalogRepository) : ViewModel() {
             load()
         }
     }
+
+    /// Flip an add-on on/off for the ACTIVE profile (the row's eye toggle, Apple
+    /// `AddonsView.swift:424` -> `profiles.toggleAddon`). A local per-profile overlay, never an
+    /// engine/account change; the repository excludes disabled add-ons from Home rows + source
+    /// groups. The silent reload re-stamps [InstalledAddon.isDisabled] so the icon flips at once.
+    fun toggleAddon(addon: InstalledAddon) {
+        viewModelScope.launch {
+            repo.setAddonDisabled(addon.transportUrl, !addon.isDisabled)
+            load(showLoading = false)
+        }
+    }
+
+    /// Persist a new add-on PRIORITY order from the reorder list's drop (Apple
+    /// `AddonsView.swift:476 .onMove` -> `applyInAppAddonOrder`): each drop applies immediately, so
+    /// leaving reorder mode needs no separate save step.
+    fun applyOrder(transportUrls: List<String>) {
+        viewModelScope.launch {
+            repo.applyAddonOrder(transportUrls)
+            load(showLoading = false)
+        }
+    }
 }

@@ -387,13 +387,18 @@ internal object EngineState {
         val groups = mutableListOf<StreamGroup>()
         for (i in 0 until array.length()) {
             val entry = array.optJSONObject(i) ?: continue
-            val addon = addonName(entry.optJSONObject("request"))
+            val request = entry.optJSONObject("request")
+            val addon = addonName(request)
             val content = entry.readyArray("content") ?: continue
             val sources = mutableListOf<StreamSource>()
             for (s in 0 until content.length()) {
                 content.optJSONObject(s)?.let { sources += parseStream(it, addon) }
             }
-            if (sources.isNotEmpty()) groups += StreamGroup(addon = addon, streams = sources)
+            if (sources.isNotEmpty()) {
+                // base = the add-on's transport URL, the stable identity the per-profile
+                // disabled-add-on filter keys on (see [com.vortx.android.model.StreamGroup.base]).
+                groups += StreamGroup(addon = addon, streams = sources, base = request?.optString("base").orEmpty())
+            }
         }
         return groups
     }
@@ -533,17 +538,18 @@ internal object EngineState {
                 description = manifest.optStringOrNull("description"),
                 isOfficial = flags?.optBoolean("official", false) ?: false,
                 isProtected = flags?.optBoolean("protected", false) ?: false,
-                providesStreams = addonProvidesStreams(manifest),
+                providesStreams = addonDeclaresResource(manifest, "stream"),
+                providesSubtitles = addonDeclaresResource(manifest, "subtitles"),
                 rawDescriptorJson = addon.toString(),
             )
         }
         return out
     }
 
-    /// True when the manifest declares a `stream` resource. `resources` entries can be either a bare
+    /// True when the manifest declares the named resource. `resources` entries can be either a bare
     /// resource-name string or an object with a `name` field (both are valid Stremio manifest shapes),
-    /// mirrors Apple `CoreDescriptor.providesStreams`.
-    private fun addonProvidesStreams(manifest: JSONObject): Boolean {
+    /// mirrors Apple `CoreDescriptor.providesStreams` / `.providesSubtitles`.
+    private fun addonDeclaresResource(manifest: JSONObject, resource: String): Boolean {
         val resources = manifest.optJSONArray("resources") ?: return false
         for (i in 0 until resources.length()) {
             val name = when (val entry = resources.opt(i)) {
@@ -551,7 +557,7 @@ internal object EngineState {
                 is JSONObject -> entry.optStringOrNull("name")
                 else -> null
             }
-            if (name == "stream") return true
+            if (name == resource) return true
         }
         return false
     }
