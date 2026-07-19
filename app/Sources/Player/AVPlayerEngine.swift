@@ -55,6 +55,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// CoreMedia startup hiccup on the loopback HLS origin). The chrome retries ONE fresh item on the same mount
     /// before demoting; this flag makes that retry happen at most once, resetting only on the next loadFile.
     private var healthyMountRetried = false
+    /// #147 reactive net, one-shot: a RAW (non-remux) mount that failed container-unsupported ("Cannot Open" -
+    /// AVFoundation has no Matroska demuxer) gets ONE retry through the PLAIN remux lane before the libmpv
+    /// demote (which would lose Picture in Picture). Loop-safe even though loadFile resets it: the retry
+    /// mounts the remux, and the retry gate refuses any remux-mounted failure (`!isRemuxMounted`), so a failed
+    /// retry demotes normally.
+    private var plainRemuxRetried = false
+    /// Forces the next loadFile onto the PLAIN remux lane (#147), bypassing the router's explicit-Matroska
+    /// candidacy (the reactive retry has already proven raw AVPlayer cannot demux the bytes). Consumed (reset
+    /// to false) inside loadFile; set only by the container-unsupported retry in handleStatus.
+    private var forcePlainRemux = false
     // AUDIO-OVER-BLACK watchdog state (#76 residual, native DV lane only; see checkAudioOverBlackWatchdog).
     // `videoFrameEverProduced` latches TRUE on the first observed video frame and permanently disarms the
     // watchdog for this item, so it can never fire on a session that ever showed a picture. `audioOverBlackSince`
@@ -185,7 +195,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         teardownObservers()
         teardownRemux()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false; healthyMountRetried = false
-        incompatibleEntryHandled = false
+        incompatibleEntryHandled = false; plainRemuxRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
@@ -217,19 +227,36 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // StreamRanking.isDolbyVision signal the router routes on, BEFORE this loadFile (and re-set before a
         // source-switch loadFile), so a genuine DV source under Auto still remuxes; `forceRemux` still covers
         // the DV-only hev1/dvhe post-attach repair regardless of the flag.
-        let wantsRemux = forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url))
+        let wantsDVRemux = forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url))
         forceRemux = false
+        // #147 (the remaining item): PLAIN (non-DV) remux lane. A NON-DV MKV can only reach this engine on
+        // explicit AVPlayer intent (the "Prefer AVPlayer" override, the in-player engine pick, or the reactive
+        // container-unsupported retry below - NEVER Auto, whose rule 5 keeps non-DV MKVs on libmpv untouched),
+        // and AVFoundation has no Matroska demuxer, so the raw mount was a GUARANTEED "Cannot Open" ->
+        // endFileError -> libmpv demote that lost Picture in Picture, the very thing the viewer chose AVPlayer
+        // for. Route it through the SAME local remux machinery in `.plain` mode instead: a straight container
+        // re-wrap (no DV/RPU handling, no panel switch, range-unlabeled single-variant HLS). HLS delivery
+        // only: with the delivery lane rolled back (deliveryEnabled=false) this lane is fully OFF and the raw
+        // path behaves exactly as before #147. Flag-gated via PlayerEngineRouter.plainRemuxEnabled
+        // (UserDefaults stremiox.plainRemux > RemoteConfig features.plainRemux > baked ON).
+        let wantsPlainRemux = !wantsDVRemux && !contentIsDolbyVision && VortXRemuxHLSServer.deliveryEnabled
+            && (forcePlainRemux || PlayerEngineRouter.shouldPlainRemux(url: url))
+        forcePlainRemux = false
+        let wantsRemux = wantsDVRemux || wantsPlainRemux
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
-           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers) {
+           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
+                                                  mode: wantsPlainRemux ? .plain : .dolbyVision) {
             remuxHLSServer = mounted.server
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
-            DiagnosticsLog.log("avplayer", "dv-remux mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
-            // [dv] the true-DV remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log("avplayer", "\(lane) mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+            // [dv] the remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
             // fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties the reason
-            // to the observed engine flip, giving one greppable [dv] trail.
-            VXProbe.log("dv", "remux mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
-        } else if wantsRemux, !VortXRemuxHLSServer.deliveryEnabled,
+            // to the observed engine flip, giving one greppable [dv] trail (the plain lane logs on the same
+            // channel so one grep still shows route -> mount -> classify -> demote in order).
+            VXProbe.log("dv", "\(lane) mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+        } else if wantsDVRemux, !VortXRemuxHLSServer.deliveryEnabled,
                   let built = VortXRemuxResourceLoader.make(input: url, headers: headers) {
             remuxLoader = built.loader
             let asset = AVURLAsset(url: built.assetURL)
@@ -239,15 +266,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             DiagnosticsLog.log("avplayer", "dv-remux mount host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
             VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
         } else if wantsRemux {
-            // The router demanded the DV-for-MKV remux lane but the mount could not be built (the local HLS
+            // The remux lane (DV or plain) was demanded but the mount could not be built (the local HLS
             // server failed to bind, or the legacy loader could not be assembled). AVFoundation has no
             // Matroska demuxer, so loading the raw MKV here would mount an item AVPlayer can never produce a
-            // frame from. Fail-soft immediately so the chrome demotes to libmpv HDR10 instead of stalling on
+            // frame from. Fail-soft immediately so the chrome demotes to libmpv instead of stalling on
             // an un-demuxable asset. This ties into the [dv] demotion trail below.
-            DiagnosticsLog.log("avplayer", "dv-remux mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
-            VXProbe.log("dv", "remux mount build failed -> endFileError demote host=\(url.host ?? "?")")
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
+            VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
             fatalErrorEmitted = true
-            emit(MPVProperty.endFileError, "DV remux unavailable")
+            emit(MPVProperty.endFileError, wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable")
             return
         } else {
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
@@ -276,8 +304,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // previously never set preferredDisplayCriteria at all). fps/size are unknown pre-attach; the
         // readyToPlay request below re-asserts with the real values. Fail-soft: a refused/ignored request
         // changes nothing about playback, and reset() on stop() restores the default mode.
-        if isRemuxMounted {
-            // REMUX lane: DEFER the panel switch to the point classify confirms a DECODABLE DV profile (#76).
+        if isRemuxMounted, wantsDVRemux {
+            // DV REMUX lane: DEFER the panel switch to the point classify confirms a DECODABLE DV profile (#76).
             // The remux stream knows the profile ~1.5-6s in; VortXRemuxHLSServer.serveMaster fires the switch
             // once the DV signaling is published and BEFORE the media playlist / first segment (still ahead of
             // the video mount, per Tech Talk 503 ordering). Firing it here on mount cycled the panel twice per
@@ -296,6 +324,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         } else {
             // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
             // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.
+            // #147: a mounted PLAIN remux lands here too (contentIsDolbyVision=false, wantsDVRemux=false), so
+            // a plain MKV following a DV title correctly clears the panel; the plain lane's server never
+            // requests a switch (serveMaster is gated on sig.dolbyVision).
             HDRDisplayMode.reset(in: nil)
         }
         #endif
@@ -312,6 +343,26 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // Drive the current status now: the KVO below uses [.initial, .new], but an item that is already
         // readyToPlay at attach time still benefits from an explicit kick so play() is never skipped.
         if newItem.status != .unknown { handleStatus(newItem) }
+    }
+
+    /// #147 reactive-net gate: should this item failure be retried through the PLAIN remux lane instead of
+    /// demoting to libmpv? True only when ALL hold:
+    ///  - the mount never produced playback (`!didStart`) and is a RAW mount (`!isRemuxMounted`: a failure on
+    ///    an already-remuxed mount means the remux lane itself cannot serve this source, so demote honestly);
+    ///  - one-shot per load (`!plainRemuxRetried`), non-DV (`!contentIsDolbyVision`: DV routing has its own
+    ///    lane + repair paths, untouched), the plain lane is enabled and HLS delivery is not rolled back;
+    ///  - the URL is one the remux can even attempt (`isPlainRemuxRetryCandidate`: not an AVPlayer-native
+    ///    container, not loopback - the broad probe-and-fail-fast candidacy, correct here because AVPlayer
+    ///    has already PROVEN it cannot demux these bytes);
+    ///  - the failure is the specific CONTAINER-UNSUPPORTED signature (AVFoundation "Cannot Open",
+    ///    fileFormatNotRecognized): a network / DRM / decode failure must demote as before, never re-spin
+    ///    the same broken source through a remux.
+    private func shouldRetryViaPlainRemux(error ns: NSError?) -> Bool {
+        guard !didStart, !isRemuxMounted, !plainRemuxRetried, !contentIsDolbyVision else { return false }
+        guard VortXRemuxHLSServer.deliveryEnabled, PlayerEngineRouter.plainRemuxEnabled() else { return false }
+        guard let url = lastLoadURL, PlayerEngineRouter.isPlainRemuxRetryCandidate(url) else { return false }
+        guard let ns, ns.domain == AVFoundationErrorDomain else { return false }
+        return ns.code == AVError.Code.fileFormatNotRecognized.rawValue   // -11828, "Cannot Open"
     }
 
     /// One-shot healthy-mount retry (#76). Field logs show the served /media.m3u8 answered and /init.mp4
@@ -981,6 +1032,21 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 }
             }
             VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
+            // #147 reactive net: a RAW (non-remux) mount that failed because AVFoundation cannot demux the
+            // container ("Cannot Open" - the raw-MKV signature, since AVFoundation has no Matroska demuxer)
+            // gets ONE retry through the PLAIN remux lane BEFORE the libmpv demote, so an MKV the proactive
+            // gate could not name (an extensionless debrid link) still keeps AVPlayer + Picture in Picture.
+            // Tightly gated (see shouldRetryViaPlainRemux): pre-start only, raw mounts only, non-DV only,
+            // the specific container-unsupported error code only, a remux-attemptable URL only, one-shot.
+            // Worst case the remux classify fails fast and the SAME demote runs a few seconds later.
+            if shouldRetryViaPlainRemux(error: ns), let failedURL = lastLoadURL {
+                plainRemuxRetried = true
+                forcePlainRemux = true
+                DiagnosticsLog.log("avplayer", "raw mount failed container-unsupported (code=\(ns?.code ?? 0)) -> ONE plain-remux retry before any libmpv demote (#147)")
+                VXProbe.log("dv", "AVPlayer raw mount container-unsupported -> plain-remux retry host=\(failedURL.host ?? "?")")
+                loadFile(failedURL, headers: lastLoadHeaders, live: lastLoadLive)
+                return
+            }
             // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv HDR10.
             // For a DV source this is the tail of the [dv] trail (a remux fail-soft usually preceded it), so
             // grepping [dv] shows route -> mount -> classify/fallback-reason -> this demotion in order.

@@ -529,7 +529,9 @@ struct PlayerScreen: View {
     /// (the override bypasses every container rule), so it offered AVPlayer for a plain non-DV MKV/AVI/TS,
     /// then a pick mounted the DV remux on non-DV content (shouldDVRemux checks container only), classify
     /// rejected, and demote-bounced the position to 0. Gate on real playability instead: an AVPlayer-native
-    /// container (mp4/mov/m4v/HLS) OR a Dolby Vision title the remux lane can carry. And gate on the ACTIVE
+    /// container (mp4/mov/m4v/HLS), a Dolby Vision title the DV remux lane can carry, OR (#147) a non-DV
+    /// Matroska title the PLAIN remux lane can carry (which is what restores the AVPlayer pick - and with it
+    /// Picture in Picture - for ordinary MKVs, this time on a lane built for them). And gate on the ACTIVE
     /// source (curURL), not the immutable LAUNCH url, so an in-player switch to a torrent no longer offers a
     /// dead AVPlayer row that would feed a loopback torrent URL into AVPlayer.
     private var canUseAVPlayerEngine: Bool {
@@ -538,6 +540,7 @@ struct PlayerScreen: View {
         let loopback = activeURL.host == "127.0.0.1" || activeURL.host == "localhost"
         if curIsTorrent || loopback { return false }
         return PlayerEngineRouter.isAVPlayerContainer(activeURL) || activeAVPlayerWouldRemux
+            || activeAVPlayerWouldPlainRemux
     }
 
     /// True when routing the ACTIVE source to AVPlayer would mount the forward-only DV remux (a Dolby Vision
@@ -551,6 +554,19 @@ struct PlayerScreen: View {
         return isDV
             && PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable)
             && PlayerEngineRouter.isDVRemuxCandidate(activeURL)
+    }
+
+    /// #147: true when routing the ACTIVE source to AVPlayer would mount the forward-only PLAIN (non-DV)
+    /// remux: a non-DV Matroska source with the plain lane enabled and HLS delivery live. Re-opens the
+    /// engine-picker AVPlayer row for plain MKVs (so a viewer can pick AVPlayer for Picture in Picture) and
+    /// feeds the same resume-floor suppression a DV remux target gets (the plain mount is equally
+    /// forward-only). Mirrors AVPlayerEngine.loadFile's `wantsPlainRemux` (minus the reactive force flag).
+    private var activeAVPlayerWouldPlainRemux: Bool {
+        let activeURL = curURL ?? url
+        let isDV = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
+        return !isDV
+            && VortXRemuxHLSServer.deliveryEnabled
+            && PlayerEngineRouter.shouldPlainRemux(url: activeURL)
     }
 
     /// The raw routing computation. Consulted once to seed `engineLatch` (and for the first renders before
@@ -1029,7 +1045,10 @@ struct PlayerScreen: View {
                         if (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true {
                             suppressedResumeFloor = resumeSeconds
                             lastReported = resumeSeconds
-                            showEngineNotice("Dolby Vision stream starts from the beginning; resume for these comes in a later update.")
+                            // #147: honest wording per lane (a plain remux mount is not a Dolby Vision stream).
+                            showEngineNotice(activeAVPlayerWouldRemux
+                                ? "Dolby Vision stream starts from the beginning; resume for these comes in a later update."
+                                : "This stream starts from the beginning on AVPlayer; resume for these comes in a later update.")
                         } else {
                             coordinator.player?.seek(to: resumeSeconds)
                             currentTime = resumeSeconds
@@ -2030,7 +2049,7 @@ struct PlayerScreen: View {
         // Whether the AVPlayer mount we're switching INTO will be the forward-only DV remux: it can't honor a
         // resume seek, so it starts at 0. Capture the real position as a save floor (mirrors tvOS maybeResume)
         // so the periodic / exit saves don't regress the account resume below where the viewer actually was.
-        let targetIsRemux = toAVPlayer && activeAVPlayerWouldRemux
+        let targetIsRemux = toAVPlayer && (activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux)
         // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
@@ -2051,7 +2070,12 @@ struct PlayerScreen: View {
             // Forward-only remux: the resume seek would be dropped and playback restarts at 0. Skip the doomed
             // nudge, keep the real position as a save floor (below), and tell the viewer once.
             suppressedResumeFloor = resume > 5 ? resume : nil
-            if resume > 5 { showEngineNotice("Dolby Vision stream starts from the beginning; resume for these comes in a later update.") }
+            // #147: honest wording per lane (a plain remux target is not a Dolby Vision stream).
+            if resume > 5 {
+                showEngineNotice(activeAVPlayerWouldRemux
+                    ? "Dolby Vision stream starts from the beginning; resume for these comes in a later update."
+                    : "This stream starts from the beginning on AVPlayer; resume for these comes in a later update.")
+            }
         } else {
             suppressedResumeFloor = nil
             if resume > 5 { nudgeResume(to: resume) }

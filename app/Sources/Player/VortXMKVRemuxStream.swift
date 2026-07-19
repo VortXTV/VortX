@@ -46,10 +46,21 @@ import Libdovi
 /// AVIO/AVFormatContext free order.
 final class VortXMKVRemuxStream: @unchecked Sendable {
 
+    /// What this remux session is FOR (#147). `.dolbyVision` is the original lane: classify REQUIRES an
+    /// AVPlayer-decodable DV profile (5/8, or 7 converted to 8.1), forces the dvh1/hvc1 sample entry,
+    /// sanitizes/synthesizes the DOVI config box, and signals DV in the HLS master (SUPPLEMENTAL-CODECS +
+    /// VIDEO-RANGE + the tvOS panel switch). `.plain` is the non-DV lane: a STRAIGHT container re-wrap
+    /// (MKV -> fMP4/HLS) so AVPlayer can demux a non-DV MKV and keep Picture in Picture - no DV requirement
+    /// (classify instead requires an AVPlayer stream-copyable VIDEO codec: H.264 or HEVC), no DOVI handling,
+    /// no panel switch, and honest range-unlabeled single-variant signaling. Everything else (audio pick +
+    /// transcode, hvc1 extradata repair for HEVC, segmenting, buffer, fail-soft demotes) is shared unchanged.
+    enum Mode { case dolbyVision, plain }
+
     let buffer = VortXRemuxBuffer()
 
     private let input: String
     private let headers: [String: String]?
+    private let mode: Mode
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
 
@@ -100,10 +111,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// write/seek callbacks synchronously on it), so it needs no lock.
     private var avioWriteCursor: Int = 0
 
-    init(input: String, headers: [String: String]?, indexForHLS: Bool = false) {
+    init(input: String, headers: [String: String]?, indexForHLS: Bool = false, mode: Mode = .dolbyVision) {
         self.input = input
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
+        self.mode = mode
     }
 
     // MARK: - HLS output index (b166; populated only when `hlsIndexingEnabled`)
@@ -121,14 +133,19 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// strings, the DV SUPPLEMENTAL-CODECS compatibility brand, and VIDEO-RANGE. Apple's HLS authoring spec
     /// calls the brand + VIDEO-RANGE mandatory cross-checks for DV 8.1.
     struct HLSSignaling {
-        let videoCodec: String         // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5)
+        let videoCodec: String         // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5) or "avc1.640028" (plain H.264)
         let supplementalCodec: String? // "dvh1.08.06/db1p" for P8.1; nil when not applicable
-        let videoRange: String?        // "PQ" / "HLG"
+        let videoRange: String?        // "PQ" / "HLG"; nil on the plain lane (range-unlabeled, the b170 survivor shape)
         let audioCodec: String?        // "ec-3" / "ac-3" / "mp4a.40.2" / ...
         let width: Int
         let height: Int
         let bandwidth: Int
         let fps: Double                // base video frame rate; 0 when unknown (FRAME-RATE then omitted)
+        /// #147: whether this is a Dolby Vision session (`Mode.dolbyVision`). The HLS server keys the tvOS DV
+        /// panel switch AND the two-variant (DV + lifeboat) master rendering on THIS, so a plain-mode mount
+        /// can never switch the panel or declare DV. Mode-derived, not profile-derived, so DV-mode behavior is
+        /// bit-identical (a P8 with an unknown compat id still counts as DV, exactly as before).
+        let dolbyVision: Bool
     }
 
     /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
@@ -616,7 +633,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // in-band VPS/SPS/PPS a parameter-sets-in-band stream repeats ahead of its IDR slice, so one bounded,
         // seek-free read serves both needs. Files whose extradata is already hvc1-ready skip this exactly as
         // before, so nothing that opens today reads a single extra packet.
-        if baseVideoIn >= 0, info.dvProfile < 0 || !hvc1Check.eligible {
+        // #147: in `.plain` mode the DV half of the pre-scan is meaningless (no DV requirement), so the scan
+        // runs ONLY for the HEVC extradata repair (`!hvc1Check.eligible`); an H.264 or clean-extradata HEVC
+        // plain source reads zero extra packets. `.dolbyVision` mode keeps the exact original condition.
+        if baseVideoIn >= 0, (mode == .dolbyVision && info.dvProfile < 0) || !hvc1Check.eligible {
             let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
             let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
             var scanned = 0
@@ -626,7 +646,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 scanned += 1
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
-                    if info.dvProfile < 0 {
+                    if mode == .dolbyVision, info.dvProfile < 0 {
                         let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
                         if prof >= 0 {
                             info.dvProfile = prof
@@ -648,21 +668,37 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
-        let convertP7 = (info.dvProfile == 7)
-        guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
-            // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
-            // libmpv HDR10. Logs the exact reason (no DOVI config vs an undecodable profile like 4/9).
-            VXProbe.log("dv", "HDR10 FALLBACK: dvProfile=\(info.dvProfile) not AVPlayer-decodable")
-            buffer.fail(info.dvProfile < 0
-                ? "source has no Dolby Vision configuration (label mismatch)"
-                : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
-            return
-        }
-        // Reject an obviously-malformed base video track up front so the conversion path has a valid stream to
-        // work on and a bad source still fails soft to the libmpv demotion rather than mid-loop.
-        if convertP7, baseVideoIn < 0 {
-            buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
-            return
+        let convertP7 = (mode == .dolbyVision && info.dvProfile == 7)
+        if mode == .dolbyVision {
+            guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
+                // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
+                // libmpv HDR10. Logs the exact reason (no DOVI config vs an undecodable profile like 4/9).
+                VXProbe.log("dv", "HDR10 FALLBACK: dvProfile=\(info.dvProfile) not AVPlayer-decodable")
+                buffer.fail(info.dvProfile < 0
+                    ? "source has no Dolby Vision configuration (label mismatch)"
+                    : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
+                return
+            }
+            // Reject an obviously-malformed base video track up front so the conversion path has a valid stream to
+            // work on and a bad source still fails soft to the libmpv demotion rather than mid-loop.
+            if convertP7, baseVideoIn < 0 {
+                buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
+                return
+            }
+        } else {
+            // PLAIN lane (#147): no DV requirement. Gate the VIDEO codec instead: only H.264 and HEVC are
+            // stream-copyable into an fMP4 AVPlayer decodes (the lane exists to keep a plain MKV on AVPlayer
+            // for PiP). Anything else (VP8/VP9/AV1/MPEG-4/...) fails fast into the SAME fail-soft demote the
+            // DV guards use, so libmpv (which decodes everything) still plays it exactly as today.
+            var plainVideoID = AV_CODEC_ID_NONE
+            if baseVideoIn >= 0, let vpar = inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar {
+                plainVideoID = vpar.pointee.codec_id
+            }
+            guard plainVideoID == AV_CODEC_ID_H264 || plainVideoID == AV_CODEC_ID_HEVC else {
+                VXProbe.log("dv", "PLAIN REMUX FALLBACK: video codec \(info.videoCodec) is not AVPlayer stream-copyable")
+                buffer.fail("video codec \(info.videoCodec) is not AVPlayer-decodable (plain remux)")
+                return
+            }
         }
         // AVPlayer cannot decode TrueHD/DTS, but a TrueHD/DTS-only source no longer fails here: its one audio
         // track is transcoded in-flight (see `transcodeActive`), which was the DOMINANT real-world reason a
@@ -716,11 +752,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // profiles so a non-DV decoder can still read the base layer. movenc accepts both tags for HEVC
                 // in mp4; the hvcC parameter sets stay out-of-band either way, so the extradata-repair gate
                 // below still applies.
-                outStream.pointee.codecpar.pointee.codec_tag = info.dvProfile == 5
-                    ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
-                        | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
-                    : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
-                        | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                // #147: the forced tag applies ONLY to an HEVC base track (every DV source the profile guard
+                // admits, 5/7/8, is HEVC-based by spec, so `.dolbyVision` behavior is unchanged). A plain-lane
+                // H.264 track keeps codec_tag 0 so movenc derives the standard 'avc1' sample entry from its
+                // avcC extradata (H.264 MKVs carry the parameter sets out-of-band in CodecPrivate; a source
+                // without them fails write_header into the same fail-soft demote). 'dvh1' additionally
+                // requires `.dolbyVision` mode, which is implied today (a plain source has dvProfile -1) and
+                // made explicit so the plain lane can never mint a DV sample entry.
+                if outStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+                    outStream.pointee.codecpar.pointee.codec_tag = (mode == .dolbyVision && info.dvProfile == 5)
+                        ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
+                            | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                        : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
+                            | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                }
                 // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
                 // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
                 // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
@@ -745,6 +790,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                         return
                     }
                 }
+                // #147: everything DOVI below is `.dolbyVision`-mode only. The plain lane carries no DOVI
+                // record (its classify skipped the RPU probe and admitted non-DV sources), and it must never
+                // synthesize one: a dvvC/dvcC box on a non-DV stream would be a lie AVPlayer may reject.
+                if mode == .dolbyVision {
                 // For a Profile 7 conversion, re-label the OUTPUT DOVI configuration record as Profile 8.1 so
                 // FFmpeg's mov muxer writes a Profile-8 `dvvC` box (dv_profile>7 selects dvvC) and AVPlayer
                 // engages true DV. The RPU itself is converted per-packet in the mux loop; this makes the
@@ -777,6 +826,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                              width: info.width, height: info.height,
                                              fps: Self.frameRate(inStream))
                 }
+                }   // end mode == .dolbyVision (#147)
             }
             // fMP4 requires each AUDIO track to carry a frame_size; a matroska stream-copy usually leaves it 0,
             // and movenc then rejects write_header with EINVAL ("track N: codec frame size is not set"). This,
@@ -1613,10 +1663,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     }
                 }
             }
-            if let parsed = Self.hevcCodecString(vpar) { videoCodec = parsed }
+            // #147 plain lane: an H.264 base track's extradata is an avcC record, which hevcCodecString's
+            // loose header check (version byte 1, length >= 23) could MISPARSE as hvcC, so H.264 takes its
+            // own RFC-6381 builder. Inert in `.dolbyVision` mode (the profile guard admits only HEVC-based
+            // profiles, so the codec there is always HEVC).
+            if vpar.pointee.codec_id == AV_CODEC_ID_H264 {
+                videoCodec = Self.avcCodecString(vpar) ?? "avc1.640033"   // generous High@5.1 fallback (CODECS gates selection only)
+            } else if let parsed = Self.hevcCodecString(vpar) { videoCodec = parsed }
         }
         var supplemental: String?
-        var range: String? = "PQ"
+        // #147 plain lane: declare NO VIDEO-RANGE (and the profile checks below no-op on dvProfile -1, so no
+        // SUPPLEMENTAL-CODECS either). Range-unlabeled is the b170 "lifeboat" shape, empirically proven to
+        // always survive AVFoundation's variant filter; an explicit range bought nothing and the PQ default
+        // would be a lie for the common SDR H.264 MKV. `.dolbyVision` keeps the exact original PQ default.
+        var range: String? = mode == .dolbyVision ? "PQ" : nil
         let lvl = String(format: "%02d", min(max(dvLevel, 1), 13))
         if profile == 5 {
             videoCodec = "dvh1.05.\(lvl)"   // Profile 5 is DV-only (no cross-compatible base layer)
@@ -1640,9 +1700,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // an enhancement-layer video track too, so "the first video stream" is the wrong one.
         let fps = baseVideoIn >= 0 ? Self.frameRate(inCtx.pointee.streams[baseVideoIn]) : 0
         let sig = HLSSignaling(videoCodec: videoCodec, supplementalCodec: supplemental, videoRange: range,
-                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps)
+                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps,
+                               dolbyVision: mode == .dolbyVision)
         hlsLock.lock(); _hlsSignaling = sig; hlsLock.unlock()
-        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth)")
+        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth) dv=\(mode == .dolbyVision)")
     }
 
     /// RFC 6381 HEVC codec string ("hvc1.2.4.L153.B0") from an hvcC record's profile/tier/level bytes.
@@ -1685,6 +1746,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).L\(level)"
         if !constraints.isEmpty { s += "." + constraints.joined(separator: ".") }
         return s
+    }
+
+    /// RFC 6381 H.264 codec string ("avc1.640028") from an avcC record's profile / constraint / level bytes
+    /// (#147, the plain lane's H.264 base track). avcC layout: [0]=version(1), [1]=AVCProfileIndication,
+    /// [2]=profile_compatibility, [3]=AVCLevelIndication, hex-concatenated per RFC 6381. Returns nil (the
+    /// caller keeps a generous High@5.1 default) when the extradata is not a parseable avcC record.
+    private static func avcCodecString(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> String? {
+        guard let par, let ex = par.pointee.extradata else { return nil }
+        guard Int(par.pointee.extradata_size) >= 4, ex[0] == 1 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", ex[1], ex[2], ex[3])
     }
 
     /// RFC 6381 codec string for the one mapped audio track (nil = leave it out of CODECS).

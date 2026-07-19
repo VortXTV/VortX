@@ -70,10 +70,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private let mediaGateLock = NSLock()
     private var startupMediaList: (segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool)?
 
-    /// Build the remux stream + local server for a DV MKV URL. Returns nil when the listener cannot bind
+    /// Build the remux stream + local server for an MKV URL. Returns nil when the listener cannot bind
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
-    static func make(input: URL, headers: [String: String]?) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
-        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true)
+    /// `mode` (#147): `.dolbyVision` (the default, the original lane) or `.plain` for a non-DV MKV kept on
+    /// AVPlayer for Picture in Picture; the mode flows into classify + signaling (see VortXMKVRemuxStream.Mode).
+    static func make(input: URL, headers: [String: String]?,
+                     mode: VortXMKVRemuxStream.Mode = .dolbyVision) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true, mode: mode)
         let server = VortXRemuxHLSServer(stream: stream)
         guard server.listen() else { return nil }
         var comps = URLComponents()
@@ -295,6 +298,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         #if os(tvOS)
+        // #147: the panel switch below is DV-lane only. A PLAIN (non-DV) remux mount must never touch the
+        // panel: its master carries no DV declaration and its content is whatever the source was (usually
+        // SDR). `sig.dolbyVision` is mode-derived (every `.dolbyVision` master keeps today's behavior exactly,
+        // including a P8 with an unknown compat id).
+        if sig.dolbyVision {
         // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published signaling, and BEFORE
         // the media playlist / any segment (the real video mount). This replaces the old pre-attach switch in
         // loadFile, which fired on mount for every remux candidate and cycled the panel twice per hop whenever
@@ -323,6 +331,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if switched.wait(timeout: .now() + 2) == .timedOut {   // bounded: a wedged main must not hang the serve task
             DiagnosticsLog.log("dv", "DV display switch request not confirmed within 2s (main queue busy); the switch may land after the master is served")
         }
+        }   // end sig.dolbyVision (#147)
         #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
         // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
@@ -333,6 +342,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
+        // #147 PLAIN lane: ONE variant, no SUPPLEMENTAL-CODECS, no VIDEO-RANGE (sig built them nil) - the
+        // exact range-unlabeled shape the b170 bisect proved always survives AVFoundation's variant filter,
+        // so no lifeboat second variant is needed (the lifeboat exists only because the DV variant's explicit
+        // PQ/HLG range can be filtered). Points at media.m3u8 -> init.mp4 (the untouched init: there is no
+        // dvvC to strip on a plain mount; init-hdr simply falls back to the same bytes and is never referenced).
+        if !sig.dolbyVision {
+            var inf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
+            if sig.width > 0, sig.height > 0 { inf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
+            inf += ",CODECS=\"\(codecs)\""
+            if sig.fps > 0 { inf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
+            let body = Data("#EXTM3U\n#EXT-X-VERSION:7\n\(inf)\nmedia.m3u8\n".utf8)
+            DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=1 (plain) \(body.count)B")
+            respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+            return
+        }
         // DV variant FIRST (Apple authoring-spec truth: SUPPLEMENTAL-CODECS + VIDEO-RANGE) so it is the
         // initial pick whenever the pipeline admits HDR at parse time.
         var dvInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
