@@ -112,6 +112,12 @@ class EngineStremioRepository(
     }
     private val trackPrefs by lazy { TrackPreferencesStore(appContext) }
 
+    /// One-time flag read for the vortx-core SHADOW ranking lane (engine cutover Phase 7 slice 1,
+    /// the Android analogue of the Apple VortxBridge shadow). Forced on the first stream rank; after
+    /// that the call-site guard is a single volatile read, so the default-OFF flag costs nothing and
+    /// the app behaves byte-identically until it is switched on. See [VortxRankingShadow].
+    private val shadowRankingConfigured by lazy { VortxRankingShadow.configure(appContext); true }
+
     /// Field names that changed in the most recent engine event. extraBufferCapacity + DROP_OLDEST
     /// keeps a burst of back-to-back events from ever suspending (blocking) the native callback thread
     /// that publishes them -- see the class doc.
@@ -635,7 +641,12 @@ class EngineStremioRepository(
         )
         StreamRanking.installReading(snapshot)
         val pin = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
-        StreamRanking.rankedGroups(EngineState.parseStreamGroups(state), prefs = snapshot, pin = pin)
+        val groups = EngineState.parseStreamGroups(state)
+        // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
+        // kernel fire-and-forget and log the agreement (a diff count). It never touches the ranked
+        // list returned below; with the flag at its default OFF this line is one volatile read.
+        if (shadowRankingConfigured && VortxRankingShadow.enabled) VortxRankingShadow.compareAsync(groups, snapshot)
+        StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
     } }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {

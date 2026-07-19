@@ -15,3 +15,9 @@ captures/
 
 # Kotlin compiler scratch/cache dir (regenerated per build; never committed).
 .kotlin/
+
+# Prebuilt vortx-core JNI cdylib (libvortx_ffi.so), produced OUT-OF-REPO from the engine branch's
+# vortx-core (crates/ffi with --no-default-features --features jni) via cargo-ndk; see
+# app/src/main/jniLibs/README.md for the exact command. Binaries are never committed; every
+# machine/CI builds its own. The README itself stays tracked.
+app/src/main/jniLibs/**/*.so
