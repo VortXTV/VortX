@@ -8,6 +8,7 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.model.MediaType
 import com.vortx.android.search.SearchHistoryStore
+import com.vortx.android.sync.VortXSyncManager
 
 /// Constructor injection without a DI framework (KISS): a factory that hands the shared
 /// [CatalogRepository]/[AuthRepository] seams to each ViewModel. When Hilt/Koin is introduced for the
@@ -22,6 +23,7 @@ class StremioXViewModelFactory(
     private val auth: AuthRepository = PreviewAuthRepository(),
     private val detailArgs: DetailArgs? = null,
     private val appContext: Context? = null,
+    private val syncManager: VortXSyncManager? = null,
 ) : ViewModelProvider.Factory {
 
     data class DetailArgs(val type: MediaType, val id: String)
@@ -37,6 +39,14 @@ class StremioXViewModelFactory(
         }
         modelClass.isAssignableFrom(AddonsViewModel::class.java) -> AddonsViewModel(repo) as T
         modelClass.isAssignableFrom(AccountViewModel::class.java) -> AccountViewModel(auth) as T
+        modelClass.isAssignableFrom(VortXAccountViewModel::class.java) -> {
+            // The app-process VortXSyncManager (VortXApplication.syncManager): the E2E VortX account +
+            // cross-device sync engine. Only the VortX account screen asks for this ViewModel, and its
+            // entry row is hidden when the manager could not be stood up, so this requireNotNull can
+            // only trip on a wiring bug, not in normal use.
+            val manager = requireNotNull(syncManager) { "VortXAccountViewModel requires the app VortXSyncManager" }
+            VortXAccountViewModel(manager) as T
+        }
         modelClass.isAssignableFrom(DetailViewModel::class.java) -> {
             val args = requireNotNull(detailArgs) { "DetailViewModel requires DetailArgs" }
             val context = requireNotNull(appContext) {

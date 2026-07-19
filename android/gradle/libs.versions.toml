@@ -80,6 +80,14 @@ coil = "3.3.0"
 # pinned 2.2.10 compiler can read its .kotlin_module metadata with a wide margin. It carries everything this port
 # needs (CoroutineWorker, setForeground/ForegroundInfo, unique work). Bump alongside a coordinated Kotlin bump.
 work = "2.10.0"
+# OkHttp: the account realtime-sync WebSocket transport (com.vortx.android.sync.VortXSyncRealtime).
+# HttpURLConnection (which the sync manager's plain HTTP helper uses) has no WebSocket support, and
+# OkHttp is ALREADY on the runtime classpath -- coil-network-okhttp 3.3.0 resolves okhttp 4.12.0
+# transitively as Coil3's documented default engine -- so this explicit pin is the tink pattern above:
+# it introduces no new artifact/version (offline-safe) and no resolution conflict, it only makes the
+# dependency first-party instead of leaning on a transitive. 4.12.0 also predates Kotlin 2.3.0 (it is
+# built on Kotlin 1.8/1.9-era metadata), so the pinned 2.2.10 compiler reads it with wide margin.
+okhttp = "4.12.0"
 
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
@@ -110,6 +118,8 @@ tv-material = { group = "androidx.tv", name = "tv-material", version.ref = "tvMa
 
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 

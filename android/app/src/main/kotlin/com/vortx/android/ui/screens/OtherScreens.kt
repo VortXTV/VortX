@@ -220,7 +220,9 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
 }
 
 /// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). The
-/// Account row is real (S03): it reflects the live engine [AuthState] and opens [AccountScreen] via
+/// VortX Account row is the PRIMARY login (the E2E account + cross-device sync, opened via
+/// [onVortxAccountClick]); the Stremio row below it is real too (S03): it reflects the live engine
+/// [AuthState] and opens [AccountScreen] via
 /// [onAccountClick]. The Add-ons row (S04) opens the add-on management screen via [onAddonsClick]. In
 /// debug builds only, one extra row opens the S02 design-system gallery for visual review — the boundary
 /// is [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
@@ -240,6 +242,12 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
 @Composable
 fun SettingsScreen(
     authState: AuthState,
+    // The VortX account row (the E2E account + cross-device sync, VortXSyncManager): the live
+    // signed-in summary, or null to hide the row when the sync manager could not be stood up
+    // (@Previews, a keystore failure). The VortX account is the PRIMARY login; the [authState]
+    // row below stays the engine's optional Stremio account.
+    vortxAccountValue: String?,
+    onVortxAccountClick: () -> Unit,
     onProfilesClick: () -> Unit,
     onAccountClick: () -> Unit,
     onAddonsClick: () -> Unit,
@@ -291,7 +299,12 @@ fun SettingsScreen(
         // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
         // makes the whole multi-profile subsystem reachable.
         SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
-        SettingRow(VortXIcons.account, "Account", accountValue, onClick = onAccountClick)
+        // VortX Account above the Stremio row: the VortX account is the primary login (sign in /
+        // create / recover + cross-device sync); Stremio below is the optional engine import.
+        if (vortxAccountValue != null) {
+            SettingRow(VortXIcons.account, "VortX Account", vortxAccountValue, onClick = onVortxAccountClick)
+        }
+        SettingRow(VortXIcons.account, "Stremio", accountValue, onClick = onAccountClick)
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
         SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)
         SettingRow(VortXIcons.mediaServer, "Media servers", "Plex, Jellyfin, Emby", onClick = onMediaServersClick)

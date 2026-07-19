@@ -207,6 +207,13 @@ dependencies {
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
 
+    // OkHttp (account realtime sync): the WebSocket client behind com.vortx.android.sync.VortXSyncRealtime
+    // (the SyncRoom wss channel). Already on the runtime classpath transitively via coil-network-okhttp at
+    // this exact version (see the catalog note), made explicit because sync code now imports okhttp3.*
+    // directly -- first-party code never leans on a transitive coordinate it doesn't declare. Both flavors
+    // (sync is not a licensing-boundary feature), so a plain `implementation`.
+    implementation(libs.okhttp)
+
     // WorkManager (Round 5): the offline-downloads transport. com.vortx.android.downloads.DownloadWorker runs one
     // download as a foreground-service worker, which is what gives the Android port the two properties Apple gets
     // from its two URLSessions at once: the transfer survives process death (WorkManager persists the work and

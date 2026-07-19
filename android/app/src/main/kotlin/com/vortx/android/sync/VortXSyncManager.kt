@@ -34,7 +34,8 @@ import java.net.URL
  * AND the sync engine (`syncUp` / `syncDown`, the [VortXSyncDoc] `vortx` doc-merge, tombstone folds, and
  * the never-shrink / never-zero / decrypt-miss / version guards), built on [VortXCrypto]'s
  * `sealDocument` / `openDocument`. The sync engine covers the PROFILE + WATCH-OVERLAY + PROFILE-TOMBSTONE
- * legs; the realtime WebSocket channel and the add-on / library / apiKeys / searches legs (which depend on
+ * legs, plus the realtime WebSocket pull channel ([VortXSyncRealtime], via [startRealtime] /
+ * [stopRealtime]); the add-on / library / apiKeys / searches legs (which depend on
  * stores not yet ported) are later rounds — this engine PRESERVES those foreign doc keys on the
  * read-merge-write so it never drops what another surface wrote. VortX works fully signed out; this only
  * adds cross-device sync, backup, and recovery, so nothing here is on the critical launch path.
@@ -232,8 +233,9 @@ class VortXSyncManager(context: Context) {
         return AuthResult.Failed("Recovery failed.")
     }
 
-    /** Sign out: drop the pending push, drop and clear the persisted session. */
+    /** Sign out: drop the realtime channel and the pending push, drop and clear the persisted session. */
     fun signOut() {
+        stopRealtime()   // drop the SyncRoom socket + poll before clearing the token (Apple signOut order)
         pendingSync?.cancel()
         pendingSync = null
         hasPendingPush = false
@@ -544,10 +546,44 @@ class VortXSyncManager(context: Context) {
         }
     }
 
-    /** Catch-up PULL entry point (foreground / manual "Sync now"). The realtime WS channel is a later round. */
+    /** Catch-up PULL entry point (manual "Sync now"); [startRealtime] is the foreground entry point. */
     fun syncDownSoon() {
         if (isSignedIn) scope.launch { syncDown() }
     }
+
+    // ---- Real-time pull channel (WebSocket SyncRoom + while-active poll fallback) ----
+
+    /**
+     * The Android port of the Apple realtime leg ([VortXSyncRealtime]): the worker SyncRoom WebSocket
+     * plus the 10s while-active fallback poll. Lazy so a signed-out launch never builds the OkHttp
+     * client. The channel only ever calls the guarded [syncDown] -- the #145 pull guards (tri-state
+     * pull, version-wins, pending-push defer) all still apply to every realtime-triggered apply.
+     */
+    private val realtime by lazy {
+        VortXSyncRealtime(this, scope, BASE.replaceFirst("https://", "wss://") + "/v1/sync/connect")
+    }
+
+    /**
+     * Open the real-time channel + run one catch-up pull. Called on app-foreground (the
+     * [com.vortx.android.VortXApplication] started-activity hook) and after a successful sign-in.
+     * Idempotent and fail-soft: a no-op when signed out or already live, and a failed socket degrades
+     * to the fallback poll, never breaking the pull+debounced-push engine underneath.
+     */
+    fun startRealtime() {
+        realtime.start()
+    }
+
+    /** Close the real-time channel. Called on app-background and inside [signOut]. Safe to repeat. */
+    fun stopRealtime() {
+        realtime.stop()
+    }
+
+    /**
+     * The signed-in account's applied-version high-water mark, for the realtime channel's up-front
+     * broadcast filter (only a strictly-newer pushed version triggers a pull). Same-package internal,
+     * like [currentSession]: not part of the public API.
+     */
+    internal fun lastAppliedVersion(): Long = lastSyncedVersion()
 
     // ---- Sign-in reconciliation (no blind last-writer-wins) ----
 

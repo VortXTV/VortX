@@ -148,11 +148,13 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
      * no new dependency and covers BOTH launcher activities from the one process -- the phone [MainActivity]
      * and the TV [com.vortx.android.ui.tv.TvActivity] -- with a single started-activity counter. The 0 -> 1
      * started transition IS "the app came to the foreground" (cold launch OR return from background),
-     * matching Apple's scenePhase == .active; [VortXSyncManager.syncDownSoon] is the manager's own documented
-     * foreground / "Sync now" pull entry point (the realtime WebSocket channel is a later Android round).
-     * Rotation does not recreate the launcher activities (they declare configChanges), and a pull is
-     * version-guarded and defers to any queued local push, so even a rare spurious foreground tick (an
-     * uncovered config-change recreation) is a cheap, safe no-op rather than a wipe risk.
+     * matching Apple's scenePhase == .active; [VortXSyncManager.startRealtime] is the manager's foreground
+     * entry point (Apple's scene-.active startRealtime): it opens the SyncRoom WebSocket + fallback poll AND
+     * runs the same catch-up pull the old syncDownSoon hook did. The 1 -> 0 stopped transition mirrors
+     * Apple's scene-.background [VortXSyncManager.stopRealtime], so no socket or poll outlives the
+     * foreground. Rotation does not recreate the launcher activities (they declare configChanges), and a
+     * pull is version-guarded and defers to any queued local push, so even a rare spurious foreground tick
+     * (an uncovered config-change recreation) is a cheap, safe no-op rather than a wipe risk.
      */
     private fun wireAccountSync() {
         val store = ProfileStore.sharedOrNull() ?: return   // ProfileStore init failed: leave sync dormant
@@ -168,16 +170,20 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             private var startedActivities = 0
 
             override fun onActivityStarted(activity: Activity) {
-                // 0 -> 1: the app is now in the foreground. Pull the account doc so a remote edit applies,
-                // mirroring Apple's scenePhase == .active syncDown. syncDownSoon() is fail-soft + a no-op
-                // when signed out, and the pull is version-guarded (applies only a strictly-newer remote and
-                // defers while a local push is queued), so it never clobbers local state.
-                if (startedActivities == 0) manager.syncDownSoon()
+                // 0 -> 1: the app is now in the foreground. Open the realtime channel (SyncRoom WebSocket +
+                // fallback poll) AND run the catch-up pull, mirroring Apple's scenePhase == .active
+                // startRealtime. Fail-soft + a no-op when signed out or already live, and every pull it
+                // triggers is version-guarded (applies only a strictly-newer remote and defers while a
+                // local push is queued), so it never clobbers local state.
+                if (startedActivities == 0) manager.startRealtime()
                 startedActivities++
             }
 
             override fun onActivityStopped(activity: Activity) {
                 if (startedActivities > 0) startedActivities--
+                // 1 -> 0: the app left the foreground. Close the socket + poll (Apple's scene-.background
+                // stopRealtime); the next foreground re-opens them. Safe to call repeatedly.
+                if (startedActivities == 0) manager.stopRealtime()
             }
 
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}

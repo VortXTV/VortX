@@ -60,6 +60,14 @@ class MainActivity : ComponentActivity() {
         // The engine repository lives on VortXApplication (constructed once per process), NOT built
         // here -- see VortXApplication's doc comment for why an Activity-scoped instance is unsafe.
         val app = application as VortXApplication
-        setContent { StremioXApp(repo = app.catalogRepository, auth = app.authRepository) }
+        setContent {
+            StremioXApp(
+                repo = app.catalogRepository,
+                auth = app.authRepository,
+                // The VortX account + cross-device sync engine (nullable: sync is off the critical
+                // path; a keystore failure hides the account row instead of blocking launch).
+                syncManager = app.syncManager,
+            )
+        }
     }
 }

@@ -65,6 +65,8 @@ import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
+import com.vortx.android.ui.screens.VortXAccountScreen
+import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlassPanel
@@ -79,6 +81,7 @@ import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -103,6 +106,10 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 fun StremioXApp(
     repo: CatalogRepository = PreviewCatalogRepository(),
     auth: AuthRepository = PreviewAuthRepository(),
+    // The app-process VortX account + sync engine (VortXApplication.syncManager). Null in @Previews and
+    // when the manager could not be stood up (keystore failure): the VortX Account settings row is then
+    // hidden and everything else is unchanged -- sync is off the critical path by design.
+    syncManager: VortXSyncManager? = null,
 ) {
     VortXTheme {
         var tab by remember { mutableStateOf(Tab.HOME) }
@@ -118,6 +125,7 @@ fun StremioXApp(
         var playingMeta by remember { mutableStateOf<MetaItem?>(null) }
         var showGallery by remember { mutableStateOf(false) }
         var showAccount by remember { mutableStateOf(false) }
+        var showVortxAccount by remember { mutableStateOf(false) }
         var showAddons by remember { mutableStateOf(false) }
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
@@ -289,6 +297,17 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showVortxAccount && syncManager != null) {
+            // Settings > VortX Account: the E2E VortX account (sign in / create / recover) + cross-device
+            // sync controls, driving the app-process VortXSyncManager. Separate from the Stremio account
+            // overlay below: the VortX account is the primary login; Stremio stays the optional import.
+            BackHandler { showVortxAccount = false }
+            val vortxAccountVm: VortXAccountViewModel =
+                viewModel(factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
+            VortXAccountScreen(viewModel = vortxAccountVm, onBack = { showVortxAccount = false })
+            return@VortXTheme
+        }
+
         if (showAccount) {
             // System Back = the screen's own back affordance (dismiss to Settings), never an app exit.
             BackHandler { showAccount = false }
@@ -447,6 +466,15 @@ fun StremioXApp(
                 Tab.SEARCH -> SearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, content)
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
+                    // The VortX account row: live signed-in summary straight off the sync manager's
+                    // account flow. Null manager (preview / keystore failure) hides the row entirely.
+                    // The conditional collect is safe: [syncManager] is process-constant, so the
+                    // composition never flips between the two branches.
+                    vortxAccountValue = syncManager?.let { manager ->
+                        val vortxAccount by manager.account.collectAsStateWithLifecycle()
+                        vortxAccount?.let { it.username.ifEmpty { it.email } } ?: "Not signed in"
+                    },
+                    onVortxAccountClick = { showVortxAccount = true },
                     onProfilesClick = { showProfiles = true },
                     onAccountClick = { showAccount = true },
                     onAddonsClick = { showAddons = true },
