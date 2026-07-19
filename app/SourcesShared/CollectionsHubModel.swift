@@ -128,6 +128,53 @@ struct SubCatalog: Identifiable {
     let load: (_ page: Int) async -> [MetaPreview]
 }
 
+// MARK: - Curated freshness (per-app-open seeded page rotation)
+
+/// Freshness for the VORTX-CURATED catalogs: the hub's popularity windows (the genre / service / decade
+/// "Movies", "Shows" and "Trending" pills, page-rotated here) and the editorial Home rails
+/// (CuratedCollections, pool-rotated via `rotation`), so the same static ordering does not read as the
+/// identical list every open. The seed is drawn ONCE per process, so the rotation is STABLE within a
+/// viewing session (scrolling, paginating and returning never reorder under the user) and changes on the
+/// next app open. Deterministic per catalog: the offset hashes the catalog's own query/id, so "1990s
+/// Movies" and "1990s Shows" rotate independently. Complements (not replaces) the server-side `vxday=1`
+/// daily shuffle opt-in: that reorders WITHIN a page once the worker ships and only on the keyless edge
+/// route; this rotates the visible WINDOW on every route, today. Semantic rows (New*, Top This Week/Month/
+/// Year, the native Discover lists) and everything outside the curated set (Continue Watching, Library,
+/// add-on catalogs) are untouched.
+enum CuratedFreshness {
+    /// One draw per app launch: fresh rotation each open, stable for the whole session.
+    static let sessionSeed = UInt64.random(in: .min ... .max)
+
+    /// Pages 1...(span) rotate; span 4 keeps every rotated first page inside the top ~80 titles of the
+    /// window, so a curated row still reads as "the good stuff", just a different slice of it per open.
+    static let span: UInt64 = 4
+
+    /// Deterministic 0..<span page offset for a curated window (FNV-1a over the window's own query,
+    /// mixed with the session seed).
+    static func pageOffset(key: String) -> Int {
+        Int(mix(key) % span)
+    }
+
+    /// Deterministic 0..<count rotation start for an already-fetched curated pool (the editorial Home
+    /// rails): the same seeded mix, scaled to the pool size instead of the page span. 0 on an empty pool.
+    static func rotation(key: String, count: Int) -> Int {
+        guard count > 0 else { return 0 }
+        return Int(mix(key) % UInt64(count))
+    }
+
+    /// FNV-1a over the key, mixed with the per-open session seed.
+    private static func mix(_ key: String) -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for byte in key.utf8 {
+            h ^= UInt64(byte)
+            h = h &* 0x100000001b3
+        }
+        h ^= sessionSeed
+        h = h &* 0x100000001b3
+        return h
+    }
+}
+
 /// Builds the sub-catalog pills for a hub target. All loaders resolve to engine-playable `tt` previews via
 /// TMDBClient and fail soft to []. The Movies/Shows/New/Top/Trending vocabulary is shared across services
 /// and genres; the Discover cards use the native trending/popular/now-playing/upcoming list endpoints.
@@ -167,12 +214,24 @@ enum CollectionsCatalog {
 
     private static func scopedSubs(movieScope: String?, tvScope: String?, region: String, serviceFallback: Bool = false) -> [SubCatalog] {
         let today = TMDBClient.isoDate(daysAgo: 0)
-        func sub(_ id: String, _ title: String, movieExtra: ((String) -> String)?, tvExtra: ((String) -> String)?) -> SubCatalog {
+        // `fresh` opts a POPULARITY window (Movies / Shows / Trending) into the per-app-open seeded page
+        // rotation (CuratedFreshness). Date-sorted and Top-This-* rows keep their semantic order. When a
+        // rotated first page comes back empty (a sparse window shorter than the rotation span, e.g. a small
+        // provider's catalog), fall back to the unrotated page 1 so rotation never blanks a working row;
+        // that unrotated retry is also what keeps the service US-region fallback reachable (it only arms
+        // on page 1).
+        func sub(_ id: String, _ title: String, movieExtra: ((String) -> String)?, tvExtra: ((String) -> String)?, fresh: Bool = false) -> SubCatalog {
             SubCatalog(id: id, title: title, load: { page in
-                await mergedDiscover(
-                    movie: movieScope.flatMap { s in movieExtra.map { $0(s) } },
-                    tv:    tvScope.flatMap   { s in tvExtra.map   { $0(s) } },
-                    region: region, page: page, serviceRegionFallback: serviceFallback)
+                let movie = movieScope.flatMap { s in movieExtra.map { $0(s) } }
+                let tv = tvScope.flatMap { s in tvExtra.map { $0(s) } }
+                let offset = fresh ? CuratedFreshness.pageOffset(key: "\(movie ?? "")|\(tv ?? "")") : 0
+                let items = await mergedDiscover(
+                    movie: movie, tv: tv,
+                    region: region, page: page + offset, serviceRegionFallback: serviceFallback)
+                if offset > 0, page == 1, items.isEmpty {
+                    return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1, serviceRegionFallback: serviceFallback)
+                }
+                return items
             })
         }
         // vote_count thresholds scale with the window: TMDB votes accrue slowly, so a 7-day window with a
@@ -184,8 +243,8 @@ enum CollectionsCatalog {
                        tvExtra:    { "\($0)&sort_by=popularity.desc&first_air_date.gte=\(from)&first_air_date.lte=\(today)&vote_count.gte=\(minVotes)" })
         }
         return [
-            sub("movies", "Movies", movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: nil),
-            sub("shows", "Shows", movieExtra: nil, tvExtra: { "\($0)&sort_by=popularity.desc" }),
+            sub("movies", "Movies", movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: nil, fresh: true),
+            sub("shows", "Shows", movieExtra: nil, tvExtra: { "\($0)&sort_by=popularity.desc" }, fresh: true),
             sub("newmovies", "New Movies",
                 movieExtra: { "\($0)&sort_by=primary_release_date.desc&primary_release_date.lte=\(today)&vote_count.gte=5" }, tvExtra: nil),
             sub("newshows", "New Shows",
@@ -194,7 +253,7 @@ enum CollectionsCatalog {
             top("topmonth", "Top This Month", days: 30, minVotes: 8),
             top("topyear", "Top This Year", days: 365, minVotes: 10),
             sub("trending", "Trending",
-                movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: { "\($0)&sort_by=popularity.desc" }),
+                movieExtra: { "\($0)&sort_by=popularity.desc" }, tvExtra: { "\($0)&sort_by=popularity.desc" }, fresh: true),
         ]
     }
 
@@ -207,17 +266,24 @@ enum CollectionsCatalog {
     private static func decadeSubs(_ d: DecadeSpec, region: String) -> [SubCatalog] {
         let movieWindow = "primary_release_date.gte=\(d.startYear)-01-01&primary_release_date.lte=\(d.endYear)-12-31"
         let tvWindow = "first_air_date.gte=\(d.startYear)-01-01&first_air_date.lte=\(d.endYear)-12-31"
-        func sub(_ id: String, _ title: String, movie: String?, tv: String?) -> SubCatalog {
+        // `fresh` mirrors scopedSubs: seeded per-app-open page rotation for the popularity windows only,
+        // with the unrotated page-1 fallback so a sparse window (early-decade TV) never reads empty.
+        func sub(_ id: String, _ title: String, movie: String?, tv: String?, fresh: Bool = false) -> SubCatalog {
             SubCatalog(id: id, title: title, load: { page in
-                await mergedDiscover(movie: movie, tv: tv, region: region, page: page)
+                let offset = fresh ? CuratedFreshness.pageOffset(key: "\(movie ?? "")|\(tv ?? "")") : 0
+                let items = await mergedDiscover(movie: movie, tv: tv, region: region, page: page + offset)
+                if offset > 0, page == 1, items.isEmpty {
+                    return await mergedDiscover(movie: movie, tv: tv, region: region, page: 1)
+                }
+                return items
             })
         }
         return [
-            sub("movies", "Movies", movie: "\(movieWindow)&sort_by=popularity.desc", tv: nil),
-            sub("shows", "Shows", movie: nil, tv: "\(tvWindow)&sort_by=popularity.desc"),
+            sub("movies", "Movies", movie: "\(movieWindow)&sort_by=popularity.desc", tv: nil, fresh: true),
+            sub("shows", "Shows", movie: nil, tv: "\(tvWindow)&sort_by=popularity.desc", fresh: true),
             sub("newmovies", "New Movies", movie: "\(movieWindow)&sort_by=primary_release_date.desc&vote_count.gte=5", tv: nil),
             sub("newshows", "New Shows", movie: nil, tv: "\(tvWindow)&sort_by=first_air_date.desc&vote_count.gte=5"),
-            sub("trending", "Trending", movie: "\(movieWindow)&sort_by=popularity.desc", tv: "\(tvWindow)&sort_by=popularity.desc"),
+            sub("trending", "Trending", movie: "\(movieWindow)&sort_by=popularity.desc", tv: "\(tvWindow)&sort_by=popularity.desc", fresh: true),
         ]
     }
 
