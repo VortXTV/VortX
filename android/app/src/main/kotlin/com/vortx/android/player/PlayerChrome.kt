@@ -24,8 +24,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material3.Icon
@@ -74,6 +76,9 @@ fun PlayerChrome(
     onBack: () -> Unit,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
+    /// Relative seek in milliseconds (negative = back): the +/-10s transport buttons drive this, and the
+    /// host also wires the double-tap gesture to the same engine seam. See [PlayerEngine.seekBy].
+    onSeekBy: (Long) -> Unit,
     onSelectAudio: (Int) -> Unit,
     onSelectSubtitle: (Int?) -> Unit,
     onSetSpeed: (Float) -> Unit,
@@ -146,6 +151,7 @@ fun PlayerChrome(
             emberAccent = emberAccent,
             onTogglePause = onTogglePause,
             onSeek = onSeek,
+            onSeekBy = onSeekBy,
             scrubPreview = scrubPreview,
             modifier = Modifier
                 .fillMaxWidth()
@@ -192,6 +198,10 @@ private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SPEED }
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+
+/// The relative-seek step (ms) for the transport's Replay10/Forward10 buttons. 10s matches the icon
+/// glyphs and the host's double-tap gesture step.
+private const val SEEK_STEP_MS = 10_000L
 
 private data class SheetOption(val label: String, val selected: Boolean, val onPick: () -> Unit)
 
@@ -312,6 +322,7 @@ private fun TransportBar(
     emberAccent: Color,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
     scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
@@ -365,6 +376,22 @@ private fun TransportBar(
                     imageVector = if (state.isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
                     contentDescription = if (state.isPaused) "Play" else "Pause",
                     tint = Color.White,
+                )
+            }
+            // The +/-10s jump controls (the relative seek the scrubber physically cannot do: 10s of a
+            // 2h film is under a pixel of slider travel). Gated like the slider on a known duration.
+            IconButton(onClick = { onSeekBy(-SEEK_STEP_MS) }, enabled = duration > 0L) {
+                Icon(
+                    imageVector = Icons.Filled.Replay10,
+                    contentDescription = "Back 10 seconds",
+                    tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
+                )
+            }
+            IconButton(onClick = { onSeekBy(SEEK_STEP_MS) }, enabled = duration > 0L) {
+                Icon(
+                    imageVector = Icons.Filled.Forward10,
+                    contentDescription = "Forward 10 seconds",
+                    tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }
             Text(

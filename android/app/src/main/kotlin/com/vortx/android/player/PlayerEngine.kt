@@ -37,6 +37,18 @@ interface PlayerEngine {
     fun togglePause()
     fun seekTo(positionMs: Long)
 
+    /// RELATIVE seek: jump [deltaMs] milliseconds from the current position (negative = back), clamped
+    /// to [0, duration]. This is the seam the +/-10s controls and the double-tap gesture drive. The
+    /// default derives the target from the last published [state] snapshot + [seekTo], so any engine is
+    /// correct by construction; both concrete engines override with their native relative seek (mpv
+    /// `seek <s> relative`, ExoPlayer `currentPosition`) because the sampled state can lag the true
+    /// position by up to a poll tick.
+    fun seekBy(deltaMs: Long) {
+        val s = state.value
+        val upper = if (s.durationMs > 0L) s.durationMs else Long.MAX_VALUE
+        seekTo((s.positionMs + deltaMs).coerceIn(0L, upper))
+    }
+
     /// Set the playback speed multiplier (1.0 = normal). Both engines support this natively (ExoPlayer's
     /// `setPlaybackSpeed`, mpv's `speed` property); the chrome offers a small set of presets.
     fun setPlaybackSpeed(speed: Float)

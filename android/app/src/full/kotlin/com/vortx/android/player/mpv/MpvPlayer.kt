@@ -199,6 +199,12 @@ class MpvPlayer private constructor(
         mpv.command(arrayOf("seek", (positionMs.coerceAtLeast(0L) / 1000.0).toString(), "absolute"))
     }
 
+    override fun seekBy(deltaMs: Long) {
+        // mpv's own relative seek: exact against mpv's true position (the observed time-pos can lag up
+        // to a second behind) and natively clamped to [0, duration], so no state math here.
+        mpv.command(arrayOf("seek", (deltaMs / 1000.0).toString(), "relative"))
+    }
+
     override fun setPlaybackSpeed(speed: Float) { mpv.setPropertyString(PROP_SPEED, speed.toString()) }
 
     override fun selectAudioTrack(id: Int) { mpv.setPropertyString(PROP_AID, id.toString()) }
@@ -424,7 +430,14 @@ class MpvPlayer private constructor(
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                            // mpv reads the new size off the attached Surface; nothing to re-set here.
+                            // mpv does NOT read dimensions off the attached Surface: its Android GL
+                            // context sizes the render viewport from the `android-surface-size`
+                            // property (the mpv-android/jdtech contract). The framework guarantees this
+                            // callback fires at least once after surfaceCreated with the real size, and
+                            // again on every resize (the portrait<->landscape rotation). Without this
+                            // write mpv keeps a stale/zero viewport and the frame renders at the wrong
+                            // aspect; this IS the aspect-ratio fix, not an optimization.
+                            mpv.setPropertyString(PROP_ANDROID_SURFACE_SIZE, "${width}x$height")
                         }
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -457,6 +470,8 @@ class MpvPlayer private constructor(
         private const val PROP_VID = "vid"
         private const val PROP_SPEED = "speed"
         private const val PROP_PANSCAN = "panscan"
+        /// The Android GL context's viewport size, written on every surfaceChanged (mpv-android contract).
+        private const val PROP_ANDROID_SURFACE_SIZE = "android-surface-size"
         private const val PROP_VOLUME = "volume"
         private const val PROP_MUTE = "mute"
         // Per-file User-Agent override (the trailer UA/URL lockstep); the base UA is a pre-init option.
