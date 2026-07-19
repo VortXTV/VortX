@@ -15,7 +15,14 @@ crate-type = ["staticlib"]
 #  - `derive`          : the #[derive(Model)] proc-macro used by TvosModel.
 #  - `env-future-send` : makes EnvFuture = Send BoxFuture so Runtime's Send+Sync bounds hold
 #                        on a multi-threaded (non-wasm) host. REQUIRED for tvOS; wasm-incompatible.
-stremio-core = { git = "https://github.com/Stremio/stremio-core", branch = "development", features = ["derive", "env-future-send"] }
+#
+# Pinned to an explicit rev, NOT a branch. A `branch = "development"` dep with no committed
+# Cargo.lock (this crate gitignores its lock) re-resolves to whatever the upstream branch tip is
+# on the day of the build, so unreviewed third-party code could land in a release build. This rev
+# is the one already recorded in desktop/src-tauri/Cargo.lock, which keeps the Apple core and the
+# desktop shell on the same engine, as the comment in that manifest claims. Moving this rev is a
+# deliberate, reviewed act: bump it on purpose, never by rebuilding.
+stremio-core = { git = "https://github.com/Stremio/stremio-core", rev = "f1f0228d78ce72133780705ccbabaa7716e966b8", features = ["derive", "env-future-send"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -90,6 +90,10 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework, iOS slices), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # The NEW vortx-core engine (scripts/build-vortx-core-xcframework.sh), shadow-mode ranking
+      # increment: linked alongside StremioXCore until the cutover completes.
+      - framework: Vendor/VortXCore.xcframework
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
@@ -138,6 +142,10 @@ targets:
         product: MPVKit-GPL # macos-arm64_x86_64 slice
       - framework: Vendor/StremioXCore.xcframework
         embed: false # now carries an aarch64-apple-darwin slice
+      # The NEW vortx-core engine, shadow-mode ranking increment (macOS slice is
+      # _rust_eh_personality-localized the same way as StremioXCore's).
+      - framework: Vendor/VortXCore.xcframework
+        embed: false
     preBuildScripts:
       # Download the standalone node binary before the resource copy phase runs. Idempotent:
       # skips the ~95MB download when the right version is already present.
@@ -194,6 +202,9 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # The NEW vortx-core engine, shadow-mode ranking increment: linked, not embedded.
+      - framework: Vendor/VortXCore.xcframework
+        embed: false
       # AVKit must be an explicit link: the only thing used from it is the
       # UIWindow.avDisplayManager CATEGORY (no link-time symbols), so autolink
       # plus the dead-stripping linker silently dropped the framework, the
@@ -239,6 +250,9 @@ targets:
         product: MPVKit-GPL
       # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
+        embed: false
+      # The NEW vortx-core engine, shadow-mode ranking increment: linked, not embedded.
+      - framework: Vendor/VortXCore.xcframework
         embed: false
       - sdk: AVKit.framework
     settings:

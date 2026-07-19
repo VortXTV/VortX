@@ -552,6 +552,9 @@ enum StreamRanking {
     static func rankedGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         let groups = applyUserFilters(groups)
         guard !SourcePreferences.shared.useAddonOrder else { return groups }
+        // SHADOW ONLY (flag-gated, default off): hand the same filtered list to the vortx-core
+        // engine and log divergence. Never alters the order returned below.
+        EngineShadowRanking.shadowCompare(groups)
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {

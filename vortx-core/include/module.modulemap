@@ -1,0 +1,4 @@
+module VortXCore {
+    header "vortx_core.h"
+    export *
+}

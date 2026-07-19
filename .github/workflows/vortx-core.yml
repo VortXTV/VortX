@@ -1,0 +1,108 @@
+name: VortX Core (Rust engine)
+
+# The correctness + licence gate for vortx-core, the from-scratch Rust engine that replaces
+# stremio-core. vortx-core is compiled by NO app target today (no Xcode target, no Gradle module),
+# so nothing else in CI would notice if it broke. Without this job the engine is unguarded: it would
+# rot in place on the integration branch rather than on a side branch, which is no improvement.
+#
+# Two gates, both of which fail the build:
+#   1. `cargo test --workspace` in vortx-core/ (671 tests across 15 crates as of this commit).
+#      Verified locally: 671 passed, 0 failed. A deliberately failing test was injected to confirm
+#      cargo exits 101 (not 0) on a regression, so a red test really does redlight the PR.
+#   2. `cargo deny check` (advisories + bans + licenses + sources). The engine is GPL-3.0-or-later
+#      (see vortx-core/Cargo.toml [workspace.package]), so the licence position is load-bearing:
+#      a dependency arriving under an incompatible licence is a legal problem, not a style problem.
+#      Verified locally: exit 0, "advisories ok, bans ok, licenses ok, sources ok".
+#
+# This does NOT slow the app builds. It is a separate workflow, path-filtered to vortx-core/**, so
+# an app-only PR never triggers it, and it shares no job or runner with the Android / desktop / tvOS
+# builds. deny.toml is in the filter because the licence policy is an input to gate 2: editing the
+# policy must re-run the check that consumes it.
+#
+# NOTE on scope overlap: security.yml also runs cargo-deny, but it audits a different manifest
+# (desktop/src-tauri, covering the Tauri stack and the embedded stremio-core tree) and only checks
+# `advisories`. It never resolves the vortx-core dependency tree, so it cannot see the engine's
+# licences. The two jobs are complementary, not duplicates.
+
+on:
+  pull_request:
+    paths:
+      - "vortx-core/**"
+      - "deny.toml"
+      - ".github/workflows/vortx-core.yml"
+  # Also gate direct pushes to the integration branches. VortX development lands on `beta`, so a
+  # PR-only gate would leave direct pushes and post-merge semantic breakage unguarded.
+  push:
+    branches: [main, beta]
+    paths:
+      - "vortx-core/**"
+      - "deny.toml"
+      - ".github/workflows/vortx-core.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref, so a rapid push sequence does not queue redundant jobs
+# ahead of the app builds competing for the same runner pool.
+concurrency:
+  group: vortx-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: test + licence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: vortx-core
+    env:
+      # Pin the toolchain explicitly. This is belt and braces on top of the `toolchain:` input below,
+      # and it is REQUIRED, not decorative: vortx-core/rust-toolchain.toml pins `channel = "nightly"`,
+      # which rustup honours over an installed default, and a bare "nightly" floats to a new compiler
+      # every single day. RUSTUP_TOOLCHAIN takes precedence over the toolchain file (verified), so
+      # this is what actually holds the version still.
+      #
+      # Why stable and not the engine's declared nightly: that nightly exists for the FFI/xcframework
+      # build (`-Z build-std` for the tier-3 tvOS target), per the comment in rust-toolchain.toml.
+      # This job builds none of that, it runs host tests on Linux. The engine declares zero
+      # `#![feature(...)]` gates (verified: grep finds none) and the whole workspace compiles and
+      # passes all 671 tests on stable 1.97.1 (verified). Testing on pinned stable additionally keeps
+      # the engine stable-compatible, which the eventual host-side cutover and relicence both want.
+      # Bump this deliberately; do not let it drift.
+      RUSTUP_TOOLCHAIN: "1.97.1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "vortx-core -> target"
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          # Pinned for the same reason as the compiler: cargo-deny's defaults change across releases,
+          # and an unpinned tool can redlight a PR that changed nothing. 0.19.8 is the version this
+          # policy was verified against.
+          tool: cargo-deny@0.19.8
+
+      # 671 tests today. `--locked` is deliberately NOT passed: vortx-core/.gitignore:2 ignores
+      # Cargo.lock, so there is no committed lockfile for CI to honour and `--locked` would hard-fail
+      # on a fresh checkout. Consequence to be aware of: with no lockfile, CI re-resolves the
+      # dependency tree on every run, so a new upstream minor release can change what is tested and
+      # what is licence-checked without any change to this repo. Committing vortx-core/Cargo.lock
+      # (and then adding `--locked` here) is the follow-up that makes this gate reproducible.
+      - name: Engine tests
+        run: cargo test --workspace
+
+      # Runs from vortx-core/, so cargo-deny resolves THIS workspace's dependency tree. cargo-deny
+      # walks up to the repo-root deny.toml for policy (verified: the diagnostic cites
+      # <repo>/deny.toml), whose [licenses] allow list is written for exactly this tree, including
+      # the engine's own GPL-3.0-or-later.
+      - name: Licence and advisory gate
+        run: cargo deny check

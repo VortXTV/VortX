@@ -26,7 +26,12 @@ serde_json = "1"
 #  - derive          : the #[derive(Model)] proc-macro used by DesktopModel.
 #  - env-future-send : EnvFuture = Send BoxFuture, so Runtime's Send+Sync bounds hold on a
 #                      multi-threaded desktop host (wasm-incompatible, but we are native).
-stremio-core = { git = "https://github.com/Stremio/stremio-core", branch = "development", features = ["derive", "env-future-send"] }
+#
+# Pinned to an explicit rev, NOT a branch. This is the exact rev Cargo.lock already recorded, so
+# this pin changes no resolved code: it just moves the pin into the manifest, where dropping the
+# lock or running `cargo update` can no longer silently walk it to the upstream branch tip.
+# Matches core/Cargo.toml. Moving this rev is a deliberate, reviewed act.
+stremio-core = { git = "https://github.com/Stremio/stremio-core", rev = "f1f0228d78ce72133780705ccbabaa7716e966b8", features = ["derive", "env-future-send"] }
 serde_path_to_error = "0.1"
 once_cell = "1"
 futures = "0.3"
