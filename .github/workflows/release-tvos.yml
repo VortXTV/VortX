@@ -41,6 +41,21 @@ permissions:
 
 jobs:
   build-tvos:
+    # Environment gate for the token-bearing job (trust boundary): `engine-ci` carries a deployment
+    # branch policy (beta, main, claude/ci-engine-token), so a run started from any OTHER ref blocks
+    # at this gate before any step executes, making ENGINE_REPO_TOKEN unreachable outside those
+    # refs. The claude/ci-engine-token entry is TEMPORARY, for proof runs on the CI branch, and is
+    # removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
+    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-ref jobs
+    # from ever reaching the fetch steps that read it. Note: release events run on the tag's ref;
+    # gating releases to the policy's branches is intended (tags cut from beta/main pass).
+    #
+    # Read-only-build vs release-write split (reviewer note): the only contents:write consumer is
+    # the final release-attach step, and it already runs ONLY on release events / an explicit
+    # release_tag dispatch (see its `if:`). Splitting it into its own minimal-permission job needs
+    # an artifact handoff of every IPA/dmg plus a second runner and env replumbing -- deferred to
+    # the planned SECRETLESS PR-validation workflow lane rather than bloating this commit.
+    environment: engine-ci
     # Pinned explicit runner label: `macos-latest` is a MOVING alias (it means the macOS 15 arm64
     # image today, per actions/runner-images), and a silent alias flip -- e.g. to the macOS 26
     # image -- would swap the entire Xcode set and SDKs under the release lane with no diff in
@@ -49,8 +64,11 @@ jobs:
     # deliberate edit here, verified by a run, not an alias drift.
     runs-on: macos-15
     timeout-minutes: 90
+    # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
+    # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
+    # tag it resolved from.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -74,10 +92,10 @@ jobs:
 
       # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
       - name: Fetch stremiox-core (private, pinned)
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/stremiox-core
-          ref: bfbb9ef32a8f705b9b91a04182293da45adc7174
+          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
@@ -87,10 +105,10 @@ jobs:
       # temp path, then promote only that subdir to the app-root vortx-core/ (where the build-ffi
       # step's VORTX_ENGINE_DIR + the hashFiles('vortx-core/...') cache keys expect it).
       - name: Fetch vortx-core (private monorepo, pinned)
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/vortx-core
-          ref: 9e83954af5903118b69005d9dcdcfd96cfda4eae
+          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -104,7 +122,7 @@ jobs:
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (promoted from monorepo subdir)"
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
@@ -171,12 +189,16 @@ jobs:
         run: brew install xcodegen
 
       - name: Rust nightly with rust-src (tvOS is a tier 3 target)
+        # Dated nightly, matching the engines' rust-toolchain.toml pin: the xcframework scripts run
+        # cargo with --manifest-path from repo root, so the engines' directory-based toolchain pin
+        # cannot govern them; the scripts select +nightly-2026-07-19 explicitly and this step installs
+        # exactly that toolchain. A floating `nightly` here would rebuild with a different rustc daily.
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
-          rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup toolchain install nightly-2026-07-19 --profile minimal --component rust-src
+          rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -199,7 +221,7 @@ jobs:
 
       - name: Cache stremio-core xcframework
         id: cache-core-xcframework
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: app/Vendor/StremioXCore.xcframework
           key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
@@ -215,7 +237,7 @@ jobs:
       # The step fails fast with a clear message if the checkout's vortx-core lacks crates/ffi.
       - name: Cache vortx-ffi xcframework
         id: cache-ffi-xcframework
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: app/Vendor/VortxEngine.xcframework
           key: vortx-ffi-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh') }}
@@ -389,7 +411,7 @@ jobs:
 
       - name: Upload artifact (manual runs)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-tvOS-ci
           path: |

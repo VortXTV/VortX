@@ -21,33 +21,36 @@ cd "$CORE_DIR"
 source "$HOME/.cargo/env" 2>/dev/null || true
 
 BUILDSTD="-Z build-std=std,panic_abort"
+# --locked on every cargo build: the engine repo tracks Cargo.lock, so a drifted dependency
+# resolution FAILS the build here instead of silently linking a different graph than CI proved.
+LOCKED="--locked"
 LIB="libstremiox_core.a"
 OUT="../app/Vendor/StremioXCore.xcframework"   # Vendor/ is gitignored; produced by this script
 
-rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
+rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
 
 echo "▸ tvOS device (aarch64-apple-tvos)"
 SDKROOT="$(xcrun --sdk appletvos --show-sdk-path)" \
-  cargo +nightly build $BUILDSTD --target aarch64-apple-tvos --release
+  cargo +nightly-2026-07-19 build $LOCKED $BUILDSTD --target aarch64-apple-tvos --release
 
 echo "▸ tvOS simulator (aarch64-apple-tvos-sim)"
 SDKROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)" \
-  cargo +nightly build $BUILDSTD --target aarch64-apple-tvos-sim --release
+  cargo +nightly-2026-07-19 build $LOCKED $BUILDSTD --target aarch64-apple-tvos-sim --release
 
 echo "▸ iOS device (aarch64-apple-ios)"
 SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
-  cargo +nightly build --target aarch64-apple-ios --release
+  cargo +nightly-2026-07-19 build $LOCKED --target aarch64-apple-ios --release
 
 echo "▸ iOS simulator (aarch64-apple-ios-sim)"
 SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)" \
-  cargo +nightly build --target aarch64-apple-ios-sim --release
+  cargo +nightly-2026-07-19 build $LOCKED --target aarch64-apple-ios-sim --release
 
 # Native macOS slice for the Mac app (NOT Catalyst, which MPVKit can't link). Built with the same
 # build-std=panic_abort as tvOS, NOT the prebuilt (unwinding) std: MPVKit's Libdovi (a Rust lib)
 # also defines _rust_eh_personality, and the macOS linker rejects the duplicate against an
 # unwinding-std core. A panic=abort std core does not emit the conflicting personality.
 echo "▸ macOS (aarch64-apple-darwin)"
-cargo +nightly build $BUILDSTD --target aarch64-apple-darwin --release
+cargo +nightly-2026-07-19 build $LOCKED $BUILDSTD --target aarch64-apple-darwin --release
 # MPVKit's Libdovi (also Rust) defines _rust_eh_personality too, and the macOS linker rejects the
 # duplicate against our core's global copy (iOS tolerates it). Partial-link the darwin archive into
 # one object with that symbol made LOCAL, then re-archive: our refs still resolve in-archive, but it

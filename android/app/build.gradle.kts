@@ -278,6 +278,8 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
     // -o writes per-ABI subdirs (arm64-v8a/, x86_64/, ...) of .so files, the jniLibs layout.
+    // --locked: the engine repo tracks Cargo.lock, so a drifted dependency resolution FAILS the
+    // build instead of silently linking a different graph than the CI-proven runs.
     commandLine(
         buildList {
             add("cargo")
@@ -285,7 +287,7 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
             addAll(targetFlags)
             add("-p"); add(nativeApiLevel.toString())
             add("-o"); add(jniLibsOutDir.get().asFile.absolutePath)
-            add("build"); add("--release")
+            add("build"); add("--release"); add("--locked")
         },
     )
 
@@ -392,6 +394,8 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
     workingDir = vortxEngineCoreDir ?: coreCrateDir // placeholder wd when unset; onlyIf gates the run
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    // --locked: same fail-closed reproducibility contract as cargoNdkBuild above (the engine
+    // workspace tracks Cargo.lock; drifted resolution fails the build instead of moving silently).
     commandLine(
         buildList {
             add("cargo")
@@ -401,7 +405,7 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
             add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
             add("build"); add("-p"); add("vortx-ffi")
             add("--no-default-features"); add("--features"); add("jni,server")
-            add("--release")
+            add("--release"); add("--locked")
         },
     )
     vortxEngineCoreDir?.let { environment("CARGO_TARGET_DIR", File(it, "target-andx").absolutePath) }
