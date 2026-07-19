@@ -1,10 +1,14 @@
 package com.vortx.android.player
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -28,11 +32,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -110,6 +117,31 @@ fun PlayerScreen(
 
     DisposableEffect(engine) {
         onDispose { engine.release() }
+    }
+
+    // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
+    // landscape on the hosting Activity while this screen is in composition, and restore the PRIOR
+    // request on exit so the browse shell keeps its own orientation freedom (the player is the ONLY
+    // surface locked; the app is not). The manifest's configChanges=orientation|screenSize means this
+    // flip resizes the surface in place instead of recreating the Activity, so the engine survives the
+    // rotation. Alongside it, hide the system bars (swipe reveals them transiently) for a true
+    // fullscreen frame, restored on exit. On Android TV both calls are harmless no-ops (the panel is
+    // already landscape and TVs show no bars). Keyed on Unit: enter/exit of the player, not per engine.
+    DisposableEffect(Unit) {
+        val activity = context.findActivity()
+        val previousOrientation = activity?.requestedOrientation
+            ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        val insetsController = activity?.window?.let { w ->
+            WindowInsetsControllerCompat(w, w.decorView).apply {
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose {
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            activity?.requestedOrientation = previousOrientation
+        }
     }
 
     // Drive the engine against the host lifecycle: drop decode / pause when backgrounded, resume when it
@@ -332,6 +364,23 @@ fun PlayerScreen(
     Box(modifier = modifier.fillMaxSize()) {
         engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb(), scaleMode = scaleMode)
 
+        // Double-tap seek: right half = +10s, left half = -10s (the standard mobile-player gesture).
+        // Layered OVER the video surface and UNDER the chrome, so the chrome's own controls keep their
+        // taps (they hit-test first) and only bare-video double-taps land here. Keyed on the engine so a
+        // mid-session ExoPlayer fallback rebinds the gesture to the live engine.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(engine) {
+                    detectTapGestures(
+                        onDoubleTap = { offset ->
+                            val forward = offset.x >= size.width / 2
+                            engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
+                        },
+                    )
+                },
+        )
+
         PlayerChrome(
             playable = playable,
             state = playerState,
@@ -342,6 +391,7 @@ fun PlayerScreen(
             onBack = currentOnBack,
             onTogglePause = engine::togglePause,
             onSeek = engine::seekTo,
+            onSeekBy = engine::seekBy,
             onSelectAudio = engine::selectAudioTrack,
             onSelectSubtitle = engine::selectSubtitleTrack,
             onSetSpeed = { newSpeed ->
@@ -440,6 +490,18 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
         ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
     return resolution.substringAfter('x', "").toIntOrNull() ?: 0
 }
+
+/// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain
+/// (theme wrappers, configuration overrides). Null when unhosted (previews/tests), and every caller
+/// treats null as "no orientation/insets control", never a crash.
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+/// The double-tap relative-seek step (ms). Matches the transport bar's Replay10/Forward10 buttons.
+private const val DOUBLE_TAP_SEEK_MS = 10_000L
 
 internal val DefaultEmber = Color(0xFFD97706)
 

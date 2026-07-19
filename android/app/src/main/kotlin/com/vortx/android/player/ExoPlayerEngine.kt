@@ -211,6 +211,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun pause() { player.pause() }
     override fun togglePause() { if (player.isPlaying) player.pause() else player.play() }
     override fun seekTo(positionMs: Long) { player.seekTo(positionMs.coerceAtLeast(0L)) }
+
+    override fun seekBy(deltaMs: Long) {
+        // Native relative seek off the player's OWN currentPosition (the sampled state can lag a poll
+        // tick), clamped to the known duration when there is one.
+        val upper = player.duration.let { if (it == C.TIME_UNSET) Long.MAX_VALUE else it }
+        player.seekTo((player.currentPosition + deltaMs).coerceIn(0L, upper))
+    }
     override fun setPlaybackSpeed(speed: Float) { player.setPlaybackSpeed(speed.coerceIn(MIN_SPEED, MAX_SPEED)) }
 
     override fun selectAudioTrack(id: Int) = selectTrack(id, C.TRACK_TYPE_AUDIO)
