@@ -42,6 +42,12 @@ struct iOSSettingsView: View {
     @State private var shareOnLAN = NodeServer.sharedOnLAN
     @State private var didCopyLAN = false
     #endif
+    #if !os(macOS)
+    /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
+    /// Same key on every app (settings parity); the toggle renders only in builds whose VortxEngine
+    /// slice carries the server (VortxNativeServerFlag.isSupported), so it can never dangle.
+    @AppStorage(VortxNativeServerFlag.key) private var engineServerOn = false
+    #endif
 
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     // Match Frame Rate is an Apple TV display-mode preference (HDRDisplayMode owns the behavior), but it is
@@ -1042,6 +1048,28 @@ struct iOSSettingsView: View {
                     // quit explicit, and the status line below says whether the server is currently running.
                     Button(role: .destructive) { exit(0) } label: {
                         Label("Restart server (quits VortX, then reopen it)", systemImage: "arrow.clockwise")
+                    }
+                    // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
+                    // in builds whose linked VortxEngine slice carries the server symbols, so the toggle
+                    // can never dangle. ON starts it immediately and the player follows its port
+                    // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again. The
+                    // node path itself is never touched either way.
+                    if VortxNativeServerFlag.isSupported {
+                        Toggle(isOn: $engineServerOn) {
+                            Label("Engine streaming server (experimental)", systemImage: "gearshape.2")
+                        }
+                        .onChange(of: engineServerOn) { on in
+                            if on {
+                                VortxNativeServer.startIfNeeded()
+                            } else {
+                                Task.detached(priority: .utility) { VortxNativeServer.stop() }
+                            }
+                        }
+                        if engineServerOn {
+                            Text(VortxNativeServer.statusDescription)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
                 #endif

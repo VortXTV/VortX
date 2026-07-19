@@ -11,6 +11,12 @@ enum StremioServer {
     /// and rebinds 11470 reliably via its own port handling), this stays the fixed 11470.
     static var embeddedPort: Int {
         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
+        // Phase 8 in-process engine server (flag `vortxNativeServer`, default OFF): while it is
+        // running, the player streams from ITS bound port. publishedPort is nil unless the flag is
+        // ON and the server is up, so the default path costs one nil read and then follows the
+        // nodejs-mobile port exactly as before. Re-read per use: the engine server binds a fresh
+        // ephemeral port on every foreground start, and computing keeps followers current.
+        if let p = VortxNativeServer.publishedPort { return p }
         if let p = NodeServer.discoveredPort { return p }
         #endif
         return 11470
