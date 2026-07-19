@@ -653,9 +653,10 @@ class EngineStremioRepository(
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
         // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
         // resolves through the user's own debrid account when a key is configured (native in-client
-        // debrid, the Android port of the Apple DebridResolver); without a key it still needs the
-        // in-process streaming server (nodejs-mobile, not yet wired), so it surfaces a clear error the
-        // player layer can show instead of failing opaquely.
+        // debrid, the Android port of the Apple DebridResolver); without a key it plays through the
+        // OWN in-process streaming server ([VortxServer], the vortx-core rqbit embed), and only when
+        // THAT is unavailable (no .so in this build, start failure, kill-switch flag off) does it
+        // surface a clear error the player layer can show instead of failing opaquely.
         val handle = source.id.substringBefore('#')
         // Flag DV/Atmos from the source's own tags so [PlayerEngineRouter] routes those to the ExoPlayer
         // engine (its DefaultRenderersFactory does the DV codec fallback + DefaultAudioSink negotiates
@@ -685,16 +686,44 @@ class EngineStremioRepository(
             //
             // Fail-soft: DebridResolver.resolve returns null on ANY failure (no key, not actually
             // cached, no playable file, provider/network error). With no key it never opens the key
-            // store. On null we surface the SAME clear error as before so the player layer shows a real
-            // message rather than failing opaquely, and torrents keep today's behavior when no debrid
-            // is configured.
+            // store. On null the raw torrent falls through to the in-process streaming server below,
+            // so a debrid-configured user keeps the exact direct path they have today.
             val resolved = debridResolver.resolve(infoHash = handle)
             if (resolved != null) {
                 Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
             } else {
-                throw UnsupportedOperationException(
-                    "Torrent playback needs a debrid key or the streaming-server bridge (not yet wired on Android).",
-                )
+                // No debrid (or not cached): serve the raw torrent through the OWN in-process
+                // streaming server, the same loopback contract the desktop node server speaks:
+                // GET {base}/{infoHash}/{fileIdx} is the Range-capable playback endpoint and
+                // auto-creates the torrent on first read (crates/streaming-server http routes).
+                // startIfNeeded is idempotent and BLOCKS briefly on the first call (bind), so it
+                // runs on IO, never the caller's dispatcher. Gated by the default-ON kill-switch
+                // flag [VortxServer.FLAG_KEY]: serving beats throwing, but the lane can be killed
+                // from Settings without a build. isTorrent = true keeps playback on the mpv
+                // engine and sizes its read-ahead for a local stream ([PlayerEngineRouter]);
+                // viaStreamingServer = true gives the player its "buffering from source" chrome.
+                val serverBase = withContext(Dispatchers.IO) {
+                    // Flag read + server start both on IO: resolve() may be entered from a
+                    // viewModelScope (Main), and the first prefs-file load and the first
+                    // nativeStart (bind) are real I/O.
+                    if (VortxServer.streamingEnabled(appContext)) VortxServer.startIfNeeded(appContext) else null
+                }
+                if (serverBase != null) {
+                    val infoHash = (source.infoHash ?: handle).lowercase()
+                    val fileIdx = source.fileIdx ?: 0
+                    Playable(
+                        url = "$serverBase/$infoHash/$fileIdx",
+                        title = source.title,
+                        viaStreamingServer = true,
+                        isTorrent = true,
+                        isDolbyVision = isDolbyVision,
+                        isAtmos = isAtmos,
+                    )
+                } else {
+                    throw UnsupportedOperationException(
+                        "Torrent playback needs a debrid key or the streaming server (unavailable in this build).",
+                    )
+                }
             }
         } else {
             throw UnsupportedOperationException(
