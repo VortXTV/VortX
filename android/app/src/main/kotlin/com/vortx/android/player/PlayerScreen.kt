@@ -7,11 +7,14 @@ import android.content.pm.ActivityInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.SystemClock
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -20,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -62,7 +66,12 @@ import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -150,18 +159,56 @@ fun PlayerScreen(
     // stream starts fresh.
     var forceExoPlayer by remember(playable.url) { mutableStateOf(false) }
 
-    // Build the engine via the router. Rebuilt when the stream changes or the ExoPlayer latch flips.
-    // Release the previous engine on dispose (idempotent).
-    val engine = remember(playable.url, forceExoPlayer) {
-        if (forceExoPlayer) {
-            ExoPlayerEngine(context)
+    // ENGINE, built OFF the composition thread. The old `remember { ... .also { it.load() } }` ran the
+    // whole build synchronously in composition: for the libmpv route that is System.loadLibrary +
+    // native context create + mpv_initialize + the full option apply on the MAIN thread -- jank (and an
+    // ANR window) at every open. Now the route is decided first (pure logic), and:
+    //   - the mpv route builds + loads on a background dispatcher (the mpv handle is thread-safe by
+    //     contract; its callbacks already arrive on native worker threads);
+    //   - the ExoPlayer route stays on the main thread, REQUIRED: Media3 binds the player to the
+    //     constructing thread's looper and throws on cross-thread access, and Exo's own build is light.
+    // Until the engine lands, the composition shows the connecting state below (the same spinner the
+    // chrome shows pre-first-frame), never a dead black frame.
+    //
+    // Ownership is race-free via [engineHolder]: the built engine is set inside the build block (no
+    // suspension point between create and set), and every release path -- the keyed dispose below, the
+    // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
+    // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
+    val engineHolder = remember(playable.url, forceExoPlayer) { AtomicReference<PlayerEngine?>(null) }
+    var builtEngine by remember(playable.url, forceExoPlayer) { mutableStateOf<PlayerEngine?>(null) }
+    LaunchedEffect(playable.url, forceExoPlayer) {
+        val wantsMpv = !forceExoPlayer &&
+            PlayerEngineRouter.choose(playable, engineOverride) == PlayerEngineRouter.Engine.MPV
+        val engine: PlayerEngine = if (wantsMpv) {
+            // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
+            // (cancellation would leak it un-releasable); the block always completes, and the isActive
+            // check below hands a build that lost its composition straight to release.
+            withContext(Dispatchers.Default + NonCancellable) {
+                MpvEngineFactory.create(context)?.also {
+                    engineHolder.set(it)
+                    it.load(playable)
+                }
+            } ?: ExoPlayerEngine(context).also {
+                // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
+                engineHolder.set(it)
+                it.load(playable)
+            }
         } else {
-            PlayerEngineRouter.engine(context, playable, engineOverride)
-        }.also { it.load(playable) }
+            ExoPlayerEngine(context).also {
+                engineHolder.set(it)
+                it.load(playable)
+            }
+        }
+        if (!isActive) {
+            // The player left composition while the engine was still initializing; the dispose below
+            // may already have run (and found the holder empty), so this tail owns the release.
+            engineHolder.getAndSet(null)?.release()
+            return@LaunchedEffect
+        }
+        builtEngine = engine
     }
-
-    DisposableEffect(engine) {
-        onDispose { engine.release() }
+    DisposableEffect(playable.url, forceExoPlayer) {
+        onDispose { engineHolder.getAndSet(null)?.release() }
     }
 
     // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
@@ -189,6 +236,35 @@ fun PlayerScreen(
         }
     }
 
+    // Engine still initializing (the off-main build above): hold the fullscreen frame with the same
+    // centered spinner + "Connecting" the chrome shows pre-first-frame, so the open is one continuous
+    // loading state instead of a blank flash. Hardware/gesture Back still works (the host's BackHandler
+    // wraps this screen). Deliberately AFTER the orientation/immersive effect so the connecting frame is
+    // already landscape + edge-to-edge.
+    val engine = builtEngine
+    if (engine == null) {
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
+                Text(
+                    text = "Connecting...",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        return
+    }
+
     // Drive the engine against the host lifecycle: drop decode / pause when backgrounded, resume when it
     // returns, release on destroy. Matches the Apple player's enterBackground/enterForeground.
     DisposableEffect(lifecycleOwner, engine) {
@@ -196,7 +272,9 @@ fun PlayerScreen(
             when (event) {
                 Lifecycle.Event.ON_STOP -> engine.onEnterBackground()
                 Lifecycle.Event.ON_START -> engine.onEnterForeground()
-                Lifecycle.Event.ON_DESTROY -> engine.release()
+                // Release through the holder's single atomic claim, so a destroy-then-dispose pair can
+                // never double-release the same native engine.
+                Lifecycle.Event.ON_DESTROY -> engineHolder.getAndSet(null)?.release()
                 else -> Unit
             }
         }
@@ -207,11 +285,52 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
+    // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
+    // that connects but never delivers (or stops delivering) data: mpv's `paused-for-cache` can sit
+    // true forever with no error event, which used to mean an infinite silent black frame. This loop
+    // samples the transport once a second and trips [stallError] -- rendered through the chrome as the
+    // SAME error overlay + retry path the engines' own hasError drives -- when either bound passes with
+    // no position advance:
+    //   - [WATCHDOG_START_TIMEOUT_MS] before playback ever advanced (the source never produced data);
+    //   - the tighter [WATCHDOG_STALL_TIMEOUT_MS] once it had (a mid-stream stall that never recovers).
+    // A user pause resets the clock (holding position is then intent, not failure), a terminal
+    // error/ended state suspends it, and any position advance both re-arms the clock AND clears a
+    // previously tripped verdict, so a stream that recovers on its own heals back to normal playback.
+    var stallError by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(engine, playable.url) {
+        var lastPositionMs = -1L
+        var lastProgressAt = SystemClock.elapsedRealtime()
+        var everAdvanced = false
+        while (true) {
+            delay(WATCHDOG_POLL_MS)
+            val s = latestState
+            val now = SystemClock.elapsedRealtime()
+            if (s.hasError || s.hasEnded || s.isPaused) {
+                lastProgressAt = now
+                continue
+            }
+            if (s.positionMs != lastPositionMs) {
+                // First sample just seeds the baseline; only a CHANGE from a real prior sample proves
+                // data flowed (so a resume-seek jump does not count as playback by itself).
+                if (lastPositionMs >= 0L) everAdvanced = true
+                lastPositionMs = s.positionMs
+                lastProgressAt = now
+                if (stallError) stallError = false
+                continue
+            }
+            val bound = if (everAdvanced) WATCHDOG_STALL_TIMEOUT_MS else WATCHDOG_START_TIMEOUT_MS
+            if (now - lastProgressAt >= bound) stallError = true
+        }
+    }
+    // The one error verdict everything downstream renders and gates on: the engine's own hasError OR
+    // the watchdog's stall verdict.
+    val effectiveError = playerState.hasError || stallError
+
     // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
     // Paused, buffering, or errored playback keeps the controls on screen (hiding them over a stall or a
     // dead frame would look like a hang); any state flip or interaction tick restarts the countdown.
-    LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, playerState.hasError) {
-        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || playerState.hasError) return@LaunchedEffect
+    LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, effectiveError) {
+        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || effectiveError) return@LaunchedEffect
         delay(CONTROLS_AUTO_HIDE_MS)
         controlsVisible = false
     }
@@ -363,9 +482,12 @@ fun PlayerScreen(
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
     // Next auto-advance for a series episode with a successor, or a plain return to the detail page
-    // otherwise ([onEnded] defaults to [onBack]).
+    // otherwise ([onEnded] defaults to [onBack]). GATED on ended-and-not-errored: a failed source must
+    // surface the error overlay, never fire the next-episode auto-advance (the audit's wrong-auto-
+    // advance defect). The mpv engine now keeps hasEnded/hasError mutually exclusive at the source;
+    // this is the belt-and-suspenders at the dispatch seam, and it also covers the watchdog's verdict.
     LaunchedEffect(playerState.hasEnded) {
-        if (playerState.hasEnded) currentOnEnded()
+        if (playerState.hasEnded && !latestState.hasError && !stallError) currentOnEnded()
     }
 
     // Fail-soft watchdog: if the mpv engine flagged a surface-attach failure, rebuild on ExoPlayer. Only
@@ -534,7 +656,9 @@ fun PlayerScreen(
 
         PlayerChrome(
             playable = playable,
-            state = playerState,
+            // The watchdog's stall verdict rides the same hasError the engines publish, so the chrome
+            // has exactly one error surface (the overlay + "Choose another source" retry path).
+            state = if (stallError) playerState.copy(hasError = true) else playerState,
             dolbyVisionAvailable = displaySupportsDolbyVision(context),
             emberAccent = emberAccent,
             speed = speed,
@@ -720,6 +844,20 @@ private const val CONTROLS_AUTO_HIDE_MS = 3_500L
 /// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
 /// chrome's auto-hide: while locked the whole point is an undisturbed frame.
 private const val UNLOCK_HINT_AUTO_HIDE_MS = 2_500L
+
+/// Watchdog sampling cadence: once a second, matching the ~1s position republish of both engines, so a
+/// healthy stream is seen advancing on every tick.
+private const val WATCHDOG_POLL_MS = 1_000L
+
+/// How long a source may take from load to the FIRST position advance before the watchdog calls it
+/// failed. Generous: a cold debrid link or a torrent warm-up legitimately takes many seconds to first
+/// data, but half a minute of nothing is a dead source, not a slow one.
+private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
+
+/// How long an already-playing stream may hold position (un-paused) before the watchdog calls it
+/// stalled. Tighter than the start bound: mid-stream the pipeline is proven, so a long freeze is a
+/// dead connection, and the verdict self-clears if the stream recovers.
+private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
 
 internal val DefaultEmber = Color(0xFFD97706)
 

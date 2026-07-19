@@ -160,8 +160,11 @@ data class PlayerState(
     val isPaused: Boolean = false,
     val isBuffering: Boolean = false,
     val hasEnded: Boolean = false,
-    /// Set when the live engine reports an unrecoverable playback error (ExoPlayer's `onPlayerError`),
-    /// so the chrome can offer a return-to-sources fallback instead of a dead black frame.
+    /// Set when the live engine reports an unrecoverable playback error (ExoPlayer's `onPlayerError`;
+    /// the mpv engine's END_FILE-before-real-playback, its only reachable error signal since the JNI
+    /// seam drops the END_FILE reason), so the chrome can offer a return-to-sources fallback instead of
+    /// a dead black frame. Mutually exclusive with [hasEnded] by construction: a failed source must
+    /// never read as a finished one (the host's next-episode auto-advance keys off [hasEnded]).
     val hasError: Boolean = false,
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),

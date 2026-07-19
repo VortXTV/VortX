@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
@@ -218,6 +219,31 @@ fun PlayerChrome(
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.NONE -> Unit
+        }
+
+        // Buffering / connecting indicator: a centered spinner whenever the engine reports no data
+        // flowing -- the initial open (both engines publish isBuffering=true from load until the first
+        // frame), an mpv `paused-for-cache` mid-stream stall, an ExoPlayer rebuffer. Before this, an
+        // opening stream showed a bare black frame with a Pause glyph and an empty scrubber, which read
+        // as a hang. Suppressed under the terminal overlays: an error must show the error, not a spinner.
+        // The "Connecting" label is only added before a duration is known (nothing demuxed yet); a
+        // mid-stream rebuffer keeps the plain spinner.
+        if (state.isBuffering && !state.hasError && !state.hasEnded) {
+            Column(
+                modifier = Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
+                if (state.durationMs <= 0L) {
+                    Text(
+                        text = "Connecting...",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
         }
 
         // Error-to-sources fallback: a failed source lands here instead of a dead black frame.
