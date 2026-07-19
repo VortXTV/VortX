@@ -102,11 +102,11 @@ android {
         disable += setOf(
             "MissingTranslation", // localeConfig ships English only for now (S01); see res/xml/locales_config.xml
             "ExtraTranslation",
-            // The LEANBACK_LAUNCHER intent-filter (AndroidManifest.xml, pre-S01) makes lint want a TV
-            // banner now. ANDROID-PLAN.md §0 "Form factors & packaging" explicitly schedules the TV
-            // banner + the rest of the TV manifest work for S13, not S01 -- don't fail every PR in the
-            // meantime for a deferred, already-planned requirement. Re-enable when S13 adds the banner.
-            "MissingTvBanner",
+            // NOTE: "MissingTvBanner" used to be disabled here, because the LEANBACK_LAUNCHER
+            // intent-filter made lint ask for a TV banner that ANDROID-PLAN.md §0 had deferred to S13.
+            // S13 has now added it (res/drawable-xhdpi/tv_banner.png + android:banner on <application>),
+            // so the check is re-enabled exactly as that comment instructed -- it now guards the banner
+            // rather than excusing its absence.
         )
         checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
         abortOnError = true

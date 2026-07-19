@@ -11,6 +11,8 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.tv.VortXTvApp
+import com.vortx.android.tv.isTelevision
 import com.vortx.android.ui.StremioXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
 
@@ -60,6 +62,18 @@ class MainActivity : ComponentActivity() {
         // The engine repository lives on VortXApplication (constructed once per process), NOT built
         // here -- see VortXApplication's doc comment for why an Activity-scoped instance is unsafe.
         val app = application as VortXApplication
-        setContent { StremioXApp(repo = app.catalogRepository, auth = app.authRepository) }
+        // Phone shell or TV shell, decided at RUNTIME off the device (see isTelevision's doc for why it
+        // is not keyed off the LEANBACK_LAUNCHER category). One binary carries both: ANDROID-PLAN.md §0
+        // invariant #7 fixes one artifact per flavor for phone/tablet/TV, and invariant #1 forbids the
+        // second applicationId a TV-only build would need. Both shells take the same two repositories,
+        // so a TV runs the same engine, account and settings as the user's phone.
+        val onTelevision = isTelevision(this)
+        setContent {
+            if (onTelevision) {
+                VortXTvApp(repo = app.catalogRepository, auth = app.authRepository)
+            } else {
+                StremioXApp(repo = app.catalogRepository, auth = app.authRepository)
+            }
+        }
     }
 }
