@@ -29,6 +29,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Fetch the private engine crates (moved out of the public tree in 33ff9b5). Pinned to the exact
+      # commits the current build links: stremiox-core -> core/ (libstremiox_core.so via cargoNdkBuild),
+      # vortx-core -> vortx-core/ (the vortx-ffi shadow lane). Requires the ENGINE_REPO_TOKEN secret
+      # (fine-grained token, Contents:read; deploy keys are disabled by the VortXTV org). Fails closed.
+      - name: Fetch private engine crates (token-authenticated, pinned)
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine (see vortx-engine-deploy-key-setup.md)"; exit 1
+          fi
+          fetch_pinned () {
+            local repo="$1" sha="$2" dir="$3"
+            rm -rf "$dir"; mkdir -p "$dir"
+            git -C "$dir" init -q
+            git -C "$dir" remote add origin "https://x-access-token:${ENGINE_REPO_TOKEN}@github.com/${repo}.git"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+          }
+          fetch_pinned VortXTV/stremiox-core bfbb9ef32a8f705b9b91a04182293da45adc7174 core
+          fetch_pinned VortXTV/vortx-core     9e83954af5903118b69005d9dcdcfd96cfda4eae vortx-core
+          test -f core/Cargo.toml || { echo "::error::stremiox-core crate missing after fetch (core/Cargo.toml)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@$(git -C vortx-core rev-parse --short HEAD)"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:

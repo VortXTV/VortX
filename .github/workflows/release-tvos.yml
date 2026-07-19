@@ -42,6 +42,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Fetch the private engine crates (moved out of the public tree in 33ff9b5). Pinned to the exact
+      # commits the current beta build links: stremiox-core -> core/, vortx-core -> vortx-core/. Requires
+      # the ENGINE_REPO_TOKEN secret (fine-grained token, Contents:read on both private repos; deploy keys
+      # are disabled by the VortXTV org). Fails closed if a crate is missing (no silent build-without-engine).
+      - name: Fetch private engine crates (token-authenticated, pinned)
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine (see vortx-engine-deploy-key-setup.md)"; exit 1
+          fi
+          fetch_pinned () {
+            local repo="$1" sha="$2" dir="$3"
+            rm -rf "$dir"; mkdir -p "$dir"
+            git -C "$dir" init -q
+            git -C "$dir" remote add origin "https://x-access-token:${ENGINE_REPO_TOKEN}@github.com/${repo}.git"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+          }
+          fetch_pinned VortXTV/stremiox-core bfbb9ef32a8f705b9b91a04182293da45adc7174 core
+          fetch_pinned VortXTV/vortx-core     9e83954af5903118b69005d9dcdcfd96cfda4eae vortx-core
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after fetch (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core crate missing after fetch (vortx-core/Cargo.toml)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@$(git -C vortx-core rev-parse --short HEAD)"
+
       - name: Select the newest Xcode on the runner
         run: |
           # Pick the newest Xcode whose toolchain ACTUALLY WORKS, then resolve it to its REAL path. A
