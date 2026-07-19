@@ -80,7 +80,8 @@ else
     echo "Subtitle fonts already present."
 fi
 
-echo "Done. NodeMobile + server.js + fonts ready. Next: scripts/build-core-xcframework.sh, then 'xcodegen generate' in app/."
+echo "Done. NodeMobile + server.js + fonts ready. Next: scripts/build-core-xcframework.sh"
+echo "(+ scripts/build-ffi-xcframework.sh on the engine/apple-cutover branch), then 'xcodegen generate' in app/."
 
 # 4) Patch server.js so the /yt/:id trailer route resolves against current
 #    YouTube (the vendored ytdl-core 4.9.0 is dead). Runs AFTER the SHA256

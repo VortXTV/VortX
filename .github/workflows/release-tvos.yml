@@ -118,6 +118,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             core/target
+            vortx-core/target
           key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
@@ -140,6 +141,24 @@ jobs:
       - name: Build the stremio-core xcframework
         if: steps.cache-core-xcframework.outputs.cache-hit != 'true'
         run: ./scripts/build-core-xcframework.sh
+
+      # Phase 7 (engine/apple-cutover): the vortx-core engine ABI the shadow-ranking bridge links
+      # (app/project.yml references Vendor/VortxEngine.xcframework on VortXiOSNative, so project
+      # generation + the iOS build need it present). Built from the vortx-core workspace in this
+      # checkout; VORTX_ENGINE_DIR can repoint the step if the engine workspace lives elsewhere.
+      # The step fails fast with a clear message if the checkout's vortx-core lacks crates/ffi.
+      - name: Cache vortx-ffi xcframework
+        id: cache-ffi-xcframework
+        uses: actions/cache@v6
+        with:
+          path: app/Vendor/VortxEngine.xcframework
+          key: vortx-ffi-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh') }}
+
+      - name: Build the vortx-ffi xcframework
+        if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'
+        env:
+          VORTX_ENGINE_DIR: vortx-core
+        run: ./scripts/build-ffi-xcframework.sh
 
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
