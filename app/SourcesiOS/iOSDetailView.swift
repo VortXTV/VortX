@@ -305,6 +305,10 @@ struct iOSDetailView: View {
     /// AND no /clip): a small auto-dismissing capsule over the hero, never the full source-error screen.
     @State private var trailerNotice = false
     @State private var trailerNoticeTask: Task<Void, Never>?
+    /// Dynamic dominant-color backdrop: the page art's average color (PosterImageLoader.averageColor),
+    /// washed into the page background BELOW the hero band so the whole detail page carries the title's
+    /// palette instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
+    @State private var dominantTint: Color?
     /// yt-direct: the detail hero's ambient clip ATTEMPTED device-direct resolve, keyed by the YouTube id it
     /// resolved so a language-pick upgrade re-resolves. `url == nil` = attempted, no direct stream (mount the
     /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
@@ -502,7 +506,13 @@ struct iOSDetailView: View {
                 #endif
             }
         }
-        .background(Theme.Palette.canvas.ignoresSafeArea())
+        // Dynamic dominant-color backdrop: canvas stays the base, with the art's average color washed in
+        // BELOW the hero band. Extracted to helpers (dominantColorBackground / tintArtURL / recomputeTint)
+        // so the addition costs this huge body's type-checker almost nothing (the b183 gate finding).
+        .background(dominantColorBackground)
+        // Compute the tint from the SAME art fallback chain the hero backdrop paints, so tint and art
+        // always agree; recomputes when meta hydrates (background/poster can arrive after the seed art).
+        .task(id: tintArtURL) { await recomputeTint() }
         // A6: the rare "no trailer available right now" notice (no full YouTube trailer AND no /clip). A small
         // capsule, auto-dismissed by `showTrailerNotice`, so the Trailer button never opens the source-error screen.
         .overlay(alignment: .top) {
@@ -1043,6 +1053,39 @@ struct iOSDetailView: View {
     }
 
     /// Full-bleed artwork at the LIVE page's fixed band height (the VOD hero passes its own scaled band).
+    // MARK: Dynamic dominant-color backdrop (helpers, kept OUT of the body chain for type-check budget)
+
+    /// The art the tint derives from: the SAME fallback chain `backdrop(height:)` paints, so tint and art
+    /// always agree. Also the `.task(id:)` key, so a late meta hydrate recomputes.
+    private var tintArtURL: String? {
+        meta?.background ?? meta?.poster ?? seedBackdrop ?? FeaturedHeroItem.metahubBackground(forId: id)
+    }
+
+    /// Canvas with the dominant-color wash ramping in BELOW the hero band (clear at the top, so the hero's
+    /// canvas-fade seam stays seamless) and easing off toward the bottom. nil tint = today's flat canvas.
+    private var dominantColorBackground: some View {
+        ZStack {
+            Theme.Palette.canvas
+            if let dominantTint {
+                LinearGradient(stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .clear, location: 0.30),
+                    .init(color: dominantTint.opacity(0.28), location: 0.60),
+                    .init(color: dominantTint.opacity(0.10), location: 1.0),
+                ], startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .ignoresSafeArea()
+    }
+
+    /// Off-main average-color compute (PosterImageLoader.averageColor, cached + downsampled); cross-fades
+    /// the wash in. nil (no art / failure) keeps the plain canvas, the graceful fallback.
+    private func recomputeTint() async {
+        let tint = await PosterImageLoader.averageColor(tintArtURL)
+        guard !Task.isCancelled else { return }
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.6)) { dominantTint = tint }
+    }
+
     private var backdrop: some View { backdrop(height: backdropHeight) }
 
     /// Full-bleed artwork with the same two scrims tvOS uses: a vertical canvas fade so the lower text

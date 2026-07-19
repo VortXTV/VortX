@@ -35,6 +35,8 @@ struct SettingsView: View {
     @State private var showLangRestart = false
     // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
     @State private var showDiagExport = false
+    // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
+    @State private var showClearCWConfirm = false
     @State private var diagExport: (url: String, qr: Image)?
     // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
     // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
@@ -129,6 +131,10 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Text("Settings").screenTitleStyle()
+                    // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the
+                    // search field, ungated by the settings filter so the move state is ALWAYS inspectable
+                    // here. Not launch-gated (unlike the nag sheet): un-seeded it prompts, seeded it confirms.
+                    seedingBanner
                     // Focusable search field: typing filters the sections below (additive, the whole tree
                     // stays intact and returns the moment the field is cleared). Each section is gated by
                     // `sectionMatches`, so an empty query shows everything and a query keeps only the hits.
@@ -304,6 +310,54 @@ struct SettingsView: View {
         }
         .fullScreenCover(item: $editingProfile) { profile in
             ProfileEditorView(original: profile)
+        }
+    }
+
+    // MARK: Move seeding (Phase 0 of the com.vortx move)
+
+    /// The persistent Settings twin of the launch nag (MoveSeedingNagTV): while this Apple TV owes its
+    /// first VortX-account sync it prompts (the keyboard-free QR sign-in via LoginView, plus the QR
+    /// backup-direction flow); once seeded it confirms with the live last-sync time.
+    @ViewBuilder private var seedingBanner: some View {
+        section(String(localized: "Moving day")) {
+            if vortxSync.hasCompletedFirstSync {
+                HStack(spacing: Theme.Space.md) {
+                    Image(systemName: "checkmark.icloud.fill")
+                        .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(MoveSeeding.backedUpLine)
+                            .font(Theme.Typography.body.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
+                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            } else {
+                Label(MoveSeeding.headline, systemImage: "shippingbox.fill")
+                    .font(Theme.Typography.body.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(MoveSeeding.message)
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                if vortxSync.isSignedIn {
+                    // Signed in but the first round-trip has not landed yet: offer the manual kick.
+                    Button {
+                        Task { await vortxSync.pushThisDevice() }
+                    } label: {
+                        Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+                } else {
+                    NavigationLink { LoginView(account: account) } label: {
+                        Label("Sign in / Create account", systemImage: "person.crop.circle")
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+                    NavigationLink { BackupExportView() } label: {
+                        Label("Back up this Apple TV", systemImage: "arrow.up.circle")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                }
+            }
         }
     }
 
@@ -1141,6 +1195,20 @@ struct SettingsView: View {
                 showDiagExport = true
             } label: { Text("Export diagnostic log") }
                 .buttonStyle(ChipButtonStyle(selected: false))
+            // Clear the whole Continue Watching rail, durably: tombstoned per title (LibraryTombstones)
+            // exactly like the long-press per-item remove, so sync can never resurrect the rail.
+            Button(role: .destructive) {
+                showClearCWConfirm = true
+            } label: { Label("Clear Continue Watching", systemImage: "minus.circle") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .confirmationDialog("Clear Continue Watching?", isPresented: $showClearCWConfirm, titleVisibility: .visible) {
+                    Button("Clear Continue Watching", role: .destructive) {
+                        CoreBridge.shared.clearContinueWatching()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Removes every title from Continue Watching on this profile, across all your devices. Titles stay watchable from Search and Discover.")
+                }
         }
     }
 

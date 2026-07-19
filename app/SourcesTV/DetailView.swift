@@ -52,6 +52,10 @@ struct DetailView: View {
     /// resolve never paints over another title. `url == nil` = attempted, no direct stream (mount the /yt
     /// worker URL). The layer waits for the attempt so the clip never remounts mid-play on a late resolve.
     @State private var heroDirectTrailer: (metaID: String, url: URL?)?
+    /// Dynamic dominant-color backdrop: the page art's average color (PosterImageLoader.averageColor),
+    /// washed into the page background below the hero so the detail page carries the title's palette
+    /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
+    @State private var dominantTint: Color?
 
     var body: some View {
         Group {
@@ -87,7 +91,13 @@ struct DetailView: View {
                 }
             }
         }
-        .background(Theme.Palette.canvas.ignoresSafeArea())
+        // Dynamic dominant-color backdrop: canvas stays the base, with the art's average color washed in
+        // BELOW the hero. Extracted to helpers (dominantColorBackground / tintArtURL / recomputeTint) so
+        // the addition costs this large body's type-checker almost nothing (the b183 gate finding on iOS).
+        .background(dominantColorBackground)
+        // Compute the tint from the SAME art the hero backdrop paints (background, else poster), so tint
+        // and art always agree; recomputes when the meta hydrates or the page repoints to another title.
+        .task(id: tintArtURL) { await recomputeTint() }
         // NO ignoresSafeArea on the content: tvOS's safe-area insets exist to keep UI out of
         // TV overscan, and pushing the whole page into them clipped the top of the detail page
         // on TVs that crop (field report). The backdrops self-bleed (FullBleedBackdrop ignores
@@ -703,6 +713,39 @@ struct DetailView: View {
     /// channel's full source list lets the user pick a stream. The stream list carries the channel's
     /// live `type` in its `PlaybackMeta`, which the player reads via `LiveTypes` to engage live tuning
     /// and NO-OP resume/progress.
+    // MARK: Dynamic dominant-color backdrop (helpers, kept OUT of the body chain for type-check budget)
+
+    /// The art the tint derives from: the SAME background-else-poster pick the hero backdrop paints. Also
+    /// the `.task(id:)` key, so a late meta hydrate (or a repoint to another title) recomputes.
+    private var tintArtURL: String? {
+        core.metaDetails?.meta?.background ?? core.metaDetails?.meta?.poster
+    }
+
+    /// Canvas with the dominant-color wash ramping in BELOW the hero (clear at the top, so the hero's
+    /// canvas-fade seam stays seamless) and easing off toward the bottom. nil tint = today's flat canvas.
+    private var dominantColorBackground: some View {
+        ZStack {
+            Theme.Palette.canvas
+            if let dominantTint {
+                LinearGradient(stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .clear, location: 0.30),
+                    .init(color: dominantTint.opacity(0.25), location: 0.60),
+                    .init(color: dominantTint.opacity(0.10), location: 1.0),
+                ], startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .ignoresSafeArea()
+    }
+
+    /// Off-main average-color compute (PosterImageLoader.averageColor, cached + downsampled); cross-fades
+    /// the wash in. nil (no art / failure) keeps the plain canvas, the graceful fallback.
+    private func recomputeTint() async {
+        let tint = await PosterImageLoader.averageColor(tintArtURL)
+        guard !Task.isCancelled else { return }
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.6)) { dominantTint = tint }
+    }
+
     private func livePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
