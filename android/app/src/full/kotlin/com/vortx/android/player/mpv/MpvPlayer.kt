@@ -56,6 +56,18 @@ class MpvPlayer private constructor(
     var surfaceFailed: Boolean = false
         private set
 
+    /// True once REAL playback happened for the current file: set on MPV_EVENT_PLAYBACK_RESTART (mpv's
+    /// "playback started, first frame is on its way" signal, also fired after each seek) or on the first
+    /// observed `time-pos` advance past zero. This is the error-vs-ended discriminator for END_FILE:
+    /// the jdtech JNI seam delivers `event(id)` with NO payload, so mpv's `mpv_event_end_file.reason`
+    /// (ERROR vs EOF) is unreachable from Kotlin -- an END_FILE that arrives BEFORE any real playback
+    /// (dead debrid link, exhausted reconnects, nothing decodable) can only be a failed open, never a
+    /// watched-through end, and maps to [PlayerState.hasError]; an END_FILE after real playback is the
+    /// genuine end-of-content and maps to [PlayerState.hasEnded]. Volatile: written on the mpv event
+    /// thread, reset on [load].
+    @Volatile
+    private var playbackStarted: Boolean = false
+
     private val observer = object : MPVLib.EventObserver {
         override fun eventProperty(name: String) {
             // Format-less "changed" signal. track-list has no scalar value, so re-read it here.
@@ -68,7 +80,12 @@ class MpvPlayer private constructor(
 
         override fun eventProperty(name: String, value: Double) {
             when (name) {
-                PROP_TIME_POS -> _state.value = _state.value.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L))
+                PROP_TIME_POS -> {
+                    // A position advancing past zero is proof the demuxer/decoder delivered real data
+                    // (belt-and-suspenders alongside PLAYBACK_RESTART for the END_FILE discriminator).
+                    if (value > 0.0) playbackStarted = true
+                    _state.value = _state.value.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L))
+                }
                 PROP_DURATION -> _state.value = _state.value.copy(durationMs = (value * 1000).toLong().coerceAtLeast(0L))
             }
         }
@@ -76,7 +93,15 @@ class MpvPlayer private constructor(
         override fun eventProperty(name: String, value: Boolean) {
             when (name) {
                 PROP_PAUSE -> _state.value = _state.value.copy(isPaused = value)
-                PROP_PAUSED_FOR_CACHE -> _state.value = _state.value.copy(isBuffering = value)
+                PROP_PAUSED_FOR_CACHE -> {
+                    // Before the first frame, [load] holds isBuffering=true as the "connecting" state, and
+                    // mpv's initial observer sync delivers paused-for-cache=false for the still-idle core.
+                    // Honoring that false would clear the spinner over a black frame that has not produced
+                    // any video yet, so pre-playback only a TRUE (cache actually filling) passes through;
+                    // once real playback started every value is authoritative again. The connecting state
+                    // itself is cleared by PLAYBACK_RESTART (first frame) or the END_FILE error branch.
+                    if (value || playbackStarted) _state.value = _state.value.copy(isBuffering = value)
+                }
             }
         }
 
@@ -86,7 +111,24 @@ class MpvPlayer private constructor(
 
         override fun event(id: Int) {
             when (id) {
-                MPVLib.Event.END_FILE -> _state.value = _state.value.copy(hasEnded = true)
+                MPVLib.Event.PLAYBACK_RESTART -> {
+                    // Playback (re)started: the first frame is rendering. Marks real playback for the
+                    // END_FILE discriminator and ends the "connecting" state ([load] set isBuffering=true).
+                    playbackStarted = true
+                    _state.value = _state.value.copy(isBuffering = false)
+                }
+                MPVLib.Event.END_FILE -> {
+                    // The JNI seam exposes no END_FILE reason (see [playbackStarted]), so: an EOF before
+                    // any real playback is a FAILED SOURCE (dead link, unsupported codec, exhausted
+                    // reconnect) -> hasError, which drives the chrome's error overlay and, critically,
+                    // does NOT trip the host's hasEnded-gated next-episode auto-advance. An EOF after
+                    // real playback is the genuine end-of-content -> hasEnded, exactly as before.
+                    _state.value = if (playbackStarted) {
+                        _state.value.copy(hasEnded = true)
+                    } else {
+                        _state.value.copy(hasError = true, isBuffering = false)
+                    }
+                }
                 MPVLib.Event.FILE_LOADED -> refreshTracks()
                 MPVLib.Event.VIDEO_RECONFIG -> refreshTracks()
             }
@@ -122,7 +164,12 @@ class MpvPlayer private constructor(
     }
 
     override fun load(playable: Playable) {
-        _state.value = _state.value.copy(hasEnded = false)
+        // Fresh terminal flags for the new file, and isBuffering=true as the CONNECTING state: from
+        // loadfile until the first frame (PLAYBACK_RESTART) or a failed open (END_FILE error branch),
+        // the chrome shows its spinner instead of a silent black frame. mpv only starts reporting
+        // `paused-for-cache` once the demuxer is up, so without this the open window had no signal.
+        playbackStarted = false
+        _state.value = _state.value.copy(hasEnded = false, hasError = false, isBuffering = true)
 
         // Per-stream HTTP headers (behaviorHints.proxyHeaders). Set http-header-fields as a comma-joined
         // "Name: value" list, exactly like the Apple loadFile splits UA/Referer out and joins the rest.

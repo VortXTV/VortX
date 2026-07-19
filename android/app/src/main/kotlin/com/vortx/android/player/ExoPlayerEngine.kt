@@ -390,7 +390,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     // GPU copy. We hide the built-in controller because VortX draws its own chrome.
                     this.player = this@ExoPlayerEngine.player
                     useController = false
-                    setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+                    // The VortX chrome now draws the ONE buffering/connecting spinner for both engines
+                    // (gated on PlayerState.isBuffering, which this engine publishes from
+                    // STATE_BUFFERING). PlayerView's built-in indicator would double it up, so it is
+                    // off; nothing is lost -- the chrome's spinner also covers the initial open, which
+                    // SHOW_BUFFERING_WHEN_PLAYING did not.
+                    setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
                     resizeMode = scaleMode.toResizeMode()
                     setKeepContentOnPlayerReset(true)
                     // Hold the screen awake while the surface is attached (keep-screen-on during playback).
