@@ -655,10 +655,11 @@ struct iOSDetailView: View {
                     recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
                     recordDebridRef: launch.debridRef, startedFromExplicitPick: launch.wasExplicitPick,
                     // reportProgress feeds the engine Player (TimeChanged) so Continue Watching updates live and
-                    // watched time is tracked; saveProgress keeps the signed-in remote/overlay sync. iOS was only
-                    // doing the latter, so nothing reached the engine and CW never updated (tvOS does both).
-                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
+                    // watched time is tracked. The ACCOUNT write (account.saveProgress) moved INTO PlayerScreen
+                    // (saveAccountProgress, keyed on curMeta): closing over launch.meta here pinned every account
+                    // save to the LAUNCH episode across in-player binge advances (wrong-episode CW attribution).
+                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
                     onClose: {
                         core.unloadEnginePlayer()
                         presentation = nil
@@ -3533,8 +3534,11 @@ struct iOSEpisodeStreams: View {
                     episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
                     loadEpisode: { await loadEpisodeStream($0) },
                     warmNextEpisode: { await warmEpisodeStream($0) },
-                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
+                    // Engine feed only: the ACCOUNT write lives in PlayerScreen.saveAccountProgress, keyed on
+                    // curMeta, so a binge advance attributes progress to the CURRENT episode (capturing
+                    // launch.meta here saved every advance's progress against the launch episode).
+                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
                     onClose: {
                         core.unloadEnginePlayer()
                         presentation = nil

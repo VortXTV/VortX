@@ -2776,7 +2776,10 @@ struct PlayerScreen: View {
                 iconButton("arrow.counterclockwise", label: "Restart") {
                     coordinator.player?.seek(to: 0)
                     currentTime = 0
-                    if duration > 0 { onSeek(0, duration); lastReported = 0 }
+                    // Direct onSeek (a restart-to-0 must bypass reportSeek's resume floor), so the
+                    // account write rides along explicitly, keyed on the CURRENT episode like every
+                    // other save (the hosts no longer write the account from the closures).
+                    if duration > 0 { onSeek(0, duration); lastReported = 0; saveAccountProgress(0) }
                     if isPaused { coordinator.player?.togglePause() }   // restart implies resume
                     scheduleHide()
                 }
@@ -4654,6 +4657,7 @@ struct PlayerScreen: View {
             suppressedResumeFloor = nil
         }
         onProgress(position, duration)
+        saveAccountProgress(position)
     }
 
     /// Persist a user-initiated seek (skip buttons, macOS arrow keys, slider commit) to the presenter, which
@@ -4669,6 +4673,23 @@ struct PlayerScreen: View {
         }
         onSeek(target, duration)
         lastReported = target
+        saveAccountProgress(target)
+    }
+
+    /// ACCOUNT-ATTRIBUTION FIX (binge advance): the account's Continue-Watching write happens HERE,
+    /// keyed on `curMeta` (the episode actually playing at this event), not in the presenter closures.
+    /// Every host used to close over the LAUNCH episode's `launch.meta` in onProgress/onSeek, so after
+    /// an in-player `goToEpisode` advance the account save kept landing on the launch episode and the
+    /// account CW position named the WRONG episode. `curMeta` is published at the new file's first
+    /// frame (the binge-desync fix), so keying on it here attributes every save to the episode on
+    /// screen. Mirrors tvOS `TVPlayerView.saveProgress` (already curMeta-keyed). Called only from the
+    /// floor-guarded `reportProgress`/`reportSeek` chokepoints (+ the Restart lane, which reported
+    /// directly), so WHEN a save fires is unchanged; only WHICH episode it names moved. No meta
+    /// (trailer / paste-a-link / web shell) is a no-op, exactly like the old host-side meta guards.
+    private func saveAccountProgress(_ position: Double) {
+        guard let m = curMeta else { return }
+        let dur = duration
+        Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
     }
 
     /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it

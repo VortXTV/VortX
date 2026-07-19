@@ -3044,8 +3044,10 @@ struct iOSPlayerLaunch: Identifiable {
 }
 
 extension View {
-    /// Present `PlayerScreen` for an `iOSPlayerLaunch` over the browse screen, saving progress to
-    /// the account (the same wiring `iOSDetailView` uses) when the launch carries a `PlaybackMeta`.
+    /// Present `PlayerScreen` for an `iOSPlayerLaunch` over the browse screen (the same wiring
+    /// `iOSDetailView` uses). The account progress write happens inside PlayerScreen
+    /// (saveAccountProgress, keyed on the CURRENT episode), not here; `account` stays in the
+    /// signature for call-site symmetry with the detail covers and any future account-side wiring.
     @ViewBuilder func iOSPlayerCover(_ launch: Binding<iOSPlayerLaunch?>,
                                      account: StremioAccount, core: CoreBridge) -> some View {
         platformFullScreenPlayerCover(item: launch) { item in
@@ -3064,16 +3066,10 @@ extension View {
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
-                onProgress: { pos, dur in
-                    core.reportProgress(timeSeconds: pos, durationSeconds: dur)
-                    guard let meta = item.meta else { return }
-                    Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
-                },
-                onSeek: { pos, dur in
-                    core.reportProgress(timeSeconds: pos, durationSeconds: dur)
-                    guard let meta = item.meta else { return }
-                    Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
-                },
+                // The ACCOUNT write moved into PlayerScreen.saveAccountProgress (keyed on curMeta): capturing
+                // item.meta here attributed every in-player binge advance's saves to the LAUNCH episode.
+                onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
                 onClose: {
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil
