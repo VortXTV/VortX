@@ -306,3 +306,68 @@ android {
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
     dependsOn(cargoNdkBuild)
 }
+
+// =====================================================================================================
+// vortx-core JNI (the OWN engine): build libvortx_ffi.so (features jni + server) into
+// src/main/jniLibs and package it. Sibling of the cargoNdkBuild block above, same pattern,
+// different crate: the source is the ENGINE branch's vortx-core workspace (crates/ffi), which is
+// not vendored in this tree (the vortx-core/ dir here carries the kernel crates only, no ffi/
+// streaming-server), so the checkout path comes from the environment:
+//
+//   VORTX_ENGINE_CORE_DIR=/path/to/engine-checkout/vortx-core   (env var), or
+//   -Pvortx.engine.coreDir=/path/to/engine-checkout/vortx-core  (gradle property)
+//
+// When neither is set (or cargo is absent) the task warn-skips and the build packages whatever
+// libvortx_ffi.so is already staged in src/main/jniLibs (the manual build documented in
+// src/main/jniLibs/README.md) -- the .so binaries stay gitignored either way. `--features
+// jni,server` carries BOTH JNI surfaces in the one .so: the VortxCore kernel bridge (shadow
+// ranking) and the VortxServer in-process streaming server (raw-torrent playback).
+// CARGO_TARGET_DIR is pinned to a task-owned scratch dir (target-andx) inside the engine checkout
+// so this cross-build never dirties that checkout's own target/ build cache.
+// =====================================================================================================
+
+val vortxEngineCoreDir: File? = (
+    System.getenv("VORTX_ENGINE_CORE_DIR")
+        ?: (project.findProperty("vortx.engine.coreDir") as? String)
+    )?.let(::File)
+
+val vortxJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
+val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
+    group = "rust"
+    description = "Cross-compile the engine branch's vortx-ffi (features jni,server) to libvortx_ffi.so via cargo-ndk."
+    workingDir = vortxEngineCoreDir ?: coreCrateDir // placeholder wd when unset; onlyIf gates the run
+
+    val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    commandLine(
+        buildList {
+            add("cargo")
+            add("ndk")
+            addAll(targetFlags)
+            add("-p"); add(nativeApiLevel.toString())
+            add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
+            add("build"); add("-p"); add("vortx-ffi")
+            add("--no-default-features"); add("--features"); add("jni,server")
+            add("--release")
+        },
+    )
+    vortxEngineCoreDir?.let { environment("CARGO_TARGET_DIR", File(it, "target-andx").absolutePath) }
+
+    val cargoOnPath = System.getenv("PATH").orEmpty().split(File.pathSeparator).any { dir ->
+        File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
+    }
+    onlyIf {
+        val engineDirOk = vortxEngineCoreDir?.isDirectory == true
+        if (!engineDirOk) {
+            logger.warn("[vortx-ffi] VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir not set (or not a directory); skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
+        } else if (!cargoOnPath) {
+            logger.warn("[vortx-ffi] cargo not on PATH; skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
+        }
+        engineDirOk && cargoOnPath
+    }
+    isIgnoreExitValue = false
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(cargoNdkBuildVortxFfi)
+}
