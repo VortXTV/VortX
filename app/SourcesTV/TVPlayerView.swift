@@ -301,6 +301,24 @@ struct TVPlayerView: View {
     // missed re-point degrades to "no engine write" (the correct-identity account write still lands and
     // syncLibraryNow pulls it) instead of a wrong-episode write that clobbers it on mtime.
     @State private var enginePlayerVideoId: String?
+    // UNIFIED CURRENT-EPISODE IDENTITY (binge-desync fix, publish-at-first-frame). A binge advance used to
+    // publish `curMeta`/`curTitle` OPTIMISTICALLY at advance start, before the new stream produced a frame,
+    // so an advance interrupted across a background boundary stranded the five episode pointers on THREE
+    // different episodes (label E18, playing file E17, Back target E15). Now an advance parks everything it
+    // wants to publish here, and the ONE commit point is the incoming file's FIRST FRAME (timePos handler):
+    // display identity (curMeta/curTitle), the engine attribution gate (enginePlayerVideoId, re-pointed at
+    // engine-load time, only OPENS when curMeta catches up), and the LastStreamStore record all move
+    // together, so no surface can ever name an episode the player is not actually rendering. The loading
+    // chrome runs off this being non-nil. `issued` flips when the incoming load is actually handed to the
+    // player, so OUTGOING-file ticks during the resolve window are never mistaken for the incoming
+    // episode's first frame; `url` is what a foreground reconcile re-issues if the load died suspended.
+    private struct PendingEpisodeAdvance {
+        let meta: PlaybackMeta
+        let title: String
+        var url: URL? = nil
+        var issued = false
+    }
+    @State private var pendingAdvance: PendingEpisodeAdvance?
     // Next-episode preload: fetched + ranked in the background mid-episode so auto-advance is instant.
     @State private var preloaded: PreloadedEpisode?
     @State private var preloadingID: String?
@@ -395,6 +413,13 @@ struct TVPlayerView: View {
                     BigSpinner()
                     if let torrentStatus {
                         Text(torrentStatus)
+                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    } else if let pending = pendingAdvance {
+                        // Publish-at-first-frame: the label/selector deliberately stay on the OUTGOING
+                        // episode until the incoming file renders, so THIS line is what says an advance
+                        // is in flight (the directive's "Loading episode…" chrome, keyed off the pending
+                        // advance, never off a prematurely-advanced curMeta).
+                        Text("Loading S\(pending.meta.season ?? 0)E\(pending.meta.episode ?? 0)…")
                             .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     } else if reconnecting {
                         Text(isCurrentLiveStream ? "Reconnecting live stream…" : "Reconnecting…  (\(autoRetryCount)/\(maxAutoRetries))")
@@ -532,6 +557,15 @@ struct TVPlayerView: View {
             // per process): surface the exact tvOS setting to the viewer instead of only logging it. This is
             // the #1 silent-defeat path for DV/HDR (the toggle is OFF by default on every Apple TV).
             if let message = note.userInfo?["message"] as? String { showEngineNote(message) }
+        }
+        // FOREGROUND RECONCILE (binge-desync fix, leg 2): the player is deliberately NOT torn down on
+        // background (see onDisappear), so an episode advance can straddle a background boundary. Outside
+        // an advance the published episode and the loaded file agree BY CONSTRUCTION (the advance is
+        // published only at the incoming file's first frame), so the only state a suspension can strand
+        // is a pending advance - reconcile exactly that on return to foreground. Pairs with (never
+        // replaces) MPVMetalViewController.enterForeground, which restores video decode + play state.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            reconcileAdvanceOnForeground()
         }
         .onDisappear {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
@@ -722,8 +756,22 @@ struct TVPlayerView: View {
             }
         case MPVProperty.timePos:
             if let d = data as? Double {
-                if d > 0, !hasStartedPlaying {            // playback actually began
-                    hasStartedPlaying = true; loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
+                // Publish-at-first-frame guard: a tick of the OUTGOING file during an advance's resolve
+                // window (the incoming load has NOT been handed to the player yet, so the previous episode
+                // is still the one rendering) must not be mistaken for the incoming episode's first frame.
+                // Skip only the start-of-playback block; the normal tick handling below still runs, and its
+                // attribution reads (`curMeta`) still name the outgoing episode - exactly what is playing.
+                let outgoingResolveTick = pendingAdvance != nil && pendingAdvance?.issued != true
+                if d > 0, !hasStartedPlaying, !outgoingResolveTick {            // playback actually began
+                    hasStartedPlaying = true
+                    // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually rendered,
+                    // so publish the advance NOW, before anything below (the LastStreamStore record, the
+                    // scrobble start) reads curMeta. enginePlayerVideoId was already re-pointed at
+                    // engine-load time; publishing curMeta here is what OPENS its `==` gates (the pause
+                    // persist, the ~20s periodic tick, and the exit flush all compare against curMeta), so
+                    // the engine writes, the display identity, and the stream store all move as one.
+                    commitPendingAdvanceOnFirstFrame()
+                    loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
                     // [dv] time-to-first-frame for the watchdog trail (one-shot: armedAt self-clears). Only
                     // the remux lane logs it; the mpv lane / plain AVPlayer starts are not the diag target.
@@ -744,7 +792,13 @@ struct TVPlayerView: View {
                     }
                     // Live has no resumable position, so don't seed Continue-Watching direct-resume
                     // for it (mirrors PlayerScreen.recordLastStream's live guard).
-                    if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
+                    // Unified-identity guard: this record runs ONLY at a committed first frame
+                    // (commitPendingAdvanceOnFirstFrame above just published any in-flight advance), so
+                    // `m.videoId` and `u` name the SAME episode by construction - the store can never
+                    // again hold a lagging or mixed (old-episode-url under new-episode-id) entry. The
+                    // pendingAdvance == nil term makes that contract explicit and refuses any future
+                    // code path that could reach here mid-advance.
+                    if !isCurrentLiveStream, pendingAdvance == nil, let m = curMeta, let u = curURL {   // remember the working link for direct resume
                         // Attach the native-debrid provenance only when the ORIGINAL launched link is what's
                         // playing (a source hop before first frame would make it stale); it lets a later CW
                         // resume mint a fresh link without the slow full add-on re-resolve.
@@ -1982,6 +2036,11 @@ struct TVPlayerView: View {
             closeTorrent(hash: oldHash)
         }
         curURL = newURL
+        // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
+        // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
+        // pointed at the live URL (and issued - this loads synchronously below) so the first-frame commit
+        // and a foreground reconcile both act on the file actually in the player.
+        if pendingAdvance != nil { pendingAdvance?.url = newURL; pendingAdvance?.issued = true }
         curIsTorrent = stream.isTorrent
         curIsLive = isLiveMeta(curMeta) && !stream.isTorrent
         curBinge = stream.behaviorHints?.bingeGroup
@@ -3797,8 +3856,16 @@ struct TVPlayerView: View {
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         let newMeta = PlaybackMeta(libraryId: m.libraryId, videoId: v.id, type: "series",
                                    name: m.name, poster: m.poster, season: v.season, episode: v.episode)
-        curMeta = newMeta
-        curTitle = "\(m.name) · S\(v.season ?? 0)E\(v.episodeNumber) · \(v.episodeTitle)"
+        // PUBLISH-AT-FIRST-FRAME (binge-desync fix): do NOT advance curMeta/curTitle here. The old
+        // optimistic publish put the label, the episode selector, the watched marker, and every engine/
+        // account attribution read on the NEW episode while the player still held (or was still resolving)
+        // the OLD file - and an advance interrupted across a background boundary stranded them there
+        // forever. The advance is parked in `pendingAdvance` and published atomically at the incoming
+        // file's first frame (timePos handler); until then every surface keeps naming the OUTGOING
+        // episode, which is what is actually rendering, and the spinner line says what is loading.
+        pendingAdvance = PendingEpisodeAdvance(
+            meta: newMeta,
+            title: "\(m.name) · S\(v.season ?? 0)E\(v.episodeNumber) · \(v.episodeTitle)")
         showInfo = true; selected = .play; flashControls()
 
         // The preload already fetched and ranked this episode across every add-on → play it now.
@@ -3820,6 +3887,7 @@ struct TVPlayerView: View {
             if let oldHash = leavingHash, oldHash != pre.stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
             prepareTorrent(pre.stream)
             curURL = u
+            pendingAdvance?.url = u   // the exact media whose first frame will commit this advance
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             // Reset the local-capture throttle on the in-place episode switch (same reason as switchStream).
             lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
@@ -3838,6 +3906,11 @@ struct TVPlayerView: View {
                 // skipped (the account write still lands) rather than misattributed.
                 enginePlayerVideoId = core.loadEnginePlayer(for: pre.stream, videoId: v.id, base: pre.addonBase) ? v.id : nil
                 resumeSeconds = await account.resumeOffset(for: newMeta)
+                // ISSUE POINT: the incoming load is handed to the player NOW. Zero the clock the outgoing
+                // file's resolve-window ticks kept alive (its position/duration must not leak into the new
+                // episode's first saves), then mark the advance issued so the NEXT first frame commits it.
+                currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1
+                pendingAdvance?.issued = true
                 loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                 startLoadTimeout()
                 // R12: re-arm the guard only now that this episode's load is COMMITTED (loadIntoPlayer +
@@ -3894,11 +3967,18 @@ struct TVPlayerView: View {
                     enginePlayerVideoId = v.id
                     prepareTorrent(s)                                  // no-op for direct / debrid URLs
                     curURL = u
+                    pendingAdvance?.url = u   // the exact media whose first frame will commit this advance
                     curIsLive = isLiveMeta(newMeta) && !s.isTorrent
                     scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
                     // Reset the local-capture throttle on this in-place episode switch (same reason as switchStream).
                     lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
                     resumeSeconds = await account.resumeOffset(for: newMeta)
+                    // ISSUE POINT (fallback twin of the preload branch): zero the clock the outgoing
+                    // file's resolve-window ticks kept alive, then mark the advance issued so the NEXT
+                    // first frame commits it. Until this line the OUTGOING episode kept playing and its
+                    // ticks correctly attributed to curMeta, which still names it.
+                    currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1
+                    pendingAdvance?.issued = true
                     loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                     startLoadTimeout()
                     switchingEpisode = false   // fallback resolve landed: re-arm for the next switch
@@ -3907,9 +3987,57 @@ struct TVPlayerView: View {
                 try? await Task.sleep(for: .milliseconds(100))
             }
             loadErrorMsg = "No playable source found for this episode."
+            // The advance never ISSUED a load (no source resolved), so the player still coherently holds
+            // the OUTGOING episode and every pointer still names it: cancel the pending advance outright.
+            // (An advance whose ISSUED load then fails keeps its pendingAdvance, so the error overlay's
+            // Retry reloads the incoming URL and a success still commits the right episode.)
+            pendingAdvance = nil
             withAnimation { loadFailed = true }
             switchingEpisode = false   // fallback resolve gave up: re-arm so the user can retry
         }
+    }
+
+    /// FIRST-FRAME COMMIT of a binge advance (the single publish point of the unified current-episode
+    /// identity). Called from the timePos handler the moment the incoming file produces a frame:
+    /// publishes the display identity (curMeta/curTitle) that play(episode:) parked, which in the same
+    /// breath OPENS the enginePlayerVideoId `==` gates (re-pointed at engine-load time) and lets the
+    /// LastStreamStore record that follows capture a matching (videoId, url) pair. No-op outside an
+    /// advance, so launch playback, source switches, and stall reloads are untouched.
+    private func commitPendingAdvanceOnFirstFrame() {
+        guard let pending = pendingAdvance else { return }
+        pendingAdvance = nil
+        curMeta = pending.meta
+        curTitle = pending.title
+        // Code-level invariant (the extractable check; the app has no unit-test bundle): at commit, the
+        // published episode IS the episode of the file that just first-framed - pending.url was kept in
+        // step with curURL by play(episode:) and switchStream, so a mismatch here means a code path
+        // moved curURL without telling the pending advance. Debug builds trap; user builds log.
+        assert(pending.url == nil || pending.url == curURL,
+               "binge-advance commit: published episode's media (\(pending.url?.lastPathComponent ?? "nil")) != loaded media (\(curURL?.lastPathComponent ?? "nil"))")
+        if let u = pending.url, u != curURL {
+            DiagnosticsLog.log("binge", "COMMIT MISMATCH: pending url \(u.lastPathComponent) != curURL \(curURL?.lastPathComponent ?? "nil")")
+        }
+        DiagnosticsLog.log("binge", "advance committed at first frame -> \(pending.meta.videoId) (label/selector/store/engine-gate now agree)")
+    }
+
+    /// FOREGROUND RECONCILE of an interrupted binge advance. Outside an advance the published episode and
+    /// the loaded file agree BY CONSTRUCTION (publish happens only at the incoming file's first frame), so
+    /// there is nothing to re-derive here for normal playback - the mpv seam's enterForeground already
+    /// restores decode + play state. The ONE state a background boundary can strand is an advance whose
+    /// incoming load was ISSUED but never first-framed (the suspension killed the half-open connection, or
+    /// tvOS froze the process mid-load): the chrome correctly still shows the OUTGOING episode plus the
+    /// loading line, but the load itself may be dead. Re-issue the pending URL so the advance completes
+    /// (and commits at ITS first frame) instead of hanging on a dead half-load. An advance whose load was
+    /// never issued needs nothing: its resolve Task resumes with the app and either issues (-> first frame
+    /// -> commit) or errors out (pendingAdvance cleared). Presentation NEVER moves here - the display is
+    /// only ever advanced by the first-frame commit.
+    private func reconcileAdvanceOnForeground() {
+        guard let pending = pendingAdvance, pending.issued, !hasStartedPlaying, !loadFailed,
+              let u = pending.url else { return }
+        DiagnosticsLog.log("binge", "foreground reconcile: re-issuing interrupted advance load for \(pending.meta.videoId)")
+        buffering = true
+        loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
+        startLoadTimeout()
     }
 
     // MARK: - Next-episode preload (so auto-advance plays the best link with zero wait)
