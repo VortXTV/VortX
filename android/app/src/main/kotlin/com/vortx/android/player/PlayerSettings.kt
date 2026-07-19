@@ -492,3 +492,32 @@ object AutoAddLibrarySetting {
         prefs(context).edit().putBoolean(KEY, enabled).apply()
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// BadSourceAutoRetrySetting - kill switch for the bad-source auto-retry ladder
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * Kill switch for the bad-source AUTO-RETRY ladder (the playback-routing half of the trust fix): when a
+ * source is judged bad in the player (dead link, stall, or a runtime-mismatch junk file), the phone
+ * shell automatically tries the next ranked source, and after 3 failed sources surfaces manual
+ * selection. DEFAULT ON. Flipping it off restores the pre-ladder recovery (the error overlay's manual
+ * "Choose another source"), for the same reason [com.vortx.android.engine.VortxServer.FLAG_KEY] exists:
+ * a routing change this material needs a settings-level kill that requires no new build.
+ *
+ * DELIBERATELY NOT GATED by this flag: the runtime-mismatch CORRECTNESS itself -- never marking a
+ * junk-length file watched, never firing auto-advance off its EOF, never scrobbling it as watched.
+ * That lives inside [com.vortx.android.player.PlayerScreen] unconditionally; a kill switch that could
+ * turn "10 seconds counts as watched" back on would defeat the fix.
+ */
+object BadSourceAutoRetrySetting {
+    const val KEY = "vortx.player.badSourceAutoRetry"
+
+    /** Whether the auto-retry ladder is armed. Read when the player is wired, per play. */
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY, true)
+
+    /** Persist the choice (no Settings UI yet; the key is flippable via the shared settings file). */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY, enabled).apply()
+    }
+}

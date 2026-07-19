@@ -1,14 +1,21 @@
 package com.vortx.android.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -32,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -40,12 +48,15 @@ import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
+import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
+import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.ui.components.Wordmark
@@ -173,16 +184,23 @@ fun StremioXApp(
             // BackHandler anywhere in the shell before; this is the minimum one, scoped to the player).
             BackHandler { playing = null }
 
-            // UP NEXT AUTO-ADVANCE. For a detail-launched SERIES play (never a trailer, never a local
-            // download -- those reach the player with `detail == null`), grab the SAME keyed
-            // DetailViewModel the detail layer below uses (identical key + factory args, so this is the
-            // instance that already holds the played episode's selection). When the episode ENDS,
-            // PlayerScreen's onEnded asks it for the next episode: present -> the Up Next countdown
-            // overlay below; absent -> the old exit-to-detail. The condition is stable for the life of
-            // this block ([detail] cannot change while the player overlay is up).
+            // UP NEXT AUTO-ADVANCE + BAD-SOURCE RETRY. For ANY detail-launched play (never a trailer,
+            // never a local download -- those reach the player with `detail == null`), grab the SAME
+            // keyed DetailViewModel the detail layer below uses (identical key + factory args, so this
+            // is the instance that already holds the played target's selection and its ranked source
+            // list). Two consumers hang off it:
+            //   - Up Next: when a SERIES episode ENDS, PlayerScreen's onEnded asks it for the next
+            //     episode: present -> the Up Next countdown overlay below; absent -> exit-to-detail.
+            //     (nextEpisode() is null for a movie, so Up Next stays series-only by construction.)
+            //   - The bad-source retry ladder: when the live source is judged BAD (dead link, stall,
+            //     or the runtime-mismatch junk-file verdict), retryNextSource() plays the next ranked
+            //     source for the SAME target, and after 3 failed sources the manual pick overlay
+            //     surfaces -- movies and series both.
+            // The condition is stable for the life of this block ([detail] cannot change while the
+            // player overlay is up).
             val showForNext = detail
             val advanceVm: DetailViewModel? =
-                if (showForNext != null && showForNext.type == MediaType.SERIES && !playable.isTrailer) {
+                if (showForNext != null && !playable.isTrailer) {
                     viewModel(
                         key = "detail-${showForNext.id}",
                         factory = StremioXViewModelFactory(
@@ -197,6 +215,12 @@ fun StremioXApp(
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
+            // [playing] to the new source's playable, which resets both to false and closes the
+            // overlay on its own. The ladder's cross-retry memory (failed sources + the 3-attempt
+            // cap per episode) lives in [DetailViewModel], which survives the swaps.
+            var retryingSource by remember(playable) { mutableStateOf(false) }
+            var manualSourcePick by remember(playable) { mutableStateOf(false) }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
             // the feature (it must not write a resume position, mark watched, or attribute progress to any
@@ -218,6 +242,21 @@ fun StremioXApp(
                     onEnded = {
                         val next = advanceVm?.nextEpisode()
                         if (next != null) upNext = next else playing = null
+                    },
+                    // Bad source (dead link, stall, or a runtime-mismatch junk file): run the auto-retry
+                    // ladder instead of bouncing to the detail page -- the next ranked source resolves
+                    // through [advanceVm]'s ordinary playback flow and the collector below swaps
+                    // [playing] in place. When the ladder is exhausted (3 distinct sources failed for
+                    // this target) or there is nothing left to try, surface MANUAL selection: never
+                    // silently give up, never advance. Null (the pre-ladder error overlay) when no
+                    // detail ViewModel exists (a local download / ad-hoc play) or the kill switch
+                    // [BadSourceAutoRetrySetting] is off.
+                    onSourceFailed = if (advanceVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
+                        {
+                            if (advanceVm.retryNextSource()) retryingSource = true else manualSourcePick = true
+                        }
+                    } else {
+                        null
                     },
                     onProgress = { pos, dur ->
                         lastProgress[0] = pos
@@ -292,6 +331,51 @@ fun StremioXApp(
                         onPlayNow = { advanceVm.playNextEpisode() },
                         onCancel = { playing = null },
                     )
+                }
+                // The bad-source ladder's surfaces + their resolution collector. Like the Up Next
+                // collector above, this is the only [Playback] observer while its overlay is up (the
+                // two are mutually exclusive: Up Next requires a GENUINE ended verdict, the ladder a
+                // BAD one, and PlayerScreen keeps those disjoint). Ready swaps [playing] to the
+                // retried/picked source's playable, which resets the per-playable overlay state and
+                // closes everything; a resolve FAILURE while auto-retrying counts as the next rung of
+                // the ladder (the failed pick was recorded by retryNextSource's ledger via
+                // lastPlayedSource), falling through to manual pick when the ladder is done; a
+                // failure of the viewer's own manual pick stays on the picker for another choice.
+                if ((retryingSource || manualSourcePick) && advanceVm != null) {
+                    val retryPlayback by advanceVm.playback.collectAsStateWithLifecycle()
+                    LaunchedEffect(retryPlayback) {
+                        when (val pb = retryPlayback) {
+                            is Playback.Ready -> {
+                                advanceVm.clearPlayback()
+                                // A pick made on the MANUAL fallback is the viewer's own, warned
+                                // choice: mark it userForcedSource so the player lets it play
+                                // instead of condemning it again (the never-poison gates stay on).
+                                playing = if (manualSourcePick) {
+                                    pb.playable.copy(userForcedSource = true)
+                                } else {
+                                    pb.playable
+                                }
+                            }
+                            is Playback.Failed -> {
+                                advanceVm.clearPlayback()
+                                if (!manualSourcePick && !advanceVm.retryNextSource()) {
+                                    retryingSource = false
+                                    manualSourcePick = true
+                                }
+                            }
+                            else -> Unit
+                        }
+                    }
+                    if (manualSourcePick) {
+                        ManualSourcePickOverlay(
+                            sources = advanceVm.manualSourceOptions(),
+                            resolving = retryPlayback is Playback.Resolving,
+                            onPick = { advanceVm.play(it) },
+                            onClose = { playing = null },
+                        )
+                    } else {
+                        RetryingSourceOverlay()
+                    }
                 }
             }
             return@VortXTheme
@@ -568,6 +652,129 @@ private fun UpNextOverlay(
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
             }
+        }
+    }
+}
+
+/// The bad-source ladder's in-flight affordance: a dimmed frame + spinner while the next ranked source
+/// resolves, so a junk/dead source reads as "finding you a working file", never as a finished episode
+/// or a dead player. Closed automatically when the retried source's playable swaps in (the overlay
+/// state is keyed per playable).
+@Composable
+private fun RetryingSourceOverlay() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.6f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            modifier = Modifier
+                .vortxGlassPanel(RoundedCornerShape(14.dp))
+                .padding(horizontal = 28.dp, vertical = 22.dp),
+        ) {
+            CircularProgressIndicator(color = DefaultEmber, modifier = Modifier.size(40.dp))
+            Text(
+                text = "That file wasn't right",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 16.sp,
+            )
+            Text(
+                text = "Trying another source",
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 13.sp,
+            )
+        }
+    }
+}
+
+/// The manual fallback after the auto-retry ladder exhausts: a clear splash listing the ranked sources
+/// for THIS target so the viewer picks one to keep watching. Never auto-advances and never silently
+/// gives up; the only exits are a pick (which plays) or Back (to the detail page's full list). Rows are
+/// disabled while a pick is resolving so a double-tap cannot race two resolves.
+@Composable
+private fun ManualSourcePickOverlay(
+    sources: List<StreamSource>,
+    resolving: Boolean,
+    onPick: (StreamSource) -> Unit,
+    onClose: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.8f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .vortxGlassPanel(RoundedCornerShape(14.dp))
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = "Couldn't find a working source",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 17.sp,
+            )
+            Text(
+                text = "The last few files didn't play right. Pick a source to keep watching.",
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 13.sp,
+            )
+            if (sources.isEmpty()) {
+                Text(
+                    text = "No sources are loaded for this title. Go back to browse the full list.",
+                    color = Color.White.copy(alpha = 0.75f),
+                    fontSize = 14.sp,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 320.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(sources, key = { it.id }) { source ->
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = DefaultEmber)
+                                .clickable(enabled = !resolving) { onPick(source) }
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Text(
+                                text = listOf(StreamRanking.qualityLabel(source), source.addon)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString(" · "),
+                                color = Color.White,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                            )
+                            Text(
+                                text = source.title,
+                                color = Color.White.copy(alpha = 0.8f),
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+            Text(
+                text = if (resolving) "Starting…" else "Back",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp,
+                modifier = Modifier
+                    .clickable(enabled = !resolving, onClick = onClose)
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+            )
         }
     }
 }
