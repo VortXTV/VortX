@@ -4,7 +4,20 @@
 #   tvOS is a tier-3 Rust target, so std is built from source via -Z build-std.
 #   iOS is tier-2, so its std is prebuilt: just add the targets, no build-std.
 set -euo pipefail
-cd "$(dirname "$0")/../core"
+# stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout: STREMIOX_CORE_DIR env,
+# else a sibling ../../stremiox-core clone, else the legacy in-repo ../core (removed from the public repo).
+_SD="$(dirname "$0")"
+CORE_DIR="${STREMIOX_CORE_DIR:-}"
+if [ -z "$CORE_DIR" ]; then
+  for c in "$_SD/../../stremiox-core" "$_SD/../core"; do
+    if [ -f "$c/Cargo.toml" ]; then CORE_DIR="$c"; break; fi
+  done
+fi
+if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/Cargo.toml" ]; then
+  echo "ERROR: stremiox-core crate not found. Set STREMIOX_CORE_DIR or clone VortXTV/stremiox-core to ../../stremiox-core." >&2
+  exit 1
+fi
+cd "$CORE_DIR"
 source "$HOME/.cargo/env" 2>/dev/null || true
 
 BUILDSTD="-Z build-std=std,panic_abort"

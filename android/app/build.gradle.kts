@@ -242,7 +242,14 @@ dependencies {
 // still configures; the resulting APK simply won't contain the .so until built where cargo-ndk exists.
 // =====================================================================================================
 
-val coreCrateDir = rootProject.file("../core")
+// stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout from (in order):
+// STREMIOX_CORE_DIR env, the `stremiox.core.dir` gradle property, a sibling `../../stremiox-core`
+// clone, else the legacy in-repo `../core` (removed from the public app repo). If none exist the
+// task's onlyIf skips the native build (APK ships without libstremiox_core.so), same as no-cargo.
+val coreCrateDir: File =
+    (System.getenv("STREMIOX_CORE_DIR") ?: (project.findProperty("stremiox.core.dir") as? String))?.let(::File)
+        ?: rootProject.file("../../stremiox-core").takeIf { it.exists() }
+        ?: rootProject.file("../core")
 val jniLibsOutDir = layout.buildDirectory.dir("rustJniLibs/android")
 
 // ABIs to ship. arm64 + x86_64 cover real devices (phones, Android TV, Fire TV) and the emulator.
@@ -280,7 +287,10 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
         if (!cargoOnPath) {
             logger.warn("[stremiox-core] cargo not on PATH; skipping native build. APK will lack libstremiox_core.so until built with the Rust + cargo-ndk toolchain installed.")
         }
-        cargoOnPath
+        if (!coreCrateDir.exists()) {
+            logger.warn("[stremiox-core] engine crate not found at ${coreCrateDir.path} (proprietary, private repo). Set STREMIOX_CORE_DIR or clone VortXTV/stremiox-core to ../../stremiox-core. APK will lack libstremiox_core.so.")
+        }
+        cargoOnPath && coreCrateDir.exists()
     }
     // Don't fail the whole build if cargo-ndk errors during early scaffolding; surface it instead.
     isIgnoreExitValue = false
