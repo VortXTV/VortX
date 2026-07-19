@@ -1,21 +1,26 @@
 name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
-# workflow IS the build feedback loop. It builds BOTH product flavors on every push/PR that touches
+# workflow IS the build feedback loop. It builds BOTH product flavors on every push that touches
 # android/, verifies each flavor produced an APK carrying BOTH engine .so's for BOTH ABIs, and
 # enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
 # libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
 # 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
 # which is itself a path trigger, so the old `core/**` path filters are gone (that dir no longer
 # exists in the public tree).
+#
+# No `pull_request` trigger, DELIBERATELY: the engine-fetch steps below hold ENGINE_REPO_TOKEN in
+# the same job that executes repo-controlled code (gradle build scripts, cargo build scripts), so
+# building PR heads here would hand any same-repo PR author's code a credential / private-source
+# exfiltration lane. Fork PRs never received secrets anyway, so their builds could only die at the
+# token preflight; nothing of value is lost. The dev flow is push-to-branch (which triggers this
+# workflow); PR validation of app-only changes belongs to a future SECRETLESS workflow (no engine
+# fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and never
+# `pull_request_target` -- to THIS workflow.
 
 on:
   push:
     branches: [main, beta, "android/**"]
-    paths:
-      - "android/**"
-      - ".github/workflows/android.yml"
-  pull_request:
     paths:
       - "android/**"
       - ".github/workflows/android.yml"
@@ -26,7 +31,12 @@ permissions:
 
 jobs:
   build-android:
-    runs-on: ubuntu-latest
+    # Pinned explicit runner label: `ubuntu-latest` is a MOVING alias (it means ubuntu-24.04 today,
+    # per actions/runner-images), and a silent alias flip would swap the whole toolchain -- JDK
+    # packages, binutils, kernel -- under a runtime-proven lane with no diff in this file. The APK
+    # gate below also leans on the image's binutils readelf (2.42 on ubuntu-24.04). Moving to a
+    # newer image is a deliberate edit here, verified by a run, not an alias drift.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -127,6 +137,13 @@ jobs:
 
       # SHA-pinned (see the pin note above). Pinning drops the toolchain-from-ref-name convention
       # (@nightly), so the toolchain is passed explicitly.
+      #
+      # Toolchain truth: rust-toolchain.toml IS the Rust-version authority, not this step. BOTH
+      # engine checkouts carry one (core/rust-toolchain.toml and the promoted
+      # vortx-core/rust-toolchain.toml, each `channel = "nightly"` + rust-src; verified at the
+      # pinned engine commits), and rustup's directory-override rule means every cargo invocation
+      # inside those dirs resolves the toolchain through that file. This step is ONLY the
+      # installer that puts nightly + the Android targets on the runner for those files to select.
       - name: Install Rust nightly + Android targets
         uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
@@ -142,8 +159,12 @@ jobs:
             core -> target
             vortx-core -> target-andx
 
+      # Pinned EXACTLY: "^3" is a moving target (a new 3.x release would swap the build tool under
+      # this runtime-proven lane with no diff here). =3.5.4 is what "^3" resolves to at pin time,
+      # i.e. the version the proven runs actually installed. cargo-ndk 4.x exists (4.1.2 today);
+      # that major bump is a deliberate future change with its own verifying run, not a pin.
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "^3" --locked
+        run: cargo install cargo-ndk --version "=3.5.4" --locked
 
       # Build BOTH flavors. lint.abortOnError = true (app/build.gradle.kts) still gates each assemble.
       #
@@ -189,18 +210,46 @@ jobs:
       # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a AND x86_64. Both engine tasks feed the `main`
       # sourceSet's jniLibs, so BOTH flavors carry both engines (only the GPLv3 libmpv is play-gated).
       # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
-      # pass. Instead EXTRACT each entry and require non-zero size plus the ELF magic (\x7fELF), so a
-      # silently degraded engine build can never ship.
-      - name: Verify engine .so in every APK (both ABIs, non-empty, real ELF)
+      # pass. Presence + ELF magic alone is not proof either: a valid ELF of the wrong architecture,
+      # an executable, or a stub with no JNI surface would pass and only die on-device. So EXTRACT
+      # each entry and require, in order (all via the image's binutils readelf; each check fail-closed):
+      #   1. non-zero size + the ELF magic \x7fELF (cheap pre-checks with a clear byte-level error);
+      #   2. readelf -h: Class ELF64 (e_ident[EI_CLASS]=2), little-endian data (e_ident[EI_DATA]=1),
+      #      Type DYN (e_type=ET_DYN: a shared object, not ET_EXEC/ET_REL), and the machine matching
+      #      the ABI dir: AArch64 (EM_AARCH64=183) under lib/arm64-v8a/, Advanced Micro Devices
+      #      X86-64 (EM_X86_64=62) under lib/x86_64/;
+      #   3. readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
+      #      required names are DERIVED from source, not guessed -- JNI resolves a Kotlin
+      #      `external fun` to Java_<package with _>_<Class>_<method>, and both engines export those
+      #      names directly via #[no_mangle] (neither registers via RegisterNatives):
+      #        libstremiox_core.so <- StremioCoreNative.kt:43 loadLibrary("stremiox_core"),
+      #          external funs at StremioCoreNative.kt:75/81/83/85; exported by the pinned
+      #          stremiox-core commit's core/src/android_jni.rs:70/83/133/150 plus JNI_OnLoad
+      #          (android_jni.rs:61, caches the JavaVM for engine worker threads).
+      #        libvortx_ffi.so <- VortxCore.kt:38 + VortxServer.kt:65 loadLibrary("vortx_ffi"),
+      #          external funs at VortxCore.kt:50/54/58/61/64 and VortxServer.kt:85/88/91/95;
+      #          exported by the pinned vortx-core commit's crates/ffi/src/jni.rs:128-230 (feature
+      #          `jni`) and crates/ffi/src/jni_server.rs:82-146 (features `jni`+`server`) -- both
+      #          features are ON in this build (build.gradle.kts:403 passes `--features jni,server`),
+      #          so a .so built with a dropped feature (kernel bridge or server lane silently gone)
+      #          fails this gate instead of shipping.
+      - name: Verify engine .so in every APK (both ABIs, ELF64 shared object, right arch, JNI exports)
         run: |
           set -euo pipefail
           shopt -s nullglob
           apks=(android/app/build/outputs/apk/full/debug/*.apk android/app/build/outputs/apk/play/debug/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then echo "::error::no APKs found to verify engine .so"; exit 1; fi
+          # Required dynamic exports per lib (derivation + source citations in the step comment above).
+          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion"
+          syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
           fail=0
           workdir="$(mktemp -d)"
           for apk in "${apks[@]}"; do
             for abi in arm64-v8a x86_64; do
+              case "$abi" in
+                arm64-v8a) machine='AArch64' ;;
+                x86_64)    machine='Advanced Micro Devices X86-64' ;;
+              esac
               for lib in libstremiox_core.so libvortx_ffi.so; do
                 entry="lib/$abi/$lib"
                 out="$workdir/$(basename "$apk").$abi.$lib"
@@ -215,13 +264,37 @@ jobs:
                 if [ "$magic" != "7f454c46" ]; then
                   echo "::error::$entry in $apk is not an ELF binary (leading bytes: $magic)"; fail=1; continue
                 fi
-                echo "ok: $apk $entry ($size bytes, ELF)"
+                if ! hdr="$(readelf -h "$out" 2>/dev/null)"; then
+                  echo "::error::$entry in $apk has an unparseable ELF header (readelf -h failed)"; fail=1; continue
+                fi
+                if ! grep -Eq 'Class:[[:space:]]+ELF64' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not ELF64 (e_ident[EI_CLASS] != 2): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq 'Data:.*little endian' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not little-endian (e_ident[EI_DATA] != 1): $(grep -E 'Data:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq 'Type:[[:space:]]+DYN\b' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not a shared object (e_type != ET_DYN): $(grep -E 'Type:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq "Machine:[[:space:]]+${machine}[[:space:]]*\$" <<<"$hdr"; then
+                  echo "::error::$entry in $apk is the WRONG ARCHITECTURE (want $machine): $(grep -E 'Machine:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                dynsyms="$(readelf -W --dyn-syms "$out" 2>/dev/null || true)"
+                syms_var="syms_${lib%.so}"
+                missing=""
+                for sym in ${!syms_var}; do
+                  grep -Eq "[[:space:]]${sym}[[:space:]]*\$" <<<"$dynsyms" || missing="$missing $sym"
+                done
+                if [ -n "$missing" ]; then
+                  echo "::error::$entry in $apk is missing required JNI export(s):$missing"; fail=1; continue
+                fi
+                echo "ok: $apk $entry ($size bytes, ELF64 LE DYN $machine, all required JNI exports present)"
               done
             done
           done
           rm -rf "$workdir"
           if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "every APK embeds libstremiox_core.so + libvortx_ffi.so for arm64-v8a + x86_64 (non-empty, ELF-verified)"
+          echo "every APK embeds libstremiox_core.so + libvortx_ffi.so for arm64-v8a + x86_64 (ELF64 little-endian shared objects, correct machine per ABI, JNI export surface verified)"
 
       # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
       # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs

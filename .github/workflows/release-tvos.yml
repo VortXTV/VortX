@@ -9,6 +9,15 @@ name: Release apps (iOS + tvOS + macOS)
 # this file, which is itself a path trigger, so the old `core/**` path filters
 # are gone (that dir no longer exists in the public tree).
 # The macOS app ships as a drag-to-install .dmg (ad-hoc signed, not notarized).
+#
+# No `pull_request` trigger, DELIBERATELY: this job holds ENGINE_REPO_TOKEN (plus the
+# Trakt/SIMKL/edge secrets) in the same job that executes repo-controlled code (scripts/*,
+# app/scripts/*, the xcodegen'd build phases), so building PR heads here would hand any same-repo
+# PR author's code a credential / private-source exfiltration lane. Fork PRs never received
+# secrets anyway, so their builds could only fail early; nothing of value is lost. The dev flow is
+# push-to-branch; PR validation of app-only changes belongs to a future SECRETLESS workflow (no
+# engine fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and
+# never `pull_request_target` -- to THIS workflow.
 
 on:
   # Release-tag caches are isolated per tag, so seed the same exact cache key on
@@ -20,12 +29,6 @@ on:
       - "scripts/**"
   release:
     types: [published]
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/release-tvos.yml"
-      - "scripts/**"
-      - "app/**"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -38,7 +41,13 @@ permissions:
 
 jobs:
   build-tvos:
-    runs-on: macos-latest
+    # Pinned explicit runner label: `macos-latest` is a MOVING alias (it means the macOS 15 arm64
+    # image today, per actions/runner-images), and a silent alias flip -- e.g. to the macOS 26
+    # image -- would swap the entire Xcode set and SDKs under the release lane with no diff in
+    # this file. The Xcode-selection step below already copes with image rotation WITHIN a
+    # version; pinning the label keeps that rotation bounded. Moving to a newer image is a
+    # deliberate edit here, verified by a run, not an alias drift.
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -232,7 +241,7 @@ jobs:
       # We keep a SINGLE source of truth: the VORTX_EDGE_SECRET repo secret holds the raw hex, and CI
       # derives the masked blob here by compiling the app's OWN VortXEdgeAuth.swift with a tiny driver,
       # so the derivation can never drift from the runtime de-mask. The value is derived, never stored
-      # twice. A fork or PR build has no secret: the driver reports EMPTY, we inject nothing, and request
+      # twice. A fork or otherwise secretless build: the driver reports EMPTY, we inject nothing, and request
       # signing stays a harmless observe-mode no-op (the workers accept unsigned requests today). An
       # already-masked stored value is detected and passed through unchanged; a value that is neither
       # 64-hex nor a valid masked blob falls back to an empty secret with a warning, never failing the
