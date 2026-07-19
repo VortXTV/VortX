@@ -1762,7 +1762,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// slow-start, mid-stream redirects, transient resets) that make a plain FFmpeg open time out (rc=-60) on a
     /// URL libmpv plays fine. Set on the same AVDictionary handed to avformat_open_input. Unknown keys on an
     /// older protocol build are simply left in the dict, never fatal.
-    private static func applyDebridHTTPResilience(_ opts: inout OpaquePointer?) {
+    // Internal (not private): the DIRECT DV lane opens its input with the same resilience posture.
+    static func applyDebridHTTPResilience(_ opts: inout OpaquePointer?) {
         av_dict_set(&opts, "reconnect", "1", 0)
         av_dict_set(&opts, "reconnect_streamed", "1", 0)
         av_dict_set(&opts, "reconnect_on_network_error", "1", 0)
@@ -1807,7 +1808,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Read the HEVC NAL length-prefix size (1, 2, or 4 bytes) from the base track's hvcC extradata. In an
     /// hvcC record byte 21 holds `lengthSizeMinusOne` in its low two bits. Falls back to 4 (the near-universal
     /// value FFmpeg's matroska demuxer emits) when extradata is absent, too short, or not an hvcC record.
-    private static func hevcNalLengthSize(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> Int {
+    // Internal (not private): the DIRECT DV lane (VortXDirectDVEngine) reuses this exact reader.
+    static func hevcNalLengthSize(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> Int {
         guard let par, let ex = par.pointee.extradata else { return 4 }
         let n = Int(par.pointee.extradata_size)
         // hvcC starts with configurationVersion (1) and needs at least 23 bytes to reach the length-size byte.
@@ -2067,7 +2069,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// with pixel rate; the boundaries are the documented (resolution, fps) tiers: 1080p24=3 ... 2160p24=6,
     /// 2160p30=7, 2160p60=9. Used only when synthesizing a record for an in-band-only source (a container
     /// record already carries its own level).
-    private static func doViLevel(width: Int, height: Int, fps: Double) -> UInt8 {
+    // Internal (not private): the DIRECT DV lane synthesizes its in-band-only DOVI config with the same ladder.
+    static func doViLevel(width: Int, height: Int, fps: Double) -> UInt8 {
         let dim = max(width, height)
         let f = fps > 0 ? fps : 24
         switch dim {
@@ -2096,7 +2099,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// SEEK-FREE and side-effect-free: reads the packet bytes only, never advances the demuxer or mutates the
     /// packet. Mirrors the NAL walk + memory pattern of `convertPacketRPUToProfile81`; uses only libdovi symbols
     /// already linked (dovi_parse_unspec62_nalu / dovi_rpu_get_header / guessed_profile / free).
-    private static func inBandDoViProfile(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int) -> Int {
+    // Internal (not private): the DIRECT DV lane (VortXDirectDVEngine) reuses this exact probe.
+    static func inBandDoViProfile(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int) -> Int {
         guard let src = pkt.pointee.data else { return -1 }
         let total = Int(pkt.pointee.size)
         guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return -1 }
@@ -2130,7 +2134,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
     /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
     /// genuinely can't convert.
-    private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
+    // Internal (not private): the DIRECT DV lane (VortXDirectDVEngine) runs this same converter per packet,
+    // so both DV lanes share ONE proven P7 -> 8.1 implementation (stats + fail-soft semantics identical).
+    static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
         guard let src = pkt.pointee.data else { return }
         let total = Int(pkt.pointee.size)
         guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return }

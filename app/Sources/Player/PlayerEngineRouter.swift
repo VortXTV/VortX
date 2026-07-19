@@ -69,6 +69,47 @@ enum PlayerEngineRouter {
         return dvDisplayCapable   // remote absent -> baked default: on where DV can actually be shown (mandate)
     }
 
+    /// Opt-in flag for the DIRECT Dolby Vision lane (the sample-buffer shim: FFmpeg demux -> compressed
+    /// CMSampleBuffers -> AVSampleBufferDisplayLayer, no HLS and no playlist declarations, so the -12927
+    /// declaration/content cross-check cannot exist on it). OFF by default everywhere: this is an
+    /// EXPERIMENTAL additional lane; when disabled nothing anywhere changes. Resolution order mirrors
+    /// `dvRemuxEnabled`: explicit user default first, then the RemoteConfig fleet value, then a baked
+    /// default of FALSE (unlike the remux lane there is no display-capability widening: the lane must be
+    /// deliberately turned on, per-device or fleet-wide, while it earns trust).
+    /// No Settings UI exists for this yet ON PURPOSE: the settings-parity rule requires any user-facing
+    /// toggle to land on ALL platforms at once, so until the lane graduates the switch is RemoteConfig
+    /// (`features.dvDirect`) or a defaults write, not a visible setting.
+    static let dvDirectKey = "stremiox.dvDirect"
+    static func dvDirectEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: dvDirectKey) != nil {
+            return UserDefaults.standard.bool(forKey: dvDirectKey)   // explicit user value always wins
+        }
+        // Same present-vs-absent probe as dvRemuxEnabled: agreeing probes mean the remote key is SET.
+        let snap = RemoteConfig.snapshot
+        let onWhenAbsentTrue = snap.isFeatureOn("dvDirect", default: true)
+        let onWhenAbsentFalse = snap.isFeatureOn("dvDirect", default: false)
+        if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }
+        return false   // remote absent -> baked default OFF (experimental lane)
+    }
+
+    /// Whether the chrome should mount the DIRECT DV lane for a stream it has already routed to the
+    /// AVPlayer side under the DV rules. This deliberately sits UNDER the existing routing (rule 3b) as a
+    /// surface-level sub-branch rather than a new Engine case: the direct lane's failure demotes to the
+    /// remux lane, whose failure demotes to libmpv, so every ladder rung that ships today is preserved.
+    /// tvOS-only for now: that is the platform of the -12927 report and the DV mandate's primary target;
+    /// the engine itself compiles on all platforms for when iOS/macOS chromes gain the mount.
+    @MainActor
+    static func shouldUseDirectDV(url: URL, isDolbyVision: Bool) -> Bool {
+        #if os(tvOS)
+        guard isDolbyVision, dvDirectEnabled(), DVDisplaySupport.isCapable else { return false }
+        // The direct lane demuxes with FFmpeg, so its candidacy is the remux lane's: an MKV or an
+        // extensionless/mislabeled debrid link. Native mp4/mov and HLS stay on AVPlayer itself.
+        return isDVRemuxCandidate(url)
+        #else
+        return false
+        #endif
+    }
+
     /// Pick the engine for a stream.
     /// - Parameters:
     ///   - url: the RAW stream URL (before any StremioServer proxy rewrite).

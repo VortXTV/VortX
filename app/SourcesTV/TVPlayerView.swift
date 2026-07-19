@@ -159,6 +159,11 @@ struct TVPlayerView: View {
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
+    /// The DIRECT Dolby Vision lane (sample-buffer shim, flag-gated via PlayerEngineRouter.dvDirectEnabled)
+    /// failed for this stream: fall back to the AVPlayer remux lane IN PLACE. Sits ABOVE `avEngineFailed`
+    /// in the ladder: direct -> remux(AVPlayer) -> libmpv, so a direct failure loses nothing that ships
+    /// today. Reset by `.id(req.id)` like the other per-request latches.
+    @State private var directDVFailed = false
     /// The engine routing decision, LATCHED once per playback (seeded in onAppear), mirroring
     /// PlayerScreen.engineLatch. `useAVPlayerEngine` is read by `playerSurface` on every SwiftUI body pass
     /// (4-9x/sec during playback), and re-running the full route each render (regex + UserDefaults +
@@ -629,12 +634,25 @@ struct TVPlayerView: View {
     /// mirrors `PlayerScreen.playerSurface` on iOS / macOS.
     @ViewBuilder private var playerSurface: some View {
         if useAVPlayerEngine {
-            AVPlayerEngineView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers,
-                      isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
-                .live(initialLiveMode)
-                .onPropertyChange { _, name, data in handleProperty(name, data) }
-                .ignoresSafeArea()
+            if useDirectDVLane {
+                // DIRECT Dolby Vision lane (experimental, default OFF): compressed sample buffers straight
+                // into the display pipeline, no HLS and no playlist declarations, so the -12927
+                // declaration/content cross-check that degraded the remux lane cannot exist here. A fatal
+                // on this lane flips `directDVFailed` and this same branch re-renders the AVPlayer remux
+                // surface below; its own failure path (demoteAVPlayerToMPV) is unchanged.
+                DirectDVEngineView(coordinator: coordinator)
+                    .play(initialPlayback.url, headers: initialPlayback.headers, isDolbyVision: true)
+                    .live(initialLiveMode)
+                    .onPropertyChange { _, name, data in handleProperty(name, data) }
+                    .ignoresSafeArea()
+            } else {
+                AVPlayerEngineView(coordinator: coordinator)
+                    .play(initialPlayback.url, headers: initialPlayback.headers,
+                          isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
+                    .live(initialLiveMode)
+                    .onPropertyChange { _, name, data in handleProperty(name, data) }
+                    .ignoresSafeArea()
+            }
         } else {
             MPVMetalPlayerView(coordinator: coordinator)
                 .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
@@ -649,6 +667,17 @@ struct TVPlayerView: View {
     /// equivalent for: audio sync (setAudioDelay), audio output mode, and the hardware-decoding toggle).
     /// External add-on subtitles and trickplay frame capture DO work on AVPlayer, so those rows stay shown.
     private var isAVPlayerActive: Bool { coordinator.player is AVPlayerEngineController }
+
+    /// Whether the DIRECT DV lane should mount for THIS stream (a sub-branch of the AVPlayer route, so the
+    /// existing latch semantics are untouched): flag on, DV launch stream, remux-class container, no prior
+    /// direct failure, and no manual engine pick (a manual "AVPlayer" pick means the REMUX lane
+    /// specifically). Evaluated on the immutable LAUNCH url like `routedToAVPlayer`, so the mounted surface
+    /// never flips mid-play except through the explicit `directDVFailed` demote.
+    private var useDirectDVLane: Bool {
+        guard !directDVFailed, manualEngineAVPlayer == nil else { return false }
+        return PlayerEngineRouter.shouldUseDirectDV(url: url,
+                                                    isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
+    }
 
     // MARK: - Property handling (shared by both engines via the MPVProperty event bus)
 
@@ -860,6 +889,37 @@ struct TVPlayerView: View {
                 autoSelectTracks()
             }
         case MPVProperty.endFileError:
+            // DIRECT DV lane failure: demote to the AVPlayer REMUX lane in place (ladder rung 1 of
+            // direct -> remux -> libmpv). The pipeline fails fast pre-mount for every classify miss
+            // (wrong profile, no passthrough audio, unusable hvcC), and the remux lane can transcode
+            // audio and repair extradata, so falling THROUGH it loses nothing. The engine hard-latches
+            // its emissions on stop(), so no stale direct event can reach the AVPlayer paths below.
+            if coordinator.player is VortXDirectDVEngineController {
+                loadTimeout?.cancel()
+                avStartWatchdog?.cancel(); avStartWatchdog = nil
+                DiagnosticsLog.log("dv", "direct DV lane failed (\((data as? String) ?? "-")) -> AVPlayer remux lane in place")
+                coordinator.player?.stop()
+                engineSwitchedAt = Date()
+                // Carry the live position into the remux mount exactly like demoteAVPlayerToMPV does.
+                let reconcileResume: Double? = hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : (resumeSeconds ?? suppressedResumeFloor)
+                hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
+                inFlightSeekTarget = nil
+                resumeSeconds = reconcileResume
+                directDVFailed = true
+                startLoadTimeout()
+                // In-place source/episode switches moved curURL off the launch url; re-point the fresh
+                // AVPlayer mount at the ACTIVE stream once its controller exists (same deferral shape as
+                // demoteAVPlayerToMPV, keyed on this demote's own latch).
+                if let cu = curURL, cu != url {
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard directDVFailed, !Task.isCancelled, curURL == cu else { return }
+                        appliedResume = false
+                        loadIntoPlayer(cu, headers: curHeaders, live: curIsLive)
+                    }
+                }
+                break
+            }
             // Stale event from the just-dismounted AVPlayer engine after a user engine switch / demote: a KVO
             // .failed queued on the main thread can land AFTER the surface swap. Swallow it (and DON'T cancel
             // the fresh mpv load's watchdog) when the AV engine is no longer the mounted one, so it never burns
@@ -2538,7 +2598,11 @@ struct TVPlayerView: View {
     /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
     /// design; matching is by lang/title). No-op when already on the requested engine.
     private func switchPlayerEngine(toAVPlayer: Bool) {
-        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        // The DIRECT DV lane counts as the "AVPlayer side" for the picker: picking libmpv from it must
+        // switch, and picking AVPlayer from it means the REMUX lane specifically (the manual override set
+        // below makes useDirectDVLane stand down, so the AVPlayer surface that mounts is the remux one).
+        let onAppleLane = isAVPlayerActive || coordinator.player is VortXDirectDVEngineController
+        guard toAVPlayer != onAppleLane else { withAnimation { showOptions = false }; return }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
         // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.
