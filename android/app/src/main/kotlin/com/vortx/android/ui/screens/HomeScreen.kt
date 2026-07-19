@@ -1,6 +1,7 @@
 package com.vortx.android.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,10 +20,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
@@ -63,23 +66,20 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
 @Composable
 private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, modifier: Modifier) {
     val hero = catalogs.firstOrNull()?.items?.firstOrNull()
-    // GROUP 3a fix (Tab S11 Ultra device round): the hero is a flat gradient placeholder with no real
-    // artwork behind it (S10 brings the real rotating-featured backdrop) -- on a phone that reads as an
-    // intentional cinematic panel, but stretched across a large-screen width (tablet / unfolded
-    // foldable, >= the Material "expanded" width-class breakpoint) the SAME flat gradient becomes a
-    // huge, mostly-empty black bar that read as a broken/blank Home (screenshot p5). The fix chosen
-    // here is the smaller of the two options the plan allows: fall back to a plain rail-first layout
-    // above the breakpoint instead of building S10's real rotating hero early. Phones (and the Fold's
-    // narrow cover screen) are completely unaffected -- this only removes the placeholder gradient
-    // block on screens wide enough that it was never going to read as intentional.
-    val isLargeScreen = LocalConfiguration.current.screenWidthDp >= LARGE_SCREEN_BREAKPOINT_DP
+    // The featured hero is the first item of the first rail (Continue Watching, else the leading add-on
+    // catalog) -- the SAME data the rails below already render. It now loads that title's real
+    // backdrop/poster art (see [HeroHeader]), so the earlier large-screen gate (which hid the hero on
+    // tablets/foldables precisely BECAUSE it was an artwork-less flat gradient that stretched into a
+    // "huge, mostly-empty black bar", the Tab S11 Ultra GROUP 3a finding) no longer applies: with real
+    // art plus the height cap in [HeroHeader], the panel reads as intentional at any width. The blank
+    // hero the device round hit was this billboard never binding any image at all.
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(bottom = VortXTheme.spacing.xl),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
     ) {
-        if (hero != null && !isLargeScreen) {
-            item { HeroHeader(hero) }
+        if (hero != null) {
+            item { HeroHeader(hero, onItem) }
         }
         items(catalogs, key = { it.id }) { catalog ->
             // The leading Continue Watching rail carries the editorial kicker, like tvOS.
@@ -88,10 +88,6 @@ private fun HomeContent(catalogs: List<Catalog>, onItem: (MetaItem) -> Unit, mod
         }
     }
 }
-
-/// Material 3's "expanded" window width-class breakpoint (large tablets / unfolded foldables), used as
-/// the large-vs-phone cutoff for [HomeContent]'s hero fallback.
-private const val LARGE_SCREEN_BREAKPOINT_DP = 840
 
 @Composable
 private fun LoadingColumn(modifier: Modifier) {
@@ -104,22 +100,28 @@ private fun LoadingColumn(modifier: Modifier) {
     }
 }
 
-/// The featured-hero billboard (DESIGN-SYSTEM.md §4 "Featured hero"): a full-bleed backdrop with a
-/// dual scrim (here: a vertical fade to canvas, the leading-fade half is deferred to S10's real
-/// artwork/rotation work — this session only re-skins the placeholder to the token set) and the
-/// bottom-left content block (eyebrow kicker + serif hero title + meta line).
+/// The featured-hero billboard (DESIGN-SYSTEM.md §4 "Featured hero"): the featured title's full-bleed
+/// backdrop (falling back to its poster, then to a plain gradient when neither has loaded) under a
+/// bottom scrim that fades to canvas, with the bottom-left content block (eyebrow kicker + serif hero
+/// title + meta line). Tapping it opens the title. The S10 rotation/leading-fade work is still to come.
 @Composable
-private fun HeroHeader(item: MetaItem) {
+private fun HeroHeader(item: MetaItem, onItem: (MetaItem) -> Unit) {
     val colors = VortXTheme.colors
+    // The featured title's real artwork, drawn from the SAME catalog data the rails use: prefer the
+    // wide featured backdrop ([MetaItem.background], what browse pages lead with and what the engine's
+    // `parseMetaPreview` fills for add-on catalog items), fall back to the poster (Continue Watching
+    // items carry only that). Both go through the one app-wide Coil loader, exactly like [PosterArt].
+    // Null/blank on both (the offline preview, or a still-hydrating first item) keeps the plain
+    // gradient so the panel stays intentional rather than empty -- the sensible fallback.
+    val backdropUrl = item.background?.takeUnless { it.isBlank() } ?: item.poster?.takeUnless { it.isBlank() }
     Box(
         modifier = Modifier
             .fillMaxWidth()
             // Cap the hero's height BEFORE applying the aspect ratio: on a large-screen portrait
             // window (tablet / unfolded foldable, width 800-1000dp) an unclamped 16:10 of full width
-            // is a 500-640dp near-black gradient block that swallows the viewport and reads as a
-            // blank screen (S03 device-round finding on the Tab S11 Ultra). Phones stay under the
-            // cap, so their ratio is untouched; when the cap binds, the box goes full-width at
-            // 420dp tall instead (fine for a gradient; S10's real artwork brings its own sizing).
+            // is a 500-640dp block that swallows the viewport (S03 device-round finding on the Tab S11
+            // Ultra). Phones stay under the cap, so their ratio is untouched; when the cap binds, the
+            // box goes full-width at 420dp tall instead.
             .heightIn(max = 420.dp)
             .aspectRatio(16f / 10f)
             // GROUP 3a: a Box does not clip its children by default, so a title tall enough to exceed
@@ -129,8 +131,31 @@ private fun HeroHeader(item: MetaItem) {
             // AFTER this one, appeared to render "behind" it -- the device-round "Obsession" overlap
             // finding. Clipping plus the title's own line/overflow limit below are the two guards.
             .clipToBounds()
+            // Tap the billboard to open the featured title, the same action a poster tap performs.
+            .clickable { onItem(item) }
+            // Placeholder fill for when there is no artwork yet; hidden behind the image when there is.
             .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
     ) {
+        if (backdropUrl != null) {
+            AsyncImage(
+                model = backdropUrl,
+                contentDescription = item.name,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+            // Bottom-anchored scrim so the eyebrow/title/meta stay legible over any artwork: the
+            // DESIGN-SYSTEM hero's fade to canvas, without dimming the top of the image.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0.35f to Color.Transparent,
+                            1f to colors.canvas,
+                        ),
+                    ),
+            )
+        }
         Column(modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.edge)) {
             Text(text = item.type.label.uppercase(), style = VortXTheme.type.eyebrow)
             Text(
