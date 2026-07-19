@@ -209,6 +209,11 @@ struct RootTabView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
+    /// Observed only to SKIP arming the seeding nag while something is playing (the player covers the
+    /// shell); the same shared object RootView drives the player with.
+    @EnvironmentObject private var presenter: PlayerPresenter
+    /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
+    @State private var showSeedingNag = false
     @State private var selection = 0
     // Per-tab identity token. Each tab owns its own NavigationStack whose pushed pages persist
     // while the tab stays alive (tvOS keeps tabs mounted). Bumping the token of the tab you LEAVE
@@ -358,6 +363,12 @@ struct RootTabView: View {
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
         }
+        // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
+        // Apple TV still owes its first VortX-account sync. armLaunchNag waits out the splash + the
+        // profile picker so the sheet never fights a modal; skipped while something is playing. Always
+        // dismissible, never blocks the app.
+        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagTV() }
+        .task { await armSeedingNag() }
         .onAppear {
             applyTabBarAccent()
             // Same idea as applyTabBarAccent, for the other tvOS system-white default: the UITextField
@@ -455,6 +466,15 @@ struct RootTabView: View {
     /// The focused / selected tab pill is system white by default; recolor it to the active accent
     /// with dark on-accent ink, and push the appearance onto any live tab bars so an accent change
     /// repaints without a relaunch.
+    /// Phase-0 seeding nag arm (com.vortx move): a named method (not an inline closure) so the shell
+    /// body's already-tight type-check budget pays nothing for it. Skips arming while something is
+    /// playing (the player covers the shell); MoveSeeding gates once-per-launch + needs-seeding.
+    private func armSeedingNag() async {
+        await MoveSeeding.armLaunchNag {
+            if presenter.request == nil { showSeedingNag = true }
+        }
+    }
+
     private func applyTabBarAccent() {
         let item = UITabBarItemAppearance()
         item.normal.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.textSecondary)]

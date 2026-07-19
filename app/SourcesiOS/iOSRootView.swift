@@ -91,6 +91,8 @@ struct iOSRootView: View {
     /// once, then stays mounted (opacity-switched) so its state survives switches exactly as before.
     /// Launch no longer pays for ~6 unvisited screens' engine subscriptions, heroes, and image loads.
     @State private var visitedTabs: Set<Int> = [Tab.home.rawValue]
+    /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
+    @State private var showSeedingNag = false
     #if os(macOS)
     /// macOS keyboard browse: the focused bottom tab-strip item (its own focus space, traversed with
     /// Left/Right and Tab; Enter switches to it). nil = no tab in the strip is focused. Keyed by raw value.
@@ -287,6 +289,11 @@ struct iOSRootView: View {
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
         }
+        // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
+        // device still owes its first VortX-account sync. armLaunchNag waits out the splashless iOS launch
+        // + the profile picker, so the sheet never fights a modal; always dismissible, never blocks use.
+        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagView() }
+        .task { await armSeedingNag() }
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
         }
@@ -341,6 +348,13 @@ struct iOSRootView: View {
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
         .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+    }
+
+    /// Phase-0 seeding nag arm (com.vortx move): a named method (not an inline closure) so the shell
+    /// body's already-tight type-check budget pays nothing for it. MoveSeeding gates once-per-launch,
+    /// waits out the profile picker, and only fires while the device still needs seeding.
+    private func armSeedingNag() async {
+        await MoveSeeding.armLaunchNag { showSeedingNag = true }
     }
 
     #if os(macOS)

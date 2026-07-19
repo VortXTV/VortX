@@ -226,6 +226,13 @@ struct PlayerScreen: View {
     @State private var isHDR = false
     @State private var metadataLine = ""        // "4K · HDR · EAC3"-style line shown under the title
     @State private var controlsVisible = true
+    /// Player Lock: while true the chrome is hidden and non-interactive and a tap on the video only
+    /// reveals the small unlock chip, so a pocketed phone / a handed-over device can't seek or pause by
+    /// accident. Engaged from the top bar's lock button; per-playback state (never persisted).
+    @State private var isLocked = false
+    /// The transient unlock affordance a locked player shows on tap; auto-hides after a few seconds.
+    @State private var unlockChipVisible = false
+    @State private var unlockChipHideTask: Task<Void, Never>?
     @State private var scrubbing = false
     @State private var scrubTarget: Double = 0   // committed scrub position while dragging; avoids timePos fighting the thumb (#32)
     @State private var refreshTask: Task<Void, Never>?   // debounced panel/track refresh; cancellable so it can't outlive the player (#20)
@@ -675,20 +682,47 @@ struct PlayerScreen: View {
             // recognizer on the Metal view frequently missed taps (you had to tap many times);
             // a SwiftUI contentShape layer catches every tap. The controls sit above it, so their
             // buttons still work and a tap on empty space falls through here to toggle.
-            Color.clear.contentShape(Rectangle()).onTapGesture { toggleControls() }.ignoresSafeArea()
-                .accessibilityLabel("Show player controls")
-                .accessibilityAction { toggleControls() }
+            Color.clear.contentShape(Rectangle())
+                .onTapGesture { if isLocked { revealUnlockChip() } else { toggleControls() } }
+                .ignoresSafeArea()
+                .accessibilityLabel(isLocked ? "Unlock player controls" : "Show player controls")
+                .accessibilityAction { if isLocked { revealUnlockChip() } else { toggleControls() } }
 
             if (buffering || reconnecting) && !loadFailed { bufferingOverlay }
 
             // Skip pill shows only while watching (controls hidden); suppressed once the Up Next band is up
             // so the two end-of-episode prompts never stack.
-            if let seg = currentSkip, !controlsVisible, panel == nil, !loadFailed, upNextRemaining == nil { skipPill(seg) }
+            // Suppressed while locked: the pill is a tap-to-seek affordance, and the whole point of the
+            // lock is that no stray tap can move playback.
+            if let seg = currentSkip, !controlsVisible, !isLocked, panel == nil, !loadFailed, upNextRemaining == nil { skipPill(seg) }
 
             // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
             // still reach them when auto-hidden — otherwise a hidden bar drops out of the a11y tree (#31).
+            // A LOCKED player keeps them faded AND non-interactive regardless of controlsVisible; the
+            // unlock chip below is the only interactive element until unlock.
             if !loadFailed {
-                controls.opacity(controlsVisible ? 1 : 0).allowsHitTesting(controlsVisible)
+                controls.opacity(controlsVisible && !isLocked ? 1 : 0)
+                    .allowsHitTesting(controlsVisible && !isLocked)
+            }
+
+            // The lock's single escape hatch: a small top-center chip, revealed by tapping the locked
+            // video and auto-hidden a few seconds later. Tapping it unlocks and restores the chrome.
+            if isLocked, unlockChipVisible, !loadFailed {
+                VStack {
+                    Button { unlock() } label: {
+                        Label("Unlock", systemImage: "lock.fill")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .vortxGlassToast(in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Unlock player controls")
+                    .padding(.top, 24)
+                    Spacer()
+                }
+                .transition(.opacity)
+                .zIndex(50)
             }
 
             if upNextRemaining != nil, panel == nil, !loadFailed, hasStartedPlaying { upNextBand }
@@ -2672,6 +2706,10 @@ struct PlayerScreen: View {
             }
             #endif
             #if os(iOS)
+            // Player Lock (touch surfaces): hide the chrome and ignore every tap until the small unlock
+            // chip is used, so nothing can accidentally seek/pause. iOS-only affordance (a pointer/remote
+            // can't pocket-tap); the state machinery compiles everywhere harmlessly.
+            iconButton("lock.open", label: "Lock player controls") { engageLock() }
             AirPlayRoutePickerButton()   // start AirPlay from the player overlay (AVPlayer/HLS mirrors video, libmpv routes audio)
             #endif
             volumeControl   // D5: in-player volume slider + mute (libmpv `volume` / AVPlayer.volume), persisted
@@ -4626,6 +4664,41 @@ struct PlayerScreen: View {
         if panel != nil { return }   // a tap behind an open panel shouldn't flip the bar; the scrim handles dismissal
         withAnimation(.easeInOut(duration: 0.2)) { controlsVisible.toggle() }
         if controlsVisible { scheduleHide() } else { hideTask?.cancel() }
+    }
+
+    // MARK: - Player Lock (touch-lock)
+
+    /// Engage the lock from the top bar: chrome drops immediately, the auto-hide timer stands down, and
+    /// a brief unlock-chip flash teaches where the exit is.
+    private func engageLock() {
+        hideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isLocked = true
+            controlsVisible = false
+        }
+        revealUnlockChip()
+    }
+
+    /// A tap on the locked video: flash the unlock chip for a few seconds instead of toggling controls.
+    private func revealUnlockChip() {
+        withAnimation(.easeInOut(duration: 0.2)) { unlockChipVisible = true }
+        unlockChipHideTask?.cancel()
+        unlockChipHideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.3)) { unlockChipVisible = false }
+        }
+    }
+
+    /// Unlock: restore the chrome exactly as a normal tap-to-show would (visible now, auto-hide re-armed).
+    private func unlock() {
+        unlockChipHideTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            isLocked = false
+            unlockChipVisible = false
+            controlsVisible = true
+        }
+        scheduleHide()
     }
     private func scheduleHide() {
         noteInteraction()            // every control interaction routes through here: re-arm the idle guard

@@ -53,6 +53,11 @@ struct FeaturedHeroView: View {
     /// resolve never paints another title's clip. `url == nil` = attempted, no direct stream (mount the
     /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
     @State private var heroClipDirect: (heroID: String, url: URL?)?
+    /// Dynamic dominant-color backdrop: the featured art's average color (PosterImageLoader.averageColor),
+    /// painted as the band's BASE layer in place of flat canvas, so the load-in / fallback state and the
+    /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
+    /// today's fixed canvas + gradients exactly, so this is purely additive ambience.
+    @State private var heroTint: Color?
 
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
@@ -158,6 +163,15 @@ struct FeaturedHeroView: View {
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
+        // Dynamic dominant-color backdrop: recompute the band's base tint per featured title, off-main and
+        // cached (PosterImageLoader.averageColor). Cross-fades with the art; nil keeps the canvas fallback.
+        .task(id: model.hero?.id) {
+            let tint = await PosterImageLoader.averageColor(model.hero?.backdrop ?? model.hero?.poster)
+            guard !Task.isCancelled else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
+                heroTint = tint
+            }
+        }
         // FALLBACK cover (iOS/Mac, no server): the keyless WKWebView IFrame, used only when the native /yt
         // resolver is unavailable (Lite build) but a YouTube id exists. Fills the window on macOS too.
         .platformFullScreenPlayerCover(item: $trailerEmbed) { launch in
@@ -231,6 +245,10 @@ struct FeaturedHeroView: View {
         GeometryReader { geo in
             KenBurnsArt {
             ZStack {
+                // Dynamic dominant-color base: the featured art's average color under everything, so the
+                // band already carries the title's palette while the art streams in (and whenever a layer
+                // above misses). nil = today's flat canvas, the graceful fallback.
+                (heroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
                 // band (the iPhone "no backdrop" report — AsyncImage fell straight to the black canvas on
                 // a load miss while the iPad had it cached). The poster is the catalog art the screen
@@ -287,13 +305,14 @@ struct FeaturedHeroView: View {
                 if case .success(let img) = phase {
                     img.resizable().aspectRatio(contentMode: .fill)
                 } else {
-                    Theme.Palette.canvas
+                    // Dominant-color tint while the poster streams in (falls to canvas with no tint).
+                    (heroTint ?? Theme.Palette.canvas)
                 }
             }
             // Decorative backdrop filler — never announced by VoiceOver.
             .accessibilityHidden(true)
         } else {
-            Theme.Palette.canvas
+            (heroTint ?? Theme.Palette.canvas)
                 .accessibilityHidden(true)
         }
     }

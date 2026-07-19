@@ -40,6 +40,12 @@ final class VortXSyncManager: ObservableObject {
 
     @Published private(set) var account: Account?
     @Published private(set) var isSignedIn = false
+    /// Wall-clock time of the LAST successful sync round-trip for the signed-in account: stamped on every
+    /// ACCEPTED push (pushSyncDocAt) and on every applied / definitively-empty pull (syncDown). Persisted
+    /// per account (lastSyncKey(for:)) so a relaunch still shows "last synced 2 hours ago", and published so
+    /// the seeding banner / SyncSettingsView repaint live. nil = this account has never completed a sync
+    /// from this device (or signed out).
+    @Published private(set) var lastSyncAt: Date?
 
     private let base = "https://api.vortx.tv"
     private let kcAccount = "vortx.sync.session.v1"
@@ -105,6 +111,35 @@ final class VortXSyncManager: ObservableObject {
     private var hasAppliedAccountDoc: Bool {
         get { UserDefaults.standard.bool(forKey: appliedDocKey(for: account?.id)) }
         set { UserDefaults.standard.set(newValue, forKey: appliedDocKey(for: account?.id)) }
+    }
+    /// Per-account "last successful sync" wall-clock stamp behind the published `lastSyncAt`. Keyed per
+    /// account exactly like versionKey(for:) so an account switch shows that account's own stamp. Under the
+    /// `vortx.sync.` prefix so SettingsBackup.deviceLocalKeyPrefixes keeps it out of every synced blob.
+    private func lastSyncKey(for accountId: String?) -> String { "vortx.sync.lastSuccessAt." + (accountId ?? "") }
+    /// Re-seed the published `lastSyncAt` from the persisted per-account stamp (sign-in / Keychain restore).
+    private func reloadLastSyncStamp() {
+        let t = UserDefaults.standard.double(forKey: lastSyncKey(for: account?.id))
+        lastSyncAt = t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+    /// Record a successful sync round-trip NOW. The UserDefaults write rides the remote-apply suppression
+    /// window (nested calls are re-entrancy-safe, see withRemoteApplySuppressed) so stamping a push can
+    /// never arm ANOTHER push via the global didChange observer (a self-echo loop).
+    private func stampSyncSuccess() {
+        let now = Date()
+        withRemoteApplySuppressed {
+            UserDefaults.standard.set(now.timeIntervalSince1970, forKey: lastSyncKey(for: account?.id))
+        }
+        lastSyncAt = now
+    }
+    /// The Phase-0 seeding signal for the com.vortx move: this device is signed in AND has completed at
+    /// least one REAL sync round-trip with the account (an accepted push or an applied pull), so an
+    /// encrypted doc exists server-side and a future reinstall/bundle-id move restores it on sign-in.
+    /// `lastSyncedVersion > 0` backfills installs that synced before this build existed (it advances only
+    /// on an accepted push or an applied pull, never on an `.empty` account); `lastSyncAt` covers the
+    /// fresh path going forward. Deliberately NOT `hasAppliedAccountDoc`, which also flips on an `.empty`
+    /// pull, where nothing is backed up yet.
+    var hasCompletedFirstSync: Bool {
+        isSignedIn && (lastSyncAt != nil || lastSyncedVersion > 0)
     }
     /// In-flight guaranteed restore, so the sign-in kick, the Keychain-restored relaunch kick, and a syncUp
     /// that is blocked by the gate all await ONE restore instead of racing several forced pulls at once.
@@ -259,6 +294,7 @@ final class VortXSyncManager: ObservableObject {
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
               let dk = Data(base64Encoded: p.dataKey) else { return }
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
+        reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
         // On Apple TV that first transition can be minutes away (screensaver dismissal), leaving the device
@@ -273,6 +309,7 @@ final class VortXSyncManager: ObservableObject {
     func signOut() {
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
+        lastSyncAt = nil   // the persisted per-account stamp stays (keyed by account id), the live value clears
         Keychain.set(nil, for: kcAccount)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
@@ -311,6 +348,7 @@ final class VortXSyncManager: ObservableObject {
             username: acct["username"] as? String ?? "",
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
+        reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
         // is active it would also be opened by scenePhase, but adopting here covers the in-place sign-in
@@ -555,6 +593,7 @@ final class VortXSyncManager: ObservableObject {
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
             if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
+            stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
             return .accepted(version: version)
         }
         // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
@@ -1427,6 +1466,11 @@ final class VortXSyncManager: ObservableObject {
         // Same reason as the version stamp for living inside the suppression window: it is a UserDefaults write,
         // and arming a push from the act of restoring is the self-echo this region exists to prevent.
         hasAppliedAccountDoc = true
+        // A decrypted account doc was applied: "last synced" = now. INSIDE the suppression window like the
+        // stamps above: stamping after the window closes would enqueue this write's didChange notification
+        // BEHIND the outer window's queued clear, so the observer would see it unsuppressed and arm a
+        // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
+        stampSyncSuccess()
         }   // end withRemoteApplySuppressed
         return restored
     }

@@ -1387,6 +1387,34 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    /// Clear the WHOLE Continue Watching rail durably (Settings > Advanced). Per title this is exactly the
+    /// long-press "Remove from Continue Watching" path, so it inherits its cross-device durability: the
+    /// OWNER branch tombstones every id (LibraryTombstones) BEFORE the engine dispatch so vortxSummary
+    /// subtracts them from the doc.vortx.library union and peers fold the removals, and an overlay profile
+    /// touches only its private history via ProfileStore. One immediate push at the end for the whole batch
+    /// (not one per title, unlike the single-item path) so the tombstones land promptly without N round
+    /// trips. Never "just delete locally": a bare local clear would be resurrected by the next union pull.
+    func clearContinueWatching() {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: CW renders from the profile's private overlay; clear those entries only.
+            for item in ProfileStore.shared.cwItems {
+                ProfileStore.shared.removeWatchEntry(metaId: item.id)
+            }
+            return
+        }
+        let ids = continueWatching.map(\.id)
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            LibraryTombstones.tombstone(id)
+            dispatchCtx(["action": "RemoveFromLibrary", "args": id])
+        }
+        // The engine re-emits continue_watching_preview + library, so the rail empties on its own.
+        Task {
+            let ok = await VortXSyncManager.shared.pushThisDevice()
+            NSLog("[library] cleared Continue Watching (%d titles), pushed to sync (ok=%@)", ids.count, ok ? "yes" : "no")
+        }
+    }
+
     /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
     /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
     /// entries rather than full catalog previews. A no-op if the id isn't in the library.

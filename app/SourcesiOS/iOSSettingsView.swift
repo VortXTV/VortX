@@ -153,10 +153,16 @@ struct iOSSettingsView: View {
     @State private var showLibraryExporter = false
     @State private var showLibraryImporter = false
     @State private var libraryDocument: BackupDocument?
+    // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
+    @State private var showClearCWConfirm = false
 
     var body: some View {
         NavigationStack {
             Form {
+                // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the search
+                // field, ungated by the settings filter so the move state is ALWAYS inspectable here. Not
+                // launch-gated (unlike the nag sheet): signed-out it prompts, signed-in it confirms.
+                seedingSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
                 // Search field pinned at the top: typing filters the sections below (additive, the whole
                 // tree stays intact and returns the moment the field is cleared).
                 searchSection
@@ -489,6 +495,57 @@ struct iOSSettingsView: View {
         }
     }
 
+    // MARK: Move seeding (Phase 0 of the com.vortx move)
+
+    /// The persistent Settings twin of the launch nag (MoveSeedingNagView): while this device owes its
+    /// first VortX-account sync it prompts (sign-in + the file-backup decline path, both reusing the
+    /// flows this screen already owns); once seeded it confirms with the live last-sync time.
+    @ViewBuilder private var seedingSection: some View {
+        Section {
+            if vortxSync.hasCompletedFirstSync {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(MoveSeeding.backedUpLine).font(.subheadline.weight(.semibold))
+                        Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "checkmark.icloud.fill").foregroundStyle(Theme.Palette.accent)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(MoveSeeding.headline, systemImage: "shippingbox.fill")
+                        .font(.subheadline.weight(.semibold))
+                    Text(MoveSeeding.message)
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                if vortxSync.isSignedIn {
+                    // Signed in but the first round-trip has not landed yet: offer the manual kick.
+                    Button {
+                        Task { await vortxSync.pushThisDevice() }
+                    } label: {
+                        Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                } else {
+                    NavigationLink("Sign in / Create account") { SyncSettingsView() }
+                        .font(.subheadline.weight(.semibold))
+                }
+                Button {
+                    do {
+                        backupDocument = BackupDocument(data: try SettingsBackup.makeBackup())
+                        showBackupExporter = true
+                    } catch {
+                        backupAlert = BackupAlert(title: String(localized: "Backup Failed"), message: error.localizedDescription)
+                    }
+                } label: {
+                    Label("Export backup instead", systemImage: "arrow.up.doc")
+                }
+            }
+        } header: {
+            Text("Moving day")
+        }
+    }
+
     // MARK: Account
 
     @ViewBuilder private var accountSection: some View {
@@ -689,6 +746,21 @@ struct iOSSettingsView: View {
                         message: String(localized: "Turn on Diagnostic logging, reproduce the issue, then export the log."))
                 }
                 .tint(Theme.Palette.accent)
+            }
+            // Clear the whole Continue Watching rail, durably: tombstoned per title (LibraryTombstones)
+            // exactly like the long-press per-item remove, so sync can never resurrect the rail.
+            Button(role: .destructive) {
+                showClearCWConfirm = true
+            } label: {
+                Label("Clear Continue Watching", systemImage: "minus.circle")
+            }
+            .confirmationDialog("Clear Continue Watching?", isPresented: $showClearCWConfirm, titleVisibility: .visible) {
+                Button("Clear Continue Watching", role: .destructive) {
+                    CoreBridge.shared.clearContinueWatching()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Removes every title from Continue Watching on this profile, across all your devices. Titles stay watchable from Search and Discover.")
             }
         } header: {
             Text("Advanced (mpv options)")
