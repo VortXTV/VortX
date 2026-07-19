@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -52,6 +53,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import com.vortx.android.VortXApplication
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
@@ -128,6 +130,21 @@ fun PlayerScreen(
         controlsInteractionTick++
     }
 
+    // PLAYER LOCK (touch-lock). Engaged from the chrome's lock control: the chrome hides and every
+    // tap/double-tap/key is swallowed so nothing mid-film seeks or pauses by accident (handing the
+    // phone over, pocketing it, a sprawled thumb). The ONLY interactive surface while locked is a
+    // small glass "Tap to unlock" affordance that a bare tap reveals (auto-hidden again after
+    // [UNLOCK_HINT_AUTO_HIDE_MS]); unlocking restores the normal chrome. Hardware Back deliberately
+    // keeps meaning "leave the player": the lock guards against accidental TOUCH, and trapping the
+    // viewer inside a locked player would be worse than any accidental exit.
+    var controlsLocked by remember(playable.url) { mutableStateOf(false) }
+    var unlockHintVisible by remember(playable.url) { mutableStateOf(false) }
+    var unlockHintTick by remember(playable.url) { mutableStateOf(0) }
+    fun revealUnlockHint() {
+        unlockHintVisible = true
+        unlockHintTick++
+    }
+
     // Force-to-ExoPlayer latch: flipped when the mpv engine reports a surface failure, so the remember
     // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playable url so a new
     // stream starts fresh.
@@ -197,6 +214,48 @@ fun PlayerScreen(
         if (!controlsVisible || playerState.isPaused || playerState.isBuffering || playerState.hasError) return@LaunchedEffect
         delay(CONTROLS_AUTO_HIDE_MS)
         controlsVisible = false
+    }
+
+    // The unlock affordance's own auto-hide: while locked, the small "Tap to unlock" pill stays up a
+    // couple of seconds after each reveal (any tap/key re-reveals + re-arms via [unlockHintTick]),
+    // then drops back to clean full-screen video.
+    LaunchedEffect(controlsLocked, unlockHintVisible, unlockHintTick) {
+        if (!controlsLocked || !unlockHintVisible) return@LaunchedEffect
+        delay(UNLOCK_HINT_AUTO_HIDE_MS)
+        unlockHintVisible = false
+    }
+
+    // ADD-ON SUBTITLES (the Android port of Apple SubtitleAddons.swift:37 `installedSources` +
+    // :54 `fetch`): once per load, union the installed subtitle-capable add-ons (minus any the
+    // active profile turned off) and fetch their external tracks for THIS title, keyed by the
+    // playable's imdb identity. Fail-soft at every step -- a trailer, an id-less playable, no
+    // subtitle add-ons installed, or a flaky add-on simply leaves the sheet's add-on section empty.
+    // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
+    // it on the live engine (mpv `sub-add` / the ExoPlayer side-loaded track rebuild) and
+    // auto-selects it once the engine reports the grown track list.
+    var addonSubtitles by remember(playable.url) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    val mountedAddonSubs = remember(playable.url) { mutableSetOf<String>() }
+    var pendingSubSelectAbove by remember(playable.url) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(playable.url) {
+        if (playable.isTrailer) return@LaunchedEffect
+        val ref = playable.mediaRef ?: return@LaunchedEffect
+        val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
+        val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+        val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
+        if (sources.isEmpty()) return@LaunchedEffect
+        addonSubtitles = SubtitleAddonService.fetch(sources, type, videoId)
+    }
+    // A picked add-on subtitle has mounted when the engine's subtitle list grows past its pre-mount
+    // count; select the newly appended track (mpv appends on `sub-add`, the ExoPlayer rebuild
+    // appends the side-loaded config last). Idempotent on mpv, whose `sub-add` default flag already
+    // selects the new track.
+    LaunchedEffect(playerState.subtitleTracks) {
+        val preMountCount = pendingSubSelectAbove ?: return@LaunchedEffect
+        val tracks = latestState.subtitleTracks
+        if (tracks.size > preMountCount) {
+            tracks.lastOrNull()?.let { engine.selectSubtitleTrack(it.id) }
+            pendingSubSelectAbove = null
+        }
     }
 
     // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
@@ -414,6 +473,21 @@ fun PlayerScreen(
             .focusRequester(rootFocus)
             .onKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                if (controlsLocked) {
+                    // Locked: swallow everything except Back/Escape (leaving the player must always
+                    // work). OK/Enter UNLOCKS, so a D-pad-only device (TV, or a phone with a remote)
+                    // can always get out of the lock without a touchscreen; any other key just
+                    // surfaces the unlock affordance so the press is not a dead end.
+                    if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
+                    if (event.key == Key.Enter || event.key == Key.NumPadEnter || event.key == Key.DirectionCenter) {
+                        controlsLocked = false
+                        unlockHintVisible = false
+                        showControls()
+                        return@onKeyEvent true
+                    }
+                    revealUnlockHint()
+                    return@onKeyEvent true
+                }
                 if (!controlsVisible) {
                     // Back must keep meaning "leave the player", never be swallowed into a reveal.
                     if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
@@ -438,17 +512,23 @@ fun PlayerScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(engine) {
-                    detectTapGestures(
-                        onTap = {
-                            if (controlsVisible) controlsVisible = false else showControls()
-                        },
-                        onDoubleTap = { offset ->
-                            val forward = offset.x >= size.width / 2
-                            engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
-                            showControls()
-                        },
-                    )
+                .pointerInput(engine, controlsLocked) {
+                    if (controlsLocked) {
+                        // Locked: taps only reveal the unlock affordance; the double-tap seek is
+                        // deliberately absent so no gesture can move playback.
+                        detectTapGestures(onTap = { revealUnlockHint() })
+                    } else {
+                        detectTapGestures(
+                            onTap = {
+                                if (controlsVisible) controlsVisible = false else showControls()
+                            },
+                            onDoubleTap = { offset ->
+                                val forward = offset.x >= size.width / 2
+                                engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
+                                showControls()
+                            },
+                        )
+                    }
                 },
         )
 
@@ -459,7 +539,7 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
-            controlsVisible = controlsVisible,
+            controlsVisible = controlsVisible && !controlsLocked,
             // Continuous interactions the chrome owns internally (scrubber drags, sheet opens) re-arm
             // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
             onInteraction = { showControls() },
@@ -479,6 +559,22 @@ fun PlayerScreen(
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
+            onLock = {
+                controlsLocked = true
+                controlsVisible = false
+                // Show the unlock pill once on engage so the viewer learns where unlock lives.
+                revealUnlockHint()
+            },
+            addonSubtitles = addonSubtitles,
+            onSelectAddonSubtitle = { sub ->
+                showControls()
+                // Mount once per URL: a re-pick of an already-mounted subtitle would only duplicate
+                // the track (it is selectable from the embedded list above once mounted).
+                if (mountedAddonSubs.add(sub.url)) {
+                    pendingSubSelectAbove = latestState.subtitleTracks.size
+                    engine.addExternalSubtitle(sub.url)
+                }
+            },
             // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
             // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null
             // until (or unless) this title has a community sheet, and the scrubber then simply shows no
@@ -491,12 +587,49 @@ fun PlayerScreen(
         // the bottom-right, clear of the transport bar. Shows only while the playhead sits inside a
         // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
         // scrubber does), so it works identically on libmpv and ExoPlayer.
-        SkipButton(
-            segments = skipSegments,
-            positionMs = playerState.positionMs,
-            emberAccent = emberAccent,
-            onSkip = engine::seekTo,
-        )
+        // While locked, the skip affordance is withheld too: it is a tappable seek, exactly the class
+        // of accidental input the lock exists to prevent.
+        if (!controlsLocked) {
+            SkipButton(
+                segments = skipSegments,
+                positionMs = playerState.positionMs,
+                emberAccent = emberAccent,
+                onSkip = engine::seekTo,
+            )
+        }
+
+        // The lock's single interactive surface: a small glass pill, revealed by any tap/key while
+        // locked and auto-hidden again. Drawn LAST so it sits above the tap layer and is the one
+        // thing a finger can actually hit.
+        if (controlsLocked && unlockHintVisible) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 24.dp)
+                    .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+                    .clickable {
+                        controlsLocked = false
+                        unlockHintVisible = false
+                        showControls()
+                    }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Lock,
+                    contentDescription = "Unlock player controls",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = "Tap to unlock",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                )
+            }
+        }
     }
 }
 
@@ -583,6 +716,10 @@ private const val DOUBLE_TAP_SEEK_MS = 10_000L
 /// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
 /// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.
 private const val CONTROLS_AUTO_HIDE_MS = 3_500L
+
+/// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
+/// chrome's auto-hide: while locked the whole point is an undisturbed frame.
+private const val UNLOCK_HINT_AUTO_HIDE_MS = 2_500L
 
 internal val DefaultEmber = Color(0xFFD97706)
 

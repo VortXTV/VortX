@@ -473,6 +473,11 @@ data class StreamSource(
 data class StreamGroup(
     val addon: String,
     val streams: List<StreamSource>,
+    /// The add-on's transport base URL (`request.base`), the STABLE identity the per-profile
+    /// disabled-add-on filter keys on (Apple `assembleStreamGroups`' `request.base` guard,
+    /// CoreBridge.swift:984) -- [addon] is a display label (host string) and is not unique enough
+    /// to filter by. Empty for a group whose request carried no base (kept, never filtered).
+    val base: String = "",
 )
 
 /// A resolved, directly-playable handle for the player. The engine turns a [StreamSource] (which may

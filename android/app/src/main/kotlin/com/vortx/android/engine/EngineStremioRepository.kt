@@ -3,8 +3,10 @@ package com.vortx.android.engine
 import android.content.Context
 import android.util.Log
 import com.vortx.android.auth.AuthIdentityStore
+import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.model.AddonOrder
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.model.AuthState
@@ -111,6 +113,14 @@ class EngineStremioRepository(
         SourcePinStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE }
     }
     private val trackPrefs by lazy { TrackPreferencesStore(appContext) }
+
+    /// Add-on order + per-profile on/off overlay (the Android port of Apple's
+    /// `VortXSyncManager.appliedAddonOrder` + `ProfileStore.activeDisabledAddons` pair). Per-profile
+    /// keying reads the ACTIVE profile id live on each call (same provider-lambda pattern as
+    /// [sourcePins]), so a profile switch needs no reload hook here.
+    private val addonPrefs by lazy {
+        AddonPrefsStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: AddonPrefsStore.DEFAULT_PROFILE }
+    }
 
     /// One-time flag read for the vortx-core SHADOW ranking lane (engine cutover Phase 7 slice 1,
     /// the Android analogue of the Apple VortxBridge shadow). Forced on the first stream rank; after
@@ -402,7 +412,20 @@ class EngineStremioRepository(
     /// so [homeUpdates] can call it on every event/poll tick cheaply.
     private fun homeSnapshot(): List<Catalog> {
         val titleMap = EngineState.parseAddonCatalogTitles(StremioCoreNative.getState(EngineActions.ctxField()))
-        val boardRows = EngineState.parseCatalogs(StremioCoreNative.getState(EngineActions.boardField()), titleMap)
+        val allBoardRows = EngineState.parseCatalogs(StremioCoreNative.getState(EngineActions.boardField()), titleMap)
+        // Per-profile add-on on/off overlay (Apple `buildBoardRows`' disabledAddons guard,
+        // CoreBridge.swift:2191): a disabled add-on's catalog rows must not render on this profile's
+        // Home. The row id is "<base>|<type>|<id>" (see [EngineState.parseCatalogs]); rows with no
+        // base ("row-N" fallbacks, the "continue" rail prepended below) are never filtered.
+        val disabledAddons = addonPrefs.disabledBases()
+        val boardRows = if (disabledAddons.isEmpty()) {
+            allBoardRows
+        } else {
+            allBoardRows.filter { row ->
+                val base = row.id.substringBefore('|', "")
+                base.isEmpty() || AddonOrder.normalize(base) !in disabledAddons
+            }
+        }
         // Suppressed right after sign-out: see [suppressHomeUntilFreshLoad]'s doc comment. The engine's
         // continue_watching_preview field keeps serving the PREVIOUS account's items indefinitely (an
         // engine quirk, not a race), so trusting it here would render a signed-out Home with another
@@ -509,8 +532,90 @@ class EngineStremioRepository(
     }
 
     override suspend fun installedAddons(): Result<List<InstalledAddon>> = withContext(Dispatchers.Default) { runCatching {
-        EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        // Display order = the user's applied add-on order (Apple `orderedByApplied` on the add-on
+        // list); newly installed add-ons fold in at the end in engine order. Each entry is stamped
+        // with the ACTIVE profile's on/off overlay so the Add-ons screen renders the eye toggle
+        // state without a second query.
+        val addons = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        val disabledAddons = addonPrefs.disabledBases()
+        addonPrefs.orderedByApplied(addons) { it.transportUrl }.map { addon ->
+            val disabled = AddonOrder.normalize(addon.transportUrl) in disabledAddons
+            if (disabled) addon.copy(isDisabled = true) else addon
+        }
     } }
+
+    override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            addonPrefs.setDisabled(transportUrl, disabled)
+            // A LOCAL overlay change the engine knows nothing about: poke our own reactive surfaces
+            // (ctxUpdates listeners re-read the add-on list; homeUpdates re-snapshots the filtered
+            // board) so the toggle shows everywhere immediately instead of riding the 3s safety poll.
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            Unit
+        } }
+
+    override suspend fun applyAddonOrder(transportUrls: List<String>): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            addonPrefs.setAppliedOrder(transportUrls)
+            // Same local-poke as [setAddonDisabled]: the list order + future meta picks changed.
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            Unit
+        } }
+
+    override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            // Per-profile gate first (Apple `setCatalogWatched`'s `overlaySetWatchedById` branch): an
+            // overlay profile's card mark toggles its OWN private watch overlay, never the account
+            // library (the never-poison invariant).
+            overlayProfiles()?.let { store ->
+                store.setWatched(isWatched, item.id, listOf(item.id), item.name, item.type.id, item.poster)
+                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                return@runCatching
+            }
+            // Engine path (Apple CoreBridge.swift:1624): hand `MetaItemMarkAsWatched` the engine's OWN
+            // serialized preview for this id when a resident catalog field holds it (`MetaItemPreview`
+            // deserializes through a legacy shape, so echoing beats reconstructing), falling back to
+            // the same minimal `{id,type,name,poster}` object [EngineActions.addToLibrary] already
+            // proves the deserializer accepts. The action creates a temporary library item when none
+            // exists -- exactly the mark-from-a-card use case.
+            val preview = rawMetaPreview(item.id) ?: JSONObject()
+                .put("id", item.id)
+                .put("type", item.type.id)
+                .put("name", item.name)
+                .also { if (item.poster != null) it.put("poster", item.poster) }
+            StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+        } }
+
+    /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog
+    /// field currently holds it. Mirrors Apple `CoreBridge.rawMetaPreview(forId:)`: catalog state
+    /// nests previews under `content` arrays a few levels down, so this is a bounded depth-first
+    /// search over the three catalog-shaped fields. Null when no resident field holds the id.
+    private fun rawMetaPreview(metaId: String): JSONObject? {
+        for (field in listOf(EngineActions.FIELD_BOARD, EngineActions.FIELD_DISCOVER, EngineActions.FIELD_SEARCH)) {
+            val root = runCatching { JSONObject(StremioCoreNative.getState("\"$field\"")) }.getOrNull() ?: continue
+            findMetaPreview(root, metaId)?.let { return it }
+        }
+        return null
+    }
+
+    /// Depth-first search for a meta preview (`{id, type, name, …}`) with the given id inside an
+    /// engine state object (Apple `CoreBridge.findMetaPreview`).
+    private fun findMetaPreview(node: Any?, metaId: String): JSONObject? {
+        when (node) {
+            is JSONObject -> {
+                if (node.optString("id") == metaId && node.opt("type") is String && node.opt("name") is String) return node
+                for (key in node.keys()) {
+                    findMetaPreview(node.opt(key), metaId)?.let { return it }
+                }
+            }
+            is org.json.JSONArray -> {
+                for (i in 0 until node.length()) {
+                    findMetaPreview(node.opt(i), metaId)?.let { return it }
+                }
+            }
+        }
+        return null
+    }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
         val normalized = normalizeAddonUrl(url)
@@ -600,7 +705,10 @@ class EngineStremioRepository(
         val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id)) {
             EngineState.parseMetaDetail(it) != null
         }
-        val detail = EngineState.parseMetaDetail(state)
+        // The applied add-on order rides the meta pick (#144 on Apple): the detail meta resolves from
+        // the user's #1 add-on (e.g. a localized meta provider), not whichever the engine lists first.
+        // An empty order (never reordered) keeps the old first-Ready pick byte-identically.
+        val detail = EngineState.parseMetaDetail(state, addonPrefs.appliedOrder())
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
         // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
         // overlay profile (no-op for engine-backed profiles).
@@ -641,7 +749,13 @@ class EngineStremioRepository(
         )
         StreamRanking.installReading(snapshot)
         val pin = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
-        val groups = EngineState.parseStreamGroups(state)
+        // Per-profile add-on on/off overlay (Apple `assembleStreamGroups`' disabledAddons guard,
+        // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
+        // this profile. Groups with no base (a malformed request) are kept, never dropped.
+        val disabledAddons = addonPrefs.disabledBases()
+        val groups = EngineState.parseStreamGroups(state).filter { group ->
+            group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
+        }
         // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
         // kernel fire-and-forget and log the agreement (a diff count). It never touches the ranked
         // list returned below; with the flag at its default OFF this line is one volatile read.
@@ -919,7 +1033,7 @@ class EngineStremioRepository(
     // separate re-load, so ticks/progress/library-chip state flip live the instant the action returns.
 
     private fun currentMetaDetail(): MetaDetail? =
-        EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()))
+        EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()), addonPrefs.appliedOrder())
 
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         // Per-profile gate: an overlay profile's aggregate (movie-level) watched mark toggles its OWN
