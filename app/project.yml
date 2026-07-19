@@ -282,6 +282,14 @@ targets:
         # the shared Products/include/ copy step: "Multiple commands produce .../module.modulemap").
         # Swift finds the nested module through this include path instead.
         SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # Phase 8 server slice: this target's VortxEngine ios-arm64 / ios-arm64-simulator slices are
+        # SERVER-INCLUSIVE (built by scripts/build-ffi-xcframework.sh with the ffi crate's `server`
+        # feature: vortx_server_start/port/base_url/stop). `canImport(VortxEngine)` cannot see
+        # symbols, only the module, so this condition is the per-target statement "the linked slice
+        # carries the server ABI"; SourcesShared/VortxNativeServer.swift compiles its real body
+        # under `canImport(VortxEngine) && VORTX_ENGINE_SERVER` and inert stubs elsewhere. Do NOT
+        # copy this to a target whose slice is kernel-only (tvOS today): it would fail at link.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "183"
         TARGETED_DEVICE_FAMILY: "1,2"

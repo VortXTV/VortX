@@ -54,6 +54,13 @@ struct VortXiOSApp: App {
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
+            #if !os(macOS)
+            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
+            // streaming server (vortx-core over the C server ABI); the player follows its port via
+            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off, so
+            // the default launch path is unchanged and nodejs-mobile keeps serving.
+            VortxNativeServer.startIfNeeded()
+            #endif
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
@@ -83,6 +90,10 @@ struct VortXiOSApp: App {
                         // CONNECTION-REFUSED result while the process is alive, signals the in-node rebind; a
                         // timeout is left alone (busy-but-alive). macOS is excluded: MacNodeServer rebinds 11470.
                         Task.detached(priority: .utility) { await NodeServer.recoverIfSuspended() }
+                        // Phase 8: the flag-gated in-process engine server stops on background (below),
+                        // so foreground restarts it on a fresh ephemeral port; the player follows via
+                        // StremioServer.embeddedPort. No-op while `vortxNativeServer` is off.
+                        VortxNativeServer.startIfNeeded()
                         #endif
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
@@ -97,6 +108,11 @@ struct VortXiOSApp: App {
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     }
                     if phase == .background {
+                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
+                        // Phase 8: stop the flag-gated in-process engine server on background (graceful
+                        // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
+                        VortxNativeServer.stopOnBackground()
+                        #endif
                         VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
                         // push profiles + settings under a background-task grace window so a just-made library
                         // removal / rewind survives a sideload-update process kill (CW resurrection fix).

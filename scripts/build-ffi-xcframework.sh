@@ -1,26 +1,60 @@
 #!/usr/bin/env bash
 # Build the vortx-core engine ABI (the Rust `vortx-ffi` staticlib) for the Apple platforms and
-# package it as app/Vendor/VortxEngine.xcframework - the Phase 7 (engine/apple-cutover) sibling of
-# build-core-xcframework.sh. Requires: Rust nightly + rust-src, Xcode.
+# package it as app/Vendor/VortxEngine.xcframework - the Phase 7/8 (engine/apple-cutover) sibling
+# of build-core-xcframework.sh. Requires: Rust nightly + rust-src, Xcode.
 #
 # This produces EXACTLY the artifact app/project.yml links (see the VortxEngine.xcframework
 # dependency on VortXiOSNative), which is deliberately NOT what the engine workspace's own
-# vortx-core/scripts/build-ffi-xcframework.sh emits. The differences, and why:
-#   - iOS device + iOS simulator + macOS slices only. Those are the targets this branch links
-#     (the shadow ranking diff runs in VortXiOSNative); no tvOS slices yet.
-#   - KERNEL-ONLY build (--no-default-features). VortxBridge.swift drives the frozen vortx_* C
-#     ABI only; the default `host` feature would drag tokio + reqwest into an Apple cross-compile
-#     for no consumer.
-#   - Every slice builds against a panic_abort std (-Z build-std=std,panic_abort) so no panic can
-#     unwind across the C boundary, mirroring the stremio-core recipe.
+# vortx-core/scripts/build-ffi-xcframework.sh emits. The layout, per slice:
+#
+#   ios-arm64            SERVER-INCLUSIVE (kernel ABI + vortx_server_start/port/base_url/stop)
+#   ios-arm64-simulator  SERVER-INCLUSIVE
+#   tvos-arm64           KERNEL-ONLY (see the tier-3 note below)
+#   tvos-arm64-simulator KERNEL-ONLY
+#   macos-arm64          KERNEL-ONLY (macOS runs the server as a spawned child; the desktop
+#                        cutover branch owns that lane, so nothing here consumes a mac server)
+#
+# Feature selection (Phase 8): the server slices build the ffi crate with
+# `--no-default-features --features server`. NOT the crate's full default set: the default `host`
+# feature drags rquickjs (the QuickJS JS-plugin executor), and rquickjs-sys 0.12.1 ships NO
+# prebuilt bindings for aarch64-apple-ios (build error: "couldn't read .../bindings/
+# aarch64-apple-ios.rs"), and no Apple app target calls vortx_host_resolve_json anyway. Kernel +
+# server is exactly the ABI the app links.
+#
+# tvOS tier-3 verdict (2026-07-19, honest record): the SERVER feature does NOT cross-compile to
+# aarch64-apple-tvos / aarch64-apple-tvos-sim. The wall is openssl-sys v0.9.117, reached via
+#   librqbit v8.1.1 -> librqbit-sha1-wrapper v4.1.0 (default feature `sha1-crypto-hash`)
+#     -> crypto-hash v0.3.4 -> openssl v0.10.81 -> openssl-sys v0.9.117
+# crypto-hash selects CommonCrypto only for target_os = macos/ios and falls back to OpenSSL for
+# every other unix; tvOS is "other unix" to it and has no OpenSSL sysroot, so the build script
+# aborts ("Could not find directory of OpenSSL installation", exit 101). The fix is engine-side:
+# declare librqbit with default-features = false and its `rust-tls` set (reqwest/rustls-tls +
+# sha1-ring) in vortx-streaming-server/Cargo.toml, then re-verify the rest of the tree (aws-lc-rs
+# on tvOS is the next unknown). Until that lands, tvOS ships kernel-only slices and the app's
+# server manager compiles to inert stubs there (no VORTX_ENGINE_SERVER condition on VortXTV).
+# The KERNEL cross-compiles to both tvOS targets cleanly (verified Finished/exit 0).
+#
+# Both tvOS targets are TIER 3 (no prebuilt std), which is why every slice here builds with
+# `-Z build-std=std,panic_abort` from rust-src - the same flag the panic-abort C-boundary
+# discipline already required on the tier-2 slices.
+#
+# Other invariants, unchanged from the Phase 7 script:
+#   - Every slice builds against a panic_abort std so no panic can unwind across the C boundary.
 #   - ALL non-vortx_* globals are localized per slice (ld -r + -exported_symbols_list). The app
 #     already links StremioXCore (another Rust staticlib) and MPVKit's Libdovi (Rust as well);
 #     any exported std/compiler-builtins symbol from this archive would be a duplicate at link
-#     time. Only the 8 vortx_* entry points stay global.
+#     time. Only the vortx_* entry points stay global.
 #   - Headers are nested as Headers/vortx/{vortx_ffi.h,module.modulemap}. A flat Headers/ would
 #     collide with StremioXCore's module.modulemap in the shared Products/include copy step
 #     ("Multiple commands produce ... module.modulemap"); project.yml points SWIFT_INCLUDE_PATHS
 #     at $(BUILT_PRODUCTS_DIR)/include/vortx to discover the nested module instead.
+#
+# Usage:
+#   build-ffi-xcframework.sh              # the Phase 8 layout above (server on the iOS slices)
+#   build-ffi-xcframework.sh --no-server  # EVERY slice kernel-only: the JSCore/wasm-shaped
+#                                         # fallback route. Same slice set, no server symbols
+#                                         # anywhere; a target built against it must NOT define
+#                                         # VORTX_ENGINE_SERVER.
 #
 # Engine source resolution (first existing crates/ffi wins):
 #   1. $VORTX_ENGINE_DIR                 - explicit override (CI passes the in-repo path)
@@ -31,6 +65,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 source "$HOME/.cargo/env" 2>/dev/null || true
 REPO_ROOT="$(pwd)"
+
+MODE=server
+if [ "${1:-}" = "--no-server" ]; then MODE=kernel; fi
 
 ENGINE_DIR="${VORTX_ENGINE_DIR:-}"
 if [ -z "$ENGINE_DIR" ]; then
@@ -47,25 +84,40 @@ if [ -z "$ENGINE_DIR" ] || [ ! -f "$ENGINE_DIR/crates/ffi/Cargo.toml" ]; then
     exit 1
 fi
 ENGINE_DIR="$(cd "$ENGINE_DIR" && pwd)"
-echo "engine workspace: $ENGINE_DIR"
+echo "engine workspace: $ENGINE_DIR (mode: $MODE)"
 
 BUILDSTD="-Z build-std=std,panic_abort"
 LIB="libvortx_ffi.a"
 OUT="$REPO_ROOT/app/Vendor/VortxEngine.xcframework"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ENGINE_DIR/target}"
 
+# Tier-2 targets install prebuilt components; the tier-3 tvOS triples have none to install
+# (build-std compiles std from rust-src), so they are deliberately absent here.
 rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
 
-build_slice() { # <triple> <sdk>
-    echo "- vortx-ffi $1 (kernel-only)"
+# The per-slice feature sets. `kernel` = the pure frozen kernel ABI; `server` = kernel + the
+# 4-symbol in-process streaming server. See the header comment for why `host` is never built.
+FEATURES_KERNEL="--no-default-features"
+FEATURES_SERVER="--no-default-features --features server"
+
+build_slice() { # <triple> <sdk> <kernel|server>
+    local features="$FEATURES_KERNEL"
+    [ "$3" = server ] && features="$FEATURES_SERVER"
+    echo "- vortx-ffi $1 ($3)"
     SDKROOT="$(xcrun --sdk "$2" --show-sdk-path)" \
         cargo +nightly build $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
-        -p vortx-ffi --no-default-features --release --target "$1"
+        -p vortx-ffi $features --release --target "$1"
 }
 
-build_slice aarch64-apple-ios     iphoneos
-build_slice aarch64-apple-ios-sim iphonesimulator
-build_slice aarch64-apple-darwin  macosx
+# What each slice carries in THIS mode (kernel mode strips the server everywhere).
+IOS_KIND=server
+[ "$MODE" = kernel ] && IOS_KIND=kernel
+
+build_slice aarch64-apple-ios       iphoneos          "$IOS_KIND"
+build_slice aarch64-apple-ios-sim   iphonesimulator   "$IOS_KIND"
+build_slice aarch64-apple-tvos      appletvos         kernel
+build_slice aarch64-apple-tvos-sim  appletvsimulator  kernel
+build_slice aarch64-apple-darwin    macosx            kernel
 
 # Localize every non-vortx_* global. Two other Rust staticlibs live in the same binaries
 # (StremioXCore, MPVKit's Libdovi), so an exported std symbol (or _rust_eh_personality) is a
@@ -86,12 +138,19 @@ localize() { # <triple> <ld-platform> <minos> <sdkver>
 
 IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-version)"
 SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+TVOS_SDK="$(xcrun --sdk appletvos --show-sdk-version)"
+TVSIM_SDK="$(xcrun --sdk appletvsimulator --show-sdk-version)"
 MAC_SDK="$(xcrun --sdk macosx --show-sdk-version)"
-localize aarch64-apple-ios     ios           16.0 "$IOS_SDK"
-localize aarch64-apple-ios-sim ios-simulator 16.0 "$SIM_SDK"
-localize aarch64-apple-darwin  macos         14.0 "$MAC_SDK"
+localize aarch64-apple-ios      ios             16.0 "$IOS_SDK"
+localize aarch64-apple-ios-sim  ios-simulator   16.0 "$SIM_SDK"
+localize aarch64-apple-tvos     tvos            16.0 "$TVOS_SDK"
+localize aarch64-apple-tvos-sim tvos-simulator  16.0 "$TVSIM_SDK"
+localize aarch64-apple-darwin   macos           14.0 "$MAC_SDK"
 
-# Stage the nested header dir: Headers/vortx/{vortx_ffi.h,module.modulemap}.
+# Stage the nested header dir: Headers/vortx/{vortx_ffi.h,module.modulemap}. One header for every
+# slice: it declares the server symbols unconditionally, and a target linking a kernel-only slice
+# is fine as long as its Swift never REFERENCES them - which is exactly what the per-target
+# VORTX_ENGINE_SERVER compilation condition enforces (see project.yml / VortxNativeServer.swift).
 HDRS="$(mktemp -d)"
 mkdir -p "$HDRS/vortx"
 cp "$ENGINE_DIR/crates/ffi/include/vortx_ffi.h" "$HDRS/vortx/"
@@ -106,13 +165,17 @@ echo "- packaging $OUT"
 mkdir -p "$REPO_ROOT/app/Vendor"
 rm -rf "$OUT"
 xcodebuild -create-xcframework \
-    -library "$TARGET_DIR/aarch64-apple-ios/release/$LIB"     -headers "$HDRS" \
-    -library "$TARGET_DIR/aarch64-apple-ios-sim/release/$LIB" -headers "$HDRS" \
-    -library "$TARGET_DIR/aarch64-apple-darwin/release/$LIB"  -headers "$HDRS" \
+    -library "$TARGET_DIR/aarch64-apple-ios/release/$LIB"      -headers "$HDRS" \
+    -library "$TARGET_DIR/aarch64-apple-ios-sim/release/$LIB"  -headers "$HDRS" \
+    -library "$TARGET_DIR/aarch64-apple-tvos/release/$LIB"     -headers "$HDRS" \
+    -library "$TARGET_DIR/aarch64-apple-tvos-sim/release/$LIB" -headers "$HDRS" \
+    -library "$TARGET_DIR/aarch64-apple-darwin/release/$LIB"   -headers "$HDRS" \
     -output "$OUT"
 
-echo "- exported globals per slice (must be vortx_* only):"
-for slice in ios-arm64 ios-arm64-simulator macos-arm64; do
-    echo "  $slice: $(nm -gUj "$OUT/$slice/$LIB" | sort -u | tr '\n' ' ')"
+echo "- slice audit (exports must be vortx_* only; server column from _vortx_server_start):"
+for slice in ios-arm64 ios-arm64-simulator tvos-arm64 tvos-arm64-simulator macos-arm64; do
+    syms="$(nm -gUj "$OUT/$slice/$LIB" | sort -u)"
+    if echo "$syms" | grep -q '^_vortx_server_start$'; then kind=server-inclusive; else kind=kernel-only; fi
+    echo "  $slice [$kind]: $(echo "$syms" | tr '\n' ' ')"
 done
-echo "OK: $OUT (iOS device + iOS simulator + macOS slices, kernel-only, vortx_*-only exports)"
+echo "OK: $OUT (iOS device+sim $IOS_KIND, tvOS device+sim kernel-only, macOS kernel-only; vortx_*-only exports)"

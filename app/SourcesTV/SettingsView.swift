@@ -23,6 +23,11 @@ struct SettingsView: View {
     // Match Frame Rate: HDRDisplayMode owns both the key and the display-mode behavior it drives, so the key
     // string lives there rather than being duplicated as a literal across the Settings screens.
     @AppStorage(HDRDisplayMode.matchFrameRateKey) private var matchFrameRate = HDRDisplayMode.defaultMatchFrameRate
+    /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
+    /// Same key as iOSSettingsView (settings parity); the row renders only in builds whose linked
+    /// VortxEngine slice carries the server (VortxNativeServerFlag.isSupported), which today is no
+    /// tvOS build (the tier-3 server cross-compile walls), so this stays invisible until it can work.
+    @AppStorage(VortxNativeServerFlag.key) private var engineServerOn = false
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
@@ -681,6 +686,40 @@ struct SettingsView: View {
                     Label("Configure server", systemImage: "server.rack")
                 }
                 .buttonStyle(PrimaryActionStyle())
+                // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
+                // in builds whose linked VortxEngine slice carries the server symbols (today: none on
+                // tvOS; the guard makes this row appear automatically the day a tvOS server slice
+                // exists). ON starts it immediately and the player follows its port
+                // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again.
+                if VortxNativeServerFlag.isSupported {
+                    Button {
+                        engineServerOn.toggle()
+                        if engineServerOn {
+                            VortxNativeServer.startIfNeeded()
+                        } else {
+                            Task.detached(priority: .utility) { VortxNativeServer.stop() }
+                        }
+                    } label: {
+                        HStack(alignment: .center, spacing: Theme.Space.lg) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Engine streaming server (experimental)")
+                                    .font(Theme.Typography.cardTitle)
+                                    .foregroundStyle(Theme.Palette.textPrimary)
+                                Text(engineServerOn ? VortxNativeServer.statusDescription
+                                                    : "Serve torrents from the built-in VortX engine instead of the bundled server.")
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(Theme.Palette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: Theme.Space.md)
+                            TogglePill(isOn: engineServerOn)
+                        }
+                        .padding(Theme.Space.md)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    }
+                    .buttonStyle(RowFocusStyle())
+                }
             }
         }
     }
