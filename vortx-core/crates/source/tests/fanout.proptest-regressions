@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 061f0b6c264ea4c0b8f8ef8ad0f12f5dd10685ccacbba2d9e990a1a00c93e084 # shrinks to results = [AddonResult { addon_id: "d", outcome: Malformed }, AddonResult { addon_id: "d", outcome: Ok { items: [] } }]
