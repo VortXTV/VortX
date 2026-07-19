@@ -31,14 +31,27 @@ permissions:
 
 jobs:
   build-android:
+    # Environment gate for the token-bearing job (trust boundary): `engine-ci` carries a deployment
+    # branch policy (beta, main, claude/ci-engine-token), so a push to any OTHER branch -- e.g. the
+    # android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this gate
+    # before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches. The
+    # claude/ci-engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
+    # is removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
+    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-branch jobs
+    # from ever reaching the fetch steps that read it.
+    environment: engine-ci
     # Pinned explicit runner label: `ubuntu-latest` is a MOVING alias (it means ubuntu-24.04 today,
     # per actions/runner-images), and a silent alias flip would swap the whole toolchain -- JDK
-    # packages, binutils, kernel -- under a runtime-proven lane with no diff in this file. The APK
-    # gate below also leans on the image's binutils readelf (2.42 on ubuntu-24.04). Moving to a
-    # newer image is a deliberate edit here, verified by a run, not an alias drift.
+    # packages, kernel -- under a runtime-proven lane with no diff in this file. (The APK gate below
+    # no longer leans on the image's binutils readelf; it uses the pinned NDK's own llvm-readelf, so
+    # its provenance is tied to the NDK pin, not this image.) Moving to a newer image is a
+    # deliberate edit here, verified by a run, not an alias drift.
     runs-on: ubuntu-24.04
+    # GitHub-owned actions are SHA-pinned too (finishing the supply-chain pass that already pinned
+    # the third-party actions): a mutable tag -- even on an actions/* repo -- can be repointed, and
+    # this job holds ENGINE_REPO_TOKEN. Each pin carries the tag it resolved from.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -76,10 +89,10 @@ jobs:
 
       # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
       - name: Fetch stremiox-core (private, pinned)
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/stremiox-core
-          ref: bfbb9ef32a8f705b9b91a04182293da45adc7174
+          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
@@ -88,10 +101,10 @@ jobs:
       # sits at vortx-core/vortx-core/Cargo.toml inside the repo). Check out to a temp path, then
       # promote only that subdir to the app-root vortx-core/ the gradle task builds from.
       - name: Fetch vortx-core (private monorepo, pinned)
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: VortXTV/vortx-core
-          ref: 9e83954af5903118b69005d9dcdcfd96cfda4eae
+          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -105,10 +118,10 @@ jobs:
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (promoted from monorepo subdir)"
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: "17"
@@ -140,14 +153,18 @@ jobs:
       #
       # Toolchain truth: rust-toolchain.toml IS the Rust-version authority, not this step. BOTH
       # engine checkouts carry one (core/rust-toolchain.toml and the promoted
-      # vortx-core/rust-toolchain.toml, each `channel = "nightly"` + rust-src; verified at the
-      # pinned engine commits), and rustup's directory-override rule means every cargo invocation
-      # inside those dirs resolves the toolchain through that file. This step is ONLY the
-      # installer that puts nightly + the Android targets on the runner for those files to select.
+      # vortx-core/rust-toolchain.toml, each `channel = "nightly-2026-07-19"` + rust-src; verified
+      # at the pinned engine commits), and rustup's directory-override rule means every cargo
+      # invocation inside those dirs resolves the toolchain through that file. This step is ONLY
+      # the installer that puts that DATED toolchain + the Android targets on the runner for those
+      # files to select; it MUST name the same dated channel the engine toolchain files pin,
+      # because the Android targets are installed per-toolchain. Drift fails closed, not silently:
+      # if the files pin a different date, rustup auto-installs that toolchain WITHOUT the Android
+      # targets and the cargo-ndk build dies with a missing-target error.
       - name: Install Rust nightly + Android targets
         uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-07-19
           targets: aarch64-linux-android,x86_64-linux-android
           components: rust-src
 
@@ -180,6 +197,9 @@ jobs:
       #   VORTX_REQUIRE_ENGINE=1 -> flips both tasks' dev-machine warn-and-skip into a HARD FAILURE
       #                             (missing manifest, missing cargo, or missing/empty .so output all
       #                             throw), so a CI APK can never silently ship without its engines.
+      # Reproducibility: both engine cargo-ndk invocations pass --locked (build.gradle.kts) against
+      # the Cargo.lock each pinned engine commit now tracks, so a drifted dependency resolution
+      # FAILS the build instead of silently linking a different graph than the proven runs.
       - name: Build debug APKs (full + play)
         working-directory: android
         env:
@@ -212,13 +232,20 @@ jobs:
       # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
       # pass. Presence + ELF magic alone is not proof either: a valid ELF of the wrong architecture,
       # an executable, or a stub with no JNI surface would pass and only die on-device. So EXTRACT
-      # each entry and require, in order (all via the image's binutils readelf; each check fail-closed):
+      # each entry and require, in order (each check fail-closed), all via the PINNED NDK's own
+      # llvm-readelf (the toolchain that produced the .so's, installed above; gate provenance now
+      # rides the NDK pin instead of whatever binutils the runner image ships). llvm-readelf prints
+      # GNU-readelf-compatible output by default and accepts -W as a GNU-compat no-op; the exact
+      # strings the greps below match ("Class: ELF64", "2's complement, little endian",
+      # "Type: DYN (Shared object file)", "Machine: AArch64" / "Machine: Advanced Micro Devices
+      # X86-64", and --dyn-syms rows ending in the bare symbol name) were verified verbatim against
+      # NDK 27.2.12479018's llvm-readelf 18.0.3 on real android26 .so's for both ABIs:
       #   1. non-zero size + the ELF magic \x7fELF (cheap pre-checks with a clear byte-level error);
-      #   2. readelf -h: Class ELF64 (e_ident[EI_CLASS]=2), little-endian data (e_ident[EI_DATA]=1),
+      #   2. llvm-readelf -h: Class ELF64 (e_ident[EI_CLASS]=2), little-endian data (e_ident[EI_DATA]=1),
       #      Type DYN (e_type=ET_DYN: a shared object, not ET_EXEC/ET_REL), and the machine matching
       #      the ABI dir: AArch64 (EM_AARCH64=183) under lib/arm64-v8a/, Advanced Micro Devices
       #      X86-64 (EM_X86_64=62) under lib/x86_64/;
-      #   3. readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
+      #   3. llvm-readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
       #      required names are DERIVED from source, not guessed -- JNI resolves a Kotlin
       #      `external fun` to Java_<package with _>_<Class>_<method>, and both engines export those
       #      names directly via #[no_mangle] (neither registers via RegisterNatives):
@@ -237,6 +264,14 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
+          # The pinned NDK's llvm-readelf (same NDK the cargo-ndk cross-link used; installed by the
+          # "Install Android NDK" step above). Fail closed if it is not where that pin puts it: a
+          # silent fallback to another readelf would detach the gate's provenance from the NDK pin.
+          READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          if [ ! -x "$READELF" ]; then
+            echo "::error::pinned NDK llvm-readelf not found/executable at $READELF; refusing to verify APKs with an unpinned readelf"
+            exit 1
+          fi
           apks=(android/app/build/outputs/apk/full/debug/*.apk android/app/build/outputs/apk/play/debug/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then echo "::error::no APKs found to verify engine .so"; exit 1; fi
           # Required dynamic exports per lib (derivation + source citations in the step comment above).
@@ -264,8 +299,8 @@ jobs:
                 if [ "$magic" != "7f454c46" ]; then
                   echo "::error::$entry in $apk is not an ELF binary (leading bytes: $magic)"; fail=1; continue
                 fi
-                if ! hdr="$(readelf -h "$out" 2>/dev/null)"; then
-                  echo "::error::$entry in $apk has an unparseable ELF header (readelf -h failed)"; fail=1; continue
+                if ! hdr="$("$READELF" -h "$out" 2>/dev/null)"; then
+                  echo "::error::$entry in $apk has an unparseable ELF header (llvm-readelf -h failed)"; fail=1; continue
                 fi
                 if ! grep -Eq 'Class:[[:space:]]+ELF64' <<<"$hdr"; then
                   echo "::error::$entry in $apk is not ELF64 (e_ident[EI_CLASS] != 2): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
@@ -279,7 +314,7 @@ jobs:
                 if ! grep -Eq "Machine:[[:space:]]+${machine}[[:space:]]*\$" <<<"$hdr"; then
                   echo "::error::$entry in $apk is the WRONG ARCHITECTURE (want $machine): $(grep -E 'Machine:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
                 fi
-                dynsyms="$(readelf -W --dyn-syms "$out" 2>/dev/null || true)"
+                dynsyms="$("$READELF" -W --dyn-syms "$out" 2>/dev/null || true)"
                 syms_var="syms_${lib%.so}"
                 missing=""
                 for sym in ${!syms_var}; do
@@ -319,14 +354,14 @@ jobs:
           echo "play flavor is clean of libmpv/ffmpeg GPL native libs"
 
       - name: Upload full-flavor APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Android-full-debug
           path: android/app/build/outputs/apk/full/debug/*.apk
           if-no-files-found: error
 
       - name: Upload play-flavor APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Android-play-debug
           path: android/app/build/outputs/apk/play/debug/*.apk

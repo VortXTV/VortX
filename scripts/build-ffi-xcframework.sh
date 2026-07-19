@@ -106,8 +106,10 @@ build_slice() { # <triple> <sdk> <kernel|server>
     local features="$FEATURES_KERNEL"
     [ "$3" = server ] && features="$FEATURES_SERVER"
     echo "- vortx-ffi $1 ($3)"
+    # --locked: the engine workspace tracks Cargo.lock, so a drifted dependency resolution FAILS
+    # the build here instead of silently linking a different graph than CI proved.
     SDKROOT="$(xcrun --sdk "$2" --show-sdk-path)" \
-        cargo +nightly build $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
+        cargo +nightly build --locked $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
         -p vortx-ffi $features --release --target "$1"
 }
 
