@@ -42,10 +42,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Fetch the private engine crates (moved out of the public tree in 33ff9b5). Pinned to the exact
-      # commits the current beta build links: stremiox-core -> core/, vortx-core -> vortx-core/. Requires
-      # the ENGINE_REPO_TOKEN secret (fine-grained token, Contents:read on both private repos; deploy keys
-      # are disabled by the VortXTV org). Fails closed if a crate is missing (no silent build-without-engine).
+      # Fetch the private engine crates (moved out of the public tree in 33ff9b5). Apple builds BOTH engines:
+      # StremioXCore.xcframework from core/ AND VortxEngine.xcframework from vortx-core/. Pinned to the exact
+      # commits the current beta build links. Requires the ENGINE_REPO_TOKEN secret (fine-grained token,
+      # Contents:read on both private repos; deploy keys are disabled by the VortXTV org). Fails closed if a
+      # crate is missing (no silent build-without-engine).
+      #
+      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root), so it clones straight into core/.
+      # vortx-core is a FULL MONOREPO whose engine is its vortx-core/ SUBDIR; a plain clone would nest it to
+      # vortx-core/vortx-core/Cargo.toml, so we fetch to a temp dir and promote only that subdir to the
+      # app-root vortx-core/ (where the build-ffi step + hashFiles('vortx-core/Cargo.toml','vortx-core/crates/**')
+      # expect it). The token is passed ONLY as a per-command http.extraheader, never `git remote add ...token...`
+      # (which would persist it into .git/config, exposing it to every later step).
       - name: Fetch private engine crates (token-authenticated, pinned)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
@@ -54,19 +62,30 @@ jobs:
           if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
             echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine (see vortx-engine-deploy-key-setup.md)"; exit 1
           fi
-          fetch_pinned () {
-            local repo="$1" sha="$2" dir="$3"
-            rm -rf "$dir"; mkdir -p "$dir"
-            git -C "$dir" init -q
-            git -C "$dir" remote add origin "https://x-access-token:${ENGINE_REPO_TOKEN}@github.com/${repo}.git"
-            git -C "$dir" fetch -q --depth 1 origin "$sha"
-            git -C "$dir" checkout -q FETCH_HEAD
+          fetch_standalone () {   # standalone crate -> checked out directly into $dest
+            local repo="$1" sha="$2" dest="$3"
+            rm -rf "$dest"
+            git init -q "$dest"
+            git -C "$dest" -c http.extraheader="AUTHORIZATION: bearer ${ENGINE_REPO_TOKEN}" \
+              fetch -q --depth 1 "https://github.com/${repo}.git" "$sha"
+            git -C "$dest" checkout -q FETCH_HEAD
           }
-          fetch_pinned VortXTV/stremiox-core bfbb9ef32a8f705b9b91a04182293da45adc7174 core
-          fetch_pinned VortXTV/vortx-core     9e83954af5903118b69005d9dcdcfd96cfda4eae vortx-core
+          fetch_subdir () {       # monorepo -> only its $subdir is promoted to $dest
+            local repo="$1" sha="$2" subdir="$3" dest="$4" tmp
+            tmp="$(mktemp -d)"
+            git init -q "$tmp"
+            git -C "$tmp" -c http.extraheader="AUTHORIZATION: bearer ${ENGINE_REPO_TOKEN}" \
+              fetch -q --depth 1 "https://github.com/${repo}.git" "$sha"
+            git -C "$tmp" checkout -q FETCH_HEAD
+            rm -rf "$dest"
+            mv "$tmp/$subdir" "$dest"
+            rm -rf "$tmp"
+          }
+          fetch_standalone VortXTV/stremiox-core bfbb9ef32a8f705b9b91a04182293da45adc7174 core
+          fetch_subdir     VortXTV/vortx-core     9e83954af5903118b69005d9dcdcfd96cfda4eae vortx-core vortx-core
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after fetch (core/Cargo.toml)"; exit 1; }
-          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core crate missing after fetch (vortx-core/Cargo.toml)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@$(git -C vortx-core rev-parse --short HEAD)"
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine missing after fetch (vortx-core/Cargo.toml)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
