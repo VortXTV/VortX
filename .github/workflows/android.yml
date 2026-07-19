@@ -2,21 +2,22 @@ name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
 # workflow IS the build feedback loop. It builds BOTH product flavors on every push/PR that touches
-# android/ or core/ (the engine .so is cross-compiled from core/), verifies each flavor produced an
-# APK, and enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the
-# GPLv3 libmpv native libs.
+# android/, verifies each flavor produced an APK carrying BOTH engine .so's for BOTH ABIs, and
+# enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
+# libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
+# 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
+# which is itself a path trigger, so the old `core/**` path filters are gone (that dir no longer
+# exists in the public tree).
 
 on:
   push:
     branches: [main, beta, "android/**"]
     paths:
       - "android/**"
-      - "core/**"
       - ".github/workflows/android.yml"
   pull_request:
     paths:
       - "android/**"
-      - "core/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -28,29 +29,73 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      # Fetch the private engine crate (moved out of the public tree in 33ff9b5). Android builds ONLY core/
-      # (-> libstremiox_core.so via the gradle cargoNdkBuild task). The vortx-ffi shadow lane is OFF here, so
-      # vortx-core/ and VORTX_ENGINE_CORE_DIR are NOT needed; fetching only core/ keeps the job lean. stremiox-core
-      # is a STANDALONE crate (Cargo.toml at its repo root), so it clones straight into core/. Pinned to the exact
-      # commit the current build links. Requires the ENGINE_REPO_TOKEN secret (fine-grained token, Contents:read;
-      # deploy keys are disabled by the VortXTV org). Fails closed if the crate is missing. The token is passed ONLY
-      # as a per-command http.extraheader, never `git remote add ...token...` (which would persist it in .git/config).
-      - name: Fetch private engine crate (token-authenticated, pinned)
+      # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
+      # Android needs BOTH private engines, because android/app/build.gradle.kts attaches BOTH native
+      # build tasks to every variant's merge<Variant>JniLibFolders (lines 359-361 and 449-451):
+      #   - cargoNdkBuild -> libstremiox_core.so from the stremiox-core crate. Hard runtime
+      #     requirement: StremioCoreNative.kt:43 does a bare System.loadLibrary("stremiox_core") in
+      #     its class initializer. Resolved via STREMIOX_CORE_DIR (build.gradle.kts:261-264).
+      #   - cargoNdkBuildVortxFfi -> libvortx_ffi.so (features jni,server) from the vortx-core engine
+      #     workspace, resolved ONLY via VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir
+      #     (build.gradle.kts:382-385). Without it the task skips on dev machines and HARD-FAILS
+      #     under VORTX_REQUIRE_ENGINE (the onlyIf at build.gradle.kts:412-431), because the APK
+      #     would otherwise package "whatever .so is already staged in src/main/jniLibs" -- which in
+      #     CI is NOTHING (android/.gitignore:23 ignores app/src/main/jniLibs/**/*.so). That would
+      #     ship the DEFAULT-ON in-process torrent streaming server (VortxServer.kt FLAG_KEY doc:
+      #     "DEFAULT ON: with the server absent a raw torrent could only ever throw") and the
+      #     vortx.engine shadow-ranking lane permanently dead, since this workflow is the ONLY
+      #     Android build channel. So CI fetches vortx-core too and exports VORTX_ENGINE_CORE_DIR.
+      #
+      # Both fetches use actions/checkout (GitHub's own auth path: the token is injected through an
+      # env-sourced local git config, never argv, and persist-credentials: false wipes it after the
+      # step), pinned to the exact commits the current build links. Requires the ENGINE_REPO_TOKEN
+      # secret (fine-grained PAT, Contents:read on both private repos; deploy keys are disabled by
+      # the VortXTV org). Fails closed: empty secret or a missing crate manifest kills the job.
+      - name: Preflight the engine token (fail closed)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
-            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine (see vortx-engine-deploy-key-setup.md)"; exit 1
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            exit 1
           fi
-          rm -rf core
-          git init -q core
-          git -C core -c http.extraheader="AUTHORIZATION: bearer ${ENGINE_REPO_TOKEN}" \
-            fetch -q --depth 1 "https://github.com/VortXTV/stremiox-core.git" bfbb9ef32a8f705b9b91a04182293da45adc7174
-          git -C core checkout -q FETCH_HEAD
-          test -f core/Cargo.toml || { echo "::error::stremiox-core crate missing after fetch (core/Cargo.toml)"; exit 1; }
-          echo "engine fetched: core@$(git -C core rev-parse --short HEAD)"
+
+      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
+      - name: Fetch stremiox-core (private, pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: VortXTV/stremiox-core
+          ref: bfbb9ef32a8f705b9b91a04182293da45adc7174
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      # vortx-core is a MONOREPO whose engine workspace is its vortx-core/ SUBDIR (the engine manifest
+      # sits at vortx-core/vortx-core/Cargo.toml inside the repo). Check out to a temp path, then
+      # promote only that subdir to the app-root vortx-core/ the gradle task builds from.
+      - name: Fetch vortx-core (private monorepo, pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: VortXTV/vortx-core
+          ref: 9e83954af5903118b69005d9dcdcfd96cfda4eae
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: _vortx_core_src
+          persist-credentials: false
+
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          rm -rf vortx-core
+          mv _vortx_core_src/vortx-core vortx-core
+          rm -rf _vortx_core_src
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
+          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (promoted from monorepo subdir)"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -58,14 +103,16 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # Non-GitHub-owned actions below are pinned to full commit SHAs (mutable tags on third-party
+      # repos are a supply-chain hole; GitHub-owned actions/* stay on major tags).
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
 
       # No gradle-version here: the committed wrapper (android/gradle/wrapper/gradle-wrapper.properties)
       # is the single Gradle-version truth. setup-gradle is kept only for its build cache; the build
       # runs via ./gradlew below.
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
       # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
       # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
@@ -78,15 +125,22 @@ jobs:
           yes | sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      # SHA-pinned (see the pin note above). Pinning drops the toolchain-from-ref-name convention
+      # (@nightly), so the toolchain is passed explicitly.
       - name: Install Rust nightly + Android targets
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
+          toolchain: nightly
           targets: aarch64-linux-android,x86_64-linux-android
           components: rust-src
 
-      - uses: swatinem/rust-cache@v2
+      # Second workspace line: the vortx-ffi cross-build's CARGO_TARGET_DIR is pinned by the gradle
+      # task to <engine>/target-andx (build.gradle.kts:407), not the default target/.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          workspaces: "core -> target"
+          workspaces: |
+            core -> target
+            vortx-core -> target-andx
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "^3" --locked
@@ -98,6 +152,13 @@ jobs:
       # These are the SAME GitHub Actions secrets the Apple release CI uses (release-tvos.yml feeds them
       # into the Info.plist): TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, SIMKL_CLIENT_ID, SIMKL_CLIENT_SECRET.
       # Absent secrets resolve to "" so the build still succeeds with the feature dormant (e.g. on a fork).
+      # Engine wiring (see the fetch block above for the gradle-contract citations):
+      #   STREMIOX_CORE_DIR      -> cargoNdkBuild's crate dir (explicit; don't lean on the legacy
+      #                             ../core fallback chain in build.gradle.kts:261-264).
+      #   VORTX_ENGINE_CORE_DIR  -> cargoNdkBuildVortxFfi's engine workspace (build.gradle.kts:382-385).
+      #   VORTX_REQUIRE_ENGINE=1 -> flips both tasks' dev-machine warn-and-skip into a HARD FAILURE
+      #                             (missing manifest, missing cargo, or missing/empty .so output all
+      #                             throw), so a CI APK can never silently ship without its engines.
       - name: Build debug APKs (full + play)
         working-directory: android
         env:
@@ -105,6 +166,9 @@ jobs:
           TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
           SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
           SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
+          STREMIOX_CORE_DIR: ${{ github.workspace }}/core
+          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
+          VORTX_REQUIRE_ENGINE: "1"
         run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
 
       # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant
@@ -120,30 +184,44 @@ jobs:
           echo "full APK(s): ${full[*]}"
           echo "play APK(s): ${play[*]}"
 
-      # Engine-presence proof (fail-closed): every built APK MUST embed the cross-compiled engine as
-      # lib/<abi>/libstremiox_core.so. If the engine fetch or cargoNdkBuild silently degraded, the APK would
-      # still assemble but ship without a native engine; that build must NEVER pass CI. Scan the zip listing of
-      # each built APK (both flavors carry the engine; only the GPLv3 libmpv is play-gated) and fail if absent.
-      - name: Verify engine .so present in every APK
+      # Engine-presence proof (fail-closed, strong): every built APK MUST embed BOTH engines for BOTH
+      # shipped ABIs (the abiFilters/androidAbis list in app/build.gradle.kts): lib/<abi>/libstremiox_core.so
+      # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a AND x86_64. Both engine tasks feed the `main`
+      # sourceSet's jniLibs, so BOTH flavors carry both engines (only the GPLv3 libmpv is play-gated).
+      # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
+      # pass. Instead EXTRACT each entry and require non-zero size plus the ELF magic (\x7fELF), so a
+      # silently degraded engine build can never ship.
+      - name: Verify engine .so in every APK (both ABIs, non-empty, real ELF)
         run: |
           set -euo pipefail
           shopt -s nullglob
           apks=(android/app/build/outputs/apk/full/debug/*.apk android/app/build/outputs/apk/play/debug/*.apk)
           if [ ${#apks[@]} -eq 0 ]; then echo "::error::no APKs found to verify engine .so"; exit 1; fi
           fail=0
+          workdir="$(mktemp -d)"
           for apk in "${apks[@]}"; do
-            # Capture the full listing first so grep never SIGPIPEs unzip under pipefail (a short-circuiting
-            # grep -q on a long listing could otherwise make the step falsely pass).
-            listing="$(unzip -l "$apk")"
-            if grep -Eq 'lib/[^/]+/libstremiox_core\.so' <<<"$listing"; then
-              echo "engine .so present: $apk"
-            else
-              echo "::error::engine libstremiox_core.so missing from APK: $apk"
-              fail=1
-            fi
+            for abi in arm64-v8a x86_64; do
+              for lib in libstremiox_core.so libvortx_ffi.so; do
+                entry="lib/$abi/$lib"
+                out="$workdir/$(basename "$apk").$abi.$lib"
+                if ! unzip -p "$apk" "$entry" > "$out" 2>/dev/null; then
+                  echo "::error::$entry missing from APK: $apk"; fail=1; continue
+                fi
+                size="$(stat -c%s "$out")"
+                if [ "$size" -eq 0 ]; then
+                  echo "::error::$entry in $apk is EMPTY (0 bytes)"; fail=1; continue
+                fi
+                magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+                if [ "$magic" != "7f454c46" ]; then
+                  echo "::error::$entry in $apk is not an ELF binary (leading bytes: $magic)"; fail=1; continue
+                fi
+                echo "ok: $apk $entry ($size bytes, ELF)"
+              done
+            done
           done
+          rm -rf "$workdir"
           if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "all APKs embed libstremiox_core.so"
+          echo "every APK embeds libstremiox_core.so + libvortx_ffi.so for arm64-v8a + x86_64 (non-empty, ELF-verified)"
 
       # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
       # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs

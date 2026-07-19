@@ -1,10 +1,13 @@
 name: Release apps (iOS + tvOS + macOS)
 
 # Builds the iOS + tvOS IPAs and the native macOS app from source on GitHub's
-# runners and attaches them to the release, so anyone can verify the published
-# binaries really come from this code (issue #7). Everything it consumes is
-# public: NodeMobile and the fonts from this repo's vendor release, server.js
-# from Stremio's CDN, and the stremio-core engine built from the core/ crate.
+# runners and attaches them to the release (issue #7). The app sources, scripts,
+# NodeMobile + fonts (this repo's vendor release), and server.js (Stremio's CDN)
+# are public; the two ENGINE crates (stremiox-core, vortx-core) are PRIVATE
+# (moved out of the public tree in 33ff9b5) and are fetched below at pinned
+# commits with the ENGINE_REPO_TOKEN secret. Bumping an engine pin means editing
+# this file, which is itself a path trigger, so the old `core/**` path filters
+# are gone (that dir no longer exists in the public tree).
 # The macOS app ships as a drag-to-install .dmg (ad-hoc signed, not notarized).
 
 on:
@@ -14,7 +17,6 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/release-tvos.yml"
-      - "core/**"
       - "scripts/**"
   release:
     types: [published]
@@ -22,7 +24,6 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/release-tvos.yml"
-      - "core/**"
       - "scripts/**"
       - "app/**"
   workflow_dispatch:
@@ -41,51 +42,60 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      # Fetch the private engine crates (moved out of the public tree in 33ff9b5). Apple builds BOTH engines:
-      # StremioXCore.xcframework from core/ AND VortxEngine.xcframework from vortx-core/. Pinned to the exact
-      # commits the current beta build links. Requires the ENGINE_REPO_TOKEN secret (fine-grained token,
-      # Contents:read on both private repos; deploy keys are disabled by the VortXTV org). Fails closed if a
-      # crate is missing (no silent build-without-engine).
-      #
-      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root), so it clones straight into core/.
-      # vortx-core is a FULL MONOREPO whose engine is its vortx-core/ SUBDIR; a plain clone would nest it to
-      # vortx-core/vortx-core/Cargo.toml, so we fetch to a temp dir and promote only that subdir to the
-      # app-root vortx-core/ (where the build-ffi step + hashFiles('vortx-core/Cargo.toml','vortx-core/crates/**')
-      # expect it). The token is passed ONLY as a per-command http.extraheader, never `git remote add ...token...`
-      # (which would persist it into .git/config, exposing it to every later step).
-      - name: Fetch private engine crates (token-authenticated, pinned)
+      # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
+      # Apple builds BOTH engines: StremioXCore.xcframework from core/ AND VortxEngine.xcframework
+      # from vortx-core/. Pinned to the exact commits the current beta build links. Requires the
+      # ENGINE_REPO_TOKEN secret (fine-grained PAT, Contents:read on both private repos; deploy keys
+      # are disabled by the VortXTV org). Both fetches use actions/checkout (GitHub's own auth path:
+      # the token is injected through an env-sourced local git config, never argv, and
+      # persist-credentials: false wipes it after the step). Fails closed: an empty secret or a
+      # missing crate manifest kills the job (no silent build-without-engine).
+      - name: Preflight the engine token (fail closed)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
-            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine (see vortx-engine-deploy-key-setup.md)"; exit 1
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            exit 1
           fi
-          fetch_standalone () {   # standalone crate -> checked out directly into $dest
-            local repo="$1" sha="$2" dest="$3"
-            rm -rf "$dest"
-            git init -q "$dest"
-            git -C "$dest" -c http.extraheader="AUTHORIZATION: bearer ${ENGINE_REPO_TOKEN}" \
-              fetch -q --depth 1 "https://github.com/${repo}.git" "$sha"
-            git -C "$dest" checkout -q FETCH_HEAD
-          }
-          fetch_subdir () {       # monorepo -> only its $subdir is promoted to $dest
-            local repo="$1" sha="$2" subdir="$3" dest="$4" tmp
-            tmp="$(mktemp -d)"
-            git init -q "$tmp"
-            git -C "$tmp" -c http.extraheader="AUTHORIZATION: bearer ${ENGINE_REPO_TOKEN}" \
-              fetch -q --depth 1 "https://github.com/${repo}.git" "$sha"
-            git -C "$tmp" checkout -q FETCH_HEAD
-            rm -rf "$dest"
-            mv "$tmp/$subdir" "$dest"
-            rm -rf "$tmp"
-          }
-          fetch_standalone VortXTV/stremiox-core bfbb9ef32a8f705b9b91a04182293da45adc7174 core
-          fetch_subdir     VortXTV/vortx-core     9e83954af5903118b69005d9dcdcfd96cfda4eae vortx-core vortx-core
-          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after fetch (core/Cargo.toml)"; exit 1; }
-          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine missing after fetch (vortx-core/Cargo.toml)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (from monorepo subdir)"
+
+      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
+      - name: Fetch stremiox-core (private, pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: VortXTV/stremiox-core
+          ref: bfbb9ef32a8f705b9b91a04182293da45adc7174
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      # vortx-core is a FULL MONOREPO whose engine workspace is its vortx-core/ SUBDIR; a direct
+      # checkout would nest the engine manifest at vortx-core/vortx-core/Cargo.toml. Check out to a
+      # temp path, then promote only that subdir to the app-root vortx-core/ (where the build-ffi
+      # step's VORTX_ENGINE_DIR + the hashFiles('vortx-core/...') cache keys expect it).
+      - name: Fetch vortx-core (private monorepo, pinned)
+        uses: actions/checkout@v7
+        with:
+          repository: VortXTV/vortx-core
+          ref: 9e83954af5903118b69005d9dcdcfd96cfda4eae
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: _vortx_core_src
+          persist-credentials: false
+
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          rm -rf vortx-core
+          mv _vortx_core_src/vortx-core vortx-core
+          rm -rf _vortx_core_src
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
+          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@9e83954 (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
@@ -164,7 +174,9 @@ jobs:
             ~/.cargo/git
             core/target
             vortx-core/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml') }}
+          # hashFiles runs when this step runs, i.e. AFTER the engine fetch above, so both engines'
+          # manifests exist and both feed the key (a vortx-core-only dep bump must roll the cache too).
+          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Fetch server deps (NodeMobile, server.js, subtitle fonts)
