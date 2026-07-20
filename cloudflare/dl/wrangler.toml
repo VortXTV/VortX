@@ -1,0 +1,11 @@
+# VortX download shortcut. dl.vortx.tv always points at the newest release
+# artifacts, so a TV user can type one short address (or a Downloader code
+# that wraps it) and get the current APK without knowing version numbers.
+# Stateless, secretless: it reads the public latest-release listing (edge
+# cached) and answers with a redirect.
+name = "vortx-dl"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+routes = [
+  { pattern = "dl.vortx.tv", custom_domain = true }
+]
