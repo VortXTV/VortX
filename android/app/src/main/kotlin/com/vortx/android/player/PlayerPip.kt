@@ -8,7 +8,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
 import android.os.Build
@@ -227,9 +226,13 @@ internal fun rememberPlayerPip(
 /// Whether the hosting activity declares `android:supportsPictureInPicture` in the manifest.
 /// Calling setPictureInPictureParams on one that does not THROWS, so this is checked, not assumed
 /// (the check keeps this composable safe even if a future host forgets the manifest attribute).
+/// ActivityInfo.FLAG_SUPPORTS_PICTURE_IN_PICTURE is @hide in the public SDK, so the manifest bit is
+/// read by its frozen AOSP value; the surrounding runCatching keeps any platform surprise fail-soft.
+private const val FLAG_SUPPORTS_PIP_MANIFEST = 0x400000
+
 private fun activityDeclaresPip(activity: Activity): Boolean = runCatching {
     val info = activity.packageManager.getActivityInfo(activity.componentName, 0)
-    (info.flags and ActivityInfo.FLAG_SUPPORTS_PICTURE_IN_PICTURE) != 0
+    (info.flags and FLAG_SUPPORTS_PIP_MANIFEST) != 0
 }.getOrDefault(false)
 
 /// Build the live PiP params: clamped video aspect, the play/pause RemoteAction, auto-enter on S+.
