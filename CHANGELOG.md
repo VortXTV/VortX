@@ -4,6 +4,14 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 6 - 2026-07-20
+
+A hotfix over Beta 5. Beta 5 could not launch on Apple TV: the Settings screen had accumulated enough sections that its compiled view type grew too large for the tvOS runtime to construct at launch, and the release build (produced on a regressed CI toolchain lane) emitted it in a form the device runtime rejected, so the app crashed within a fraction of a second of starting and returned to the Home screen. Two-layer fix: the Settings screen is restructured so its type stays small regardless of how many sections it holds, and the release pipeline is pinned to the verified known-good toolchain with fail-closed minimum-OS assertions and an automatic launch-smoke check, so a build that does not open can no longer ship. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.
+
+### Fixed
+
+- **Apple TV launches again.** The Beta 5 Apple TV launch crash is fixed at its root (the Settings screen is restructured so its compiled type cannot overflow the runtime), and the release pipeline now verifies the toolchain, the minimum OS, and an actual launch before it can publish. Apple TV.
+
 ## 0.3.14 Beta 5 - 2026-07-20
 
 The correctness beta. (Beta 4 exists as a tag and release page but never carried a download: its tag predated the final build-tooling commit, and the pipeline refuses artifacts whose tag does not name the built commit, so Beta 5 completes the same feature work at build 185 with the tag on the exact built commit.) The headline is the end of wrong-episode playback: episode identity is now proven end to end, from the file a season pack or debrid source selects to the progress that gets saved. Around it, fixes from the Beta 3 field reports (thank you ozdek and konrepo for the detailed logs), the remaining Apple surfaces join the glass design, and Android ships in the same beta with Picture-in-Picture, gestures, system media controls, IPTV Live, and real downloads.

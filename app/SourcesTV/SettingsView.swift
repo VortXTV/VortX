@@ -318,6 +318,12 @@ struct SettingsView: View {
     /// The persistent Settings twin of the launch nag (MoveSeedingNagTV): while this Apple TV owes its
     /// first VortX-account sync it prompts (the keyboard-free QR sign-in via LoginView, plus the QR
     /// backup-direction flow); once seeded it confirms with the live last-sync time.
+    // Layout is the ORIGINAL inline builder (do not extract or wrap in an added VStack/Group: that
+    // changed the banner's proposed width, button width, and spatial-focus grouping). Type erasure is
+    // NOT applied here: the `section()` helper below returns AnyView, so this whole banner enters
+    // SettingsView.body as a single AnyView already, which is what bounds body's metadata. The nested
+    // conditional here forms only as `section`'s Content parameter, off body's own type. See
+    // DIS-260720-02 / FAIL-260720-114.
     @ViewBuilder private var seedingBanner: some View {
         section(String(localized: "Moving day")) {
             if vortxSync.hasCompletedFirstSync {
@@ -1379,18 +1385,31 @@ struct SettingsView: View {
 
     // MARK: Section chrome
 
-    @ViewBuilder private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            Text(title).eyebrowStyle()
-            content()
-        }
-        .padding(Theme.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
-        // tvOS focus is spatial: "Log Out" sits far right (after a Spacer) while the next focusable
-        // views are left-aligned, outside the downward beam. Making each section a focus section lets
-        // the engine redirect focus into it even when it's off the movement axis.
-        .focusSection()
+    // Returns AnyView on purpose (do NOT change back to `some View`). SettingsView.body stacks ~20 of
+    // these; with each carrying its own opaque generic Content type, body's compile-time generic type
+    // grew large enough that the tvOS 26.5 runtime metadata demangler could not instantiate it,
+    // crashing the app ~0.2s after launch (Beta 5, built on the SDK 26.2 lane; five paired-device logs
+    // map the failing opaque reference to the outer body's playbackSection slot). Adding the com.vortx
+    // `seedingBanner` grew the outer body from 19 to 20 children and crossed that threshold. Returning
+    // AnyView here type-erases every section so the OUTER body metadata (the proven-failing type) stays
+    // small and uniform. Note: each section's generic Content still forms as this function's parameter,
+    // off body's own type, so this bounds the proven-failing outer metadata; it is not a proof against
+    // every possible toolchain. The release-lane toolchain pin plus a signed-device launch gate close
+    // the rest. See DIS-260720-02 / FAIL-260720-114 / XV-260720-65.
+    private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                Text(title).eyebrowStyle()
+                content()
+            }
+            .padding(Theme.Space.lg)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .vortxSettingsCard()
+            // tvOS focus is spatial: "Log Out" sits far right (after a Spacer) while the next focusable
+            // views are left-aligned, outside the downward beam. Making each section a focus section lets
+            // the engine redirect focus into it even when it's off the movement axis.
+            .focusSection()
+        )
     }
 
     private func infoRow(_ label: String, _ value: String) -> some View {

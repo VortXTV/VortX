@@ -4,6 +4,7 @@ options:
   developmentLanguage: en
   deploymentTarget:
     iOS: "16.0"
+    tvOS: "18.0" # MUST stay set: without an explicit tvOS floor the targets default to the runner's SDK version (beta 5 shipped minos 26.2 and would not launch on any older Apple TV). 18.0 is the real floor the tvOS SwiftUI code requires (it uses onChange(of:initial:), focusEffectDisabled, navigationDestination(item:) from tvOS 17 and the .switch toggle style from tvOS 18, all unguarded). Every Apple TV in service runs tvOS 18 or newer.
   createIntermediateGroups: true
   # Full localization roster shipped by the single Resources/Localizable.xcstrings String Catalog.
   # The catalog compiler emits an .lproj for every localization in the catalog regardless of this list,
@@ -184,7 +185,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
@@ -294,7 +295,7 @@ targets:
         # cross-compile).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -382,7 +383,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -491,7 +492,7 @@ targets:
         # condition set, the tvOS Settings toggle renders (VortxNativeServerFlag.isSupported).
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
@@ -534,7 +535,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no
         # INFOPLIST_KEY_* equivalent and so cannot be expressed as build settings. Xcode merges its
         # GENERATED keys on top, exactly as ResourcesTV/Info-tvOS.plist does for the app: that merge is
@@ -608,7 +609,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "185"
+        CURRENT_PROJECT_VERSION: "187"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
