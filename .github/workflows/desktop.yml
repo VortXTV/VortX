@@ -47,7 +47,7 @@ jobs:
             libssl-dev \
             pkg-config
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           # Node 22 (current LTS). Node 20 is EOL (April 2026), and vite 8 requires
           # ^20.19.0 || >=22.12.0, so 22 is the clean floor.
