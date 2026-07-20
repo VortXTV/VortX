@@ -62,14 +62,13 @@ struct CoreCWItem: Decodable, Identifiable {
     ///   it sits in the live-in-progress band (`resumeFloor`…0.9); that must KEEP it in the rail so the
     ///   rewatch shows and resumes, even though the watched counters are non-zero. A movie parked at the
     ///   credits, or freshly flagged-watched with no active offset, has no in-progress position and clears.
-    /// - Series: `timesWatched` counts WATCHED EPISODES, so a mid-series item has it high while still
-    ///   actively resumable, meaning it must NOT gate the rail. The only safe finished signal for a series
-    ///   is the CURRENT episode being at/past 0.9 (the finale, or the last episode, watched to the credits).
+    /// - Series: `timesWatched` counts watched episodes, so it must NOT gate the rail. The only safe
+    ///   finished signal is the current episode being at/past 0.9.
     ///   A finished episode with a next one rolls `time_offset` back to a low value for the new episode, so
     ///   its progress is low and it correctly stays.
     var isFinished: Bool {
         let watchedToEnd = progress >= 0.9
-        if type == "series" { return watchedToEnd }
+        if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) { return watchedToEnd }
         // A live, resumable position (progress above the resume floor but below the finished ceiling)
         // means an active watch/rewatch: keep it even if the watched counters are set.
         let resumeFloor = 0.0
@@ -162,6 +161,25 @@ enum CWResume {
               let infoHash = entry.infoHash, !infoHash.isEmpty else {
             return (stored ?? URL(fileURLWithPath: "/"), false)
         }
+        // An episodic provider-array fallback needs a positive S/E hint. The original Stremio fileIdx is
+        // source provenance only and cannot index a provider-local array. TorBox's stored torrentId+fileId
+        // pair is an exact fast path, but a failure there must still close before an unscoped re-add.
+        // The stored direct URL is already a concrete file, so return that exact URL unchanged and let the
+        // platform decide whether it is safe to replay (raw loopback torrents still require fileIdx).
+        let episodeHint = entry.season.flatMap { season in
+            entry.episode.flatMap { episode in
+                season >= 0 && episode > 0 ? DebridEpisode(season: season, episode: episode) : nil
+            }
+        }
+        let isEpisode = EpisodePlaybackIdentity.isEpisodicContext(
+            type: entry.type, season: entry.season, episode: entry.episode,
+            videoID: entry.videoId
+        )
+        let hasExactProviderIDs = service == .torBox
+            && entry.debridTorrentId != nil && entry.debridFileId != nil
+        if isEpisode, episodeHint == nil, !hasExactProviderIDs {
+            return (stored ?? URL(fileURLWithPath: "/"), false)
+        }
         // INSTANT RESUME (Step 4): the previous behaviour reresolved a fresh link on EVERY resume, a blocking
         // network round-trip before the player appeared (the "CW resume is slow" regression). But a debrid
         // link minted moments ago is still valid, so when the stored link is inside the fresh window hand it
@@ -174,11 +192,11 @@ enum CWResume {
         }
         // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
         // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
-        // providers re-add from the infoHash+fileIdx, still far cheaper than a full source re-resolve, and
-        // still the SAME source.
+        // providers may re-add only when a semantic episode selector proves the target file.
         if let fresh = try? await DebridCoordinator.shared.reresolve(
             service: service, infoHash: infoHash,
-            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx) {
+            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx,
+            episode: episodeHint, requiresSemanticSelection: isEpisode) {
             return (fresh, true)
         }
         // Same source is genuinely unavailable (evicted / no key): fall back to the stored link, letting the
@@ -714,6 +732,389 @@ struct CoreStreamGroup: Decodable {
     let content: CoreLoadable<[CoreStream]>?
 }
 
+/// Opaque identity for one logical media load. Equality is the only supported operation: callers use it
+/// to prove that an engine callback came from the load whose state they are about to publish.
+struct PlayerLoadToken: Hashable, Sendable {
+    private let value = UUID()
+
+    init() {}
+}
+
+/// A play-head sample with the exact logical load that produced it. URL equality is deliberately absent:
+/// proxies, redirects, remux mounts, and repeated CDN URLs can all rewrite or reuse a URL.
+struct PlayerTimePositionEvent: Sendable {
+    let seconds: Double
+    let loadToken: PlayerLoadToken
+}
+
+/// Pure callback-provenance state used by the libmpv bridge and its standalone regressions. The controller
+/// serializes mutations with its own lock; this value only defines the fail-closed state transitions.
+struct PlayerLoadProvenanceState {
+    struct CommandResultField: Equatable {
+        let key: String
+        let int64Value: Int64?
+    }
+
+    private var requestedTokens: [Int64: PlayerLoadToken] = [:]
+    private(set) var activeEntryID: Int64?
+    private(set) var activeToken: PlayerLoadToken?
+    private(set) var fileLoaded = false
+
+    mutating func invalidate() {
+        requestedTokens.removeAll(keepingCapacity: true)
+        activeEntryID = nil
+        activeToken = nil
+        fileLoaded = false
+    }
+
+    mutating func registerRequest(entryID: Int64, token: PlayerLoadToken) {
+        guard entryID > 0 else { return }
+        requestedTokens[entryID] = token
+        // `loadfile replace` succeeded and the exact playlist entry is now registered. Publish the
+        // request token immediately so the caller can prove issuance synchronously. Property callbacks
+        // still stay closed until `bindStart` because `callbackToken` requires an active entry below.
+        activeEntryID = nil
+        activeToken = token
+        fileLoaded = false
+    }
+
+    /// Complete one synchronous `loadfile replace` attempt. A rejected command did not change mpv's
+    /// playlist, so the previous request remains the only callback owner. An accepted command retires the
+    /// previous provenance and publishes the new request atomically. If mpv accepted the command but did not
+    /// expose a usable playlist-entry ID, invalidate instead of falsely restoring a token for media mpv has
+    /// already replaced.
+    @discardableResult
+    mutating func completeReplacement(commandSucceeded: Bool, entryID: Int64,
+                                      token: PlayerLoadToken) -> Bool {
+        guard commandSucceeded else { return false }
+        guard entryID > 0 else {
+            invalidate()
+            return false
+        }
+        invalidate()
+        registerRequest(entryID: entryID, token: token)
+        return true
+    }
+
+    /// Extract the one immutable playlist entry id returned by `loadfile`. Missing, mistyped, duplicate,
+    /// or non-positive fields are unusable because associating the request with a guessed playlist entry
+    /// would let a later callback publish the wrong media identity.
+    static func playlistEntryID(from fields: [CommandResultField]) -> Int64? {
+        let matches = fields.filter { $0.key == "playlist_entry_id" }
+        guard matches.count == 1, let entryID = matches[0].int64Value, entryID > 0 else { return nil }
+        return entryID
+    }
+
+    mutating func bindStart(entryID: Int64) {
+        // `loadfile replace` can leave an old START_FILE already queued behind the controller lock. Accepted
+        // replacement retired that entry's mapping, so ignore it instead of clearing the new request's
+        // provisional active token. Callbacks remain closed until the registered new entry starts.
+        guard let token = requestedTokens[entryID] else { return }
+        activeEntryID = entryID
+        activeToken = token
+        fileLoaded = false
+    }
+
+    mutating func markFileLoaded() {
+        fileLoaded = activeToken != nil
+    }
+
+    mutating func propagateRedirect(from entryID: Int64, firstInsertedID: Int64, count: Int) {
+        guard let token = requestedTokens[entryID], firstInsertedID > 0, count > 0 else { return }
+        for offset in 0..<count { requestedTokens[firstInsertedID + Int64(offset)] = token }
+    }
+
+    func callbackToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
+        guard activeEntryID != nil else { return nil }
+        guard !requiresLoadedFile || fileLoaded else { return nil }
+        return activeToken
+    }
+
+    func token(forEntryID entryID: Int64) -> PlayerLoadToken? {
+        requestedTokens[entryID]
+    }
+
+    static func accepts(callbackToken: PlayerLoadToken?, activeToken: PlayerLoadToken?) -> Bool {
+        guard let callbackToken, let activeToken else { return false }
+        return callbackToken == activeToken
+    }
+
+    /// AVPlayer callbacks must prove both halves of their provenance: the token belongs to the current
+    /// logical request and the observer's captured item is still the item mounted by the player.
+    static func acceptsAVCallback(callbackToken: PlayerLoadToken?, activeToken: PlayerLoadToken?,
+                                  capturedItemIsCurrent: Bool) -> Bool {
+        capturedItemIsCurrent && accepts(callbackToken: callbackToken, activeToken: activeToken)
+    }
+
+    static func canCommit(callbackToken: PlayerLoadToken?, activeToken: PlayerLoadToken?,
+                          pendingToken: PlayerLoadToken?) -> Bool {
+        accepts(callbackToken: callbackToken, activeToken: activeToken)
+            && callbackToken == pendingToken
+    }
+}
+
+/// Small, pure identity decisions shared by the engine bridge, episode play paths, and native-debrid
+/// file selection. Keeping these decisions together prevents one surface from treating a torrent as
+/// hash-only while another treats `(infoHash,fileIdx)` as the actual media identity.
+enum EpisodePlaybackIdentity {
+    enum TerminalEventRoute: Equatable {
+        case committed
+        case pending
+        case superseded
+        case outgoingCommittedWhileResolving
+        case stale
+    }
+
+    enum TerminalEventKind: Equatable {
+        case error
+        case eof
+    }
+
+    enum TerminalEventAction: Equatable {
+        case handleCommitted
+        case handlePending
+        case markSupersededTerminal
+        case persistOutgoingCompletionOnly
+        case ignoreOutgoingError
+        case ignoreStale
+    }
+
+    enum EngineBindingSource: Equatable {
+        case original
+        case resolvedDirectURL(String)
+    }
+
+    struct FileCandidate: Equatable {
+        let offset: Int
+        let name: String
+        let size: Int64
+        let isVideo: Bool
+    }
+
+    struct EpisodeNumbers: Equatable {
+        let season: Int
+        let episode: Int
+    }
+
+    static func provenEpisodeNumbers(season: Int?, episode: Int?) -> EpisodeNumbers? {
+        guard let season, season >= 0, let episode, episode > 0 else { return nil }
+        return EpisodeNumbers(season: season, episode: episode)
+    }
+
+    /// Conservative beta fence for title lifecycle and state semantics. Only canonical `series` metadata
+    /// may use episode-scoped resume, watched, navigation, terminal, scrobble, and download behavior. Broad
+    /// physical-media safety remains in `isEpisodicContext`. INS-260720-03 dissolves this fence after catalog
+    /// identities are normalized end to end.
+    static func usesSeriesLifecycle(type: String?) -> Bool {
+        type?.caseInsensitiveCompare("series") == .orderedSame
+    }
+
+    /// A provider-array fallback may use movie heuristics only for a known movie. Episode retries need an
+    /// independent semantic selector because the raw torrent fileIdx is not a provider-array position.
+    static func providerArrayFallbackAllowed(requiresSemanticSelection: Bool,
+                                             season: Int?, episode: Int?,
+                                             sourceFilename: String? = nil) -> Bool {
+        guard requiresSemanticSelection else { return true }
+        if provenEpisodeNumbers(season: season, episode: episode) != nil { return true }
+        guard let sourceFilename else { return false }
+        return !sourceFilename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Identify episode-like playback from durable media identity, not only the metadata type. Collection
+    /// and franchise pages can retain their non-series type while carrying S/E fields. The canonical id:S:E
+    /// suffix is independent evidence when those fields are unavailable. A different video id alone is not
+    /// enough because some movies use a distinct default video id and retain hash-only movie compatibility.
+    static func isEpisodicContext(type: String?, season: Int?, episode: Int?,
+                                  videoID: String) -> Bool {
+        if type?.caseInsensitiveCompare("series") == .orderedSame { return true }
+        if let season, season >= 0, let episode, episode > 0 { return true }
+        let parts = videoID.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 3,
+              let season = Int(parts[parts.count - 2]), season >= 0,
+              let episode = Int(parts[parts.count - 1]), episode > 0 else { return false }
+        return true
+    }
+
+    /// A saved title-level resume belongs to the requested episode only when their exact video ids match.
+    /// Movies retain title-level resume compatibility, even when their default video id differs from the
+    /// library id.
+    static func savedResumeTargetsDifferentEpisode(usesSeriesLifecycle: Bool, savedVideoID: String?,
+                                                    requestedVideoID: String) -> Bool {
+        usesSeriesLifecycle && savedVideoID.map { $0 != requestedVideoID } == true
+    }
+
+    /// Whole-title rewind is safe for a movie. Episodic playback requires a resident episode list and the
+    /// current episode must be the proven final entry, so a missing list or mid-season close cannot erase the
+    /// title resume position.
+    static func canRewindWholeTitleAtTerminal(usesSeriesLifecycle: Bool,
+                                              currentEpisodeIndex: Int?, episodeCount: Int) -> Bool {
+        guard usesSeriesLifecycle else { return true }
+        guard episodeCount > 0,
+              let currentEpisodeIndex,
+              episodesContains(index: currentEpisodeIndex, count: episodeCount) else { return false }
+        return currentEpisodeIndex == episodeCount - 1
+    }
+
+    private static func episodesContains(index: Int, count: Int) -> Bool {
+        index >= 0 && index < count
+    }
+
+    /// Accept an async media result only while both its request generation and target identity remain
+    /// current. Cancellation is advisory, so callers also run this check after every awaited provider call.
+    static func asyncMediaResultIsCurrent(capturedGeneration: Int, currentGeneration: Int,
+                                          capturedVideoID: String?, currentVideoID: String?) -> Bool {
+        capturedGeneration == currentGeneration && capturedVideoID == currentVideoID
+    }
+
+    /// Route a terminal callback by exact physical-load identity. A newer target can be resolving while an
+    /// older issued target is still the active file, so `switchingEpisode` or `pending.issued` alone cannot
+    /// distinguish the published outgoing file from that superseded physical load.
+    static func terminalEventRoute(callbackToken: PlayerLoadToken?, activeToken: PlayerLoadToken?,
+                                   committedToken: PlayerLoadToken?,
+                                   pendingToken: PlayerLoadToken?, pendingIssued: Bool,
+                                   supersededToken: PlayerLoadToken? = nil,
+                                   supersededIssued: Bool = false,
+                                   switchingEpisode: Bool) -> TerminalEventRoute {
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: callbackToken, activeToken: activeToken
+        ), let callbackToken else { return .stale }
+        if pendingIssued, callbackToken == pendingToken { return .pending }
+        if supersededIssued, callbackToken == supersededToken { return .superseded }
+        if switchingEpisode, !pendingIssued {
+            return callbackToken == committedToken ? .outgoingCommittedWhileResolving : .stale
+        }
+        if committedToken == nil || callbackToken == committedToken { return .committed }
+        return .stale
+    }
+
+    /// Shared option-C policy used by both player surfaces. An outgoing committed EOF may persist that exact
+    /// completion but cannot advance or exit while the requested target is resolving. Its error is ignored.
+    static func terminalEventAction(route: TerminalEventRoute,
+                                    kind: TerminalEventKind) -> TerminalEventAction {
+        switch route {
+        case .committed:
+            return .handleCommitted
+        case .pending:
+            return .handlePending
+        case .superseded:
+            return .markSupersededTerminal
+        case .outgoingCommittedWhileResolving:
+            return kind == .eof ? .persistOutgoingCompletionOnly : .ignoreOutgoingError
+        case .stale:
+            return .ignoreStale
+        }
+    }
+
+    /// A raw NZB URL is a descriptor, not playable media. Keep `CoreStream.playableURL` available for row
+    /// eligibility, but episodic playback and download selection must require a resolved direct URL.
+    static func resolvedEpisodeMediaURL(isUsenet: Bool, resolvedURL: URL?, fallbackURL: URL?) -> URL? {
+        if isUsenet { return resolvedURL }
+        return resolvedURL ?? fallbackURL
+    }
+
+    /// Torrent identity is the complete pair. A season pack can reuse one hash for every episode, so a
+    /// hash-only match is never enough to recover the selected raw stream from engine state.
+    static func torrentMatches(rawInfoHash: String?, rawFileIdx: Int?,
+                               selectedInfoHash: String?, selectedFileIdx: Int?,
+                               isEpisode: Bool = true) -> Bool {
+        guard let rawInfoHash, let selectedInfoHash,
+              rawInfoHash.caseInsensitiveCompare(selectedInfoHash) == .orderedSame else { return false }
+        if !isEpisode, rawFileIdx == nil, selectedFileIdx == nil { return true }
+        guard
+              let rawFileIdx, rawFileIdx >= 0,
+              let selectedFileIdx, selectedFileIdx >= 0 else { return false }
+        return rawFileIdx == selectedFileIdx
+    }
+
+    /// Movies preserve the embedded server's legacy file-zero fallback. An episode must carry a selector:
+    /// silently turning a hash-only season-pack row into `/hash/0` can play a different episode.
+    static func playableTorrentFileIndex(fileIdx: Int?, isEpisode: Bool) -> Int? {
+        if let fileIdx { return fileIdx >= 0 ? fileIdx : nil }
+        return isEpisode ? nil : 0
+    }
+
+    /// Pick the stream shape for an explicit episode engine load. Direct streams remain unchanged even when
+    /// they also carry provenance fields. A raw hash-only torrent can bind only through the concrete direct
+    /// URL that native debrid actually resolved; no provider-local file offset is treated as a torrent index.
+    static func engineBindingSource(isRawTorrent: Bool, fileIdx: Int?, resolvedURL: String?)
+        -> EngineBindingSource? {
+        if let resolvedURL, !resolvedURL.isEmpty { return .resolvedDirectURL(resolvedURL) }
+        guard isRawTorrent else { return .original }
+        return playableTorrentFileIndex(fileIdx: fileIdx, isEpisode: true).map { _ in .original }
+    }
+
+    /// A caller records an engine request identity only after CoreBridge confirms that it dispatched a valid
+    /// binding. Failed bindings return nil, keeping every progress/watched gate closed.
+    static func boundVideoID(requestedVideoID: String, bindingSucceeded: Bool) -> String? {
+        bindingSucceeded ? requestedVideoID : nil
+    }
+
+    /// Engine progress/watched writes are safe only when the Player's successfully bound request names the
+    /// same video as the media identity currently published by the native player.
+    static func engineWritesAllowed(boundVideoID: String?, displayedVideoID: String?) -> Bool {
+        guard let boundVideoID, let displayedVideoID else { return false }
+        return boundVideoID == displayedVideoID
+    }
+
+    /// A different episode must issue different media. Treating the outgoing URL as a successful advance
+    /// would publish and scrobble the target while the previous episode keeps rendering.
+    static func canIssueEpisodeSwitch(currentVideoID: String?, targetVideoID: String,
+                                      currentURL: URL?, targetURL: URL) -> Bool {
+        guard currentVideoID != targetVideoID else { return false }
+        return currentURL != targetURL
+    }
+
+    /// Choose a file from a provider-returned array. A raw torrent's `fileIdx` is deliberately absent here:
+    /// provider order and ids are independent from torrent-metainfo order. Semantic identity wins, followed
+    /// by an exact normalized source path/name when available, then a sole effective file; ambiguity closes.
+    static func pickFileOffset(_ files: [FileCandidate], season: Int?, episode: Int?,
+                               sourceFilename: String? = nil) -> Int? {
+        let videos = files.filter(\.isVideo)
+        let pool = videos.isEmpty ? files : videos
+        if let numbers = provenEpisodeNumbers(season: season, episode: episode) {
+            let scored = pool.map { candidate in
+                (candidate, episodeMatchScore(
+                    filename: candidate.name, season: numbers.season, episode: numbers.episode
+                ))
+            }
+            let matches = scored.filter { $0.1 > 0 }
+            if matches.count == 1 { return matches[0].0.offset }
+        }
+        let semanticFilename = sourceFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let semanticFilename, !semanticFilename.isEmpty {
+            let source = normalizedFileIdentity(semanticFilename)
+            let exactPath = pool.filter { normalizedFileIdentity($0.name).path == source.path }
+            if exactPath.count == 1 { return exactPath[0].offset }
+            let exactName = pool.filter { normalizedFileIdentity($0.name).name == source.name }
+            if exactName.count == 1 { return exactName[0].offset }
+        }
+        let attemptedSemanticSelection = season != nil || episode != nil || semanticFilename?.isEmpty == false
+        if !attemptedSemanticSelection {
+            return pool.max(by: { $0.size < $1.size })?.offset
+        }
+        return pool.count == 1 ? pool[0].offset : nil
+    }
+
+    private static func normalizedFileIdentity(_ raw: String) -> (path: String, name: String) {
+        let decoded = raw.removingPercentEncoding ?? raw
+        let slashPath = decoded.replacingOccurrences(of: "\\", with: "/")
+        let parts = slashPath.split(separator: "/").map(String.init).filter { $0 != "." }
+        let path = parts.joined(separator: "/").lowercased()
+        return (path, parts.last?.lowercased() ?? "")
+    }
+
+    private static func episodeMatchScore(filename: String, season: Int, episode: Int) -> Int {
+        let lower = filename.lowercased()
+        let sxe = "(?<![0-9])s0*\(season)e0*\(episode)(?![0-9])"
+        if lower.range(of: sxe, options: .regularExpression) != nil { return 3 }
+        let oneX = "(?<![0-9])\(season)x0*\(episode)(?![0-9])"
+        if lower.range(of: oneX, options: .regularExpression) != nil { return 2 }
+        let words = "(?<![0-9])season[ ._-]+0*\(season)[ ._-]+episode[ ._-]+0*\(episode)(?![0-9])"
+        if lower.range(of: words, options: .regularExpression) != nil { return 1 }
+        return 0
+    }
+}
+
 /// A playable stream. `StreamSource` is `#[serde(untagged)]` + flattened, so the source fields
 /// (url / ytId / infoHash / externalUrl) sit at the top level, decode them all optionally.
 struct CoreStream: Decodable, Identifiable, Equatable {
@@ -765,7 +1166,11 @@ struct CoreStream: Decodable, Identifiable, Equatable {
     /// `/yt/{id}` route — the same path the Trailer button uses (`TrailerRequest`). The remote
     /// resolver needs no embedded server, so this is playable on every scheme including Lite.
     /// Without this, every Streailer stream rendered as an inert lock-icon row.
-    var playableURL: URL? {
+    var playableURL: URL? { playableURL(isEpisode: false) }
+
+    /// Episode-aware playable URL. Direct, usenet, and YouTube sources keep their existing behavior. Raw
+    /// episode torrents require an explicit file selector so a season-pack hash can never default to file 0.
+    func playableURL(isEpisode: Bool) -> URL? {
         if let url, let parsed = URL(string: url) { return parsed }
         // USENET: playable only when a TorBox key can resolve it. The play path
         // (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a direct https link BEFORE the
@@ -781,7 +1186,10 @@ struct CoreStream: Decodable, Identifiable, Equatable {
         }
         guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let hash = infoHash?.lowercased() else { return nil }
-        return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
+        guard let selectedFileIndex = EpisodePlaybackIdentity.playableTorrentFileIndex(
+            fileIdx: fileIdx, isEpisode: isEpisode
+        ) else { return nil }
+        return URL(string: "\(StremioServer.base)/\(hash)/\(selectedFileIndex)")
     }
 
     /// The bare YouTube id of an `isYouTubeTrailer` source-list stream (a trailer add-on's `{ "ytId": "…" }`

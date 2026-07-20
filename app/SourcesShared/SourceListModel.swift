@@ -35,15 +35,28 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
     /// The assembled, filtered, ranked source groups, ready to render. Replaced atomically per rebuild,
     /// so an unchanged list is the SAME array instance and `==` on it is a buffer-identity fast path.
-    @Published private(set) var groups: [CoreStreamSourceGroup] = []
+    @Published private var publishedGroups: [CoreStreamSourceGroup] = []
     /// The ranked best playable stream (continuity-aware), the Watch-Now pick.
-    @Published private(set) var best: CoreStream?
+    @Published private var publishedBest: CoreStream?
     /// Resolution-tier labels present in the ranked list (["4K","1080p",...]); the Quality picker's first level.
     /// Computed once per off-main rebuild so the detail bodies stop re-ranking on every body eval.
-    @Published private(set) var tiers: [String] = []
+    @Published private var publishedTiers: [String] = []
     /// Best playable stream per resolution label (forward-compat: the player's resolution dropdown).
     /// Computed alongside `tiers` on the same off-main pass.
-    @Published private(set) var resolutionOptions: [(label: String, stream: CoreStream)] = []
+    @Published private var publishedResolutionOptions: [(label: String, stream: CoreStream)] = []
+
+    var groups: [CoreStreamSourceGroup] {
+        publishedIdentity == outputIdentity(for: context) ? publishedGroups : []
+    }
+    var best: CoreStream? {
+        publishedIdentity == outputIdentity(for: context) ? publishedBest : nil
+    }
+    var tiers: [String] {
+        publishedIdentity == outputIdentity(for: context) ? publishedTiers : []
+    }
+    var resolutionOptions: [(label: String, stream: CoreStream)] {
+        publishedIdentity == outputIdentity(for: context) ? publishedResolutionOptions : []
+    }
 
     // MARK: Context (the view-owned ranking inputs, set from body, equality-guarded)
 
@@ -53,6 +66,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     struct Context: Equatable {
         var metaId = ""              // for the pin scope + the health-metric log only
         var streamId: String?        // nil = all loaded groups (movie/live); set = one episode's groups (iOS + tvOS episode pages)
+        var auxiliaryContentID: String?   // canonical query token for TorBox Search + Singularity
+        var mediaServerTargetID: String?  // exact page token, including IMDb-less title/year fallback pages
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
         var prefsSignature = ""      // SourcePreferences.rankingSignature (filter/rank settings)
@@ -73,6 +88,13 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let inputsHash: Int
     }
 
+    private struct OutputIdentity: Equatable {
+        let metaId: String
+        let streamId: String?
+        let auxiliaryContentID: String?
+        let mediaServerTargetID: String?
+    }
+
     /// Sendable weak indirection for the detached worker's main-actor publish. Capturing `weak self` directly
     /// and then closing over that mutable weak capture inside `MainActor.run` is rejected in Swift 6 mode.
     private final class WeakOwner: @unchecked Sendable {
@@ -91,6 +113,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private let trigger = PassthroughSubject<Void, Never>()
     private var generation = 0
     private var publishedSignature: Signature?
+    private var publishedIdentity: OutputIdentity?
     private var pendingSignature: Signature?
 
     /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in; the
@@ -135,10 +158,13 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// Update the view-owned ranking inputs. Safe (and intended) to call from `body`: it is a few
     /// cheap reads plus an equality check, publishes nothing synchronously, and only nudges the
     /// coalescer when an input actually moved.
-    func setContext(metaId: String, streamId: String?, continuity: String?, pin: ResolvedPin?) {
+    func setContext(metaId: String, streamId: String?, continuity: String?, pin: ResolvedPin?,
+                    auxiliaryContentID: String? = nil, mediaServerTargetID: String? = nil) {
         var next = Context()
         next.metaId = metaId
         next.streamId = streamId
+        next.auxiliaryContentID = auxiliaryContentID
+        next.mediaServerTargetID = mediaServerTargetID
         next.continuity = continuity
         next.pin = pin
         next.prefsSignature = SourcePreferences.shared.rankingSignature
@@ -146,8 +172,28 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.directLinksOnly = PlaybackSettings.directLinksOnly
         next.disabledAddons = ProfileStore.activeDisabledAddons()
         guard next != context else { return }
+        let identityChanged = next.metaId != context.metaId || next.streamId != context.streamId
+            || next.auxiliaryContentID != context.auxiliaryContentID
+            || next.mediaServerTargetID != context.mediaServerTargetID
         context = next
+        if identityChanged {
+            // A detached rebuild for the prior title/episode may still be running. Retire its generation and
+            // synchronously remove every selectable output before asking the coalescer for the new identity.
+            // Without this fence, one render after E2 -> E3 can still expose E2's rows and Watch-Now pick.
+            generation &+= 1
+            pendingSignature = nil
+            publishedSignature = nil
+        }
         trigger.send()
+    }
+
+    private func outputIdentity(for context: Context) -> OutputIdentity {
+        OutputIdentity(
+            metaId: context.metaId,
+            streamId: context.streamId,
+            auxiliaryContentID: context.auxiliaryContentID,
+            mediaServerTargetID: context.mediaServerTargetID
+        )
     }
 
     // MARK: Rebuild (coalesced entry; snapshot on main, assemble off-main, publish once)
@@ -162,6 +208,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         var hasher = Hasher()
         hasher.combine(ctx.metaId)
         hasher.combine(ctx.streamId)
+        hasher.combine(ctx.auxiliaryContentID)
+        hasher.combine(ctx.mediaServerTargetID)
         hasher.combine(ctx.continuity)
         hasher.combine(String(describing: ctx.pin))
         hasher.combine(ctx.prefsSignature)
@@ -182,12 +230,15 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
         // Immutable snapshot on the main actor; everything below is value types.
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
-        let torboxStreams = torbox.streams
-        let singularityStreams = singularity.streams
+        let target = ctx.auxiliaryContentID
+        let torboxStreams = target != nil && torbox.publishedContentID == target ? torbox.streams : []
+        let singularityStreams = target != nil && singularity.publishedContentID == target ? singularity.streams : []
         let singularityEpoch = singularity.epoch
         let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
         let includedSingularity = !singularityStreams.isEmpty
-        let mediaServerGroups = mediaServers.groups
+        let mediaTarget = ctx.mediaServerTargetID
+        let mediaServerGroups = mediaTarget != nil && mediaServers.publishedContentID == mediaTarget
+            ? mediaServers.groups : []
         // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
         // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
         // main thread (Settings edits, profile reload()), so reading them from the detached rank below
@@ -244,13 +295,14 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 }
                 self.pendingSignature = nil
                 self.publishedSignature = signature
+                self.publishedIdentity = self.outputIdentity(for: ctx)
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
                 // 250 ms coalescer is broken (this used to fire per body eval, thousands of lines).
                 VXProbe.log("sing", "merged rebuild meta=\(ctx.metaId.isEmpty ? "-" : ctx.metaId) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
-                self.groups = ranked
-                self.best = rankedBest
-                self.tiers = rankedTiers
-                self.resolutionOptions = rankedResOpts
+                self.publishedGroups = ranked
+                self.publishedBest = rankedBest
+                self.publishedTiers = rankedTiers
+                self.publishedResolutionOptions = rankedResOpts
             }
 
             // Phase 7 SHADOW (flag `vortxShadowRanking`, default OFF): rank the SAME assembled
@@ -271,10 +323,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         generation &+= 1
         pendingSignature = nil
         publishedSignature = nil
-        groups = []
-        best = nil
-        tiers = []
-        resolutionOptions = []
+        publishedIdentity = nil
+        publishedGroups = []
+        publishedBest = nil
+        publishedTiers = []
+        publishedResolutionOptions = []
         trigger.send()
     }
 }

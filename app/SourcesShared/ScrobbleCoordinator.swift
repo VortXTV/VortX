@@ -207,7 +207,7 @@ final class ScrobbleCoordinator {
         // traffic. `isConfigured` is a synchronous constant check.
         guard TraktAuth.isConfigured || SIMKLAuth.isConfigured else { return }
         // Snapshot the plain value fields on the caller thread (PlaybackMeta is a Sendable-safe value).
-        let isSeries = meta.type == "series"
+        let isSeries = meta.usesSeriesLifecycle
         let libraryId = meta.libraryId
         let season = meta.season, episode = meta.episode
         let title = meta.name

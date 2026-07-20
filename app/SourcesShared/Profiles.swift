@@ -1265,7 +1265,8 @@ final class ProfileStore: ObservableObject {
             // this a watched movie stays pinned forever by the watchedVideoIds keep-rule below), OR a near-end
             // offset. A series is unaffected: its keep-signal is EPISODE ids, never the series metaId, so it
             // rolls forward to the next episode as before. (libraryItems keeps finished movies; this is cwItems.)
-            if entry.type == "movie",
+            let usesSeriesLifecycle = EpisodePlaybackIdentity.usesSeriesLifecycle(type: entry.type)
+            if !usesSeriesLifecycle,
                entry.watchedVideoIds.contains(metaId)
                 || (entry.durationMs > 0 && Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95) { continue }
             guard entry.timeOffsetMs > 0 || !entry.watchedVideoIds.isEmpty else { continue }
@@ -1314,7 +1315,11 @@ final class ProfileStore: ObservableObject {
     /// Saved resume position in seconds (0 = start fresh); series only resume the same episode.
     func resumeOffset(for meta: PlaybackMeta) -> Double {
         guard let entry = watch[meta.libraryId] else { return 0 }
-        if meta.type == "series", let saved = entry.videoId, saved != meta.videoId { return 0 }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: entry.videoId,
+            requestedVideoID: meta.videoId
+        ) { return 0 }
         return entry.timeOffsetMs > 0 ? Double(entry.timeOffsetMs) / 1000 : 0
     }
 

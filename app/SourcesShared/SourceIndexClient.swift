@@ -1066,6 +1066,9 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     private(set) var epoch = 0
 
     private var lastContentID: String?
+    /// Canonical identity for the rows currently owned by this source. The source-list assembler checks it
+    /// before merging so a detached E2 snapshot cannot be reused for E3.
+    var publishedContentID: String? { lastContentID }
     private var task: Task<Void, Never>?
 
     typealias FetchPooled = @Sendable (String, Bool) async throws -> [SourceIndexClient.PooledSource]

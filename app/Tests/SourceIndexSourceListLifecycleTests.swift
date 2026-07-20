@@ -74,8 +74,9 @@ final class CoreBridge: ObservableObject {
 
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
-    @Published var streams: [CoreStream] = []
+    @Published var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
     var epoch = 0
+    var publishedContentID: String?
 
     nonisolated static func merge(
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
@@ -87,11 +88,15 @@ final class TorBoxSearchSource: ObservableObject {
 
 @MainActor
 final class SourceIndexServeSource: ObservableObject, SourceIndexLifecycleParticipant {
-    @Published private(set) var streams: [CoreStream]
+    @Published var streams: [CoreStream] { didSet { epoch &+= 1 } }
     private(set) var epoch = 0
     private var gateOpen = true
+    var publishedContentID: String?
 
-    init(streams: [CoreStream]) { self.streams = streams }
+    init(streams: [CoreStream], publishedContentID: String? = nil) {
+        self.streams = streams
+        self.publishedContentID = publishedContentID
+    }
 
     nonisolated static func merge(
         _ streams: [CoreStream], into groups: [CoreStreamSourceGroup]
@@ -102,6 +107,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
 
     func sourceIndexLifecycleDidClose(retiredSourceGeneration _: UInt64) {
         gateOpen = false
+        publishedContentID = nil
         streams = []
         epoch &+= 1
     }
@@ -118,8 +124,9 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
 
 @MainActor
 final class MediaServerSource: ObservableObject {
-    @Published var groups: [CoreStreamSourceGroup] = []
+    @Published var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
     var epoch = 0
+    var publishedContentID: String?
 
     nonisolated static func merge(
         _ mediaGroups: [CoreStreamSourceGroup], into groups: [CoreStreamSourceGroup]
@@ -245,14 +252,28 @@ struct SourceIndexSourceListLifecycleTests {
     static func main() async {
         let ordinary = CoreStream(id: "ordinary", infoHash: nil, isTorrent: false)
         let pooled = CoreStream(id: "pooled", infoHash: String(repeating: "a", count: 40), isTorrent: true)
+        let torboxRow = CoreStream(id: "torbox-row", infoHash: String(repeating: "b", count: 40), isTorrent: true)
+        let mediaRow = CoreStream(id: "media-row", infoHash: nil, isTorrent: false)
         let core = CoreBridge(groups: [
             CoreStreamSourceGroup(id: "ordinary", addon: "Ordinary", streams: [ordinary]),
         ])
         let torbox = TorBoxSearchSource()
-        let singularity = SourceIndexServeSource(streams: [pooled])
+        torbox.publishedContentID = "tt0903747:1:1"
+        torbox.streams = [torboxRow]
+        let singularity = SourceIndexServeSource(
+            streams: [pooled], publishedContentID: "tt0903747:1:1"
+        )
         let mediaServers = MediaServerSource()
+        mediaServers.publishedContentID = "page:tt0903747:1:1"
+        mediaServers.groups = [
+            CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
+        ]
         let debridCache = DebridCacheAwareness()
         let model = SourceListModel()
+        model.setContext(
+            metaId: "tt0903747", streamId: "tt0903747:1:1", continuity: nil, pin: nil,
+            auxiliaryContentID: "tt0903747:1:1", mediaServerTargetID: "page:tt0903747:1:1"
+        )
 
         model.bind(
             core: core,
@@ -265,7 +286,55 @@ struct SourceIndexSourceListLifecycleTests {
             if model.groups.contains(where: { $0.id == "singularity" }) { break }
             await Task.yield()
         }
-        let initialPublished = model.groups.contains { $0.id == "singularity" }
+        let initialPublished = ["torbox", "singularity", "media"].allSatisfy { id in
+            model.groups.contains { $0.id == id }
+        }
+
+        model.setContext(
+            metaId: "tt0903747", streamId: "tt0903747:1:2", continuity: nil, pin: nil,
+            auxiliaryContentID: "tt0903747:1:2", mediaServerTargetID: "page:tt0903747:1:2"
+        )
+        let identityClearedSynchronously = model.groups.isEmpty
+            && model.best == nil
+            && model.tiers.isEmpty
+            && model.resolutionOptions.isEmpty
+        for _ in 0..<4_000 {
+            if model.groups.contains(where: { $0.id == "ordinary" }) { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let staleAuxiliaryExcluded = ["torbox", "singularity", "media"].allSatisfy { id in
+            !model.groups.contains { $0.id == id }
+        }
+
+        torbox.publishedContentID = "tt0903747:1:2"
+        torbox.streams = [torboxRow]
+        singularity.publishedContentID = "tt0903747:1:2"
+        singularity.streams = [pooled]
+        mediaServers.publishedContentID = "page:tt0903747:1:2"
+        mediaServers.groups = [
+            CoreStreamSourceGroup(id: "media", addon: "My Server", streams: [mediaRow]),
+        ]
+        for _ in 0..<4_000 {
+            let ids = Set(model.groups.map(\.id))
+            if ids.isSuperset(of: ["torbox", "singularity", "media"]) { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
+        let matchingAuxiliaryIncluded = ["torbox", "singularity", "media"].allSatisfy { id in
+            model.groups.contains { $0.id == id }
+        }
+
+        model.setContext(
+            metaId: "tt0903747", streamId: "tt0903747:1:3", continuity: nil, pin: nil,
+            auxiliaryContentID: "tt0903747:1:3", mediaServerTargetID: "page:tt0903747:1:3"
+        )
+        let nextEpisodeClearedSynchronously = model.groups.isEmpty
+            && model.best == nil
+            && model.tiers.isEmpty
+            && model.resolutionOptions.isEmpty
+        for _ in 0..<4_000 {
+            if model.groups.contains(where: { $0.id == "singularity" }) { break }
+            try? await Task<Never, Never>.sleep(nanoseconds: 250_000)
+        }
 
         RankingBlocker.shared.arm()
         core.streamsEpoch &+= 1
@@ -292,11 +361,13 @@ struct SourceIndexSourceListLifecycleTests {
             && model.best?.id == "ordinary"
             && !model.groups.contains(where: { $0.id == "singularity" })
 
-        if initialPublished && detachedRankBlocked && clearedSynchronously && staleCompletionFenced {
-            print("PASS  SourceListModel clears synchronously and fences a blocked stale Singularity rank")
+        if initialPublished && identityClearedSynchronously && staleAuxiliaryExcluded
+            && matchingAuxiliaryIncluded && nextEpisodeClearedSynchronously
+            && detachedRankBlocked && clearedSynchronously && staleCompletionFenced {
+            print("PASS  SourceListModel clears identities, excludes stale auxiliary rows, and fences stale ranks")
             exit(0)
         }
-        print("FAIL  initial=\(initialPublished) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
+        print("FAIL  initial=\(initialPublished) identityClear=\(identityClearedSynchronously) auxScope=\(staleAuxiliaryExcluded) auxMatch=\(matchingAuxiliaryIncluded) nextClear=\(nextEpisodeClearedSynchronously) blocked=\(detachedRankBlocked) clear=\(clearedSynchronously) fenced=\(staleCompletionFenced)")
         exit(1)
     }
 }

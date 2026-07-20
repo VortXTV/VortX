@@ -61,6 +61,13 @@ struct DebridFile: Sendable, Equatable {
 struct DebridEpisode: Sendable, Equatable {
     let season: Int
     let episode: Int
+    let sourceFilename: String?
+
+    init(season: Int, episode: Int, sourceFilename: String? = nil) {
+        self.season = season
+        self.episode = episode
+        self.sourceFilename = sourceFilename
+    }
 }
 
 enum DebridError: Error, Equatable {
@@ -75,8 +82,9 @@ enum DebridError: Error, Equatable {
 /// The provenance of a natively-resolved debrid link: enough to regenerate a FRESH stream link straight
 /// from the provider (skip the add step) when the minted URL has expired. Carried from the resolve site to
 /// the play-record so a Continue-Watching resume can `DebridCoordinator.reresolve(...)`. All fields but the
-/// URL are the reresolve inputs; `torrentId`/`fileId` are the provider ids that avoid a re-add, `infoHash`/
-/// `fileIdx` let a provider re-add from scratch if the id is gone. Value type, `Sendable`.
+/// URL are the reresolve inputs; `torrentId`/`fileId` are exact provider ids that avoid a re-add. `infoHash`
+/// enables a re-add, while `fileIdx` remains source provenance and never indexes provider arrays. Episodic
+/// re-add also requires a semantic target. Value type, `Sendable`.
 struct DebridPlaybackRef: Sendable, Equatable {
     let url: URL
     let service: DebridService
@@ -134,9 +142,10 @@ protocol DebridResolving: Actor {
         async throws -> (url: URL, torrentId: Int?, fileId: Int?)
 
     /// Regenerate a FRESH direct link for an already-resolved file, skipping the add step where possible.
-    /// `torrentId`+`fileId` (when present) take the fast provider-native path; otherwise fall back to a full
-    /// re-add via `resolve` using the carried `infoHash`/`fileIdx`. Throws `.notCached` when the file is gone.
-    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL
+    /// `torrentId`+`fileId` (when present) take the exact provider-native path. Full re-add is allowed for a
+    /// movie or a semantic episode selector, never from raw `fileIdx` alone.
+    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
+                       episode: DebridEpisode?, requiresSemanticSelection: Bool) async throws -> URL
 
     /// List what is ALREADY in this provider's cloud (finished torrents / stored files), each carrying
     /// enough to resolve to a direct URL on demand. Powers the browsable debrid library. Default: none.
@@ -154,11 +163,17 @@ extension DebridResolving {
         return (url, nil, nil)
     }
 
-    /// Default reresolve: no stable ids, so re-add from the infohash (the provider dedups an already-present
-    /// torrent, so this is still far cheaper than the full add-on re-resolve). RD/AD/PM use this path.
-    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL {
+    /// Default reresolve: providers without stable ids may re-add from the infohash only when an episodic
+    /// request still has semantic identity. RD/AD/PM use this path. Raw fileIdx never authorizes the re-add.
+    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
+                       episode: DebridEpisode?, requiresSemanticSelection: Bool) async throws -> URL {
+        guard EpisodePlaybackIdentity.providerArrayFallbackAllowed(
+            requiresSemanticSelection: requiresSemanticSelection,
+            season: episode?.season, episode: episode?.episode,
+            sourceFilename: episode?.sourceFilename
+        ) else { throw DebridError.noMatchingFile }
         let magnet = DebridResolve.magnet(forHash: infoHash)
-        return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: nil)
+        return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
     }
 
     /// Default: a provider that has not implemented cloud browsing surfaces nothing (never throws, so the
@@ -200,30 +215,24 @@ enum DebridResolve {
         return s
     }
 
-    /// Pick the file to stream: explicit fileIdx -> SxEy filename match -> largest video file.
-    static func pickFile(_ files: [DebridFile], episode: DebridEpisode?, fileIdx: Int?) -> DebridFile? {
-        if let idx = fileIdx, files.indices.contains(idx) { return files[idx] }
-        let videos = files.filter(\.isVideo)
-        // Provider omitted filenames (isVideo false for every entry, e.g. AllDebrid on a cached single-file
-        // torrent): fall back to the whole file list so size selection still resolves instead of noMatchingFile.
-        let pool = videos.isEmpty ? files : videos
-        guard let episode else { return pool.max(by: { $0.size < $1.size }) }
-        let scored = pool.compactMap { f -> (DebridFile, Int)? in
-            let s = episodeMatchScore(filename: f.shortName.isEmpty ? f.name : f.shortName,
-                                      season: episode.season, episode: episode.episode)
-            return s > 0 ? (f, s) : nil
+    /// Pick by semantic provider data only. The raw torrent fileIdx is provenance and never indexes these
+    /// provider arrays because their ordering and ids are provider-local.
+    static func pickFile(_ files: [DebridFile], episode: DebridEpisode?) -> DebridFile? {
+        let candidates = files.enumerated().map { offset, file in
+            EpisodePlaybackIdentity.FileCandidate(
+                offset: offset,
+                name: file.name.isEmpty ? file.shortName : file.name,
+                size: file.size,
+                isVideo: file.isVideo
+            )
         }
-        if let best = scored.max(by: { $0.1 < $1.1 })?.0 { return best }
-        return pool.max(by: { $0.size < $1.size })   // pack fallback: biggest video
-    }
-
-    /// Score a filename against a SxEy target (SnnEnn, n x nn, "season n ... episode n"). 0 = no match.
-    static func episodeMatchScore(filename: String, season: Int, episode: Int) -> Int {
-        let lower = filename.lowercased()
-        if lower.contains(String(format: "s%02de%02d", season, episode)) { return 3 }
-        if lower.contains("\(season)x\(String(format: "%02d", episode))") { return 2 }
-        if lower.contains("season \(season)") && lower.contains("episode \(episode)") { return 1 }
-        return 0
+        guard let offset = EpisodePlaybackIdentity.pickFileOffset(
+            candidates,
+            season: episode?.season,
+            episode: episode?.episode,
+            sourceFilename: episode?.sourceFilename
+        ), files.indices.contains(offset) else { return nil }
+        return files[offset]
     }
 }
 
@@ -322,11 +331,10 @@ actor TorBoxResolver: DebridResolving {
             DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> notReady (no torrentId after poll) elapsed=\(DebridProbe.since(srcProbeStart))ms")
             throw DebridError.notReady
         }
-        guard let pick = DebridResolve.pickFile(files, episode: episode, fileIdx: fileIdx) else {
+        guard let pick = DebridResolve.pickFile(files, episode: episode) else {
             DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> noMatchingFile (files=\(files.count)) elapsed=\(DebridProbe.since(srcProbeStart))ms")
             throw DebridError.noMatchingFile
         }
-
         // 3. Request the direct stream URL.
         let url = try await requestDL(torrentId: id, fileId: pick.id)
         DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> OK torrentId=\(id) fileId=\(pick.id) elapsed=\(DebridProbe.since(srcProbeStart))ms")
@@ -334,9 +342,10 @@ actor TorBoxResolver: DebridResolving {
     }
 
     /// Regenerate a fresh link from the stored ids. When `torrentId`+`fileId` are present, this is a single
-    /// `requestdl` (no add step) — the fast path a debrid resume wants. If TorBox 404s the file (evicted),
-    /// fall back to a full re-add via the default resolve. Nil ids also fall back.
-    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL {
+    /// `requestdl` (no add step), the exact fast path a debrid resume wants. A failed fast path may re-add
+    /// only when a movie or semantic episode selector makes provider-array selection safe.
+    func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
+                       episode: DebridEpisode?, requiresSemanticSelection: Bool) async throws -> URL {
         // [src-probe] CW-resume fast path: mint a fresh link from the stored torrentId+fileId (no re-add). A
         // fall-through here means the stored ids were stale/evicted and we drop to a full re-add.
         DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path ids torrentId=\(torrentId.map(String.init) ?? "nil") fileId=\(fileId.map(String.init) ?? "nil")")
@@ -354,8 +363,13 @@ actor TorBoxResolver: DebridResolving {
             catch DebridError.invalidKey { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path invalidKey (auth blip) -> re-add") }
             catch DebridError.notReady { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path notReady -> re-add") }
         }
+        guard EpisodePlaybackIdentity.providerArrayFallbackAllowed(
+            requiresSemanticSelection: requiresSemanticSelection,
+            season: episode?.season, episode: episode?.episode,
+            sourceFilename: episode?.sourceFilename
+        ) else { throw DebridError.noMatchingFile }
         let magnet = DebridResolve.magnet(forHash: infoHash)
-        return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: nil)
+        return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
     }
 
     /// The `requestdl` leg: mint a direct stream URL for a known torrent_id+file_id. A missing file surfaces
@@ -529,7 +543,8 @@ actor TorBoxUsenetResolver {
 
     /// Resolve one usenet stream (nzb link) to a direct HTTPS URL. Mirrors the torrent resolve flow:
     /// createusenetdownload -> poll mylist until present -> pick the file -> requestdl. `fileMustInclude`
-    /// (a regex) and `fileIdx` bias the pick when present; otherwise the shared `pickFile` heuristic runs.
+    /// (a regex) filters provider files first; otherwise the shared semantic picker runs. `fileIdx` remains
+    /// source provenance and never indexes the provider list.
     /// `knownHash` is the source's authoritative NZB md5 when the emitter had one (TorBox search results
     /// carry it); the md5-of-the-link fallback only matches when TorBox derived its key the same way.
     func resolve(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
@@ -548,7 +563,7 @@ actor TorBoxUsenetResolver {
         }
         guard let id = usenetId else { throw DebridError.notReady }
 
-        // 3. Pick the file, honoring fileMustInclude / fileIdx, then the shared episode/size heuristic.
+        // 3. Pick the file, applying fileMustInclude first, then the shared semantic episode/movie heuristic.
         guard let pick = pickUsenetFile(files, mustInclude: fileMustInclude, fileIdx: fileIdx, episode: episode) else {
             throw DebridError.noMatchingFile
         }
@@ -557,8 +572,8 @@ actor TorBoxUsenetResolver {
         return try await requestDL(usenetId: id, fileId: pick.id)
     }
 
-    /// File pick with the usenet-specific `fileMustInclude` regex applied FIRST (when present + it matches
-    /// a video), then the shared `DebridResolve.pickFile` (explicit idx -> SxEy -> largest video).
+    /// File pick with the usenet-specific `fileMustInclude` regex applied first when it matches a video,
+    /// then the shared semantic provider picker. Raw fileIdx remains provenance and is deliberately ignored.
     private func pickUsenetFile(_ files: [DebridFile], mustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) -> DebridFile? {
         if let pattern = mustInclude, !pattern.isEmpty,
            let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
@@ -567,9 +582,9 @@ actor TorBoxUsenetResolver {
                 let name = f.shortName.isEmpty ? f.name : f.shortName
                 return re.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
             }
-            if let best = DebridResolve.pickFile(matched, episode: episode, fileIdx: nil) { return best }
+            if let best = DebridResolve.pickFile(matched, episode: episode) { return best }
         }
-        return DebridResolve.pickFile(files, episode: episode, fileIdx: fileIdx)
+        return DebridResolve.pickFile(files, episode: episode)
     }
 
     /// The `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id.
@@ -694,7 +709,9 @@ actor RealDebridResolver: DebridResolving {
         let dfiles = fileList.map { f -> DebridFile in
             DebridFile(id: f.id, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
         }
-        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil) else { throw DebridError.noMatchingFile }
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode) else {
+            throw DebridError.noMatchingFile
+        }
         try await formVoid("\(Self.base)/torrents/selectFiles/\(id)", ["files": String(pick.id)])
         var link: String?
         for attempt in 0..<12 {
@@ -833,7 +850,7 @@ actor AllDebridResolver: DebridResolving {
         }
         // fileIdx is torrent-wide; AD's link list may differ in order/count, so pick by the filename/size
         // heuristic (which keeps `links[pick.id]` aligned), not by the raw torrent index.
-        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode),
               links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: links[pick.id].link)]))
         guard let s = un.data?.link, let u = URL(string: s) else { throw DebridError.providerError("unlock") }
@@ -921,7 +938,7 @@ actor PremiumizeResolver: DebridResolving {
         }
         // fileIdx is torrent-wide; PM's directdl content order may differ, so pick by the filename/size
         // heuristic (which keeps `content[pick.id]` aligned), not by the raw torrent index.
-        guard let pick = DebridResolve.pickFile(dfiles, episode: episode, fileIdx: nil),
+        guard let pick = DebridResolve.pickFile(dfiles, episode: episode),
               content.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let item = content[pick.id]
         guard let s = item.streamLink ?? item.link, let u = URL(string: s) else { throw DebridError.providerError("no link") }
@@ -1101,11 +1118,15 @@ actor DebridCoordinator {
     /// add step where the provider supports it. Throws `.noKey` when that provider is no longer configured,
     /// `.notCached`/`.providerError` when the file is gone. Used by the Continue-Watching resume path to
     /// refresh an expired debrid link without the slow full add-on re-resolve.
-    func reresolve(service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?)
+    func reresolve(service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
+                   episode: DebridEpisode? = nil, requiresSemanticSelection: Bool)
         async throws -> URL {
         await warmIfNeeded()
         guard let resolver = resolvers[service] else { throw DebridError.noKey }
-        return try await resolver.reresolveLink(infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx)
+        return try await resolver.reresolveLink(
+            infoHash: infoHash, torrentId: torrentId, fileId: fileId, fileIdx: fileIdx,
+            episode: episode, requiresSemanticSelection: requiresSemanticSelection
+        )
     }
 
     private func pick(_ service: DebridService?) -> (any DebridResolving)? {
@@ -1194,6 +1215,12 @@ extension DebridCoordinator {
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
+        let selectionEpisode = episode.map {
+            DebridEpisode(
+                season: $0.season, episode: $0.episode,
+                sourceFilename: $0.sourceFilename ?? stream.behaviorHints?.filename
+            )
+        }
         // USENET first: a stream with an `.nzb` link (and no direct `url`) resolves through the TorBox
         // usenet backend, gated on a TorBox key. With no TorBox key `hasUsenetResolver` is false, so this
         // returns nil here with no network (only the at-most-once lazy warm hop), so a usenet row behaves
@@ -1215,7 +1242,9 @@ extension DebridCoordinator {
             return await withTaskGroup(of: DebridPlaybackRef?.self) { group in
                 group.addTask {
                     guard let url = try? await DebridCoordinator.shared.resolveUsenet(
-                        nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude, fileIdx: fileIdx, episode: episode) else { return nil }
+                        nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
+                        fileIdx: fileIdx, episode: selectionEpisode
+                    ) else { return nil }
                     // Usenet is a plain direct link: no infoHash / torrentId to carry (no reresolve fast
                     // path), so the ref's torrent fields are nil. The `url` alone lets the player open it.
                     return DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
@@ -1255,8 +1284,8 @@ extension DebridCoordinator {
         }
         DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) gate=\(confirmedCachedHashes == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking resolve (\(DebridProbe.ms(DebridCoordinator.resolveTimeout))ms budget)")
 
-        // Build the magnet from the infohash (+ the add-on's `sources`, which carry trackers some providers
-        // use to add the magnet); fileIdx biases the season-pack pick when present, the episode SxEy refines it.
+        // Build the magnet from the infohash plus the add-on trackers. fileIdx remains source provenance only;
+        // provider arrays are selected by episode/name semantics and never by that torrent-wide position.
         let trackers = (stream.sources ?? []).filter { $0.hasPrefix("tracker:") }.map { String($0.dropFirst("tracker:".count)) }
         let magnet = DebridResolve.magnet(forHash: hash, name: stream.behaviorHints?.filename, trackers: trackers)
         let fileIdx = stream.fileIdx   // hoist the value so the @Sendable task captures an Int?, not CoreStream
@@ -1267,7 +1296,9 @@ extension DebridCoordinator {
         let result = await withTaskGroup(of: DebridPlaybackRef?.self) { group in
             group.addTask {
                 guard let (r, service) = try? await DebridCoordinator.shared.resolveWithIds(
-                    infoHash: hash, magnet: magnet, fileIdx: fileIdx, episode: episode) else { return nil }
+                    infoHash: hash, magnet: magnet, fileIdx: fileIdx,
+                    episode: selectionEpisode
+                ) else { return nil }
                 return DebridPlaybackRef(url: r.url, service: service, infoHash: hash,
                                          torrentId: r.torrentId, fileId: r.fileId, fileIdx: fileIdx)
             }
@@ -1537,7 +1568,7 @@ extension TorBoxResolver {
             guard row.ready else { return nil }
             let files = (row.files ?? []).map(file(from:))
             // Pick the file that would stream (largest video; no episode target for a bare library browse).
-            guard let pick = DebridResolve.pickFile(files, episode: nil, fileIdx: nil) else { return nil }
+            guard let pick = DebridResolve.pickFile(files, episode: nil) else { return nil }
             let name = (row.name?.isEmpty == false) ? row.name! : pick.shortName
             return DebridLibraryItem(
                 id: "\(service.rawValue):\(row.id)",
@@ -1560,7 +1591,7 @@ extension TorBoxResolver {
         // No stored file id (defensive): fetch the item and pick the largest video before minting the link.
         guard let row = try await fetchItem(id: tid) else { throw DebridError.notCached }
         let files = (row.files ?? []).map(file(from:))
-        guard let pick = DebridResolve.pickFile(files, episode: nil, fileIdx: nil) else { throw DebridError.noMatchingFile }
+        guard let pick = DebridResolve.pickFile(files, episode: nil) else { throw DebridError.noMatchingFile }
         return try await requestDL(torrentId: tid, fileId: pick.id)
     }
 }
@@ -1601,7 +1632,7 @@ extension RealDebridResolver {
         let dfiles = selected.enumerated().map { idx, f -> DebridFile in
             DebridFile(id: idx, name: f.path, shortName: (f.path as NSString).lastPathComponent, size: f.bytes, mimetype: nil)
         }
-        guard let pick = DebridResolve.pickFile(dfiles, episode: nil, fileIdx: nil), links.indices.contains(pick.id) else {
+        guard let pick = DebridResolve.pickFile(dfiles, episode: nil), links.indices.contains(pick.id) else {
             throw DebridError.noMatchingFile
         }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
@@ -1639,7 +1670,7 @@ extension AllDebridResolver {
                 let n = l.filename ?? ""
                 return DebridFile(id: idx, name: n, shortName: (n as NSString).lastPathComponent, size: l.size ?? 0, mimetype: nil)
             }
-            guard let pick = DebridResolve.pickFile(dfiles, episode: nil, fileIdx: nil), links.indices.contains(pick.id) else { return nil }
+            guard let pick = DebridResolve.pickFile(dfiles, episode: nil), links.indices.contains(pick.id) else { return nil }
             let name = (m.filename?.isEmpty == false) ? m.filename!
                 : (pick.shortName.isEmpty ? "Untitled" : pick.shortName)
             return DebridLibraryItem(

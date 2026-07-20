@@ -219,6 +219,10 @@ final class TorBoxSearchSource: ObservableObject {
     /// Monotonic epoch bumped whenever `streams` is REPLACED. `SourceListModel` folds this into its
     /// O(1) rebuild signature (a single Int compare instead of hashing the array).
     private(set) var epoch = 0
+    /// Canonical title/episode identity for the currently published rows. SourceListModel compares this
+    /// token with the page target before merging, so an owner that is reused across E2 -> E3 can never lend
+    /// E2 search rows to E3 while the replacement request is in flight.
+    private(set) var publishedContentID: String?
 
     /// The title currently shown (its fetch key). Switching titles resets `streams` so a previous title's
     /// results can never leak onto one we don't (or can't) fetch.
@@ -241,12 +245,14 @@ final class TorBoxSearchSource: ObservableObject {
     /// off during a scraper cooldown. Safe to call on every meta change / `.onAppear`. Pass `season`/`episode`
     /// from an episode context so the index scopes usenet/torrent results to that episode (nil = movie level).
     func refresh(imdbId: String?, season: Int? = nil, episode: Int? = nil) {
-        guard let imdbId, imdbId.hasPrefix("tt") else { return }
-        guard DebridKeys.shared.isConfigured(.torBox) else { return }   // gate: no TorBox key -> no-op
+        guard let imdbId, imdbId.hasPrefix("tt") else { clearResults(); return }
+        guard DebridKeys.shared.isConfigured(.torBox) else { clearResults(); return }   // gate: no TorBox key -> no-op
         let fetchKey = "\(imdbId)|\(season ?? -1)|\(episode ?? -1)"
+        let contentID = if let season, let episode { "\(imdbId):\(season):\(episode)" } else { imdbId }
         // New title: publish its cached results (or clear), so the prior title's streams never linger.
         if fetchKey != shownKey {
             shownKey = fetchKey
+            publishedContentID = contentID
             streams = cache[fetchKey] ?? []
         }
         if cache[fetchKey] != nil { return }              // cached: already published above, no round trip
@@ -296,6 +302,7 @@ final class TorBoxSearchSource: ObservableObject {
     /// already blocks a stale publish).
     func clearResults() {
         shownKey = nil
+        publishedContentID = nil
         if !streams.isEmpty { streams = [] }
     }
 
