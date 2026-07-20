@@ -192,8 +192,27 @@ jobs:
           done
           echo "After:"; df -h /
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen (pinned release artifact, sha256-verified)
+        env:
+          XCODEGEN_VERSION: "2.46.0"
+          # sha256 of yonaskolb/XcodeGen 2.46.0's xcodegen.zip (computed from the release asset).
+          XCODEGEN_SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+        run: |
+          set -euo pipefail
+          # `brew install xcodegen` installs whatever the formula's HEAD resolves to -- a MOVING
+          # version with no clean per-formula pin -- so the release build tool could shift under this
+          # runtime-proven lane with no diff in this file. Instead fetch the EXACT release zip, verify
+          # the sha256 recorded above before trusting a byte of it (fail closed on mismatch), and put
+          # its bin on PATH. The release bundle keeps bin/ and share/ as siblings, so the binary
+          # resolves its SettingPresets from ../share with no separate install step or sudo.
+          workdir="$(mktemp -d)"
+          url="https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          curl -fsSL --retry 3 -o "$workdir/xcodegen.zip" "$url"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$workdir/xcodegen.zip" > "$workdir/xcodegen.sha256"
+          shasum -a 256 -c "$workdir/xcodegen.sha256"
+          unzip -q "$workdir/xcodegen.zip" -d "$workdir"
+          "$workdir/xcodegen/bin/xcodegen" --version
+          echo "$workdir/xcodegen/bin" >> "$GITHUB_PATH"
 
       - name: Rust nightly with rust-src (tvOS is a tier 3 target)
         # Dated nightly, matching the engines' rust-toolchain.toml pin: the xcframework scripts run
@@ -207,11 +226,21 @@ jobs:
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          # Cache ONLY the public dependency downloads under ~/.cargo. The private-engine BUILD
+          # intermediates (core/target, vortx-core/target) are DELIBERATELY excluded: this cache
+          # carries a broad restore-keys prefix (cargo-<os>-) and its default-branch copy is
+          # restorable from ANY ref in the repo, so caching compiled private-engine objects here
+          # would let an untrusted-ref run (e.g. a future secretless PR workflow) restore them.
+          # The engines' compiled output lives only in the two xcframework caches below, which are
+          # exact-key-only (content-addressed to the private source via hashFiles, with NO
+          # restore-keys fallback), so a run without the private source cannot reconstruct their key
+          # and cannot restore them. Excluding the target dirs costs a recompile only on an
+          # xcframework-cache MISS (rare: a miss means the private source changed, which also rolls
+          # the xcframework key); on the common hit the engine build steps are skipped and these
+          # target dirs are never produced or needed.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            core/target
-            vortx-core/target
           # hashFiles runs when this step runs, i.e. AFTER the engine fetch above, so both engines'
           # manifests exist and both feed the key (a vortx-core-only dep bump must roll the cache too).
           key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/Cargo.toml') }}
@@ -222,7 +251,7 @@ jobs:
 
       - name: Fetch the macOS node runtime
         # VortXMac bundles node + server.js as its streaming server. The binary is gitignored, so
-        # it must be fetched BEFORE xcodegen runs — xcodegen validates that the
+        # it must be fetched BEFORE xcodegen runs: xcodegen validates that the
         # Resources/node-darwin-arm64 source path exists, and fails project generation if it's absent.
         run: ./app/scripts/fetch-node-macos.sh
 
@@ -433,14 +462,26 @@ jobs:
 
   # Isolated release-write job: the ONLY job in this workflow with `contents: write`. Least
   # privilege by construction: it does NOT check out the repo (so it executes no repo-controlled
-  # code with write authority), it carries NO environment (so it can never read ENGINE_REPO_TOKEN
-  # or the build secrets the engine-ci environment will hold), and it consumes the build strictly
-  # through the artifact handoff from the read-only build job above. Asset upload needs no macOS,
-  # so this runs on the cheap pinned Linux image.
+  # code with write authority) and it consumes the build strictly through the artifact handoff from
+  # the read-only build job above. Asset upload needs no macOS, so this runs on the cheap pinned
+  # Linux image.
+  #
+  # Approval gate: this job runs in the `release-approval` environment, which the owner configures
+  # with a REQUIRED REVIEWER, so an actual release write pauses for human approval before any asset
+  # is attached. That environment is DISTINCT from the build job's `engine-ci` and holds NO secrets
+  # (no ENGINE_REPO_TOKEN, no build secrets): it exists only to carry the approval policy, so this
+  # write job still cannot reach the token or the build secrets.
+  #
+  # Arbitrary-ref guard: a `release` event runs on the tag's own ref and is bound to the built
+  # commit by the tag-commit binding step below. A `workflow_dispatch` can be launched from any
+  # ref, so the dispatch lane ADDITIONALLY requires a protected branch ref (main / beta) here. This
+  # in-workflow ref check is only defense in depth; the real enforcement is the environment's
+  # required reviewer plus the branch protection the owner configures on those refs.
   attach-release:
     needs: [build-tvos]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'))
     runs-on: ubuntu-24.04
+    environment: release-approval
     permissions:
       contents: write
     timeout-minutes: 15
@@ -468,21 +509,27 @@ jobs:
             echo "::error::no tag name available (empty release_tag / missing release tag_name)"
             exit 1
           fi
-          # Constrain the string's shape before it ever reaches an API path (no slashes, no
-          # spaces, no traversal): validation happens against the resolved objects, not the name.
-          case "$TAG" in
-            *[!A-Za-z0-9._-]*)
-              echo "::error::release tag '$TAG' has an unexpected shape; refusing to resolve it"
-              exit 1 ;;
-          esac
+          # STRICT release-tag grammar, fail closed. The previous shape check accepted any
+          # [A-Za-z0-9._-] string, which STILL lets CLI-option-shaped values through (e.g.
+          # "--help" or "-R"): gh would consume those as flags rather than as a tag. Require a real
+          # release tag -- vMAJOR.MINOR.PATCH with an optional -prerelease -- anchored end to end, so
+          # an option-shaped or otherwise malformed value can never reach a gh call. (Regex kept in a
+          # variable and used unquoted: the bash idiom that avoids [[ =~ ]] escaping pitfalls.) Every
+          # gh call below ALSO gets a `--` option terminator as belt-and-braces, so the tag text can
+          # never be parsed as an option even if this grammar is later loosened.
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag (want vMAJOR.MINOR.PATCH[-prerelease]); refusing to resolve it"
+            exit 1
+          fi
           # (a) The tag must name an EXISTING release, not just any git tag.
-          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq .tag_name >/dev/null; then
+          if ! gh api --jq .tag_name -- "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" >/dev/null; then
             echo "::error::no existing release found for tag '$TAG'; refusing to create or write anything"
             exit 1
           fi
           # (b) Resolve the tag ref and peel annotated tag objects (an annotated tag's ref points
           # at a tag OBJECT, not the commit; nested tag objects are legal, so peel with a bound).
-          ref_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
+          ref_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
           sha="$(jq -r '.object.sha' <<<"$ref_json")"
           otype="$(jq -r '.object.type' <<<"$ref_json")"
           hops=0
@@ -492,7 +539,7 @@ jobs:
               echo "::error::tag '$TAG' nests more than 5 tag objects; refusing"
               exit 1
             fi
-            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+            tag_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
             sha="$(jq -r '.object.sha' <<<"$tag_json")"
             otype="$(jq -r '.object.type' <<<"$tag_json")"
           done
@@ -511,17 +558,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
+          set -euo pipefail
+          # Re-assert the strict release-tag grammar here (defense in depth: the verify step above
+          # already gates the job on it, but this step re-derives TAG and spends it in shell paths
+          # and gh calls, so it must not run on anything but a real release tag).
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [ -z "${TAG:-}" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag; refusing to attach"
+            exit 1
+          fi
           mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
           mv out/VortX-tvOS-lite-ci.ipa "out/VortX-tvOS-lite-$TAG-ci.ipa"
           mv out/VortX-iOS-ci.ipa "out/VortX-iOS-$TAG-ci.ipa"
           mv out/VortX-macOS-ci.dmg "out/VortX-macOS-$TAG-ci.dmg"
           shasum -a 256 "out/VortX-tvOS-$TAG-ci.ipa" "out/VortX-tvOS-lite-$TAG-ci.ipa" "out/VortX-iOS-$TAG-ci.ipa" "out/VortX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
-          gh release upload "$TAG" \
+          # `--clobber` before `--`, then the tag and files as positionals: with the terminator the
+          # tag can never be parsed as a flag even if the grammar above is ever relaxed.
+          gh release upload --clobber -- "$TAG" \
             "out/VortX-tvOS-$TAG-ci.ipa" \
             "out/VortX-tvOS-lite-$TAG-ci.ipa" \
             "out/VortX-iOS-$TAG-ci.ipa" \
             "out/VortX-macOS-$TAG-ci.dmg" \
-            out/SHA256SUMS-ci.txt \
-            --clobber
+            out/SHA256SUMS-ci.txt
           # Remove the older .zip mac asset if this tag had one from a previous run.
-          gh release delete-asset "$TAG" "VortX-macOS-$TAG-ci.zip" -y 2>/dev/null || true
+          gh release delete-asset -y -- "$TAG" "VortX-macOS-$TAG-ci.zip" 2>/dev/null || true

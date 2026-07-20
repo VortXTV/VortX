@@ -172,8 +172,16 @@ jobs:
 
       # Second workspace line: the vortx-ffi cross-build's CARGO_TARGET_DIR is pinned by the gradle
       # task to <engine>/target-andx (build.gradle.kts:407), not the default target/.
+      #
+      # Ref-scoped cache key (private-intermediate containment): the workspace `target` dirs cached
+      # here hold compiled output of the PRIVATE engine crates. `key` is folded into rust-cache's
+      # cache key (and into its restore-key prefixes), so each ref gets its OWN cache partition and a
+      # run on one branch cannot restore another branch's private-engine intermediates -- not via an
+      # exact hit and not via the lockfile-dropped prefix fallback. Same-ref pushes still restore
+      # their own cache, so repeat builds on main / beta / a given android/** branch stay warm.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          key: ${{ github.ref_name }}
           workspaces: |
             core -> target
             vortx-core -> target-andx
