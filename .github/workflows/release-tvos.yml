@@ -800,9 +800,15 @@ jobs:
             echo "::error::release tag '$TAG' is not a strict release tag (want vMAJOR.MINOR.PATCH[-prerelease]); refusing to resolve it"
             exit 1
           fi
-          # (a) The tag must name an EXISTING release, not just any git tag.
-          if ! gh api --jq .tag_name -- "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" >/dev/null; then
-            echo "::error::no existing release found for tag '$TAG'; refusing to create or write anything"
+          # (a) The tag must name an EXISTING release (draft OR published), not just any git tag.
+          # IMPORTANT: the /releases/tags/{tag} endpoint returns ONLY PUBLISHED releases and 404s on a
+          # draft, which is exactly how we cut (create a draft, build, attach, then publish). That 404
+          # used to abort this job on every cut and force a manual attach. List releases instead (that
+          # endpoint DOES include drafts) and require an exact tag_name match. The upload step below
+          # already resolves drafts by tag (gh release upload), so once this guard passes the write works.
+          if ! gh api --paginate --jq ".[] | select(.tag_name == \"${TAG}\") | .tag_name" \
+                -- "repos/${GITHUB_REPOSITORY}/releases" | grep -qx -- "${TAG}"; then
+            echo "::error::no existing release (draft or published) found for tag '$TAG'; refusing to create or write anything"
             exit 1
           fi
           # (b) Resolve the tag ref and peel annotated tag objects (an annotated tag's ref points
