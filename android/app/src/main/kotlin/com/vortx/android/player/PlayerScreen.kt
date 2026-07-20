@@ -121,6 +121,10 @@ fun PlayerScreen(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    // The hosting Activity + AudioManager, resolved once: the gesture layer (window brightness,
+    // stream volume), the audio-focus request, and PiP all hang off these two handles.
+    val hostActivity = remember(context) { context.findActivity() }
+    val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val currentOnBack by rememberUpdatedState(onBack)
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
@@ -241,6 +245,9 @@ fun PlayerScreen(
         onDispose {
             insetsController?.show(WindowInsetsCompat.Type.systemBars())
             activity?.requestedOrientation = previousOrientation
+            // The brightness gesture only ever overrides the WINDOW level; hand the window back to
+            // the system setting so the browse shell never inherits a mid-film dimming.
+            clearWindowBrightness(activity)
         }
     }
 
@@ -367,6 +374,36 @@ fun PlayerScreen(
     // The one error verdict everything downstream renders and gates on: the engine's own hasError OR
     // the watchdog's stall verdict OR the runtime-mismatch verdict.
     val effectiveError = playerState.hasError || stallError || runtimeMismatch
+
+    // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
+    // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
+    // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
+    // every touch surface below can vacate the tiny window. Home-press entry is auto-enter on S+
+    // and MainActivity's onUserLeaveHint -> PlayerPipBridge on 26-30; the chrome's PiP button is
+    // the explicit entry. Fail-soft: an unsupported device/host yields supported=false and the
+    // player renders exactly as before.
+    val pip = rememberPlayerPip(
+        engine = engine,
+        isActivelyPlaying = !playerState.isPaused && !playerState.hasEnded && !effectiveError,
+        isPaused = playerState.isPaused,
+        durationKnown = playerState.durationMs > 0L,
+    )
+    // Crossing the PiP boundary: entering drops the chrome + any live gesture HUD (dead pixels in
+    // the small window); expanding back restores the controls so the viewer lands oriented.
+    var gestureHud by remember(playable.url) { mutableStateOf<PlayerGestureHud?>(null) }
+    LaunchedEffect(pip.isInPip) {
+        if (pip.isInPip) {
+            controlsVisible = false
+            gestureHud = null
+        } else {
+            showControls()
+        }
+    }
+
+    // System MediaSession over the live engine: headset/Bluetooth transport, the Android TV
+    // now-playing row, assistant play/pause. Scoped to this composition (no background playback
+    // exists to outlive it); rebuilt with the engine on a mid-session ExoPlayer fallback.
+    PlayerMediaSessionEffect(engine = engine, playable = playable, speed = speed)
 
     // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
     // Every bad-source class funnels through here -- a dead link (hasError), a silent stall
@@ -658,14 +695,17 @@ fun PlayerScreen(
 
     // AudioFocus: pause when another app takes audio (a call, another player) so VortX never talks over
     // it, and resume on gain. Standard AudioManager focus request (minSdk 26 carries AudioFocusRequest).
+    // The pause/resume DECISION is [AudioFocusPolicy] (pure, unit-tested): it pauses on every loss
+    // class (transient included; ducking film dialog is worse than pausing it) but only ever
+    // auto-RESUMES playback the policy itself paused, so a GAIN can no longer un-pause a film the
+    // viewer had paused deliberately before the interruption.
     DisposableEffect(engine) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val focusPolicy = AudioFocusPolicy()
         val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-            when (change) {
-                AudioManager.AUDIOFOCUS_LOSS,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> engine.pause()
-                AudioManager.AUDIOFOCUS_GAIN -> engine.play()
+            when (focusPolicy.onFocusChange(change, latestState.isPaused)) {
+                AudioFocusPolicy.Action.PAUSE -> engine.pause()
+                AudioFocusPolicy.Action.RESUME -> engine.play()
+                AudioFocusPolicy.Action.NONE -> Unit
             }
         }
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -695,6 +735,41 @@ fun PlayerScreen(
             .focusRequester(rootFocus)
             .onKeyEvent { event ->
                 if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                // MEDIA transport keys (TV remote play/pause/ffwd/rew, BT keyboards) drive the
+                // engine directly, before every other branch: a deliberate hardware transport press
+                // is never the accidental touch the lock guards, and a blind press while the chrome
+                // is hidden should ACT, not merely reveal. Consuming here also keeps the window
+                // authoritative over the MediaSession for these keys (the session only receives
+                // media keys the foreground window did not handle), so D-pad focus handling below
+                // and in the chrome is untouched by the session by construction.
+                when (event.key) {
+                    Key.MediaPlayPause -> {
+                        showControls()
+                        engine.togglePause()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaPlay -> {
+                        showControls()
+                        engine.play()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaPause -> {
+                        showControls()
+                        engine.pause()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaFastForward -> {
+                        showControls()
+                        engine.seekBy(DOUBLE_TAP_SEEK_MS)
+                        return@onKeyEvent true
+                    }
+                    Key.MediaRewind -> {
+                        showControls()
+                        engine.seekBy(-DOUBLE_TAP_SEEK_MS)
+                        return@onKeyEvent true
+                    }
+                    else -> Unit
+                }
                 if (controlsLocked) {
                     // Locked: swallow everything except Back/Escape (leaving the player must always
                     // work). OK/Enter UNLOCKS, so a D-pad-only device (TV, or a phone with a remote)
@@ -730,11 +805,21 @@ fun PlayerScreen(
         // -10s, the standard mobile-player gesture) and re-shows the chrome so the seek is visible.
         // Layered OVER the video surface and UNDER the chrome, so the chrome's own controls keep their
         // taps (they hit-test first) and only bare-video taps land here. Keyed on the engine so a
-        // mid-session ExoPlayer fallback rebinds the gesture to the live engine.
+        // mid-session ExoPlayer fallback rebinds the gesture to the live engine. A PiP window
+        // receives no app touch input, so both detectors stand down while [pip.isInPip].
+        //
+        // The SECOND pointerInput is the drag-gesture surface (PlayerGestures.kt): left-half
+        // vertical = window brightness, right-half vertical = media volume, horizontal = seek with a
+        // live target HUD, committed on release. The two detectors run in parallel on this one Box;
+        // the drag consuming its position changes is what makes the tap detector give up on drags,
+        // so a brightness swipe never also toggles the chrome. Drags are withheld while locked (the
+        // lock's whole point), in PiP, and under the error overlay (seeking a dead source from a
+        // half-visible gesture would fight the retry ladder).
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(engine, controlsLocked) {
+                .pointerInput(engine, controlsLocked, pip.isInPip) {
+                    if (pip.isInPip) return@pointerInput
                     if (controlsLocked) {
                         // Locked: taps only reveal the unlock affordance; the double-tap seek is
                         // deliberately absent so no gesture can move playback.
@@ -751,6 +836,22 @@ fun PlayerScreen(
                             },
                         )
                     }
+                }
+                .pointerInput(engine, controlsLocked, pip.isInPip, effectiveError) {
+                    if (controlsLocked || pip.isInPip || effectiveError) return@pointerInput
+                    detectPlayerDragGestures(
+                        currentPositionMs = { latestState.positionMs },
+                        currentDurationMs = { latestState.durationMs },
+                        currentBrightness = { windowBrightnessFraction(hostActivity) },
+                        currentVolumeFraction = { streamVolumeFraction(audioManager) },
+                        onBrightness = { setWindowBrightnessFraction(hostActivity, it) },
+                        onVolumeFraction = { setStreamVolumeFraction(audioManager, it) },
+                        onSeekCommit = { target ->
+                            showControls()
+                            engine.seekTo(target)
+                        },
+                        onHud = { gestureHud = it },
+                    )
                 },
         )
 
@@ -770,7 +871,9 @@ fun PlayerScreen(
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
-            controlsVisible = controlsVisible && !controlsLocked,
+            // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
+            // controls; ours would be unreachable dead pixels under them).
+            controlsVisible = controlsVisible && !controlsLocked && !pip.isInPip,
             // Continuous interactions the chrome owns internally (scrubber drags, sheet opens) re-arm
             // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
             onInteraction = { showControls() },
@@ -790,6 +893,13 @@ fun PlayerScreen(
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
+            // The explicit PiP entry (user action); null on devices/hosts that cannot PiP, which
+            // hides the control entirely. Home-press entry rides auto-enter / onUserLeaveHint.
+            onEnterPip = if (pip.supported) {
+                { pip.enter() }
+            } else {
+                null
+            },
             onLock = {
                 controlsLocked = true
                 controlsVisible = false
@@ -819,8 +929,9 @@ fun PlayerScreen(
         // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
         // scrubber does), so it works identically on libmpv and ExoPlayer.
         // While locked, the skip affordance is withheld too: it is a tappable seek, exactly the class
-        // of accidental input the lock exists to prevent.
-        if (!controlsLocked) {
+        // of accidental input the lock exists to prevent. Withheld in PiP for the same reason the
+        // chrome is: nothing in the small window is tappable by the app.
+        if (!controlsLocked && !pip.isInPip) {
             SkipButton(
                 segments = skipSegments,
                 positionMs = playerState.positionMs,
@@ -829,10 +940,15 @@ fun PlayerScreen(
             )
         }
 
+        // The live gesture HUD (seek target / brightness / volume), centered over everything the
+        // drag concerns. Rendered only while a drag is in flight; [gestureHud] is cleared on
+        // release/cancel and on entering PiP.
+        PlayerGestureHudOverlay(hud = gestureHud, emberAccent = emberAccent)
+
         // The lock's single interactive surface: a small glass pill, revealed by any tap/key while
         // locked and auto-hidden again. Drawn LAST so it sits above the tap layer and is the one
         // thing a finger can actually hit.
-        if (controlsLocked && unlockHintVisible) {
+        if (controlsLocked && unlockHintVisible && !pip.isInPip) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -934,8 +1050,9 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
 
 /// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain
 /// (theme wrappers, configuration overrides). Null when unhosted (previews/tests), and every caller
-/// treats null as "no orientation/insets control", never a crash.
-private tailrec fun Context.findActivity(): Activity? = when (this) {
+/// treats null as "no orientation/insets control", never a crash. Internal (was private): the PiP
+/// wiring (PlayerPip.kt) and the session-activity resolve (PlayerMediaSession.kt) walk the same chain.
+internal tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
     else -> null

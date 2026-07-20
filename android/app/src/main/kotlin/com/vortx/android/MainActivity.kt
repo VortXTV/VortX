@@ -11,6 +11,7 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.StremioXApp
 import com.vortx.android.ui.theme.isAnimatorScaleZero
 
@@ -69,5 +70,16 @@ class MainActivity : ComponentActivity() {
                 syncManager = app.syncManager,
             )
         }
+    }
+
+    /// Home press during playback -> Picture-in-Picture, on API 26-30 where the params-based
+    /// auto-enter (S+) does not exist. The bridge holds the live player's "am I actually playing"
+    /// probe and entry action ONLY while a player is composed, so this is inert on every other
+    /// screen; on S+ it is a no-op entirely (auto-enter owns the transition there). This override
+    /// is the one piece of PiP that must live on the Activity, because onUserLeaveHint has no
+    /// listener API to reach it from a composable.
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        PlayerPipBridge.onUserLeaveHint()
     }
 }

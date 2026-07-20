@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Speed
@@ -99,6 +100,10 @@ fun PlayerChrome(
     /// in isolation and on hosts that opt out (the TV shell, where D-pad focus makes a touch-lock
     /// meaningless).
     onLock: (() -> Unit)? = null,
+    /// Picture-in-Picture: shrinks the player into the system PiP window (the host wires it to
+    /// [PlayerScreen]'s PiP handle). Null hides the control entirely: devices/hosts without PiP
+    /// support (no system feature, an activity that does not declare it) never show a dead button.
+    onEnterPip: (() -> Unit)? = null,
     /// External subtitles offered by the installed subtitle add-ons for THIS title (the Apple
     /// `SubtitleAddons` union, fetched by the host once per load). Listed in the subtitle sheet
     /// under the file's embedded tracks; picking one mounts + selects it on the live engine via
@@ -157,6 +162,11 @@ fun PlayerChrome(
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
+                // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
+                // therefore most protected-from-fat-finger) position.
+                onEnterPip?.let { pip ->
+                    ChromeIcon(Icons.Filled.PictureInPictureAlt, "Picture in picture") { pip() }
+                }
                 // Player Lock: hides the chrome and freezes touch input so nothing mid-film seeks or
                 // pauses by accident; the host draws the unlock affordance while locked.
                 onLock?.let { lock ->
@@ -511,8 +521,10 @@ private fun trimSpeed(speed: Float): String {
     return s.ifEmpty { "1" }
 }
 
-/// Milliseconds -> H:MM:SS / M:SS. Kept local; no dependency on any engine.
-private fun formatTime(ms: Long): String {
+/// Milliseconds -> H:MM:SS / M:SS. No dependency on any engine. Internal (was private): the gesture
+/// seek HUD (PlayerGestures.kt) renders the same H:MM:SS shape, and one formatter keeps the two
+/// surfaces from ever drifting.
+internal fun formatTime(ms: Long): String {
     val totalSeconds = (ms / 1000).coerceAtLeast(0L)
     val hours = totalSeconds / 3600
     val minutes = (totalSeconds % 3600) / 60
