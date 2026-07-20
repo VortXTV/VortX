@@ -1248,7 +1248,7 @@ final class CoreBridge: ObservableObject {
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
     /// flips live instead of waiting for a library sync. Relies on meta_details being loaded (it is,
     /// since playback is launched from the detail screen).
-    func markPlaybackWatched(_ meta: PlaybackMeta) {
+    func markPlaybackWatched(_ meta: PlaybackMeta, allowEngineWrite: Bool = true) {
         // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
         // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
         // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
@@ -1258,7 +1258,11 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.markWatched(meta: meta)   // overlay profile: private history only
             return
         }
-        if meta.type == "series" {
+        // Scrobble and overlay-profile state above are keyed by the explicit PlaybackMeta and remain safe even
+        // when an episodic engine re-point failed. Only the owner-engine dispatch depends on confirmed Player
+        // attribution; callers close this leg rather than suppressing the correct external watched signal.
+        guard allowEngineWrite else { return }
+        if meta.usesSeriesLifecycle {
             var payload: [String: Any] = ["id": meta.videoId]
             if let season = meta.season { payload["season"] = season }
             if let episode = meta.episode { payload["episode"] = episode }
@@ -1297,7 +1301,11 @@ final class CoreBridge: ObservableObject {
         // throughout this file (markPlaybackWatched, removeFromLibrary, setLibraryItemWatched, finishedWatching).
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
         guard let item = metaDetails?.libraryItem else { return vortxOwnedResumeSeconds(for: meta) }
-        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId {
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: item.state.videoId,
+            requestedVideoID: meta.videoId
+        ) {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
@@ -1332,7 +1340,11 @@ final class CoreBridge: ObservableObject {
             .items.first(where: { $0.id == meta.libraryId }) { matched = preview }
         else if let lib = library?.catalog.first(where: { $0.id == meta.libraryId }) { matched = lib }
         guard let item = matched else { return vortxOwnedResumeSeconds(for: meta) }   // engine has no entry: cache
-        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId {
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: item.state.videoId,
+            requestedVideoID: meta.videoId
+        ) {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
@@ -1352,7 +1364,11 @@ final class CoreBridge: ObservableObject {
     private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
         guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
-        if meta.type == "series", let v = entry.v, v != meta.videoId { return nil }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: entry.v,
+            requestedVideoID: meta.videoId
+        ) { return nil }
         return entry.t
     }
 
@@ -1693,6 +1709,8 @@ final class CoreBridge: ObservableObject {
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
         let metaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
                            ?? metaItems.first)?["request"]
+        let metaPath = ((metaRequest as? [String: Any])?["path"] as? [String: Any])
+        let metaType = metaPath?["type"] as? String
         var rawStream: [String: Any]?
         var streamRequest: Any?
         var firstReadyStream: [String: Any]?
@@ -1702,7 +1720,13 @@ final class CoreBridge: ObservableObject {
                   content["type"] as? String == "Ready",
                   let streams = content["content"] as? [[String: Any]] else { continue }
             if firstReadyStream == nil, let s = streams.first { firstReadyStream = s; firstReadyRequest = group["request"] }
-            if let match = streams.first(where: { streamMatches($0, stream) }) {
+            let requestPath = ((group["request"] as? [String: Any])?["path"] as? [String: Any])
+            let requestVideoID = requestPath?["id"] as? String ?? metaPath?["id"] as? String ?? ""
+            let requestType = requestPath?["type"] as? String ?? metaType
+            let isEpisode = EpisodePlaybackIdentity.isEpisodicContext(
+                type: requestType, season: nil, episode: nil, videoID: requestVideoID
+            )
+            if let match = streams.first(where: { streamMatches($0, stream, isEpisode: isEpisode) }) {
                 rawStream = match; streamRequest = group["request"]; break
             }
         }
@@ -1712,7 +1736,13 @@ final class CoreBridge: ObservableObject {
         // so Continue Watching + resume + progress track correctly regardless of which stream object we hand
         // the engine. Without this, a match miss silently skipped the Player load -> no library item -> CW
         // never updated and progress was lost (the "CW stopped working / progress not tracked" report).
-        if rawStream == nil { rawStream = firstReadyStream; streamRequest = firstReadyRequest }
+        // A torrent is identified by the full (infoHash,fileIdx) pair. Falling back to an arbitrary ready
+        // torrent after an exact miss can bind a different episode from the same season pack. Direct sources
+        // keep the historical fallback because proxy/reconstruction can legitimately obscure their URL.
+        if rawStream == nil, !stream.isTorrent, !stream.isUsenet {
+            rawStream = firstReadyStream
+            streamRequest = firstReadyRequest
+        }
         guard let rawStream, let streamRequest, let metaRequest else {
             DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing) — CW + progress will not track for this item")
             return
@@ -1737,7 +1767,8 @@ final class CoreBridge: ObservableObject {
     /// first tick. The meta request is still read from the resident `meta_details` (series-stable across a binge).
     /// Returns true when the Player was dispatched; the caller uses that to set its progress-attribution gate.
     @discardableResult
-    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?) -> Bool {
+    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?,
+                          resolvedURL: URL? = nil) -> Bool {
         guard let data = stateData("meta_details"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
@@ -1760,7 +1791,28 @@ final class CoreBridge: ObservableObject {
         // opens the attribution gate for videoId (a FALSE re-point confirmation). Degrade to nil exactly like
         // the missing-base path: no-op here, the caller sets enginePlayerVideoId = nil, and the gated writers
         // skip the wrong-episode engine write until the resident-scrape poll re-points.
-        let raw = rawStreamDict(stream)
+        // This overload constructs a series episode request. A raw torrent without fileIdx is ambiguous.
+        // When native debrid already resolved it, bind the concrete direct URL that will play. Never turn a
+        // provider-local file offset into a Stremio torrent selector. A direct stream may legitimately carry
+        // infoHash provenance, so only `isTorrent` enters this guard.
+        guard let bindingSource = EpisodePlaybackIdentity.engineBindingSource(
+            isRawTorrent: stream.isTorrent,
+            fileIdx: stream.fileIdx,
+            resolvedURL: resolvedURL?.absoluteString
+        ) else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (episode torrent missing fileIdx and resolved URL); engine progress will not re-point")
+            return false
+        }
+        let raw: [String: Any]
+        switch bindingSource {
+        case .original:
+            raw = rawStreamDict(stream)
+        case .resolvedDirectURL(let url):
+            var direct: [String: Any] = ["url": url]
+            if let name = stream.name { direct["name"] = name }
+            if let description = stream.description { direct["description"] = description }
+            raw = direct
+        }
         let hasSource = raw["url"] != nil || raw["ytId"] != nil || raw["infoHash"] != nil
             || raw["sources"] != nil || raw["externalUrl"] != nil
         guard hasSource else {
@@ -1797,6 +1849,8 @@ final class CoreBridge: ObservableObject {
         if let ext = s.externalUrl { raw["externalUrl"] = ext }
         if let name = s.name { raw["name"] = name }
         if let desc = s.description { raw["description"] = desc }
+        if let nzb = s.nzbUrl { raw["nzbUrl"] = nzb }
+        if let include = s.fileMustInclude { raw["fileMustInclude"] = include }
         return raw
     }
 
@@ -1807,9 +1861,24 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "Unload"], field: "player")
     }
 
-    private func streamMatches(_ raw: [String: Any], _ stream: CoreStream) -> Bool {
+    private func streamMatches(_ raw: [String: Any], _ stream: CoreStream, isEpisode: Bool) -> Bool {
         if let url = stream.url { return raw["url"] as? String == url }
-        if let hash = stream.infoHash { return raw["infoHash"] as? String == hash }
+        if stream.infoHash != nil {
+            return EpisodePlaybackIdentity.torrentMatches(
+                rawInfoHash: raw["infoHash"] as? String,
+                rawFileIdx: raw["fileIdx"] as? Int,
+                selectedInfoHash: stream.infoHash,
+                selectedFileIdx: stream.fileIdx,
+                isEpisode: isEpisode
+            )
+        }
+        if let nzb = stream.nzbUrl {
+            guard raw["nzbUrl"] as? String == nzb else { return false }
+            if let include = stream.fileMustInclude {
+                return raw["fileMustInclude"] as? String == include
+            }
+            return true
+        }
         if let yt = stream.ytId { return raw["ytId"] as? String == yt }
         return false
     }

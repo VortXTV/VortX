@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Short-lived MOAT token issuer + cache for the VortX community SERVE side.
 ///
@@ -28,17 +29,58 @@ actor MoatToken {
 
     // MARK: - Cache state
 
-    /// The cached token + its absolute expiry. nil until a first successful mint (and after a hard clear).
-    private var cached: (token: String, expiresAt: Date)?
-    /// A single in-flight mint shared by concurrent callers, so N simultaneous gated reads mint once.
-    private var inFlight: Task<String?, Never>?
-    /// Monotonic tag identifying the current mint. clear() bumps it so a stale mint's store()/clearInFlight
-    /// (which run after its await returns) cannot clobber a newer mint's state.
+    struct Credential: Equatable, Sendable {
+        let bearer: String
+        let identityDigest: String
+    }
+
+    struct Minted: Sendable {
+        let token: String
+        let expiresAt: Date
+    }
+
+    private struct Scope: Equatable, Sendable {
+        let sessionGeneration: UInt64
+        let consentGeneration: UInt64
+        let credentialDigest: String
+    }
+
+    private struct Cached {
+        let scope: Scope
+        let token: String
+        let expiresAt: Date
+    }
+
+    private struct InFlight {
+        let scope: Scope
+        let task: Task<String?, Never>
+    }
+
+    typealias CredentialProvider = @Sendable () -> Credential?
+    typealias MintProvider = @Sendable (String) async -> Minted?
+
+    /// The cached token is bound to both authorization generations and a private digest of the exact account
+    /// session credential. The digest is never logged, persisted, or returned.
+    private var cached: Cached?
+    /// Only callers in the identical authorization scope share a mint.
+    private var inFlight: InFlight?
+    /// Monotonic tag identifying the current mint. clear() bumps it so a stale mint's final acceptance
+    /// (which runs after its await returns) cannot clobber a newer mint's state.
     private var mintGeneration: UInt64 = 0
+    private let credentialProvider: CredentialProvider
+    private let mintProvider: MintProvider
 
     /// Refresh the token this far BEFORE its stated expiry, so a read never rides an about-to-die token across
     /// the worker's clock skew. 60 s covers a slow mint + request latency.
     private let refreshSkew: TimeInterval = 60
+
+    init(
+        credentialProvider: @escaping CredentialProvider = { MoatToken.sessionCredential() },
+        mintProvider: @escaping MintProvider = { bearer in await MoatToken.mint(bearer: bearer) }
+    ) {
+        self.credentialProvider = credentialProvider
+        self.mintProvider = mintProvider
+    }
 
     // MARK: - Public API
 
@@ -48,32 +90,43 @@ actor MoatToken {
     /// `isSignedIn` is the caller's account signed-in flag (the SERVE gate is login-only). Passed in rather
     /// than read here so this stays free of a SwiftUI/main-actor dependency and testable.
     func current(isSignedIn: Bool) async -> String? {
-        guard MoatConsent.contributeAndConsume, isSignedIn else {
-            // Opted out or signed out: drop any stale token so a later opt-in / sign-in re-mints cleanly.
-            cached = nil
-            return nil
-        }
+        // A delayed caller carrying false must not erase a newer account's cache. Known sign-out and consent
+        // writers perform generation-scoped invalidation at their mutation boundary.
+        guard MoatConsent.contributeAndConsume, isSignedIn,
+              let credential = credentialProvider() else { return nil }
+
+        let lifecycle = SourceIndexLifecycleClock.snapshot()
+        let scope = Scope(
+            sessionGeneration: lifecycle.sessionGeneration,
+            consentGeneration: lifecycle.consentGeneration,
+            credentialDigest: credential.identityDigest
+        )
+
+        discardMismatchedState(currentScope: scope)
         // Fresh cached token (with skew headroom): hand it straight back.
-        if let c = cached, c.expiresAt.timeIntervalSinceNow > refreshSkew {
+        if let c = cached, c.scope == scope, c.expiresAt.timeIntervalSinceNow > refreshSkew {
             return c.token
         }
         // Coalesce concurrent mints onto one task.
-        if let task = inFlight { return await task.value }
-        // Tag each mint with a token so store()/clearInFlight only act when THIS mint still owns inFlight; a
-        // concurrent clear()/re-mint bumps the tag so a stale task cannot clobber the newer one.
+        if let inFlight, inFlight.scope == scope { return await inFlight.task.value }
+        // Tag each mint so final acceptance acts only when THIS mint still owns inFlight; a concurrent
+        // clear()/re-mint bumps the tag so a stale task cannot clobber the newer one.
         mintGeneration &+= 1
         let generation = mintGeneration
+        let mintProvider = self.mintProvider
         let task = Task<String?, Never> { [weak self] in
             guard let self else { return nil }
-            let minted = await Self.mint()
-            // A concurrent clear() cancels this task and may have already started a fresh mint; if so, do not
-            // store a stale result or clear the newer in-flight pointer (which would defeat coalescing).
-            if Task.isCancelled { return nil }
-            await self.store(minted, generation: generation)
-            await self.clearInFlight(generation: generation)
-            return minted?.token
+            let minted = await mintProvider(credential.bearer)
+            // Acceptance is one actor operation. It rechecks every live authorization fact, stores only an
+            // accepted token, clears only this mint's pointer, and returns exactly the accepted value.
+            return await self.accept(
+                minted,
+                scope: scope,
+                generation: generation,
+                wasCancelled: Task.isCancelled
+            )
         }
-        inFlight = task
+        inFlight = InFlight(scope: scope, task: task)
         return await task.value
     }
 
@@ -83,12 +136,34 @@ actor MoatToken {
         _ = await current(isSignedIn: isSignedIn)
     }
 
-    /// Drop the cached token (e.g. on sign-out / consent withdrawal). The next `current` re-mints.
+    /// Unconditional teardown for process shutdown/testing. Authorization mutations use the scoped overload.
     func clear() {
         cached = nil
-        inFlight?.cancel()
+        inFlight?.task.cancel()
         inFlight = nil
         mintGeneration &+= 1   // orphan any in-flight mint so its late store()/clearInFlight is a no-op
+    }
+
+    /// Clear only state from retired account or consent generations. A delayed invalidation from account A or
+    /// consent-off cannot erase a token minted after account B signs in or consent is re-enabled.
+    func clear(
+        retiredSessionGeneration: UInt64?,
+        retiredConsentGeneration: UInt64?
+    ) {
+        func isRetired(_ scope: Scope) -> Bool {
+            if let retiredSessionGeneration,
+               scope.sessionGeneration <= retiredSessionGeneration { return true }
+            if let retiredConsentGeneration,
+               scope.consentGeneration <= retiredConsentGeneration { return true }
+            return false
+        }
+
+        if let cached, isRetired(cached.scope) { self.cached = nil }
+        if let inFlight, isRetired(inFlight.scope) {
+            inFlight.task.cancel()
+            self.inFlight = nil
+            mintGeneration &+= 1
+        }
     }
 
     // MARK: - Header stamping helpers
@@ -118,13 +193,11 @@ actor MoatToken {
 
     // MARK: - Mint (issuer round trip)
 
-    private struct Minted { let token: String; let expiresAt: Date }
-
     /// One mint round trip to the issuer. Fail-soft to nil on any error / non-2xx / decode miss / no session.
     /// POSTs to `<issuer>/moat/token` with the VortX account session bearer; the worker returns
     /// `{ token, expiresIn?|expiresAt? }`.
-    private static func mint() async -> Minted? {
-        guard let bearer = sessionBearer(), !bearer.isEmpty else { return nil }   // no VortX session -> no mint
+    private static func mint(bearer: String) async -> Minted? {
+        guard !bearer.isEmpty else { return nil }
         // The live issuer route is /v1/moat/token (api.vortx.tv). The un-versioned /moat/token 404s, so a
         // tokenless app never un-gates the moat SERVE (Singularity sources, pooled subs) - this is that fix.
         guard let url = URL(string: issuerBase + "/v1/moat/token") else { return nil }
@@ -160,12 +233,15 @@ actor MoatToken {
     /// api.vortx.tv identity (NOT the Stremio authKey). Decodes only the `token` field; a missing/garbled slot
     /// (signed out of VortX sync) yields nil, which fails the mint soft. Kept here so the client is
     /// self-contained and never reaches into another type's private state.
-    private static func sessionBearer() -> String? {
+    private static func sessionCredential() -> Credential? {
         guard let raw = Keychain.string(vortxSessionSlot),
               let data = raw.data(using: .utf8),
               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let token = obj["token"] as? String, !token.isEmpty else { return nil }
-        return token
+        let accountID = (obj["account"] as? [String: Any])?["id"] as? String ?? ""
+        let digestInput = Data((accountID + "\u{0}" + token).utf8)
+        let digest = SHA256.hash(data: digestInput).map { String(format: "%02x", $0) }.joined()
+        return Credential(bearer: token, identityDigest: digest)
     }
 
     /// The Keychain account slot `VortXSyncManager` stores its `{ token, account, dataKey }` blob under. Kept
@@ -173,19 +249,43 @@ actor MoatToken {
     /// change it here too (a compile-time comment marker, since the two cannot share a private symbol).
     private static let vortxSessionSlot = "vortx.sync.session.v1"
 
-    // MARK: - Actor-isolated mutators (called from the mint Task)
+    // MARK: - Actor-isolated final acceptance (called from the mint Task)
 
-    private func store(_ minted: Minted?, generation: UInt64) {
-        guard generation == mintGeneration else { return }   // a clear()/re-mint superseded this mint: drop it
-        guard let minted else { return }   // keep any still-valid cached token on a failed refresh
-        cached = (token: minted.token, expiresAt: minted.expiresAt)
+    private func accept(
+        _ minted: Minted?,
+        scope: Scope,
+        generation: UInt64,
+        wasCancelled: Bool
+    ) -> String? {
+        // A stale mint must never clear the pointer for a newer mint.
+        guard generation == mintGeneration else { return nil }
+        inFlight = nil
+        guard !wasCancelled,
+              Self.scopeIsCurrent(scope, credentialProvider: credentialProvider),
+              let minted else { return nil }
+        cached = Cached(scope: scope, token: minted.token, expiresAt: minted.expiresAt)
+        return minted.token
     }
 
-    /// Clear the in-flight pointer only if this generation still owns it, so a stale mint completing after a
-    /// concurrent clear()/re-mint does not null out the newer in-flight task (which would defeat coalescing).
-    private func clearInFlight(generation: UInt64) {
-        guard generation == mintGeneration else { return }
-        inFlight = nil
+    private func discardMismatchedState(currentScope: Scope) {
+        if cached?.scope != currentScope { cached = nil }
+        if let inFlight, inFlight.scope != currentScope {
+            inFlight.task.cancel()
+            self.inFlight = nil
+            mintGeneration &+= 1
+        }
+    }
+
+    private static func scopeIsCurrent(
+        _ scope: Scope,
+        credentialProvider: CredentialProvider
+    ) -> Bool {
+        let lifecycle = SourceIndexLifecycleClock.snapshot()
+        guard MoatConsent.contributeAndConsume,
+              lifecycle.sessionGeneration == scope.sessionGeneration,
+              lifecycle.consentGeneration == scope.consentGeneration,
+              let credential = credentialProvider() else { return false }
+        return credential.identityDigest == scope.credentialDigest
     }
 
     // MARK: - Wire shape

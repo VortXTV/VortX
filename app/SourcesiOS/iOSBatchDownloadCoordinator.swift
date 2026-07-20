@@ -254,8 +254,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         finish(cancelled: Task.isCancelled)
     }
 
-    /// Fire the two contributor refreshes ONCE PER SERIES (the manual episode page refreshes them
-    /// show-level on appear, exactly this shape). Both calls are fire-and-forget: results land async
+    /// Refresh both auxiliary contributors for the exact episode target. Both calls are fire-and-forget: results land async
     /// and are picked up by the per-iteration merge in `resolveAndQueue`, the same async-contribution
     /// pattern the pages use.
     ///
@@ -272,15 +271,22 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// Singularity result bank intact (those protect the APIs session-wide, which is why the
     /// instances are cleared rather than recreated).
     private func refreshContributorsIfNeeded(for job: Job) {
-        guard job.seriesId != contributorSeriesKey else { return }
-        contributorSeriesKey = job.seriesId
+        let season = job.video.season
+        let episode = job.video.episode
+        let contentID = SourceIndexClient.contentID(
+            imdbId: job.seriesImdbId, season: season, episode: episode
+        )
+        let target = contentID ?? "meta:\(job.seriesId)|video:\(job.video.id)"
+        guard target != contributorSeriesKey else { return }
+        contributorSeriesKey = target
         // Reset FIRST, unconditionally: this also closes the valid-id window where the previous
         // series' streams linger until the new series' own fetch lands (Singularity does not clear
         // on a content-id change until its fetch returns).
         torboxSearch.clearResults()
         sourceIndex.clearResults()
-        torboxSearch.refresh(imdbId: job.seriesImdbId)
-        sourceIndex.refresh(contentID: SourceIndexClient.contentID(imdbId: job.seriesImdbId),
+        guard let season, season >= 0, let episode, episode > 0, contentID != nil else { return }
+        torboxSearch.refresh(imdbId: job.seriesImdbId, season: season, episode: episode)
+        sourceIndex.refresh(contentID: contentID,
                             isSignedIn: VortXSyncManager.shared.isSignedIn)
     }
 
@@ -334,19 +340,31 @@ final class BatchDownloadCoordinator: ObservableObject {
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let best = StreamRanking.best(groups, continuity: job.continuity, pin: job.pin,
-                                            debridCachedHashes: job.cachedHashes),
-              let url = best.playableURL else { return .noSource }
+                                            debridCachedHashes: job.cachedHashes) else { return .noSource }
         if Task.isCancelled { return .cancelled }   // don't start a debrid resolve for a stopped batch
-        let ep = job.video.season.flatMap { s in job.video.episode.map { DebridEpisode(season: s, episode: $0) } }
-        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
+        let ep = job.video.season.flatMap { season in
+            job.video.episode.flatMap { episode in
+                season >= 0 && episode > 0 ? DebridEpisode(season: season, episode: episode) : nil
+            }
+        }
+        let resolved: URL?
+        if best.url == nil, ep == nil {
+            resolved = nil
+        } else {
+            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
+        }
         if Task.isCancelled { return .cancelled }
+        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+            isUsenet: best.isUsenet, resolvedURL: resolved,
+            fallbackURL: best.playableURL(isEpisode: true)
+        ) else { return .noSource }
         // Raw torrent: the loopback server must be told to /create it first (#21). Fire-and-forget:
         // the prime's retry loop is self-terminating (~15s max), same as the CW-resume prime.
         if resolved == nil, best.isTorrent { _ = prepareTorrentStream(best) }
         let pm = PlaybackMeta(libraryId: job.seriesId, videoId: job.video.id, type: "series",
                               name: job.seriesName, poster: job.video.thumbnail ?? job.fallbackPoster,
                               season: job.video.season, episode: job.video.episode)
-        let record = DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: resolved ?? url,
+        let record = DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
                                                      sourceName: best.name,
                                                      qualityText: StreamRanking.signature(best))
         // download() can refuse synchronously (an HLS source on a device that can't save HLS, a storage
@@ -357,10 +375,19 @@ final class BatchDownloadCoordinator: ObservableObject {
         // (nothing else playable) arms no plan, so that episode simply fails honestly as before.
         let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
                                                         debridCachedHashes: job.cachedHashes)
-        if let alternate = candidates.first(where: { $0.playableURL?.absoluteString != best.playableURL?.absoluteString }) {
+        if let alternate = candidates.first(where: { !sameSource($0, best) }) {
             retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
         }
         return .queued
+    }
+
+    private func sameSource(_ lhs: CoreStream, _ rhs: CoreStream) -> Bool {
+        if let left = lhs.url, let right = rhs.url { return left == right }
+        if let left = lhs.infoHash, let right = rhs.infoHash {
+            return left.caseInsensitiveCompare(right) == .orderedSame && lhs.fileIdx == rhs.fileIdx
+        }
+        if let left = lhs.nzbUrl, let right = rhs.nzbUrl { return left == right }
+        return false
     }
 
     // MARK: One-shot failure swap (#119 remainder)
@@ -390,11 +417,21 @@ final class BatchDownloadCoordinator: ObservableObject {
         guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: plan.alternate, episode: plan.episode)
+            let resolved: URL?
+            if plan.alternate.url == nil, plan.episode == nil {
+                resolved = nil
+            } else {
+                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(
+                    for: plan.alternate, episode: plan.episode
+                )
+            }
             if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
-            guard let fallback = plan.alternate.playableURL else { return }   // no URL: keep the failed row, do not orphan the episode
+            guard let fallback = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                isUsenet: plan.alternate.isUsenet, resolvedURL: resolved,
+                fallbackURL: plan.alternate.playableURL(isEpisode: true)
+            ) else { return }   // no URL: keep the failed row, do not orphan the episode
             let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
-                                                         resolvedURL: resolved ?? fallback,
+                                                         resolvedURL: fallback,
                                                          sourceName: plan.alternate.name,
                                                          qualityText: StreamRanking.signature(plan.alternate))
             // Replacement is queued: now drop the failed download via the canonical DownloadManager path

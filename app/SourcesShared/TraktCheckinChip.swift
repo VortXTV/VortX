@@ -33,29 +33,31 @@ struct TraktCheckinChip: View {
     @State private var showError = false
 
     var body: some View {
-        if enabled, connected, let meta = core.metaDetails?.meta,
-           TraktCheckinModel.canOffer(isSeries: meta.type == "series", season: season, episode: episode) {
-            let key = TraktCheckinModel.key(id: meta.id, season: season, episode: episode)
-            let isActive = model.isActive(key)
-            Button { act(meta, isActive: isActive) } label: {
-                Label(label(isActive: isActive), systemImage: isActive ? "eye.fill" : "eye")
+        if enabled, connected, let meta = core.metaDetails?.meta {
+            let isSeries = EpisodePlaybackIdentity.usesSeriesLifecycle(type: meta.type)
+            if TraktCheckinModel.canOffer(isSeries: isSeries, season: season, episode: episode) {
+                let key = TraktCheckinModel.key(id: meta.id, season: season, episode: episode)
+                let isActive = model.isActive(key)
+                Button { act(meta, isSeries: isSeries, isActive: isActive) } label: {
+                    Label(label(isActive: isActive), systemImage: isActive ? "eye.fill" : "eye")
+                }
+                .buttonStyle(ChipButtonStyle(selected: isActive))
+                .disabled(model.working)
+                .alert("Already watching something", isPresented: $showConflict) {
+                    Button("Keep it", role: .cancel) {}
+                    Button("Check in here") { replace(meta, isSeries: isSeries) }
+                } message: {
+                    Text(conflictMessage)
+                }
+                .alert("Could not check in", isPresented: $showError) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(errorMessage ?? "Trakt could not be reached.")
+                }
+                // Sign-in lives behind an actor, so it is resolved once the chip appears rather than read
+                // synchronously in `body`.
+                .task { connected = await TraktAuth.shared.isSignedIn }
             }
-            .buttonStyle(ChipButtonStyle(selected: isActive))
-            .disabled(model.working)
-            .alert("Already watching something", isPresented: $showConflict) {
-                Button("Keep it", role: .cancel) {}
-                Button("Check in here") { replace(meta) }
-            } message: {
-                Text(conflictMessage)
-            }
-            .alert("Could not check in", isPresented: $showError) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(errorMessage ?? "Trakt could not be reached.")
-            }
-            // Sign-in lives behind an actor, so it is resolved once the chip appears rather than read
-            // synchronously in `body`.
-            .task { connected = await TraktAuth.shared.isSignedIn }
         }
     }
 
@@ -76,21 +78,21 @@ struct TraktCheckinChip: View {
         return "Trakt already shows you as watching something else until \(until.formatted(date: .omitted, time: .shortened)). Checking in here will stop that."
     }
 
-    private func act(_ meta: CoreMetaItem, isActive: Bool) {
+    private func act(_ meta: CoreMetaItem, isSeries: Bool, isActive: Bool) {
         Task {
             if isActive {
                 await model.cancelActive()
                 return
             }
-            let outcome = await model.checkIn(id: meta.id, isSeries: meta.type == "series",
+            let outcome = await model.checkIn(id: meta.id, isSeries: isSeries,
                                               season: season, episode: episode, title: meta.name)
             handle(outcome)
         }
     }
 
-    private func replace(_ meta: CoreMetaItem) {
+    private func replace(_ meta: CoreMetaItem, isSeries: Bool) {
         Task {
-            let outcome = await model.replaceActive(id: meta.id, isSeries: meta.type == "series",
+            let outcome = await model.replaceActive(id: meta.id, isSeries: isSeries,
                                                     season: season, episode: episode, title: meta.name)
             handle(outcome)
         }

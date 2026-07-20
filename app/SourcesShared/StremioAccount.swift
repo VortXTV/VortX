@@ -122,6 +122,10 @@ struct PlaybackMeta: Hashable {
     let poster: String?
     let season: Int?
     let episode: Int?
+
+    var usesSeriesLifecycle: Bool {
+        EpisodePlaybackIdentity.usesSeriesLifecycle(type: type)
+    }
 }
 
 /// Manages the signed-in Stremio session: auth token (persisted), installed addons, and the
@@ -293,7 +297,11 @@ final class StremioAccount: ObservableObject {
         guard let key = authKey,
               let item = await rawLibraryItem(id: meta.libraryId, authKey: key),
               let state = item["state"] as? [String: Any] else { return 0 }
-        if meta.type == "series", let saved = state["video_id"] as? String, saved != meta.videoId { return 0 }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: state["video_id"] as? String,
+            requestedVideoID: meta.videoId
+        ) { return 0 }
         let ms = Self.numeric(state["timeOffset"])
         return ms > 0 ? ms / 1000 : 0
     }

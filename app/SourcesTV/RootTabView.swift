@@ -37,6 +37,10 @@ struct PlaybackRequest: Identifiable {
     /// When this request plays a NATIVELY-resolved debrid link, its provenance so the play-record can store
     /// enough to reresolve a fresh link on a later Continue-Watching resume. nil for torrent/direct/trailer.
     var debridRef: DebridPlaybackRef? = nil
+    /// Exact source row that produced the URL, retained for raw-torrent selector provenance.
+    var sourceStream: CoreStream? = nil
+    /// Exact series engine identity confirmed by the launch path. nil keeps engine writes closed.
+    var enginePlayerVideoId: String? = nil
     /// yt-direct adaptive pair (trailers / pasted YouTube links): the separate AUDIO stream mpv mounts
     /// alongside the video-only `url` (`--audio-files`). Forces the libmpv engine in TVPlayerView.
     var audioSidecarURL: URL? = nil
@@ -128,6 +132,8 @@ struct RootView: View {
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
+                             initialSourceStream: req.sourceStream,
+                             initialEnginePlayerVideoId: req.enginePlayerVideoId,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
                              // Tear down the engine Player on a genuine exit so a stale Player from this session

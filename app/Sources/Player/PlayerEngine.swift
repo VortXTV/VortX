@@ -19,12 +19,18 @@ import Foundation
 @MainActor
 protocol PlayerEngine: AnyObject {
     // Loading + transport
-    func loadFile(_ url: URL, headers: [String: String]?, live: Bool)
     /// yt-direct adaptive pair: load `url` (a video-only adaptive stream) with an EXTERNAL AUDIO SIDECAR
     /// merged in at load (mpv `--audio-files`). nil = no sidecar (identical to the 3-arg form). The libmpv
-    /// engine mounts it; the AVPlayer engine takes the extension default below, which DROPS the sidecar
-    /// (AVFoundation can't merge a second remote file), so AVPlayer callers must hand it a muxed URL.
-    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?)
+    /// engine mounts it; AVFoundation drops the sidecar because it cannot merge a second remote file.
+    /// `reusing` is reserved for a proven retry of the same logical media request. Every unrelated load
+    /// receives a fresh opaque token, returned atomically with the engine issue.
+    @discardableResult
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
+                  reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken
+    /// The logical request currently allowed to publish callbacks. nil means callbacks fail closed while
+    /// the engine is between requests, was invalidated, or has stopped.
+    var activeLoadToken: PlayerLoadToken? { get }
+    func invalidateLoadToken()
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE `loadFile`. The AVPlayer lane
     /// (true DV) uses it to switch the Apple TV into Dolby Vision mode before the item attaches; the libmpv
     /// lane renders DV as a tone-mapped PQ base layer, so it requests only HDR10 (a decoded-pixel pipeline
@@ -106,18 +112,15 @@ extension PlayerEngine {
         addExternalSubtitle(url: url, title: title, lang: lang, timeout: 20, completion: completion)
     }
 
-    // The two loadFile requirements default into each other so each engine only implements ONE concrete
-    // form: MPVMetalViewController implements the 4-arg (its defaulted `audioSidecar:` parameter matches
-    // the full signature) and gets the 3-arg here; AVPlayerEngineController implements the 3-arg and gets
-    // the sidecar-DROPPING 4-arg here (AVFoundation cannot merge a second remote file; trailers on the
-    // AVPlayer lane must be handed a muxed URL instead). NOTE: a new engine must implement at least one
-    // of the two or these defaults recurse.
-    func loadFile(_ url: URL, headers: [String: String]?, live: Bool) {
-        loadFile(url, headers: headers, live: live, audioSidecar: nil)
+    @discardableResult
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool) -> PlayerLoadToken {
+        loadFile(url, headers: headers, live: live, audioSidecar: nil, reusing: nil)
     }
 
-    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?) {
-        loadFile(url, headers: headers, live: live)
+    @discardableResult
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool,
+                  audioSidecar: URL?) -> PlayerLoadToken {
+        loadFile(url, headers: headers, live: live, audioSidecar: audioSidecar, reusing: nil)
     }
 
     // Default no-op fingerprint/offset inputs for engines that don't surface them (the AVPlayer engine).

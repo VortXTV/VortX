@@ -935,7 +935,7 @@ final class DownloadManager: NSObject, ObservableObject {
     ///    exact (`watchedVideoIds` holds each finished episode id), and a finished movie records its own id.
     private func isFinishedWatched(_ record: DownloadRecord) -> Bool {
         let profiles = ProfileStore.shared
-        let isEpisode = record.type == "series" && record.season != nil && record.episode != nil
+        let isEpisode = record.usesSeriesLifecycle
         if profiles.activeUsesEngineHistory {
             let watched = WatchedIndex.shared.ids
             // Movie: contentId == videoId == metaId; either matches. Episode: only the series-completion

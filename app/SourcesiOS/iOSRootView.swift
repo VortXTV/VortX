@@ -3027,6 +3027,9 @@ struct iOSPlayerLaunch: Identifiable {
     /// When a natively-resolved debrid link launched this, its provenance so the play-record can store enough
     /// to reresolve a fresh link on a later CW resume. Carried on a CW debrid-reresolve; nil for torrent/direct.
     var debridRef: DebridPlaybackRef? = nil
+    var sourceStream: CoreStream? = nil
+    /// Exact series engine identity confirmed by the launch path. nil keeps engine writes closed.
+    var enginePlayerVideoId: String? = nil
     /// True when this launch is the user's exact chosen source (a CW-card-tap that reresolved the SAME debrid
     /// file), so PlayerScreen HONORS it on a start-timeout (retries in place) instead of silently hopping to a
     /// different, lower-quality source. False for a stale-url replay / paste-a-link (which may hop normally).
@@ -3034,7 +3037,7 @@ struct iOSPlayerLaunch: Identifiable {
     /// True when this launch is a Continue-Watching RESUME (directResume). Plays the exact stored source first
     /// but hops to a fresh source on a HARD load failure (a stale debrid link) instead of dead-ending.
     var wasResume: Bool = false
-    /// Series only: the season's ordered episodes + a resolver, so a Continue-Watching resume gets the
+    /// Series only: all-series episodes ordered across every season + a resolver, so a Continue-Watching resume gets the
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
@@ -3059,7 +3062,10 @@ extension View {
                 // SAME source resumes it as the user's chosen pick (honored on a start-timeout, re-recorded for
                 // the next resume), not a stale replay that hops across every source. Defaults keep other
                 // launch paths (paste-a-link, downloads) unchanged.
-                recordDebridRef: item.debridRef, startedFromExplicitPick: item.wasExplicitPick,
+                recordDebridRef: item.debridRef,
+                initialSourceStream: item.sourceStream,
+                initialEnginePlayerVideoId: item.enginePlayerVideoId,
+                startedFromExplicitPick: item.wasExplicitPick,
                 startedFromResume: item.wasResume,
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
@@ -3098,7 +3104,12 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     if PlaybackSettings.torrentsDisabled && entry.torrent == true {
         LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
     }
-    if item.type == "series", let cwVideo = item.cwVideoId, cwVideo != entry.videoId {
+    let hasEpisodicPhysicalIdentity = EpisodePlaybackIdentity.isEpisodicContext(
+        type: entry.type, season: entry.season, episode: entry.episode,
+        videoID: entry.videoId
+    )
+    let usesSeriesLifecycle = EpisodePlaybackIdentity.usesSeriesLifecycle(type: entry.type)
+    if hasEpisodicPhysicalIdentity, let cwVideo = item.cwVideoId, cwVideo != entry.videoId {
         LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
     }
     LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
@@ -3126,6 +3137,10 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
     let playURL = refreshed ? resolvedURL : url
+    if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
+        LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
+        return nil
+    }
     let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
     var explicitDebridRef: DebridPlaybackRef? = nil
     var wasExplicitPick = false
@@ -3165,17 +3180,19 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // dead-ending on the "sources didn't load" overlay (the debrid CW-resume failure). Non-blocking: the
     // stored link still plays immediately; if it fails, the player's failover now has FRESH sources to pick.
     // (Series loads its episode streams below; this gives movies the same hop-on-failure safety net.)
-    if entry.type == "movie",
-       core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty {
-        core.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+    if !usesSeriesLifecycle,
+       (core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty) {
+        core.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
     }
-    // For a series, give the player the season's episode list + a resolver so the CW resume has the same
+    // For a series, give the player the full all-season episode list + a resolver so the CW resume has the same
     // in-player Next / Prev / episode-list as the detail page. The CW item's videos may not be resident,
     // so wait briefly (~1.5s) for the meta; if it doesn't arrive, the recorded stream still resumes,
     // just without episode nav this session.
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
-    if entry.type == "series" {
+    var enginePlayerVideoId: String? = nil
+    var launchSource: CoreStream? = nil
+    if usesSeriesLifecycle {
         // Load the series meta (for the episode list) AND the CURRENT episode's streams, so the in-player
         // Sources button has this episode's alternates. Loading meta-only here had wiped the resident
         // episode streams the Sources list relied on — the "Sources button gone from CW resume" regression.
@@ -3190,25 +3207,78 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             }
         }
         let season = entry.season ?? 1
-        let seasonVideos = (core.metaDetails?.meta?.videos ?? [])
-            .filter { ($0.season ?? 1) == season }
-            .sorted { $0.episodeNumber < $1.episodeNumber }
-        if seasonVideos.count > 1 {
-            episodes = seasonVideos.map { PlayerEpisodeRef(id: $0.id, label: "E\($0.episodeNumber) · \($0.episodeTitle)") }
+        let allSeriesVideos = (core.metaDetails?.meta?.videos ?? []).orderedBySeasonEpisode
+        if !allSeriesVideos.isEmpty {
+            episodes = allSeriesVideos.map {
+                PlayerEpisodeRef(
+                    id: $0.id,
+                    label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)"
+                )
+            }
             loadEpisode = { vid in
-                await iOSResolveEpisodeStream(videoId: vid, in: seasonVideos, seriesId: item.id,
+                await iOSResolveEpisodeStream(videoId: vid, in: allSeriesVideos, seriesId: item.id,
                                               seriesName: entry.name, defaultSeason: season,
                                               fallbackPoster: entry.poster, continuity: entry.qualityText,
                                               binge: entry.bingeGroup, core: core, account: account)
             }
         }
     }
+    if hasEpisodicPhysicalIdentity {
+        let groups = core.streamGroups(forStreamId: entry.videoId)
+        let flattened = groups.flatMap(\.streams)
+        let source: CoreStream? = {
+            if let hash = entry.infoHash {
+                let sameHash = flattened.filter {
+                    $0.infoHash?.caseInsensitiveCompare(hash) == .orderedSame
+                }
+                if let fileIdx = entry.fileIdx,
+                   let exact = sameHash.first(where: { $0.fileIdx == fileIdx }) {
+                    return exact
+                }
+                if refreshed { return iOSDirectStream(url: playURL, name: entry.title) }
+                return entry.fileIdx.flatMap {
+                    iOSRawTorrentStream(infoHash: hash, fileIdx: $0, name: entry.title)
+                }
+            }
+            return flattened.first { $0.url == entry.url || $0.url == playURL.absoluteString }
+                ?? iOSDirectStream(url: playURL, name: entry.title)
+        }()
+        launchSource = source
+        if let source {
+            let base = iOSEngineAddonBase(for: source, in: groups)
+            let succeeded = core.loadEnginePlayer(
+                for: source, videoId: entry.videoId, base: base,
+                resolvedURL: explicitDebridRef?.url
+            )
+            enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
+                requestedVideoID: entry.videoId, bindingSucceeded: succeeded
+            )
+        }
+    }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
                            isTorrent: refreshed ? false : (entry.torrent ?? false),
-                           debridRef: explicitDebridRef, wasExplicitPick: wasExplicitPick, wasResume: true,
+                           debridRef: explicitDebridRef, sourceStream: launchSource,
+                           enginePlayerVideoId: enginePlayerVideoId,
+                           wasExplicitPick: wasExplicitPick, wasResume: true,
                            episodes: episodes, loadEpisode: loadEpisode)
+}
+
+private func iOSDirectStream(url: URL, name: String) -> CoreStream? {
+    let json: [String: Any] = ["url": url.absoluteString, "name": name]
+    guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+    return try? JSONDecoder().decode(CoreStream.self, from: data)
+}
+
+private func iOSRawTorrentStream(infoHash: String, fileIdx: Int, name: String) -> CoreStream? {
+    let json: [String: Any] = [
+        "infoHash": infoHash,
+        "fileIdx": fileIdx,
+        "name": name,
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+    return try? JSONDecoder().decode(CoreStream.self, from: data)
 }
 
 /// Stremio's "paste a link" feature on touch / Mac (#16) — the twin of the tvOS `OpenLinkView`. Plays

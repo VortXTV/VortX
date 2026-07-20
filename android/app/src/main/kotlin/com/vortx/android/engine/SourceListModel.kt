@@ -16,7 +16,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
-import java.util.Collections
 
 /// Owns a detail screen's source-list ASSEMBLY pipeline off the render path: raw engine stream groups ->
 /// merge (TorBox search + Singularity + media-server groups) -> disabled-add-on subtraction -> direct-links
@@ -146,13 +145,21 @@ class SourceListModel(
         val assembled = assemble(raw, torboxStreams, singularityStreams, media, ctx)
         _state.value = assembled
 
-        // HOARD (fire-and-forget): seed the community pool from the assembled groups. Not a capture pipeline;
-        // the assembly IS the capture point (descriptors are pure, extracted from the ranked groups). Deduped
-        // per content id per process so re-assembling the same title does not re-POST. Gated + fail-soft.
+        // HOARD (fire-and-forget): capture only raw add-on + TorBox torrent infohashes, before the display's
+        // direct-links-only filter. Singularity output and media-server groups are intentionally outside this
+        // boundary, so pooled witnesses cannot feed themselves and private media-server URLs cannot cross it.
+        // Dedup is per (content id, infohash), allowing torrents that arrive in later engine waves to upload.
         val cid = ctx.contentId
-        if (cid != null && SourceIndexClient.isEnabled && assembled.groups.isNotEmpty() && markHoarded(cid)) {
-            scope.launch(Dispatchers.IO) {
-                SourceIndexClient.hoard(cid, assembled.groups)
+        if (cid != null && SourceIndexClient.isEnabled) {
+            val candidates = contributionDescriptors(raw, torboxStreams, ctx.disabledAddons)
+            // The process ledger is intentionally marked before the fail-soft POST starts. This at-most-once
+            // tradeoff prevents rebuild storms from retrying a failing endpoint; a dropped POST becomes
+            // eligible again on the next app launch. The pool is opportunistic and never gates playback.
+            val fresh = hoardLedger.takeNew(cid, candidates, SourceIndexClient.MAX_DESCRIPTORS_PER_TITLE)
+            if (fresh.isNotEmpty()) {
+                scope.launch(Dispatchers.IO) {
+                    SourceIndexClient.contribute(cid, fresh)
+                }
             }
         }
     }
@@ -182,15 +189,11 @@ class SourceListModel(
     )
 
     companion object {
+        private val hoardLedger = SourceHoardLedger()
+
         /// The coalescing window. At most ~4 rebuilds/sec while an engine burst streams sources in. Mirrors
         /// Apple's `coalesceMs`.
         const val COALESCE_MS = 250L
-
-        /// Per-process dedup of full-title HOARD seeds, so re-assembling the same title in one launch does not
-        /// re-POST (the worker upserts by UNIQUE(content_id, kind, id), so a duplicate is harmless anyway).
-        private val hoardedContentIds: MutableSet<String> = Collections.synchronizedSet(HashSet())
-
-        private fun markHoarded(contentId: String): Boolean = hoardedContentIds.add(contentId)
 
         /// The PURE assembly: subtract disabled add-ons, merge the TorBox + Singularity + media-server lanes in
         /// Apple's order (TorBox first, then Singularity, then media-server groups), apply the direct-links
@@ -204,24 +207,17 @@ class SourceListModel(
             mediaServerGroups: List<StreamGroup>,
             ctx: Context,
         ): SourceListState {
-            // Belt-and-suspenders disabled-add-on subtraction (Android has no add-on tombstone surface yet, so
-            // this is inert until [Context.disabledAddons] is populated). Matched on the group's add-on label
-            // (Android groups carry no transport-url id, unlike Apple's `group.id`).
-            var assembled = if (ctx.disabledAddons.isEmpty()) {
-                raw
-            } else {
-                val disabled = ctx.disabledAddons.map { it.trim().lowercase() }.toSet()
-                raw.filter { it.addon.trim().lowercase() !in disabled }
-            }
+            // Raw add-on + TorBox inputs form both the initial display assembly and the only contribution
+            // boundary. Singularity and media-server lanes are merged only after capture eligibility is fixed.
+            var assembled = contributionGroups(raw, torboxStreams, ctx.disabledAddons)
 
-            // Merge order preserved from Apple's displayGroups: TorBox search first, then the Singularity pool,
-            // then the media-server direct-play groups. Final rank order is decided by StreamRanking, not merge
-            // order.
+            // Merge order preserved from Apple's displayGroups: Singularity after raw + TorBox, then the
+            // media-server direct-play groups. Final rank order is decided by StreamRanking, not merge order.
             assembled = mergeMediaServer(
                 mediaServerGroups,
                 SourceIndexServeSource.merge(
                     singularityStreams,
-                    TorBoxSearchSource.merge(torboxStreams, assembled),
+                    assembled,
                 ),
             )
 
@@ -243,6 +239,32 @@ class SourceListModel(
             return SourceListState(groups = ranked, best = best, tiers = tiers, resolutionOptions = resolutionOptions)
         }
 
+        /// The only groups eligible for contribution: enabled raw add-on results plus TorBox search results.
+        /// This is deliberately evaluated before any direct-links-only display filter and has no parameters for
+        /// Singularity or media-server lanes, making recursive pooled witnesses and private server URLs
+        /// structurally ineligible.
+        fun contributionGroups(
+            raw: List<StreamGroup>,
+            torboxStreams: List<StreamSource>,
+            disabledAddons: Set<String>,
+        ): List<StreamGroup> {
+            val enabledRaw = if (disabledAddons.isEmpty()) {
+                raw
+            } else {
+                val disabled = disabledAddons.map { it.trim().lowercase() }.toSet()
+                raw.filter { it.addon.trim().lowercase() !in disabled }
+            }
+            return TorBoxSearchSource.merge(torboxStreams, enabledRaw)
+        }
+
+        /// Extract canonical torrent descriptors from the contribution-only group boundary.
+        fun contributionDescriptors(
+            raw: List<StreamGroup>,
+            torboxStreams: List<StreamSource>,
+            disabledAddons: Set<String>,
+        ): List<SourceIndexClient.Descriptor> =
+            SourceIndexClient.descriptors(contributionGroups(raw, torboxStreams, disabledAddons))
+
         /// Append the pre-built media-server direct-play groups (one per server), deduped against streams
         /// already present by playable handle so a server copy never duplicates an add-on's identical direct
         /// link. Mirrors Apple `MediaServerSource.merge` (append + handle dedup).
@@ -260,6 +282,36 @@ class SourceListModel(
         /// The playable handle (url / infoHash / nzbUrl before the `#name#desc` suffix the engine encodes into
         /// [StreamSource.id]) used to de-dup a media-server copy against an identical add-on stream.
         private fun handleOf(s: StreamSource): String = s.id.substringBefore('#')
+    }
+}
+
+/// Process-lifetime contribution dedup keyed by content id plus canonical torrent identity. It marks only the
+/// descriptors actually returned to the caller, so a per-run limit cannot strand an unsubmitted tail forever.
+/// Capacity is fail-closed: once [maxEntries] is reached, new unique claims stop and existing process-lifetime
+/// claims are never evicted. The client is compile-time dormant; its re-enable lane must relocate this state
+/// beside the process-wide pacer and replace claim-before-launch with atomic pending reservations.
+internal class SourceHoardLedger(private val maxEntries: Int = 40_000) {
+    private val seen = LinkedHashSet<String>()
+
+    @Synchronized
+    fun takeNew(
+        contentId: String,
+        descriptors: List<SourceIndexClient.Descriptor>,
+        limit: Int = Int.MAX_VALUE,
+    ): List<SourceIndexClient.Descriptor> {
+        if (limit <= 0 || maxEntries <= 0 || SourceIndexClient.canonicalContentId(contentId) != contentId) {
+            return emptyList()
+        }
+        val fresh = ArrayList<SourceIndexClient.Descriptor>(minOf(descriptors.size, limit))
+        for (descriptor in descriptors) {
+            if (fresh.size >= limit) break
+            val key = "$contentId|${descriptor.kind}|${descriptor.id}"
+            if (key in seen) continue
+            if (seen.size >= maxEntries) break
+            seen.add(key)
+            fresh.add(descriptor)
+        }
+        return fresh
     }
 }
 

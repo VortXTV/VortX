@@ -169,6 +169,7 @@ struct InHeroTrailerView: View {
     private func handleProperty(_ engine: any PlayerEngine, _ name: String, _ data: Any?) {
         switch name {
         case MPVProperty.timePos:
+            guard let event = data as? PlayerTimePositionEvent else { return }
             // First decoded time-pos means the clip really started; seek into the window (if any) and
             // arm the reveal beat exactly once.
             if !didStart {
@@ -178,7 +179,7 @@ struct InHeroTrailerView: View {
             }
             // Windowed mode: keep the snippet looping by re-seeking to the start once playback runs past
             // the window. A small guard band absorbs the time-pos event granularity so we never thrash.
-            if let window, let pos = data as? Double, pos >= window.start + window.length {
+            if let window, event.seconds >= window.start + window.length {
                 engine.seek(to: window.start)
             }
         case MPVProperty.endFileError:

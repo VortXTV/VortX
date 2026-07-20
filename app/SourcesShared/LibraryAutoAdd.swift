@@ -70,7 +70,7 @@ enum LibraryAutoAdd {
                 rememberAutoAdded(id)
                 NSLog("[autolib] auto-added %@ to account library (engine, loaded meta)", id)
             } else {
-                let type = (meta.type == "series") ? "series" : "movie"
+                let type = meta.usesSeriesLifecycle ? "series" : "movie"
                 Task { @MainActor in
                     // Only remember the auto-add once the account write actually succeeded; a failed resolve
                     // must retry on the next play, not be silently pinned as "already added".

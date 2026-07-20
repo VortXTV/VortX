@@ -1056,12 +1056,24 @@ struct iOSSettingsView: View {
     /// off = out of the whole pool. Singularity SERVE is a further per-device opt-in that also needs sign-in.
     @ViewBuilder private var communitySection: some View {
         Section {
-            Toggle("Contribute anonymized data to improve results", isOn: $moatContribute)
+            Toggle("Contribute anonymized data to improve results", isOn: Binding(
+                get: { moatContribute },
+                set: { newValue in
+                    SourceIndexLifecycleScope.shared.preferencesWillApply(consent: newValue)
+                    moatContribute = newValue
+                }
+            ))
                 .tint(Theme.Palette.accent)
             Text(MoatConsent.disclosure)
                 .font(.caption).foregroundStyle(.secondary)
             if moatContribute {
-                Toggle("Singularity sources", isOn: $singularityServe)
+                Toggle("Singularity sources", isOn: Binding(
+                    get: { singularityServe },
+                    set: { newValue in
+                        SourceIndexLifecycleScope.shared.preferencesWillApply(serve: newValue)
+                        singularityServe = newValue
+                    }
+                ))
                     .tint(Theme.Palette.accent)
                     .disabled(!vortxSync.isSignedIn)
                 if vortxSync.isSignedIn {

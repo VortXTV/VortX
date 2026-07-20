@@ -608,13 +608,21 @@ struct SettingsView: View {
         section(String(localized: "Community")) {
             choiceRow(String(localized: "Contribute anonymized data to improve results"),
                       [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { moatContribute ? "1" : "0" }, set: { moatContribute = ($0 == "1") }))
+                      selection: Binding(get: { moatContribute ? "1" : "0" }, set: {
+                          let newValue = ($0 == "1")
+                          SourceIndexLifecycleScope.shared.preferencesWillApply(consent: newValue)
+                          moatContribute = newValue
+                      }))
             Text(MoatConsent.disclosure)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             if moatContribute {
                 if vortxSync.isSignedIn {
                     choiceRow(String(localized: "Singularity sources"), [("0", "Off"), ("1", "On")],
-                              selection: Binding(get: { singularityServe ? "1" : "0" }, set: { singularityServe = ($0 == "1") }))
+                              selection: Binding(get: { singularityServe ? "1" : "0" }, set: {
+                                  let newValue = ($0 == "1")
+                                  SourceIndexLifecycleScope.shared.preferencesWillApply(serve: newValue)
+                                  singularityServe = newValue
+                              }))
                     Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 } else {

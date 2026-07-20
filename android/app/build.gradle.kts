@@ -109,6 +109,11 @@ android {
         checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
         abortOnError = true
     }
+
+    testOptions {
+        // Local JVM tests exercise pure source-index seams that still share files with fail-soft Android logs.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {
@@ -222,6 +227,9 @@ dependencies {
     // Apple needs its foreground session + beginBackgroundTask assertion for). Both flavors need it -- downloads are
     // not a licensing-boundary feature -- so this is a plain `implementation`, not flavor-scoped.
     implementation(libs.work.runtime.ktx)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.json.jvm)
 }
 
 // =====================================================================================================

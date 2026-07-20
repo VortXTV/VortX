@@ -582,7 +582,12 @@ struct CoreContinueWatchingRow: View {
         if PlaybackSettings.torrentsDisabled && entry.torrent == true {
             LastStreamStore.logResume("torrentDisabled", libraryId: item.id, profileID: pid); return nil
         }
-        if item.type == "series", let cwVideo = item.state.videoId, cwVideo != entry.videoId {
+        let hasEpisodicPhysicalIdentity = EpisodePlaybackIdentity.isEpisodicContext(
+            type: entry.type, season: entry.season, episode: entry.episode,
+            videoID: entry.videoId
+        )
+        let usesSeriesLifecycle = EpisodePlaybackIdentity.usesSeriesLifecycle(type: entry.type)
+        if hasEpisodicPhysicalIdentity, let cwVideo = item.state.videoId, cwVideo != entry.videoId {
             LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
@@ -614,21 +619,41 @@ struct CoreContinueWatchingRow: View {
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
                 let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
                 let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
+                if hasEpisodicPhysicalIdentity, entry.torrent == true,
+                   entry.fileIdx == nil, !refreshed {
+                    LastStreamStore.logResume(
+                        "episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid
+                    )
+                    return
+                }
                 if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
                    let hash = entry.infoHash, !hash.isEmpty {
                     // Fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
                     // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
                     // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
                     NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
-                    bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
-                    let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
+                    let requestType = usesSeriesLifecycle ? "series" : entry.type
+                    bridge.loadMeta(type: requestType, id: item.id,
+                                    streamType: requestType, streamId: entry.videoId)
+                    let eps = await prefetchEpisodes(bridge, itemID: item.id,
+                                                     usesSeriesLifecycle: usesSeriesLifecycle)
+                    let groups = bridge.streamGroups(forStreamId: entry.videoId)
+                    let source = resumeSource(entry: entry, url: resolvedURL, groups: groups,
+                                              forceDirect: true)
+                    let engineVideoID = source.flatMap {
+                        bindResumeEngine(bridge, source: $0, entry: entry,
+                                         hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
+                                         groups: groups, resolvedURL: resolvedURL)
+                    }
+                    let ref = DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
+                                                torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
+                                                fileIdx: entry.fileIdx)
                     presenter.request = PlaybackRequest(
                         url: resolvedURL, title: entry.title, meta: meta, episodes: eps,
                         sourceHint: entry.qualityText, torrent: false,
                         bingeGroup: entry.bingeGroup, headers: entry.headers,
-                        debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
-                                                     torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
-                                                     fileIdx: entry.fileIdx),
+                        debridRef: ref, sourceStream: source,
+                        enginePlayerVideoId: engineVideoID,
                         wasExplicitPick: true, wasResume: true)
                     return
                 }
@@ -639,16 +664,74 @@ struct CoreContinueWatchingRow: View {
                 // gives the resume-path community hoard (above) the groups it polls for (series was previously
                 // left unloaded here, so a series fallback resume seeded nothing).
                 NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL path=fallback-stored-url", entry.debridService ?? "-", hashShort, entry.fileIdx.map(String.init) ?? "-")
-                if bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
-                    bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
+                if bridge.metaDetails?.meta?.id != item.id
+                    || bridge.streamGroups(forStreamId: entry.videoId).isEmpty
+                    || (usesSeriesLifecycle && (bridge.metaDetails?.meta?.videos?.isEmpty ?? true)) {
+                    let requestType = usesSeriesLifecycle ? "series" : entry.type
+                    bridge.loadMeta(type: requestType, id: item.id,
+                                    streamType: requestType, streamId: entry.videoId)
                 }
-                let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
+                let eps = await prefetchEpisodes(bridge, itemID: item.id,
+                                                 usesSeriesLifecycle: usesSeriesLifecycle)
+                let groups = bridge.streamGroups(forStreamId: entry.videoId)
+                let source = resumeSource(entry: entry, url: resolvedURL, groups: groups)
+                let engineVideoID = source.flatMap {
+                    bindResumeEngine(bridge, source: $0, entry: entry,
+                                     hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
+                                     groups: groups, resolvedURL: nil)
+                }
+                if let source { tvPrimeTorrentStream(source) }
                 presenter.request = PlaybackRequest(
                     url: resolvedURL, title: entry.title, meta: meta,
                     episodes: eps, sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
-                    headers: entry.headers, wasResume: true)
+                    headers: entry.headers, sourceStream: source,
+                    enginePlayerVideoId: engineVideoID, wasResume: true)
             }
         }
+    }
+
+    private func resumeSource(entry: LastStreamStore.Entry, url: URL,
+                              groups: [CoreStreamSourceGroup], forceDirect: Bool = false) -> CoreStream? {
+        let streams = groups.flatMap(\.streams)
+        if let hash = entry.infoHash {
+            let matches = streams.filter {
+                $0.infoHash?.caseInsensitiveCompare(hash) == .orderedSame
+            }
+            if let fileIdx = entry.fileIdx,
+               let exact = matches.first(where: { $0.fileIdx == fileIdx }) { return exact }
+        }
+        if let direct = streams.first(where: { $0.url == entry.url || $0.url == url.absoluteString }) {
+            return direct
+        }
+        var json: [String: Any] = ["name": entry.title]
+        if forceDirect || entry.torrent != true {
+            json["url"] = url.absoluteString
+        } else if let hash = entry.infoHash, let fileIdx = entry.fileIdx, fileIdx >= 0 {
+            json["infoHash"] = hash
+            json["fileIdx"] = fileIdx
+        } else {
+            return nil
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(CoreStream.self, from: data)
+    }
+
+    private func bindResumeEngine(_ bridge: CoreBridge, source: CoreStream,
+                                  entry: LastStreamStore.Entry,
+                                  hasEpisodicPhysicalIdentity: Bool,
+                                  groups: [CoreStreamSourceGroup], resolvedURL: URL?) -> String? {
+        guard hasEpisodicPhysicalIdentity else {
+            bridge.loadEnginePlayer(for: source)
+            return nil
+        }
+        let rawBase = groups.first(where: { $0.streams.contains(source) })?.id
+        let base = rawBase.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+        let succeeded = bridge.loadEnginePlayer(
+            for: source, videoId: entry.videoId, base: base, resolvedURL: resolvedURL
+        )
+        return EpisodePlaybackIdentity.boundVideoID(
+            requestedVideoID: entry.videoId, bindingSucceeded: succeeded
+        )
     }
 
     /// Direct-resume episode prefetch (mirrors iOSRootView's CW-resume prefetch): hand the player its
@@ -657,8 +740,9 @@ struct CoreContinueWatchingRow: View {
     /// plus the EOF last-chance retry remain the backstop). The raw unsorted videos are byte-equivalent
     /// to what the in-player backfill sets (loadedEpisodes = vids), the proven 0.3.11 behavior.
     @MainActor
-    private func prefetchEpisodes(_ bridge: CoreBridge, itemID: String, entryType: String) async -> [CoreVideo] {
-        guard entryType == "series" else { return [] }
+    private func prefetchEpisodes(_ bridge: CoreBridge, itemID: String,
+                                  usesSeriesLifecycle: Bool) async -> [CoreVideo] {
+        guard usesSeriesLifecycle else { return [] }
         for _ in 0 ..< 6 {
             if let meta = bridge.metaDetails?.meta, meta.id == itemID,
                let vids = meta.videos, !vids.isEmpty { return vids }

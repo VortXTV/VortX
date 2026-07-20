@@ -29,6 +29,8 @@ struct PlayerEpisodeStream {
     let meta: PlaybackMeta
     let title: String
     let resume: Double
+    var debridRef: DebridPlaybackRef? = nil
+    var engineAddonBase: String? = nil
 }
 
 struct PlayerScreen: View {
@@ -46,6 +48,9 @@ struct PlayerScreen: View {
     var recordBingeGroup: String? = nil                     // behaviorHints.bingeGroup of the launching stream (CW binge continuity)
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
     var recordDebridRef: DebridPlaybackRef? = nil           // native-debrid provenance, for CW reresolve of an expired link
+    var initialSourceStream: CoreStream? = nil               // exact raw torrent selector for CW before groups are resident
+    /// Exact engine episode identity confirmed by the launch presenter. nil keeps series engine writes closed.
+    var initialEnginePlayerVideoId: String? = nil
     var isTrailer: Bool = false                             // a trailer preview: always plays in-app, never auto-routes external
     /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
     /// false for an auto-pick (Watch Now / a Continue-Watching resume). An explicit pick is HONORED on a
@@ -320,9 +325,24 @@ struct PlayerScreen: View {
     // and add-on subtitles all key off the episode ACTUALLY playing (not the one first opened).
     @State private var curMetaState: PlaybackMeta? = nil
     @State private var curTitleState: String? = nil
+    @State private var enginePlayerVideoId: String? = nil
+    @State private var engineAttributionInitialized = false
+    @State private var curDebridRef: DebridPlaybackRef? = nil
     @State private var switchingEpisode = false       // a Next/Prev/list switch is resolving its stream
+    @State private var resumeRetryGeneration = 0
+    @State private var episodeSwitchGeneration = 0
+    @State private var episodeResolveGeneration: Int?
+    @State private var playbackExited = false
     private var curMeta: PlaybackMeta? { curMetaState ?? recordMeta }
     private var curTitle: String { curTitleState ?? title }
+    private var isEpisodePlaybackContext: Bool {
+        let target = pendingAdvance?.meta ?? curMeta
+        if let target, EpisodePlaybackIdentity.isEpisodicContext(
+            type: target.type, season: target.season, episode: target.episode,
+            videoID: target.videoId
+        ) { return true }
+        return loadEpisode != nil || !episodes.isEmpty
+    }
     // UNIFIED CURRENT-EPISODE IDENTITY (binge-desync fix, publish-at-first-frame; mirror of
     // TVPlayerView.pendingAdvance). goToEpisode used to publish curMetaState/curTitleState the moment the
     // episode RESOLVED, before its file produced a frame, so an advance interrupted across a background
@@ -337,10 +357,41 @@ struct PlayerScreen: View {
         let meta: PlaybackMeta
         let title: String
         let binge: String?
+        let generation: Int
+        var debridRef: DebridPlaybackRef?
         var url: URL? = nil
         var issued = false
+        var loadToken: PlayerLoadToken? = nil
+        var terminal = false
+        var deferredDuration: Double? = nil
+        var deferredTrackList = false
+        var deferredSeekable: Bool? = nil
+    }
+    private struct EpisodeSourceSnapshot {
+        let url: URL?
+        let headers: [String: String]?
+        let stream: CoreStream?
+        let debridRef: DebridPlaybackRef?
+        let hint: String?
+        let binge: String?
+        let isTorrent: Bool
+        let engineVideoID: String?
+        let engineAddonBase: String?
+    }
+    private struct SupersededEpisodeAdvance {
+        var pending: PendingEpisodeAdvance
+        let source: EpisodeSourceSnapshot
     }
     @State private var pendingAdvance: PendingEpisodeAdvance?
+    @State private var supersededAdvance: SupersededEpisodeAdvance?
+    @State private var committedLoadToken: PlayerLoadToken?
+    @State private var uncommittedIdentityBlocked = false
+    @State private var persistenceBlockedForExit = false
+    private var hasUncommittedIssuedMedia: Bool {
+        uncommittedIdentityBlocked
+            || pendingAdvance?.issued == true
+            || supersededAdvance?.pending.issued == true
+    }
     /// True while the skip-segment editor bar is open. Always false on tvOS (the editor is iOS/Mac
     /// only), so the EOF/auto-hide/up-next guards can reference it without per-call `#if` fences.
     private var skipEditActive: Bool {
@@ -366,7 +417,7 @@ struct PlayerScreen: View {
 
     // Community-subtitle system (pooled subs P2, sync offset P3, embedded upload P4). All fail-soft + gated.
     @State private var pooledSubs: [SubtitlePoolClient.PooledSubtitle] = []
-    @State private var pooledSubsKey = ""                 // contentKey the pooled list belongs to
+    @State private var subtitlePoolRequests = SubtitlePoolClient.RequestOwnership()
     @State private var addedPooledIDs: Set<Int> = []      // pooled subs already loaded into the player
     @State private var pooledSeededOffset = false         // the community offset was applied once this session
     @State private var embeddedUploadDone = false         // the embedded-track upload ran once this session
@@ -463,6 +514,7 @@ struct PlayerScreen: View {
     }
     @State private var curHeaders: [String: String]?
     @State private var curIsTorrent = false
+    @State private var curSourceStream: CoreStream?
     @State private var torrentWarmupsUsed = 0          // bounded torrent peer-discovery warm-up rounds
     @State private var torrentStatus: String?          // "Connecting to peers · N connected" shown during warm-up
     // Auto-failover: when a source spends its retry / stall budget, hop to the best-ranked UNTRIED
@@ -669,7 +721,7 @@ struct PlayerScreen: View {
                 .play(url, headers: headers,
                       isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
                 .live(initialIsLive)
-                .onPropertyChange { _, name, data in handleProperty(name, data) }
+                .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .ignoresSafeArea()
         } else {
             mpvSurface
@@ -686,7 +738,7 @@ struct PlayerScreen: View {
             .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
                   isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
             .live(initialIsLive)
-            .onPropertyChange { _, name, data in handleProperty(name, data) }
+            .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
     }
 
@@ -822,6 +874,8 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            playbackExited = false
+            persistenceBlockedForExit = false
             // Diagnostic-only: this is the player surface, so the heartbeat reports the player route.
             VXProbeState.shared.setRoute("player")
             // Mark the engine player-active so CoreBridge skips the library-branch In-Library re-decode of
@@ -838,6 +892,12 @@ struct PlayerScreen: View {
             }
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            if curSourceStream == nil { curSourceStream = initialSourceStream }
+            if !engineAttributionInitialized {
+                enginePlayerVideoId = initialEnginePlayerVideoId
+                engineAttributionInitialized = true
+            }
+            if curDebridRef == nil { curDebridRef = recordDebridRef }
             if curHint == nil { curHint = recordQualityText }   // seed the "playing now" signature from the launch stream
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
@@ -874,6 +934,7 @@ struct PlayerScreen: View {
             #endif
         }
         .onDisappear {
+            invalidateEpisodeWorkForExit()
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
@@ -974,15 +1035,94 @@ struct PlayerScreen: View {
 
     // MARK: - Property handling
 
-    private func handleProperty(_ name: String, _ data: Any?) {
+    private func terminalRoute(for loadToken: PlayerLoadToken?) -> EpisodePlaybackIdentity.TerminalEventRoute {
+        EpisodePlaybackIdentity.terminalEventRoute(
+            callbackToken: loadToken, activeToken: coordinator.player?.activeLoadToken,
+            committedToken: committedLoadToken,
+            pendingToken: pendingAdvance?.loadToken, pendingIssued: pendingAdvance?.issued == true,
+            supersededToken: supersededAdvance?.pending.loadToken,
+            supersededIssued: supersededAdvance?.pending.issued == true,
+            switchingEpisode: switchingEpisode
+        )
+    }
+
+    private func terminalAction(for loadToken: PlayerLoadToken?,
+                                kind: EpisodePlaybackIdentity.TerminalEventKind)
+        -> EpisodePlaybackIdentity.TerminalEventAction {
+        EpisodePlaybackIdentity.terminalEventAction(
+            route: terminalRoute(for: loadToken), kind: kind
+        )
+    }
+
+    private func callbackBelongsToCommittedMedia(_ loadToken: PlayerLoadToken?) -> Bool {
+        guard let loadToken, let committedLoadToken else { return false }
+        return loadToken == committedLoadToken
+            && loadToken == coordinator.player?.activeLoadToken
+    }
+
+    private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        if pendingAdvance == nil, supersededAdvance == nil,
+           let loadToken, loadToken == coordinator.player?.activeLoadToken {
+            committedLoadToken = loadToken
+        }
+        if name == MPVProperty.duration, let value = data as? Double,
+           !callbackBelongsToCommittedMedia(loadToken) {
+            if pendingAdvance?.issued == true, loadToken == pendingAdvance?.loadToken {
+                pendingAdvance?.deferredDuration = value
+            } else if supersededAdvance?.pending.issued == true,
+                      loadToken == supersededAdvance?.pending.loadToken {
+                supersededAdvance?.pending.deferredDuration = value
+            }
+            return
+        }
+        if name == MPVProperty.trackList, !callbackBelongsToCommittedMedia(loadToken) {
+            if pendingAdvance?.issued == true, loadToken == pendingAdvance?.loadToken {
+                pendingAdvance?.deferredTrackList = true
+            } else if supersededAdvance?.pending.issued == true,
+                      loadToken == supersededAdvance?.pending.loadToken {
+                supersededAdvance?.pending.deferredTrackList = true
+            }
+            return
+        }
+        if name == MPVProperty.seekable, let value = data as? Bool,
+           !callbackBelongsToCommittedMedia(loadToken) {
+            if pendingAdvance?.issued == true, loadToken == pendingAdvance?.loadToken {
+                pendingAdvance?.deferredSeekable = value
+            } else if supersededAdvance?.pending.issued == true,
+                      loadToken == supersededAdvance?.pending.loadToken {
+                supersededAdvance?.pending.deferredSeekable = value
+            }
+            return
+        }
         switch name {
         case MPVProperty.pausedForCache:
             if let b = data as? Bool { buffering = b }
         case MPVProperty.videoParamsSigPeak:
             if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
         case MPVProperty.timePos:
-            if let d = data as? Double {
+            if let event = data as? PlayerTimePositionEvent,
+               PlayerLoadProvenanceState.accepts(
+                callbackToken: event.loadToken,
+                activeToken: coordinator.player?.activeLoadToken
+               ) {
+                let d = event.seconds
+                if pendingAdvance?.issued != true, supersededAdvance == nil {
+                    committedLoadToken = event.loadToken
+                }
+                let supersededTick = supersededAdvance?.pending.issued == true
+                    && event.loadToken == supersededAdvance?.pending.loadToken
+                if supersededTick { return }
+                if pendingAdvance?.issued == true,
+                   event.loadToken == pendingAdvance?.loadToken, d <= 0 { return }
                 if d > 0, !hasStartedPlaying {      // playback actually began
+                    if let pending = pendingAdvance {
+                        guard pending.issued,
+                              PlayerLoadProvenanceState.canCommit(
+                                callbackToken: event.loadToken,
+                                activeToken: coordinator.player?.activeLoadToken,
+                                pendingToken: pending.loadToken
+                              ) else { return }
+                    }
                     // [src-probe] FIRST FRAME: the overlay/spinner is about to clear and real playback begins.
                     // The gap between LOAD START and this line is the true startup latency; if a reconnect/hop
                     // message showed during that window (see the overlay-set probes) it was a transient shown
@@ -993,7 +1133,19 @@ struct PlayerScreen: View {
                     // rendered, so publish an in-flight advance NOW, before anything below
                     // (recordLastStream, the scrobble start) reads curMeta/curTitle - the store record
                     // then captures a matching (videoId, url) pair by construction.
-                    commitPendingAdvanceOnFirstFrame()
+                    let deferredDuration = pendingAdvance?.deferredDuration
+                    let deferredTrackList = pendingAdvance?.deferredTrackList == true
+                    let deferredSeekable = pendingAdvance?.deferredSeekable
+                    commitPendingAdvanceOnFirstFrame(loadToken: event.loadToken)
+                    if let deferredDuration {
+                        handleProperty(MPVProperty.duration, deferredDuration, loadToken: event.loadToken)
+                    }
+                    if deferredTrackList {
+                        handleProperty(MPVProperty.trackList, nil, loadToken: event.loadToken)
+                    }
+                    if let deferredSeekable {
+                        handleProperty(MPVProperty.seekable, deferredSeekable, loadToken: event.loadToken)
+                    }
                     loadTimeout?.cancel(); autoRetryTask?.cancel()
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
                     #if os(iOS) || os(macOS)
@@ -1007,7 +1159,8 @@ struct PlayerScreen: View {
                         }
                     }
                     #endif
-                    reconnecting = false; loadFailed = false
+                    reconnecting = episodeResolveGeneration != nil
+                    loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
                     // External sync (Trakt/SIMKL): live scrobble START. Additive + fail-soft + gated inside
@@ -1038,7 +1191,7 @@ struct PlayerScreen: View {
                     // until a real value lands and route it through the same handling as the event.
                     if duration <= 0, !effectivelyLive,
                        let engineDur = coordinator.player?.mediaDurationSeconds(), engineDur.isFinite, engineDur > 0 {
-                        handleProperty(MPVProperty.duration, engineDur)
+                        handleProperty(MPVProperty.duration, engineDur, loadToken: event.loadToken)
                     }
                     #if !os(tvOS)
                     if skipDBPreviewing, d >= skipDBEditStart {
@@ -1083,9 +1236,10 @@ struct PlayerScreen: View {
                     if !effectivelyLive, (duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120) { warmNextIfNeeded() }
                     // ~90% in → flip the engine's watched marker live, so the title leaves Continue
                     // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if !markedWatched, !effectivelyLive, duration > 0, d / duration >= 0.9, let m = curMeta {
+                    if !markedWatched, !effectivelyLive, duration > 0, d / duration >= 0.9,
+                       let m = curMeta {
                         markedWatched = true
-                        core.markPlaybackWatched(m)
+                        core.markPlaybackWatched(m, allowEngineWrite: engineWritesOpen)
                     }
                 }
             }
@@ -1154,7 +1308,8 @@ struct PlayerScreen: View {
                 // nothing else (no resume-point write). Additive + fail-soft + gated inside the coordinator;
                 // a no-op with empty creds. Live content is excluded (parity with the start/stop hooks).
                 // SIMKL has no live scrobble, so it is skipped by capability.
-                if let m = curMeta, !effectivelyLive {
+                if callbackBelongsToCommittedMedia(loadToken),
+                   let m = curMeta, !effectivelyLive {
                     let pos = max(currentTime, suppressedResumeFloor ?? 0)
                     if b { ScrobbleCoordinator.shared.playbackPaused(m, position: pos, duration: duration) }
                     else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
@@ -1174,6 +1329,21 @@ struct PlayerScreen: View {
                 autoSelectTracks()
             }
         case MPVProperty.endFileError:
+            switch terminalAction(for: loadToken, kind: .error) {
+            case .handleCommitted:
+                break
+            case .handlePending:
+                pendingAdvance?.terminal = true
+                uncommittedIdentityBlocked = true
+            case .markSupersededTerminal:
+                supersededAdvance?.pending.terminal = true
+                uncommittedIdentityBlocked = true
+                return
+            case .ignoreOutgoingError, .ignoreStale:
+                return
+            case .persistOutgoingCompletionOnly:
+                return
+            }
             #if os(iOS) || os(macOS)
             // ANY AVPlayer failure, pre-start (a Profile 7 / TrueHD-only DV remux, a container AVPlayer
             // can't open) or MID-PLAY, demotes to libmpv IN PLACE: flipping avEngineFailed swaps
@@ -1200,12 +1370,35 @@ struct PlayerScreen: View {
                 srcProbe("endFileError IGNORED (already playing) reason=\((data as? String) ?? "-")")
             }
         case MPVProperty.endFileEof:
+            let completionOnly: Bool
+            switch terminalAction(for: loadToken, kind: .eof) {
+            case .handleCommitted:
+                completionOnly = false
+            case .handlePending:
+                pendingAdvance?.terminal = true
+                uncommittedIdentityBlocked = true
+                loadTimeout?.cancel()
+                handleLoadFailure("Episode ended before its first frame")
+                return
+            case .markSupersededTerminal:
+                supersededAdvance?.pending.terminal = true
+                uncommittedIdentityBlocked = true
+                return
+            case .persistOutgoingCompletionOnly:
+                completionOnly = true
+            case .ignoreOutgoingError, .ignoreStale:
+                return
+            }
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
-            if !markedWatched, !effectivelyLive, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            if !markedWatched, !effectivelyLive, let m = curMeta {
+                markedWatched = true
+                core.markPlaybackWatched(m, allowEngineWrite: engineWritesOpen)
+            }
             // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op
             // with empty creds. Fired for the finishing episode before any in-place advance opens a new session.
             if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
+            if completionOnly { return }
             if sleepAtEpisodeEnd {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
@@ -1213,6 +1406,7 @@ struct PlayerScreen: View {
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
+                invalidateEpisodeWorkForExit()
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
@@ -1221,6 +1415,7 @@ struct PlayerScreen: View {
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
+                invalidateEpisodeWorkForExit()
                 onClose()
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
                 // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
@@ -1242,10 +1437,18 @@ struct PlayerScreen: View {
                 // Guard: a series that reached EOF with NO episode list (a CW resume whose list never loaded)
                 // is a mid-season episode misread as a finale, so do NOT clear the whole series from Continue
                 // Watching here; only genuine finishes (movies, or a series with a real list) rewind it out.
-                if let m = curMeta, !(m.type == "series" && episodes.isEmpty && !hasNext) { core.finishedWatching(libraryId: m.libraryId) }
+                if let m = curMeta,
+                   EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
+                       usesSeriesLifecycle: m.usesSeriesLifecycle,
+                       currentEpisodeIndex: episodeIndex,
+                       episodeCount: episodes.count
+                   ) {
+                    core.finishedWatching(libraryId: m.libraryId)
+                }
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 exitPlayerFullScreenIfNeeded()  // item 6: land back in windowed browse, not stranded fullscreen
+                invalidateEpisodeWorkForExit()
                 onClose()
             }
         default: break
@@ -1562,15 +1765,20 @@ struct PlayerScreen: View {
         // (old-episode-url under new-episode-id) or lagging entry.
         guard pendingAdvance == nil else { return }
         guard let m = curMeta else { return }
-        let ref = recordDebridRef
+        let ref = curDebridRef
+        // A raw episode torrent has no native-debrid ref. Preserve the exact Stremio selector that made its
+        // loopback URL safe so a later Continue-Watching resume does not degrade into ambiguous hash-only /0.
+        let rawTorrent = curIsTorrent ? currentStream : nil
         LastStreamStore.record(libraryId: m.libraryId, entry: .init(
             videoId: m.videoId, url: (curURL ?? url).absoluteString, title: curTitle,
             season: m.season, episode: m.episode, name: m.name,
             poster: m.poster, type: m.type, qualityText: curHint ?? recordQualityText,
             bingeGroup: curBingeState ?? recordBingeGroup,
             torrent: curIsTorrent, savedAt: Date(), headers: curHeaders,
-            debridService: ref?.service.rawValue, infoHash: ref?.infoHash,
-            debridFileId: ref?.fileId, debridTorrentId: ref?.torrentId, fileIdx: ref?.fileIdx,
+            debridService: ref?.service.rawValue,
+            infoHash: curIsTorrent ? rawTorrent?.infoHash : ref?.infoHash,
+            debridFileId: ref?.fileId, debridTorrentId: ref?.torrentId,
+            fileIdx: curIsTorrent ? rawTorrent?.fileIdx : ref?.fileIdx,
             linkSavedAt: ref != nil ? Date() : nil),
             profileID: ProfileStore.shared.activeID)
     }
@@ -1614,7 +1822,10 @@ struct PlayerScreen: View {
     }
 
     /// (retry, stall recovery, source switch), mirroring tvOS `loadIntoPlayer`.
-    private func loadIntoPlayer(_ u: URL, headers h: [String: String]?, live: Bool) {
+    @discardableResult
+    private func loadIntoPlayer(_ u: URL, headers h: [String: String]?, live: Bool,
+                                reusing loadToken: PlayerLoadToken? = nil,
+                                contentHint: String? = nil) -> PlayerLoadToken? {
         // ENGINE-AWARE playback tuple. The AVFoundation engine must receive the RAW stream url + headers:
         // it attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey) and the DV remux server takes them
         // directly, while the StremioServer proxy rewrite (playback(for:)) turns the host into 127.0.0.1,
@@ -1635,8 +1846,29 @@ struct PlayerScreen: View {
         // Tell the libmpv lane whether this stream is Dolby Vision (same flag the engine router uses) so a DV
         // file that lands on libmpv drives the display into DV mode instead of HDR10 (tvOS effect; harmless on
         // iOS/macOS, which have no display-mode switch).
-        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(curHint ?? recordQualityText ?? "")
-        coordinator.player?.loadFile(p.url, headers: p.headers, live: live, audioSidecar: sidecar)
+        coordinator.player?.contentIsDolbyVision = StreamRanking.isDolbyVision(
+            contentHint ?? curHint ?? recordQualityText ?? ""
+        )
+        guard let player = coordinator.player else { return nil }
+        let candidateToken = player.loadFile(
+            p.url, headers: p.headers, live: live, audioSidecar: sidecar,
+            reusing: loadToken
+        )
+        let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
+        if pendingAdvance != nil {
+            pendingAdvance?.loadToken = issuedToken
+            pendingAdvance?.issued = issuedToken != nil
+            if issuedToken != nil {
+                pendingAdvance?.terminal = false
+                pendingAdvance?.deferredDuration = nil
+                pendingAdvance?.deferredTrackList = false
+                pendingAdvance?.deferredSeekable = nil
+                supersededAdvance = nil
+            }
+        } else if let issuedToken {
+            committedLoadToken = issuedToken
+        }
+        return issuedToken
     }
 
     /// A pre-playback failure (an endFileError before the first frame). For a torrent, the engine simply
@@ -1648,7 +1880,24 @@ struct PlayerScreen: View {
     /// reset the load state, and replay it in place. Returns true once it kicks off (the caller stops); false
     /// when there is no debrid provenance to re-resolve, so the caller falls through to the failover hop.
     private func retryResumeSameSource() -> Bool {
-        guard let ref = recordDebridRef, !ref.infoHash.isEmpty else { return false }
+        let retryRef = pendingAdvance?.debridRef ?? curDebridRef
+        let retryMeta = pendingAdvance?.meta ?? curMeta
+        guard let ref = retryRef, !ref.infoHash.isEmpty else { return false }
+        let episodeHint: DebridEpisode? = retryMeta.flatMap { meta -> DebridEpisode? in
+            guard let season = meta.season, season >= 0,
+                  let episode = meta.episode, episode > 0 else { return nil }
+            return DebridEpisode(season: season, episode: episode)
+        }
+        let retryRequiresSemanticSelection = isEpisodePlaybackContext
+        let hasExactProviderIDs = ref.service == .torBox && ref.torrentId != nil && ref.fileId != nil
+        // Raw fileIdx is not a provider-array selector. Missing semantic identity may try only TorBox's exact
+        // provider-ID path; the resolver closes before any re-add if that fast path fails.
+        if retryRequiresSemanticSelection, episodeHint == nil, !hasExactProviderIDs { return false }
+        resumeRetryGeneration &+= 1
+        let generation = resumeRetryGeneration
+        let targetVideoID = retryMeta?.videoId
+        let retryURL = curURL
+        let retrySource = currentStream
         resumeSourceReresolved = true
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
         autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
@@ -1656,15 +1905,45 @@ struct PlayerScreen: View {
         reconnectMsg = "Reloading your source…"; withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
-            if let fresh = try? await DebridCoordinator.shared.reresolve(
+            let fresh = try? await DebridCoordinator.shared.reresolve(
                 service: ref.service, infoHash: ref.infoHash,
-                torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx) {
+                torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
+                episode: episodeHint, requiresSemanticSelection: retryRequiresSemanticSelection)
+            let activeMeta = pendingAdvance?.meta ?? curMeta
+            let activeRef = pendingAdvance?.debridRef ?? curDebridRef
+            guard !Task.isCancelled,
+                  EpisodePlaybackIdentity.asyncMediaResultIsCurrent(
+                    capturedGeneration: generation, currentGeneration: resumeRetryGeneration,
+                    capturedVideoID: targetVideoID, currentVideoID: activeMeta?.videoId
+                  ),
+                  activeRef == ref, curURL == retryURL, currentStream == retrySource else { return }
+            if let fresh {
                 srcProbe("resume: re-selected the SAME source (fresh link) after the stored link expired")
                 reconnecting = false
                 curURL = fresh
+                let freshRef = DebridPlaybackRef(
+                    url: fresh, service: ref.service, infoHash: ref.infoHash,
+                    torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx
+                )
+                if pendingAdvance != nil {
+                    pendingAdvance?.url = fresh
+                    pendingAdvance?.debridRef = freshRef
+                } else {
+                    curDebridRef = freshRef
+                }
+                if let target = retryMeta, let source = currentStream {
+                    let succeeded = core.loadEnginePlayer(
+                        for: source, videoId: target.videoId,
+                        base: engineAddonBase(for: source), resolvedURL: fresh
+                    )
+                    enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
+                        requestedVideoID: target.videoId, bindingSucceeded: succeeded
+                    )
+                }
                 // resumeSeconds is the launch input (immutable) and the resume never started, so loadIntoPlayer
                 // applies the correct resume offset on its own.
-                loadIntoPlayer(fresh, headers: curHeaders, live: isLive)
+                let issuedToken = loadIntoPlayer(fresh, headers: curHeaders, live: isLive)
+                if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
                 startLoadTimeout()
             } else {
                 srcProbe("resume: same source unavailable on re-resolve -> hopping to another")
@@ -2057,6 +2336,10 @@ struct PlayerScreen: View {
     /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
     private func demoteAVPlayerToMPV(silent: Bool) {
         srcProbe("demoteAVPlayerToMPV (AVPlayer -> libmpv, SAME url, silent=\(silent), NOT a hop)")
+        resumeRetryGeneration &+= 1
+        let reissueEpisodeGeneration = episodeSwitchGeneration
+        let reissueMediaGeneration = resumeRetryGeneration
+        let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         // Fully tear down the outgoing AVFoundation engine BEFORE flipping `avEngineFailed` mounts the libmpv
         // surface, so the old AVPlayer decoder cannot straddle into the mpv mount (the player-teardown-straddle
@@ -2091,10 +2374,13 @@ struct PlayerScreen: View {
         if resume > 5 { nudgeResume(to: resume) }
         // The fresh mpv mount auto-loads the LAUNCH url; if this session had switched sources, re-point it at
         // the ACTIVE one once the controller exists.
-        if let cu = curURL, cu != url {
+        if let cu = curURL, cu != url || pendingAdvance?.issued == true {
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
-                guard avEngineFailed, !Task.isCancelled else { return }
+                guard avEngineFailed, !Task.isCancelled, curURL == cu,
+                      reissueEpisodeGeneration == episodeSwitchGeneration,
+                      reissueMediaGeneration == resumeRetryGeneration,
+                      reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
                 loadIntoPlayer(cu, headers: curHeaders, live: isLive)
             }
         }
@@ -2117,6 +2403,10 @@ struct PlayerScreen: View {
             close(); return
         }
         srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
+        resumeRetryGeneration &+= 1
+        let reissueEpisodeGeneration = episodeSwitchGeneration
+        let reissueMediaGeneration = resumeRetryGeneration
+        let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let resume = hasStartedPlaying ? currentTime : (resumeSeconds > 5 ? resumeSeconds : 0)
         // Whether the AVPlayer mount we're switching INTO will be the forward-only DV remux: it can't honor a
@@ -2154,17 +2444,23 @@ struct PlayerScreen: View {
             if resume > 5 { nudgeResume(to: resume) }
         }
         // The fresh mount auto-loads the LAUNCH url; re-point at the ACTIVE source if this session switched.
-        if let cu = curURL, cu != url {
+        if let cu = curURL, cu != url || pendingAdvance?.issued == true {
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
-                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+                guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled, curURL == cu,
+                      reissueEpisodeGeneration == episodeSwitchGeneration,
+                      reissueMediaGeneration == resumeRetryGeneration,
+                      reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
                 loadIntoPlayer(cu, headers: curHeaders, live: isLive)
             }
         }
         // Re-apply speed + subtitle sync once the new engine's controller is mounted (next render).
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(700))
-            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled else { return }
+            guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled,
+                  reissueEpisodeGeneration == episodeSwitchGeneration,
+                  reissueMediaGeneration == resumeRetryGeneration,
+                  reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
             if abs(speed - 1.0) > 0.01 { coordinator.player?.setSpeed(speed) }
             if subDelay != 0 { coordinator.player?.setSubDelay(subDelay) }
         }
@@ -2286,7 +2582,7 @@ struct PlayerScreen: View {
     private func nextUntriedStream() -> CoreStream? {
         let remaining = currentSourceGroups.map { group in
             CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
-                guard let u = s.playableURL else { return false }
+                guard let u = playableURL(for: s) else { return false }
                 return u != curURL && !exhaustedURLs.contains(u)
             })
         }
@@ -2325,9 +2621,12 @@ struct PlayerScreen: View {
         // key number: if the fresh streams haven't loaded yet this is ~0, so the hop returns false and the
         // "Tried N sources, none worked" overlay appears even though a working cached source exists in a row
         // the user CAN pick manually a moment later (once currentSourceGroups has populated).
-        let srcProbeCandidateCount = currentSourceGroups.reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count }
+        let srcProbeCandidateCount = currentSourceGroups.reduce(0) {
+            $0 + $1.streams.filter { playableURL(for: $0) != nil }.count
+        }
         let srcProbeUntried = nextUntriedStream()
-        guard sourceHops < maxSourceHops, let stream = srcProbeUntried, let newURL = stream.playableURL else {
+        guard sourceHops < maxSourceHops, let stream = srcProbeUntried,
+              let newURL = playableURL(for: stream) else {
             srcProbe("hopToNextSource(\(reason)) FALSE: hops=\(sourceHops)/\(maxSourceHops) untriedFound=\(srcProbeUntried != nil ? "Y" : "N") totalPlayableCandidates=\(srcProbeCandidateCount) exhausted=\(exhaustedURLs.count) -> caller shows error overlay")
             return false
         }
@@ -2342,16 +2641,63 @@ struct PlayerScreen: View {
         return true
     }
 
+    private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        currentPickWasExplicit = explicitPick
+        currentPlaybackIsResume = false
+        bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+        bufferedTime = 0
+        if userInitiated {
+            sourceHops = 0; exhaustedURLs = []
+            recoveryDeadline?.cancel(); recoveryDeadline = nil
+            stallRecoveries = 0
+        }
+        appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
+        userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
+        pendingSubtitleReapply = nil; suppressedResumeFloor = nil
+        hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
+        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
+        torrentWarmupsUsed = 0; torrentStatus = nil
+        subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
+        subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
+        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
+        langContributeDone = false
+        reconnectMsg = "Switching source…"
+    }
+
+    /// Target-only latches move at the same transaction boundary as the accepted player command. While an
+    /// episode is merely resolving, the outgoing episode remains physical and published, so resetting these
+    /// earlier would let a rejected replacement duplicate its watched/auto-add/progress side effects or undo
+    /// the viewer's Watch Credits choice.
+    private func resetRuntimeForIssuedEpisode() {
+        markedWatched = false
+        autoAddedThisPlayback = false
+        upNextSuppressed = false
+        appliedInitialResume = true
+        lastReported = -1
+    }
+
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
-    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool, explicitPick: Bool = false, resumeOverride: Double? = nil) {
+    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool,
+                              explicitPick: Bool = false, resumeOverride: Double? = nil,
+                              debridRef: DebridPlaybackRef? = nil, engineAlreadyBound: Bool = false,
+                              engineAddonBaseOverride: String? = nil) {
         guard newURL != curURL else {
+            if let pending = pendingAdvance, !pending.issued,
+               pending.meta.videoId != curMeta?.videoId {
+                pendingAdvance = nil
+                if restoreSupersededAdvance() { return }
+                switchingEpisode = false; reconnecting = false
+                loadErrorMsg = "That episode resolved to the current episode's file."
+                withAnimation { loadFailed = true }
+                return
+            }
             srcProbe("switchStream NO-OP (same url as current) userInitiated=\(userInitiated) explicit=\(explicitPick)")
             if userInitiated { close() }; return
         }
+        resumeRetryGeneration &+= 1
         srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
-        srcProbeLoadStart = Date()   // [src-probe] a source switch is a fresh attempt: re-anchor the elapsed clock
         if userInitiated { close() }
         // Cleanly destroy the torrent engine we're leaving BEFORE loading the next source, so engines never
         // pile up on the embedded server (the 0.2.48 RSS-balloon regression). Every in-place transition funnels
@@ -2360,50 +2706,75 @@ struct PlayerScreen: View {
         // episode (only the file index differs), and destroy-then-recreate would cold-start warm-up at 0 peers,
         // so a same-hash episode switch keeps the live engine. currentTorrentHash reads curURL, so it must be
         // evaluated before curURL is overwritten just below. No-op for a direct/debrid source (no hash).
-        if let oldHash = currentTorrentHash, oldHash != stream.infoHash?.lowercased() {
-            closeTorrent(hash: oldHash)
-        }
+        let oldHash = currentTorrentHash
         let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
-        curURL = newURL
+        let priorPending = pendingAdvance
         // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
         // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
         // pointed at the live URL (and issued - this loads synchronously below) so the first-frame commit
         // and a foreground reconcile both act on the file actually in the player. Mirrors TVPlayerView.
-        if pendingAdvance != nil { pendingAdvance?.url = newURL; pendingAdvance?.issued = true }
-        curHeaders = stream.requestHeaders
-        curIsTorrent = stream.isTorrent
-        curHint = StreamRanking.signature(stream)   // keep the "playing now" signature in step for the DV gate + engine picker
-        // `explicitPick` (a real source-row / quality tap) is DISTINCT from `userInitiated` (which resets the
-        // failover budget for any fresh load, including episode auto-advance). Only a real source pick honors
-        // the same source on a start-timeout; an auto-advanced episode or an auto-hop stays non-explicit so it
-        // still fails over automatically (an unattended binge must not dead-end on one slow/dead auto-picked source).
-        currentPickWasExplicit = explicitPick
-        currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
-        bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
-        bufferedTime = 0   // fresh source: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
-        if userInitiated {
-            sourceHops = 0; exhaustedURLs = []
-            recoveryDeadline?.cancel(); recoveryDeadline = nil
-            stallRecoveries = 0
+        if pendingAdvance != nil {
+            pendingAdvance?.url = newURL
+            pendingAdvance?.debridRef = debridRef
+            pendingAdvance?.issued = false
+            pendingAdvance?.loadToken = nil
         }
-        if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock (buffered band already cleared above)
-        // Re-key trickplay for the new source/episode and reset the local-capture throttle: otherwise the
-        // new stream's capture stays gated by the PREVIOUS stream's lastLocalTrickplayCapture, so episodes
-        // 2..N of a session captured nothing. configureCommunity is idempotent and re-keys on the new title.
+        let nextHeaders = stream.requestHeaders
+        let nextIsTorrent = debridRef == nil && stream.isTorrent
+        let nextHint = StreamRanking.signature(stream)
+        let nextLive = recordMeta.map { LiveTypes.contains($0.type) } == true && !nextIsTorrent
+        let issuedToken = loadIntoPlayer(
+            newURL, headers: nextHeaders, live: nextLive, contentHint: nextHint
+        )
+        if pendingAdvance != nil {
+            guard let issuedToken else {
+                if let priorPending, priorPending.issued, !priorPending.terminal,
+                   priorPending.loadToken == coordinator.player?.activeLoadToken {
+                    pendingAdvance = priorPending
+                    switchingEpisode = true; reconnecting = true
+                    return
+                }
+                pendingAdvance = nil
+                if restoreSupersededAdvance() { return }
+                switchingEpisode = false
+                loadErrorMsg = "The player could not issue this episode."
+                withAnimation { loadFailed = true }
+                return
+            }
+            pendingAdvance?.loadToken = issuedToken
+            pendingAdvance?.issued = true
+        } else if issuedToken == nil {
+            return
+        }
+        srcProbeLoadStart = Date()
+        if priorPending?.issued == false {
+            resetRuntimeForIssuedEpisode()
+        }
+        resetRuntimeForIssuedSourceSwitch(
+            userInitiated: userInitiated, explicitPick: explicitPick
+        )
+        curURL = newURL
+        curHeaders = nextHeaders
+        curSourceStream = stream
+        curIsTorrent = nextIsTorrent
+        if pendingAdvance == nil { curDebridRef = debridRef }
+        curHint = nextHint
+        if let oldHash, oldHash != stream.infoHash?.lowercased() { closeTorrent(hash: oldHash) }
+        if resumeOverride != nil { currentTime = 0; duration = 0 }
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         configureCommunityTrickplayProvisional()
-        appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false   // re-apply saved volume to the new engine
-        pendingSubtitleReapply = nil; suppressedResumeFloor = nil   // a real source change: drop any pending switch-scoped subtitle/resume state
-        hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
-        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
-        torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
-        // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
-        // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
-        subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
-        addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false; langContributeDone = false
-        reconnectMsg = "Switching source…"
-        loadIntoPlayer(newURL, headers: curHeaders, live: isLive)
+        if !engineAlreadyBound, isEpisodePlaybackContext,
+           let meta = pendingAdvance?.meta ?? curMeta {
+            let succeeded = core.loadEnginePlayer(
+                for: stream, videoId: meta.videoId,
+                base: engineAddonBaseOverride ?? engineAddonBase(for: stream),
+                resolvedURL: debridRef?.url
+            )
+            enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
+                requestedVideoID: meta.videoId, bindingSucceeded: succeeded
+            )
+        }
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
     }
@@ -2538,58 +2909,184 @@ struct PlayerScreen: View {
         Task { await warm(nextID) }
     }
 
+    private func invalidateEpisodeWorkForExit() {
+        persistenceBlockedForExit = hasUncommittedIssuedMedia
+        playbackExited = true
+        episodeSwitchGeneration &+= 1
+        episodeResolveGeneration = nil
+        resumeRetryGeneration &+= 1
+        autoRetryTask?.cancel()
+        pendingAdvance = nil
+        supersededAdvance = nil
+        switchingEpisode = false
+        coordinator.player?.invalidateLoadToken()
+    }
+
+    private func currentEpisodeSourceSnapshot() -> EpisodeSourceSnapshot {
+        let stream = currentStream
+        return EpisodeSourceSnapshot(
+            url: curURL, headers: curHeaders, stream: stream, debridRef: curDebridRef,
+            hint: curHint, binge: curBingeState, isTorrent: curIsTorrent,
+            engineVideoID: enginePlayerVideoId,
+            engineAddonBase: stream.flatMap { engineAddonBase(for: $0) }
+        )
+    }
+
+    private func restoreEpisodeSourceSnapshot(_ source: EpisodeSourceSnapshot,
+                                              for pending: PendingEpisodeAdvance) {
+        curURL = source.url
+        curHeaders = source.headers
+        curSourceStream = source.stream
+        curDebridRef = source.debridRef
+        curHint = source.hint
+        curBingeState = source.binge
+        curIsTorrent = source.isTorrent
+        if let stream = source.stream {
+            let succeeded = core.loadEnginePlayer(
+                for: stream, videoId: pending.meta.videoId,
+                base: source.engineAddonBase, resolvedURL: source.debridRef?.url
+            )
+            enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
+                requestedVideoID: pending.meta.videoId, bindingSucceeded: succeeded
+            )
+        } else {
+            enginePlayerVideoId = source.engineVideoID
+        }
+    }
+
+    @discardableResult
+    private func restoreSupersededAdvance() -> Bool {
+        guard let superseded = supersededAdvance,
+              !superseded.pending.terminal,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: superseded.pending.loadToken,
+                activeToken: coordinator.player?.activeLoadToken
+              ) else {
+            supersededAdvance = nil
+            return false
+        }
+        pendingAdvance = superseded.pending
+        restoreEpisodeSourceSnapshot(superseded.source, for: superseded.pending)
+        supersededAdvance = nil
+        switchingEpisode = true
+        reconnecting = true
+        buffering = true
+        return true
+    }
+
     /// Switch to another episode in place: flush the current position, resolve the episode through the
     /// caller, then hot-swap the source and record against the new episode. No cover teardown — the
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) {
-        guard let loadEpisode, !switchingEpisode else { return }
+        guard let loadEpisode, !playbackExited else { return }
         switchingEpisode = true
+        episodeSwitchGeneration &+= 1
+        let episodeGeneration = episodeSwitchGeneration
+        episodeResolveGeneration = episodeGeneration
+        resumeRetryGeneration &+= 1
+        let mediaGeneration = resumeRetryGeneration
+        autoRetryTask?.cancel()
         if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
         Task {
             let resolved = await loadEpisode(videoId)
-            switchingEpisode = false
+            let resultIsCurrent = !Task.isCancelled && !playbackExited
+                && episodeGeneration == episodeSwitchGeneration
+                && mediaGeneration == resumeRetryGeneration
+            guard resultIsCurrent else {
+                // A source change can retire this result without starting a newer episode generation. Clear
+                // only this generation's switch state; a newer episode request owns the state when generations
+                // differ and must never be reset by this stale completion.
+                if !playbackExited, episodeGeneration == episodeSwitchGeneration {
+                    episodeResolveGeneration = nil
+                    let healthyPending = pendingAdvance != nil && pendingAdvance?.terminal != true
+                    switchingEpisode = healthyPending
+                    reconnecting = healthyPending
+                }
+                return
+            }
             guard let es = resolved else {
-                reconnecting = false; buffering = false
+                episodeResolveGeneration = nil
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
+                if pendingAdvance?.terminal == true {
+                    switchingEpisode = false
+                    reconnecting = false; buffering = false
+                    loadErrorMsg = "The pending episode ended before it could start."
+                    withAnimation { loadFailed = true }
+                    return
+                }
+                if pendingAdvance != nil {
+                    // A previously issued replacement is still the only media request in flight. Keep its
+                    // exact pending identity and token until its own first frame commits, so a failed newer
+                    // selection cannot strand E2 metadata beside an E3 URL.
+                    switchingEpisode = true
+                    reconnecting = true
+                    return
+                }
+                switchingEpisode = false
+                reconnecting = false; buffering = false
                 if autoAdvance {
                     if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the finished episode's engine (no-op for direct/debrid)
                     exitPlayerFullScreenIfNeeded()   // item 6: land back in windowed browse, not stranded fullscreen
+                    invalidateEpisodeWorkForExit()
                     onClose()            // nothing playable on auto-advance: leave, don't hang on a spinner
                 }
                 else { loadErrorMsg = "Couldn't load that episode"; withAnimation { loadFailed = true } }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
                 return
             }
+            guard EpisodePlaybackIdentity.canIssueEpisodeSwitch(
+                currentVideoID: curMeta?.videoId, targetVideoID: es.meta.videoId,
+                currentURL: curURL, targetURL: es.url
+            ) else {
+                episodeResolveGeneration = nil
+                if pendingAdvance?.terminal == true {
+                    switchingEpisode = false
+                    reconnecting = false; buffering = false
+                    loadErrorMsg = "The pending episode ended before it could start."
+                    withAnimation { loadFailed = true }
+                    return
+                }
+                if pendingAdvance != nil {
+                    switchingEpisode = true
+                    reconnecting = true
+                    return
+                }
+                switchingEpisode = false
+                reconnecting = false; buffering = false
+                if es.meta.videoId != curMeta?.videoId {
+                    loadErrorMsg = "That episode resolved to the current episode's file."
+                    withAnimation { loadFailed = true }
+                }
+                return
+            }
+            episodeResolveGeneration = nil
             // PUBLISH-AT-FIRST-FRAME (binge-desync fix): do NOT advance curMetaState/curTitleState here.
             // The old publish-on-resolve put the label, the episode-list checkmark, and every attribution
             // read (incl. recordLastStream) on the NEW episode before its file rendered a frame, so an
             // advance interrupted across a background boundary stranded them on media the player never
             // played. Park the identity; the incoming file's first frame (timePos handler) publishes it.
-            // Degenerate same-URL "advance" (the resolved target IS the loaded, playing file): there is no
-            // new first frame coming (switchStream below will no-op on the equal URL), so publish now -
-            // identity and media trivially agree.
-            if es.url == curURL {
-                curMetaState = es.meta
-                curTitleState = es.title
-                curBingeState = es.stream.behaviorHints?.bingeGroup
-            } else {
-                pendingAdvance = PendingEpisodeAdvance(meta: es.meta, title: es.title,
-                                                       binge: es.stream.behaviorHints?.bingeGroup,
-                                                       url: es.url, issued: true)
+            if let pending = pendingAdvance, pending.issued {
+                supersededAdvance = SupersededEpisodeAdvance(
+                    pending: pending, source: currentEpisodeSourceSnapshot()
+                )
             }
-            markedWatched = false
-            autoAddedThisPlayback = false   // re-arm the 60s auto-add/watch-ping for the new episode (idempotent per show)
-            upNextSuppressed = false   // re-arm the Up Next band for the new episode
-            appliedInitialResume = true   // drive resume via nudgeResume below; skip the launch-offset path
-            lastReported = -1
-            // External sync (Trakt/SIMKL): a genuine episode advance is a new playback session, so re-mint
-            // the token and open the new episode's scrobble START here (the same-title recovery reloads that
-            // also flip hasStartedPlaying keep the old token and never reach this block). The first-frame
-            // hook re-fires with the same key + token and is deduped by the coordinator's start latch.
-            playbackSessionID = UUID().uuidString
-            ScrobbleCoordinator.shared.playbackStarted(es.meta, position: es.resume, duration: 0, sessionToken: playbackSessionID)
-            switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume)
+            pendingAdvance = PendingEpisodeAdvance(meta: es.meta, title: es.title,
+                                                   binge: es.stream.behaviorHints?.bingeGroup,
+                                                   generation: episodeGeneration,
+                                                   debridRef: es.debridRef,
+                                                   url: es.url, issued: false)
+            // External sync starts only after the target's first frame commits its identity. The commit point
+            // re-mints the session token, and the normal first-frame hook opens the new episode's scrobble.
+            // The player command is the transaction boundary. Source state and engine attribution move only
+            // after that command returns an exact active token inside switchStream.
+            guard !playbackExited,
+                  episodeGeneration == episodeSwitchGeneration,
+                  mediaGeneration == resumeRetryGeneration,
+                  pendingAdvance?.meta.videoId == es.meta.videoId else { return }
+            switchStream(to: es.stream, url: es.url, userInitiated: true, resumeOverride: es.resume,
+                         debridRef: es.debridRef, engineAlreadyBound: false,
+                         engineAddonBaseOverride: es.engineAddonBase)
         }
     }
 
@@ -2599,12 +3096,23 @@ struct PlayerScreen: View {
     /// scrobble attribution, and the LastStreamStore record that follows in the same first-frame block all
     /// name the episode whose file just rendered. No-op outside an advance, so launch playback, source
     /// switches, and stall reloads are untouched.
-    private func commitPendingAdvanceOnFirstFrame() {
-        guard let pending = pendingAdvance else { return }
+    private func commitPendingAdvanceOnFirstFrame(loadToken: PlayerLoadToken) {
+        guard let pending = pendingAdvance,
+              PlayerLoadProvenanceState.canCommit(
+                callbackToken: loadToken,
+                activeToken: coordinator.player?.activeLoadToken,
+                pendingToken: pending.loadToken
+              ) else { return }
         pendingAdvance = nil
+        supersededAdvance = nil
+        committedLoadToken = loadToken
+        uncommittedIdentityBlocked = false
         curMetaState = pending.meta
         curTitleState = pending.title
         curBingeState = pending.binge
+        curDebridRef = pending.debridRef
+        switchingEpisode = episodeResolveGeneration != nil
+        playbackSessionID = UUID().uuidString
         // Code-level invariant (the extractable check; the app has no unit-test bundle): at commit, the
         // published episode IS the episode of the file that just first-framed - pending.url is kept in
         // step with curURL by goToEpisode and switchStream. Debug builds trap; user builds log.
@@ -2628,7 +3136,8 @@ struct PlayerScreen: View {
               let u = pending.url else { return }
         srcProbe("foreground reconcile: re-issuing interrupted advance load for \(pending.meta.videoId)")
         buffering = true; reconnecting = true; reconnectMsg = "Loading episode…"
-        loadIntoPlayer(u, headers: curHeaders, live: isLive)
+        guard let loadToken = loadIntoPlayer(u, headers: curHeaders, live: isLive) else { return }
+        pendingAdvance?.loadToken = loadToken
         startLoadTimeout()
     }
 
@@ -2779,7 +3288,11 @@ struct PlayerScreen: View {
                     // Direct onSeek (a restart-to-0 must bypass reportSeek's resume floor), so the
                     // account write rides along explicitly, keyed on the CURRENT episode like every
                     // other save (the hosts no longer write the account from the closures).
-                    if duration > 0 { onSeek(0, duration); lastReported = 0; saveAccountProgress(0) }
+                    if duration > 0 {
+                        if engineWritesOpen { onSeek(0, duration) }
+                        lastReported = 0
+                        saveAccountProgress(0)
+                    }
                     if isPaused { coordinator.player?.togglePause() }   // restart implies resume
                     scheduleHide()
                 }
@@ -3642,7 +4155,10 @@ struct PlayerScreen: View {
         if let sub = pick {
             autoAddonSubTried = true
             subtitleLoadingURL = sub.url
+            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            let subtitleVideoID = curMeta?.videoId
             coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
                 subtitleLoadingURL = nil
                 if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                 refreshSoon()
@@ -3683,6 +4199,13 @@ struct PlayerScreen: View {
         return SubtitleReleaseFingerprint.contentKey(imdbId: m.libraryId, season: m.season, episode: m.episode)
     }
 
+    /// A subtitle request may finish after an episode load or same-episode reload replaced the player item.
+    /// Require both its opaque load token and its content identity before publishing completion state.
+    private func permitsSubtitlePublication(loadToken: PlayerLoadToken?, videoID: String?) -> Bool {
+        guard let loadToken, coordinator.player?.activeLoadToken == loadToken else { return false }
+        return curMeta?.videoId == videoID
+    }
+
     /// The release name for the fingerprint: the playing stream's display name / release text.
     private var communityReleaseName: String? {
         if let s = currentStream { return sourceLabel(s) }
@@ -3712,15 +4235,24 @@ struct PlayerScreen: View {
         let fp = subFingerprint
         // Re-fetch when the content key changes OR when we now have a real fingerprint we didn't have before.
         let key = "\(contentKey)#\(fp ?? "")"
-        guard key != pooledSubsKey else { return }
-        pooledSubsKey = key
+        guard let requestID = subtitlePoolRequests.beginFetch(dedupeKey: key) else { return }
         Task { @MainActor in
             // SERVE moat gate: the pooled-subtitle READ is login-only on the worker (no VortX sign-in -> empty
             // list, the pool "shows nothing" bug). Thread the real account flag like SourceIndexClient does, so a
             // signed-in device stamps X-VX-Moat and the worker serves the pool.
+            let signedIn = VortXSyncManager.shared.isSignedIn
+            let publicationFence = SubtitlePoolClient.PublicationFence(contentKey: contentKey)
             let result = await SubtitlePoolClient.fetchPooled(contentKey: contentKey, lang: nil, fingerprint: fp,
-                                                              isSignedIn: VortXSyncManager.shared.isSignedIn)
-            guard communityContentKey == contentKey else { return }   // title changed mid-fetch
+                                                              isSignedIn: signedIn)
+            let mayPublish = publicationFence.permits(
+                currentContentKey: communityContentKey,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
+            guard mayPublish else {
+                subtitlePoolRequests.finishFetch(requestID, published: false)
+                return
+            }
+            guard subtitlePoolRequests.finishFetch(requestID, published: true) else { return }
             pooledSubs = result.subs
             VXProbe.log("subs", "community subtitles listed count=\(result.subs.count)")
             // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
@@ -3746,21 +4278,58 @@ struct PlayerScreen: View {
     /// `auto`: a background language-chain pick (autoSelectAddonSubtitleIfNeeded tier 2), which suppresses the
     /// subtitleLoadFailed alert on failure, matching the add-on auto path and tvOS (the user did not ask).
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
-        guard subtitleLoadingURL == nil else { return }
+        guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
+              MoatConsent.contributeAndConsume,
+              VortXSyncManager.shared.isSignedIn else { return }
         let marker = sub.url.absoluteString
+        let downloadID = subtitlePoolRequests.beginDownload()
         subtitleLoadingURL = marker
         VXProbe.log("subs", "community subtitle selected lang=\(sub.lang)")
         if panel == .subtitles { panelRows = rows(for: .subtitles) }
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
-            guard let localURL = await SubtitlePoolClient.download(sub, isSignedIn: VortXSyncManager.shared.isSignedIn) else {
-                subtitleLoadingURL = nil
-                if !auto { subtitleLoadFailed = true }
-                if panel == .subtitles { panelRows = rows(for: .subtitles) }
+            let signedIn = VortXSyncManager.shared.isSignedIn
+            let publicationFence = SubtitlePoolClient.PublicationFence(contentKey: sub.contentKey)
+            let downloaded = await SubtitlePoolClient.download(sub, isSignedIn: signedIn)
+            let mayPublishDownload = publicationFence.permits(
+                currentContentKey: communityContentKey,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
+            guard mayPublishDownload else {
+                if subtitlePoolRequests.finishDownload(downloadID) {
+                    subtitleLoadingURL = nil
+                    if panel == .subtitles { panelRows = rows(for: .subtitles) }
+                }
                 return
             }
+            guard let localURL = downloaded else {
+                if subtitlePoolRequests.finishDownload(downloadID) {
+                    subtitleLoadingURL = nil
+                    if !auto { subtitleLoadFailed = true }
+                    if panel == .subtitles { panelRows = rows(for: .subtitles) }
+                }
+                return
+            }
+            guard let externalID = subtitlePoolRequests.beginExternal(after: downloadID) else { return }
             let title = pooledLabel(sub)
+            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            let subtitleVideoID = curMeta?.videoId
             coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
+                let mayPublishExternal = publicationFence.permits(
+                    currentContentKey: communityContentKey,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                )
+                let loadStillCurrent = permitsSubtitlePublication(
+                    loadToken: subtitleLoadToken, videoID: subtitleVideoID
+                )
+                guard mayPublishExternal, loadStillCurrent else {
+                    if subtitlePoolRequests.finishExternal(externalID) {
+                        subtitleLoadingURL = nil
+                        if panel == .subtitles { panelRows = rows(for: .subtitles) }
+                    }
+                    return
+                }
+                guard subtitlePoolRequests.finishExternal(externalID) else { return }
                 subtitleLoadingURL = nil
                 VXProbe.log("subs", "community subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
                 if ok { addedPooledIDs.insert(sub.id) } else if !auto { subtitleLoadFailed = true }
@@ -4035,7 +4604,12 @@ struct PlayerScreen: View {
                         subtitleLoadingURL = sub.url
                         VXProbe.log("subs", "add-on subtitle selected lang=\(sub.lang) src=\(sub.addonName)")
                         if panel == .subtitles { panelRows = rows(for: .subtitles) }   // reflect Loading… in place
+                        let subtitleLoadToken = coordinator.player?.activeLoadToken
+                        let subtitleVideoID = curMeta?.videoId
                         coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                            guard permitsSubtitlePublication(
+                                loadToken: subtitleLoadToken, videoID: subtitleVideoID
+                            ) else { return }
                             subtitleLoadingURL = nil
                             VXProbe.log("subs", "add-on subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
                             if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) } else { subtitleLoadFailed = true }
@@ -4147,8 +4721,10 @@ struct PlayerScreen: View {
             if opts.isEmpty { return [Row(label: "No alternate qualities", isHeader: true)] }
             return opts.map { opt in
                 Row(label: opt.label, detail: StreamRanking.sizeText(opt.stream) ?? "",
-                    selected: opt.stream.playableURL == curURL) {
-                    if let url = opt.stream.playableURL { switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true) }
+                    selected: playableURL(for: opt.stream) == curURL) {
+                    if let url = playableURL(for: opt.stream) {
+                        switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true)
+                    }
                 }
             }
         case .sources:
@@ -4166,7 +4742,9 @@ struct PlayerScreen: View {
                     rows.append(Row(label: "File", detail: file, wraps: true))   // long filenames wrap, never truncate
                 }
                 if let size = StreamRanking.sizeText(s) { rows.append(Row(label: "Size", detail: size)) }
-                if let addon = currentSourceGroups.first(where: { $0.streams.contains { $0.playableURL == curURL } })?.addon {
+                if let addon = currentSourceGroups.first(where: {
+                    $0.streams.contains { playableURL(for: $0) == curURL }
+                })?.addon {
                     rows.append(Row(label: "Add-on", detail: addon))
                 }
             }
@@ -4301,23 +4879,40 @@ struct PlayerScreen: View {
     /// to the bare resident groups for movies / before the per-id set has populated. This is what makes the
     /// in-player Sources button reliably appear on a Continue-Watching resume.
     private var currentSourceGroups: [CoreStreamSourceGroup] {
-        if let id = curMeta?.videoId {
+        let target = pendingAdvance?.meta ?? curMeta
+        if let meta = target, isEpisodePlaybackContext {
+            return core.streamGroups(forStreamId: meta.videoId)
+        }
+        if let id = target?.videoId {
             let scoped = core.streamGroups(forStreamId: id)
             if !scoped.isEmpty { return scoped }
         }
         return core.streamGroups()
     }
 
+    private func playableURL(for stream: CoreStream) -> URL? {
+        EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+            isUsenet: stream.isUsenet, resolvedURL: nil,
+            fallbackURL: stream.playableURL(isEpisode: isEpisodePlaybackContext)
+        )
+    }
+
+    private func engineAddonBase(for stream: CoreStream) -> String? {
+        guard let id = currentSourceGroups.first(where: { $0.streams.contains(stream) })?.id,
+              URL(string: id)?.scheme != nil else { return nil }
+        return id
+    }
+
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
-        currentSourceGroups.reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
+        currentSourceGroups.reduce(0) { $0 + $1.streams.filter { playableURL(for: $0) != nil }.count } > 1
     }
 
     /// The stream currently on screen: the loaded source whose playable URL matches what mpv is playing.
     /// Drives the Playback Info panel's source-file rows (release / filename / size). Nil for a pasted
     /// direct link with no matching loaded source.
     private var currentStream: CoreStream? {
-        currentSourceGroups.flatMap(\.streams).first { $0.playableURL == curURL }
+        curSourceStream ?? currentSourceGroups.flatMap(\.streams).first { playableURL(for: $0) == curURL }
     }
 
     /// A magnet link for the current torrent, rebuilt from its info hash plus the trackers the add-on
@@ -4344,7 +4939,7 @@ struct PlayerScreen: View {
         var out: [String] = []
         for group in currentSourceGroups {
             for stream in group.streams {
-                guard let link = stream.playableURL?.absoluteString else { continue }
+                guard let link = playableURL(for: stream)?.absoluteString else { continue }
                 if seen.insert(link).inserted { out.append(link) }
             }
         }
@@ -4373,7 +4968,7 @@ struct PlayerScreen: View {
         let groups = currentSourceGroups
         if groups.isEmpty { return [Row(label: "Loading sources…", isHeader: true)] }
         for group in groups {
-            let best = group.streams.filter { $0.playableURL != nil }
+            let best = group.streams.filter { playableURL(for: $0) != nil }
                 .map { (stream: $0, rank: StreamRanking.score($0)) }
                 .sorted { $0.rank > $1.rank }
                 .prefix(perAddon)
@@ -4381,7 +4976,7 @@ struct PlayerScreen: View {
             guard !best.isEmpty, count < maxInPlayerSources else { continue }
             rs.append(Row(label: group.addon, isHeader: true))
             for stream in best {
-                guard count < maxInPlayerSources, let sURL = stream.playableURL else { continue }
+                guard count < maxInPlayerSources, let sURL = playableURL(for: stream) else { continue }
                 count += 1
                 let info = StreamRanking.sourceDetail(stream)
                 let name = String(sourceLabel(stream).prefix(40))
@@ -4455,6 +5050,7 @@ struct PlayerScreen: View {
     /// the cover down — so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        invalidateEpisodeWorkForExit()
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         #if os(iOS) || os(macOS)
@@ -4466,12 +5062,24 @@ struct PlayerScreen: View {
             // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
             // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
-            if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
+            if !persistenceBlockedForExit, let m = curMeta,
+               currentTime / duration >= 0.9,
+               EpisodePlaybackIdentity.canRewindWholeTitleAtTerminal(
+                   usesSeriesLifecycle: m.usesSeriesLifecycle,
+                   currentEpisodeIndex: episodeIndex,
+                   episodeCount: episodes.count
+               ) {
+                core.finishedWatching(libraryId: m.libraryId)
+            }
         }
         // External sync (Trakt/SIMKL): scrobble STOP on a genuine user exit. Additive + fail-soft + gated +
         // once-latched inside the coordinator; a no-op with empty creds. Near the end this records the watch
         // (deduped against the 90%/EOF record); mid-title it saves a resume/pause point (live scrobble only).
-        if !effectivelyLive, let m = curMeta { ScrobbleCoordinator.shared.playbackStopped(m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration) }
+        if !persistenceBlockedForExit, !effectivelyLive, let m = curMeta {
+            ScrobbleCoordinator.shared.playbackStopped(
+                m, position: max(currentTime, suppressedResumeFloor ?? 0), duration: duration
+            )
+        }
         // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
         // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
         // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.
@@ -4652,11 +5260,12 @@ struct PlayerScreen: View {
     /// exit flush would overwrite the account resume with the restarted-low position. The floor clears once
     /// the playhead passes it (the viewer caught up) or on the next source/episode load.
     private func reportProgress(_ position: Double) {
+        guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         if let floor = suppressedResumeFloor {
             if position < floor { return }
             suppressedResumeFloor = nil
         }
-        onProgress(position, duration)
+        if engineWritesOpen { onProgress(position, duration) }
         saveAccountProgress(position)
     }
 
@@ -4666,14 +5275,25 @@ struct PlayerScreen: View {
     /// overwrite the real account resume until the playhead has actually passed the floor. The floor clears
     /// once passed. Backward / non-suppressed seeks pass straight through.
     private func reportSeek(_ target: Double) {
+        guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard duration > 0 else { return }
         if let floor = suppressedResumeFloor {
             if target < floor { return }
             suppressedResumeFloor = nil
         }
-        onSeek(target, duration)
+        if engineWritesOpen { onSeek(target, duration) }
         lastReported = target
         saveAccountProgress(target)
+    }
+
+    /// Movies keep their historical engine-write behavior. Series writes require a confirmed explicit load
+    /// whose video id matches the episode currently published by the first-frame identity commit.
+    private var engineWritesOpen: Bool {
+        guard isEpisodePlaybackContext else { return true }
+        return EpisodePlaybackIdentity.engineWritesAllowed(
+            boundVideoID: enginePlayerVideoId,
+            displayedVideoID: curMeta?.videoId
+        )
     }
 
     /// ACCOUNT-ATTRIBUTION FIX (binge advance): the account's Continue-Watching write happens HERE,
@@ -4687,6 +5307,7 @@ struct PlayerScreen: View {
     /// directly), so WHEN a save fires is unchanged; only WHICH episode it names moved. No meta
     /// (trailer / paste-a-link / web shell) is a no-op, exactly like the old host-side meta guards.
     private func saveAccountProgress(_ position: Double) {
+        guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard let m = curMeta else { return }
         let dur = duration
         Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
@@ -4720,7 +5341,10 @@ struct PlayerScreen: View {
                      ?? subtitleTracks.first { $0.lang.lowercased() == l }
             coordinator.player?.setSubtitleTrack(match?.id ?? -1)
         case let .external(urlStr, title, lang):
+            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            let subtitleVideoID = curMeta?.videoId
             coordinator.player?.addExternalSubtitle(url: urlStr, title: title, lang: lang) { ok in
+                guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
                 if ok { addedSubURLs.insert(urlStr) }
             }
         case let .pooled(id):

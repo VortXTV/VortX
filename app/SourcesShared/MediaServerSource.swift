@@ -16,6 +16,8 @@ final class MediaServerSource: ObservableObject {
     /// rebuild signature.
     @Published private(set) var groups: [CoreStreamSourceGroup] = [] { didSet { epoch &+= 1 } }
     private(set) var epoch = 0
+    /// Canonical title/episode identity for the currently published direct-play groups.
+    private(set) var publishedContentID: String?
 
     /// The title currently shown (its fetch key). Switching titles resets `groups`.
     private var shownKey: String?
@@ -28,15 +30,22 @@ final class MediaServerSource: ObservableObject {
     /// Resolve the current title on the connected servers, if any. Fail-soft and session-cached. Safe on every
     /// meta change / `.onAppear`. `imdb` is the detail id (imdb `tt...` or tmdb `tmdb:...`); `title`/`year` are
     /// the name+year fallback for GUID-less libraries; `season`/`episode` scope a series to one episode.
-    func refresh(imdb: String?, season: Int? = nil, episode: Int? = nil, title: String? = nil, year: Int? = nil) {
+    func refresh(imdb: String?, season: Int? = nil, episode: Int? = nil, title: String? = nil,
+                 year: Int? = nil, publicationTarget: String? = nil) {
         // DORMANCY GATE (synchronous, before any resolver work): no server -> no network, ever.
-        guard !MediaServerStore.shared.servers.isEmpty else { if !groups.isEmpty { groups = [] }; return }
+        guard !MediaServerStore.shared.servers.isEmpty else { clearResults(); return }
         let idKey = imdb ?? ""
-        guard !idKey.isEmpty || !(title ?? "").isEmpty else { if !groups.isEmpty { groups = [] }; return }
+        guard !idKey.isEmpty || !(title ?? "").isEmpty else { clearResults(); return }
 
-        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)"
+        let target = publicationTarget ?? {
+            if let season, let episode { return "\(idKey):\(season):\(episode)" }
+            return idKey
+        }()
+        guard !target.isEmpty else { clearResults(); return }
+        let fetchKey = "\(idKey)|\(season ?? -1)|\(episode ?? -1)|\(title ?? "")|\(year ?? -1)|\(target)"
         if fetchKey != shownKey {
             shownKey = fetchKey
+            publishedContentID = target
             groups = cache[fetchKey] ?? []
         }
         if cache[fetchKey] != nil { return }          // cached: already published above
@@ -58,6 +67,7 @@ final class MediaServerSource: ObservableObject {
     /// across titles). A title that cannot resolve (no server / no id) must see it EMPTY.
     func clearResults() {
         shownKey = nil
+        publishedContentID = nil
         if !groups.isEmpty { groups = [] }
     }
 

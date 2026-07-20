@@ -81,8 +81,14 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         return self
     }
 
-    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
+    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?, PlayerLoadToken) -> Void) -> Self {
         coordinator.onPropertyChange = handler
+        return self
+    }
+
+    /// Compatibility form for non-transactional surfaces such as muted hero trailers.
+    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
+        coordinator.onPropertyChange = { engine, name, data, _ in handler(engine, name, data) }
         return self
     }
 
@@ -110,17 +116,20 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         var loops = false
         /// Ambient hero clip only (#44): crop-to-fill so the clip fills the whole hero band, never letterboxed.
         var forceFill = false
-        var onPropertyChange: ((any PlayerEngine, String, Any?) -> Void)?
+        var onPropertyChange: ((any PlayerEngine, String, Any?, PlayerLoadToken) -> Void)?
         var onTap: (() -> Void)?
 
         func play(_ url: URL) {
             player?.loadFile(url, headers: playHeaders, live: playLive)
         }
 
-        func propertyChange(propertyName: String, data: Any?) {
-            guard let player else { return }
+        func propertyChange(propertyName: String, data: Any?, loadToken: PlayerLoadToken) {
+            guard let player,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken, activeToken: player.activeLoadToken
+                  ) else { return }
 
-            self.onPropertyChange?(player, propertyName, data)
+            self.onPropertyChange?(player, propertyName, data, loadToken)
         }
     }
 }

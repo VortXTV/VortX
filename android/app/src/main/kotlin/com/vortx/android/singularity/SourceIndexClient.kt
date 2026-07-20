@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -25,51 +26,56 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicInteger
 
+private val CANONICAL_INFOHASH = Regex("""^[0-9a-f]{40}$""")
+private val CANONICAL_CONTENT_ID = Regex("""^(tt[0-9]{6,10}|tmdb:[0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$""")
+
 /// Client for VortX's community SOURCE INDEX at `sources.vortx.tv` ("Singularity"): the Kotlin port of Apple
-/// `app/SourcesShared/SourceIndexClient.swift`. The pooled record of which SOURCES (torrent / usenet / direct)
-/// exist for a title, corroborated across users.
+/// `app/SourcesShared/SourceIndexClient.swift`. The pooled record of which torrent sources exist for a title,
+/// corroborated across users.
 ///
 /// TWO halves, both fully fail-soft (any miss / error / offline is a silent no-op; nothing ever blocks or
 /// slows playback or a screen):
 ///
-///   1. HOARD (default ON, anonymous): whenever the app assembles a title's stream results, it reports the
+///   1. HOARD (available only after the hard gate is wired): when enabled, assembled stream results report the
 ///      source DESCRIPTORS, NOT the media, NOT any account token or user id. A descriptor is only
-///      { kind, id, quality, sizeBytes, sourceTag, seeders? } where `id` is the source's real, re-resolvable
-///      identity: a torrent infohash, a usenet nzb link, or the direct http link. The worker STRIPS credential
-///      query params before storing. Fire-and-forget, batched, deduped by id.
+///      { kind, id, quality, sizeBytes, seeders? } where `id` is an exact 40-hex torrent infohash. Raw HTTP and
+///      usenet URLs are never uploaded. Fire-and-forget, batched, deduped by infohash.
 ///
 ///   2. SERVE (opt-in): when the user turns the Singularity toggle ON AND is signed in, the detail screen
-///      reads the corroborated pooled sources and MERGES them into the stream list, ALL kinds (torrent /
-///      usenet / direct), each resolved by the user's own debrid / TorBox pipeline. Empty on any miss;
-///      signed-out disables the read entirely (hard login gate, matching the worker).
+///      reads corroborated torrent infohashes and MERGES them into the stream list for the user's debrid
+///      pipeline. HTTP and usenet have no v1 consumer contract and are dropped. Empty on any miss; signed-out
+///      disables the read entirely (hard login gate, matching the worker).
 ///
 /// GATING (VortX-only): `sources.vortx.tv` is a [VortXEdgeAuth] gated host, so BOTH the POST and the GET are
 /// HMAC-signed. Signing is a safe no-op without a provisioned secret (the worker's observe mode allows it).
 ///
-/// PARITY GAPS (Android has no surface yet, documented like [com.vortx.android.trickplay.CommunityTrickplay]):
-///   - The `MoatConsent.contributeAndConsume` give-to-get toggle and the RemoteConfig `sourceIndex` fleet
-///     kill-switch are absent, so [isEnabled] is a plain feature-on default; wire them here when they land.
-///   - The SERVE X-VX-Moat token (Apple stamps `MoatToken` after the edge signature; the worker returns an
-///     empty list without it) has no Android surface, so [moatTokenProvider] defaults to a null hook. Until it
-///     is wired, SERVE reads sign as observe-mode requests and the worker returns empty under moat enforce.
+/// ANDROID AVAILABILITY: this client is deliberately dormant because Android has no canonical give-to-get
+/// consent, SourceIndex fleet switch, VortX-account identity, X-VX-Moat token, or bounded streamed transport
+/// surface. Re-enable also requires pinning the exact baked origin and refusing every redirect. Consent, fleet,
+/// account, and moat must be live lifecycle gates whose closure cancels in-flight SERVE, clears published
+/// sources, and prevents late publication. [isEnabled] remains false until a separate lane wires and verifies
+/// all six surfaces and receives independent security sign-off. Before that
+/// re-enable, the process ledger must also move from SourceListModel beside this client's pacer, claim each
+/// <=16 chunk after pacing immediately before POST without eviction, and gain cancellation/overlap tests.
+/// Extraction and
+/// reconstruction stay compiled and tested, but neither HOARD nor SERVE can touch the network while disabled.
 object SourceIndexClient {
 
     private const val TAG = "sing"
 
     // MARK: - Public models
 
-    /// A source kind as the pool records it. Mirrors the app's torrent / usenet / direct classification.
-    enum class Kind(val wire: String) { TORRENT("torrent"), USENET("usenet"), DIRECT("direct") }
+    /// Torrent-only v1 has one wire kind.
+    enum class Kind(val wire: String) { TORRENT("torrent") }
 
     /// One anonymized source descriptor for the HOARD upload. Carries ONLY public, non-personal fields.
     /// Mirrors Apple `Descriptor`.
     data class Descriptor(
         val kind: String,
-        val id: String, // infohash (torrent) | real nzb link (usenet) | real http link (direct)
+        val id: String, // normalized 40-hex torrent infohash
         val quality: String, // e.g. "4K", "1080p", "Other" (from StreamRanking.qualityLabel)
         val sizeBytes: Long, // 0 when the add-on advertised no size
-        val sourceTag: String, // the add-on / provider label the source came from (no user data)
-        val seeders: Int?, // torrents only, when advertised
+        val seeders: Int?, // when advertised
     )
 
     /// One corroborated source the pool returns for SERVE. `id` matches the descriptor id space. Mirrors
@@ -79,7 +85,6 @@ object SourceIndexClient {
         val id: String?,
         val quality: String?,
         val sizeBytes: Long?,
-        val sourceTag: String?,
         val seeders: Int?,
         val corroboration: Int?,
     )
@@ -90,77 +95,80 @@ object SourceIndexClient {
     /// episode). null when the id is not a real imdb `tt…` id. Mirrors Apple `contentID`.
     fun contentId(imdbId: String?, season: Int? = null, episode: Int? = null): String? {
         if (imdbId == null) return null
-        val match = Regex("""^tt\d{6,}""").find(imdbId) ?: return null
-        val base = match.value
-        return if (season != null && episode != null) "$base:$season:$episode" else base
+        if (!Regex("""^tt[0-9]{6,10}$""").matches(imdbId)) return null
+        val contentId = if (season != null && episode != null) "$imdbId:$season:$episode" else imdbId
+        return canonicalContentId(contentId)
     }
 
     // MARK: - Descriptor extraction (pure; no user data)
 
     /// Build the anonymized descriptor set for a title's assembled source groups. Uses [StreamRanking] as the
     /// single source of truth for quality / size / seeders, so the pool's view matches the app's. Skips
-    /// YouTube trailers and any stream with no derivable public id. Deduped by descriptor id. Mirrors Apple
-    /// `descriptors(from:)`.
+    /// YouTube trailers and every stream without an exact 40-hex torrent infohash. Deduped by normalized
+    /// infohash. Mirrors Apple `descriptors(from:)`.
     fun descriptors(groups: List<StreamGroup>): List<Descriptor> {
         val seen = HashSet<String>()
         val out = ArrayList<Descriptor>()
         for (group in groups) {
             for (stream in group.streams) {
                 if (stream.isYouTubeTrailer) continue
-                val d = descriptor(stream, group.addon) ?: continue
+                val d = descriptor(stream) ?: continue
                 if (seen.add(d.kind + "|" + d.id)) out.add(d)
             }
         }
         return out
     }
 
-    /// One descriptor for one stream, or null when it carries no public identity. The debrid-resolved `url` of
-    /// a torrent is a PERSONAL link, so it is never sent (the public infohash is used instead). Mirrors Apple
-    /// `descriptor(for:sourceTag:)`.
-    private fun descriptor(stream: StreamSource, sourceTag: String): Descriptor? {
+    /// One descriptor for one stream, or null when it has no canonical torrent identity. A debrid-resolved URL
+    /// may be personal, so only the public torrent infohash crosses this boundary. Mirrors Apple
+    /// `descriptor(for:)`.
+    private fun descriptor(stream: StreamSource): Descriptor? {
         val sizeGb = StreamRanking.sizeForSort(stream) // GB (0 when unknown)
         val sizeBytes = if (sizeGb > 0) Math.round(sizeGb * 1024.0 * 1024.0 * 1024.0) else 0L
         val quality = StreamRanking.qualityLabel(stream)
-        val tag = sanitizeTag(sourceTag)
 
-        // USENET: keyed by the REAL nzb link so any user can re-resolve it with their own TorBox usenet plan.
-        val nzb = stream.nzbUrl
-        if (stream.isUsenet && !nzb.isNullOrEmpty()) {
-            return Descriptor(Kind.USENET.wire, nzb, quality, sizeBytes, tag, seeders = null)
-        }
-        // TORRENT (raw OR debrid-resolved): keyed by the infohash, which is public and identity-stable. The
-        // (possibly personal) resolved url is never sent.
-        val hash = stream.infoHash?.lowercase()
-        if (!hash.isNullOrEmpty()) {
-            val seeders = StreamRanking.seedersForSort(stream)
-            return Descriptor(Kind.TORRENT.wire, hash, quality, sizeBytes, tag, seeders = if (seeders >= 0) seeders else null)
-        }
-        // DIRECT: a plain http(s) link with no infohash. Keyed by the REAL link (credential params stripped
-        // worker-side) so another user can play it or unrestrict it through their own debrid.
-        val url = stream.url
-        if (!url.isNullOrEmpty()) {
-            return Descriptor(Kind.DIRECT.wire, url, quality, sizeBytes, tag, seeders = null)
-        }
-        return null
+        val hash = normalizeInfoHash(stream.infoHash) ?: return null
+        val seeders = StreamRanking.seedersForSort(stream)
+        return Descriptor(
+            Kind.TORRENT.wire,
+            hash,
+            quality,
+            sizeBytes,
+            seeders = if (seeders >= 0) seeders else null,
+        )
     }
 
     // MARK: - HOARD: POST /sources/contribute (signed, fire-and-forget)
 
     /// Report the assembled source descriptors for a title. Gated on the feature flag. Popular titles resolve
-    /// far more than one POST can carry (the worker truncates at MAX_SOURCES_PER_CONTRIBUTE = 100), so we chunk
-    /// the whole deduped set into [BATCH_SIZE]-descriptor POSTs sent SEQUENTIALLY, spaced by
-    /// [INTER_BATCH_DELAY_MS] to stay under the worker's per-IP rate limit. Each POST is independently
-    /// fire-and-forget. No-op on an empty set. Mirrors Apple `contribute`.
+    /// far more than one POST can carry (the worker rejects a POST above MAX_SOURCES_PER_CONTRIBUTE = 16), so we chunk
+    /// the whole deduped set into [BATCH_SIZE]-descriptor POSTs. The process-wide [uploadPacer] serializes all
+    /// callers and spaces every POST by [INTER_BATCH_DELAY_MS], so overlapping title rebuilds cannot multiply
+    /// the worker's per-IP request rate. Each POST is independently fire-and-forget. No-op on an empty set.
+    /// Mirrors Apple `contribute`.
     suspend fun contribute(contentId: String, descriptors: List<Descriptor>) {
-        if (!isEnabled || descriptors.isEmpty()) return
-        val all = descriptors.take(MAX_DESCRIPTORS_PER_TITLE)
-        val batches = all.chunked(BATCH_SIZE)
+        contributeUsing(contentId, descriptors) { id, chunk, index, total ->
+            postBatch(id, chunk, index, total)
+        }
+    }
+
+    /// Internal transport seam used to prove that the hard availability gate prevents every POST attempt.
+    internal suspend fun contributeUsing(
+        contentId: String,
+        descriptors: List<Descriptor>,
+        post: suspend (String, List<Descriptor>, Int, Int) -> Unit,
+    ) {
+        if (!isEnabled || canonicalContentId(contentId) != contentId) return
+        // Revalidate at the network boundary. Descriptor is a simple value type and can be constructed without
+        // descriptors(groups), so only torrent-only canonical identities are allowed to reach the encoder.
+        val batches = uploadBatches(descriptors)
+        if (batches.isEmpty()) return
         withContext(Dispatchers.IO) {
             for ((i, chunk) in batches.withIndex()) {
                 if (!isActive) return@withContext
-                postBatch(contentId, chunk, i + 1, batches.size)
-                // Space the batches so the whole run stays under the worker per-IP limit. Skip after the last.
-                if (i < batches.size - 1) delay(INTER_BATCH_DELAY_MS)
+                uploadPacer.pace {
+                    if (isActive) post(contentId, chunk, i + 1, batches.size)
+                }
             }
         }
     }
@@ -173,23 +181,7 @@ object SourceIndexClient {
     }
 
     private fun postBatch(contentId: String, chunk: List<Descriptor>, index: Int, total: Int) {
-        val body = JSONObject().apply {
-            put("content_id", contentId)
-            val arr = JSONArray()
-            for (d in chunk) {
-                arr.put(
-                    JSONObject().apply {
-                        put("kind", d.kind)
-                        put("id", d.id)
-                        put("quality", d.quality)
-                        put("sizeBytes", d.sizeBytes)
-                        put("sourceTag", d.sourceTag)
-                        if (d.seeders != null) put("seeders", d.seeders)
-                    },
-                )
-            }
-            put("sources", arr)
-        }.toString()
+        val body = contributionBody(contentId, chunk) ?: return
 
         var conn: HttpURLConnection? = null
         try {
@@ -198,6 +190,7 @@ object SourceIndexClient {
                 connectTimeout = HTTP_TIMEOUT_MS
                 readTimeout = HTTP_TIMEOUT_MS
                 useCaches = false
+                instanceFollowRedirects = false
                 doOutput = true
                 setRequestProperty("content-type", "application/json")
             }
@@ -212,20 +205,91 @@ object SourceIndexClient {
         }
     }
 
+    /// Pure wire encoder kept visible to deterministic unit tests. The closed DTO makes it impossible for a
+    /// stream URL, NZB URL, or provider tag to enter the upload JSON.
+    internal fun contributionBody(contentId: String, chunk: List<Descriptor>): String? {
+        if (canonicalContentId(contentId) != contentId || chunk.isEmpty() || chunk.size > BATCH_SIZE) return null
+        val sources = uploadableDescriptors(chunk)
+        if (sources.isEmpty()) return null
+        return JSONObject().apply {
+            put("content_id", contentId)
+            val arr = JSONArray()
+            for (d in sources) {
+                arr.put(
+                    JSONObject().apply {
+                        put("kind", d.kind)
+                        put("id", d.id)
+                        put("quality", d.quality)
+                        put("sizeBytes", d.sizeBytes)
+                        if (d.seeders != null) put("seeders", d.seeders)
+                    },
+                )
+            }
+            put("sources", arr)
+        }.toString()
+    }
+
+    /// Final upload-boundary validation for arbitrary descriptors, deduped by normalized infohash. Both the
+    /// network path and its wire encoder call this so a future caller cannot bypass the torrent-only contract.
+    internal fun uploadableDescriptors(descriptors: List<Descriptor>): List<Descriptor> {
+        val seen = HashSet<String>()
+        return descriptors.mapNotNull { descriptor ->
+            if (descriptor.kind != Kind.TORRENT.wire) return@mapNotNull null
+            val hash = normalizeInfoHash(descriptor.id) ?: return@mapNotNull null
+            if (!seen.add(hash)) return@mapNotNull null
+            descriptor.copy(
+                kind = Kind.TORRENT.wire,
+                id = hash,
+                quality = normalizeQuality(descriptor.quality),
+                sizeBytes = descriptor.sizeBytes.coerceIn(0, MAX_SAFE_SIZE_BYTES),
+                seeders = descriptor.seeders?.takeIf { it in 0..MAX_SEEDERS },
+            )
+        }
+    }
+
+    /// Pure final normalization and worker-cap chunking, kept visible for parity tests with Apple and the worker.
+    internal fun uploadBatches(descriptors: List<Descriptor>): List<List<Descriptor>> =
+        uploadableDescriptors(descriptors).take(MAX_DESCRIPTORS_PER_TITLE).chunked(BATCH_SIZE)
+
     // MARK: - SERVE: GET /sources?content_id=… (signed, opt-in + login-gated)
 
     /// Read the corroborated pooled sources for [contentId]. Returns `[]` unless the Singularity SERVE toggle
     /// is on AND the user is signed in AND the fleet flag is on. Fail-soft to `[]` on any error or when
     /// disabled. Mirrors Apple `fetchPooled`.
     suspend fun fetchPooled(contentId: String, isSignedIn: Boolean): List<PooledSource> {
+        return fetchPooledUsing(
+            contentId = contentId,
+            isSignedIn = isSignedIn,
+            moatProvider = { runCatching { moatTokenProvider?.invoke() }.getOrNull() },
+            request = ::fetchPooledNetwork,
+        )
+    }
+
+    /// Internal transport seam used to prove that the hard availability gate prevents token and GET work.
+    internal suspend fun fetchPooledUsing(
+        contentId: String,
+        isSignedIn: Boolean,
+        moatProvider: suspend () -> String?,
+        request: suspend (String, String, String?) -> List<PooledSource>,
+    ): List<PooledSource> {
+        // Validate before logging or constructing a request. A caller-controlled or user-shaped value must not
+        // enter telemetry or the query string even when a future call site bypasses contentId().
+        val url = serveUrl(contentId) ?: return emptyList()
         Log.d(TAG, "fetchPooled GATE contentId=$contentId isEnabled=$isEnabled serveEnabled=$serveEnabled isSignedIn=$isSignedIn")
         if (!isEnabled || !serveEnabled || !isSignedIn) {
             Log.d(TAG, "fetchPooled GATE CLOSED contentId=$contentId -> [] (gate off / not signed in)")
             return emptyList()
         }
-        val moat = runCatching { moatTokenProvider?.invoke() }.getOrNull()
+        val moat = moatProvider()
+        return request(url, contentId, moat)
+    }
+
+    private suspend fun fetchPooledNetwork(
+        url: String,
+        contentId: String,
+        moat: String?,
+    ): List<PooledSource> {
         return withContext(Dispatchers.IO) {
-            val url = "$BASE_URL/sources?content_id=${enc(contentId)}"
             var conn: HttpURLConnection? = null
             try {
                 conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -233,6 +297,7 @@ object SourceIndexClient {
                     connectTimeout = HTTP_TIMEOUT_MS
                     readTimeout = HTTP_TIMEOUT_MS
                     useCaches = false
+                    instanceFollowRedirects = false
                     setRequestProperty("accept", "application/json")
                 }
                 VortXEdgeAuth.sign(conn)
@@ -245,6 +310,8 @@ object SourceIndexClient {
                     Log.d(TAG, "fetchPooled HTTP non-2xx contentId=$contentId status=$code -> []")
                     return@withContext emptyList()
                 }
+                // This reader remains unreachable while isEnabled is the compile-time false gate. Before any
+                // re-enable, replace it with the separately reviewed bounded streamed transport (surface five).
                 val text = conn.inputStream.bufferedReader().use(BufferedReader::readText)
                 val sources = parsePooled(text)
                 Log.d(TAG, "fetchPooled HTTP OK contentId=$contentId status=$code corroboratedSources=${sources.size}")
@@ -260,11 +327,12 @@ object SourceIndexClient {
         }
     }
 
-    private fun parsePooled(body: String): List<PooledSource> {
+    internal fun parsePooled(body: String): List<PooledSource> {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         val arr = root.optJSONArray("sources") ?: return emptyList()
-        val out = ArrayList<PooledSource>(arr.length())
-        for (i in 0 until arr.length()) {
+        val acceptedCount = minOf(arr.length(), MAX_SERVE_RESULTS)
+        val out = ArrayList<PooledSource>(acceptedCount)
+        for (i in 0 until acceptedCount) {
             val o = arr.optJSONObject(i) ?: continue
             out.add(
                 PooledSource(
@@ -272,7 +340,6 @@ object SourceIndexClient {
                     id = o.optStringOrNull("id"),
                     quality = o.optStringOrNull("quality"),
                     sizeBytes = if (o.has("sizeBytes") && !o.isNull("sizeBytes")) o.optLong("sizeBytes") else null,
-                    sourceTag = o.optStringOrNull("sourceTag"),
                     seeders = if (o.has("seeders") && !o.isNull("seeders")) o.optInt("seeders") else null,
                     corroboration = if (o.has("corroboration") && !o.isNull("corroboration")) o.optInt("corroboration") else null,
                 ),
@@ -281,36 +348,22 @@ object SourceIndexClient {
         return out
     }
 
-    /// Turn the corroborated pooled sources into playable [StreamSource]s to merge. ALL three kinds are
-    /// reconstructable: a torrent (infohash id), a usenet source (real nzb link id), and a direct source (real
-    /// http link id), each then resolved by the user's own debrid / TorBox pipeline. A LEGACY row whose id is
-    /// a bare hash (old fleet stored sha256 for usenet/http) is not replayable and is dropped. Mirrors Apple
-    /// `streams(from:)`.
+    /// Turn canonical pooled torrent infohashes into playable [StreamSource]s. Every non-torrent or malformed
+    /// row is dropped before it can enter the user's debrid pipeline. Mirrors Apple `streams(from:)`.
     fun streams(pooled: List<PooledSource>): List<StreamSource> {
-        val built = pooled.mapNotNull { src ->
+        val built = pooled.take(MAX_SERVE_RESULTS).mapNotNull { src ->
             val kind = src.kind ?: return@mapNotNull null
             val id = src.id
             if (id.isNullOrEmpty()) return@mapNotNull null
-            val quality = src.quality?.takeIf { it.isNotEmpty() } ?: "Source"
-            val sizeSuffix = if ((src.sizeBytes ?: 0) > 0) " · ${humanSize(src.sizeBytes ?: 0)}" else ""
-            val seedSuffix = src.seeders?.let { " · 👤 $it" }.orEmpty()
             // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source.
-            val name = "$quality · Singularity"
-            val isLink = id.lowercase().startsWith("http://") || id.lowercase().startsWith("https://")
-            when (kind) {
-                Kind.TORRENT.wire -> {
-                    if (Regex("""^[0-9a-fA-F]{20,64}$""").matches(id)) {
-                        makeTorrent(name, "Singularity source$sizeSuffix$seedSuffix", id.lowercase())
-                    } else {
-                        null
-                    }
-                }
-                Kind.USENET.wire -> if (isLink) makeUsenet(name, "Singularity usenet$sizeSuffix", id) else null
-                "http", Kind.DIRECT.wire -> if (isLink) makeDirect(name, "Singularity source$sizeSuffix", id) else null
-                else -> null
+            if (kind == Kind.TORRENT.wire && (src.corroboration ?: 0) >= MIN_CORROBORATION
+                && CANONICAL_INFOHASH.matches(id)) {
+                makeTorrent("Other · Singularity", "Singularity source", id)
+            } else {
+                null
             }
         }
-        Log.d(TAG, "streams reconstruct pooled=${pooled.size} -> playable=${built.size} (legacy-hash rows dropped)")
+        Log.d(TAG, "streams reconstruct pooled=${pooled.size} -> playable=${built.size} (torrent-only)")
         return built
     }
 
@@ -319,40 +372,28 @@ object SourceIndexClient {
         addon = GROUP_ADDON,
         title = name,
         description = description,
+        quality = "Other",
         isTorrent = true,
         infoHash = infoHash,
     )
 
-    private fun makeUsenet(name: String, description: String, nzbUrl: String): StreamSource = StreamSource(
-        id = "$nzbUrl#$name#$description",
-        addon = GROUP_ADDON,
-        title = name,
-        description = description,
-        nzbUrl = nzbUrl,
-    )
-
-    private fun makeDirect(name: String, description: String, url: String): StreamSource = StreamSource(
-        id = "$url#$name#$description",
-        addon = GROUP_ADDON,
-        title = name,
-        description = description,
-        url = url,
-    )
-
     // MARK: - Feature gates
 
-    /// The master gate for the whole client. Apple ANDs give-to-get consent + the RemoteConfig fleet flag;
-    /// Android has neither surface (see the class doc), so this is a plain feature-on default. Wire the consent
-    /// + kill-switch here when they land, exactly as Apple's `isEnabled` does.
-    const val isEnabled: Boolean = true
+    /// Hard availability gate. Re-enable only after a separate lane wires and verifies six surfaces: consent,
+    /// the SourceIndex fleet switch, VortX-account identity, X-VX-Moat token minting, exact baked-origin
+    /// enforcement with every redirect refused, and bounded streamed GET/POST transport. Consent, fleet,
+    /// account, and moat closure must cancel in-flight SERVE, clear current published sources, and prevent late
+    /// publication before independent security sign-off. That lane must also relocate the
+    /// non-evicting process ledger beside [uploadPacer], claim each paced <=16 batch immediately before POST,
+    /// and verify cancellation plus overlapping callers.
+    const val isEnabled: Boolean = false
 
     /// The per-user SERVE opt-in (the "Singularity" Settings toggle). Default ON (give-to-get; still sign-in
     /// gated in [fetchPooled]). A settings surface can flip this when one lands. Mirrors Apple `serveEnabled`.
     @Volatile
     var serveEnabled: Boolean = true
 
-    /// Optional hook that yields the short-lived X-VX-Moat token for a SERVE read (null = no surface wired
-    /// yet). Set once a MoatToken surface exists on Android; until then SERVE signs as an observe-mode request.
+    /// Reserved hook for the future signed-off identity lane. It is never invoked while [isEnabled] is false.
     @Volatile
     var moatTokenProvider: (suspend () -> String?)? = null
 
@@ -370,35 +411,50 @@ object SourceIndexClient {
     private const val BASE_URL = "https://sources.vortx.tv"
     private const val HTTP_TIMEOUT_MS = 8_000
     private const val MOAT_HEADER = "X-VX-Moat"
+    private const val MAX_SAFE_SIZE_BYTES = 9_007_199_254_740_991L
+    private const val MAX_SEEDERS = 1_000_000
+    internal const val MAX_SERVE_RESULTS = 100
+    private const val MIN_CORROBORATION = 2
 
-    /// The overall per-title cap on descriptors uploaded. At [BATCH_SIZE] per POST this is at most 20 POSTs.
-    private const val MAX_DESCRIPTORS_PER_TITLE = 2000
+    /// Exact public title-id boundary shared by HOARD and SERVE. ASCII digits are intentional.
+    internal fun canonicalContentId(raw: String): String? = raw.takeIf(CANONICAL_CONTENT_ID::matches)
 
-    /// Descriptors per POST. MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE (currently 100) or each batch
-    /// tail is truncated worker-side and silently lost.
-    private const val BATCH_SIZE = 100
+    /// Pure SERVE request builder. Keeping validation here makes the no-network-on-invalid-id guarantee
+    /// deterministic in local tests and prevents future callers from interpolating an unchecked id.
+    internal fun serveUrl(contentId: String): String? {
+        val canonical = canonicalContentId(contentId) ?: return null
+        return "$BASE_URL/sources?content_id=${enc(canonical)}&kind=${Kind.TORRENT.wire}"
+    }
 
-    /// Delay between sequential batch POSTs, just over one second so 20 batches spread over ~21s stay under the
-    /// worker's per-IP limit (60 contributes per 60s).
+    private fun normalizeInfoHash(raw: String?): String? {
+        val normalized = raw?.lowercase() ?: return null
+        return normalized.takeIf(CANONICAL_INFOHASH::matches)
+    }
+
+    private fun normalizeQuality(raw: String): String = when (raw.trim().lowercase()) {
+        "4k", "2160p", "uhd" -> "4K"
+        "1440p" -> "1440p"
+        "1080p" -> "1080p"
+        "720p" -> "720p"
+        "576p" -> "576p"
+        "540p" -> "540p"
+        "480p", "sd" -> "480p"
+        else -> "Other"
+    }
+
+    /// The overall per-title cap on descriptors uploaded. At [BATCH_SIZE] per POST this is at most 125 POSTs.
+    internal const val MAX_DESCRIPTORS_PER_TITLE = 2000
+
+    /// Sixteen descriptors produce 49 D1 statements (3 each plus one retention prune), under Cloudflare D1's
+    /// 50-query Free-plan invocation limit. Keep this equal to the worker and Apple maximum.
+    internal const val BATCH_SIZE = 16
+
+    /// Delay between sequential batch POST starts. Just over one second keeps each process near 55/minute,
+    /// leaving headroom within the worker's 240/minute per-IP limit for several devices behind one NAT.
     private const val INTER_BATCH_DELAY_MS = 1_100L
 
-    /// Trim + bound the source tag so it stays a short provider label with no accidental user data.
-    private fun sanitizeTag(raw: String): String {
-        val t = raw.trim()
-        return if (t.isEmpty()) "Add-on" else t.take(64)
-    }
-
-    /// A binary byte size ("12.4 GB" / "850 MB") for the row detail line, locale-US so the decimal separator
-    /// is always '.'.
-    private fun humanSize(bytes: Long): String {
-        if (bytes <= 0) return ""
-        val gb = bytes / 1_073_741_824.0
-        if (gb >= 1.0) return String.format(java.util.Locale.US, "%.1f GB", gb)
-        val mb = bytes / 1_048_576.0
-        if (mb >= 1.0) return String.format(java.util.Locale.US, "%.0f MB", mb)
-        val kb = bytes / 1024.0
-        return String.format(java.util.Locale.US, "%.0f KB", kb)
-    }
+    /// One process-wide pacer, not one delay loop per title. This is the actual per-IP rate-control boundary.
+    private val uploadPacer = SourceUploadPacer(INTER_BATCH_DELAY_MS)
 
     private fun JSONObject.optStringOrNull(key: String): String? {
         if (!has(key) || isNull(key)) return null
@@ -408,11 +464,37 @@ object SourceIndexClient {
     private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
 }
 
+/// Serializes outbound actions and leaves [intervalMs] after the previous action completes. Clock and sleeper
+/// injection make cross-invocation pacing deterministic to test without a real 1.1-second wait.
+internal class SourceUploadPacer(
+    private val intervalMs: Long,
+    private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val sleepMs: suspend (Long) -> Unit = { delay(it) },
+) {
+    private val mutex = Mutex()
+    private var lastCompletedAtMs: Long? = null
+
+    suspend fun <T> pace(action: suspend () -> T): T {
+        mutex.lock()
+        try {
+            val previous = lastCompletedAtMs
+            if (previous != null) {
+                val remaining = intervalMs - (nowMs() - previous)
+                if (remaining > 0) sleepMs(remaining)
+            }
+            return action()
+        } finally {
+            lastCompletedAtMs = nowMs()
+            mutex.unlock()
+        }
+    }
+}
+
 /// A per-detail-view SERVE contributor that reads the community source index for the current title and
 /// publishes the corroborated, actionable sources as one extra group to MERGE into the list. The Kotlin port
 /// of Apple `SourceIndexServeSource`: `@Published streams` becomes a [StateFlow], the SwiftUI `Task` becomes a
-/// coroutine [Job], and the process-lifetime result bank (the publish-lost fix) is preserved. Gated inside
-/// [SourceIndexClient] (toggle OFF / signed-out / fleet-off all yield an empty group).
+/// coroutine [Job]. Completed results are never retained across instances. Gated inside [SourceIndexClient]
+/// (toggle OFF / signed-out / fleet-off all yield an empty group).
 class SourceIndexServeSource(
     /// The scope the fetch coroutines run on. Owned + cancellable via [close]; defaults to an IO scope so a
     /// caller that never provides one still works standalone.
@@ -437,44 +519,35 @@ class SourceIndexServeSource(
     /// by content id. Safe to call on every meta change. Mirrors Apple `refresh`.
     fun refresh(contentId: String?, isSignedIn: Boolean) {
         val gateOpen = SourceIndexClient.serveEnabled && SourceIndexClient.isEnabled && isSignedIn
-        if (!gateOpen || contentId == null || contentId == lastContentId) {
+        val canonicalContentId = contentId?.let(SourceIndexClient::canonicalContentId)
+        if (!gateOpen || canonicalContentId == null || canonicalContentId == lastContentId) {
             // Clear any previously-merged community sources whenever the SERVE gate is CLOSED, so stale rows do
             // not linger after the gate closes. A skip for an unchanged / null content id with the gate still
             // open leaves them in place.
-            if (!gateOpen && _streams.value.isNotEmpty()) publish(emptyList())
+            if (!gateOpen) {
+                job?.cancel()
+                job = null
+                lastContentId = null
+                if (_streams.value.isNotEmpty()) publish(emptyList())
+            }
             return
         }
-        lastContentId = contentId
-        // WARM PAINT: a fetch for this exact content id already landed this process (often on a predecessor
-        // view destroyed before the round trip returned). Publish it synchronously so the recreated view
-        // merges the pool immediately; the network fetch below still runs and replaces it with the fresh
-        // answer.
-        bankedFor(contentId)?.let { banked ->
-            if (banked.isNotEmpty()) {
-                Log.d(TAG, "refresh seeded from bank contentId=$contentId streams=${banked.size}")
-                publish(banked)
-            }
-        }
+        lastContentId = canonicalContentId
         job?.cancel()
         job = scope.launch {
-            val pooled = SourceIndexClient.fetchPooled(contentId, isSignedIn)
+            val pooled = SourceIndexClient.fetchPooled(canonicalContentId, isSignedIn)
             val built = SourceIndexClient.streams(pooled)
-            // Bank BEFORE the liveness guard: the result is correct for this content id whether or not the
-            // requesting view survived. Empty results are never banked (a young pool may fill; keep asking).
-            if (built.isNotEmpty()) bank(contentId, built)
             if (!isActive) {
-                Log.d(TAG, "refresh publish SKIPPED contentId=$contentId (cancelled) built=${built.size}")
+                Log.d(TAG, "refresh publish SKIPPED contentId=$canonicalContentId (cancelled) built=${built.size}")
                 return@launch
             }
-            Log.d(TAG, "refresh publish contentId=$contentId streams=${built.size} (now merge-ready)")
+            Log.d(TAG, "refresh publish contentId=$canonicalContentId streams=${built.size} (now merge-ready)")
             publish(built)
         }
     }
 
-    /// Empty the PUBLISHED community streams, cancelling any in-flight fetch first (its completion publishes
-    /// unconditionally, so an uncancelled late answer for a previous title would repopulate after this clear).
-    /// The cancel loses nothing durable: the fetch banks its result BEFORE the liveness guard. [lastContentId]
-    /// resets so a later refresh for the SAME title re-publishes (bank-seeded). Mirrors Apple `clearResults`.
+    /// Empty the published community streams and cancel any in-flight fetch. No completed result survives this
+    /// instance, and [lastContentId] resets so a later refresh for the same title performs a fresh read.
     fun clearResults() {
         job?.cancel()
         lastContentId = null
@@ -499,45 +572,17 @@ class SourceIndexServeSource(
     companion object {
         private const val TAG = "sing"
 
-        // MARK: - Process-lifetime result bank (publish-lost fix)
-
-        /// Last successfully BUILT pool result per content id, process-lifetime. The fetch result used to live
-        /// only on the per-view instance, which is routinely destroyed before the ~0.5s network round trip
-        /// returns (the "Singularity sources never appear" report). Banking by content id lets the NEXT
-        /// instance for the same title publish instantly. Bounded defensively: on overflow it resets. Mirrors
-        /// Apple's `resultBank`.
-        private val resultBank = HashMap<String, List<StreamSource>>()
-
-        private fun bank(contentId: String, built: List<StreamSource>) {
-            synchronized(resultBank) {
-                if (resultBank.size >= 64 && !resultBank.containsKey(contentId)) resultBank.clear()
-                resultBank[contentId] = built
-            }
-        }
-
-        /// The banked build for [contentId], or null. Serialized against concurrent [bank] writes.
-        private fun bankedFor(contentId: String): List<StreamSource>? =
-            synchronized(resultBank) { resultBank[contentId] }
-
-        /// The pure merge: append the community sources as one "Singularity" group, deduped ONLY within its own
-        /// list (by replayable identity: torrent infohash, usenet nzb link, or direct url), NOT against the
-        /// user's add-on groups (so a release your add-ons already return still appears under the Singularity
-        /// label). Mirrors Apple `SourceIndexServeSource.merge`.
+        /// The pure merge: append canonical torrent sources as one "Singularity" group, deduped ONLY within its
+        /// own list by infohash, NOT against the user's add-on groups. Mirrors Apple
+        /// `SourceIndexServeSource.merge`.
         fun merge(extra: List<StreamSource>, groups: List<StreamGroup>): List<StreamGroup> {
             if (extra.isEmpty()) return groups
             val seen = HashSet<String>()
             val own = ArrayList<StreamSource>()
             for (s in extra) {
-                val h = s.infoHash?.lowercase()
-                val nzb = s.nzbUrl
-                val u = s.url
-                val key: String? = when {
-                    !h.isNullOrEmpty() -> "t:$h"
-                    !nzb.isNullOrEmpty() -> "u:$nzb"
-                    !u.isNullOrEmpty() -> "d:$u"
-                    else -> null
-                }
-                if (key == null) continue
+                val hash = s.infoHash ?: continue
+                if (!CANONICAL_INFOHASH.matches(hash)) continue
+                val key = "t:$hash"
                 if (seen.add(key)) own.add(s)
             }
             if (own.isEmpty()) return groups

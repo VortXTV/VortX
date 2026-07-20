@@ -255,11 +255,19 @@ final class DownloadPickCoordinator: ObservableObject {
     /// retried against itself.
     func startDownload(chosen: CoreStream, rankedCandidates: [CoreStream],
                        meta: PlaybackMeta, episode: DebridEpisode?) {
-        let chosenURL = chosen.playableURL?.absoluteString
-        let fallbacks = rankedCandidates.filter { $0.playableURL?.absoluteString != chosenURL }
+        let fallbacks = rankedCandidates.filter { !sameSource($0, chosen) }
         Task { @MainActor [weak self] in
             await self?.launch([chosen] + fallbacks, meta: meta, episode: episode, replacing: nil)
         }
+    }
+
+    private func sameSource(_ lhs: CoreStream, _ rhs: CoreStream) -> Bool {
+        if let left = lhs.url, let right = rhs.url { return left == right }
+        if let left = lhs.infoHash, let right = rhs.infoHash {
+            return left.caseInsensitiveCompare(right) == .orderedSame && lhs.fileIdx == rhs.fileIdx
+        }
+        if let left = lhs.nzbUrl, let right = rhs.nzbUrl { return left == right }
+        return false
     }
 
     // MARK: Launch + fallback
@@ -275,12 +283,24 @@ final class DownloadPickCoordinator: ObservableObject {
         var queue = candidates
         while let head = queue.first {
             queue.removeFirst()
-            guard let url = head.playableURL else { continue }   // unplayable candidate: skip to the next
             // Resolve a cached-debrid direct link when possible; a raw torrent must have its loopback stream
             // /created first, exactly as the manual + batch download paths do (#21).
-            let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: head, episode: episode)
+            let isEpisode = episode != nil || EpisodePlaybackIdentity.isEpisodicContext(
+                type: meta.type, season: meta.season, episode: meta.episode,
+                videoID: meta.videoId
+            )
+            let resolved: URL?
+            if isEpisode, head.url == nil, episode == nil {
+                resolved = nil
+            } else {
+                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: head, episode: episode)
+            }
+            guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+                isUsenet: head.isUsenet, resolvedURL: resolved,
+                fallbackURL: head.playableURL(isEpisode: isEpisode)
+            ) else { continue }
             if resolved == nil, head.isTorrent { _ = prepareTorrentStream(head) }
-            let record = DownloadManager.shared.download(stream: head, meta: meta, resolvedURL: resolved ?? url,
+            let record = DownloadManager.shared.download(stream: head, meta: meta, resolvedURL: url,
                                                          sourceName: head.name,
                                                          qualityText: StreamRanking.signature(head))
             // download() can refuse synchronously (an HLS source on a device that can't save HLS, or a storage

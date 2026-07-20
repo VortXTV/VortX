@@ -209,35 +209,18 @@ final class DownloadStore: ObservableObject {
         var order: [String] = []                       // group keys in newest-first encounter order
         var byKey: [String: [DownloadRecord]] = [:]
         for record in records {
-            let key = Self.groupKey(for: record)
+            let key = record.groupingKey
             if byKey[key] == nil { order.append(key) }
             byKey[key, default: []].append(record)
         }
         return order.compactMap { key -> DownloadGroup? in
             guard let items = byKey[key], let head = items.first else { return nil }
-            let sorted = head.type == "series" ? items.sorted(by: Self.episodeOrder) : items
+            let sorted = head.usesSeriesLifecycle ? items.sorted(by: DownloadRecord.episodeOrder) : items
             return DownloadGroup(id: key, title: head.name, poster: head.poster,
                                  type: head.type, records: sorted)
         }
     }
 
-    /// Grouping key: a series collects ALL its episodes under the series id (`contentId`), so every downloaded
-    /// episode of the same show lands in one folder; a movie stands alone under its own `videoId` (for a movie
-    /// `contentId == videoId`, so this is unique per movie). The `series:` / `movie:` prefixes keep the two
-    /// namespaces from ever colliding on an id that happens to match.
-    private static func groupKey(for record: DownloadRecord) -> String {
-        record.type == "series" ? "series:\(record.contentId)" : "movie:\(record.videoId)"
-    }
-
-    /// Season-then-episode ascending; an unknown season or episode sorts last (so a stray untagged episode
-    /// never jumps ahead of S1E1), tie-broken oldest-added-first for a stable order.
-    private static func episodeOrder(_ a: DownloadRecord, _ b: DownloadRecord) -> Bool {
-        let seasonA = a.season ?? Int.max, seasonB = b.season ?? Int.max
-        if seasonA != seasonB { return seasonA < seasonB }
-        let episodeA = a.episode ?? Int.max, episodeB = b.episode ?? Int.max
-        if episodeA != episodeB { return episodeA < episodeB }
-        return a.addedAt < b.addedAt
-    }
 }
 
 /// A virtual "folder" of downloads for one show (all episodes of a series) or a single movie, derived from
@@ -251,13 +234,13 @@ struct DownloadGroup: Identifiable {
     /// `name` is the show name.
     let title: String
     let poster: String?
-    /// "series" (a show folder) or "movie" (a standalone row).
+    /// Original persisted catalog type from the group's first record. Folder rendering uses `isShow`.
     let type: String
     /// The group's downloads: for a series, episodes sorted season-then-episode; for a movie, the one record.
     let records: [DownloadRecord]
 
-    /// True for a show folder (a series). A movie group renders as a plain row instead of a folder.
-    var isShow: Bool { type == "series" }
+    /// True for a derived episode group. A movie group renders as a plain row instead of a folder.
+    var isShow: Bool { records.first?.usesSeriesLifecycle ?? false }
     /// Number of downloads in the folder (episode count for a show).
     var count: Int { records.count }
 }

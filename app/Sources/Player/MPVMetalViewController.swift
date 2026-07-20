@@ -39,6 +39,15 @@ final class MPVMetalViewController: PlatformViewController {
     private var wakeupRelay: Unmanaged<WakeupRelay>?
     var playDelegate: MPVPlayerDelegate?
     lazy var queue = DispatchQueue(label: "mpv", qos: .userInitiated)
+    /// mpv loads asynchronously after `loadfile` returns. Bind logical request tokens through mpv's unique
+    /// playlist-entry IDs instead of assuming START_FILE order. The same lock covers command registration
+    /// and event binding, so a wakeup cannot observe START_FILE before its exact entry ID is registered.
+    private let loadTokenLock = NSLock()
+    private var loadProvenance = PlayerLoadProvenanceState()
+    var activeLoadToken: PlayerLoadToken? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return loadProvenance.activeToken
+    }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
     // Initialized on first capture using the same MTLDevice mpv renders into. Always accessed from
     // captureQueue (serial), so no lock is needed.
@@ -855,10 +864,45 @@ final class MPVMetalViewController: PlatformViewController {
     }
     #endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only
 
+    func invalidateLoadToken() {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        loadProvenance.invalidate()
+    }
+
+    private func callbackLoadToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return loadProvenance.callbackToken(requiresLoadedFile: requiresLoadedFile)
+    }
+
+    private func bindStartFile(entryID: Int64) {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        loadProvenance.bindStart(entryID: entryID)
+    }
+
+    private func markActiveFileLoaded() {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        loadProvenance.markFileLoaded()
+    }
+
+    private func loadToken(forEntryID entryID: Int64) -> PlayerLoadToken? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return loadProvenance.token(forEntryID: entryID)
+    }
+
+    private func propagateRedirect(_ event: mpv_event_end_file) {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        loadProvenance.propagateRedirect(
+            from: event.playlist_entry_id,
+            firstInsertedID: event.playlist_insert_id,
+            count: Int(event.playlist_insert_num_entries)
+        )
+    }
+
     /// Tear mpv down safely when the player closes. Clearing the wakeup callback first
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
+        invalidateLoadToken()
         NotificationCenter.default.removeObserver(self)
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
 #if os(tvOS)
@@ -910,15 +954,25 @@ final class MPVMetalViewController: PlatformViewController {
     /// its UA into the next stream.
     private lazy var defaultUserAgent = getString("user-agent") ?? ""
 
+    @discardableResult
     func loadFile(
         _ url: URL,
         headers: [String: String]? = nil,
         live: Bool = false,
-        audioSidecar: URL? = nil
-    ) {
+        audioSidecar: URL? = nil,
+        reusing loadToken: PlayerLoadToken? = nil
+    ) -> PlayerLoadToken {
+        // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
+        // including internal reloads, so a queued callback can never become valid again through token reuse.
+        let issuedToken = PlayerLoadToken()
+        // Keep the prior request's provenance until `loadfile replace` succeeds. The synchronous command can
+        // reject before changing mpv's playlist; eagerly invalidating here would erase the still-playing
+        // request and make a caller-restored pending episode impossible to commit. START_FILE is blocked by
+        // `loadTokenLock` during the command below, then success atomically retires the old request and
+        // registers the new entry.
         // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
         // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
-        guard mpv != nil else { return }
+        guard mpv != nil else { return issuedToken }
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
         // colorspace — the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
@@ -1125,7 +1179,52 @@ final class MPVMetalViewController: PlatformViewController {
         // userinfo and query string, which must not land in the device's persistent unified log.
         let redactedURL = "\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"
         mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(sidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
-        command("loadfile", args: args)
+        // `loadfile replace` mutates the playlist synchronously, while actual loading begins later. Hold the
+        // same lock START_FILE takes and consume the immutable entry id returned by this exact command before
+        // a racing event can bind. Reading playlist/0 afterward is racy because redirects and START_FILE may
+        // mutate index zero as soon as the mpv core releases its own lock.
+        loadTokenLock.lock()
+        var commandNode = mpv_node()
+        let commandResult = commandReturningNode("loadfile", args: args, result: &commandNode)
+        let entryID: Int64
+        if commandResult >= 0 {
+            entryID = Self.returnedPlaylistEntryID(from: commandNode) ?? 0
+            mpv_free_node_contents(&commandNode)
+            if entryID == 0 {
+                mpvLog.error("loadfile accepted without one valid returned playlist entry id; callback attribution invalidated")
+            }
+        } else {
+            entryID = 0
+        }
+        loadProvenance.completeReplacement(
+            commandSucceeded: commandResult >= 0,
+            entryID: entryID,
+            token: issuedToken
+        )
+        loadTokenLock.unlock()
+        return issuedToken
+    }
+
+    /// Decode only the command result map promised by mpv for `loadfile`. The pure field selector lives in
+    /// `PlayerLoadProvenanceState` so malformed and duplicate result cases are covered by the standalone
+    /// callback-provenance contract without mirroring libmpv's threading behavior.
+    private static func returnedPlaylistEntryID(from result: mpv_node) -> Int64? {
+        guard result.format == MPV_FORMAT_NODE_MAP,
+              let list = result.u.list,
+              list.pointee.num > 0,
+              let keys = list.pointee.keys,
+              let values = list.pointee.values else { return nil }
+        var fields: [PlayerLoadProvenanceState.CommandResultField] = []
+        fields.reserveCapacity(Int(list.pointee.num))
+        for index in 0..<Int(list.pointee.num) {
+            guard let keyPointer = keys[index] else { continue }
+            let value = values[index]
+            fields.append(.init(
+                key: String(cString: keyPointer),
+                int64Value: value.format == MPV_FORMAT_INT64 ? value.u.int64 : nil
+            ))
+        }
+        return PlayerLoadProvenanceState.playlistEntryID(from: fields)
     }
 
     private func configureLiveMode(_ live: Bool) {
@@ -1623,14 +1722,19 @@ final class MPVMetalViewController: PlatformViewController {
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval = MPVMetalViewController.subtitleDownloadTimeout,
                              completion: ((Bool) -> Void)? = nil) {
-        guard let remote = URL(string: url) else { completion?(false); return }
+        guard let remote = URL(string: url), let requestToken = activeLoadToken else {
+            completion?(false)
+            return
+        }
         let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
 
         // Fast path: reuse a previously downloaded file if it's still on disk (no network).
         if let cached = Self.cachedSubtitleFile(for: remote) {
-            self.queue.async {
-                self.command("sub-add", args: [cached.path, "select", title, lang])
-                finish(true)
+            self.queue.async { [weak self] in
+                guard let self else { finish(false); return }
+                finish(self.applyExternalSubtitle(
+                    cached, title: title, lang: lang, loadToken: requestToken
+                ))
             }
             return
         }
@@ -1638,10 +1742,24 @@ final class MPVMetalViewController: PlatformViewController {
         Self.downloadSubtitle(remote, timeout: timeout, retriesLeft: Self.subtitleDownloadRetries) { [weak self] localFile in
             guard let self, let localFile else { finish(false); return }
             self.queue.async {
-                self.command("sub-add", args: [localFile.path, "select", title, lang])   // local file: no network, off-main
-                finish(true)
+                finish(self.applyExternalSubtitle(
+                    localFile, title: title, lang: lang, loadToken: requestToken
+                ))
             }
         }
+    }
+
+    private func applyExternalSubtitle(_ localFile: URL, title: String, lang: String,
+                                       loadToken: PlayerLoadToken) -> Bool {
+        // Serialize the ownership check and sub-add with replacement load issue. If replacement won the lock,
+        // this fetch is stale and is dropped. If subtitle add won, it completes on the old file before that file
+        // is synchronously replaced, so it cannot attach an E2 subtitle to E3 media.
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: loadToken, activeToken: loadProvenance.activeToken
+        ) else { return false }
+        command("sub-add", args: [localFile.path, "select", title, lang])
+        return true
     }
 
     /// Return the cached local file for `remote` only if it was recorded this session AND still exists on
@@ -1894,6 +2012,25 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
+    /// Synchronous command variant for commands whose returned node is part of correctness. The caller owns
+    /// the successful result and must release it with `mpv_free_node_contents` after parsing.
+    private func commandReturningNode(
+        _ command: String,
+        args: [String?] = [],
+        result: inout mpv_node
+    ) -> Int32 {
+        guard mpv != nil else { return -1 }
+        var cargs = makeCArgs(command, args).map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
+        defer {
+            for ptr in cargs where ptr != nil {
+                free(UnsafeMutablePointer(mutating: ptr!))
+            }
+        }
+        let returnValue = mpv_command_ret(mpv, &cargs, &result)
+        checkError(returnValue)
+        return returnValue
+    }
+
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
         // Build or rebuild the pipeline lazily — at VIDEO_RECONFIG time the device/drawableSize may
@@ -1944,10 +2081,16 @@ final class MPVMetalViewController: PlatformViewController {
     /// Deliver a property change on the main thread, dropping it if the player has been torn
     /// down (mpv == nil). Without the guard, a queued block force-unwraps the nil IUO mpv and
     /// traps, the crash on close.
-    private func emit(_ name: String, _ data: Any?) {
+    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        guard let capturedToken = loadToken ?? callbackLoadToken() else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.mpv != nil else { return }
-            self.playDelegate?.propertyChange(propertyName: name, data: data)
+            guard let self, self.mpv != nil,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: capturedToken, activeToken: self.activeLoadToken
+                  ) else { return }
+            self.playDelegate?.propertyChange(
+                propertyName: name, data: data, loadToken: capturedToken
+            )
         }
     }
 
@@ -1981,9 +2124,14 @@ final class MPVMetalViewController: PlatformViewController {
                         let propertyName = String(cString: property.name)
                         switch propertyName {
                         case MPVProperty.videoParamsSigPeak:
-                            if let sigPeak = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
+                            if let sigPeak = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee,
+                               let loadToken = self.callbackLoadToken() {
                                 DispatchQueue.main.async { [weak self] in
-                                    guard let self, self.mpv != nil else { return }   // dropped if torn down
+                                    guard let self, self.mpv != nil,
+                                          PlayerLoadProvenanceState.accepts(
+                                            callbackToken: loadToken,
+                                            activeToken: self.activeLoadToken
+                                          ) else { return }
                                     #if canImport(UIKit)
                                     let maxEDRRange = self.view.window?.screen.potentialEDRHeadroom ?? 1.0
                                     #elseif canImport(AppKit)
@@ -1992,14 +2140,20 @@ final class MPVMetalViewController: PlatformViewController {
                                     // display screen support HDR and current playing HDR video
                                     self.hdrAvailable = maxEDRRange > 1.0 && sigPeak > 1.0
                                     self.syncDisplayDynamicRange(sigPeak: sigPeak)
-                                    self.playDelegate?.propertyChange(propertyName: propertyName, data: sigPeak)
+                                    self.playDelegate?.propertyChange(
+                                        propertyName: propertyName, data: sigPeak, loadToken: loadToken
+                                    )
                                 }
                             }
                         case MPVProperty.videoParamsGamma:
                             // Gamma settled (e.g. HLG, or a late pq on an in-place switch). Re-derive the
                             // range from the current params; reapplyDynamicRange reads sig-peak fresh.
+                            guard let loadToken = self.callbackLoadToken() else { break }
                             DispatchQueue.main.async { [weak self] in
-                                guard let self, self.mpv != nil else { return }
+                                guard let self, self.mpv != nil,
+                                      PlayerLoadProvenanceState.accepts(
+                                        callbackToken: loadToken, activeToken: self.activeLoadToken
+                                      ) else { return }
                                 self.reapplyDynamicRange()
                             }
                         case MPVProperty.pausedForCache:
@@ -2045,7 +2199,13 @@ final class MPVMetalViewController: PlatformViewController {
                                 if now - self.lastTimePosEmit >= minInterval {
                                     self.lastTimePosEmit = now
                                     VXProbeState.shared.setPlayer(pos: Int(value))
-                                    self.emit(propertyName, value)
+                                    if let loadToken = self.callbackLoadToken(requiresLoadedFile: true) {
+                                        self.emit(
+                                            propertyName,
+                                            PlayerTimePositionEvent(seconds: value, loadToken: loadToken),
+                                            loadToken: loadToken
+                                        )
+                                    }
                                 }
                             }
                         case MPVProperty.pause:
@@ -2063,7 +2223,14 @@ final class MPVMetalViewController: PlatformViewController {
                         default: break
                         }
                     }
+                case MPV_EVENT_START_FILE:
+                    if let data = event!.pointee.data {
+                        let start = UnsafePointer<mpv_event_start_file>(OpaquePointer(data)).pointee
+                        self.bindStartFile(entryID: start.playlist_entry_id)
+                    }
                 case MPV_EVENT_FILE_LOADED:
+                    self.markActiveFileLoaded()
+                    guard let loadedToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
                     // The file opened and its tracks/params are known. Push a compact source label (the
                     // current path's host, redacted of any token-bearing query) into the probe state so the
                     // heartbeat names what is playing, and mark the engine as mpv + state playing.
@@ -2075,7 +2242,10 @@ final class MPVMetalViewController: PlatformViewController {
                     // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
                     // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                        guard let self, self.mpv != nil else { return }
+                        guard let self, self.mpv != nil,
+                              PlayerLoadProvenanceState.accepts(
+                                callbackToken: loadedToken, activeToken: self.activeLoadToken
+                              ) else { return }
                         let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
                         let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
                         let ao = self.getString("current-ao") ?? "?"
@@ -2088,8 +2258,12 @@ final class MPVMetalViewController: PlatformViewController {
                     // every in-place episode switch even when two HDR episodes share a mastering peak —
                     // exactly the case that left ~2 of 3 switches dull. Re-derive + re-apply HDR from the
                     // freshly settled params (the nil sentinel set in loadFile guarantees it isn't swallowed).
+                    guard let loadToken = self.callbackLoadToken() else { break }
                     DispatchQueue.main.async { [weak self] in
-                        guard let self, self.mpv != nil else { return }
+                        guard let self, self.mpv != nil,
+                              PlayerLoadProvenanceState.accepts(
+                                callbackToken: loadToken, activeToken: self.activeLoadToken
+                              ) else { return }
                         self.reapplyDynamicRange()
                         self.updateCapturePipeline()
                     }
@@ -2099,14 +2273,19 @@ final class MPVMetalViewController: PlatformViewController {
                     // forever" and let the user pick another source.
                     if let data = event!.pointee.data {
                         let ef = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
+                        if ef.reason == MPV_END_FILE_REASON_REDIRECT {
+                            self.propagateRedirect(ef)
+                            break
+                        }
+                        guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
                             VXProbe.event("player", "endfile error \(msg)")
-                            self.emit(MPVProperty.endFileError, msg)
+                            self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
                             VXProbe.event("player", "endfile eof")
-                            self.emit(MPVProperty.endFileEof, nil)   // natural end → auto-play-next
+                            self.emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:

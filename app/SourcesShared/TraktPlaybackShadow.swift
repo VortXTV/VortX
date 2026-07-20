@@ -103,7 +103,7 @@ final class TraktPlaybackShadow {
     /// Trakt's stored percent for this title/episode under whichever id form the caller's meta carries.
     private func progress(for meta: PlaybackMeta) -> Double? {
         let key: String
-        if meta.type == "series" {
+        if meta.usesSeriesLifecycle {
             guard let season = meta.season, let episode = meta.episode else { return nil }
             key = Self.episodeKey(meta.libraryId, season: season, episode: episode)
         } else {
