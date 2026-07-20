@@ -320,7 +320,16 @@ struct SettingsView: View {
     /// backup-direction flow); once seeded it confirms with the live last-sync time.
     @ViewBuilder private var seedingBanner: some View {
         section(String(localized: "Moving day")) {
-            if vortxSync.hasCompletedFirstSync {
+            // Type-erased body (see below). This is the deepest nested conditional in Settings and
+            // the exact frame the Beta 5 launch crash logs point at; keeping its content AnyView-wrapped
+            // is the second line of defence behind `section` also returning AnyView. See FAIL-260720-113.
+            seedingBannerContent
+        }
+    }
+
+    private var seedingBannerContent: AnyView {
+        if vortxSync.hasCompletedFirstSync {
+            return AnyView(
                 HStack(spacing: Theme.Space.md) {
                     Image(systemName: "checkmark.icloud.fill")
                         .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
@@ -333,7 +342,10 @@ struct SettingsView: View {
                     }
                     Spacer(minLength: 0)
                 }
-            } else {
+            )
+        }
+        return AnyView(
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
                 Label(MoveSeeding.headline, systemImage: "shippingbox.fill")
                     .font(Theme.Typography.body.weight(.semibold))
                     .foregroundStyle(Theme.Palette.textPrimary)
@@ -358,7 +370,7 @@ struct SettingsView: View {
                     .buttonStyle(ChipButtonStyle(selected: false))
                 }
             }
-        }
+        )
     }
 
     // MARK: Account
@@ -1379,18 +1391,27 @@ struct SettingsView: View {
 
     // MARK: Section chrome
 
-    @ViewBuilder private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            Text(title).eyebrowStyle()
-            content()
-        }
-        .padding(Theme.Space.lg)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
-        // tvOS focus is spatial: "Log Out" sits far right (after a Spacer) while the next focusable
-        // views are left-aligned, outside the downward beam. Making each section a focus section lets
-        // the engine redirect focus into it even when it's off the movement axis.
-        .focusSection()
+    // Returns AnyView on purpose (do NOT change back to `some View`). SettingsView.body stacks ~22
+    // of these; with each section carrying its own opaque generic Content type, body's compile-time
+    // generic type grew large enough that the tvOS runtime metadata demangler could not instantiate
+    // it, crashing the app at launch on tvOS 26.5 the moment the com.vortx `seedingBanner` was added
+    // (Beta 5, built against SDK 26.2). Type-erasing every section here bounds body's metadata to a
+    // small, uniform type so the launch crash cannot recur on any build toolchain. See
+    // DIS-260720-02 / FAIL-260720-113.
+    private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                Text(title).eyebrowStyle()
+                content()
+            }
+            .padding(Theme.Space.lg)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .vortxSettingsCard()
+            // tvOS focus is spatial: "Log Out" sits far right (after a Spacer) while the next focusable
+            // views are left-aligned, outside the downward beam. Making each section a focus section lets
+            // the engine redirect focus into it even when it's off the movement axis.
+            .focusSection()
+        )
     }
 
     private func infoRow(_ label: String, _ value: String) -> some View {
