@@ -95,7 +95,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ENGINE_DIR/target}"
 
 # Tier-2 targets install prebuilt components; the tier-3 tvOS triples have none to install
 # (build-std compiles std from rust-src), so they are deliberately absent here.
-rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
+rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>/dev/null || true
 
 # The per-slice feature sets. `kernel` = the pure frozen kernel ABI; `server` = kernel + the
 # 4-symbol in-process streaming server. See the header comment for why `host` is never built.
@@ -106,8 +106,10 @@ build_slice() { # <triple> <sdk> <kernel|server>
     local features="$FEATURES_KERNEL"
     [ "$3" = server ] && features="$FEATURES_SERVER"
     echo "- vortx-ffi $1 ($3)"
+    # --locked: the engine workspace tracks Cargo.lock, so a drifted dependency resolution FAILS
+    # the build here instead of silently linking a different graph than CI proved.
     SDKROOT="$(xcrun --sdk "$2" --show-sdk-path)" \
-        cargo +nightly build $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
+        cargo +nightly-2026-07-19 build --locked $BUILDSTD --manifest-path "$ENGINE_DIR/Cargo.toml" \
         -p vortx-ffi $features --release --target "$1"
 }
 

@@ -248,7 +248,19 @@ dependencies {
 // is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).
 // On a machine without the toolchain the task is skipped with a warning so the Kotlin/Compose build
 // still configures; the resulting APK simply won't contain the .so until built where cargo-ndk exists.
+// RELEASE-INTENT builds are the exception: see `engineRequired` below -- CI sets it, and then every
+// skip above becomes a hard build failure instead.
 // =====================================================================================================
+
+// Fail-closed switch for release-intent builds. When VORTX_REQUIRE_ENGINE=1 (env) or
+// -Pvortx.requireEngine=true is set, a missing engine checkout, a missing cargo toolchain, or a
+// missing/empty .so output is a HARD build failure (GradleException) instead of the dev-machine
+// warn-and-skip: an APK from such a build must never silently ship without its engines. CI
+// (.github/workflows/android.yml) sets it on every build it distributes; dev machines without the
+// Rust toolchain keep the graceful skip so the Kotlin/Compose build still works.
+val engineRequired: Boolean =
+    System.getenv("VORTX_REQUIRE_ENGINE") == "1" ||
+        (project.findProperty("vortx.requireEngine") as? String)?.toBoolean() == true
 
 // stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout from (in order):
 // STREMIOX_CORE_DIR env, the `stremiox.core.dir` gradle property, a sibling `../../stremiox-core`
@@ -274,6 +286,8 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
     // -o writes per-ABI subdirs (arm64-v8a/, x86_64/, ...) of .so files, the jniLibs layout.
+    // --locked: the engine repo tracks Cargo.lock, so a drifted dependency resolution FAILS the
+    // build instead of silently linking a different graph than the CI-proven runs.
     commandLine(
         buildList {
             add("cargo")
@@ -281,27 +295,51 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
             addAll(targetFlags)
             add("-p"); add(nativeApiLevel.toString())
             add("-o"); add(jniLibsOutDir.get().asFile.absolutePath)
-            add("build"); add("--release")
+            add("build"); add("--release"); add("--locked")
         },
     )
 
     // Skip gracefully when the toolchain is absent so non-Rust dev machines can still build the
-    // Kotlin/Compose app. CI (android.yml) installs cargo-ndk + the Android Rust targets, so there the
-    // task runs and the .so is packaged.
+    // Kotlin/Compose app -- UNLESS the build is release-intent (engineRequired), where a missing
+    // engine is a hard failure. CI (android.yml) installs cargo-ndk + the Android Rust targets and
+    // sets VORTX_REQUIRE_ENGINE=1, so there the task must run and the .so must be packaged.
     val cargoOnPath = System.getenv("PATH").orEmpty().split(File.pathSeparator).any { dir ->
         File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
     }
     onlyIf {
+        val manifestOk = File(coreCrateDir, "Cargo.toml").isFile
+        if (engineRequired && !(cargoOnPath && manifestOk)) {
+            val why = if (!manifestOk) "no crate manifest at ${coreCrateDir.path}/Cargo.toml" else "cargo is not on PATH"
+            throw GradleException(
+                "[stremiox-core] engine build REQUIRED (VORTX_REQUIRE_ENGINE / vortx.requireEngine) but $why; " +
+                    "refusing to package an APK without libstremiox_core.so.",
+            )
+        }
         if (!cargoOnPath) {
             logger.warn("[stremiox-core] cargo not on PATH; skipping native build. APK will lack libstremiox_core.so until built with the Rust + cargo-ndk toolchain installed.")
         }
-        if (!coreCrateDir.exists()) {
+        if (!manifestOk) {
             logger.warn("[stremiox-core] engine crate not found at ${coreCrateDir.path} (proprietary, private repo). Set STREMIOX_CORE_DIR or clone VortXTV/stremiox-core to ../../stremiox-core. APK will lack libstremiox_core.so.")
         }
-        cargoOnPath && coreCrateDir.exists()
+        cargoOnPath && manifestOk
     }
     // Don't fail the whole build if cargo-ndk errors during early scaffolding; surface it instead.
     isIgnoreExitValue = false
+    // Fail-closed output proof (release-intent only): cargo-ndk exiting 0 is not enough -- a path
+    // drift in -o would leave the jniLibs merge packaging nothing. Require every shipped ABI's .so,
+    // non-empty, or fail the build.
+    doLast {
+        if (engineRequired) {
+            androidAbis.forEach { abi ->
+                val so = jniLibsOutDir.get().file("$abi/libstremiox_core.so").asFile
+                if (!so.isFile || so.length() == 0L) {
+                    throw GradleException(
+                        "[stremiox-core] engine build REQUIRED but no usable $abi/libstremiox_core.so at ${so.path} (missing or 0 bytes).",
+                    )
+                }
+            }
+        }
+    }
 }
 
 android {
@@ -364,6 +402,8 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
     workingDir = vortxEngineCoreDir ?: coreCrateDir // placeholder wd when unset; onlyIf gates the run
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    // --locked: same fail-closed reproducibility contract as cargoNdkBuild above (the engine
+    // workspace tracks Cargo.lock; drifted resolution fails the build instead of moving silently).
     commandLine(
         buildList {
             add("cargo")
@@ -373,7 +413,7 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
             add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
             add("build"); add("-p"); add("vortx-ffi")
             add("--no-default-features"); add("--features"); add("jni,server")
-            add("--release")
+            add("--release"); add("--locked")
         },
     )
     vortxEngineCoreDir?.let { environment("CARGO_TARGET_DIR", File(it, "target-andx").absolutePath) }
@@ -382,15 +422,40 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
         File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
     }
     onlyIf {
-        val engineDirOk = vortxEngineCoreDir?.isDirectory == true
-        if (!engineDirOk) {
-            logger.warn("[vortx-ffi] VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir not set (or not a directory); skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
+        val manifestOk = vortxEngineCoreDir?.let { File(it, "Cargo.toml").isFile } == true
+        if (engineRequired && !(cargoOnPath && manifestOk)) {
+            val why = if (!manifestOk) {
+                "no engine workspace manifest at ${vortxEngineCoreDir?.path ?: "<unset VORTX_ENGINE_CORE_DIR / vortx.engine.coreDir>"}/Cargo.toml"
+            } else {
+                "cargo is not on PATH"
+            }
+            throw GradleException(
+                "[vortx-ffi] engine build REQUIRED (VORTX_REQUIRE_ENGINE / vortx.requireEngine) but $why; " +
+                    "refusing to package an APK without a freshly built libvortx_ffi.so.",
+            )
+        }
+        if (!manifestOk) {
+            logger.warn("[vortx-ffi] VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir not set (or no Cargo.toml there); skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
         } else if (!cargoOnPath) {
             logger.warn("[vortx-ffi] cargo not on PATH; skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
         }
-        engineDirOk && cargoOnPath
+        manifestOk && cargoOnPath
     }
     isIgnoreExitValue = false
+    // Fail-closed output proof (release-intent only), mirroring cargoNdkBuild's doLast: every shipped
+    // ABI must have a non-empty libvortx_ffi.so staged for the jniLibs merge, or the build fails.
+    doLast {
+        if (engineRequired) {
+            androidAbis.forEach { abi ->
+                val so = vortxJniLibsDir.file("$abi/libvortx_ffi.so").asFile
+                if (!so.isFile || so.length() == 0L) {
+                    throw GradleException(
+                        "[vortx-ffi] engine build REQUIRED but no usable $abi/libvortx_ffi.so at ${so.path} (missing or 0 bytes).",
+                    )
+                }
+            }
+        }
+    }
 }
 
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
