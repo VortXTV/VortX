@@ -274,6 +274,8 @@ You sign in with your own account and bring your own add-ons. No content is bund
 
 ## Building it yourself
 
+**Most people do not need this.** VortX's engine layer is proprietary and now lives in a private repo, so a full from-source build requires access to that engine repo and is available only to the project maintainers. If you just want to run VortX, download the prebuilt, unsigned IPA (and the macOS `.dmg`) from the [Releases](https://github.com/VortXTV/VortX/releases) page and sideload it the usual way. That is the supported path, and it is always the latest build. The public repo here holds the app itself; the engine step below stops with `stremiox-core crate not found` without engine access, so the rest of this section is for maintainers who have it.
+
 You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust nightly with rust-src (the native engine now powers Apple TV, iPhone, iPad, and Mac). MPVKit comes in over Swift Package Manager. No local streaming-server install is needed: the fetch script downloads everything it cannot find.
 
 ```bash
@@ -282,7 +284,9 @@ You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 #    public CDN), and the bundled subtitle fallback fonts.
 ./scripts/fetch-server-deps.sh
 
-# 2) Build the stremio-core engine into an xcframework (needs Rust nightly + rust-src).
+# 2) Build the engine into an xcframework (needs Rust nightly + rust-src AND access to the
+#    private stremiox-core engine repo: set STREMIOX_CORE_DIR, or clone it to ../../stremiox-core).
+#    Maintainers only. Without engine access this stops with "stremiox-core crate not found".
 #    Produces the tvOS, iOS, and macOS slices the native apps link.
 ./scripts/build-core-xcframework.sh
 
