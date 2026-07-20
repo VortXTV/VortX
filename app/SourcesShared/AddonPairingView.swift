@@ -211,7 +211,9 @@ struct AddonPairingView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // Shared settings-card glass instead of a hand-rolled surface1 plate (opaque warm card on tvOS via
+        // the preset's built-in path). The white QR plate above stays solid on purpose: scan contrast.
+        .vortxSettingsCard()
     }
 
     @ViewBuilder private func trailingControl(for row: Row) -> some View {

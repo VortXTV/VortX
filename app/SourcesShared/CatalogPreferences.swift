@@ -482,7 +482,15 @@ struct CatalogManagerView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        // Shared glass instead of a hand-rolled surface1 plate. Split per host: on iPhone/iPad/Mac the row
+        // lives inside the reorder List, where row insets clip a normal drop shadow, so it takes the
+        // List-safe `vortxGlassListRow` (flat shadow); on tvOS the rows scroll under the focus engine, so
+        // they take `vortxSettingsCard`, whose built-in opaque tvOS path avoids a per-row live blur.
+        #if os(tvOS)
+        .vortxSettingsCard()
+        #else
+        .vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        #endif
     }
 
     private func move(_ keys: [String], from: Int, to: Int) {

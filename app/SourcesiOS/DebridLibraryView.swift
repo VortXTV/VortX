@@ -57,16 +57,12 @@ struct DebridLibraryView: View {
     }
 
     private var refreshButton: some View {
-        Button {
+        // The shared circular chrome disc (CircleIconDisc on the disc glass primitive, with the standard
+        // press/hover feedback) instead of a hand-rolled surface2 circle, so this matches the hero back /
+        // overflow discs everywhere else.
+        CircleIconButton(systemName: "arrow.clockwise", diameter: Theme.Control.circleChrome) {
             Task { await model.reload(hasKey: debrid.hasAnyKey) }
-        } label: {
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .padding(Theme.Space.sm)
-                .background(Theme.Palette.surface2, in: Circle())
         }
-        .buttonStyle(.plain)
         .disabled(model.phase == .loading || !debrid.hasAnyKey)
         .opacity(model.phase == .loading ? 0.5 : 1)
         .accessibilityLabel("Refresh library")

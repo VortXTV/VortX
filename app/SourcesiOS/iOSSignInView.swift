@@ -222,15 +222,16 @@ struct iOSSignInView: View {
         .frame(maxWidth: 460)
     }
 
-    /// A warm surface card wrapping a single text/secure field, matching the tvOS login fields.
+    /// A glass field wrapping a single text/secure field, matching the tvOS login fields and the other
+    /// text-entry surfaces (ServerConfigView, StremioImportView): `vortxGlassField`'s higher fill alpha
+    /// keeps typed text legible over the blur.
     private func field<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         content()
             .font(Theme.Typography.body)
             .foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.sm)
-            .background(Theme.Palette.surface1,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
     }
 
     // MARK: Footnote
