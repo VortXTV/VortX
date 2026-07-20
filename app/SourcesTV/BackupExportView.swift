@@ -88,7 +88,10 @@ struct BackupExportView: View {
             // but the BACKUP default is "Keep this device": the user came here to SAVE this Apple TV's data,
             // so pushThisDevice() is the primary button. None of the three can silently drop a profile
             // (syncDown unions the local roster back in even on "Use account's data").
-            Button("Keep this device") { resolve { await $0.pushThisDevice() } }
+            // keepThisDeviceOverridingAccount, not pushThisDevice: reached only after the account's doc was
+            // positively READ, so this is the user's informed choice to overwrite it and the one push allowed
+            // past the #145 restore gate.
+            Button("Keep this device") { resolve { await $0.keepThisDeviceOverridingAccount() } }
             Button("Merge both (keep all profiles)") { resolve { await $0.mergeBoth() } }
             Button("Use account's data") { resolve { await $0.useAccountData() } }
         } message: {

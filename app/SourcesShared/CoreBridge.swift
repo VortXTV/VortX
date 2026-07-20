@@ -90,6 +90,18 @@ final class CoreBridge: ObservableObject {
     /// slot, own-account profiles their own). Resolved per read so a profile switch re-points it.
     private var activeTokenAccount: String { ProfileStore.shared.activeKeychainAccount }
 
+    /// Wave 4: this device has imported its Stremio-owned library into the VortX account AND is not opted into
+    /// two-way Stremio sync, so the engine must run purely LOCAL: never seed / re-auth the Stremio token, never
+    /// pull from api.strem.io. BOTH bootstrapAuth and scheduleSessionRepair gate on this so neither re-establishes
+    /// a Stremio session behind the migration (the logout / re-login ping-pong that would defeat the import).
+    /// Computed from the Keychain token + the per-account import flag + the opt-in. After the post-import Logout
+    /// the (now server-dead) token is cleared, so there is no token and this reads false: the device is then
+    /// simply signed out of Stremio and takes the signed-out recovery path.
+    private var importedAwayFromStremio: Bool {
+        guard let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return false }
+        return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
+    }
+
     private init() {}
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
@@ -121,13 +133,15 @@ final class CoreBridge: ObservableObject {
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
     private func seedInitialState() {
-        let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
         let rows = buildBoardRows()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if !items.isEmpty { self.continueWatching = items }
             if !rows.isEmpty { self.boardRows = rows }
         }
+        // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
+        // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
+        // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
+        rebuildContinueWatching()
         refreshAddons()
     }
 
@@ -156,14 +170,16 @@ final class CoreBridge: ObservableObject {
            let addons = profile["addons"] as? [[String: Any]] {
             for addon in addons { if let url = addon["transportUrl"] as? String { raw[url] = addon } }
         }
-        // Enforce durable removal tombstones at the publish point. Official/protected stubs are NEVER
-        // tombstoned (a logout resets the engine to exactly those), so this can only ever remove a
-        // user-installed add-on the user explicitly deleted.
+        // Enforce durable removal tombstones at the publish point. PROTECTED stubs (Cinemeta, Local Files)
+        // are NEVER tombstoned (a logout resets the engine to exactly those, and the UI has no Remove for
+        // them), so this can only ever remove an add-on the user explicitly deleted: a user-installed
+        // add-on OR a REMOVABLE official one (YouTube, WatchHub, Public Domain, OpenSubtitles are
+        // official=true, protected=false and the engine re-seeds them on every reset, #137).
         let removed = AddonTombstones.all()
         if !removed.isEmpty {
             func isTombstoned(_ descriptor: CoreDescriptor) -> Bool {
                 removed.contains(AddonTombstones.normalize(descriptor.transportUrl))
-                    && !descriptor.isOfficial && !descriptor.isProtected
+                    && !descriptor.isProtected
             }
             let toUninstall = typed.filter(isTombstoned).compactMap { raw[$0.transportUrl] }
             let survivingTyped = typed.filter { !isTombstoned($0) }
@@ -210,17 +226,21 @@ final class CoreBridge: ObservableObject {
     /// `tombstone` (default true) records a DURABLE cross-device removal in `AddonTombstones` so the
     /// removal SYNCS: `vortxSummary` pushes the set into `doc.vortx.deletedAddons` and subtracts it from
     /// the `doc.vortx.addons` UNION, and `syncDown` re-applies it on peers (mirrors `deletedProfiles`).
-    /// Official/protected stubs are NEVER tombstoned (a logout resets the engine to exactly those, so a
-    /// tombstone there would wrongly suppress a default forever). The Change-URL replace path passes
+    /// PROTECTED stubs (Cinemeta, Local Files) are NEVER tombstoned (a logout resets the engine to exactly
+    /// those, so a tombstone there would wrongly suppress an essential default forever; the UI also offers
+    /// no Remove for them). A REMOVABLE official add-on (YouTube, WatchHub, Public Domain, OpenSubtitles:
+    /// official=true, protected=false) IS tombstoned, because the engine re-seeds OFFICIAL_ADDONS on every
+    /// reset and would otherwise resurrect a user's deletion on the next launch (#137); a genuine re-add
+    /// through the store clears it via `AddonTombstones.forget`. The Change-URL replace path passes
     /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
-    /// URL must stay re-addable on every device. The genuine in-app Remove button keeps the default.
+    /// URL must stay re-addable on every device.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
         // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
         // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
         // `guard let raw ... else { return }` made Remove a SILENT NO-OP in that case, which is exactly the
         // owner-reported "pressing delete doesn't delete." Tombstoning + refreshAddons still suppresses it.
-        if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
+        if tombstone, !descriptor.isProtected {
             AddonTombstones.tombstone(descriptor.transportUrl)
             // Propagate the removal to your other devices PROMPTLY. The tombstone write arms the
             // UserDefaults-didChange auto-sync, but that push is DEBOUNCED and reschedules on every write,
@@ -427,27 +447,80 @@ final class CoreBridge: ObservableObject {
     ///  - Else migrate the legacy authKey: fetch the real User (PullUserFromAPI builds profile.auth),
     ///    then, once the `ctx` event confirms we're logged in, pull addons + sync the library.
     private func bootstrapAuth() {
+        // Wave 4 (VortX owns the library + Continue Watching): once THIS Stremio account's library has been
+        // imported into the VortX account doc, the engine runs on its purely-LOCAL library bucket (already
+        // mirrored to doc.vortx.library + re-hydrated on cold devices), and the engine's Stremio session is
+        // unloaded (see the importedAway branch below) so stremio-core stops auto-syncing to api.strem.io.
+        // `importedAway` = migrated AND not opted into two-way sync.
+        let stremioToken = Keychain.string(activeTokenAccount)
+        let hasStremioToken = (stremioToken?.isEmpty == false)
+        let importedAway = importedAwayFromStremio
+
         if isLoggedIn() {
+            if importedAway {
+                // Wave 4 (Finding 2): this account is migrated to VortX and NOT opted into two-way sync, yet the
+                // engine still holds a live Stremio session from its own persisted storage. stremio-core
+                // auto-persists library / progress mutations to api.strem.io whenever a session is loaded (the
+                // same upstream-persist behavior the add-on delete paths guard against), so leaving it logged in
+                // keeps writing to Stremio behind our back and the device is not actually independent. Unload the
+                // engine session ONCE. Logout KILLS the Stremio session SERVER-SIDE (so the token is now dead)
+                // and resets the engine to its empty default profile, so: gate it on the account doc being
+                // reachable THIS launch; then clear the now-dead Keychain token (Fix A: reconnecting Stremio
+                // later is a FRESH sign-in, never a reuse of this dead token); then DETERMINISTICALLY recover the
+                // owner library at launch (Fix C: wait for the engine to process the Logout, load the empty
+                // library, then hydrate owned add-ons + recover from doc.vortx) instead of waiting for the 14s
+                // session repair. Next launch has no token, so isLoggedIn() is false and this runs at most once;
+                // on an unreachable launch we keep the session and retry next launch (never an empty UI).
+                Task { @MainActor in
+                    if await VortXSyncManager.shared.accountDocReachable() {
+                        NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
+                        self.logOut()   // Ctx Logout: kills the Stremio session server-side + resets the engine
+                        // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
+                        // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
+                        // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
+                        Keychain.set(nil, for: self.activeTokenAccount)
+                        // Deterministic post-logout recovery: wait for the engine to actually process the Logout
+                        // (isLoggedIn flips false and the library resets), then load that empty library and recover
+                        // the owner library from doc.vortx at launch, not after the 14s repair.
+                        for _ in 0 ..< 30 where self.isLoggedIn() { try? await Task.sleep(nanoseconds: 100_000_000) }
+                        await self.loadLibraryAndAwait()
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    } else {
+                        NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
+                    }
+                    self.loadBoard()
+                }
+                loadBoard()
+                return
+            }
+            // Not migrated yet (or opted into two-way sync): pull/sync from Stremio as before.
             refreshFromAPI()
             // VortX-first (account-owns-everything): hydrate the VortX account's owned add-ons into the engine
             // on EVERY launch, not only when degraded, so doc.vortx.addons is the source of truth and a still-
             // valid Stremio session reconciles ON TOP of it rather than the engine's Stremio-sourced storage
             // being the sole source. Idempotent + never-zero guarded inside the sync manager (installs only the
             // missing owned add-ons), so a healthy engine is a no-op and a failed/empty account pull does nothing.
+            // Then run the one-time library import so the token-load can stop on the next launch (data-safe:
+            // capture-then-record, never destroys; a no-op once the per-account flag is set).
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                if hasStremioToken, let stremioToken {
+                    await VortXSyncManager.shared.importOwnerLibraryFromStremioOnce(stremioToken: stremioToken)
+                }
                 self.loadBoard()
             }
             loadBoard() // refresh the board now too; addons were already hydrated from the engine's own storage
             return       // scheduleSessionRepair() is now called once from start() for ALL paths
         }
-        guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
-            NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
-            // Account-owns-everything: with no Stremio session, hydrate the VortX account's owned add-ons
-            // back into the engine BEFORE loading the board, so a logged-out device shows the account's
-            // add-ons + sources instead of only Cinemeta. Idempotent + never-zero guarded inside the sync
-            // manager (a failed/empty account pull does nothing). loadBoard runs once hydration kicks the
-            // ctx event, and again here so a no-account-doc device still gets the default browsable Home.
+        guard hasStremioToken, let stremioToken, !importedAway else {
+            // Either genuinely signed out (no token), OR post-import + opt-out: do NOT seed the engine with the
+            // Stremio token. Account-owns-everything: hydrate the VortX account's owned add-ons + recover the
+            // owner library BEFORE loading the board, so the device shows the account's add-ons + sources +
+            // library instead of only Cinemeta. Idempotent + never-zero guarded inside the sync manager (a
+            // failed/empty account pull does nothing). loadBoard runs once hydration kicks the ctx event, and
+            // again here so a no-account-doc device still gets the default browsable Home.
+            NSLog("[CoreBridge] engine stays signed out of Stremio (%@)",
+                  hasStremioToken ? "library imported to VortX; token retained but not loaded" : "no token in Keychain")
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
                 self.loadBoard()
@@ -458,9 +531,11 @@ final class CoreBridge: ObservableObject {
             loadBoard()
             return
         }
+        // Not yet imported (or opted into two-way sync): seed the engine from the Stremio token as before. The
+        // ctx event completes the pull; the one-time import then runs on a subsequent launch's isLoggedIn() path.
         awaitingAuthMigration = true
         NSLog("[CoreBridge] seeding engine from legacy authKey…")
-        dispatchCtx(["action": "PullUserFromAPI", "args": ["token": key]])
+        dispatchCtx(["action": "PullUserFromAPI", "args": ["token": stremioToken]])
     }
 
     /// Self-heal a stale or INCOMPLETE engine session. Two failure modes seen in the wild, both of
@@ -491,11 +566,13 @@ final class CoreBridge: ObservableObject {
             // genuinely-logged-out or degraded device.
             Task { @MainActor in
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
-                // When a Stremio token still exists, also re-establish that session so the live Stremio
-                // pull reconciles on top of the hydrated floor (no zero window: the doc hydrated first).
-                // When there is NO usable token (genuinely logged out), the doc hydration is the whole
-                // recovery — never call switchAccount with an empty token.
-                if hasStremioToken, let key {
+                // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
+                // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
+                // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
+                // logout / re-login ping-pong (and, since the post-import token is server-dead, thrash the UI).
+                // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
+                // Never call switchAccount with an empty token.
+                if hasStremioToken, let key, !self.importedAwayFromStremio {
                     NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
                     self.switchAccount(token: key)
                 } else {
@@ -766,6 +843,22 @@ final class CoreBridge: ObservableObject {
                  field: "library")
     }
 
+    /// Dispatch `loadLibrary()` and AWAIT the engine populating its `library` field (LibraryWithFilters), so a
+    /// caller (the Wave 4 one-time Stremio import) can snapshot the FULL owner library rather than racing the
+    /// load. Bounded poll; returns as soon as `library` is non-nil or the timeout elapses. Idempotent: if the
+    /// library is already loaded this returns immediately without re-dispatching.
+    @MainActor
+    func loadLibraryAndAwait(timeout: TimeInterval = 6) async {
+        if library == nil { loadLibrary() }
+        let deadlineNanos = UInt64(timeout * 1_000_000_000)
+        let stepNanos: UInt64 = 200_000_000   // 0.2s poll cadence
+        var elapsed: UInt64 = 0
+        while library == nil, elapsed < deadlineNanos {
+            try? await Task.sleep(nanoseconds: stepNanos)
+            elapsed += stepNanos
+        }
+    }
+
     /// Switch the Library's type / sort, pass the chip's own `request` back verbatim.
     func selectLibrary(_ request: CoreLibraryRequest) {
         guard let requestDict = Self.encodeToDict(request) else { return }
@@ -915,14 +1008,16 @@ final class CoreBridge: ObservableObject {
 
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
     /// descriptor's transportUrl) is in the durable removal tombstone set. Mirrors the refreshAddons
-    /// enforcement (CoreBridge.refreshAddons): official/protected add-ons are never subtracted, so a
-    /// malformed web-authored removal of a default can hide nothing, exactly like the list surface.
+    /// enforcement (CoreBridge.refreshAddons): PROTECTED add-ons (Cinemeta, Local Files) are never
+    /// subtracted, so a malformed web-authored removal of an essential default can hide nothing. A
+    /// removable official add-on (YouTube, WatchHub, …) the user deleted IS subtracted, matching the list
+    /// and board surfaces (#137).
     @MainActor
     private func isTombstonedAddonBase(_ base: String, removed: Set<String>) -> Bool {
         let key = AddonTombstones.normalize(base)
         guard removed.contains(key) else { return false }
         if let descriptor = addons.first(where: { AddonTombstones.normalize($0.transportUrl) == key }),
-           descriptor.isOfficial || descriptor.isProtected {
+           descriptor.isProtected {
             return false
         }
         return true
@@ -1153,7 +1248,7 @@ final class CoreBridge: ObservableObject {
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
     /// flips live instead of waiting for a library sync. Relies on meta_details being loaded (it is,
     /// since playback is launched from the detail screen).
-    func markPlaybackWatched(_ meta: PlaybackMeta) {
+    func markPlaybackWatched(_ meta: PlaybackMeta, allowEngineWrite: Bool = true) {
         // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
         // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
         // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
@@ -1163,7 +1258,11 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.markWatched(meta: meta)   // overlay profile: private history only
             return
         }
-        if meta.type == "series" {
+        // Scrobble and overlay-profile state above are keyed by the explicit PlaybackMeta and remain safe even
+        // when an episodic engine re-point failed. Only the owner-engine dispatch depends on confirmed Player
+        // attribution; callers close this leg rather than suppressing the correct external watched signal.
+        guard allowEngineWrite else { return }
+        if meta.usesSeriesLifecycle {
             var payload: [String: Any] = ["id": meta.videoId]
             if let season = meta.season { payload["season"] = season }
             if let episode = meta.episode { payload["episode"] = episode }
@@ -1201,9 +1300,76 @@ final class CoreBridge: ObservableObject {
         // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
         // throughout this file (markPlaybackWatched, removeFromLibrary, setLibraryItemWatched, finishedWatching).
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
-        guard let item = metaDetails?.libraryItem else { return nil }
-        if meta.type == "series", let videoId = item.state.videoId, videoId != meta.videoId { return 0 }
-        return max(0, item.state.timeOffset / 1000.0)
+        guard let item = metaDetails?.libraryItem else { return vortxOwnedResumeSeconds(for: meta) }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: item.state.videoId,
+            requestedVideoID: meta.videoId
+        ) {
+            return vortxOwnedResumeSeconds(for: meta) ?? 0
+        }
+        let engine = max(0, item.state.timeOffset / 1000.0)
+        if engine > 0 { return engine }                                    // freshest local play wins
+        // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
+        // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
+        // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
+        if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
+        return 0
+    }
+
+    /// Resume position (seconds) for `meta` read from the engine's LOCAL library bucket BY ID: the currently
+    /// loaded meta_details item (matched on id), else the Continue-Watching preview, else the loaded library
+    /// catalog. Unlike `engineResumeSeconds` (which reads whatever meta_details currently holds, trusting the
+    /// caller to have loaded the right title), this matches on `meta.libraryId`, so it stays correct even when a
+    /// DIFFERENT title is loaded, the Continue-Watching direct-resume race where meta_details has not landed yet
+    /// and the caller fell through from `engineResumeSeconds`. This is the VortX-owned resume source: the local
+    /// bucket is mirrored to doc.vortx.library and re-hydrated on cold devices, so it needs no Stremio session.
+    /// Returns nil only when the engine has no entry for this title at all (the caller then decides 0 vs the
+    /// opt-in Stremio read). A series entry whose saved episode differs returns 0 (start this episode fresh),
+    /// mirroring `engineResumeSeconds`.
+    @MainActor
+    func engineResumeSecondsByLibraryId(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }   // overlay: not this profile's item
+        // The engine's own library item for this id: the loaded meta, else the published CW, else the RAW preview
+        // (which still includes finished movies / mid-series roll-forwards the published CW prunes), else the
+        // loaded library catalog.
+        var matched: CoreCWItem?
+        if let loaded = metaDetails?.libraryItem, loaded.id == meta.libraryId { matched = loaded }
+        else if let cw = continueWatching.first(where: { $0.id == meta.libraryId }) { matched = cw }
+        else if let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?
+            .items.first(where: { $0.id == meta.libraryId }) { matched = preview }
+        else if let lib = library?.catalog.first(where: { $0.id == meta.libraryId }) { matched = lib }
+        guard let item = matched else { return vortxOwnedResumeSeconds(for: meta) }   // engine has no entry: cache
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: item.state.videoId,
+            requestedVideoID: meta.videoId
+        ) {
+            return vortxOwnedResumeSeconds(for: meta) ?? 0
+        }
+        let engine = max(0, item.state.timeOffset / 1000.0)
+        if engine > 0 { return engine }                                    // freshest local play wins
+        // Engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
+        // duration == 0). A genuine finished / rewound 0 keeps duration > 0 and is REAL, so trust it.
+        if item.state.duration == 0 { return vortxOwnedResumeSeconds(for: meta) ?? 0 }
+        return 0
+    }
+
+    /// The VortX-owned resume offset (seconds) for `meta.libraryId` held in the local owner-resume cache
+    /// (`OwnerResumeStore`, populated from `doc.vortx.library` on cold recovery). Consulted ONLY when the
+    /// engine's own library bucket has no positive offset for the title: a cold / reinstalled / post-import
+    /// device re-adds owner titles at time 0 because stremio-core exposes no action to inject a saved offset,
+    /// so this cache is what restores cross-device resume. Series: only when the cached episode matches. Returns
+    /// nil (not 0) when there is no positive cached offset, so a genuine "start from 0" is never overridden.
+    private func vortxOwnedResumeSeconds(for meta: PlaybackMeta) -> Double? {
+        guard ProfileStore.shared.activeUsesEngineHistory else { return nil }
+        guard let entry = OwnerResumeStore.entry(forId: meta.libraryId), entry.t > 0 else { return nil }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: entry.v,
+            requestedVideoID: meta.videoId
+        ) { return nil }
+        return entry.t
     }
 
     // MARK: Library / Continue Watching mutations (Ctx actions; CW + library refresh live via events)
@@ -1237,6 +1403,34 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    /// Clear the WHOLE Continue Watching rail durably (Settings > Advanced). Per title this is exactly the
+    /// long-press "Remove from Continue Watching" path, so it inherits its cross-device durability: the
+    /// OWNER branch tombstones every id (LibraryTombstones) BEFORE the engine dispatch so vortxSummary
+    /// subtracts them from the doc.vortx.library union and peers fold the removals, and an overlay profile
+    /// touches only its private history via ProfileStore. One immediate push at the end for the whole batch
+    /// (not one per title, unlike the single-item path) so the tombstones land promptly without N round
+    /// trips. Never "just delete locally": a bare local clear would be resurrected by the next union pull.
+    func clearContinueWatching() {
+        guard ProfileStore.shared.activeUsesEngineHistory else {
+            // Overlay profile: CW renders from the profile's private overlay; clear those entries only.
+            for item in ProfileStore.shared.cwItems {
+                ProfileStore.shared.removeWatchEntry(metaId: item.id)
+            }
+            return
+        }
+        let ids = continueWatching.map(\.id)
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            LibraryTombstones.tombstone(id)
+            dispatchCtx(["action": "RemoveFromLibrary", "args": id])
+        }
+        // The engine re-emits continue_watching_preview + library, so the rail empties on its own.
+        Task {
+            let ok = await VortXSyncManager.shared.pushThisDevice()
+            NSLog("[library] cleared Continue Watching (%d titles), pushed to sync (ok=%@)", ids.count, ok ? "yes" : "no")
+        }
+    }
+
     /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
     /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
     /// entries rather than full catalog previews. A no-op if the id isn't in the library.
@@ -1260,6 +1454,66 @@ final class CoreBridge: ObservableObject {
     /// so a mid-series roll-forward with a fresh low-progress episode is preserved).
     static func pruneFinished(_ items: [CoreCWItem]) -> [CoreCWItem] {
         items.filter { !$0.isFinished }
+    }
+
+    /// Recompute + publish the owner Continue Watching rail as the engine's own `continue_watching_preview`
+    /// UNIONED with owner-library titles the engine currently holds at time 0 whose saved resume offset is
+    /// cached in `OwnerResumeStore`.
+    ///
+    /// A device migrated off Stremio (the default) or cold-installed against a VortX account re-adds its owner
+    /// library through `AddToLibrary` at time 0 (stremio-core exposes no action to inject a saved offset), so
+    /// the engine's `continue_watching_preview` (membership is purely `time_offset > 0`) comes back EMPTY and
+    /// the Home rail hides (#149) even though every resume position is already synced into `OwnerResumeStore`.
+    /// Those offsets were previously consulted ONLY at play time (`vortxOwnedResumeSeconds`), never surfaced
+    /// into the rail. This paints them from the LOCAL cache immediately, before any per-title Cinemeta re-add
+    /// or network round trip settles, which also fixes the #147 "CW slower / flashes then disappears" report.
+    ///
+    /// Owner-profile only: an overlay profile rides `profiles.cwItems` and ignores this published value, so for
+    /// a non-owner profile this stays EXACTLY `pruneFinished(engine preview)` (unchanged behaviour). Decodes off
+    /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
+    /// synthesizes + publishes on main.
+    func rebuildContinueWatching() {
+        let engine = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
+        let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let items = ProfileStore.shared.activeUsesEngineHistory
+                ? Self.unionOwnerContinueWatching(engine: engine, library: library)
+                : engine
+            VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
+            self.continueWatching = items
+        }
+    }
+
+    /// Merge the engine's live-offset preview with SYNTHESIZED entries for owner-library titles the engine
+    /// holds at time 0 whose saved offset is cached in `OwnerResumeStore`. Engine items come FIRST (they are
+    /// authoritative and already recency-sorted) and win any id present in both, so a title is never
+    /// double-counted (the engine's live position also wins the resume read, `vortxOwnedResumeSeconds`).
+    /// Synthesized items follow in library order (the library's default `lastwatched` sort, so still
+    /// recency-leaning) and are pruned of finished titles. Pure + owner-only; the caller gates on
+    /// `activeUsesEngineHistory`.
+    static func unionOwnerContinueWatching(engine: [CoreCWItem], library: [CoreCWItem]) -> [CoreCWItem] {
+        var seen = Set(engine.map(\.id))
+        var synthesized: [CoreCWItem] = []
+        for item in library {
+            // Real saved titles only: skip removed / temp markers, and skip anything the engine already
+            // surfaces with a live offset (dedup, engine wins).
+            guard !(item.removed ?? false), !(item.temp ?? false), !seen.contains(item.id) else { continue }
+            // Only titles with a positive CACHED offset are resumable; a finished/rewound title caches t == 0
+            // (a finish that propagated) and is correctly excluded, so it never resurrects here.
+            guard let entry = OwnerResumeStore.entry(forId: item.id), entry.t > 0 else { continue }
+            // Overlay the cached offset (seconds -> ms) onto the library item's own display fields. Watched
+            // counts are left at 0 (as the overlay-profile builder does): the title HAS a resume position, so
+            // it should show unless its own progress is at/past the 0.9 finished ceiling, which pruneFinished
+            // below still enforces. The resume video id falls back to the library item's when the cache has
+            // none (a movie).
+            let overlaid = CoreLibState(timeOffset: entry.t * 1000, duration: entry.d * 1000,
+                                        videoId: entry.v ?? item.state.videoId)
+            synthesized.append(CoreCWItem(id: item.id, type: item.type, name: item.name,
+                                          poster: item.poster, state: overlaid))
+            seen.insert(item.id)
+        }
+        return engine + pruneFinished(synthesized)
     }
 
     /// Drop a finished title (a movie, or the last episode of a series) out of Continue Watching by
@@ -1455,6 +1709,8 @@ final class CoreBridge: ObservableObject {
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
         let metaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
                            ?? metaItems.first)?["request"]
+        let metaPath = ((metaRequest as? [String: Any])?["path"] as? [String: Any])
+        let metaType = metaPath?["type"] as? String
         var rawStream: [String: Any]?
         var streamRequest: Any?
         var firstReadyStream: [String: Any]?
@@ -1464,7 +1720,13 @@ final class CoreBridge: ObservableObject {
                   content["type"] as? String == "Ready",
                   let streams = content["content"] as? [[String: Any]] else { continue }
             if firstReadyStream == nil, let s = streams.first { firstReadyStream = s; firstReadyRequest = group["request"] }
-            if let match = streams.first(where: { streamMatches($0, stream) }) {
+            let requestPath = ((group["request"] as? [String: Any])?["path"] as? [String: Any])
+            let requestVideoID = requestPath?["id"] as? String ?? metaPath?["id"] as? String ?? ""
+            let requestType = requestPath?["type"] as? String ?? metaType
+            let isEpisode = EpisodePlaybackIdentity.isEpisodicContext(
+                type: requestType, season: nil, episode: nil, videoID: requestVideoID
+            )
+            if let match = streams.first(where: { streamMatches($0, stream, isEpisode: isEpisode) }) {
                 rawStream = match; streamRequest = group["request"]; break
             }
         }
@@ -1474,7 +1736,13 @@ final class CoreBridge: ObservableObject {
         // so Continue Watching + resume + progress track correctly regardless of which stream object we hand
         // the engine. Without this, a match miss silently skipped the Player load -> no library item -> CW
         // never updated and progress was lost (the "CW stopped working / progress not tracked" report).
-        if rawStream == nil { rawStream = firstReadyStream; streamRequest = firstReadyRequest }
+        // A torrent is identified by the full (infoHash,fileIdx) pair. Falling back to an arbitrary ready
+        // torrent after an exact miss can bind a different episode from the same season pack. Direct sources
+        // keep the historical fallback because proxy/reconstruction can legitimately obscure their URL.
+        if rawStream == nil, !stream.isTorrent, !stream.isUsenet {
+            rawStream = firstReadyStream
+            streamRequest = firstReadyRequest
+        }
         guard let rawStream, let streamRequest, let metaRequest else {
             DiagnosticsLog.log("cw", "loadEnginePlayer no-op (meta_details/stream/metaRequest missing) — CW + progress will not track for this item")
             return
@@ -1499,7 +1767,8 @@ final class CoreBridge: ObservableObject {
     /// first tick. The meta request is still read from the resident `meta_details` (series-stable across a binge).
     /// Returns true when the Player was dispatched; the caller uses that to set its progress-attribution gate.
     @discardableResult
-    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?) -> Bool {
+    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?,
+                          resolvedURL: URL? = nil) -> Bool {
         guard let data = stateData("meta_details"),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
@@ -1522,7 +1791,28 @@ final class CoreBridge: ObservableObject {
         // opens the attribution gate for videoId (a FALSE re-point confirmation). Degrade to nil exactly like
         // the missing-base path: no-op here, the caller sets enginePlayerVideoId = nil, and the gated writers
         // skip the wrong-episode engine write until the resident-scrape poll re-points.
-        let raw = rawStreamDict(stream)
+        // This overload constructs a series episode request. A raw torrent without fileIdx is ambiguous.
+        // When native debrid already resolved it, bind the concrete direct URL that will play. Never turn a
+        // provider-local file offset into a Stremio torrent selector. A direct stream may legitimately carry
+        // infoHash provenance, so only `isTorrent` enters this guard.
+        guard let bindingSource = EpisodePlaybackIdentity.engineBindingSource(
+            isRawTorrent: stream.isTorrent,
+            fileIdx: stream.fileIdx,
+            resolvedURL: resolvedURL?.absoluteString
+        ) else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (episode torrent missing fileIdx and resolved URL); engine progress will not re-point")
+            return false
+        }
+        let raw: [String: Any]
+        switch bindingSource {
+        case .original:
+            raw = rawStreamDict(stream)
+        case .resolvedDirectURL(let url):
+            var direct: [String: Any] = ["url": url]
+            if let name = stream.name { direct["name"] = name }
+            if let description = stream.description { direct["description"] = description }
+            raw = direct
+        }
         let hasSource = raw["url"] != nil || raw["ytId"] != nil || raw["infoHash"] != nil
             || raw["sources"] != nil || raw["externalUrl"] != nil
         guard hasSource else {
@@ -1559,6 +1849,8 @@ final class CoreBridge: ObservableObject {
         if let ext = s.externalUrl { raw["externalUrl"] = ext }
         if let name = s.name { raw["name"] = name }
         if let desc = s.description { raw["description"] = desc }
+        if let nzb = s.nzbUrl { raw["nzbUrl"] = nzb }
+        if let include = s.fileMustInclude { raw["fileMustInclude"] = include }
         return raw
     }
 
@@ -1569,9 +1861,24 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "Unload"], field: "player")
     }
 
-    private func streamMatches(_ raw: [String: Any], _ stream: CoreStream) -> Bool {
+    private func streamMatches(_ raw: [String: Any], _ stream: CoreStream, isEpisode: Bool) -> Bool {
         if let url = stream.url { return raw["url"] as? String == url }
-        if let hash = stream.infoHash { return raw["infoHash"] as? String == hash }
+        if stream.infoHash != nil {
+            return EpisodePlaybackIdentity.torrentMatches(
+                rawInfoHash: raw["infoHash"] as? String,
+                rawFileIdx: raw["fileIdx"] as? Int,
+                selectedInfoHash: stream.infoHash,
+                selectedFileIdx: stream.fileIdx,
+                isEpisode: isEpisode
+            )
+        }
+        if let nzb = stream.nzbUrl {
+            guard raw["nzbUrl"] as? String == nzb else { return false }
+            if let include = stream.fileMustInclude {
+                return raw["fileMustInclude"] as? String == include
+            }
+            return true
+        }
         if let yt = stream.ytId { return raw["ytId"] as? String == yt }
         return false
     }
@@ -1714,9 +2021,9 @@ final class CoreBridge: ObservableObject {
 
         // Decode the changed screens off the main thread, then publish on main.
         if fields.contains("continue_watching_preview") {
-            let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
-            VXProbe.log("engine", "continueWatching changed n=\(items.count)")
-            DispatchQueue.main.async { [weak self] in self?.continueWatching = items }
+            // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
+            // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
+            rebuildContinueWatching()
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
         // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
@@ -1765,6 +2072,13 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.library = value }
+            // A library change can change which owner titles belong in Continue Watching: the cold-recovery
+            // re-add lands at time 0 and NEVER fires a continue_watching_preview event, and a newly-synced
+            // offset (refreshOwnerResumeCache) can qualify a title. Rebuild the rail from the engine preview
+            // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
+            // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
+            // while sparing the ~20s progress-save churn (#147).
+            if !playerActive { rebuildContinueWatching() }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.
@@ -2018,12 +2332,13 @@ final class CoreBridge: ObservableObject {
     /// list, so every other ctx-derived read surface (the Home board rows, the catalog manager list)
     /// must subtract this set too, or a removed add-on's catalogs ghost forever (#121). Read-side only:
     /// stored hide/order prefs for a ghost key stay intact, so a genuine reinstall gets the user's old
-    /// catalog prefs back. Official/protected stubs are never suppressed, mirroring `refreshAddons`.
+    /// catalog prefs back. PROTECTED stubs (Cinemeta, Local Files) are never suppressed; a removable
+    /// official add-on the user deleted IS, mirroring `refreshAddons` (#137).
     private static func tombstonedBases(in addons: [CoreDescriptor]) -> Set<String> {
         let removed = AddonTombstones.all()
         guard !removed.isEmpty else { return [] }
         var out = Set<String>()
-        for addon in addons where !addon.isOfficial && !addon.isProtected {
+        for addon in addons where !addon.isProtected {
             let key = AddonTombstones.normalize(addon.transportUrl)
             if removed.contains(key) { out.insert(key) }
         }

@@ -26,7 +26,7 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
-import com.vortx.android.ui.theme.vortxShadow
+import com.vortx.android.ui.theme.vortxGlassRow
 
 /// One episode row (DESIGN-SYSTEM.md §3 "Episode row"): a 16:9 [thumb] slot + watched check + progress
 /// stripe, `code` (S/E) + [title], [airDate], and a 2-line [overview]. Dims when [watched]. [thumb] is
@@ -53,9 +53,7 @@ fun EpisodeRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .vortxShadow(VortXTheme.elevation.rest, VortXShapes.card)
-            .clip(VortXShapes.card)
-            .background(colors.surface1, VortXShapes.card)
+            .vortxGlassRow()
             .then(
                 if (onLongClick != null) {
                     Modifier.combinedClickable(onLongClick = onLongClick, onClick = onClick)

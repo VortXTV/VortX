@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Samsung Tizen TV web application manifest for VortX. The packaged .wgt is the same built webapp
+     dist/ (index.html + hashed assets), wrapped so a Samsung TV can install and launch it. The Tizen
+     application id is <10-char package id>.<app name>; the package id must stay in sync with the
+     signing profile. required_version targets Tizen 6.0 (2021 TV models and newer). -->
+<widget xmlns="http://www.w3.org/ns/widgets"
+        xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://vortx.tv/webapp"
+        version="0.1.0"
+        viewmodes="maximized">
+  <tizen:application id="VortXtv001.VortX" package="VortXtv001" required_version="6.0"/>
+  <content src="index.html"/>
+  <name>VortX</name>
+  <description>Watch your add-on catalogs on the big screen. Direct, debrid, and HLS-first streaming.</description>
+  <icon src="icon.png"/>
+  <tizen:profile name="tv"/>
+  <!-- 1080p landscape TV surface. -->
+  <feature name="http://tizen.org/feature/screen.size.normal.1080.1920"/>
+  <!-- Network access to Cinemeta + user-installed add-on / debrid hosts. -->
+  <tizen:privilege name="http://tizen.org/privilege/internet"/>
+  <access origin="*" subdomains="true"/>
+  <tizen:allow-navigation>*</tizen:allow-navigation>
+  <!-- hwkey-event delivers the remote Back key (keyCode 10009) as a keydown so tvnav.ts can handle it;
+       landscape only; no background running (playback stops when the app is backgrounded). -->
+  <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable"
+                 encryption="disable" install-location="auto" hwkey-event="enable"/>
+</widget>

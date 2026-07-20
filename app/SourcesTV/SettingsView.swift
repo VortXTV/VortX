@@ -15,8 +15,19 @@ struct SettingsView: View {
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
+    /// Settings search query. Empty shows the full settings tree; a non-empty query filters the sections
+    /// below to those whose title or any of their row keywords contain it (case-insensitive substring).
+    @State private var settingsQuery = ""
     @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
+    // Match Frame Rate: HDRDisplayMode owns both the key and the display-mode behavior it drives, so the key
+    // string lives there rather than being duplicated as a literal across the Settings screens.
+    @AppStorage(HDRDisplayMode.matchFrameRateKey) private var matchFrameRate = HDRDisplayMode.defaultMatchFrameRate
+    /// Phase 8: the in-process engine streaming-server flag (default OFF, CEO/device-gated flip).
+    /// Same key as iOSSettingsView (settings parity); the row renders only in builds whose linked
+    /// VortxEngine slice carries the server (VortxNativeServerFlag.isSupported), which today is no
+    /// tvOS build (the tier-3 server cross-compile walls), so this stays invisible until it can work.
+    @AppStorage(VortxNativeServerFlag.key) private var engineServerOn = false
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
@@ -24,6 +35,8 @@ struct SettingsView: View {
     @State private var showLangRestart = false
     // Diagnostic-log export over the LAN: the QR overlay flag + the started (url, qr) payload.
     @State private var showDiagExport = false
+    // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
+    @State private var showClearCWConfirm = false
     @State private var diagExport: (url: String, qr: Image)?
     // Per-tab bar visibility (#117): the four hideable tabs, one key each (TabBarPrefs). Home,
     // Add-ons, and Settings have no toggle so the app can never lose its anchor or this screen.
@@ -33,9 +46,16 @@ struct SettingsView: View {
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
     @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
+    // Top Shelf mirror of Continue Watching (the tvOS Home screen row). The writer reads this same key,
+    // and the change handler below republishes so a toggle takes effect without waiting for a re-seed.
+    @AppStorage(TopShelfSnapshotWriter.showKey) private var topShelfCW = TopShelfSnapshotWriter.showDefault
     @AppStorage("vortx.collections.refreshCadence") private var hubCadence = "daily"
     @AppStorage("vortx.detail.showFinancials") private var showFinancials = true
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true
+    // Spoiler-safe mode (SourcePreferences.spoilerSafeKey) supersets the legacy thumbnail-only blur: the ONE
+    // visible row below drives both keys together so the detail views' `(spoilerSafe || spoilerBlur)` gate has
+    // a single source of truth (no leftover legacy default-on blur when the user turns spoiler-safe off).
+    @AppStorage(SourcePreferences.spoilerSafeKey) private var spoilerSafe = SourcePreferences.defaultSpoilerSafe
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -44,6 +64,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.forced) private var prefForced = TrackPreferences.ForcedPolicy.forced.rawValue
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
+    @AppStorage(TrackPreferences.Key.subOnlyPreferred) private var subOnlyPreferred = false
     // When "1", the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
     @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
@@ -93,6 +114,13 @@ struct SettingsView: View {
     // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
     // authorization through UNUserNotificationCenter directly (see setNotifyNewEpisodes below).
     @AppStorage("stremiox.notifyNewEpisodes") private var notifyNewEpisodes = true
+    // Auto-delete watched downloads: a completed download whose title becomes fully finished-watched has its
+    // file + record removed to reclaim space. Default OFF, so the feature stays inert until opted into. SAME
+    // key iOS/Mac binds (DownloadManager.autoDeleteWatchedDefaultsKey is the single source of truth for the
+    // name). Enforcement is already cross-platform: DownloadManager reads this key straight off UserDefaults
+    // at each finished-watched signal, and that path is in SourcesShared with no os(iOS) guard, so tvOS was
+    // already honouring the key with no way to set it here.
+    @AppStorage(DownloadManager.autoDeleteWatchedDefaultsKey) private var autoDeleteWatched = false
     /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
     /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
     private enum AccountFocus: Hashable { case vortx, importStremio }
@@ -103,21 +131,33 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Text("Settings").screenTitleStyle()
-                    profilesSection
-                    accountSection
-                    stremioMirrorSection
-                    playbackSection
-                    notificationsSection
-                    streamsSection
-                    communitySection
-                    serverSection
-                    tabBarSection
-                    appearanceSection
-                    audioSubtitleSection
-                    subtitleSection
-                    advancedSection
-                    backupSection
-                    aboutSection
+                    // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the
+                    // search field, ungated by the settings filter so the move state is ALWAYS inspectable
+                    // here. Not launch-gated (unlike the nag sheet): un-seeded it prompts, seeded it confirms.
+                    seedingBanner
+                    // Focusable search field: typing filters the sections below (additive, the whole tree
+                    // stays intact and returns the moment the field is cleared). Each section is gated by
+                    // `sectionMatches`, so an empty query shows everything and a query keeps only the hits.
+                    searchSection
+                    if isSearching && !hasAnySettingsMatch {
+                        noSettingsMatchSection
+                    }
+                    if sectionMatches(.profiles) { profilesSection }
+                    if sectionMatches(.account) { accountSection }
+                    if sectionMatches(.stremioMirror) { stremioMirrorSection }
+                    if sectionMatches(.playback) { playbackSection }
+                    if sectionMatches(.downloads) { downloadsSection }
+                    if sectionMatches(.notifications) { notificationsSection }
+                    if sectionMatches(.streams) { streamsSection }
+                    if sectionMatches(.community) { communitySection }
+                    if sectionMatches(.server) { serverSection }
+                    if sectionMatches(.tabBar) { tabBarSection }
+                    if sectionMatches(.appearance) { appearanceSection }
+                    if sectionMatches(.audioSubtitle) { audioSubtitleSection }
+                    if sectionMatches(.subtitle) { subtitleSection }
+                    if sectionMatches(.advanced) { advancedSection }
+                    if sectionMatches(.backup) { backupSection }
+                    if sectionMatches(.about) { aboutSection }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.vertical, Theme.Space.xl)
@@ -171,6 +211,65 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Settings search
+
+    /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
+    private var trimmedSettingsQuery: String {
+        settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Whether the user is actively filtering. An empty (or whitespace-only) field is treated as no filter.
+    private var isSearching: Bool { !trimmedSettingsQuery.isEmpty }
+
+    /// A section shows when there is no query, or when the query is a case-insensitive substring of the
+    /// section's title or any of its row keywords.
+    private func sectionMatches(_ id: SettingsSearchSection) -> Bool {
+        let q = trimmedSettingsQuery
+        guard !q.isEmpty else { return true }
+        if id.title.lowercased().contains(q) { return true }
+        return id.keywords.contains { $0.contains(q) }
+    }
+
+    /// True when at least one section matches the current query (drives the empty-state card).
+    private var hasAnySettingsMatch: Bool {
+        SettingsSearchSection.allCases.contains { sectionMatches($0) }
+    }
+
+    /// The focusable search field at the top of Settings. Focusing it opens the tvOS keyboard; typing
+    /// filters the sections below and the Clear chip (or emptying the field) restores the full tree. Sits
+    /// on the same settings-card glass as every section so it reads as part of the same surface.
+    private var searchSection: some View {
+        HStack(spacing: Theme.Space.md) {
+            Image(systemName: "magnifyingglass")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textTertiary)
+            TextField("Search settings", text: $settingsQuery)
+                .textFieldStyle(.plain)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .autocorrectionDisabled(true)
+            if !settingsQuery.isEmpty {
+                Button { settingsQuery = "" } label: {
+                    Label("Clear", systemImage: "xmark.circle.fill")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
+            }
+        }
+        .padding(Theme.Space.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .vortxSettingsCard()
+        .focusSection()
+    }
+
+    /// Shown in place of the settings tree when a query matches nothing, so the screen is never blank.
+    private var noSettingsMatchSection: some View {
+        section("No matches") {
+            Text("No settings match \"\(settingsQuery)\".")
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
     // MARK: Profiles
 
     private var profilesSection: some View {
@@ -211,6 +310,54 @@ struct SettingsView: View {
         }
         .fullScreenCover(item: $editingProfile) { profile in
             ProfileEditorView(original: profile)
+        }
+    }
+
+    // MARK: Move seeding (Phase 0 of the com.vortx move)
+
+    /// The persistent Settings twin of the launch nag (MoveSeedingNagTV): while this Apple TV owes its
+    /// first VortX-account sync it prompts (the keyboard-free QR sign-in via LoginView, plus the QR
+    /// backup-direction flow); once seeded it confirms with the live last-sync time.
+    @ViewBuilder private var seedingBanner: some View {
+        section(String(localized: "Moving day")) {
+            if vortxSync.hasCompletedFirstSync {
+                HStack(spacing: Theme.Space.md) {
+                    Image(systemName: "checkmark.icloud.fill")
+                        .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(MoveSeeding.backedUpLine)
+                            .font(Theme.Typography.body.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
+                            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            } else {
+                Label(MoveSeeding.headline, systemImage: "shippingbox.fill")
+                    .font(Theme.Typography.body.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(MoveSeeding.message)
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                if vortxSync.isSignedIn {
+                    // Signed in but the first round-trip has not landed yet: offer the manual kick.
+                    Button {
+                        Task { await vortxSync.pushThisDevice() }
+                    } label: {
+                        Label("Sync now", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+                } else {
+                    NavigationLink { LoginView(account: account) } label: {
+                        Label("Sign in / Create account", systemImage: "person.crop.circle")
+                    }
+                    .buttonStyle(PrimaryActionStyle())
+                    NavigationLink { BackupExportView() } label: {
+                        Label("Back up this Apple TV", systemImage: "arrow.up.circle")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                }
+            }
         }
     }
 
@@ -406,6 +553,23 @@ struct SettingsView: View {
         return all.map { (id: String($0), label: $0 == 100 ? String(localized: "Max (100%)") : "\($0)%") }
     }
 
+    // MARK: Downloads
+
+    /// Auto-delete watched downloads. UI only: the enforcement already runs here, since DownloadManager
+    /// reads the same key off UserDefaults at each finished-watched signal from shared code. This is the
+    /// switch that was missing on Apple TV, bound to the SAME key the iOS/Mac view binds, with the same copy.
+    /// Downloads have their own screen on Apple TV, so this sits in Settings next to the other opt-ins rather
+    /// than on the Downloads screen, matching where iOS/Mac put it.
+    private var downloadsSection: some View {
+        section(String(localized: "Downloads")) {
+            choiceRow(String(localized: "Auto-delete watched downloads"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { autoDeleteWatched ? "1" : "0" },
+                                         set: { autoDeleteWatched = ($0 == "1") }))
+            Text("When on, a completed download is removed automatically once you finish watching it, to reclaim space. Off by default, so downloads stay until you delete them.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+    }
+
     // MARK: Notifications
 
     /// New-episode alerts (F5). Same key + behavior as the iOS view: enabling requests notification
@@ -444,13 +608,21 @@ struct SettingsView: View {
         section(String(localized: "Community")) {
             choiceRow(String(localized: "Contribute anonymized data to improve results"),
                       [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { moatContribute ? "1" : "0" }, set: { moatContribute = ($0 == "1") }))
+                      selection: Binding(get: { moatContribute ? "1" : "0" }, set: {
+                          let newValue = ($0 == "1")
+                          SourceIndexLifecycleScope.shared.preferencesWillApply(consent: newValue)
+                          moatContribute = newValue
+                      }))
             Text(MoatConsent.disclosure)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             if moatContribute {
                 if vortxSync.isSignedIn {
                     choiceRow(String(localized: "Singularity sources"), [("0", "Off"), ("1", "On")],
-                              selection: Binding(get: { singularityServe ? "1" : "0" }, set: { singularityServe = ($0 == "1") }))
+                              selection: Binding(get: { singularityServe ? "1" : "0" }, set: {
+                                  let newValue = ($0 == "1")
+                                  SourceIndexLifecycleScope.shared.preferencesWillApply(serve: newValue)
+                                  singularityServe = newValue
+                              }))
                     Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 } else {
@@ -511,7 +683,7 @@ struct SettingsView: View {
 
     private func setDirectLinksOnly(_ value: Bool) {
         directLinksOnly = value
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !value, !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
         }
@@ -546,7 +718,7 @@ struct SettingsView: View {
                 // When the embedded server is unreachable, explain itself: node's run state and the
                 // server's own last log lines, so a dead server is diagnosable from the couch.
                 if serverOnline == false && !StremioServer.isCustom {
-                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    #if !VORTX_NO_EMBEDDED_SERVER
                     Text(NodeServer.statusDescription)
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     ForEach(NodeServer.logTail(), id: \.self) { line in
@@ -576,6 +748,40 @@ struct SettingsView: View {
                     Label("Configure server", systemImage: "server.rack")
                 }
                 .buttonStyle(PrimaryActionStyle())
+                // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
+                // in builds whose linked VortxEngine slice carries the server symbols (today: none on
+                // tvOS; the guard makes this row appear automatically the day a tvOS server slice
+                // exists). ON starts it immediately and the player follows its port
+                // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again.
+                if VortxNativeServerFlag.isSupported {
+                    Button {
+                        engineServerOn.toggle()
+                        if engineServerOn {
+                            VortxNativeServer.startIfNeeded()
+                        } else {
+                            Task.detached(priority: .utility) { VortxNativeServer.stop() }
+                        }
+                    } label: {
+                        HStack(alignment: .center, spacing: Theme.Space.lg) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Engine streaming server (experimental)")
+                                    .font(Theme.Typography.cardTitle)
+                                    .foregroundStyle(Theme.Palette.textPrimary)
+                                Text(engineServerOn ? VortxNativeServer.statusDescription
+                                                    : "Serve torrents from the built-in VortX engine instead of the bundled server.")
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(Theme.Palette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: Theme.Space.md)
+                            TogglePill(isOn: engineServerOn)
+                        }
+                        .padding(Theme.Space.md)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    }
+                    .buttonStyle(RowFocusStyle())
+                }
             }
         }
     }
@@ -667,6 +873,21 @@ struct SettingsView: View {
             Text("Tune poster width, corner radius, landscape 16:9 art, and labels, with a live preview.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
+            // Top Shelf: the row tvOS shows on its OWN Home screen when VortX is focused, above the app
+            // grid. Opt-out (default Show), because that row is visible to the whole room the moment the
+            // TV wakes, without opening VortX and without passing the profile picker.
+            // Republished from the SETTER, not a chained `.onChange` on the body: this section's body
+            // already sits against the type-check budget that the b176 gate hit, and one more chained
+            // modifier is how that regresses. It also has to be immediate rather than left to Home's
+            // next re-seed, because someone who just hid the row may well press the TV button straight
+            // from here, and the shelf must already be cleared when they land. @AppStorage writes
+            // through synchronously, so the publish below reads the value just set.
+            choiceRow(String(localized: "Continue Watching on the TV Home screen"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { topShelfCW ? "1" : "0" },
+                                         set: { topShelfCW = ($0 == "1"); TopShelfSnapshotWriter.publishCurrent() }))
+            Text("Puts what you are part-way through on the Apple TV Home screen, above the apps, so it is one press away. Hide it to keep your viewing off that screen.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
             choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
                       selection: Binding(get: { showHubHome ? "1" : "0" }, set: { showHubHome = ($0 == "1") }))
             choiceRow(String(localized: "Collections on Discover"), [("1", "Show"), ("0", "Hide")],
@@ -681,6 +902,11 @@ struct SettingsView: View {
                 Label("Discover & region", systemImage: "globe")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
+            // The full "Upcoming" calendar (next air / release dates of library + watchlisted titles).
+            NavigationLink { TVUpcomingScreen() } label: {
+                Label("Upcoming", systemImage: "calendar")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
             Text("Discover cards, Streaming-service tiles, and Genre tiles high on Home and Discover; tap a tile to browse its catalogs (Movies, Shows, New, Top week/month/year, Trending). Needs a TMDB key.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
@@ -689,13 +915,25 @@ struct SettingsView: View {
             Text("Show a movie's budget, box office, and profit on its detail page. Movies only; needs a TMDB key.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow(String(localized: "Blur unwatched episodes"), [("1", "Blur"), ("0", "Show")],
-                      selection: Binding(get: { spoilerBlur ? "1" : "0" }, set: { spoilerBlur = ($0 == "1") }))
-            Text("Blur episode thumbnails you have not watched yet, to avoid spoilers.")
+            // Spoiler-safe mode supersets the old thumbnail-only blur: it veils an unwatched episode's art AND
+            // synopsis. One row drives both the new key and the legacy `vortx.spoilerBlur` so turning it off
+            // fully clears the veil (no leftover legacy default-on blur). Retires the separate blur row.
+            choiceRow(String(localized: "Spoiler-safe mode"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { spoilerSafe ? "1" : "0" },
+                                         set: { spoilerSafe = ($0 == "1"); spoilerBlur = ($0 == "1") }))
+            Text("Veils art and synopsis for episodes you have not watched yet, to avoid spoilers.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
             Text("Auto tone-maps HDR and Dolby Vision to SDR only on a TV that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple on your TV; Always HDR forces pass-through.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            // Frame-rate matching is SDR-only by design: HDR and Dolby Vision titles already ask for their own
+            // frame rate as part of the display-mode switch, so this row adds nothing for them and does not
+            // gate them either.
+            choiceRow(String(localized: "Match Frame Rate"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { matchFrameRate ? "1" : "0" }, set: { matchFrameRate = ($0 == "1") }))
+            Text("Sends a film at its own frame rate, so 24p titles play smoothly instead of juddering in slow pans. Needs Settings > Video and Audio > Match Content > Match Frame Rate turned on in tvOS. Takes effect on the next title you play.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             stepperRow(String(localized: "App text size"), value: theme.textScale,
@@ -859,7 +1097,13 @@ struct SettingsView: View {
                       [(id: "", label: String(localized: "None"))] + TrackPreferences.commonLanguages,
                       selection: fallbackSubLang)
             choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
-            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
+            Toggle(isOn: $subOnlyPreferred) {
+                Text("Only show subtitles in my languages")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch)
+            .tint(Theme.Palette.accent)
+            Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow. Only show subtitles in my languages hides add-on and community subtitles in other languages from the in-player list (untagged-language subtitles always stay).")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
@@ -959,6 +1203,20 @@ struct SettingsView: View {
                 showDiagExport = true
             } label: { Text("Export diagnostic log") }
                 .buttonStyle(ChipButtonStyle(selected: false))
+            // Clear the whole Continue Watching rail, durably: tombstoned per title (LibraryTombstones)
+            // exactly like the long-press per-item remove, so sync can never resurrect the rail.
+            Button(role: .destructive) {
+                showClearCWConfirm = true
+            } label: { Label("Clear Continue Watching", systemImage: "minus.circle") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .confirmationDialog("Clear Continue Watching?", isPresented: $showClearCWConfirm, titleVisibility: .visible) {
+                    Button("Clear Continue Watching", role: .destructive) {
+                        CoreBridge.shared.clearContinueWatching()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Removes every title from Continue Watching on this profile, across all your devices. Titles stay watchable from Search and Discover.")
+                }
         }
     }
 
@@ -1145,6 +1403,73 @@ struct SettingsView: View {
     }
 }
 
+/// The searchable Settings sections on Apple TV. Each case carries the section's on-screen title plus the
+/// row keywords it should match, so the search field can filter the tree by a case-insensitive substring of
+/// any title or row label. Keywords are stored lowercased so matching is a plain `contains`. Kept in sync
+/// with the sections `SettingsView` actually renders (the iOS `iOSSettingsView` keeps its own equivalent).
+private enum SettingsSearchSection: CaseIterable {
+    case profiles, account, stremioMirror, playback, downloads, notifications, streams, community,
+         server, tabBar, appearance, audioSubtitle, subtitle, advanced, backup, about
+
+    var title: String {
+        switch self {
+        case .profiles: return "Profiles"
+        case .account: return "Account"
+        case .stremioMirror: return "Stremio mirror"
+        case .playback: return "Playback"
+        case .downloads: return "Downloads"
+        case .notifications: return "Notifications"
+        case .streams: return "Streams"
+        case .community: return "Community"
+        case .server: return "Streaming Server"
+        case .tabBar: return "Tab Bar"
+        case .appearance: return "Appearance"
+        case .audioSubtitle: return "Audio & Subtitles"
+        case .subtitle: return "Subtitle Style"
+        case .advanced: return "Advanced (mpv options)"
+        case .backup: return "Backup & Restore"
+        case .about: return "About"
+        }
+    }
+
+    var keywords: [String] {
+        switch self {
+        case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
+        case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
+                               "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
+                               "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
+                               "media server", "plex", "jellyfin", "emby", "api key"]
+        case .stremioMirror: return ["mirror", "two-way sync", "add-ons", "library", "continue watching"]
+        case .playback: return ["direct links only", "audio output", "video upscaling", "streaming cache",
+                                "player engine", "dolby vision", "mkv", "skip step", "auto-skip", "intro",
+                                "credits", "skip timestamps", "skip database", "seek bar", "community scrub previews",
+                                "trickplay", "autoplay trailers", "trailer language", "default volume",
+                                "auto-add watched", "play in", "external player"]
+        case .downloads: return ["downloads", "auto-delete", "delete watched", "offline", "storage", "reclaim space"]
+        case .notifications: return ["new episode alerts", "episode", "notification"]
+        case .streams: return ["quality preset", "smart source selection", "add-on ranking", "source type",
+                               "safety filter", "regex", "max quality", "minimum quality", "max file size",
+                               "compact source rows", "pinned sources", "resolution"]
+        case .community: return ["contribute", "anonymized data", "singularity", "privacy"]
+        case .server: return ["server", "configure server", "restart", "embedded", "node"]
+        case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
+        case .appearance: return ["accent", "background", "oled", "app language", "language",
+                                  "cinematic catalog cards", "hide poster labels", "poster style",
+                                  "collections on home", "collections on discover", "refresh collections",
+                                  "streaming services", "discover & region", "budget & box office", "spoiler",
+                                  "blur", "dolby vision", "hdr", "match frame rate", "frame rate", "judder",
+                                  "24p", "refresh rate", "text size", "performance",
+                                  "top shelf", "tv home screen", "home screen", "continue watching"]
+        case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
+                                     "subtitles", "forced", "match audio to subtitle"]
+        case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]
+        case .advanced: return ["mpv", "custom options", "diagnostic logging", "diagnostic log", "export log"]
+        case .backup: return ["backup", "restore", "export library", "import library"]
+        case .about: return ["version", "player", "what's new", "update", "libmpv", "mpvkit"]
+        }
+    }
+}
+
 private struct TogglePill: View {
     let isOn: Bool
 
@@ -1240,5 +1565,53 @@ private struct AccentCircle: View {
 
     private var ringWidth: CGFloat {
         focused || selected ? 5 : 0
+    }
+}
+
+/// One tapped Upcoming row, routed to its detail page. `metaId` is the meta (series / movie) catalog id.
+private struct TVUpcomingSelection: Identifiable {
+    let metaId: String
+    let type: String
+    var id: String { metaId + "|" + type }
+}
+
+/// The Settings "Upcoming" entry: a self-contained calendar of the next air / release dates of the user's
+/// library AND watchlisted titles. Owns its own `ReleaseCalendarModel` (so it is reachable without visiting
+/// Home) and refreshes it via `refreshUpcoming`, which folds the local watchlist (`LibraryAutoAdd`) in beside
+/// the library. A tapped row opens that title's `DetailView` in a sheet with its own NavigationStack, so the
+/// detail page keeps the navigation context its internal source / episode links need.
+struct TVUpcomingScreen: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()
+    @State private var selected: TVUpcomingSelection?
+
+    var body: some View {
+        UpcomingView(model: releaseCalendar) { id, type in
+            selected = TVUpcomingSelection(metaId: id, type: type)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refresh() }
+        .onChange(of: core.library?.catalog.count ?? 0) { refresh() }
+        .onChange(of: account.addons.count) { refresh() }
+        .sheet(item: $selected) { sel in
+            NavigationStack { DetailView(type: sel.type, id: sel.metaId) }
+        }
+    }
+
+    /// Derived exactly like the Home `refreshReleaseCalendar`: series / movie library ids + names / posters and
+    /// the `providesMeta` add-on bases, handed to `refreshUpcoming` (which adds the watchlisted-not-in-library titles).
+    private func refresh() {
+        let catalog = core.library?.catalog ?? []
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let seriesNames = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshUpcoming(librarySeriesIDs: series.map(\.id), librarySeriesNames: seriesNames,
+                                        libraryMovieIDs: movies.map(\.id), libraryMovieNames: movieNames,
+                                        libraryMoviePosters: moviePosters, metaBases: bases)
     }
 }

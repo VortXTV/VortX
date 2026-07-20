@@ -63,7 +63,7 @@ enum PlaybackSettings {
     }
 
     static var directLinksOnlyForced: Bool {
-        #if STREMIOX_NO_EMBEDDED_SERVER
+        #if VORTX_NO_EMBEDDED_SERVER
         true
         #else
         false
@@ -71,7 +71,7 @@ enum PlaybackSettings {
     }
 
     static var directLinksOnly: Bool {
-        #if STREMIOX_NO_EMBEDDED_SERVER
+        #if VORTX_NO_EMBEDDED_SERVER
         true
         #else
         UserDefaults.standard.bool(forKey: Key.directLinksOnly)
@@ -209,6 +209,15 @@ struct TrackPreferences: Equatable {
         static let subtitle = "stremiox.tracks.subLangs"
         static let forced = "stremiox.tracks.forced"
         static let reject = "stremiox.tracks.reject"
+        /// Opt-in: list only add-on / community subtitles whose language is in the preferred subtitle chain.
+        static let subOnlyPreferred = "stremiox.tracks.subOnlyPreferred"
+    }
+
+    /// Opt-in filter: when ON, the player's subtitle panel lists ONLY the add-on and community subtitles whose
+    /// language matches the preferred subtitle languages (embedded file tracks are never hidden). Default OFF.
+    /// Rides the settings-sync blob like the other `stremiox.tracks.*` keys. Read fresh on each panel build.
+    static var subtitlesOnlyPreferred: Bool {
+        UserDefaults.standard.bool(forKey: Key.subOnlyPreferred)
     }
 
     /// Curated language choices for the settings UI (id is the stored ISO code).

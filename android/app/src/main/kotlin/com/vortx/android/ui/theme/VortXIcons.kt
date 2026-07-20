@@ -11,14 +11,20 @@ import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.SwitchAccount
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Search
@@ -27,6 +33,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -52,8 +59,17 @@ object VortXIcons {
     val chevronDown: ImageVector = Icons.Filled.KeyboardArrowDown
     val chevronLeft: ImageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft
 
+    /// SF `chevron.up` — the reorder-upward affordance in the Sources order list. NOT AutoMirrored: up is
+    /// up in an RTL layout too, unlike [chevronLeft].
+    val chevronUp: ImageVector = Icons.Filled.KeyboardArrowUp
+
     /// SF `list.bullet` — the all-sources list disclosure.
     val listBullet: ImageVector = Icons.AutoMirrored.Filled.List
+
+    /// SF `slider.horizontal.3` — the Sources settings entry (source ranking + filters). `Tune` is the
+    /// closest Material Symbol; [listBullet] is already the in-player all-sources disclosure, so reusing it
+    /// here would make one glyph mean two different destinations.
+    val sources: ImageVector = Icons.Filled.Tune
 
     /// SF `play.rectangle` — a 16:9 media/episode-thumb affordance; Material has no rectangle-play
     /// glyph, `SmartDisplay` (a play triangle in a rounded rect) is the closest available shape.
@@ -91,4 +107,20 @@ object VortXIcons {
 
     /// SF `puzzlepiece.extension.fill` — default add-on icon when it has no manifest logo.
     val addon: ImageVector = Icons.Filled.Extension
+
+    /// SF `link` — external-service connection (Settings > Integrations: Trakt / SIMKL).
+    val link: ImageVector = Icons.Filled.Link
+
+    /// SF `server.rack` — a personal media server (Settings > Media servers: Plex / Jellyfin / Emby).
+    val mediaServer: ImageVector = Icons.Filled.Dns
+
+    // Profiles (Settings > Profiles: the "Who's watching?" switcher). Same one-object discipline.
+    /// SF `person.2.crop.square.stack` — the multi-profile switcher entry + picker.
+    val profiles: ImageVector = Icons.Filled.SwitchAccount
+
+    /// SF `pencil` — edit the active profile from the picker.
+    val edit: ImageVector = Icons.Filled.Edit
+
+    /// SF `lock.fill` — a PIN-protected profile (picker badge + PIN gate).
+    val lock: ImageVector = Icons.Filled.Lock
 }

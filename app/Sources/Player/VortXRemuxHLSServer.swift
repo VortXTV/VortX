@@ -8,15 +8,21 @@ import Network
 /// without ever producing a frame. HLS is the one delivery AVFoundation documents for a live fMP4 stream,
 /// and the one Apple's authoring spec defines for Dolby Vision 8.1 (CODECS + SUPPLEMENTAL-CODECS +
 /// VIDEO-RANGE), so this server presents the remux as:
-///   - `/master.m3u8`: two EXT-X-STREAM-INF variants on the SAME media.m3u8 - the DV variant (CODECS +
-///     SUPPLEMENTAL-CODECS + VIDEO-RANGE) plus a range-unlabeled "lifeboat" variant, so AVFoundation's
-///     variant filter (which drops an explicit PQ/HLG variant when the pipeline is not provably HDR at
-///     parse time) always leaves one playable variant instead of zero -> -1002 (the b170 fix).
+///   - `/master.m3u8`: two EXT-X-STREAM-INF variants - the DV variant (CODECS + SUPPLEMENTAL-CODECS +
+///     VIDEO-RANGE -> media.m3u8) plus a range-unlabeled "lifeboat" variant (-> media-hdr.m3u8), so
+///     AVFoundation's variant filter (which drops an explicit PQ/HLG variant when the pipeline is not
+///     provably HDR at parse time) always leaves one playable variant instead of zero -> -1002 (the b170
+///     fix). Since #143 the two variants have DISTINCT playlists/inits so each variant's media agrees with
+///     its declarations (the on-device -12927 rejections matched a declaration/content cross-check failing
+///     right after /init.mp4): the DV variant's init carries the declared db1p/db4h compatibility brand,
+///     the lifeboat's init has the dvvC stripped (it declares no Dolby Vision, so it serves none).
 ///   - `/media.m3u8`:  an EVENT playlist (starts at the beginning, append-only) of the closed segments the
 ///     remux has produced so far, EXT-X-ENDLIST once the trailer is written. The first answer is held until
 ///     a small startup window of segments exists so AVPlayer's startup never sees an empty playlist.
+///   - `/media-hdr.m3u8`: the lifeboat's EVENT playlist: same segments, EXT-X-MAP -> init-hdr.mp4.
 ///   - `/init.mp4`:    the ftyp+moov init segment (retained in memory for the whole session).
-///   - `/seg{N}.m4s`:  one closed segment, read out of the remux's sliding-window buffer.
+///   - `/init-hdr.mp4`: the lifeboat's init: same moov with the DV config box stripped (#143).
+///   - `/seg{N}.m4s`:  one closed segment (shared by both variants), read out of the sliding-window buffer.
 ///
 /// Follows the proven `VXTrailerProxy` NWListener pattern: bound to 127.0.0.1 on an OS-assigned ephemeral
 /// port (never reachable off-device), per-connection fail-soft (a bad request / evicted range / gone client
@@ -54,19 +60,23 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var invalidated = false
     private var connections: [ObjectIdentifier: NWConnection] = [:]
-    /// Single-flight for the two concurrent startup /media.m3u8 fetches (#76). The master advertises two
-    /// variants on the SAME media.m3u8 URI, so CoreMedia opens both at startup; if the two HELD requests poll
-    /// the remux 100ms apart they can capture a DIFFERENT segment count for the same URI, which CoreMedia
-    /// rejects with -12927. The first held request builds ONE body when the startup gate opens and stores it
-    /// here; every other held request answers those identical bytes. Reloads after startup build fresh so the
-    /// EVENT playlist still grows.
+    /// Single-flight for the concurrent startup media-playlist fetches (#76, reshaped by #143). CoreMedia
+    /// opens BOTH variants' playlists at startup; if the two HELD requests poll the remux 100ms apart they
+    /// can capture a DIFFERENT segment count. Since #143 the two variants have distinct URIs (media.m3u8 /
+    /// media-hdr.m3u8), so the shared state is the SEGMENT-LIST SNAPSHOT rather than one body: the first
+    /// held request stores the (segments, ended) it saw when the startup gate opened, every other held
+    /// request renders its own flavor (its own EXT-X-MAP URI) from those SAME segments, and the two startup
+    /// playlists can never disagree on content. Reloads after startup build fresh so the EVENT playlist grows.
     private let mediaGateLock = NSLock()
-    private var startupMediaBody: Data?
+    private var startupMediaList: (segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool)?
 
-    /// Build the remux stream + local server for a DV MKV URL. Returns nil when the listener cannot bind
+    /// Build the remux stream + local server for an MKV URL. Returns nil when the listener cannot bind
     /// (the caller fails soft to libmpv). The caller must `start()` the returned server to begin remuxing.
-    static func make(input: URL, headers: [String: String]?) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
-        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true)
+    /// `mode` (#147): `.dolbyVision` (the default, the original lane) or `.plain` for a non-DV MKV kept on
+    /// AVPlayer for Picture in Picture; the mode flows into classify + signaling (see VortXMKVRemuxStream.Mode).
+    static func make(input: URL, headers: [String: String]?,
+                     mode: VortXMKVRemuxStream.Mode = .dolbyVision) -> (server: VortXRemuxHLSServer, playlistURL: URL)? {
+        let stream = VortXMKVRemuxStream(input: input.absoluteString, headers: headers, indexForHLS: true, mode: mode)
         let server = VortXRemuxHLSServer(stream: stream)
         guard server.listen() else { return nil }
         var comps = URLComponents()
@@ -239,9 +249,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let path = parts[1].components(separatedBy: "?").first ?? parts[1]
         DiagnosticsLog.log("dv", "hls req \(path)")
         switch path {
-        case "/master.m3u8": serveMaster(connection)
-        case "/media.m3u8":  serveMedia(connection)
-        case "/init.mp4":    serveInit(connection)
+        case "/master.m3u8":    serveMaster(connection)
+        case "/media.m3u8":     serveMedia(connection, hdr: false)
+        case "/media-hdr.m3u8": serveMedia(connection, hdr: true)
+        case "/init.mp4":       serveInit(connection, hdr: false)
+        case "/init-hdr.mp4":   serveInit(connection, hdr: true)
         default:
             if path.hasPrefix("/seg"), path.hasSuffix(".m4s"),
                let index = Int(path.dropFirst(4).dropLast(4)) {
@@ -276,7 +288,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Resources
 
-    /// Master playlist: TWO variants on the SAME media.m3u8. Held until the remux has classified the source
+    /// Master playlist: TWO variants (DV -> media.m3u8, lifeboat -> media-hdr.m3u8, #143). Held until the
+    /// remux has classified the source
     /// and written its header (the signaling exists from then on).
     private func serveMaster(_ connection: NWConnection) {
         guard let sig = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().signaling }) else {
@@ -285,6 +298,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         #if os(tvOS)
+        // #147: the panel switch below is DV-lane only. A PLAIN (non-DV) remux mount must never touch the
+        // panel: its master carries no DV declaration and its content is whatever the source was (usually
+        // SDR). `sig.dolbyVision` is mode-derived (every `.dolbyVision` master keeps today's behavior exactly,
+        // including a P8 with an unknown compat id).
+        if sig.dolbyVision {
         // #76: FIRE the Dolby Vision panel switch HERE, now that classify has published signaling, and BEFORE
         // the media playlist / any segment (the real video mount). This replaces the old pre-attach switch in
         // loadFile, which fired on mount for every remux candidate and cycled the panel twice per hop whenever
@@ -313,6 +331,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if switched.wait(timeout: .now() + 2) == .timedOut {   // bounded: a wedged main must not hang the serve task
             DiagnosticsLog.log("dv", "DV display switch request not confirmed within 2s (main queue busy); the switch may land after the master is served")
         }
+        }   // end sig.dolbyVision (#147)
         #endif
         // Hold the master until any in-flight HDR display-mode switch settles. AVFoundation's multivariant
         // selector drops the explicit-PQ DV variant whenever it parses the master before the output pipeline
@@ -323,6 +342,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         _ = waitFor(seconds: 6) { HDRDisplayMode.isSwitchSettled ? true : nil }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
+        // #147 PLAIN lane: ONE variant, no SUPPLEMENTAL-CODECS, no VIDEO-RANGE (sig built them nil) - the
+        // exact range-unlabeled shape the b170 bisect proved always survives AVFoundation's variant filter,
+        // so no lifeboat second variant is needed (the lifeboat exists only because the DV variant's explicit
+        // PQ/HLG range can be filtered). Points at media.m3u8 -> init.mp4 (the untouched init: there is no
+        // dvvC to strip on a plain mount; init-hdr simply falls back to the same bytes and is never referenced).
+        if !sig.dolbyVision {
+            var inf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
+            if sig.width > 0, sig.height > 0 { inf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
+            inf += ",CODECS=\"\(codecs)\""
+            if sig.fps > 0 { inf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
+            let body = Data("#EXTM3U\n#EXT-X-VERSION:7\n\(inf)\nmedia.m3u8\n".utf8)
+            DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=1 (plain) \(body.count)B")
+            respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
+            return
+        }
         // DV variant FIRST (Apple authoring-spec truth: SUPPLEMENTAL-CODECS + VIDEO-RANGE) so it is the
         // initial pick whenever the pipeline admits HDR at parse time.
         var dvInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
@@ -331,25 +365,31 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if let supplemental = sig.supplementalCodec { dvInf += ",SUPPLEMENTAL-CODECS=\"\(supplemental)\"" }
         if let range = sig.videoRange { dvInf += ",VIDEO-RANGE=\(range)" }
         if sig.fps > 0 { dvInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
-        // Lifeboat (the b170 -1002 fix): same URI, same CODECS, NO VIDEO-RANGE / NO SUPPLEMENTAL-CODECS.
+        // Lifeboat (the b170 -1002 fix): same CODECS, NO VIDEO-RANGE / NO SUPPLEMENTAL-CODECS.
         // AVFoundation's multivariant selector drops any variant carrying an explicit non-SDR VIDEO-RANGE
         // (PQ/HLG) whenever the output pipeline is not provably HDR at the instant the master is parsed
         // (SDR-base Match-Content state, display switch not settled, layerless probe). With exactly ONE
         // variant that single drop leaves ZERO playable variants, which CoreMedia surfaces as
         // NSURLErrorDomain -1002 / CoreMediaErrorDomain -1002 (empirically bisected off-device, byte-exact:
         // the VIDEO-RANGE tag alone is the poison; an untagged copy of the same stream is accepted). A
-        // range-unlabeled variant is never range-filtered, so a variant always survives. Same segments
-        // either way: the fMP4 sample entry (hvc1+dvvC) and the in-band RPUs drive the actual DV decode, and
-        // VortX forces the Apple TV panel itself via HDRDisplayMode. BANDWIDTH-1 keeps the DV variant
-        // preferred when both survive; identical URIs make any ABR switch a no-op.
+        // range-unlabeled variant is never range-filtered, so a variant always survives.
+        // #143 (-12927): the lifeboat gets its OWN playlist (media-hdr.m3u8 -> init-hdr.mp4, the
+        // dvvC-stripped init) instead of sharing the DV variant's URI. A variant that declares plain HEVC
+        // (implicit SDR) while its init DECLARES Dolby Vision (dvvC) is exactly the mismatch Apple's
+        // authoring spec forbids ("the compatibility brand and the VIDEO-RANGE attribute act as
+        // cross-checks. Leaving out either one is incorrect."), and the on-device -12927 fired right after
+        // /init.mp4 on every mount, on whichever variant the selector latched. Distinct URIs also end the
+        // same-URI double-fetch arrangement (two variants, one playlist) that #76 already had to
+        // single-flight. The SEGMENTS stay shared: a non-DV decode ignores the in-band RPU NALs; the DV
+        // decode reads them via the dvvC-bearing init on the DV variant.
         // BANDWIDTH is dropped by 100 kbps (not 1) so the readyToPlay access-log's indicatedBitrate reveals
-        // which variant AVFoundation latched: ~the DV BANDWIDTH means the DV variant, ~100 kbps lower means the
-        // lifeboat. Same ordering (DV preferred), identical URI, so playback is unchanged.
+        // which variant AVFoundation latched: ~the DV BANDWIDTH means the DV variant, ~100 kbps lower means
+        // the lifeboat. DV listed first + higher BANDWIDTH keeps the DV variant preferred when both survive.
         var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 100_000, 1))"
         if sig.width > 0, sig.height > 0 { fbInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
         fbInf += ",CODECS=\"\(codecs)\""
         if sig.fps > 0 { fbInf += String(format: ",FRAME-RATE=%.3f", sig.fps) }   // authoring rule 9.15 (MUST)
-        let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia.m3u8\n"
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia-hdr.m3u8\n"
         let body = Data(playlist.utf8)
         DiagnosticsLog.log("dv", "hls resp /master.m3u8 variants=2 \(body.count)B")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
@@ -361,13 +401,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// Media playlist: EVENT type (playback starts at the beginning; entries are only ever appended) over
     /// the closed segments. The FIRST answer waits for `minStartupSegments` so AVPlayer's startup buffer
-    /// math has something to chew on; later reloads answer immediately with whatever exists.
-    private func serveMedia(_ connection: NWConnection) {
+    /// math has something to chew on; later reloads answer immediately with whatever exists. `hdr` selects
+    /// the lifeboat flavor (#143): identical segments, EXT-X-MAP -> the dvvC-stripped init-hdr.mp4.
+    private func serveMedia(_ connection: NWConnection, hdr: Bool) {
         struct Ready { let segments: [VortXMKVRemuxStream.HLSSegment]; let ended: Bool }
-        // Was the startup gate already open on the FIRST probe? If not, this is a HELD startup request (one of
-        // the two concurrent per-variant fetches of the same URI) and must share ONE body with its sibling so
-        // the two never disagree on segment count (-12927). A request that finds the gate already open is a
-        // post-startup reload and builds fresh below so the EVENT playlist keeps growing.
+        let path = hdr ? "/media-hdr.m3u8" : "/media.m3u8"
+        // Was the startup gate already open on the FIRST probe? If not, this is a HELD startup request (the
+        // concurrent per-variant fetches) and must share ONE segment snapshot with its sibling so the two
+        // variants' startup playlists never disagree on content (#76). A request that finds the gate already
+        // open is a post-startup reload and builds fresh below so the EVENT playlist keeps growing.
         let gateOpenOnEntry: Bool = {
             let snap = stream.hlsSnapshot()
             return snap.initData != nil && !snap.segments.isEmpty
@@ -379,49 +421,48 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                   snap.segments.count >= Self.minStartupSegments || snap.ended else { return nil }
             return Ready(segments: snap.segments, ended: snap.ended)
         }
-        guard let ready else {
-            DiagnosticsLog.log("dv", "hls 404 /media.m3u8")
+        guard var ready else {
+            DiagnosticsLog.log("dv", "hls 404 \(path)")
             close(connection, status: "404 Not Found")
             return
         }
         // A FAILED remux must stop feeding AVPlayer (never ENDLIST: that would end playback "successfully"
         // mid-movie and auto-advance). 404 the reload so AVPlayer errors into the libmpv demotion.
         if stream.buffer.status().failure != nil, !ready.ended {
-            DiagnosticsLog.log("dv", "hls 404 /media.m3u8 (remux failed)")
+            DiagnosticsLog.log("dv", "hls 404 \(path) (remux failed)")
             close(connection, status: "404 Not Found")
             return
         }
-        // Single-flight the held startup answers (#76): the first held request builds ONE body when the gate
-        // opens and stores it; the concurrent sibling answers those identical bytes. Reloads build fresh.
+        // Single-flight the held startup answers (#76): the first held request stores the segment snapshot it
+        // saw when the gate opened; every concurrent held sibling (either flavor) renders from those SAME
+        // segments. Reloads build fresh.
         let singleFlight = !gateOpenOnEntry
-        let body: Data
         if singleFlight {
             mediaGateLock.lock()
-            if let cached = startupMediaBody {
-                body = cached
+            if let cached = startupMediaList {
+                ready = Ready(segments: cached.segments, ended: cached.ended)
             } else {
-                body = Self.buildMediaBody(segments: ready.segments, ended: ready.ended)
-                startupMediaBody = body
+                startupMediaList = (ready.segments, ready.ended)
             }
             mediaGateLock.unlock()
-        } else {
-            body = Self.buildMediaBody(segments: ready.segments, ended: ready.ended)
         }
-        DiagnosticsLog.log("dv", "hls resp /media.m3u8 segs=\(ready.segments.count) ended=\(ready.ended) \(body.count)B\(singleFlight ? " [startup single-flight]" : "")")
+        let body = Self.buildMediaBody(segments: ready.segments, ended: ready.ended,
+                                       mapURI: hdr ? "init-hdr.mp4" : "init.mp4")
+        DiagnosticsLog.log("dv", "hls resp \(path) segs=\(ready.segments.count) ended=\(ready.ended) \(body.count)B\(singleFlight ? " [startup single-flight]" : "")")
         respond(connection, body: body, contentType: "application/vnd.apple.mpegurl")
     }
 
     /// Build the EVENT media playlist bytes for a given closed-segment set. Pure and deterministic: the same
-    /// (segments, ended) always yields byte-identical output, so two requests that share one snapshot cannot
-    /// disagree. Playback starts at the beginning; entries are only ever appended (MEDIA-SEQUENCE stays 0).
-    private static func buildMediaBody(segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool) -> Data {
+    /// (segments, ended, mapURI) always yields byte-identical output, so two requests that share one snapshot
+    /// cannot disagree. Playback starts at the beginning; entries are only ever appended (MEDIA-SEQUENCE stays 0).
+    private static func buildMediaBody(segments: [VortXMKVRemuxStream.HLSSegment], ended: Bool, mapURI: String) -> Data {
         var lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:7",
             "#EXT-X-TARGETDURATION:\(VortXMKVRemuxStream.hlsTargetDuration)",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:EVENT",
-            "#EXT-X-MAP:URI=\"init.mp4\"",
+            "#EXT-X-MAP:URI=\"\(mapURI)\"",
         ]
         for seg in segments {
             lines.append(String(format: "#EXTINF:%.3f,", seg.duration))
@@ -433,13 +474,20 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     }
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
-    private func serveInit(_ connection: NWConnection) {
-        guard let initData = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().initData }) else {
-            DiagnosticsLog.log("dv", "hls 404 /init.mp4")
+    /// `hdr` serves the lifeboat's dvvC-stripped copy (#143); both publish in the same lock write, so
+    /// whichever exists implies both do (the nil-coalesce is a belt-and-braces fallback, not a lane).
+    private func serveInit(_ connection: NWConnection, hdr: Bool) {
+        let path = hdr ? "/init-hdr.mp4" : "/init.mp4"
+        let initData = waitFor(seconds: Self.resourceWaitSeconds) { () -> Data? in
+            let snap = stream.hlsSnapshot()
+            return hdr ? (snap.initDataHDR ?? snap.initData) : snap.initData
+        }
+        guard let initData else {
+            DiagnosticsLog.log("dv", "hls 404 \(path)")
             close(connection, status: "404 Not Found")
             return
         }
-        DiagnosticsLog.log("dv", "hls resp /init.mp4 \(initData.count)B")
+        DiagnosticsLog.log("dv", "hls resp \(path) \(initData.count)B")
         respond(connection, body: initData, contentType: "video/mp4")
     }
 

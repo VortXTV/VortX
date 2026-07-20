@@ -24,6 +24,13 @@ struct MPVProperty {
     static let trackList = "track-list"
     static let aid = "aid"
     static let sid = "sid"
+    /// Secondary subtitle stream id (dual-subtitle / language-study feature). libmpv renders this track
+    /// simultaneously with the primary `sid`, pinned to the top of the frame via `secondarySubPos` so the
+    /// two languages never overlap. "no" = no secondary track.
+    static let secondarySid = "secondary-sid"
+    /// On-screen position of the secondary subtitle line, 0 (top) ... 100 (bottom). Set to 0 so the
+    /// secondary language sits at the top while the primary stays at its normal bottom position.
+    static let secondarySubPos = "secondary-sub-pos"
     static let speed = "speed"
     /// Synthetic signal (not a real mpv property): emitted when a file fails to load
     /// (MPV_EVENT_END_FILE with reason=error). Data is the mpv error string.

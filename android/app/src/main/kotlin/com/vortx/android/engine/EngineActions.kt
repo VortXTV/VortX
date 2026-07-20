@@ -129,6 +129,23 @@ object EngineActions {
     /// object). Broadcasts for the same reason as [addToLibrary].
     fun removeFromLibrary(id: String): String = ctxEnvelope(action("RemoveFromLibrary", id))
 
+    /// Mark a CATALOG item watched/unwatched by its `MetaItemPreview`, without a detail page open
+    /// (`ActionCtx::MetaItemMarkAsWatched`, which creates a temporary library item when none exists).
+    /// Mirrors Apple `CoreBridge.setCatalogWatched`'s
+    /// `["action": "MetaItemMarkAsWatched", "args": ["meta_item": raw, "is_watched": …]]` dispatch
+    /// exactly. [metaItemPreview] SHOULD be the engine's own serialized preview echoed back verbatim
+    /// (the `MetaItemPreview` deserializer goes through a legacy shape); the caller falls back to the
+    /// same minimal `{id,type,name,poster}` object [addToLibrary] proves the deserializer accepts.
+    /// Broadcasts (field = null): it touches `ctx.library`, from which `library` and
+    /// `continue_watching_preview` re-derive.
+    fun metaItemMarkAsWatched(metaItemPreview: JSONObject, isWatched: Boolean): String =
+        ctxEnvelope(
+            action(
+                "MetaItemMarkAsWatched",
+                JSONObject().put("meta_item", metaItemPreview).put("is_watched", isWatched),
+            ),
+        )
+
     // ---- S04: add-on management (ctx.profile.addons) ----
 
     /// Install (or, for an already-installed `transportUrl`, update-in-place — the engine's

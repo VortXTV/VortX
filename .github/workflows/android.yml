@@ -1,22 +1,28 @@
 name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
-# workflow IS the build feedback loop. It builds BOTH product flavors on every push/PR that touches
-# android/ or core/ (the engine .so is cross-compiled from core/), verifies each flavor produced an
-# APK, and enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the
-# GPLv3 libmpv native libs.
+# workflow IS the build feedback loop. It builds BOTH product flavors on every push that touches
+# android/, verifies each flavor produced an APK carrying BOTH engine .so's for BOTH ABIs, and
+# enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
+# libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
+# 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
+# which is itself a path trigger, so the old `core/**` path filters are gone (that dir no longer
+# exists in the public tree).
+#
+# No `pull_request` trigger, DELIBERATELY: the engine-fetch steps below hold ENGINE_REPO_TOKEN in
+# the same job that executes repo-controlled code (gradle build scripts, cargo build scripts), so
+# building PR heads here would hand any same-repo PR author's code a credential / private-source
+# exfiltration lane. Fork PRs never received secrets anyway, so their builds could only die at the
+# token preflight; nothing of value is lost. The dev flow is push-to-branch (which triggers this
+# workflow); PR validation of app-only changes belongs to a future SECRETLESS workflow (no engine
+# fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and never
+# `pull_request_target` -- to THIS workflow.
 
 on:
   push:
     branches: [main, beta, "android/**"]
     paths:
       - "android/**"
-      - "core/**"
-      - ".github/workflows/android.yml"
-  pull_request:
-    paths:
-      - "android/**"
-      - "core/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -25,24 +31,113 @@ permissions:
 
 jobs:
   build-android:
-    runs-on: ubuntu-latest
+    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
+    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
+    # plus a `v*` TAG policy (the tag lane is used by the release workflow; this workflow only ever
+    # runs on branch refs, which enter via the branch entries). A push to any OTHER branch -- e.g.
+    # the android/** trigger patterns above -- still starts the workflow but the job BLOCKS at this
+    # gate before any step runs, which makes ENGINE_REPO_TOKEN unreachable from arbitrary branches.
+    # The ci/engine-token entry in that policy is TEMPORARY, for proof runs on the CI branch, and
+    # is removed at integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment
+    # (value re-entry) is a queued owner step; until then the gate still stops arbitrary-branch jobs
+    # from ever reaching the fetch steps that read it.
+    environment: engine-ci
+    # Pinned explicit runner label: `ubuntu-latest` is a MOVING alias (it means ubuntu-24.04 today,
+    # per actions/runner-images), and a silent alias flip would swap the whole toolchain -- JDK
+    # packages, kernel -- under a runtime-proven lane with no diff in this file. (The APK gate below
+    # no longer leans on the image's binutils readelf; it uses the pinned NDK's own llvm-readelf, so
+    # its provenance is tied to the NDK pin, not this image.) Moving to a newer image is a
+    # deliberate edit here, verified by a run, not an alias drift.
+    runs-on: ubuntu-24.04
+    # GitHub-owned actions are SHA-pinned too (finishing the supply-chain pass that already pinned
+    # the third-party actions): a mutable tag -- even on an actions/* repo -- can be repointed, and
+    # this job holds ENGINE_REPO_TOKEN. Each pin carries the tag it resolved from.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
+      # Android needs BOTH private engines, because android/app/build.gradle.kts attaches BOTH native
+      # build tasks to every variant's merge<Variant>JniLibFolders (lines 359-361 and 449-451):
+      #   - cargoNdkBuild -> libstremiox_core.so from the stremiox-core crate. Hard runtime
+      #     requirement: StremioCoreNative.kt:43 does a bare System.loadLibrary("stremiox_core") in
+      #     its class initializer. Resolved via STREMIOX_CORE_DIR (build.gradle.kts:261-264).
+      #   - cargoNdkBuildVortxFfi -> libvortx_ffi.so (features jni,server) from the vortx-core engine
+      #     workspace, resolved ONLY via VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir
+      #     (build.gradle.kts:382-385). Without it the task skips on dev machines and HARD-FAILS
+      #     under VORTX_REQUIRE_ENGINE (the onlyIf at build.gradle.kts:412-431), because the APK
+      #     would otherwise package "whatever .so is already staged in src/main/jniLibs" -- which in
+      #     CI is NOTHING (android/.gitignore:23 ignores app/src/main/jniLibs/**/*.so). That would
+      #     ship the DEFAULT-ON in-process torrent streaming server (VortxServer.kt FLAG_KEY doc:
+      #     "DEFAULT ON: with the server absent a raw torrent could only ever throw") and the
+      #     vortx.engine shadow-ranking lane permanently dead, since this workflow is the ONLY
+      #     Android build channel. So CI fetches vortx-core too and exports VORTX_ENGINE_CORE_DIR.
+      #
+      # Both fetches use actions/checkout (GitHub's own auth path: the token is injected through an
+      # env-sourced local git config, never argv, and persist-credentials: false wipes it after the
+      # step), pinned to the exact commits the current build links. Requires the ENGINE_REPO_TOKEN
+      # secret (fine-grained PAT, Contents:read on both private repos; deploy keys are disabled by
+      # the VortXTV org). Fails closed: empty secret or a missing crate manifest kills the job.
+      - name: Preflight the engine token (fail closed)
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            exit 1
+          fi
+
+      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
+      - name: Fetch stremiox-core (private, pinned)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VortXTV/stremiox-core
+          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      # vortx-core is a MONOREPO whose engine workspace is its vortx-core/ SUBDIR (the engine manifest
+      # sits at vortx-core/vortx-core/Cargo.toml inside the repo). Check out to a temp path, then
+      # promote only that subdir to the app-root vortx-core/ the gradle task builds from.
+      - name: Fetch vortx-core (private monorepo, pinned)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VortXTV/vortx-core
+          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: _vortx_core_src
+          persist-credentials: false
+
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          rm -rf vortx-core
+          mv _vortx_core_src/vortx-core vortx-core
+          rm -rf _vortx_core_src
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
+          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: "17"
 
+      # Non-GitHub-owned actions below are pinned to full commit SHAs (mutable tags on third-party
+      # repos are a supply-chain hole; GitHub-owned actions/* stay on major tags).
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
 
       # No gradle-version here: the committed wrapper (android/gradle/wrapper/gradle-wrapper.properties)
       # is the single Gradle-version truth. setup-gradle is kept only for its build cache; the build
       # runs via ./gradlew below.
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
       # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
       # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
@@ -55,22 +150,76 @@ jobs:
           yes | sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      # SHA-pinned (see the pin note above). Pinning drops the toolchain-from-ref-name convention
+      # (@nightly), so the toolchain is passed explicitly.
+      #
+      # Toolchain truth: rust-toolchain.toml IS the Rust-version authority, not this step. BOTH
+      # engine checkouts carry one (core/rust-toolchain.toml and the promoted
+      # vortx-core/rust-toolchain.toml, each `channel = "nightly-2026-07-19"` + rust-src; verified
+      # at the pinned engine commits), and rustup's directory-override rule means every cargo
+      # invocation inside those dirs resolves the toolchain through that file. This step is ONLY
+      # the installer that puts that DATED toolchain + the Android targets on the runner for those
+      # files to select; it MUST name the same dated channel the engine toolchain files pin,
+      # because the Android targets are installed per-toolchain. Drift fails closed, not silently:
+      # if the files pin a different date, rustup auto-installs that toolchain WITHOUT the Android
+      # targets and the cargo-ndk build dies with a missing-target error.
       - name: Install Rust nightly + Android targets
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
+          toolchain: nightly-2026-07-19
           targets: aarch64-linux-android,x86_64-linux-android
           components: rust-src
 
-      - uses: swatinem/rust-cache@v2
+      # Second workspace line: the vortx-ffi cross-build's CARGO_TARGET_DIR is pinned by the gradle
+      # task to <engine>/target-andx (build.gradle.kts:407), not the default target/.
+      #
+      # Ref-scoped cache key (private-intermediate containment): the workspace `target` dirs cached
+      # here hold compiled output of the PRIVATE engine crates. `key` is folded into rust-cache's
+      # cache key (and into its restore-key prefixes), so each ref gets its OWN cache partition and a
+      # run on one branch cannot restore another branch's private-engine intermediates -- not via an
+      # exact hit and not via the lockfile-dropped prefix fallback. Same-ref pushes still restore
+      # their own cache, so repeat builds on main / beta / a given android/** branch stay warm.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          workspaces: "core -> target"
+          key: ${{ github.ref_name }}
+          workspaces: |
+            core -> target
+            vortx-core -> target-andx
 
+      # Pinned EXACTLY: "^3" is a moving target (a new 3.x release would swap the build tool under
+      # this runtime-proven lane with no diff here). =3.5.4 is what "^3" resolves to at pin time,
+      # i.e. the version the proven runs actually installed. cargo-ndk 4.x exists (4.1.2 today);
+      # that major bump is a deliberate future change with its own verifying run, not a pin.
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "^3" --locked
+        run: cargo install cargo-ndk --version "=3.5.4" --locked
 
       # Build BOTH flavors. lint.abortOnError = true (app/build.gradle.kts) still gates each assemble.
+      #
+      # External sync credentials (Trakt device-code OAuth, SIMKL PIN flow) are injected here as env vars,
+      # which app/build.gradle.kts's externalSyncSecret() reads into BuildConfig (TraktAuth / SIMKLAuth).
+      # These are the SAME GitHub Actions secrets the Apple release CI uses (release-tvos.yml feeds them
+      # into the Info.plist): TRAKT_CLIENT_ID, TRAKT_CLIENT_SECRET, SIMKL_CLIENT_ID, SIMKL_CLIENT_SECRET.
+      # Absent secrets resolve to "" so the build still succeeds with the feature dormant (e.g. on a fork).
+      # Engine wiring (see the fetch block above for the gradle-contract citations):
+      #   STREMIOX_CORE_DIR      -> cargoNdkBuild's crate dir (explicit; don't lean on the legacy
+      #                             ../core fallback chain in build.gradle.kts:261-264).
+      #   VORTX_ENGINE_CORE_DIR  -> cargoNdkBuildVortxFfi's engine workspace (build.gradle.kts:382-385).
+      #   VORTX_REQUIRE_ENGINE=1 -> flips both tasks' dev-machine warn-and-skip into a HARD FAILURE
+      #                             (missing manifest, missing cargo, or missing/empty .so output all
+      #                             throw), so a CI APK can never silently ship without its engines.
+      # Reproducibility: both engine cargo-ndk invocations pass --locked (build.gradle.kts) against
+      # the Cargo.lock each pinned engine commit now tracks, so a drifted dependency resolution
+      # FAILS the build instead of silently linking a different graph than the proven runs.
       - name: Build debug APKs (full + play)
         working-directory: android
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
+          STREMIOX_CORE_DIR: ${{ github.workspace }}/core
+          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
+          VORTX_REQUIRE_ENGINE: "1"
         run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
 
       # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant
@@ -85,6 +234,112 @@ jobs:
           if [ ${#play[@]} -eq 0 ]; then echo "::error::play-flavor debug APK missing"; exit 1; fi
           echo "full APK(s): ${full[*]}"
           echo "play APK(s): ${play[*]}"
+
+      # Engine-presence proof (fail-closed, strong): every built APK MUST embed BOTH engines for BOTH
+      # shipped ABIs (the abiFilters/androidAbis list in app/build.gradle.kts): lib/<abi>/libstremiox_core.so
+      # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a AND x86_64. Both engine tasks feed the `main`
+      # sourceSet's jniLibs, so BOTH flavors carry both engines (only the GPLv3 libmpv is play-gated).
+      # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
+      # pass. Presence + ELF magic alone is not proof either: a valid ELF of the wrong architecture,
+      # an executable, or a stub with no JNI surface would pass and only die on-device. So EXTRACT
+      # each entry and require, in order (each check fail-closed), all via the PINNED NDK's own
+      # llvm-readelf (the toolchain that produced the .so's, installed above; gate provenance now
+      # rides the NDK pin instead of whatever binutils the runner image ships). llvm-readelf prints
+      # GNU-readelf-compatible output by default and accepts -W as a GNU-compat no-op; the exact
+      # strings the greps below match ("Class: ELF64", "2's complement, little endian",
+      # "Type: DYN (Shared object file)", "Machine: AArch64" / "Machine: Advanced Micro Devices
+      # X86-64", and --dyn-syms rows ending in the bare symbol name) were verified verbatim against
+      # NDK 27.2.12479018's llvm-readelf 18.0.3 on real android26 .so's for both ABIs:
+      #   1. non-zero size + the ELF magic \x7fELF (cheap pre-checks with a clear byte-level error);
+      #   2. llvm-readelf -h: Class ELF64 (e_ident[EI_CLASS]=2), little-endian data (e_ident[EI_DATA]=1),
+      #      Type DYN (e_type=ET_DYN: a shared object, not ET_EXEC/ET_REL), and the machine matching
+      #      the ABI dir: AArch64 (EM_AARCH64=183) under lib/arm64-v8a/, Advanced Micro Devices
+      #      X86-64 (EM_X86_64=62) under lib/x86_64/;
+      #   3. llvm-readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
+      #      required names are DERIVED from source, not guessed -- JNI resolves a Kotlin
+      #      `external fun` to Java_<package with _>_<Class>_<method>, and both engines export those
+      #      names directly via #[no_mangle] (neither registers via RegisterNatives):
+      #        libstremiox_core.so <- StremioCoreNative.kt:43 loadLibrary("stremiox_core"),
+      #          external funs at StremioCoreNative.kt:75/81/83/85; exported by the pinned
+      #          stremiox-core commit's core/src/android_jni.rs:70/83/133/150 plus JNI_OnLoad
+      #          (android_jni.rs:61, caches the JavaVM for engine worker threads).
+      #        libvortx_ffi.so <- VortxCore.kt:38 + VortxServer.kt:65 loadLibrary("vortx_ffi"),
+      #          external funs at VortxCore.kt:50/54/58/61/64 and VortxServer.kt:85/88/91/95;
+      #          exported by the pinned vortx-core commit's crates/ffi/src/jni.rs:128-230 (feature
+      #          `jni`) and crates/ffi/src/jni_server.rs:82-146 (features `jni`+`server`) -- both
+      #          features are ON in this build (build.gradle.kts:403 passes `--features jni,server`),
+      #          so a .so built with a dropped feature (kernel bridge or server lane silently gone)
+      #          fails this gate instead of shipping.
+      - name: Verify engine .so in every APK (both ABIs, ELF64 shared object, right arch, JNI exports)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # The pinned NDK's llvm-readelf (same NDK the cargo-ndk cross-link used; installed by the
+          # "Install Android NDK" step above). Fail closed if it is not where that pin puts it: a
+          # silent fallback to another readelf would detach the gate's provenance from the NDK pin.
+          READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          if [ ! -x "$READELF" ]; then
+            echo "::error::pinned NDK llvm-readelf not found/executable at $READELF; refusing to verify APKs with an unpinned readelf"
+            exit 1
+          fi
+          apks=(android/app/build/outputs/apk/full/debug/*.apk android/app/build/outputs/apk/play/debug/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then echo "::error::no APKs found to verify engine .so"; exit 1; fi
+          # Required dynamic exports per lib (derivation + source citations in the step comment above).
+          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion"
+          syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
+          fail=0
+          workdir="$(mktemp -d)"
+          for apk in "${apks[@]}"; do
+            for abi in arm64-v8a x86_64; do
+              case "$abi" in
+                arm64-v8a) machine='AArch64' ;;
+                x86_64)    machine='Advanced Micro Devices X86-64' ;;
+              esac
+              for lib in libstremiox_core.so libvortx_ffi.so; do
+                entry="lib/$abi/$lib"
+                out="$workdir/$(basename "$apk").$abi.$lib"
+                if ! unzip -p "$apk" "$entry" > "$out" 2>/dev/null; then
+                  echo "::error::$entry missing from APK: $apk"; fail=1; continue
+                fi
+                size="$(stat -c%s "$out")"
+                if [ "$size" -eq 0 ]; then
+                  echo "::error::$entry in $apk is EMPTY (0 bytes)"; fail=1; continue
+                fi
+                magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+                if [ "$magic" != "7f454c46" ]; then
+                  echo "::error::$entry in $apk is not an ELF binary (leading bytes: $magic)"; fail=1; continue
+                fi
+                if ! hdr="$("$READELF" -h "$out" 2>/dev/null)"; then
+                  echo "::error::$entry in $apk has an unparseable ELF header (llvm-readelf -h failed)"; fail=1; continue
+                fi
+                if ! grep -Eq 'Class:[[:space:]]+ELF64' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not ELF64 (e_ident[EI_CLASS] != 2): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq 'Data:.*little endian' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not little-endian (e_ident[EI_DATA] != 1): $(grep -E 'Data:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq 'Type:[[:space:]]+DYN\b' <<<"$hdr"; then
+                  echo "::error::$entry in $apk is not a shared object (e_type != ET_DYN): $(grep -E 'Type:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                if ! grep -Eq "Machine:[[:space:]]+${machine}[[:space:]]*\$" <<<"$hdr"; then
+                  echo "::error::$entry in $apk is the WRONG ARCHITECTURE (want $machine): $(grep -E 'Machine:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                fi
+                dynsyms="$("$READELF" -W --dyn-syms "$out" 2>/dev/null || true)"
+                syms_var="syms_${lib%.so}"
+                missing=""
+                for sym in ${!syms_var}; do
+                  grep -Eq "[[:space:]]${sym}[[:space:]]*\$" <<<"$dynsyms" || missing="$missing $sym"
+                done
+                if [ -n "$missing" ]; then
+                  echo "::error::$entry in $apk is missing required JNI export(s):$missing"; fail=1; continue
+                fi
+                echo "ok: $apk $entry ($size bytes, ELF64 LE DYN $machine, all required JNI exports present)"
+              done
+            done
+          done
+          rm -rf "$workdir"
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "every APK embeds libstremiox_core.so + libvortx_ffi.so for arm64-v8a + x86_64 (ELF64 little-endian shared objects, correct machine per ABI, JNI export surface verified)"
 
       # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
       # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs
@@ -109,14 +364,14 @@ jobs:
           echo "play flavor is clean of libmpv/ffmpeg GPL native libs"
 
       - name: Upload full-flavor APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Android-full-debug
           path: android/app/build/outputs/apk/full/debug/*.apk
           if-no-files-found: error
 
       - name: Upload play-flavor APK
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-Android-play-debug
           path: android/app/build/outputs/apk/play/debug/*.apk

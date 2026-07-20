@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct StremioTVApp: App {
+struct VortXTVApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var sync = VortXSyncManager.shared
@@ -17,13 +17,24 @@ struct StremioTVApp: App {
         // its FIRST verdict (launchOffline) is ready to land an offline launch on the Library tab (where
         // Downloads live) and the shell's "You're offline" chip tracks the live (debounced) state.
         ConnectivityMonitor.shared.start()
+        // Bring DownloadManager up at launch so its "auto-delete watched downloads" subscription (it
+        // observes WatchedIndex and prunes finished downloads when the opt-in setting is ON) is live from
+        // the start on tvOS. Without touching the singleton here, nothing on tvOS instantiates it at launch,
+        // so the subscription would only arm once a Downloads screen happened to be opened.
+        _ = DownloadManager.shared
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
+            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
+            // streaming server (vortx-core over the C server ABI); the player follows its port via
+            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off (and an
+            // inert stub while VortXTV links no server-inclusive VortxEngine slice), so the default
+            // launch path is unchanged and nodejs-mobile keeps serving.
+            VortxNativeServer.startIfNeeded()
             // Once the server is up, cap its torrent cache to a TV-safe size (the 2 GB default
             // can get the whole app jetsam-killed mid-torrent). Detached so it never blocks launch.
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
@@ -59,19 +70,35 @@ struct StremioTVApp: App {
             .environmentObject(ProfileStore.shared)
             .environmentObject(VortXSyncManager.shared)
             .preferredColorScheme(.dark)
+            // The app's own `vortx://` scheme. Its only minter today is the Top Shelf extension handing
+            // back a tap from the tvOS Home screen; the router parks the destination and RootView
+            // presents it, so a link that arrives during the splash / profile picker still lands.
+            //
+            // Both Top Shelf actions (select AND play/pause) route here as "open the detail page",
+            // where the primary button already reads "Resume <time>" and runs the real resume: the
+            // exact stored source, a fresh debrid link, the episode-moved gate. A one-press resume
+            // straight from the shelf wants that logic (today private to the Continue Watching rail's
+            // `directResume`) lifted into a shared helper. That is a refactor of the app's most
+            // bug-historied path and does not belong inside a new feature's diff, so it is left as a
+            // deliberate follow-up rather than duplicated out here where the two copies would drift.
+            .onOpenURL { DeepLinkRouter.shared.handle($0) }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
-                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    #if !VORTX_NO_EMBEDDED_SERVER
                     // #130: after a suspension (Home, app switch, screensaver exit) tvOS can tear down the
                     // server's bound listener while node keeps ticking, so the server reads Offline until a
                     // manual restart. recoverIfSuspended subsumes the old drift-latch probe (isOnline) and,
                     // on a CONNECTION-REFUSED result while the process is alive, signals the in-node rebind.
                     // A timeout is left alone (busy-but-alive), so it never touches a mid-stream listener.
                     Task.detached(priority: .utility) { await NodeServer.recoverIfSuspended() }
+                    // Phase 8: the flag-gated in-process engine server stops on background (below), so
+                    // foreground restarts it on a fresh ephemeral port; the player follows via
+                    // StremioServer.embeddedPort. No-op while `vortxNativeServer` is off.
+                    VortxNativeServer.startIfNeeded()
                     #endif
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
@@ -92,6 +119,11 @@ struct StremioTVApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { TabBarHealer.heal("foreground+1.5s") }
                 }
                 if phase == .background {
+                    #if !VORTX_NO_EMBEDDED_SERVER
+                    // Phase 8: stop the flag-gated in-process engine server on background (graceful
+                    // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
+                    VortxNativeServer.stopOnBackground()
+                    #endif
                     VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
                     // push profiles + settings under a background-task grace window so a just-made library
                     // removal / rewind survives a sideload-update process kill (CW resurrection fix).

@@ -1,7 +1,7 @@
 package com.vortx.android.ui.components
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -12,18 +12,20 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXIcons
-import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
-import com.vortx.android.ui.theme.vortxShadow
+import com.vortx.android.ui.theme.vortxGlassRow
 
 /// One ranked source (DESIGN-SYSTEM.md §3 "Source row"): a surface-card row, leading play/download
 /// icon, a prominent [quality] badge (4K/1080p) + [addon] badge + a TORRENT badge when [isTorrent],
 /// then [flavorTags] + [size], then the release [title] (2-line clamp). Tapping resolves + plays;
 /// [enabled] dims + disables the row while another resolve is in flight.
+///
+/// [pinned] marks the stream the user's source pin floats to the top (Apple's per-row pin badge, #15);
+/// [onLongClick] (additive: null keeps every existing call site unchanged) opens the pin menu the
+/// caller anchors to this row, the Android analogue of Apple's `.contextMenu { pinMenu(...) }`.
 @Composable
 fun SourceRow(
     addon: String,
@@ -35,15 +37,21 @@ fun SourceRow(
     flavorTags: List<String> = emptyList(),
     size: String? = null,
     enabled: Boolean = true,
+    pinned: Boolean = false,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .vortxShadow(VortXTheme.elevation.rest, VortXShapes.card)
-            .clip(VortXShapes.card)
-            .background(colors.surface1, VortXShapes.card)
-            .clickable(enabled = enabled, onClick = onClick)
+            .vortxGlassRow()
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(enabled = enabled, onClick = onClick, onLongClick = onLongClick)
+                } else {
+                    Modifier.clickable(enabled = enabled, onClick = onClick)
+                },
+            )
             .padding(VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
@@ -54,6 +62,7 @@ fun SourceRow(
         )
         Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (pinned) Badge("Pinned")
                 quality?.let { Badge(it) }
                 Badge(addon)
                 if (isTorrent) Badge("Torrent")

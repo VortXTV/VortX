@@ -62,6 +62,31 @@ enum AppLanguage {
         }
     }
 
+    /// Re-derive the OS-level `AppleLanguages` default from our OWN restored `stremiox.languageOverride`.
+    ///
+    /// `set(_:)` writes TWO keys: our override key (a plain app pref) and `AppleLanguages` (the OS key the
+    /// bundle's `.lproj` loading actually reads). `SettingsBackup` filters every key with an "Apple" prefix
+    /// out of the captured domain, so a backup / account sync carries the override key but NOT the derived
+    /// `AppleLanguages`. After a reinstall the picker therefore reads back "Español" while the app renders in
+    /// the system language, forever: nothing ever rewrites `AppleLanguages` until the user re-picks by hand.
+    ///
+    /// Deriving it here (rather than lifting the "Apple" filter to carry `AppleLanguages` itself) keeps the
+    /// OS key out of a cross-platform, cross-device document, where it does not belong: on Mac/tvOS that key
+    /// can hold the whole system language ORDER, so transferring a peer's array wholesale would stomp the
+    /// receiving device's system language list even for a user who never set an in-app override. Our override
+    /// key already syncs today and is unambiguous, so it stays the single source of truth and `set(_:)`
+    /// remains the only writer of `AppleLanguages`.
+    ///
+    /// Only acts when the restored domain actually CARRIES the override key: `SettingsBackup.restore` merges
+    /// (it only ever sets keys, never deletes), so an absent override means "the backup did not mention it",
+    /// and an unmentioned key must be left alone. A present-but-empty override means an explicit "follow the
+    /// system", which `set(nil)` honors by removing `AppleLanguages`. Takes full effect on the next launch
+    /// (the localized bundle is chosen once at launch), exactly like a manual pick.
+    static func reapplyOverride() {
+        guard UserDefaults.standard.object(forKey: overrideKey) != nil else { return }
+        set(current)
+    }
+
     /// Display name (autonym) for a code, falling back to the system-localized name, then the raw code.
     static func name(for code: String) -> String {
         supported.first { $0.code == code }?.name

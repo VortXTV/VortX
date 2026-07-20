@@ -68,6 +68,15 @@ data class InstalledAddon(
     val isOfficial: Boolean = false,
     val isProtected: Boolean = false,
     val providesStreams: Boolean = false,
+    /// The manifest declares a `subtitles` resource (mirrors Apple `CoreDescriptor.providesSubtitles`,
+    /// the `SubtitleAddons.swift:37` union filter): this add-on can be queried for external subtitle
+    /// tracks at play time by [com.vortx.android.player.SubtitleAddonService].
+    val providesSubtitles: Boolean = false,
+    /// Turned OFF for the ACTIVE profile (the per-profile overlay, Apple `Profiles.swift:348
+    /// toggleAddon`): still installed account-wide, but excluded from this profile's Home board rows
+    /// and stream-source groups. Stamped by the repository from
+    /// [com.vortx.android.data.AddonPrefsStore]; the engine itself never sees the flag.
+    val isDisabled: Boolean = false,
     val rawDescriptorJson: String,
 ) {
     /// The transport URL's host, for a short, stable second line under the name (mirrors Apple

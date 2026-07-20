@@ -137,7 +137,7 @@ private struct MacPlayerCoverBridge<Item: Identifiable, C: View>: View {
     }
 }
 
-/// Applied ONCE at the WindowGroup scene root (StremioXiOSApp, macOS only) so it sits ABOVE any sheet
+/// Applied ONCE at the WindowGroup scene root (VortXiOSApp, macOS only) so it sits ABOVE any sheet
 /// (SignIn / OpenLink) or cover: renders the active MacPlayerHost player full-window over the dimmed +
 /// disabled app, and hides the window titlebar while it is up so no nav chrome floats over the video.
 /// Full-window edge-to-edge, matching the v0.1.6 WebView build. The macOS twin of the tvOS root player.
@@ -186,6 +186,24 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
             c.savedTitlebarTransparent = host.titlebarAppearsTransparent
             host.titleVisibility = .hidden
             host.titlebarAppearsTransparent = true
+            // Actively COLLAPSE the resurrected titlebar chain instead of only making it transparent.
+            // `titlebarAppearsTransparent` suppresses the titlebar's OWN background drawing; it does NOT hide
+            // an NSTitlebarContainerView that MacWindowChrome un-hid + gave a 28pt height with an
+            // NSVisualEffectView. That material kept drawing as a grey band (with a dead back affordance) over
+            // the video, windowed AND fullscreen (FINDING 7). Hiding the container removes it. Safe because
+            // MacWindowChrome.apply already early-returns while the player is up, so it will not fight back by
+            // re-showing the container; dismantle restores the chain on dismiss.
+            c.collapseTitlebar(host)
+            // Re-assert across the NATIVE-FULLSCREEN window/backing swap: AppKit rebuilds/re-shows the
+            // titlebar container on that transition, so a one-shot hide would not survive entering fullscreen.
+            // Guarded by content != nil so it only fires while the player cover is up.
+            c.titlebarObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didUpdateNotification, object: host, queue: .main
+            ) { [weak c] _ in
+                guard let c, !c.cancelled, let host = c.host,
+                      MacPlayerHost.shared.content != nil else { return }
+                c.collapseTitlebar(host)
+            }
             // DO NOT toggle `host.toolbar?.isVisible`. That NSToolbar is OWNED by SwiftUI's ToolbarBridge;
             // mutating its visibility here corrupts the bridge, so the NEXT SwiftUI-driven toolbar rebuild
             // (navigating into a Settings sub-screen after the player has been up) crashed in
@@ -200,9 +218,18 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
         coordinator.cancelled = true   // stops a not-yet-run makeNSView async block from hiding the titlebar
+        if let obs = coordinator.titlebarObserver {
+            // Stop re-asserting the collapse BEFORE we restore, so the observer cannot re-hide what we unhide.
+            NotificationCenter.default.removeObserver(obs)
+            coordinator.titlebarObserver = nil
+        }
         guard let host = coordinator.host else { return }
         host.titleVisibility = coordinator.savedTitleVisibility
         host.titlebarAppearsTransparent = coordinator.savedTitlebarTransparent
+        // Restore the titlebar chain we collapsed. With the player gone (content == nil), MacWindowChrome's
+        // didUpdate observer + its delayed re-applies then bring the traffic lights fully back.
+        for node in coordinator.collapsedNodes { node.view.isHidden = node.wasHidden }
+        coordinator.collapsedNodes.removeAll()
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -213,6 +240,33 @@ private struct MacPlayerChromeHider: NSViewRepresentable {
         var savedTitleVisibility: NSWindow.TitleVisibility = .visible
         var savedTitlebarTransparent = false
         var savedToolbarVisible: Bool?
+        // Titlebar-chain nodes (NSTitlebarView / NSTitlebarContainerView) we collapsed, with their prior
+        // isHidden so dismantle restores them exactly. See collapseTitlebar(_:).
+        var collapsedNodes: [(view: NSView, wasHidden: Bool)] = []
+        // Re-assert observer that keeps the chain collapsed across the native-fullscreen window swap.
+        var titlebarObserver: NSObjectProtocol?
+
+        /// Hide the whole titlebar chain from the traffic-light buttons up to (but not including) the theme
+        /// frame — exactly the chain MacWindowChrome.apply force-resurrects — reversing it. Only `isHidden`
+        /// is touched (never styleMask or frame height): hiding a view cannot resize the window, and the grey
+        /// band is the NSTitlebarContainerView's NSVisualEffectView material, which stops drawing once the
+        /// container is hidden. Each node's prior state is recorded ONCE so dismantle restores it; a fresh
+        /// fullscreen container seen on a later re-assert is recorded fresh and harmlessly restored too.
+        /// (Hiding the container also hides the traffic lights during playback, which is the correct full-bleed
+        /// behavior — the player exposes its own close/chevron control.)
+        func collapseTitlebar(_ window: NSWindow) {
+            let stop = window.contentView?.superview
+            for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                var node: NSView? = window.standardWindowButton(kind)?.superview
+                while let v = node, v !== stop {
+                    if !collapsedNodes.contains(where: { $0.view === v }) {
+                        collapsedNodes.append((v, v.isHidden))
+                    }
+                    if !v.isHidden { v.isHidden = true }
+                    node = v.superview
+                }
+            }
+        }
     }
 }
 

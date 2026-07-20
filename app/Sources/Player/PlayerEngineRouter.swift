@@ -249,6 +249,67 @@ enum PlayerEngineRouter {
         dvRemuxEnabled(dvDisplayCapable: dvDisplayCapable) && isDVRemuxCandidate(url)
     }
 
+    // MARK: - Plain (non-DV) remux lane (#147, the remaining item)
+
+    /// Flag for the PLAIN (non-Dolby-Vision) MKV remux lane (#147). AVFoundation has no Matroska demuxer, so a
+    /// non-DV MKV that reaches AVPlayer (the "Prefer AVPlayer" override, the in-player engine pick, or the
+    /// reactive container-unsupported retry - NEVER Auto, which keeps non-DV MKVs on libmpv exactly as before)
+    /// used to mount raw, fail "Cannot Open", and demote to libmpv, losing Picture in Picture - the very thing
+    /// the viewer chose AVPlayer for. With this lane on, that MKV is served through the SAME local
+    /// remux -> fMP4/HLS machinery in `.plain` mode (a straight container re-wrap: no DV/RPU handling, no
+    /// panel switch, unlabeled-range signaling) so AVPlayer demuxes it and PiP is retained.
+    ///
+    /// Resolution order mirrors `dvRemuxEnabled`: an explicit UserDefaults value always wins; else a PRESENT
+    /// RemoteConfig `features.plainRemux` value is the fleet kill-switch; else the BAKED default is ON.
+    /// ON is the deliberate default because the lane only ever engages where today's outcome is a GUARANTEED
+    /// failure -> libmpv demote (explicit AVPlayer intent on a container AVPlayer cannot demux), every failure
+    /// inside the lane lands in the same pre-existing fail-soft demote (classify fail-fast / HLS 404 /
+    /// start-watchdog), and the DV lane's own routing + classify guards are untouched (`.dolbyVision` mode is
+    /// byte-identical). Worst case equals today's behavior; best case keeps AVPlayer + PiP.
+    static let plainRemuxKey = "stremiox.plainRemux"
+    static func plainRemuxEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: plainRemuxKey) != nil {
+            return UserDefaults.standard.bool(forKey: plainRemuxKey)   // explicit local value always wins
+        }
+        // Same set-vs-absent probe as dvRemuxEnabled: agreeing probes = remote value present (fleet switch).
+        let snap = RemoteConfig.snapshot
+        let onWhenAbsentTrue = snap.isFeatureOn("plainRemux", default: true)
+        let onWhenAbsentFalse = snap.isFeatureOn("plainRemux", default: false)
+        if onWhenAbsentTrue == onWhenAbsentFalse { return onWhenAbsentTrue }
+        return true   // baked default ON (see the header: strictly replaces a guaranteed fail -> demote)
+    }
+
+    /// True for a URL the plain lane will PROACTIVELY remux: EXPLICIT Matroska evidence only (a real `.mkv`
+    /// path extension, or a boundary-matched mkv/matroska token in the filename/query), http(s), non-loopback.
+    /// Deliberately NARROWER than `dvRemuxCandidacy`'s probe-and-fail-fast widening: an extensionless debrid
+    /// link with no container hint may well be an MP4 that raw AVPlayer plays DIRECTLY, and proactively
+    /// remuxing it would add overhead for nothing. The extensionless-actually-MKV case is covered by the
+    /// REACTIVE retry (`isPlainRemuxRetryCandidate`) after raw AVPlayer proves it cannot demux the bytes.
+    static func isPlainRemuxCandidate(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return false }
+        let host = (url.host ?? "").lowercased()
+        if host == "127.0.0.1" || host == "localhost" || host.isEmpty { return false }
+        if url.pathExtension.lowercased() == "mkv" { return true }
+        let hint = (url.lastPathComponent + " " + (url.query ?? "")).lowercased()
+        return hasContainerExtension(hint, ["mkv"]) || hint.contains("matroska")
+    }
+
+    /// The REACTIVE retry's URL gate: after raw AVPlayer failed container-unsupported, may the plain remux
+    /// attempt this URL at all? Reuses the DV lane's container-side candidacy verbatim (it is DV-agnostic:
+    /// http(s), non-loopback, not an AVPlayer-native mp4/mov/m4v or HLS/DASH manifest, not a recognized
+    /// non-Matroska container), including its probe-and-fail-fast widening for extensionless links - which is
+    /// exactly right HERE, because AVPlayer has already proven it cannot demux these bytes, so the only cost
+    /// of a wrong attempt is the remux classify failing fast into the same libmpv demote.
+    static func isPlainRemuxRetryCandidate(_ url: URL) -> Bool { dvRemuxCandidacy(url).candidate }
+
+    /// The engine's loadFile asks this to decide whether to PROACTIVELY mount the plain (non-DV) remux for a
+    /// URL it is about to play (the caller has already established the stream is NOT Dolby Vision - a DV
+    /// stream takes `shouldDVRemux`). Pure UserDefaults/RemoteConfig + URL shape; no display read needed
+    /// (the plain lane never touches the panel), so this is nonisolated unlike `shouldDVRemux`.
+    static func shouldPlainRemux(url: URL) -> Bool {
+        plainRemuxEnabled() && isPlainRemuxCandidate(url)
+    }
+
     /// Convenience overload that reads the live display capability on the main actor for callers that don't
     /// track it themselves (the engine's `loadFile`). Kept separate so the default isn't a nonisolated
     /// default-argument expression.

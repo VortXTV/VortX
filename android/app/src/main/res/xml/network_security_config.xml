@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cleartext (plain http) policy.
+
+     WHY THIS EXISTS: with targetSdk >= 28 and no config, the platform blocks EVERY cleartext
+     connection from the Java network stacks. That killed the two user-supplied http cases the app
+     is explicitly built to serve: local media servers reached by raw LAN address (Jellyfin / Emby /
+     Plex - MediaServersScreen itself hints "http://192.168.1.10:8096") and add-on sources that only
+     publish an http URL, both failing with "Cleartext HTTP traffic not permitted".
+
+     WHY THE SHAPE IS INVERTED: Android's network security config cannot express IP ranges (no CIDR,
+     no wildcard IPs - only exact hostnames/IPs and DNS-suffix matches), so "cleartext for private
+     ranges only" is not literally writable; a user's media server at an arbitrary 192.168.x.y can
+     only be served by permitting cleartext in the base config. To keep that from silently blessing
+     http toward services the app itself talks to, every known first-party / credentialed service
+     domain is pinned HTTPS-ONLY below at the platform level (downgrade-proof: even a bug that built
+     an http:// URL for these hosts is refused by the OS). Net effect: the app's own traffic is
+     enforced TLS, and cleartext is possible only toward endpoints the USER supplies (their LAN
+     server, an http add-on source), which is exactly the audited requirement. -->
+<network-security-config>
+    <!-- User-supplied endpoints (LAN media servers by raw IP, http add-on streams) may use http. -->
+    <base-config cleartextTrafficPermitted="true" />
+
+    <!-- Every service the app itself is wired to stays HTTPS-only, enforced by the platform. -->
+    <domain-config cleartextTrafficPermitted="false">
+        <!-- VortX infrastructure (api / catalogs / ratings / skip / sources / trailer / trickplay ...). -->
+        <domain includeSubdomains="true">vortx.tv</domain>
+        <!-- Engine add-on defaults (Cinemeta etc.). -->
+        <domain includeSubdomains="true">strem.io</domain>
+        <!-- External sync + metadata + skip providers. -->
+        <domain includeSubdomains="true">trakt.tv</domain>
+        <domain includeSubdomains="true">simkl.com</domain>
+        <domain includeSubdomains="true">themoviedb.org</domain>
+        <domain includeSubdomains="true">tmdb.org</domain>
+        <domain includeSubdomains="true">metahub.space</domain>
+        <domain includeSubdomains="true">kitsu.io</domain>
+        <domain includeSubdomains="true">skipdb.tv</domain>
+        <domain includeSubdomains="true">theintrodb.org</domain>
+        <domain includeSubdomains="true">aniskip.com</domain>
+        <!-- Debrid accounts (API keys ride these requests: never over cleartext). -->
+        <domain includeSubdomains="true">real-debrid.com</domain>
+        <domain includeSubdomains="true">alldebrid.com</domain>
+        <domain includeSubdomains="true">premiumize.me</domain>
+        <domain includeSubdomains="true">torbox.app</domain>
+        <!-- Plex account linking (the cloud side; a local PMS by LAN IP falls under base-config). -->
+        <domain includeSubdomains="true">plex.tv</domain>
+        <!-- Trailer resolve chain. -->
+        <domain includeSubdomains="true">youtube.com</domain>
+        <domain includeSubdomains="true">googlevideo.com</domain>
+        <domain includeSubdomains="true">googleapis.com</domain>
+    </domain-config>
+</network-security-config>

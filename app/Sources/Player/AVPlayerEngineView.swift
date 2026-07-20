@@ -26,8 +26,12 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         return self
     }
     func live(_ live: Bool) -> Self { coordinator.playLive = live; return self }
-    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
+    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?, PlayerLoadToken) -> Void) -> Self {
         coordinator.onPropertyChange = handler
+        return self
+    }
+    func onPropertyChange(_ handler: @escaping (any PlayerEngine, String, Any?) -> Void) -> Self {
+        coordinator.onPropertyChange = { engine, name, data, _ in handler(engine, name, data) }
         return self
     }
     func onTap(_ handler: @escaping () -> Void) -> Self { coordinator.onTap = handler; return self }

@@ -109,7 +109,11 @@ struct SourceFilterChipsView: View {
             // engaged (kind.tint keeps Only=accent and Avoid=warn reading clearly, same as ChipButtonStyle).
             .vortxGlassChip(selected: isOn, tint: kind.tint)
         }
-        .buttonStyle(.plain)
+        // This chip took the glass BACKGROUND but kept `.buttonStyle(.plain)`, which on tvOS leaves the
+        // system focus platter ON: a white slab wider than the chip, drawn over the chips either side (it
+        // covered "HDR / DV" and "Stated quality" around a focused "My audio"). `.vortxChipButton` carries
+        // the same capsule ring + lift ChipButtonStyle draws, in this chip's own tint. See ChipButtonStyle.
+        .vortxChipButton(tint: kind.tint)
     }
 
     // MARK: Keyword lanes (Prefer / Only / Avoid words)
@@ -209,7 +213,9 @@ struct SourceFilterChipsView: View {
                 .padding(.vertical, Theme.Space.xs)
                 .vortxGlassChip(selected: selected)
         }
-        .buttonStyle(.plain)
+        // Same platter bug as the criterion chips above, and worse here: these two sit side by side, so a
+        // focused "Rank it down" covered "Hide it" AND clipped the "When I avoid a source" label above it.
+        .vortxChipButton()
     }
 
     // MARK: Auto-pick

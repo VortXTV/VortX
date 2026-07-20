@@ -2,6 +2,48 @@ import Foundation
 import CryptoKit
 import os
 
+/// Wave 4: local, per-device cache of the OWNER library's resume offsets (id -> seconds), sourced from the
+/// VortX account doc (`doc.vortx.library`). stremio-core exposes NO action to inject a saved timeOffset back
+/// into its own library bucket (only AddToLibrary, which starts an item at time 0, RewindLibraryItem, and the
+/// Player's live TimeChanged), so a cold / reinstalled / post-import-Logout device re-adds owner titles at 0
+/// and would otherwise lose every resume position. This cache is the VortX-owned resume source that CoreBridge's
+/// resume reads consult when the engine's own bucket has no positive offset for a title, so a second VortX-only
+/// device resumes exactly where device A left off.
+///
+/// Read-only convenience for playback: it never gates library membership and never deletes a title. Entries are
+/// refreshed from the authoritative doc on every cold recovery, so a stale value self-heals on the next sync.
+enum OwnerResumeStore {
+    private static let key = "vortx.owner.resumeCache.v1"
+
+    /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a series.
+    struct Entry { let t: Double; let d: Double; let v: String? }
+
+    /// Merge owner-library resume entries (from `doc.vortx.library`) into the cache. `t`/`d` are in SECONDS.
+    /// Last write wins per id: the caller passes the authoritative doc set, so this tracks the account truth.
+    static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?)]) {
+        guard !entries.isEmpty else { return }
+        var map = (UserDefaults.standard.dictionary(forKey: key)) ?? [:]
+        for e in entries where !e.id.isEmpty {
+            map[e.id] = ["t": e.t, "d": e.d, "v": e.v ?? ""]
+        }
+        UserDefaults.standard.set(map, forKey: key)
+    }
+
+    /// The cached resume entry for an owner-library id, or nil when the cache has none.
+    static func entry(forId id: String) -> Entry? {
+        guard let map = UserDefaults.standard.dictionary(forKey: key),
+              let raw = map[id] as? [String: Any] else { return nil }
+        func seconds(_ v: Any?) -> Double {
+            if let d = v as? Double { return d }
+            if let n = v as? NSNumber { return n.doubleValue }
+            if let i = v as? Int { return Double(i) }
+            return 0
+        }
+        let v = raw["v"] as? String
+        return Entry(t: seconds(raw["t"]), d: seconds(raw["d"]), v: (v?.isEmpty == false) ? v : nil)
+    }
+}
+
 /// One title's watch state inside a profile's private overlay: enough to render Continue Watching,
 /// resume, and watched markers without touching the account's shared library.
 struct WatchEntry: Codable, Equatable {
@@ -20,8 +62,14 @@ struct WatchEntry: Codable, Equatable {
     }
 }
 
-/// Syncs profile data through the Stremio account's datastore, so profiles and their watch
-/// history follow the account to every device running StremioX.
+/// The LEGACY / optional Stremio-datastore transport for profiles and their watch history.
+///
+/// VortX (doc.vortx.* via VortXSyncManager) is now AUTHORITATIVE for the roster and the per-profile
+/// overlay watch history. This transport is used for two things only: the one-time IMPORT read that
+/// migrates a user's existing Stremio-datastore data into the VortX account, and, when the user opts into
+/// the "also sync to Stremio" mirror (`alsoSyncToStremio`, default OFF), the legacy two-way Stremio sync.
+/// The automatic Stremio WRITE is dormant by default. `repairPoisonedLibrary` still runs on every launch
+/// as a permanent safety scan (an old build on the same account can still poison official library sync).
 ///
 /// Transport: our OWN datastore collection. Official clients only ever pull the collections they
 /// know ("libraryItem", ...), so documents in a different collection are invisible to them and
@@ -38,6 +86,46 @@ enum ProfileSync {
     private static let collection = "stremioxProfiles"     // our own, invisible to official clients
     private static let rosterID = "stremiox:profiles"
     private static let log = Logger(subsystem: "com.stremiox.app", category: "profilesync")
+
+    /// UserDefaults key for the opt-in "also sync to Stremio" mirror (a future Settings toggle writes it).
+    static let alsoSyncKey = "vortx.profiles.alsoSyncToStremio"
+    /// Whether the app should ALSO write the roster + per-profile overlay watch history to the legacy Stremio
+    /// account datastore. VortX (doc.vortx.*) is authoritative, so this is OFF by default and the automatic
+    /// Stremio write stays dormant. It turns ON only when the user opts into the mirror. The one-time IMPORT
+    /// read from Stremio is separate and always allowed (it is how existing data migrates into VortX).
+    static var alsoSyncToStremio: Bool { UserDefaults.standard.bool(forKey: alsoSyncKey) }
+
+    // MARK: Wave 4: one-time Stremio library import gate (VortX owns the library + Continue Watching)
+
+    /// Per-Stremio-account flag: the engine's Stremio-synced OWNER library + Continue Watching have been
+    /// captured into the VortX account doc (`doc.vortx.library`). Once set, the app stops LOADING the Stremio
+    /// token into the stremio-core engine (`CoreBridge.bootstrapAuth`) and stops the direct Stremio progress
+    /// writes (`StremioAccount.saveProgress`/`resumeOffset`). The engine then runs on its purely-LOCAL library
+    /// bucket, which is ALREADY mirrored to `doc.vortx.library` (FLOOR union, never shrinks) and re-hydrated on
+    /// cold devices, so nothing is lost. Keyed by a SHA-256 prefix of the authKey (the same shape as
+    /// `repairDoneKey`) so the raw token never lands in UserDefaults and a DIFFERENT account re-imports.
+    ///
+    /// Non-destructive + idempotent: the flag ONLY records that the VortX copy exists; it never deletes a
+    /// library item or a removal tombstone, and the library mirror keeps running regardless of this flag. A
+    /// reinstall that clears the flag re-imports additively (union), so it can never lose a title. The Keychain
+    /// token itself is never dropped here: the user can still Connect Stremio, or opt into `alsoSyncToStremio`.
+    private static func libraryImportKey(_ authKey: String) -> String {
+        let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "vortx.library.importedFromStremio.\(digest)"
+    }
+
+    /// True once THIS Stremio account's library has been imported into the VortX account doc.
+    static func libraryImportedFromStremio(authKey: String) -> Bool {
+        guard !authKey.isEmpty else { return false }
+        return UserDefaults.standard.bool(forKey: libraryImportKey(authKey))
+    }
+
+    /// Record the completed one-time library import. Call ONLY after a confirmed, non-failed capture into the
+    /// VortX account doc (see `VortXSyncManager.importOwnerLibraryFromStremioOnce`), never speculatively.
+    static func markLibraryImportedFromStremio(authKey: String) {
+        guard !authKey.isEmpty else { return }
+        UserDefaults.standard.set(true, forKey: libraryImportKey(authKey))
+    }
 
     /// nil = not probed yet; false = the API refused our collection, cloud sync is disabled and
     /// profiles stay per-device (never fall back to libraryItem smuggling again).

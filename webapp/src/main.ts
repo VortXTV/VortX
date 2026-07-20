@@ -1,4 +1,5 @@
 import "./styles/app.css";
+import "./styles/tv.css"; // 10-foot presentation; scoped under html.tv, inert unless the TV layer turns on
 
 import type { Addon } from "./lib/types";
 import { loadInstalledAddons } from "./lib/store";
@@ -26,6 +27,7 @@ import { handleLoginClick, renderLogin } from "./views/login";
 import { renderApprove, handleApproveClick } from "./views/approve";
 import { applySettings } from "./lib/settings";
 import { ensureValidSession, hydrateFromAccount } from "./lib/account";
+import { initTvPlatform } from "./lib/tvnav";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
 // hash-routed surfaces (Home board, Discover grid, Search, Detail, Add-ons). Detail resolves streams
@@ -352,6 +354,7 @@ async function start(): Promise<void> {
   app.innerHTML = APP_SHELL;
   wireGlobalClicks();
   initCardMenu(); // right-click / long-press context menu on poster cards
+  initTvPlatform(); // D-pad + OK + BACK remote input on webOS/Tizen; no-op in the browser
 
   // Validate the token in the background, then pull the account sync doc so a returning (already signed-in)
   // user's add-ons, library, and Continue Watching refresh on load - not only on a fresh sign-in. Never

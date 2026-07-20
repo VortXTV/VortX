@@ -32,8 +32,8 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     let contentId: String
     /// `PlaybackMeta.videoId` — the movie id, or `imdbId:season:episode` for an episode.
     let videoId: String
-    /// "movie" | "series" (the `PlaybackMeta.type`; an episode download carries "series", matching the
-    /// streaming episode play path).
+    /// The original `PlaybackMeta.type`. The beta lifecycle fence derives behavior without rewriting this
+    /// persisted value or migrating the download index.
     let type: String
 
     let name: String
@@ -137,12 +137,32 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
                      name: name, poster: poster, season: season, episode: episode)
     }
 
+    /// Backward-compatible beta lifecycle classification. Computed fields do not alter `index.json`, and
+    /// the raw catalog type remains available to API and storage call sites.
+    var usesSeriesLifecycle: Bool {
+        EpisodePlaybackIdentity.usesSeriesLifecycle(type: type)
+    }
+
     /// Display title, episode-aware (matches the streaming episode title format).
     var displayTitle: String {
-        if type == "series", let s = season, let e = episode {
+        if usesSeriesLifecycle, let s = season, let e = episode {
             return "\(name)  ·  S\(s)E\(e)"
         }
         return name
+    }
+
+    /// A show-like record groups under its durable title id, while a movie remains a standalone video.
+    var groupingKey: String {
+        usesSeriesLifecycle ? "series:\(contentId)" : "movie:\(videoId)"
+    }
+
+    /// Season-then-episode ascending. Unknown numbers sort last, then insertion time stabilizes ties.
+    static func episodeOrder(_ a: DownloadRecord, _ b: DownloadRecord) -> Bool {
+        let seasonA = a.season ?? Int.max, seasonB = b.season ?? Int.max
+        if seasonA != seasonB { return seasonA < seasonB }
+        let episodeA = a.episode ?? Int.max, episodeB = b.episode ?? Int.max
+        if episodeA != episodeB { return episodeA < episodeB }
+        return a.addedAt < b.addedAt
     }
 
     /// 0...1 download progress; 0 until a total is known (a torrent's total is unknown up front).

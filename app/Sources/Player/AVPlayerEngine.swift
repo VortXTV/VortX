@@ -44,6 +44,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     weak var playDelegate: MPVPlayerDelegate?
 
     private var item: AVPlayerItem?
+    /// Monotonic exact-item ownership. Logical retries may intentionally reuse a load token, so queued
+    /// delivery must also prove that the AVPlayerItem generation that emitted the event is still mounted.
+    private var itemGeneration: UInt64 = 0
+    private(set) var activeLoadToken: PlayerLoadToken?
     private var isReady = false
     private var didStart = false
     /// One fatal `endFileError` per loaded item. The item's `.failed` KVO and the failed-to-play-to-end
@@ -55,6 +59,16 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// CoreMedia startup hiccup on the loopback HLS origin). The chrome retries ONE fresh item on the same mount
     /// before demoting; this flag makes that retry happen at most once, resetting only on the next loadFile.
     private var healthyMountRetried = false
+    /// #147 reactive net, one-shot: a RAW (non-remux) mount that failed container-unsupported ("Cannot Open" -
+    /// AVFoundation has no Matroska demuxer) gets ONE retry through the PLAIN remux lane before the libmpv
+    /// demote (which would lose Picture in Picture). Loop-safe even though loadFile resets it: the retry
+    /// mounts the remux, and the retry gate refuses any remux-mounted failure (`!isRemuxMounted`), so a failed
+    /// retry demotes normally.
+    private var plainRemuxRetried = false
+    /// Forces the next loadFile onto the PLAIN remux lane (#147), bypassing the router's explicit-Matroska
+    /// candidacy (the reactive retry has already proven raw AVPlayer cannot demux the bytes). Consumed (reset
+    /// to false) inside loadFile; set only by the container-unsupported retry in handleStatus.
+    private var forcePlainRemux = false
     // AUDIO-OVER-BLACK watchdog state (#76 residual, native DV lane only; see checkAudioOverBlackWatchdog).
     // `videoFrameEverProduced` latches TRUE on the first observed video frame and permanently disarms the
     // watchdog for this item, so it can never fire on a session that ever showed a picture. `audioOverBlackSince`
@@ -181,11 +195,23 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     // MARK: Loading + transport
 
-    func loadFile(_ url: URL, headers: [String: String]?, live: Bool) {
+    func invalidateLoadToken() {
+        activeLoadToken = nil
+    }
+
+    @discardableResult
+    func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
+                  reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        let issuedToken = loadToken ?? PlayerLoadToken()
+        itemGeneration &+= 1
+        // Invalidate first so callbacks from the retired item cannot publish during replacement setup.
+        // The new logical request becomes active before any mount failure or observer can emit.
+        invalidateLoadToken()
+        activeLoadToken = issuedToken
         teardownObservers()
         teardownRemux()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false; healthyMountRetried = false
-        incompatibleEntryHandled = false
+        incompatibleEntryHandled = false; plainRemuxRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
@@ -208,19 +234,45 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // `forceRemux` (set by the hev1/dvhe post-attach repair) overrides the router's container gate, which
         // rejects mp4/mov: an AVPlayer-incompatible DV MP4 still routes into the container-agnostic remux lane.
         // Consumed here so it applies to exactly this load.
-        let wantsRemux = forceRemux || PlayerEngineRouter.shouldDVRemux(url: url)
+        // Gate the auto-remux on an actual Dolby Vision signal (#147): shouldDVRemux checks only container
+        // candidacy + a DV-capable display, never DV itself, on the false assumption (its docstring) that
+        // "only DV sources reach the AVPlayer remux lane under Auto". That holds under Auto, but the "Prefer
+        // AVPlayer" override (PlayerEngineRouter rule 2) sends ANY non-torrent URL here, so a plain non-DV MKV
+        // was mounted on the DV remux, failed fast (dvProfile=-1 -> HDR10 404), and demoted to libmpv, losing
+        // Picture in Picture after a ~2s detour. `contentIsDolbyVision` is set from the same
+        // StreamRanking.isDolbyVision signal the router routes on, BEFORE this loadFile (and re-set before a
+        // source-switch loadFile), so a genuine DV source under Auto still remuxes; `forceRemux` still covers
+        // the DV-only hev1/dvhe post-attach repair regardless of the flag.
+        let wantsDVRemux = forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url))
         forceRemux = false
+        // #147 (the remaining item): PLAIN (non-DV) remux lane. A NON-DV MKV can only reach this engine on
+        // explicit AVPlayer intent (the "Prefer AVPlayer" override, the in-player engine pick, or the reactive
+        // container-unsupported retry below - NEVER Auto, whose rule 5 keeps non-DV MKVs on libmpv untouched),
+        // and AVFoundation has no Matroska demuxer, so the raw mount was a GUARANTEED "Cannot Open" ->
+        // endFileError -> libmpv demote that lost Picture in Picture, the very thing the viewer chose AVPlayer
+        // for. Route it through the SAME local remux machinery in `.plain` mode instead: a straight container
+        // re-wrap (no DV/RPU handling, no panel switch, range-unlabeled single-variant HLS). HLS delivery
+        // only: with the delivery lane rolled back (deliveryEnabled=false) this lane is fully OFF and the raw
+        // path behaves exactly as before #147. Flag-gated via PlayerEngineRouter.plainRemuxEnabled
+        // (UserDefaults stremiox.plainRemux > RemoteConfig features.plainRemux > baked ON).
+        let wantsPlainRemux = !wantsDVRemux && !contentIsDolbyVision && VortXRemuxHLSServer.deliveryEnabled
+            && (forcePlainRemux || PlayerEngineRouter.shouldPlainRemux(url: url))
+        forcePlainRemux = false
+        let wantsRemux = wantsDVRemux || wantsPlainRemux
         if wantsRemux, VortXRemuxHLSServer.deliveryEnabled,
-           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers) {
+           let mounted = VortXRemuxHLSServer.make(input: url, headers: headers,
+                                                  mode: wantsPlainRemux ? .plain : .dolbyVision) {
             remuxHLSServer = mounted.server
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
-            DiagnosticsLog.log("avplayer", "dv-remux mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
-            // [dv] the true-DV remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log("avplayer", "\(lane) mount (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+            // [dv] the remux lane mounted: AVPlayer is now fed the remux as local HLS. If a classify
             // fail-soft fires next (see VortXMKVRemuxStream), the item .failed demotion below ties the reason
-            // to the observed engine flip, giving one greppable [dv] trail.
-            VXProbe.log("dv", "remux mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
-        } else if wantsRemux, !VortXRemuxHLSServer.deliveryEnabled,
+            // to the observed engine flip, giving one greppable [dv] trail (the plain lane logs on the same
+            // channel so one grep still shows route -> mount -> classify -> demote in order).
+            VXProbe.log("dv", "\(lane) mounted (local HLS) host=\(url.host ?? "?") -> 127.0.0.1:\(mounted.server.port)")
+        } else if wantsDVRemux, !VortXRemuxHLSServer.deliveryEnabled,
                   let built = VortXRemuxResourceLoader.make(input: url, headers: headers) {
             remuxLoader = built.loader
             let asset = AVURLAsset(url: built.assetURL)
@@ -230,16 +282,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             DiagnosticsLog.log("avplayer", "dv-remux mount host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
             VXProbe.log("dv", "remux mounted host=\(url.host ?? "?") -> \(built.assetURL.scheme ?? "?")")
         } else if wantsRemux {
-            // The router demanded the DV-for-MKV remux lane but the mount could not be built (the local HLS
+            // The remux lane (DV or plain) was demanded but the mount could not be built (the local HLS
             // server failed to bind, or the legacy loader could not be assembled). AVFoundation has no
             // Matroska demuxer, so loading the raw MKV here would mount an item AVPlayer can never produce a
-            // frame from. Fail-soft immediately so the chrome demotes to libmpv HDR10 instead of stalling on
+            // frame from. Fail-soft immediately so the chrome demotes to libmpv instead of stalling on
             // an un-demuxable asset. This ties into the [dv] demotion trail below.
-            DiagnosticsLog.log("avplayer", "dv-remux mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
-            VXProbe.log("dv", "remux mount build failed -> endFileError demote host=\(url.host ?? "?")")
+            let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
+            DiagnosticsLog.log("avplayer", "\(lane) mount build failed host=\(url.host ?? "?") -> demoting to libmpv")
+            VXProbe.log("dv", "\(lane) mount build failed -> endFileError demote host=\(url.host ?? "?")")
             fatalErrorEmitted = true
-            emit(MPVProperty.endFileError, "DV remux unavailable")
-            return
+            emit(MPVProperty.endFileError,
+                 wantsPlainRemux ? "Remux unavailable" : "DV remux unavailable",
+                 loadToken: issuedToken)
+            return issuedToken
         } else {
             let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
             newAsset = AVURLAsset(url: url, options: options)
@@ -267,8 +322,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // previously never set preferredDisplayCriteria at all). fps/size are unknown pre-attach; the
         // readyToPlay request below re-asserts with the real values. Fail-soft: a refused/ignored request
         // changes nothing about playback, and reset() on stop() restores the default mode.
-        if isRemuxMounted {
-            // REMUX lane: DEFER the panel switch to the point classify confirms a DECODABLE DV profile (#76).
+        if isRemuxMounted, wantsDVRemux {
+            // DV REMUX lane: DEFER the panel switch to the point classify confirms a DECODABLE DV profile (#76).
             // The remux stream knows the profile ~1.5-6s in; VortXRemuxHLSServer.serveMaster fires the switch
             // once the DV signaling is published and BEFORE the media playlist / first segment (still ahead of
             // the video mount, per Tech Talk 503 ordering). Firing it here on mount cycled the panel twice per
@@ -287,6 +342,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         } else {
             // A non-DV stream loading into this SAME engine (an in-player source/episode switch) must not
             // inherit a previous title's DV criteria. Idempotent: reset only clears when criteria are set.
+            // #147: a mounted PLAIN remux lands here too (contentIsDolbyVision=false, wantsDVRemux=false), so
+            // a plain MKV following a DV title correctly clears the panel; the plain lane's server never
+            // requests a switch (serveMaster is gated on sig.dolbyVision).
             HDRDisplayMode.reset(in: nil)
         }
         #endif
@@ -299,10 +357,31 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         player.replaceCurrentItem(with: newItem)
         player.allowsExternalPlayback = true   // AirPlay
         DiagnosticsLog.log("avplayer", "load host=\(url.host ?? "?") scheme=\(url.scheme ?? "?") ext=\(url.pathExtension) headers=\(headers?.count ?? 0) live=\(live)")
-        observe(newItem)
+        observe(newItem, loadToken: issuedToken)
         // Drive the current status now: the KVO below uses [.initial, .new], but an item that is already
         // readyToPlay at attach time still benefits from an explicit kick so play() is never skipped.
-        if newItem.status != .unknown { handleStatus(newItem) }
+        if newItem.status != .unknown { handleStatus(newItem, loadToken: issuedToken) }
+        return issuedToken
+    }
+
+    /// #147 reactive-net gate: should this item failure be retried through the PLAIN remux lane instead of
+    /// demoting to libmpv? True only when ALL hold:
+    ///  - the mount never produced playback (`!didStart`) and is a RAW mount (`!isRemuxMounted`: a failure on
+    ///    an already-remuxed mount means the remux lane itself cannot serve this source, so demote honestly);
+    ///  - one-shot per load (`!plainRemuxRetried`), non-DV (`!contentIsDolbyVision`: DV routing has its own
+    ///    lane + repair paths, untouched), the plain lane is enabled and HLS delivery is not rolled back;
+    ///  - the URL is one the remux can even attempt (`isPlainRemuxRetryCandidate`: not an AVPlayer-native
+    ///    container, not loopback - the broad probe-and-fail-fast candidacy, correct here because AVPlayer
+    ///    has already PROVEN it cannot demux these bytes);
+    ///  - the failure is the specific CONTAINER-UNSUPPORTED signature (AVFoundation "Cannot Open",
+    ///    fileFormatNotRecognized): a network / DRM / decode failure must demote as before, never re-spin
+    ///    the same broken source through a remux.
+    private func shouldRetryViaPlainRemux(error ns: NSError?) -> Bool {
+        guard !didStart, !isRemuxMounted, !plainRemuxRetried, !contentIsDolbyVision else { return false }
+        guard VortXRemuxHLSServer.deliveryEnabled, PlayerEngineRouter.plainRemuxEnabled() else { return false }
+        guard let url = lastLoadURL, PlayerEngineRouter.isPlainRemuxRetryCandidate(url) else { return false }
+        guard let ns, ns.domain == AVFoundationErrorDomain else { return false }
+        return ns.code == AVError.Code.fileFormatNotRecognized.rawValue   // -11828, "Cannot Open"
     }
 
     /// One-shot healthy-mount retry (#76). Field logs show the served /media.m3u8 answered and /init.mp4
@@ -317,7 +396,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         // (a mid-play failure is the demote paths' job). Today unreachable mid-play via the chrome's
         // !hasStartedPlaying gate; this makes the function safe on its own terms.
         guard let server = remuxHLSServer, server.isMountHealthy, !healthyMountRetried, !didStart,
-              let mountURL = (item?.asset as? AVURLAsset)?.url else { return false }
+              let mountURL = (item?.asset as? AVURLAsset)?.url,
+              let loadToken = activeLoadToken else { return false }
         healthyMountRetried = true
         DiagnosticsLog.log("dv", "healthy-mount retry (#76): item failed but remux healthy (init published, buffer OK) -> one fresh AVPlayerItem on 127.0.0.1:\(server.port)")
         VXProbe.log("dv", "AVPlayer .failed on a HEALTHY remux mount -> ONE fresh-item retry (same mount) before any demote")
@@ -328,6 +408,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         videoFrameEverProduced = false; audioOverBlackSince = 0; audioOverBlackFired = false
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: mountURL))
+        itemGeneration &+= 1
         item = freshItem
         freshItem.preferredForwardBufferDuration = 30   // same loopback forward-buffer cap as the initial mount
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -336,8 +417,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         freshItem.add(output)
         videoOutput = output
         player.replaceCurrentItem(with: freshItem)
-        observe(freshItem)
-        if freshItem.status != .unknown { handleStatus(freshItem) }
+        observe(freshItem, loadToken: loadToken)
+        if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
         return true
     }
 
@@ -362,7 +443,14 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             if edge > 0, clamped > edge { clamped = edge }
         }
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
-        emit(MPVProperty.timePos, clamped)
+        if let item, let loadToken = activeLoadToken,
+           owns(item, loadToken: loadToken) {
+            emit(
+                MPVProperty.timePos,
+                PlayerTimePositionEvent(seconds: clamped, loadToken: loadToken),
+                loadToken: loadToken
+            )
+        }
         updateSubtitleOverlay(atClock: clamped)   // re-check the cue now; the observer is only ~4 Hz
     }
     func seek(by seconds: Double) { seek(to: player.currentTime().seconds + seconds) }
@@ -387,6 +475,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func setMuted(_ muted: Bool) { player.isMuted = muted }
 
     func stop() {
+        invalidateLoadToken()
+        itemGeneration &+= 1
         teardownObservers()
         teardownRemux()
         #if os(tvOS)
@@ -477,14 +567,24 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// AVPlayer-native legible track so subtitles never double up. `completion(true)` once cues are loaded.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
-        guard let remote = URL(string: url) else { completion?(false); return }
+        guard let remote = URL(string: url),
+              let requestToken = activeLoadToken,
+              let requestItem = item,
+              owns(requestItem, loadToken: requestToken) else {
+            completion?(false)
+            return
+        }
         let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
         SubtitleFileFetcher.fetch(remote, timeout: timeout) { [weak self] data in
             guard let data else { finish(false); return }
             let cues = SubtitleCueRenderer.parse(data: data)
             guard !cues.isEmpty else { finish(false); return }
             Task { @MainActor in
-                guard let self else { finish(false); return }
+                guard let self,
+                      self.owns(requestItem, loadToken: requestToken) else {
+                    finish(false)
+                    return
+                }
                 self.subtitleRenderer.load(cues: cues)
                 self.externalSubActive = true
                 // Turn off any embedded/HLS legible track so we don't render two subtitle streams at once.
@@ -769,18 +869,37 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
 
     // MARK: Observation -> MPVProperty events
 
-    private func observe(_ item: AVPlayerItem) {
-        observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor in self?.handleStatus(item) }
+    private func owns(_ item: AVPlayerItem, loadToken: PlayerLoadToken) -> Bool {
+        PlayerLoadProvenanceState.acceptsAVCallback(
+            callbackToken: loadToken,
+            activeToken: activeLoadToken,
+            capturedItemIsCurrent: self.item === item && player.currentItem === item
+        )
+    }
+
+    private func observe(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
+            Task { @MainActor in self?.handleStatus(observedItem, loadToken: loadToken) }
         })
-        observations.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
-            Task { @MainActor in self?.emit(MPVProperty.pausedForCache, item.isPlaybackBufferEmpty) }
+        observations.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] observedItem, _ in
+            Task { @MainActor in
+                guard let self, self.owns(observedItem, loadToken: loadToken) else { return }
+                self.emit(
+                    MPVProperty.pausedForCache, observedItem.isPlaybackBufferEmpty,
+                    loadToken: loadToken
+                )
+            }
         })
-        observations.append(item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] item, _ in
-            Task { @MainActor in if item.isPlaybackLikelyToKeepUp { self?.emit(MPVProperty.pausedForCache, false) } }
+        observations.append(item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] observedItem, _ in
+            Task { @MainActor in
+                guard let self, observedItem.isPlaybackLikelyToKeepUp,
+                      self.owns(observedItem, loadToken: loadToken) else { return }
+                self.emit(MPVProperty.pausedForCache, false, loadToken: loadToken)
+            }
         })
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             Task { @MainActor in
+                guard let self, self.owns(item, loadToken: loadToken) else { return }
                 // Diagnostic: a player stuck at .waitingToPlayAtSpecifiedRate (2) with a buffering wait-reason
                 // is the "mounts but never plays" signature; logging the reason pinpoints it in one test.
                 DiagnosticsLog.log("avplayer", "timeControlStatus=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
@@ -791,7 +910,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     : (waiting ? "buffering" : "playing")
                 VXProbeState.shared.setPlayer(state: stateText, engine: "avplayer", buffering: waiting)
                 VXProbe.event("player", "stall \(waiting ? "start" : "end")")
-                self?.emit(MPVProperty.pause, player.timeControlStatus == .paused)
+                self.emit(
+                    MPVProperty.pause, player.timeControlStatus == .paused,
+                    loadToken: loadToken
+                )
             }
         })
         // ~4 Hz, matching the libmpv controller's coalesced time-pos cadence. Delivered on .main, so it runs
@@ -800,10 +922,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main
         ) { [weak self] time in
             MainActor.assumeIsolated {
-                guard let self, self.timeObserver != nil else { return }
+                guard let self, self.timeObserver != nil,
+                      self.owns(item, loadToken: loadToken) else { return }
                 // Cheap, every tick: the play head (scrubber smoothness) and the subtitle overlay clock. These
                 // must stay at the full 0.25s cadence or the progress bar and external subs visibly lag.
-                self.emit(MPVProperty.timePos, time.seconds)
+                self.emit(
+                    MPVProperty.timePos,
+                    PlayerTimePositionEvent(seconds: time.seconds, loadToken: loadToken),
+                    loadToken: loadToken
+                )
                 self.updateSubtitleOverlay(atClock: time.seconds)   // sync external-sub overlay to the clock
                 // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
@@ -835,11 +962,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                         guard start.isFinite, end.isFinite else { continue }
                         if now >= start - 1 && now <= end { aheadEdge = max(aheadEdge, end) }
                     }
-                    if aheadEdge > 0 { self.emit(MPVProperty.demuxerCacheTime, aheadEdge) }
+                    if aheadEdge > 0 {
+                        self.emit(MPVProperty.demuxerCacheTime, aheadEdge, loadToken: loadToken)
+                    }
                 }
             }
         }
-        NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd),
+        NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd(_:)),
                                                name: .AVPlayerItemDidPlayToEndTime, object: item)
         NotificationCenter.default.addObserver(self, selector: #selector(failedToEnd(_:)),
                                                name: .AVPlayerItemFailedToPlayToEndTime, object: item)
@@ -868,7 +997,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     }
     #endif
 
-    private func handleStatus(_ item: AVPlayerItem) {
+    private func handleStatus(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        guard owns(item, loadToken: loadToken) else { return }
         switch item.status {
         case .readyToPlay:
             isReady = true
@@ -897,9 +1027,9 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                     DiagnosticsLog.log("dv", "synthesized remux duration \(Int(known))s (item.duration indefinite)")
                 }
             }
-            if seekable { emit(MPVProperty.duration, emittedDuration) }
-            emit(MPVProperty.seekable, seekable)
-            emit(MPVProperty.trackList, nil)   // chrome re-pulls via tracks()
+            if seekable { emit(MPVProperty.duration, emittedDuration, loadToken: loadToken) }
+            emit(MPVProperty.seekable, seekable, loadToken: loadToken)
+            emit(MPVProperty.trackList, nil, loadToken: loadToken)
             loadSelectionGroups()              // async; re-emits track-list once the groups resolve
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
             emitDynamicRange(item)             // Gap 7: light the chrome's HDR chip for DV / HDR10 / HLG content
@@ -962,14 +1092,45 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             let ns = item.error as NSError?
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
+            // #143: the HLS stack's REAL reason lives only in the item's error log (the NSError carries a
+            // bare CoreMedia code like -12927 with no comment). Dump the last few events so the next device
+            // export names the exact resource + CoreMedia's own errorComment. Fail-soft, bounded.
+            if let events = item.errorLog()?.events, !events.isEmpty {
+                for ev in events.suffix(4) {
+                    let uri = ev.uri.flatMap { URL(string: $0)?.lastPathComponent ?? $0 } ?? "?"
+                    DiagnosticsLog.log("avplayer", "errorLog: \(ev.errorDomain)#\(ev.errorStatusCode) uri=\(uri) comment=\(ev.errorComment ?? "none")")
+                }
+            }
             VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
+            // #147 reactive net: a RAW (non-remux) mount that failed because AVFoundation cannot demux the
+            // container ("Cannot Open" - the raw-MKV signature, since AVFoundation has no Matroska demuxer)
+            // gets ONE retry through the PLAIN remux lane BEFORE the libmpv demote, so an MKV the proactive
+            // gate could not name (an extensionless debrid link) still keeps AVPlayer + Picture in Picture.
+            // Tightly gated (see shouldRetryViaPlainRemux): pre-start only, raw mounts only, non-DV only,
+            // the specific container-unsupported error code only, a remux-attemptable URL only, one-shot.
+            // Worst case the remux classify fails fast and the SAME demote runs a few seconds later.
+            if shouldRetryViaPlainRemux(error: ns), let failedURL = lastLoadURL {
+                plainRemuxRetried = true
+                forcePlainRemux = true
+                DiagnosticsLog.log("avplayer", "raw mount failed container-unsupported (code=\(ns?.code ?? 0)) -> ONE plain-remux retry before any libmpv demote (#147)")
+                VXProbe.log("dv", "AVPlayer raw mount container-unsupported -> plain-remux retry host=\(failedURL.host ?? "?")")
+                loadFile(
+                    failedURL, headers: lastLoadHeaders, live: lastLoadLive,
+                    audioSidecar: nil, reusing: loadToken
+                )
+                return
+            }
             // [dv] the demotion edge: the AVPlayer item failed and the chrome will fall back to libmpv HDR10.
             // For a DV source this is the tail of the [dv] trail (a remux fail-soft usually preceded it), so
             // grepping [dv] shows route -> mount -> classify/fallback-reason -> this demotion in order.
             VXProbe.log("dv", "AVPlayer item .failed -> demoting to libmpv HDR10: \(ns?.localizedDescription ?? "?")")
             guard !fatalErrorEmitted else { break }
             fatalErrorEmitted = true
-            emit(MPVProperty.endFileError, item.error?.localizedDescription ?? "Playback failed")
+            emit(
+                MPVProperty.endFileError,
+                item.error?.localizedDescription ?? "Playback failed",
+                loadToken: loadToken
+            )
         default:
             break
         }
@@ -1045,19 +1206,26 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// audio-over-black watchdog. Runs on the main actor (the diagnostics Task hops there before calling this).
     @MainActor
     private func repairIncompatibleDVSampleEntry(_ fourcc: String) {
-        guard let url = lastLoadURL else { return }
+        guard let url = lastLoadURL, let loadToken = activeLoadToken else { return }
         if VortXRemuxHLSServer.deliveryEnabled,
            PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable: DVDisplaySupport.isCapable) {
             DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable (black over audio) -> re-mounting \(url.host ?? "?") through the remux lane for hvc1 repair")
             VXProbe.log("dv", "native DV \(fourcc) -> remux re-mount (hvc1/dvh1 repair)")
             forceRemux = true
-            loadFile(url, headers: lastLoadHeaders, live: lastLoadLive)
+            loadFile(
+                url, headers: lastLoadHeaders, live: lastLoadLive,
+                audioSidecar: nil, reusing: loadToken
+            )
         } else {
             guard !fatalErrorEmitted else { return }
             fatalErrorEmitted = true
             DiagnosticsLog.log("dv", "native DV \(fourcc) sample entry is not AVPlayer-decodable and the remux lane is off -> demoting to libmpv HDR10")
             VXProbe.log("dv", "native DV \(fourcc) -> libmpv HDR10 (remux lane off)")
-            emit(MPVProperty.endFileError, "Dolby Vision sample entry not decodable (\(fourcc))")
+            emit(
+                MPVProperty.endFileError,
+                "Dolby Vision sample entry not decodable (\(fourcc))",
+                loadToken: loadToken
+            )
         }
     }
 
@@ -1141,20 +1309,41 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         return false
     }
 
-    @objc private func didPlayToEnd() {
+    @objc private func didPlayToEnd(_ note: Notification) {
+        guard let endedItem = note.object as? AVPlayerItem,
+              let loadToken = activeLoadToken,
+              owns(endedItem, loadToken: loadToken) else { return }
         VXProbe.event("player", "endfile eof")
-        emit(MPVProperty.endFileEof, nil)
+        emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
     }
     @objc private func failedToEnd(_ note: Notification) {
-        guard !fatalErrorEmitted else { return }
+        guard !fatalErrorEmitted,
+              let failedItem = note.object as? AVPlayerItem,
+              let loadToken = activeLoadToken,
+              owns(failedItem, loadToken: loadToken) else { return }
         fatalErrorEmitted = true
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
         VXProbe.event("player", "endfile error \(err?.localizedDescription ?? "?")")
-        emit(MPVProperty.endFileError, err?.localizedDescription ?? "Playback failed")
+        emit(
+            MPVProperty.endFileError, err?.localizedDescription ?? "Playback failed",
+            loadToken: loadToken
+        )
     }
 
-    private func emit(_ name: String, _ data: Any?) {
-        playDelegate?.propertyChange(propertyName: name, data: data)
+    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        guard let capturedToken = loadToken ?? activeLoadToken,
+              capturedToken == activeLoadToken else { return }
+        let capturedItemGeneration = itemGeneration
+        // Never call the chrome synchronously from `loadFile`. A mount can fail while the caller is still
+        // inside that method, before it has stored the returned token in its pending transaction. Queueing
+        // every event preserves the atomic contract: return/register first, callbacks second.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, capturedToken == self.activeLoadToken,
+                  capturedItemGeneration == self.itemGeneration else { return }
+            self.playDelegate?.propertyChange(
+                propertyName: name, data: data, loadToken: capturedToken
+            )
+        }
     }
 
     /// Load the audio + subtitle selection groups off the asset (async, non-deprecated), cache them as

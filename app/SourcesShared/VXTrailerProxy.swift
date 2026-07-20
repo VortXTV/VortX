@@ -325,7 +325,11 @@ final class VXTrailerProxy {
         var request = URLRequest(url: windowURL)
         request.timeoutInterval = Self.windowTimeout
         // NO Range header upstream: googlevideo answers the bounded `&range=` query with a plain 200.
-        request.setValue(YouTubeDirectResolver.googlevideoUserAgent, forHTTPHeaderField: "User-Agent")
+        // UA lockstep: googlevideo binds each issued URL to the InnerTube client that MINTED it, so ask the
+        // resolver for the UA recorded against THIS upstream URL (`upstream` is the exact URL the resolver
+        // returned; the `&range=` window is appended after the lookup key). With the V2 flag off the registry
+        // is empty and this returns the IOS constant, byte-identical to the previous hardcoded header.
+        request.setValue(YouTubeDirectResolver.requiredUserAgent(for: upstream), forHTTPHeaderField: "User-Agent")
 
         let task = upstream_session_dataTask(request) { [weak self] data, response, error in
             guard let self else { return }

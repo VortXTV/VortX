@@ -4,14 +4,14 @@ import UIKit
 #endif
 
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
-/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors StremioTVApp's
+/// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
 ///
 /// 0.3.0 Track 1, built incrementally: this scaffold proves the shared engine layer compiles and
 /// the Rust⇄Swift FFI links on iOS (the schema-version log is the smoke check). Screens land one
 /// by one on top of this shell.
 @main
-struct StremioXiOSApp: App {
+struct VortXiOSApp: App {
     @StateObject private var account = StremioAccount()
     @StateObject private var core = CoreBridge.shared
     @StateObject private var sync = VortXSyncManager.shared
@@ -26,7 +26,7 @@ struct StremioXiOSApp: App {
     // gives us the one reliable "the app is really quitting" hook (applicationWillTerminate),
     // which scenePhase .background/.inactive does NOT provide on macOS — those fire on ordinary
     // window/focus changes, so killing the server there would wrongly stop it mid-use.
-    #if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+    #if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
     @NSApplicationDelegateAdaptor(MacAppDelegate.self) private var appDelegate
     #endif
 
@@ -50,10 +50,17 @@ struct StremioXiOSApp: App {
         // its FIRST verdict (launchOffline) is ready to route an offline launch to Downloads / Settings
         // and the shell's "You're offline" banner tracks the live (debounced) state.
         ConnectivityMonitor.shared.start()
-        #if !STREMIOX_NO_EMBEDDED_SERVER
+        #if !VORTX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
+            #if !os(macOS)
+            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
+            // streaming server (vortx-core over the C server ABI); the player follows its port via
+            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off, so
+            // the default launch path is unchanged and nodejs-mobile keeps serving.
+            VortxNativeServer.startIfNeeded()
+            #endif
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
@@ -76,13 +83,17 @@ struct StremioXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
-                        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
                         // #130: after a long suspension iOS can tear down the server's bound listener while
                         // node keeps ticking, so the server reads Offline until a manual restart.
                         // recoverIfSuspended subsumes the old drift-latch probe (isOnline) and, on a
                         // CONNECTION-REFUSED result while the process is alive, signals the in-node rebind; a
                         // timeout is left alone (busy-but-alive). macOS is excluded: MacNodeServer rebinds 11470.
                         Task.detached(priority: .utility) { await NodeServer.recoverIfSuspended() }
+                        // Phase 8: the flag-gated in-process engine server stops on background (below),
+                        // so foreground restarts it on a fresh ephemeral port; the player follows via
+                        // StremioServer.embeddedPort. No-op while `vortxNativeServer` is off.
+                        VortxNativeServer.startIfNeeded()
                         #endif
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
@@ -97,6 +108,11 @@ struct StremioXiOSApp: App {
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     }
                     if phase == .background {
+                        #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
+                        // Phase 8: stop the flag-gated in-process engine server on background (graceful
+                        // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
+                        VortxNativeServer.stopOnBackground()
+                        #endif
                         VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
                         // push profiles + settings under a background-task grace window so a just-made library
                         // removal / rewind survives a sideload-update process kill (CW resurrection fix).
@@ -414,7 +430,7 @@ private struct MacWindowChrome: NSViewRepresentable {
 }
 #endif
 
-#if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
+#if os(macOS) && !VORTX_NO_EMBEDDED_SERVER
 import AppKit
 
 /// macOS app delegate whose sole job is to kill the embedded node streaming server when the app

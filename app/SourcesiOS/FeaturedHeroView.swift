@@ -53,6 +53,11 @@ struct FeaturedHeroView: View {
     /// resolve never paints another title's clip. `url == nil` = attempted, no direct stream (mount the
     /// /yt worker URL). The clip waits for the attempt so it never remounts mid-loop on a late resolve.
     @State private var heroClipDirect: (heroID: String, url: URL?)?
+    /// Dynamic dominant-color backdrop: the featured art's average color (PosterImageLoader.averageColor),
+    /// painted as the band's BASE layer in place of flat canvas, so the load-in / fallback state and the
+    /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
+    /// today's fixed canvas + gradients exactly, so this is purely additive ambience.
+    @State private var heroTint: Color?
 
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
@@ -63,13 +68,13 @@ struct FeaturedHeroView: View {
     /// a huge window never becomes all hero.
     static var heroHeight: CGFloat {
         #if os(macOS)
-        // The Home billboard must NEARLY FILL the window (owner ask: a 520 / 0.56 band read as a small strip
-        // in a tall Mac window, leaving a persistent black dead-band ABOVE the hero behind the floating search
-        // + nav pill and dead black BELOW). Size off the HOSTING window's content height so the hero is
-        // near-full-bleed (~92% of the visible window), with a 640 floor so a short window still shows a real
-        // billboard and a windowHeight cap so it never exceeds the window. The band already bleeds UNDER the
-        // top chrome via `.ignoresSafeArea(.container, edges: .top)` (below), so filling up to the window top
-        // is what removes the dead band above the hero; the dual scrim keeps the chrome legible over the art.
+        // The Home billboard is a BILLBOARD, not the whole page: it takes ~64% of the window so Continue
+        // Watching / the collections rails peek below it without scrolling (owner + design pass; the prior
+        // 0.92 band ate the whole window and pushed the rails off-screen). Size off the HOSTING window's
+        // content height, with a 560 floor so a short window still reads as a real billboard and a 900 cap so
+        // an enormous display never lets the hero dominate. The band bleeds UNDER the floated top chrome via
+        // `.ignoresSafeArea(.container, edges: .top)` (below): the search strip + nav pill float as glass over
+        // the art with no bare canvas strip above, and the dual scrim keeps that chrome legible over the art.
         // Prefer `mainWindow`: a macOS sheet (the Who's-watching picker and other covers present as sheets on
         // Mac, ProfilesView.swift) becomes KEY while up but never MAIN, so keying off keyWindow made the ~7s
         // hero rotation recompute the band from the ~600pt sheet and snap the whole browse column to the 520
@@ -81,7 +86,7 @@ struct FeaturedHeroView: View {
             ?? NSApplication.shared.windows.first(where: { $0.isVisible && !$0.isSheet })?.contentLayoutRect.height
             ?? NSScreen.main?.visibleFrame.height
             ?? 900
-        return min(windowHeight, max(640, windowHeight * 0.92))
+        return min(900, max(560, windowHeight * 0.64))
         #else
         // Size off the app WINDOW, not the physical screen: in iPad Split View / Slide Over the window is
         // shorter/narrower than UIScreen.main, so keying the band off the whole screen would let the
@@ -158,6 +163,15 @@ struct FeaturedHeroView: View {
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
+        // Dynamic dominant-color backdrop: recompute the band's base tint per featured title, off-main and
+        // cached (PosterImageLoader.averageColor). Cross-fades with the art; nil keeps the canvas fallback.
+        .task(id: model.hero?.id) {
+            let tint = await PosterImageLoader.averageColor(model.hero?.backdrop ?? model.hero?.poster)
+            guard !Task.isCancelled else { return }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
+                heroTint = tint
+            }
+        }
         // FALLBACK cover (iOS/Mac, no server): the keyless WKWebView IFrame, used only when the native /yt
         // resolver is unavailable (Lite build) but a YouTube id exists. Fills the window on macOS too.
         .platformFullScreenPlayerCover(item: $trailerEmbed) { launch in
@@ -231,6 +245,10 @@ struct FeaturedHeroView: View {
         GeometryReader { geo in
             KenBurnsArt {
             ZStack {
+                // Dynamic dominant-color base: the featured art's average color under everything, so the
+                // band already carries the title's palette while the art streams in (and whenever a layer
+                // above misses). nil = today's flat canvas, the graceful fallback.
+                (heroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
                 // band (the iPhone "no backdrop" report — AsyncImage fell straight to the black canvas on
                 // a load miss while the iPad had it cached). The poster is the catalog art the screen
@@ -287,13 +305,14 @@ struct FeaturedHeroView: View {
                 if case .success(let img) = phase {
                     img.resizable().aspectRatio(contentMode: .fill)
                 } else {
-                    Theme.Palette.canvas
+                    // Dominant-color tint while the poster streams in (falls to canvas with no tint).
+                    (heroTint ?? Theme.Palette.canvas)
                 }
             }
             // Decorative backdrop filler — never announced by VoiceOver.
             .accessibilityHidden(true)
         } else {
-            Theme.Palette.canvas
+            (heroTint ?? Theme.Palette.canvas)
                 .accessibilityHidden(true)
         }
     }

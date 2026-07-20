@@ -149,7 +149,7 @@ export function wireAddons(host: HTMLElement): void {
       await addAddon(url);
       onChanged?.();
     } catch {
-      errorEl.textContent = "That URL is not a valid Stremio add-on manifest. Check the link and try again.";
+      errorEl.textContent = "That URL is not a valid add-on manifest. Check the link and try again.";
       errorEl.hidden = false;
     }
   });

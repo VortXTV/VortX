@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import android.content.Context
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -9,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
@@ -20,7 +22,10 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.vortx.android.model.Playable
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -119,6 +124,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     title = format.label ?: format.language ?: "Track ${audio.size + subs.size + 1}",
                     lang = format.language,
                     selected = group.isTrackSelected(trackIndex),
+                    // Carry the container's forced disposition so TrackSelector's forced-subtitle policy
+                    // can key off the flag (not the title text), matching the mpv engine.
+                    forced = (format.selectionFlags and C.SELECTION_FLAG_FORCED) != 0,
                 )
                 when (group.type) {
                     C.TRACK_TYPE_AUDIO -> audio.add(entry)
@@ -133,11 +141,39 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
+        // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
+        // (not a single .mpd). Merge them with a [MergingMediaSource] of two [ProgressiveMediaSource]s over a
+        // [DefaultHttpDataSource] whose UA is the MINTING client's UA -- the UA/URL lockstep googlevideo
+        // requires (a 403 otherwise). Both legs are already the loopback range-proxy's 127.0.0.1 URLs (the
+        // proxy is what defeats googlevideo's Range-403 for ExoPlayer's DefaultHttpDataSource, exactly as for
+        // libmpv), so this factory GETs 127.0.0.1 and the proxy replays the real UA upstream itself. Only a
+        // client-resolved adaptive trailer carries [audioUrl]; every other stream falls through below.
+        if (playable.audioUrl != null) {
+            val trailerHttp = DefaultHttpDataSource.Factory().apply {
+                playable.userAgent?.takeIf { it.isNotEmpty() }?.let { setUserAgent(it) }
+                setAllowCrossProtocolRedirects(true)
+            }
+            val videoSource = ProgressiveMediaSource.Factory(trailerHttp)
+                .createMediaSource(MediaItem.fromUri(playable.url))
+            val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
+                .createMediaSource(MediaItem.fromUri(playable.audioUrl))
+            player.setMediaSource(MergingMediaSource(videoSource, audioSource))
+            player.playWhenReady = true
+            if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
+            player.prepare()
+            return
+        }
+
         // Per-stream HTTP headers: some add-ons front CDNs needing a Referer / browser UA. Applied via a
-        // DefaultHttpDataSource factory so both the manifest and media requests carry them.
-        val mediaSourceFactory = if (playable.headers.isNotEmpty()) {
+        // DefaultHttpDataSource factory so both the manifest and media requests carry them. A muxed trailer /
+        // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
+        val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
+        val mediaSourceFactory = if (playable.headers.isNotEmpty() || trailerUa != null) {
             val http = DefaultHttpDataSource.Factory().apply {
-                setDefaultRequestProperties(playable.headers)
+                if (playable.headers.isNotEmpty()) setDefaultRequestProperties(playable.headers)
+                // A muxed googlevideo trailer (single proxied url) still needs the minting UA as the
+                // belt-and-suspenders fallback for the raw-URL path (UA/URL lockstep).
+                trailerUa?.let { setUserAgent(it) }
                 setAllowCrossProtocolRedirects(true)
             }
             DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)
@@ -175,6 +211,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun pause() { player.pause() }
     override fun togglePause() { if (player.isPlaying) player.pause() else player.play() }
     override fun seekTo(positionMs: Long) { player.seekTo(positionMs.coerceAtLeast(0L)) }
+
+    override fun seekBy(deltaMs: Long) {
+        // Native relative seek off the player's OWN currentPosition (the sampled state can lag a poll
+        // tick), clamped to the known duration when there is one.
+        val upper = player.duration.let { if (it == C.TIME_UNSET) Long.MAX_VALUE else it }
+        player.seekTo((player.currentPosition + deltaMs).coerceIn(0L, upper))
+    }
     override fun setPlaybackSpeed(speed: Float) { player.setPlaybackSpeed(speed.coerceIn(MIN_SPEED, MAX_SPEED)) }
 
     override fun selectAudioTrack(id: Int) = selectTrack(id, C.TRACK_TYPE_AUDIO)
@@ -208,6 +251,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // subtitle at runtime re-issues the media item with the extra sidecar appended.
     private var lastPlayable: Playable? = null
 
+    // The hosted PlayerView, kept so [applySubtitleStyle] can restyle its SubtitleView after creation.
+    private var playerView: PlayerView? = null
+
+    // Volume level saved across a mute so unmute restores it (ExoPlayer has one volume, no separate mute).
+    private var preMuteVolume: Float = 1f
+
     override fun addExternalSubtitle(url: String) {
         val base = lastPlayable ?: return
         val updated = base.copy(externalSubtitles = base.externalSubtitles + url)
@@ -218,6 +267,96 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     }
 
     override fun setSubtitleDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
+
+    // Documented no-op: ExoPlayer exposes no live audio-delay (audio/video sync is the renderer's job),
+    // so there is nothing to drive here. The mpv engine implements this via `audio-delay`.
+    override fun setAudioDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
+
+    // Documented no-op: DefaultAudioSink negotiates channel layout / Atmos passthrough against the device's
+    // AudioCapabilities on its own and offers no runtime force. The router already routes Atmos/passthrough
+    // streams here precisely for that auto-negotiation, so there is nothing to override. The mpv engine
+    // implements the manual auto/stereo/surround/passthrough control.
+    override fun setAudioOutputMode(mode: AudioOutputMode) { /* auto-negotiated by DefaultAudioSink */ }
+
+    // Documented no-op: Media3 has no generic container-chapter API, so there are no chapters to expose.
+    // The mpv engine reads `chapter-list`.
+    override fun chapters(): List<PlayerChapter> = emptyList()
+
+    override fun setVolume(volume0to100: Double) {
+        player.volume = (volume0to100 / 100.0).toFloat().coerceIn(0f, 1f)
+    }
+
+    override fun setMuted(muted: Boolean) {
+        if (muted) {
+            preMuteVolume = player.volume
+            player.volume = 0f
+        } else {
+            player.volume = preMuteVolume
+        }
+    }
+
+    // Apply the persisted subtitle appearance to the hosted SubtitleView. `setApplyEmbeddedStyles(false)`
+    // makes our style win over the file's own cue styling, matching mpv where VortX's sub-* options
+    // override. No-op until the surface exists (re-applied from the AndroidView factory on creation).
+    override fun applySubtitleStyle() {
+        val view = playerView?.subtitleView ?: return
+        val style = SubtitleStyle.current(appContext)
+        val edgeType =
+            if (style.isModern) CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW else CaptionStyleCompat.EDGE_TYPE_OUTLINE
+        view.setApplyEmbeddedStyles(false)
+        view.setStyle(
+            CaptionStyleCompat(
+                style.foregroundColorArgb,
+                style.backgroundColorArgb,
+                AndroidColor.TRANSPARENT, // window (full-width) background stays clear; box is the text bg
+                edgeType,
+                AndroidColor.BLACK,
+                null,
+            ),
+        )
+        view.setFractionalTextSize(style.exoTextSizeFraction)
+    }
+
+    // Live playback stats from the current formats (ExoPlayer's equivalent of mpv's property reads): only
+    // the fields Media3 surfaces. Empty entries are dropped so the overlay shows just what is known.
+    override fun playbackStats(): List<Pair<String, String>> {
+        val stats = mutableListOf<Pair<String, String>>()
+        player.videoFormat?.let { v: Format ->
+            if (v.width > 0 && v.height > 0) stats += "Resolution" to "${v.width}x${v.height}"
+            v.codecs?.let { stats += "Video codec" to it }
+            if (v.frameRate > 0f) stats += "Frame rate" to String.format("%.3f fps", v.frameRate)
+            if (v.bitrate != Format.NO_VALUE) stats += "Video bitrate" to "${v.bitrate / 1000} kbps"
+        }
+        player.audioFormat?.let { a: Format ->
+            a.codecs?.let { stats += "Audio codec" to it }
+            if (a.channelCount != Format.NO_VALUE) stats += "Channels" to a.channelCount.toString()
+            if (a.sampleRate != Format.NO_VALUE) stats += "Sample rate" to "${a.sampleRate} Hz"
+        }
+        return stats
+    }
+
+    /// Community-trickplay frame grab: a DOCUMENTED no-op on this engine, overridden explicitly rather
+    /// than inherited so the gap is visible at the call site instead of hidden behind a default. Same
+    /// shape as this engine's other honest no-ops ([setAudioDelay], [setAudioOutputMode]).
+    ///
+    /// WHY it cannot be implemented here. This engine renders through a Media3 [PlayerView] in
+    /// SURFACE_TYPE_SURFACE_VIEW mode (see [VideoSurface]). A `SurfaceView`'s buffers belong to the system
+    /// compositor and are never mapped into the app's address space, so there is no supported way to read
+    /// the rendered frame back; Media3 exposes no pixel-readback API either
+    /// (`setVideoFrameMetadataListener` delivers timing metadata, not pixels). The ONLY in-process
+    /// readback route is hosting the video on a `TextureView` and calling `getBitmap()`, and that is
+    /// exactly what [VideoSurface] rules out: SurfaceView is required for the HDR/Dolby Vision
+    /// passthrough this engine exists to provide. Trading the DV mandate for the trickplay mandate is not
+    /// a trade this seam is allowed to make, so this returns null and the title stays a fetch-only
+    /// consumer of the community pool.
+    ///
+    /// CONSEQUENCE, stated plainly: on Android, community trickplay CONTRIBUTES only from the libmpv
+    /// engine. Since [PlayerEngineRouter] sends Dolby Vision + Atmos streams here, those titles fetch and
+    /// serve community previews but never contribute their own. Closing this needs an out-of-band grab
+    /// (a second, capture-only decode of the source via `MediaMetadataRetriever`) that never touches the
+    /// DV render path; that is a separate piece of work with its own bandwidth cost to weigh, not
+    /// something to smuggle in behind this seam.
+    override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
 
     /// Map a sidecar subtitle URL to a Media3-parseable MIME by extension, or null when unknown (skip it).
     private fun subtitleMimeFromUrl(url: String): String? {
@@ -251,18 +390,29 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     // GPU copy. We hide the built-in controller because VortX draws its own chrome.
                     this.player = this@ExoPlayerEngine.player
                     useController = false
-                    setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+                    // The VortX chrome now draws the ONE buffering/connecting spinner for both engines
+                    // (gated on PlayerState.isBuffering, which this engine publishes from
+                    // STATE_BUFFERING). PlayerView's built-in indicator would double it up, so it is
+                    // off; nothing is lost -- the chrome's spinner also covers the initial open, which
+                    // SHOW_BUFFERING_WHEN_PLAYING did not.
+                    setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
                     resizeMode = scaleMode.toResizeMode()
                     setKeepContentOnPlayerReset(true)
                     // Hold the screen awake while the surface is attached (keep-screen-on during playback).
                     keepScreenOn = true
+                    this@ExoPlayerEngine.playerView = this
+                    // Apply the persisted subtitle appearance now the SubtitleView exists.
+                    this@ExoPlayerEngine.applySubtitleStyle()
                 }
             },
             update = { view ->
                 view.applyEmberScrubber(emberArgb)
                 view.resizeMode = scaleMode.toResizeMode()
             },
-            onRelease = { view -> view.player = null },
+            onRelease = { view ->
+                view.player = null
+                if (playerView === view) playerView = null
+            },
         )
     }
 

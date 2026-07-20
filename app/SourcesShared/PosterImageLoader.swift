@@ -215,6 +215,68 @@ enum PosterImageLoader {
         }
     }
 
+    // MARK: dominant (average) color for the hero / detail backdrop tint
+
+    /// Cached average colors, keyed by art URL. A tiny class box because NSCache stores objects; bounded
+    /// so a long browse session can't grow it without limit (entries are 3 CGFloats, the cap is generous).
+    private final class TintBox {
+        let red: CGFloat, green: CGFloat, blue: CGFloat
+        init(red: CGFloat, green: CGFloat, blue: CGFloat) { (self.red, self.green, self.blue) = (red, green, blue) }
+    }
+    private static let tintCache: NSCache<NSURL, TintBox> = {
+        let c = NSCache<NSURL, TintBox>()
+        c.countLimit = 300
+        return c
+    }()
+
+    /// The average color of the art at `urlString`, for the dynamic hero/detail backdrop tint. CHEAP by
+    /// construction: bytes come from the same dedicated poster URLCache (so a backdrop the screen is
+    /// already showing re-serves from disk), the decode is ImageIO downsampled to ~32 px, and the average
+    /// is read from an 8x8 render of that thumbnail (64 pixels). Returns nil on any miss (no art, fetch or
+    /// decode failure, fully transparent image) so every caller keeps its current fixed-gradient fallback.
+    /// Never touches the decoded poster `memory` cache (a 32 px thumbnail must not replace a card's image).
+    static func averageColor(_ urlString: String?) async -> Color? {
+        guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        if let hit = tintCache.object(forKey: url as NSURL) {
+            return Color(red: hit.red, green: hit.green, blue: hit.blue)
+        }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable; the big poster disk cache serves repeats
+        VortXEdgeAuth.sign(&req)                      // headers only, so the cache key stays stable (see load())
+        guard let (data, _) = try? await session.data(for: req), !Task.isCancelled,
+              let image = decode(data, maxPixel: 32) else { return nil }
+        #if canImport(UIKit)
+        let cg = image.cgImage
+        #elseif canImport(AppKit)
+        let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        #endif
+        guard let cg, let tint = averageColor(of: cg) else { return nil }
+        tintCache.setObject(TintBox(red: tint.red, green: tint.green, blue: tint.blue), forKey: url as NSURL)
+        VXProbe.log("poster", "averageColor host=\(probeHost(raw)) r=\(Int(tint.red * 255)) g=\(Int(tint.green * 255)) b=\(Int(tint.blue * 255))")
+        return Color(red: tint.red, green: tint.green, blue: tint.blue)
+    }
+
+    /// Draw the (already tiny) image into an 8x8 RGBA context and average the 64 pixels, alpha-weighted so
+    /// transparent regions (logo art) don't drag the tint toward black. nil when everything is transparent.
+    private static func averageColor(of cg: CGImage) -> (red: CGFloat, green: CGFloat, blue: CGFloat)? {
+        let side = 8
+        var pixels = [UInt8](repeating: 0, count: side * side * 4)
+        guard let ctx = CGContext(data: &pixels, width: side, height: side, bitsPerComponent: 8,
+                                  bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .medium
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        var r = 0.0, g = 0.0, b = 0.0, a = 0.0
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let alpha = Double(pixels[i + 3])
+            guard alpha > 0 else { continue }
+            // Premultiplied components sum directly; dividing the totals by the alpha total un-premultiplies.
+            r += Double(pixels[i]); g += Double(pixels[i + 1]); b += Double(pixels[i + 2]); a += alpha
+        }
+        guard a > 0 else { return nil }
+        return (CGFloat(min(1, r / a)), CGFloat(min(1, g / a)), CGFloat(min(1, b / a)))
+    }
+
     // MARK: off-main ImageIO decode + downsample
 
     /// Decode `data` to a downsampled image using ImageIO's thumbnail path, which decodes straight to the

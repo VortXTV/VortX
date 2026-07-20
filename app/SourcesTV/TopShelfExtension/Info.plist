@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- BASE plist. Xcode merges its generated keys (CFBundleIdentifier, CFBundleVersion, and friends)
+	     on top of this, the same arrangement ResourcesTV/Info-tvOS.plist uses for the app, so only the
+	     keys that have NO build-setting equivalent live here. -->
+	<!-- The URL scheme this app family registers, substituted from the VORTX_URL_SCHEME build setting
+	     (project.yml: "vortx" for VortXTV, "vortx-lite" for VortXTVLite). The extension builds its tap
+	     deep links from this via TopShelfSnapshot.urlScheme, so the link it mints always matches the
+	     scheme its HOST app registered. Hardcoding it here would silently send Lite's taps to the Full
+	     app on a device with both installed. -->
+	<key>VortXURLScheme</key>
+	<string>$(VORTX_URL_SCHEME)</string>
+	<key>NSExtension</key>
+	<dict>
+		<!-- tvOS Top Shelf. The tv-top-shelf point (tvOS 13+) drives the modern TVTopShelfContentProvider
+		     API; the app's static "Top Shelf Image" brandasset stays the fallback the system shows when
+		     this extension returns no content. -->
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.tv-top-shelf</string>
+		<!-- Swift principal class, so it carries the module prefix. PRODUCT_MODULE_NAME resolves to the
+		     extension target's module (VortXTopShelf), not the app's. -->
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).ContentProvider</string>
+	</dict>
+</dict>
+</plist>

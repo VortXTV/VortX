@@ -18,6 +18,9 @@ enum Theme {
         static var surface2: Color { ThemeManager.shared.surface2 } // chips, controls
         static var surface3: Color { ThemeManager.shared.surface3 } // hover / selected fill
         static var hairline: Color { ThemeManager.shared.hairline } // dividers only
+        /// The translucent glass LIFT tone (see `ThemeManager.glassVeil`). Exposed here so the glass reads it
+        /// through the same `Theme.Palette` door as the surfaces it is an elevation step of.
+        static var glassVeil: Color { ThemeManager.shared.glassVeil }
         static let textPrimary   = rgb(0.965, 0.945, 0.914) // #F6F1E9
         static let textSecondary = rgb(0.737, 0.694, 0.631) // #BCB1A1
         static let textTertiary  = rgb(0.620, 0.580, 0.520) // #9E9485 — raised from #8C8273 so 10-11pt text clears 4.5:1 on the warm canvas across all 8 accents
@@ -343,10 +346,11 @@ struct CircleIconDisc: View {
             .font(.system(size: diameter * 0.42, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: diameter, height: diameter)
-            // Floating chrome over the hero art on the shared glass primitive: warm glass + top highlight,
-            // Liquid Glass on OS 26, opaque warm fallback under Reduce Transparency. The extra hairline and
-            // hit shape ride on top of whichever fill renders.
-            .vortxGlass(in: Circle(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .disc)
+            // Floating chrome over the hero art on the shared DISC glass primitive: warm fill at
+            // discFillAlpha + top highlight + tight `.disc` shadow, with a shape-clipped material blur on
+            // every OS (never Apple `glassEffect`, whose un-clipped bloom halos a tight disc), and an opaque
+            // warm fallback under Reduce Transparency. The extra hairline and hit shape ride on top.
+            .vortxGlassDisc(in: Circle())
             .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.10), lineWidth: 1))
             .contentShape(Circle())
     }

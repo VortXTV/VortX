@@ -11,6 +11,10 @@ import Foundation
 ///   - Watchlist: POST /sync/watchlist, POST /sync/watchlist/remove, GET /sync/watchlist
 ///   - History:   POST /sync/history (mark watched), POST /sync/history/remove
 ///   - Collection: GET /sync/collection
+///   - Ratings:   POST /sync/ratings, POST /sync/ratings/remove, GET /sync/ratings/{type}
+///
+/// NOTE ON SCOPES: Trakt's device-code flow grants the token every scope the application is registered
+/// for; the app sends no `scope` parameter anywhere (see `TraktAuth`), so ratings needs no auth change.
 ///
 /// An actor so the shared instance is safe to call from anywhere (player thread, library actions)
 /// without external locking. Every write goes out with a fresh, auto-refreshed access token.
@@ -106,6 +110,79 @@ actor TraktService {
         let (data, status) = try await send(path: path, method: "POST", body: items)
         try expectSuccess(status)
         return try decode(TraktSyncResponse.self, from: data)
+    }
+
+    // MARK: - Ratings (the 1...10 score the user gave a title)
+
+    /// Set ratings (`POST /sync/ratings`). Trakt treats a re-post of the same title as an UPDATE, so
+    /// there is no separate edit call. Pass `ratedAt` on each item to preserve when the user actually
+    /// rated (an offline rating drains later but must keep its original stamp, or the local shadow's
+    /// newer-wins merge would see Trakt's drain time as the newer edit and flap).
+    @discardableResult
+    func addRatings(_ items: TraktRatingItems) async throws -> TraktSyncResponse {
+        try await ratingsWrite(path: "/sync/ratings", items: items)
+    }
+
+    /// Clear ratings (`POST /sync/ratings/remove`). The ids alone identify the title; the `rating`
+    /// value is not required and is left off by the callers.
+    @discardableResult
+    func removeRatings(_ items: TraktRatingItems) async throws -> TraktSyncResponse {
+        try await ratingsWrite(path: "/sync/ratings/remove", items: items)
+    }
+
+    /// The user's ratings (`GET /sync/ratings/{type}`). `type` is "movies" or "shows".
+    ///
+    /// READ-ONLY MIRROR: this is the wire for the local shadow's convergence pass, never an authority.
+    /// `TraktRatingsStore` decides what (if anything) a returned row is allowed to change; see the
+    /// merge rules there. In particular a title's ABSENCE from this response means nothing and must
+    /// never be read as "the user cleared it".
+    func ratings(type: TraktCollectionType) async throws -> [TraktRatingEntry] {
+        let (data, status) = try await send(path: "/sync/ratings/\(type.rawValue)", method: "GET")
+        try expectSuccess(status)
+        return try decode([TraktRatingEntry].self, from: data)
+    }
+
+    private func ratingsWrite(path: String, items: TraktRatingItems) async throws -> TraktSyncResponse {
+        let (data, status) = try await send(path: path, method: "POST", body: items)
+        try expectSuccess(status)
+        return try decode(TraktSyncResponse.self, from: data)
+    }
+
+    // MARK: - Check-in (watching somewhere that is not VortX)
+
+    /// Announce on Trakt that the user is watching this RIGHT NOW, somewhere VortX cannot see: a cinema,
+    /// someone else's TV, a broadcast (`POST /checkin`). Purely a user-initiated statement about the
+    /// outside world; nothing in VortX's own playback path ever calls this (in-app plays are already
+    /// covered end to end by the scrobble endpoints above, which own every play we can actually observe).
+    ///
+    /// Trakt keeps ONE watching slot per account, shared with the live scrobble. When something already
+    /// holds it Trakt answers HTTP 409 rather than overwriting, and the body carries the `expires_at` of
+    /// the incumbent. That is surfaced as `.alreadyCheckedIn(expiresAt:)` instead of a bare failure so
+    /// the caller can name what is in the way. This call NEVER evicts the incumbent on its own: the slot
+    /// may hold a live scrobble of a real play on another device, and silently killing it would destroy a
+    /// record of something the user genuinely watched. Eviction is `cancelCheckIn()`, and only a person
+    /// gets to ask for it.
+    @discardableResult
+    func checkIn(item: TraktScrobbleItem) async throws -> TraktCheckinResponse {
+        let (data, status) = try await send(path: "/checkin", method: "POST", body: CheckinBody(item: item))
+        if status == 409 {
+            // A malformed/absent conflict body must not turn a known 409 into a generic server error:
+            // fall through with a nil expiry so the caller still reports the right thing ("already
+            // checked in"), just without a time.
+            let conflict = try? JSONDecoder().decode(TraktCheckinConflict.self, from: data)
+            throw TraktServiceError.alreadyCheckedIn(expiresAt: TraktDate.parse(conflict?.expiresAt))
+        }
+        try expectSuccess(status)
+        return try decode(TraktCheckinResponse.self, from: data)
+    }
+
+    /// Delete the account's active check-in (`DELETE /checkin`, HTTP 204 on success). Trakt answers 404
+    /// when nothing is checked in; that is treated as SUCCESS, because the caller's intent ("leave no
+    /// active check-in") already holds and surfacing an error for it would only invite a pointless retry.
+    func cancelCheckIn() async throws {
+        let (_, status) = try await send(path: "/checkin", method: "DELETE")
+        if status == 404 { return }
+        try expectSuccess(status)
     }
 
     // MARK: - HTTP plumbing
@@ -204,6 +281,18 @@ private struct ScrobbleBody: Encodable {
     }
 }
 
+/// Body for `POST /checkin`: the item's own keys (`movie`, or `episode` + `show`) at the top level,
+/// the same shape the scrobble endpoints take, so `TraktScrobbleItem` is reused rather than cloned.
+///
+/// No `sharing` field is sent, ON PURPOSE. Trakt then applies the sharing settings the user chose on
+/// their OWN Trakt account. VortX has no business overriding someone's privacy choice about where their
+/// viewing is broadcast from a button press over here.
+private struct CheckinBody: Encodable {
+    let item: TraktScrobbleItem
+
+    func encode(to encoder: Encoder) throws { try item.encode(to: encoder) }
+}
+
 /// Collection type selector for `GET /sync/collection/{type}`.
 enum TraktCollectionType: String, Sendable {
     case movies
@@ -216,6 +305,9 @@ enum TraktServiceError: LocalizedError, Sendable, Equatable {
     case unauthorized
     case rateLimited
     case ignored          // scrobble below 1% progress (HTTP 422)
+    /// `POST /checkin` hit the account's one occupied watching slot (HTTP 409). `expiresAt` is when the
+    /// incumbent frees it, when Trakt told us (nil if the body was unreadable).
+    case alreadyCheckedIn(expiresAt: Date?)
     case server(status: Int)
     case transport(String)
     case decoding
@@ -226,6 +318,9 @@ enum TraktServiceError: LocalizedError, Sendable, Equatable {
         case .unauthorized: return "Your Trakt session has expired. Please reconnect."
         case .rateLimited: return "Trakt is rate limiting requests. Please try again shortly."
         case .ignored: return "Too little was watched to record on Trakt."
+        // Deliberately time-less: the expiry reads as a wall-clock time only after formatting in the
+        // user's locale, which is the presenting view's job (this layer has no locale context).
+        case .alreadyCheckedIn: return "Trakt already shows you as watching something."
         case .server(let status): return "Trakt returned an error (HTTP \(status))."
         case .transport(let message): return message
         case .decoding: return "Could not read the response from Trakt."

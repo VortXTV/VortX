@@ -1,11 +1,23 @@
 name: Release apps (iOS + tvOS + macOS)
 
 # Builds the iOS + tvOS IPAs and the native macOS app from source on GitHub's
-# runners and attaches them to the release, so anyone can verify the published
-# binaries really come from this code (issue #7). Everything it consumes is
-# public: NodeMobile and the fonts from this repo's vendor release, server.js
-# from Stremio's CDN, and the stremio-core engine built from the core/ crate.
+# runners and attaches them to the release (issue #7). The app sources, scripts,
+# NodeMobile + fonts (this repo's vendor release), and server.js (Stremio's CDN)
+# are public; the two ENGINE crates (stremiox-core, vortx-core) are PRIVATE
+# (moved out of the public tree in 33ff9b5) and are fetched below at pinned
+# commits with the ENGINE_REPO_TOKEN secret. Bumping an engine pin means editing
+# this file, which is itself a path trigger, so the old `core/**` path filters
+# are gone (that dir no longer exists in the public tree).
 # The macOS app ships as a drag-to-install .dmg (ad-hoc signed, not notarized).
+#
+# No `pull_request` trigger, DELIBERATELY: this job holds ENGINE_REPO_TOKEN (plus the
+# Trakt/SIMKL/edge secrets) in the same job that executes repo-controlled code (scripts/*,
+# app/scripts/*, the xcodegen'd build phases), so building PR heads here would hand any same-repo
+# PR author's code a credential / private-source exfiltration lane. Fork PRs never received
+# secrets anyway, so their builds could only fail early; nothing of value is lost. The dev flow is
+# push-to-branch; PR validation of app-only changes belongs to a future SECRETLESS workflow (no
+# engine fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and
+# never `pull_request_target` -- to THIS workflow.
 
 on:
   # Release-tag caches are isolated per tag, so seed the same exact cache key on
@@ -14,17 +26,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/release-tvos.yml"
-      - "core/**"
       - "scripts/**"
   release:
     types: [published]
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/release-tvos.yml"
-      - "core/**"
-      - "scripts/**"
-      - "app/**"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -32,15 +36,100 @@ on:
         required: false
         default: ""
 
+# Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
+# app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
+# The ONLY contents:write consumer is the isolated `attach-release` job below, which overrides
+# this default for itself alone, runs no repo-controlled code, and holds no environment.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-tvos:
-    runs-on: macos-latest
+    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
+    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
+    # PLUS a `v*` TAG policy. Environment policies match REFS, and a branch entry never matches a
+    # tag ref, so the two entry lanes are distinct: branch-ref runs (push / dispatch on a listed
+    # branch) enter via the branch entries, while release-event runs, which execute on the tag's
+    # ref, enter via the `v*` tag policy. A run started from any OTHER ref blocks at this gate
+    # before any step executes, making ENGINE_REPO_TOKEN unreachable outside those refs. The
+    # ci/engine-token branch entry is TEMPORARY, for proof runs on the CI branch, and is removed at
+    # integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment (value re-entry)
+    # is a queued owner step; until then the gate still stops arbitrary-ref jobs from ever reaching
+    # the fetch steps that read it.
+    #
+    # Read-only-build vs release-write split: this job runs under the workflow-default
+    # `contents: read`, so none of the repo-controlled build code it executes can touch the repo or
+    # its releases. Release-asset attachment lives in the separate `attach-release` job below,
+    # which alone gets `contents: write` and consumes this job's output strictly through the
+    # artifact handoff.
+    environment: engine-ci
+    # Pinned explicit runner label: `macos-latest` is a MOVING alias (it means the macOS 15 arm64
+    # image today, per actions/runner-images), and a silent alias flip -- e.g. to the macOS 26
+    # image -- would swap the entire Xcode set and SDKs under the release lane with no diff in
+    # this file. The Xcode-selection step below already copes with image rotation WITHIN a
+    # version; pinning the label keeps that rotation bounded. Moving to a newer image is a
+    # deliberate edit here, verified by a run, not an alias drift.
+    runs-on: macos-15
     timeout-minutes: 90
+    # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
+    # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
+    # tag it resolved from.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
+      # Apple builds BOTH engines: StremioXCore.xcframework from core/ AND VortxEngine.xcframework
+      # from vortx-core/. Pinned to the exact commits the current beta build links. Requires the
+      # ENGINE_REPO_TOKEN secret (fine-grained PAT, Contents:read on both private repos; deploy keys
+      # are disabled by the VortXTV org). Both fetches use actions/checkout (GitHub's own auth path:
+      # the token is injected through an env-sourced local git config, never argv, and
+      # persist-credentials: false wipes it after the step). Fails closed: an empty secret or a
+      # missing crate manifest kills the job (no silent build-without-engine).
+      - name: Preflight the engine token (fail closed)
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            exit 1
+          fi
+
+      # stremiox-core is a STANDALONE crate (Cargo.toml at its repo root): check out straight into core/.
+      - name: Fetch stremiox-core (private, pinned)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VortXTV/stremiox-core
+          ref: 8bfdf1f0dcbf929b4634af24acf7ec54f97c3388
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      # vortx-core is a FULL MONOREPO whose engine workspace is its vortx-core/ SUBDIR; a direct
+      # checkout would nest the engine manifest at vortx-core/vortx-core/Cargo.toml. Check out to a
+      # temp path, then promote only that subdir to the app-root vortx-core/ (where the build-ffi
+      # step's VORTX_ENGINE_DIR + the hashFiles('vortx-core/...') cache keys expect it).
+      - name: Fetch vortx-core (private monorepo, pinned)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: VortXTV/vortx-core
+          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: _vortx_core_src
+          persist-credentials: false
+
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          rm -rf vortx-core
+          mv _vortx_core_src/vortx-core vortx-core
+          rm -rf _vortx_core_src
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
+          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
@@ -103,22 +192,58 @@ jobs:
           done
           echo "After:"; df -h /
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen (pinned release artifact, sha256-verified)
+        env:
+          XCODEGEN_VERSION: "2.46.0"
+          # sha256 of yonaskolb/XcodeGen 2.46.0's xcodegen.zip (computed from the release asset).
+          XCODEGEN_SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+        run: |
+          set -euo pipefail
+          # `brew install xcodegen` installs whatever the formula's HEAD resolves to -- a MOVING
+          # version with no clean per-formula pin -- so the release build tool could shift under this
+          # runtime-proven lane with no diff in this file. Instead fetch the EXACT release zip, verify
+          # the sha256 recorded above before trusting a byte of it (fail closed on mismatch), and put
+          # its bin on PATH. The release bundle keeps bin/ and share/ as siblings, so the binary
+          # resolves its SettingPresets from ../share with no separate install step or sudo.
+          workdir="$(mktemp -d)"
+          url="https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          curl -fsSL --retry 3 -o "$workdir/xcodegen.zip" "$url"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$workdir/xcodegen.zip" > "$workdir/xcodegen.sha256"
+          shasum -a 256 -c "$workdir/xcodegen.sha256"
+          unzip -q "$workdir/xcodegen.zip" -d "$workdir"
+          "$workdir/xcodegen/bin/xcodegen" --version
+          echo "$workdir/xcodegen/bin" >> "$GITHUB_PATH"
 
       - name: Rust nightly with rust-src (tvOS is a tier 3 target)
+        # Dated nightly, matching the engines' rust-toolchain.toml pin: the xcframework scripts run
+        # cargo with --manifest-path from repo root, so the engines' directory-based toolchain pin
+        # cannot govern them; the scripts select +nightly-2026-07-19 explicitly and this step installs
+        # exactly that toolchain. A floating `nightly` here would rebuild with a different rustc daily.
         run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
-          rustup +nightly target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustup toolchain install nightly-2026-07-19 --profile minimal --component rust-src
+          rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          # Cache ONLY the public dependency downloads under ~/.cargo. The private-engine BUILD
+          # intermediates (core/target, vortx-core/target) are DELIBERATELY excluded: this cache
+          # carries a broad restore-keys prefix (cargo-<os>-) and its default-branch copy is
+          # restorable from ANY ref in the repo, so caching compiled private-engine objects here
+          # would let an untrusted-ref run (e.g. a future secretless PR workflow) restore them.
+          # The engines' compiled output lives only in the two xcframework caches below, which are
+          # exact-key-only (content-addressed to the private source via hashFiles, with NO
+          # restore-keys fallback), so a run without the private source cannot reconstruct their key
+          # and cannot restore them. Excluding the target dirs costs a recompile only on an
+          # xcframework-cache MISS (rare: a miss means the private source changed, which also rolls
+          # the xcframework key); on the common hit the engine build steps are skipped and these
+          # target dirs are never produced or needed.
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            core/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml') }}
+          # hashFiles runs when this step runs, i.e. AFTER the engine fetch above, so both engines'
+          # manifests exist and both feed the key (a vortx-core-only dep bump must roll the cache too).
+          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/Cargo.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Fetch server deps (NodeMobile, server.js, subtitle fonts)
@@ -126,13 +251,13 @@ jobs:
 
       - name: Fetch the macOS node runtime
         # VortXMac bundles node + server.js as its streaming server. The binary is gitignored, so
-        # it must be fetched BEFORE xcodegen runs — xcodegen validates that the
+        # it must be fetched BEFORE xcodegen runs: xcodegen validates that the
         # Resources/node-darwin-arm64 source path exists, and fails project generation if it's absent.
         run: ./app/scripts/fetch-node-macos.sh
 
       - name: Cache stremio-core xcframework
         id: cache-core-xcframework
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: app/Vendor/StremioXCore.xcframework
           key: stremio-core-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ steps.toolchain.outputs.tvos_sdk }}-${{ hashFiles('core/Cargo.lock', 'core/Cargo.toml', 'core/rust-toolchain.toml', 'core/src/**', 'core/include/**', 'scripts/build-core-xcframework.sh') }}
@@ -140,6 +265,24 @@ jobs:
       - name: Build the stremio-core xcframework
         if: steps.cache-core-xcframework.outputs.cache-hit != 'true'
         run: ./scripts/build-core-xcframework.sh
+
+      # Phase 7 (engine/apple-cutover): the vortx-core engine ABI the shadow-ranking bridge links
+      # (app/project.yml references Vendor/VortxEngine.xcframework on VortXiOSNative, so project
+      # generation + the iOS build need it present). Built from the vortx-core workspace in this
+      # checkout; VORTX_ENGINE_DIR can repoint the step if the engine workspace lives elsewhere.
+      # The step fails fast with a clear message if the checkout's vortx-core lacks crates/ffi.
+      - name: Cache vortx-ffi xcframework
+        id: cache-ffi-xcframework
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: app/Vendor/VortxEngine.xcframework
+          key: vortx-ffi-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh') }}
+
+      - name: Build the vortx-ffi xcframework
+        if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'
+        env:
+          VORTX_ENGINE_DIR: vortx-core
+        run: ./scripts/build-ffi-xcframework.sh
 
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
@@ -156,7 +299,7 @@ jobs:
       # We keep a SINGLE source of truth: the VORTX_EDGE_SECRET repo secret holds the raw hex, and CI
       # derives the masked blob here by compiling the app's OWN VortXEdgeAuth.swift with a tiny driver,
       # so the derivation can never drift from the runtime de-mask. The value is derived, never stored
-      # twice. A fork or PR build has no secret: the driver reports EMPTY, we inject nothing, and request
+      # twice. A fork or otherwise secretless build: the driver reports EMPTY, we inject nothing, and request
       # signing stays a harmless observe-mode no-op (the workers accept unsigned requests today). An
       # already-masked stored value is detected and passed through unchanged; a value that is neither
       # 64-hex nor a valid masked blob falls back to an empty secret with a warning, never failing the
@@ -302,9 +445,12 @@ jobs:
           hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
-      - name: Upload artifact (manual runs)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
+      # Upload on manual runs (inspection artifact) AND on release events, where it is the ONLY
+      # handoff to the attach-release job below: the read-only build job never touches the release
+      # itself, so everything the write job attaches must travel through this artifact.
+      - name: Upload artifact (manual runs + handoff to attach-release)
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-tvOS-ci
           path: |
@@ -314,23 +460,125 @@ jobs:
             out/VortX-macOS-ci.dmg
             out/SHA256SUMS-ci.txt
 
-      - name: Attach the CI builds to the release
-        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+  # Isolated release-write job: the ONLY job in this workflow with `contents: write`. Least
+  # privilege by construction: it does NOT check out the repo (so it executes no repo-controlled
+  # code with write authority) and it consumes the build strictly through the artifact handoff from
+  # the read-only build job above. Asset upload needs no macOS, so this runs on the cheap pinned
+  # Linux image.
+  #
+  # Approval gate: this job runs in the `release-approval` environment, which the owner configures
+  # with a REQUIRED REVIEWER, so an actual release write pauses for human approval before any asset
+  # is attached. That environment is DISTINCT from the build job's `engine-ci` and holds NO secrets
+  # (no ENGINE_REPO_TOKEN, no build secrets): it exists only to carry the approval policy, so this
+  # write job still cannot reach the token or the build secrets.
+  #
+  # Arbitrary-ref guard: a `release` event runs on the tag's own ref and is bound to the built
+  # commit by the tag-commit binding step below. A `workflow_dispatch` can be launched from any
+  # ref, so the dispatch lane ADDITIONALLY requires a protected branch ref (main / beta) here. This
+  # in-workflow ref check is only defense in depth; the real enforcement is the environment's
+  # required reviewer plus the branch protection the owner configures on those refs.
+  attach-release:
+    needs: [build-tvos]
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta'))
+    runs-on: ubuntu-24.04
+    environment: release-approval
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Download the built apps (handoff from the build job)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (resolved read-only via git ls-remote)
+        with:
+          name: VortX-tvOS-ci
+          path: out
+
+      # Tag-commit binding (fail closed): a tag NAME is an operator/event string, never authority.
+      # Before anything is written, prove that (a) the tag belongs to an EXISTING release (for
+      # workflow_dispatch this is what stops a free-text release_tag from minting a write; for
+      # release events it is trivially true) and (b) the tag's ref, peeled through any annotated
+      # tag objects to its ultimate commit, points at EXACTLY the commit this run built
+      # (github.sha). This also catches a tag force-moved between the trigger and this job. Any
+      # resolution failure or mismatch aborts before the upload step can run.
+      - name: Verify the release tag points at the built commit (fail closed)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
+          set -euo pipefail
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::no tag name available (empty release_tag / missing release tag_name)"
+            exit 1
+          fi
+          # STRICT release-tag grammar, fail closed. The previous shape check accepted any
+          # [A-Za-z0-9._-] string, which STILL lets CLI-option-shaped values through (e.g.
+          # "--help" or "-R"): gh would consume those as flags rather than as a tag. Require a real
+          # release tag -- vMAJOR.MINOR.PATCH with an optional -prerelease -- anchored end to end, so
+          # an option-shaped or otherwise malformed value can never reach a gh call. (Regex kept in a
+          # variable and used unquoted: the bash idiom that avoids [[ =~ ]] escaping pitfalls.) Every
+          # gh call below ALSO gets a `--` option terminator as belt-and-braces, so the tag text can
+          # never be parsed as an option even if this grammar is later loosened.
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag (want vMAJOR.MINOR.PATCH[-prerelease]); refusing to resolve it"
+            exit 1
+          fi
+          # (a) The tag must name an EXISTING release, not just any git tag.
+          if ! gh api --jq .tag_name -- "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" >/dev/null; then
+            echo "::error::no existing release found for tag '$TAG'; refusing to create or write anything"
+            exit 1
+          fi
+          # (b) Resolve the tag ref and peel annotated tag objects (an annotated tag's ref points
+          # at a tag OBJECT, not the commit; nested tag objects are legal, so peel with a bound).
+          ref_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
+          sha="$(jq -r '.object.sha' <<<"$ref_json")"
+          otype="$(jq -r '.object.type' <<<"$ref_json")"
+          hops=0
+          while [ "$otype" = "tag" ]; do
+            hops=$((hops + 1))
+            if [ "$hops" -gt 5 ]; then
+              echo "::error::tag '$TAG' nests more than 5 tag objects; refusing"
+              exit 1
+            fi
+            tag_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
+            sha="$(jq -r '.object.sha' <<<"$tag_json")"
+            otype="$(jq -r '.object.type' <<<"$tag_json")"
+          done
+          if [ "$otype" != "commit" ]; then
+            echo "::error::tag '$TAG' ultimately points at a '$otype' object, not a commit; refusing"
+            exit 1
+          fi
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "::error::tag '$TAG' points at commit $sha but this run built $GITHUB_SHA; refusing to attach assets built from a different commit"
+            exit 1
+          fi
+          echo "tag-commit binding verified: $TAG peels to $sha == github.sha"
+
+      - name: Attach the CI builds to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # Re-assert the strict release-tag grammar here (defense in depth: the verify step above
+          # already gates the job on it, but this step re-derives TAG and spends it in shell paths
+          # and gh calls, so it must not run on anything but a real release tag).
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          if [ -z "${TAG:-}" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not a strict release tag; refusing to attach"
+            exit 1
+          fi
           mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
           mv out/VortX-tvOS-lite-ci.ipa "out/VortX-tvOS-lite-$TAG-ci.ipa"
           mv out/VortX-iOS-ci.ipa "out/VortX-iOS-$TAG-ci.ipa"
           mv out/VortX-macOS-ci.dmg "out/VortX-macOS-$TAG-ci.dmg"
           shasum -a 256 "out/VortX-tvOS-$TAG-ci.ipa" "out/VortX-tvOS-lite-$TAG-ci.ipa" "out/VortX-iOS-$TAG-ci.ipa" "out/VortX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
-          gh release upload "$TAG" \
+          # `--clobber` before `--`, then the tag and files as positionals: with the terminator the
+          # tag can never be parsed as a flag even if the grammar above is ever relaxed.
+          gh release upload --clobber -- "$TAG" \
             "out/VortX-tvOS-$TAG-ci.ipa" \
             "out/VortX-tvOS-lite-$TAG-ci.ipa" \
             "out/VortX-iOS-$TAG-ci.ipa" \
             "out/VortX-macOS-$TAG-ci.dmg" \
-            out/SHA256SUMS-ci.txt \
-            --clobber
+            out/SHA256SUMS-ci.txt
           # Remove the older .zip mac asset if this tag had one from a previous run.
-          gh release delete-asset "$TAG" "VortX-macOS-$TAG-ci.zip" -y 2>/dev/null || true
+          gh release delete-asset -y -- "$TAG" "VortX-macOS-$TAG-ci.zip" 2>/dev/null || true

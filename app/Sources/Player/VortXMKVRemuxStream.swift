@@ -46,10 +46,21 @@ import Libdovi
 /// AVIO/AVFormatContext free order.
 final class VortXMKVRemuxStream: @unchecked Sendable {
 
+    /// What this remux session is FOR (#147). `.dolbyVision` is the original lane: classify REQUIRES an
+    /// AVPlayer-decodable DV profile (5/8, or 7 converted to 8.1), forces the dvh1/hvc1 sample entry,
+    /// sanitizes/synthesizes the DOVI config box, and signals DV in the HLS master (SUPPLEMENTAL-CODECS +
+    /// VIDEO-RANGE + the tvOS panel switch). `.plain` is the non-DV lane: a STRAIGHT container re-wrap
+    /// (MKV -> fMP4/HLS) so AVPlayer can demux a non-DV MKV and keep Picture in Picture - no DV requirement
+    /// (classify instead requires an AVPlayer stream-copyable VIDEO codec: H.264 or HEVC), no DOVI handling,
+    /// no panel switch, and honest range-unlabeled single-variant signaling. Everything else (audio pick +
+    /// transcode, hvc1 extradata repair for HEVC, segmenting, buffer, fail-soft demotes) is shared unchanged.
+    enum Mode { case dolbyVision, plain }
+
     let buffer = VortXRemuxBuffer()
 
     private let input: String
     private let headers: [String: String]?
+    private let mode: Mode
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
 
@@ -100,10 +111,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// write/seek callbacks synchronously on it), so it needs no lock.
     private var avioWriteCursor: Int = 0
 
-    init(input: String, headers: [String: String]?, indexForHLS: Bool = false) {
+    init(input: String, headers: [String: String]?, indexForHLS: Bool = false, mode: Mode = .dolbyVision) {
         self.input = input
         self.headers = headers
         self.hlsIndexingEnabled = indexForHLS
+        self.mode = mode
     }
 
     // MARK: - HLS output index (b166; populated only when `hlsIndexingEnabled`)
@@ -121,20 +133,31 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// strings, the DV SUPPLEMENTAL-CODECS compatibility brand, and VIDEO-RANGE. Apple's HLS authoring spec
     /// calls the brand + VIDEO-RANGE mandatory cross-checks for DV 8.1.
     struct HLSSignaling {
-        let videoCodec: String         // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5)
+        let videoCodec: String         // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5) or "avc1.640028" (plain H.264)
         let supplementalCodec: String? // "dvh1.08.06/db1p" for P8.1; nil when not applicable
-        let videoRange: String?        // "PQ" / "HLG"
+        let videoRange: String?        // "PQ" / "HLG"; nil on the plain lane (range-unlabeled, the b170 survivor shape)
         let audioCodec: String?        // "ec-3" / "ac-3" / "mp4a.40.2" / ...
         let width: Int
         let height: Int
         let bandwidth: Int
         let fps: Double                // base video frame rate; 0 when unknown (FRAME-RATE then omitted)
+        /// #147: whether this is a Dolby Vision session (`Mode.dolbyVision`). The HLS server keys the tvOS DV
+        /// panel switch AND the two-variant (DV + lifeboat) master rendering on THIS, so a plain-mode mount
+        /// can never switch the panel or declare DV. Mode-derived, not profile-derived, so DV-mode behavior is
+        /// bit-identical (a P8 with an unknown compat id still counts as DV, exactly as before).
+        let dolbyVision: Bool
     }
 
     /// Guards the four published index fields below (written on the remux thread, read from the HLS server's
     /// serve queue). The head-scan / cut state further down is remux-thread-only and needs no lock.
     private let hlsLock = NSLock()
     private var _hlsInitData: Data?
+    /// The lifeboat variant's init segment (#143): the same ftyp+moov with the dvcC/dvvC box surgically
+    /// removed, so the variant that deliberately declares NO Dolby Vision (no SUPPLEMENTAL-CODECS, no
+    /// VIDEO-RANGE - the b170 filter-survivor) never serves content that DECLARES Dolby Vision. Falls back
+    /// to the exact `_hlsInitData` bytes when the strip is not applicable (P5) or the moov shape is
+    /// unexpected. Published atomically with `_hlsInitData`.
+    private var _hlsInitDataHDR: Data?
     private var _hlsSegments: [HLSSegment] = []
     private var _hlsEnded = false
     private var _hlsSignaling: HLSSignaling?
@@ -157,10 +180,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The source MKV chapter markers (start seconds + title, start-sorted; empty when none). Thread-safe.
     var chapters: [(start: Double, title: String)] { hlsLock.lock(); defer { hlsLock.unlock() }; return _chapters }
 
-    /// Consistent snapshot of the published HLS index for the local server.
-    func hlsSnapshot() -> (initData: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
+    /// Consistent snapshot of the published HLS index for the local server. `initDataHDR` is the lifeboat
+    /// variant's DV-stripped init (#143); non-nil exactly when `initData` is.
+    func hlsSnapshot() -> (initData: Data?, initDataHDR: Data?, segments: [HLSSegment], ended: Bool, signaling: HLSSignaling?) {
         hlsLock.lock(); defer { hlsLock.unlock() }
-        return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
+        return (_hlsInitData, _hlsInitDataHDR, _hlsSegments, _hlsEnded, _hlsSignaling)
     }
 
     /// Monotonic mount-progress counters for the chrome's PROGRESS-AWARE start watchdog. Every field only
@@ -218,10 +242,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private static let hlsMaxSegmentBytes = 32 << 20
     /// The playlist's EXT-X-TARGETDURATION: must be >= every EXTINF and stay constant across reloads.
     static let hlsTargetDuration = 5
-    /// Belt-and-braces to the flush-rc check (#76): if the moov placeholder is located but its size backpatch
-    /// never lands within this window while packets still flow, the init is starved (an unparseable audio bed
-    /// blocking moov finalization); fail so the demotion runs in ~1s rather than at the 20s start watchdog.
+    /// Init-starve guard (#76/#134): if a moov size-0 placeholder is located but its size backpatch never
+    /// lands within this window while packets still flow, the init is starved and the mount is dead; fail so
+    /// the demotion runs in ~1s rather than at the start watchdog. With the pre-init cut gate (#134) the only
+    /// legitimate way a placeholder reaches the scan is a >AVIO-buffer moov flushed mid-write (whose backpatch
+    /// arrives via the seekable-AVIO overwrite path); this guard catches that path wedging.
     private static let hlsInitStarveSecs = 4.0
+    /// Pre-init moov deadline (#134 correction): fail fast when this much MEDIA time has been muxed since
+    /// the first video packet and movenc has still not even STARTED the moov (no placeholder armed). That
+    /// shape means some mapped track has never delivered a parseable packet, so the force=0 auto-flush
+    /// defers forever and no init can ever publish. Measured on the MEDIA clock, not wall time, on
+    /// purpose: a slow chunked mount advances media slowly and must never be failed early (the
+    /// progress-aware start watchdog owns that call); this trips only while packets are flowing briskly
+    /// and the moov is provably uncompletable. movenc attempts the auto-flush every 1s of media
+    /// (frag_duration), and the DV pre-scan drain is capped at 240 packets (under ~10s of media even if
+    /// all-video), so 12s of pure deferral is conclusive without ever tripping inside the drain.
+    private static let hlsPreInitMoovDeadlineSecs = 12.0
 
     /// Start the remux on a dedicated background thread. Idempotent-ish: call once per session.
     ///
@@ -597,7 +633,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // in-band VPS/SPS/PPS a parameter-sets-in-band stream repeats ahead of its IDR slice, so one bounded,
         // seek-free read serves both needs. Files whose extradata is already hvc1-ready skip this exactly as
         // before, so nothing that opens today reads a single extra packet.
-        if baseVideoIn >= 0, info.dvProfile < 0 || !hvc1Check.eligible {
+        // #147: in `.plain` mode the DV half of the pre-scan is meaningless (no DV requirement), so the scan
+        // runs ONLY for the HEVC extradata repair (`!hvc1Check.eligible`); an H.264 or clean-extradata HEVC
+        // plain source reads zero extra packets. `.dolbyVision` mode keeps the exact original condition.
+        if baseVideoIn >= 0, (mode == .dolbyVision && info.dvProfile < 0) || !hvc1Check.eligible {
             let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
             let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
             var scanned = 0
@@ -607,7 +646,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 scanned += 1
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
-                    if info.dvProfile < 0 {
+                    if mode == .dolbyVision, info.dvProfile < 0 {
                         let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
                         if prof >= 0 {
                             info.dvProfile = prof
@@ -629,21 +668,37 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
-        let convertP7 = (info.dvProfile == 7)
-        guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
-            // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
-            // libmpv HDR10. Logs the exact reason (no DOVI config vs an undecodable profile like 4/9).
-            VXProbe.log("dv", "HDR10 FALLBACK: dvProfile=\(info.dvProfile) not AVPlayer-decodable")
-            buffer.fail(info.dvProfile < 0
-                ? "source has no Dolby Vision configuration (label mismatch)"
-                : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
-            return
-        }
-        // Reject an obviously-malformed base video track up front so the conversion path has a valid stream to
-        // work on and a bad source still fails soft to the libmpv demotion rather than mid-loop.
-        if convertP7, baseVideoIn < 0 {
-            buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
-            return
+        let convertP7 = (mode == .dolbyVision && info.dvProfile == 7)
+        if mode == .dolbyVision {
+            guard info.dvProfile == 5 || info.dvProfile == 8 || convertP7 else {
+                // [dv] the DV source is not an AVPlayer-decodable profile -> fail fast so the chrome demotes to
+                // libmpv HDR10. Logs the exact reason (no DOVI config vs an undecodable profile like 4/9).
+                VXProbe.log("dv", "HDR10 FALLBACK: dvProfile=\(info.dvProfile) not AVPlayer-decodable")
+                buffer.fail(info.dvProfile < 0
+                    ? "source has no Dolby Vision configuration (label mismatch)"
+                    : "Dolby Vision profile \(info.dvProfile) is not AVPlayer-decodable")
+                return
+            }
+            // Reject an obviously-malformed base video track up front so the conversion path has a valid stream to
+            // work on and a bad source still fails soft to the libmpv demotion rather than mid-loop.
+            if convertP7, baseVideoIn < 0 {
+                buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
+                return
+            }
+        } else {
+            // PLAIN lane (#147): no DV requirement. Gate the VIDEO codec instead: only H.264 and HEVC are
+            // stream-copyable into an fMP4 AVPlayer decodes (the lane exists to keep a plain MKV on AVPlayer
+            // for PiP). Anything else (VP8/VP9/AV1/MPEG-4/...) fails fast into the SAME fail-soft demote the
+            // DV guards use, so libmpv (which decodes everything) still plays it exactly as today.
+            var plainVideoID = AV_CODEC_ID_NONE
+            if baseVideoIn >= 0, let vpar = inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar {
+                plainVideoID = vpar.pointee.codec_id
+            }
+            guard plainVideoID == AV_CODEC_ID_H264 || plainVideoID == AV_CODEC_ID_HEVC else {
+                VXProbe.log("dv", "PLAIN REMUX FALLBACK: video codec \(info.videoCodec) is not AVPlayer stream-copyable")
+                buffer.fail("video codec \(info.videoCodec) is not AVPlayer-decodable (plain remux)")
+                return
+            }
         }
         // AVPlayer cannot decode TrueHD/DTS, but a TrueHD/DTS-only source no longer fails here: its one audio
         // track is transcoded in-flight (see `transcodeActive`), which was the DOMINANT real-world reason a
@@ -697,11 +752,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // profiles so a non-DV decoder can still read the base layer. movenc accepts both tags for HEVC
                 // in mp4; the hvcC parameter sets stay out-of-band either way, so the extradata-repair gate
                 // below still applies.
-                outStream.pointee.codecpar.pointee.codec_tag = info.dvProfile == 5
-                    ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
-                        | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
-                    : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
-                        | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                // #147: the forced tag applies ONLY to an HEVC base track (every DV source the profile guard
+                // admits, 5/7/8, is HEVC-based by spec, so `.dolbyVision` behavior is unchanged). A plain-lane
+                // H.264 track keeps codec_tag 0 so movenc derives the standard 'avc1' sample entry from its
+                // avcC extradata (H.264 MKVs carry the parameter sets out-of-band in CodecPrivate; a source
+                // without them fails write_header into the same fail-soft demote). 'dvh1' additionally
+                // requires `.dolbyVision` mode, which is implied today (a plain source has dvProfile -1) and
+                // made explicit so the plain lane can never mint a DV sample entry.
+                if outStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+                    outStream.pointee.codecpar.pointee.codec_tag = (mode == .dolbyVision && info.dvProfile == 5)
+                        ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
+                            | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                        : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
+                            | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                }
                 // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
                 // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
                 // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
@@ -726,6 +790,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                         return
                     }
                 }
+                // #147: everything DOVI below is `.dolbyVision`-mode only. The plain lane carries no DOVI
+                // record (its classify skipped the RPU probe and admitted non-DV sources), and it must never
+                // synthesize one: a dvvC/dvcC box on a non-DV stream would be a lie AVPlayer may reject.
+                if mode == .dolbyVision {
                 // For a Profile 7 conversion, re-label the OUTPUT DOVI configuration record as Profile 8.1 so
                 // FFmpeg's mov muxer writes a Profile-8 `dvvC` box (dv_profile>7 selects dvvC) and AVPlayer
                 // engages true DV. The RPU itself is converted per-packet in the mux loop; this makes the
@@ -758,6 +826,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                              width: info.width, height: info.height,
                                              fps: Self.frameRate(inStream))
                 }
+                }   // end mode == .dolbyVision (#147)
             }
             // fMP4 requires each AUDIO track to carry a frame_size; a matroska stream-copy usually leaves it 0,
             // and movenc then rejects write_header with EINVAL ("track N: codec frame size is not set"). This,
@@ -874,7 +943,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // seek-free half: the buffered packets are the exact bytes the loop would have read, so muxing them in
         // order reproduces a full stream. Same streamMap / convertP7 / rescale path as the live loop below.
         while !prebuffered.isEmpty, !isCancelled {
-            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
+            if let starve = hlsInitStarved() { buffer.fail(starve); return }
             let p = prebuffered.removeFirst()
             defer { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) }
             let inIdx = Int(p.pointee.stream_index)
@@ -918,9 +987,24 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let AVERROR_EOF_CONST: Int32 = -541478725
         var readRetries = 0
         let maxReadRetries = 4
+        // One-shot startup diagnostic (#134): the stalled-mount logs froze with produced at a few KB and NO
+        // further remux activity for 15s+, which means av_read_frame itself sat blocked on the source (a
+        // sizeless/chunked debrid link going quiet right after the probe read-ahead, rw_timeout x reconnect
+        // in play). That input-side stall is otherwise invisible in a device export; log the FIRST live read
+        // that takes pathologically long so the next diagnostics export separates "source went quiet"
+        // (network) from "muxer wedged" (code) in one line. Date() twice per read until it fires, then free.
+        var slowReadLogged = false
         while !isCancelled {
-            if hlsInitStarved() { buffer.fail("init starved: audio track never parsed"); return }
+            if let starve = hlsInitStarved() { buffer.fail(starve); return }
+            let readBegan = slowReadLogged ? nil : Date()
             let rf = av_read_frame(inCtx, pkt)
+            if let readBegan {
+                let took = Date().timeIntervalSince(readBegan)
+                if took > 3.0 {
+                    slowReadLogged = true
+                    DiagnosticsLog.log("dv", "live source read stalled \(String(format: "%.1f", took))s (rc=\(rf), produced=\(buffer.producedCount)B)")
+                }
+            }
             if rf < 0 {
                 if rf == AVERROR_EOF_CONST { break }   // genuine EOF: write the trailer + finish() below
                 if isCancelled { break }
@@ -1176,6 +1260,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     hlsFinalizeInit(moovStart: pos, moovSize: size)
                 } else {
                     hlsMoovLocatedAt = Date()   // start the init-starve clock (#76): finalize must land soon
+                    armInitStarveTimeout()      // #148: wall-clock backstop, fires even if packets go quiet
                     DiagnosticsLog.log("dv", "hls init: moov located at byte \(pos), awaiting size backpatch (placeholder size field=\(size))")
                 }
                 return
@@ -1209,6 +1294,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// Publish the init segment (ftyp .. end-of-moov) read back from the produced buffer. One-shot. Nothing is
     /// served until this sets `_hlsInitData`, so the whole init is still resident from offset 0 (no eviction
     /// yet) and `snapshotPrefix` returns it regardless of moov size.
+    ///
+    /// #143 (-12927 device rejections): the SERVED inits are rewritten copies so each master variant's init
+    /// agrees with that variant's declarations - CoreMedia rejected every DV mount right after fetching
+    /// /init.mp4 (master + media + init all served, seg0 never requested), the signature of a declaration /
+    /// content cross-check failure, and both b182/b181 logs show it deterministically on healthy mounts:
+    ///  - DV variant (/init.mp4): the master declares SUPPLEMENTAL-CODECS="dvh1.08.LL/db1p" but FFmpeg's
+    ///    movenc has no way to write the Dolby Vision CMAF media-profile brand into ftyp (it writes only the
+    ///    generic 'dby1'; ftyp here is exactly [iso5, iso5, iso6, dby1, mp41], 32B). Apple's authoring spec:
+    ///    the SUPPLEMENTAL-CODECS fields "must be compatibility brands that pertain to that codec's
+    ///    bitstream" and for DV "the compatibility brand and the VIDEO-RANGE attribute act as cross-checks.
+    ///    Leaving out either one is incorrect." Reference packagers (shaka) write db1p/db4h into the init
+    ///    ftyp from the DOVI record for exactly this reason. So the DECLARED brand is appended to the served
+    ///    copy's ftyp. Byte surgery on the retained Data only: buffer offsets, segment byte ranges, and the
+    ///    legacy loader delivery are untouched.
+    ///  - Lifeboat variant (/init-hdr.mp4): the b170 filter-survivor declares plain HEVC (no
+    ///    SUPPLEMENTAL-CODECS, no VIDEO-RANGE) but used to serve the SAME init whose dvvC box DECLARES
+    ///    Dolby Vision - the exact "leaving out either one" mismatch, on whichever variant the selector
+    ///    lands when the pipeline is not provably HDR at master-parse. Its served copy has the dvcC/dvvC
+    ///    box stripped (ancestor box sizes fixed), making it honestly the HDR10 base layer; the in-band
+    ///    RPU NALs remaining in the shared segments are ignorable ES metadata for a non-DV decode. P5 is
+    ///    exempt (its CODECS is dvh1.05.LL: DV IS declared, and a dvh1 sample entry requires its dvcC).
     private func hlsFinalizeInit(moovStart: Int, moovSize: Int) {
         guard !hlsHeadDone else { return }
         let initLen = moovStart + moovSize
@@ -1216,10 +1322,131 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsAbortInitScan("init \(initLen)B (moov \(moovSize)B @\(moovStart)) not fully resident")
             return
         }
-        hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
-        hlsSegmentStartByte = initLen   // segment 0 starts right after the init
+        hlsLock.lock(); let sig = _hlsSignaling; hlsLock.unlock()
+        // "dvh1.08.06/db1p" -> "db1p" (nil for P5 / plain-HEVC signaling: nothing declared, nothing to add).
+        let declaredBrand: String? = sig?.supplementalCodec.flatMap { s in
+            let fields = s.split(separator: "/")
+            return fields.count >= 2 ? String(fields[1]) : nil
+        }
+        var servedDV = initData
+        var dvNote = "brand n/a"
+        var servedHDR = initData   // fallback: byte-identical to the source init (pre-#143 behavior)
+        var hdrNote = "same as dv"
+        if let brand = declaredBrand {
+            // DV-declared lane (P8.1/8.4, incl. converted P7): brand the DV init, strip the lifeboat's.
+            if let branded = Self.appendFtypCompatibleBrand(initData, brand: brand) {
+                servedDV = branded
+                dvNote = "+\(brand)"
+            } else {
+                dvNote = "\(brand) NOT appended (unexpected ftyp shape)"
+            }
+            if let stripped = Self.stripDoViConfigBox(initData) {   // from the ORIGINAL bytes: no db1p here
+                servedHDR = stripped
+                hdrNote = "dovi stripped"
+            } else {
+                hdrNote = "strip failed, original bytes"
+            }
+        } else if sig?.videoCodec.hasPrefix("hvc1") == true, let stripped = Self.stripDoViConfigBox(initData) {
+            // P8 with an unknown compat id: the master deliberately declares plain HEVC HDR on BOTH variants,
+            // so neither may serve a dvvC-bearing init (same undeclared-DV mismatch, same -12927 exposure).
+            servedDV = stripped
+            servedHDR = stripped
+            dvNote = "dovi stripped (undeclared P8)"
+            hdrNote = "same as dv"
+        }
+        hlsLock.lock(); _hlsInitData = servedDV; _hlsInitDataHDR = servedHDR; hlsLock.unlock()
+        hlsSegmentStartByte = initLen   // segment 0 starts right after the init (BUFFER offsets: original length)
         hlsHeadDone = true; hlsHeadBuf = []
-        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData)))" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B, \(Self.describeInitDoVi(initData))) served dv=\(servedDV.count)B [\(dvNote)] hdr=\(servedHDR.count)B [\(hdrNote)]" + String(format: " +%.1fs after mount", Date().timeIntervalSince(mountedAt)))
+    }
+
+    // MARK: - #143 served-init byte surgery (pure, fail-soft: nil keeps the original bytes)
+
+    /// Big-endian 32-bit read/write on a byte array (bounds are the caller's responsibility; every caller
+    /// below validates `i + 4 <= count` via its box-size checks first).
+    private static func be32(_ b: [UInt8], _ i: Int) -> Int {
+        (Int(b[i]) << 24) | (Int(b[i + 1]) << 16) | (Int(b[i + 2]) << 8) | Int(b[i + 3])
+    }
+    private static func putBE32(_ b: inout [UInt8], _ i: Int, _ v: Int) {
+        b[i] = UInt8((v >> 24) & 0xFF); b[i + 1] = UInt8((v >> 16) & 0xFF)
+        b[i + 2] = UInt8((v >> 8) & 0xFF); b[i + 3] = UInt8(v & 0xFF)
+    }
+    private static func fourccAt(_ b: [UInt8], _ i: Int) -> String {
+        guard i + 4 <= b.count else { return "" }
+        return String(bytes: b[i ..< i + 4], encoding: .ascii) ?? ""
+    }
+
+    /// Append one compatibility brand (e.g. "db1p") to the ftyp of a captured ftyp+moov init segment.
+    /// Returns nil when the data does not open with a sane ftyp immediately followed by moov, or when the
+    /// brand is already present (movenc never writes it today, but stay idempotent).
+    static func appendFtypCompatibleBrand(_ data: Data, brand: String) -> Data? {
+        let brandBytes = Array(brand.utf8)
+        guard brandBytes.count == 4 else { return nil }
+        var b = [UInt8](data)
+        let n = b.count
+        guard n >= 24 else { return nil }
+        let ftypSize = be32(b, 0)
+        // ftyp: size + 'ftyp' + major + minor (16B) then 4-byte brands; moov must follow immediately.
+        guard ftypSize >= 16, ftypSize % 4 == 0, ftypSize + 8 <= n,
+              fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
+        var off = 8   // scan major + compatible brands for an existing copy
+        while off + 4 <= ftypSize {
+            if b[off] == brandBytes[0], b[off + 1] == brandBytes[1],
+               b[off + 2] == brandBytes[2], b[off + 3] == brandBytes[3] { return nil }
+            off += 4
+        }
+        b.insert(contentsOf: brandBytes, at: ftypSize)
+        putBE32(&b, 0, ftypSize + 4)
+        return Data(b)
+    }
+
+    /// Remove the dvcC/dvvC box from a captured ftyp+moov init segment, fixing the size of every enclosing
+    /// box (moov/trak/mdia/minf/stbl/stsd/<visual sample entry>). Returns nil when the layout is not the
+    /// movenc shape this remux produces (the caller then serves the unmodified bytes).
+    static func stripDoViConfigBox(_ data: Data) -> Data? {
+        var b = [UInt8](data)
+        let n = b.count
+        guard n >= 24 else { return nil }
+        let ftypSize = be32(b, 0)
+        guard ftypSize >= 8, ftypSize + 8 <= n, fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
+        let moovSize = be32(b, ftypSize)
+        guard moovSize >= 8, ftypSize + moovSize <= n else { return nil }
+        var ancestors: [Int] = []          // box-start offsets whose 32-bit sizes must shrink
+        var target: (start: Int, size: Int)?
+        // Descend ONLY the fixed container path movenc writes; every other child is skipped opaquely.
+        // Payload offsets: plain containers 8; stsd 16 (FullBox header + entry_count); visual sample entry 86
+        // (8B box header + 78B fixed VisualSampleEntry fields before its child boxes).
+        func search(boxStart: Int, boxSize: Int, type: String) -> Bool {
+            let payload: Int
+            switch type {
+            case "moov", "trak", "mdia", "minf", "stbl": payload = 8
+            case "stsd": payload = 16
+            case "hvc1", "hev1", "dvh1", "dvhe": payload = 86
+            default: return false
+            }
+            let end = boxStart + boxSize
+            var p = boxStart + payload
+            while p + 8 <= end {
+                let s = be32(b, p)
+                guard s >= 8, p + s <= end else { return false }   // malformed child: abort the whole strip
+                let t = fourccAt(b, p + 4)
+                if t == "dvcC" || t == "dvvC" {
+                    target = (p, s)
+                    ancestors.append(boxStart)
+                    return true
+                }
+                if search(boxStart: p, boxSize: s, type: t) {
+                    ancestors.append(boxStart)
+                    return true
+                }
+                p += s
+            }
+            return false
+        }
+        guard search(boxStart: ftypSize, boxSize: moovSize, type: "moov"), let hit = target else { return nil }
+        for off in ancestors { putBE32(&b, off, be32(b, off) - hit.size) }
+        b.removeSubrange(hit.start ..< hit.start + hit.size)
+        return Data(b)
     }
 
     /// Decode the DV carriage straight out of the SERVED init bytes (not the codecpar we handed the muxer) so
@@ -1254,13 +1481,55 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         DiagnosticsLog.log("dv", "hls init scan aborted: \(reason)")
     }
 
-    /// Belt-and-braces to the flush-rc check (#76): the moov placeholder was located but its size backpatch has
-    /// never landed to publish the init, `hlsInitStarveSecs` after it was seen and while packets are still being
-    /// fed. That means moov finalization is wedged (the unparseable audio bed blocking it), so the mount is dead;
-    /// the caller fails the buffer so demotion runs in ~1s rather than at the 20s start watchdog. Remux-thread only.
-    private func hlsInitStarved() -> Bool {
-        guard hlsIndexingEnabled, !hlsHeadDone, hlsMoovStart != nil, let located = hlsMoovLocatedAt else { return false }
-        return Date().timeIntervalSince(located) > Self.hlsInitStarveSecs
+    /// Init-starve guard (#76/#134): returns the fail-fast reason once the init provably can no longer
+    /// publish, or nil while it is still viable (or already published). Checked between packets while data
+    /// still flows, so a stalled source can never trip it (remux thread only). Two independent trips:
+    /// backpatch starve (#76), the moov placeholder was located but its size backpatch never landed within
+    /// `hlsInitStarveSecs` (with the pre-init cut gate this only arms on the legitimate >AVIO-buffer moov
+    /// path, so it means finalization is wedged); and the pre-init moov deadline (#134),
+    /// `hlsPreInitMoovDeadlineSecs` of media muxed and movenc never even started the moov (see the
+    /// constant). The caller fails the buffer so demotion runs in ~1s rather than at the start watchdog.
+    private func hlsInitStarved() -> String? {
+        guard hlsIndexingEnabled, !hlsHeadDone else { return nil }
+        if hlsMoovStart != nil, let located = hlsMoovLocatedAt,
+           Date().timeIntervalSince(located) > Self.hlsInitStarveSecs {
+            return "init starved: moov size backpatch never landed"
+        }
+        if hlsMoovStart == nil, let start = hlsSegmentStartSec {
+            let media = hlsLastVideoSec - start
+            if media > Self.hlsPreInitMoovDeadlineSecs {
+                return "init starved: moov never began after \(String(format: "%.1f", media))s of media (a mapped track never parsed)"
+            }
+        }
+        return nil
+    }
+
+    /// FIX A (#148): wall-clock backstop for the backpatch-starve trip above. `hlsInitStarved()` is evaluated
+    /// ONLY between packets in the mux loop, so a moov placeholder that wedges while the source goes QUIET
+    /// right after it (the Housemaid EAC3 profile=-99 half-moov orphan) is never re-checked and the demote
+    /// falls through to the ~15s progress-aware start watchdog. Armed ONCE when the placeholder is located
+    /// (hlsIndexHead's `hlsMoovStart == nil` guard makes that branch fire at most once), this fires the demote
+    /// ~hlsInitStarveSecs later even with zero further packets, cutting the visible cache-gone/rebuffer gap
+    /// ~3x. Self-contained: dispatched on a global queue with a weak self, and `failIfInitStarved` re-reads
+    /// PUBLISHED state under hlsLock (race-free) before failing the buffer.
+    private func armInitStarveTimeout() {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + Self.hlsInitStarveSecs) { [weak self] in
+            self?.failIfInitStarved()
+        }
+    }
+
+    /// Fail the buffer iff the located moov placeholder still has not published its init segment. Callable from
+    /// ANY thread: `isCancelled` is atomic, `hlsSnapshot()` reads published state under hlsLock, and
+    /// `buffer.fail` is any-thread-safe and idempotent (a no-op once the buffer already failed/ended). No-ops
+    /// when the init published (initData != nil) or the stream ended, so a healthy mount is never demoted; a
+    /// still-nil init this far past the placeholder is the exact wedged state the packet-driven guard treats
+    /// as fatal, so the two paths agree on the same 4s threshold.
+    private func failIfInitStarved() {
+        guard !isCancelled else { return }
+        let snap = hlsSnapshot()
+        guard snap.initData == nil, !snap.ended else { return }
+        buffer.fail("init starved: moov size backpatch never landed (time-based backstop, source went quiet)")
+        DiagnosticsLog.log("dv", "hls init-starve backstop fired: moov placeholder never finalized within \(Self.hlsInitStarveSecs)s and packets stopped; demoting to libmpv")
     }
 
     /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
@@ -1269,6 +1538,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// the muxer's open fragment (`av_interleaved_write_frame(ctx, nil)`, the documented movenc fragment
     /// cut) + flush the AVIO tail, after which `buffer.producedCount` is EXACTLY the segment's end byte.
     /// movenc's own frag_duration auto-cuts continue as shipped; they simply become intra-segment fragments.
+    /// Cuts are GATED on the init segment being published (`hlsHeadDone`): pre-init a forced flush is both
+    /// useless (no segment can close before `hlsSegmentStartByte` exists) and DANGEROUS (see the #134 note
+    /// inside), so the delayed moov is left entirely to movenc's own safe frag_duration auto-flush. The
+    /// pre-init branch still pushes the AVIO tail on every base-video packet, so an auto-flushed moov
+    /// reaches the head scan on the next packet rather than on a 4 MiB AVIO-buffer overflow (note inside).
     private func hlsMaybeCut(outCtx: UnsafeMutablePointer<AVFormatContext>,
                              pkt: UnsafeMutablePointer<AVPacket>,
                              timeBase: AVRational) {
@@ -1283,6 +1557,40 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             hlsSegmentStartSec = sec   // the first base-video packet opens segment 0
             return
         }
+        // #134 root cause: NEVER force a fragment flush before the init segment is published. The forced
+        // flush below reaches movenc as mov_flush_fragment(force=1), which BYPASSES the "all tracks have
+        // data" guard and tries to serialize the delayed moov even when the mapped audio track has no
+        // parsed packet yet (a probe window that re-delivered only video so far, or a first (E)AC3 burst
+        // the parser has not finished). movenc then HALF-writes the moov into the AVIO buffer (ftyp +
+        // video trak, dying at the audio sample entry: "Cannot write moov atom before (E)AC3 packets"),
+        // and mov_write_packet(s, NULL) SWALLOWS that error (returns 1, libavformat 62.12.101), so the
+        // flushRc check below can never see it and movenc's moov_written stays 0. The avio_flush below
+        // then pushed that ORPHANED ftyp+moov with a size-0 placeholder into the produced stream,
+        // hlsIndexHead armed hlsMoovStart on it, and the one-shot head scan waited forever for a size
+        // backpatch movenc never issues: a LATER successful moov is a FRESH ftyp+moov appended at a
+        // higher offset, invisible to the armed scan. Init never published -> media.m3u8 starved ->
+        // "TRUE STALL -> libmpv HDR10" on ~half of all DV mounts (issue #134). So pre-init, ONLY the
+        // forced flush is skipped. There is nothing to cut yet anyway (hlsCloseSegment no-ops until
+        // hlsFinalizeInit sets hlsSegmentStartByte); movenc's frag_duration auto-flush (force=0) DEFERS
+        // WHOLE until every mapped track really has data (mov_flush_fragment returns before writing a
+        // byte), so it can never begin a moov it has to abandon: the first head bytes it ever emits are
+        // a COMPLETE ftyp+moov with its size backpatched in-buffer, or the >AVIO-buffer overflow path
+        // whose placeholder+backpatch the init-starve guard already polices. Cuts resume here on the
+        // first packet after the init publishes. hlsHeadDone also flips on hlsAbortInitScan, so a dead
+        // scan cannot park this gate forever (that mount is already failing over). Legacy loader
+        // delivery is untouched (hlsIndexingEnabled guard).
+        guard hlsHeadDone else {
+            // Push the AVIO tail even though the cut is skipped. movenc lands that completed moov in the
+            // 4 MiB AVIO buffer during a packet write, and with AVFMT_FLAG_FLUSH_PACKETS unset nothing
+            // else drains the buffer until it OVERFLOWS: waiting for the overflow adds ~1.3s of startup
+            // latency to every DV mount and never comes at all on a chunked/slow mount that stalls under
+            // 4 MiB (a completed, playable moov sitting unserved until the start watchdog demotes the
+            // title to HDR10). avio_flush only moves bytes movenc already finished writing and cannot
+            // call back into movenc, so it can publish the moov early but can never re-create the
+            // half-moov orphan above.
+            avio_flush(outCtx.pointee.pb)
+            return
+        }
         let elapsed = sec - start
         let isKey = (pkt.pointee.flags & AV_PKT_FLAG_KEY_CONST) != 0
         let openBytes = buffer.producedCount - (hlsSegmentStartByte ?? 0)
@@ -1291,13 +1599,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 || openBytes >= Self.hlsMaxSegmentBytes else { return }
         let flushRc = av_interleaved_write_frame(outCtx, nil)   // drain the interleave queue + flush the open fragment
         if flushRc < 0 {
-            // A delayed moov (movflags delay_moov) is emitted on the FIRST fragment flush; when the audio bed's
-            // sample entry cannot be finalized (an E-AC3/DDP track libav could not parse) this flush fails and
-            // the moov is never written. That rc used to be discarded (`_ =`), so the init never published, the
-            // playlist starved, and only the 20s start watchdog demoted. Fail here so the HLS server 404s and
-            // the existing demotion runs in ~1s. (Every later cut flushes too; a failure there is just as fatal.)
-            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsHeadDone) (delayed moov write failed)")
-            buffer.fail("delayed moov write failed (\(flushRc))")
+            // Post-init only (the hlsHeadDone gate above): a failed cut means the interleave drain or the
+            // fragment write died, so the pipeline is wedged; fail so the HLS server 404s and the demotion
+            // runs in ~1s instead of the start watchdog. NOTE (#134): this rc can NOT see a failed DELAYED
+            // MOOV write. movenc's mov_write_packet(s, NULL) discards mov_flush_fragment's error and returns
+            // 1 (libavformat 62.12.101), which is why the pre-init force is gated off above rather than
+            // rc-checked here; the moov-write failure that CAN surface (an unparseable audio bed at movenc's
+            // own force=0 auto-flush) comes back through the av_interleaved_write_frame(pkt) rc in the mux
+            // loops, which already logs + fails the buffer.
+            DiagnosticsLog.log("dv", "hls fragment flush FAILED rc=\(flushRc) preMoov=\(!hlsHeadDone)")
+            buffer.fail("fragment flush failed (\(flushRc))")
             return
         }
         avio_flush(outCtx.pointee.pb)                 // push the AVIO tail so producedCount == the boundary
@@ -1352,10 +1663,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     }
                 }
             }
-            if let parsed = Self.hevcCodecString(vpar) { videoCodec = parsed }
+            // #147 plain lane: an H.264 base track's extradata is an avcC record, which hevcCodecString's
+            // loose header check (version byte 1, length >= 23) could MISPARSE as hvcC, so H.264 takes its
+            // own RFC-6381 builder. Inert in `.dolbyVision` mode (the profile guard admits only HEVC-based
+            // profiles, so the codec there is always HEVC).
+            if vpar.pointee.codec_id == AV_CODEC_ID_H264 {
+                videoCodec = Self.avcCodecString(vpar) ?? "avc1.640033"   // generous High@5.1 fallback (CODECS gates selection only)
+            } else if let parsed = Self.hevcCodecString(vpar) { videoCodec = parsed }
         }
         var supplemental: String?
-        var range: String? = "PQ"
+        // #147 plain lane: declare NO VIDEO-RANGE (and the profile checks below no-op on dvProfile -1, so no
+        // SUPPLEMENTAL-CODECS either). Range-unlabeled is the b170 "lifeboat" shape, empirically proven to
+        // always survive AVFoundation's variant filter; an explicit range bought nothing and the PQ default
+        // would be a lie for the common SDR H.264 MKV. `.dolbyVision` keeps the exact original PQ default.
+        var range: String? = mode == .dolbyVision ? "PQ" : nil
         let lvl = String(format: "%02d", min(max(dvLevel, 1), 13))
         if profile == 5 {
             videoCodec = "dvh1.05.\(lvl)"   // Profile 5 is DV-only (no cross-compatible base layer)
@@ -1379,9 +1700,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // an enhancement-layer video track too, so "the first video stream" is the wrong one.
         let fps = baseVideoIn >= 0 ? Self.frameRate(inCtx.pointee.streams[baseVideoIn]) : 0
         let sig = HLSSignaling(videoCodec: videoCodec, supplementalCodec: supplemental, videoRange: range,
-                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps)
+                               audioCodec: audio, width: info.width, height: info.height, bandwidth: bandwidth, fps: fps,
+                               dolbyVision: mode == .dolbyVision)
         hlsLock.lock(); _hlsSignaling = sig; hlsLock.unlock()
-        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth)")
+        DiagnosticsLog.log("dv", "hls signaling codecs=\(videoCodec)\(audio.map { ",\($0)" } ?? "") supplemental=\(supplemental ?? "none") range=\(range ?? "none") fps=\(String(format: "%.3f", fps)) bw=\(bandwidth) dv=\(mode == .dolbyVision)")
     }
 
     /// RFC 6381 HEVC codec string ("hvc1.2.4.L153.B0") from an hvcC record's profile/tier/level bytes.
@@ -1424,6 +1746,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).L\(level)"
         if !constraints.isEmpty { s += "." + constraints.joined(separator: ".") }
         return s
+    }
+
+    /// RFC 6381 H.264 codec string ("avc1.640028") from an avcC record's profile / constraint / level bytes
+    /// (#147, the plain lane's H.264 base track). avcC layout: [0]=version(1), [1]=AVCProfileIndication,
+    /// [2]=profile_compatibility, [3]=AVCLevelIndication, hex-concatenated per RFC 6381. Returns nil (the
+    /// caller keeps a generous High@5.1 default) when the extradata is not a parseable avcC record.
+    private static func avcCodecString(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> String? {
+        guard let par, let ex = par.pointee.extradata else { return nil }
+        guard Int(par.pointee.extradata_size) >= 4, ex[0] == 1 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", ex[1], ex[2], ex[3])
     }
 
     /// RFC 6381 codec string for the one mapped audio track (nil = leave it out of CODECS).

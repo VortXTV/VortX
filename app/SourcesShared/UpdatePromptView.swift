@@ -49,8 +49,10 @@ struct UpdatePromptView: View {
                         .padding(Theme.Space.md)
                 }
                 .frame(maxHeight: notesMaxHeight)
-                .background(Theme.Palette.surface1)
+                // Clip the scrolling notes to the card shape FIRST, then draw the shared settings-card
+                // glass behind them (its rounded shape matches the clip), replacing the flat surface1 slab.
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxSettingsCard()
             }
 
             VStack(spacing: Theme.Space.sm) {

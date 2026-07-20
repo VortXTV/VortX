@@ -360,8 +360,14 @@ struct iOSDecadeTile: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [decade.tint.opacity(0.9), decade.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+            // The cover is a PORTRAIT poster; an unbounded `.fill` child grows the ZStack to the poster's
+            // filled height (width x 1.5width), the outer width x 0.5width frame then centers that oversized
+            // stack, and the bottom-anchored decade label lands OUTSIDE the visible clip (the "image but no
+            // name" tile). Bounding the image to the tile frame keeps the stack, scrim and label inside.
             if let cover, !cover.isEmpty {
                 iOSTileImage(url: cover, maxPixel: 900, contentMode: .fill) { Color.clear }
+                    .frame(width: width, height: width * 0.5)
+                    .clipped()
             }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {

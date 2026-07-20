@@ -1,10 +1,10 @@
 import Foundation
 
 @MainActor
-public protocol MPVPlayerDelegate: AnyObject {
+protocol MPVPlayerDelegate: AnyObject {
     /// A player property changed (an mpv property name, or a synthetic key like the end-file events).
-    /// The engine that changed is the delegate's own `player` reference, so it is not re-passed here;
-    /// keeping this engine-agnostic lets an AVFoundation engine drive the same chrome through the same
-    /// Coordinator (it just sets `coordinator.player` to itself and calls this).
-    func propertyChange(propertyName: String, data: Any?)
+    /// Every callback carries the opaque logical load that produced it. The shared Coordinator compares
+    /// that token with its currently mounted engine, so callbacks from a replaced or dismantled engine
+    /// fail closed even after the Coordinator's weak player reference points at another controller.
+    func propertyChange(propertyName: String, data: Any?, loadToken: PlayerLoadToken)
 }

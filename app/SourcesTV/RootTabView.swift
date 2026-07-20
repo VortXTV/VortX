@@ -37,6 +37,10 @@ struct PlaybackRequest: Identifiable {
     /// When this request plays a NATIVELY-resolved debrid link, its provenance so the play-record can store
     /// enough to reresolve a fresh link on a later Continue-Watching resume. nil for torrent/direct/trailer.
     var debridRef: DebridPlaybackRef? = nil
+    /// Exact source row that produced the URL, retained for raw-torrent selector provenance.
+    var sourceStream: CoreStream? = nil
+    /// Exact series engine identity confirmed by the launch path. nil keeps engine writes closed.
+    var enginePlayerVideoId: String? = nil
     /// yt-direct adaptive pair (trailers / pasted YouTube links): the separate AUDIO stream mpv mounts
     /// alongside the video-only `url` (`--audio-files`). Forces the libmpv engine in TVPlayerView.
     var audioSidecarURL: URL? = nil
@@ -54,6 +58,12 @@ struct PlaybackRequest: Identifiable {
     /// (so the source is identical, per the play-from-start invariant); only the start position differs. The
     /// stored resume point is left untouched. TVPlayerView reads it to skip its engine/account resume lookup.
     var startFromZero: Bool = false
+    /// An explicit start position in seconds: the same idea as `startFromZero` generalized past 0:00. Set by
+    /// the Trakt "Resume from <time>" chip, which offers a position another device reported to Trakt. Like
+    /// `startFromZero` it changes only WHERE this playback begins, never WHICH source plays, and it leaves
+    /// the stored resume point untouched: VortX remains the sole resume authority and re-records its own
+    /// position from here as playback proceeds. Takes precedence over `startFromZero` (a caller sets one).
+    var startAtSeconds: Double? = nil
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -82,6 +92,7 @@ struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var core: CoreBridge   // tear down the engine Player on a genuine player exit
+    @ObservedObject private var router = DeepLinkRouter.shared   // parked `vortx://` destination (Top Shelf taps)
     @State private var splashDone = false
 
     var body: some View {
@@ -93,6 +104,21 @@ struct RootView: View {
             RootTabView()
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
+                // A `vortx://open` link (today: a Top Shelf tap) opens the title's detail page.
+                //
+                // Presented as a REAL modal over the shell, wrapped in its own NavigationStack, which is
+                // the idiom the Upcoming screen's detail sheet already uses. It deliberately does NOT
+                // push into Home's navigation stack: the shell is mounted once and never rebuilt (see the
+                // focus rules above), and reaching into a tab's stack from outside is exactly the kind of
+                // mid-flight mutation that parked the tab bar offscreen. UIKit moves focus into a real
+                // presentation natively, so the Siri remote lands in the detail page and Menu dismisses it
+                // back to wherever the user was.
+                //
+                // Hung on the shell child rather than on the ZStack because the profile picker's cover is
+                // already on the ZStack, and two presentation modifiers on ONE view do not both present.
+                .fullScreenCover(item: deepLinkDetail) { target in
+                    NavigationStack { DetailView(type: target.type, id: target.id) }
+                }
             if let req = presenter.request {
                 // #76: AVPlayer is now FIRST-CLASS under the full TVPlayerView chrome. Every request goes to
                 // TVPlayerView, which picks the engine per stream in `playerSurface` (AVPlayer for HLS / Dolby
@@ -106,8 +132,10 @@ struct RootView: View {
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
+                             initialSourceStream: req.sourceStream,
+                             initialEnginePlayerVideoId: req.enginePlayerVideoId,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
-                             startFromZero: req.startFromZero,
+                             startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
                              // Tear down the engine Player on a genuine exit so a stale Player from this session
                              // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
                              // the single user-exit choke point (leavePlayback routes through it); a request-id
@@ -130,6 +158,13 @@ struct RootView: View {
             guard presenter.request == nil else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { TabBarHealer.heal("player-closed") }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { TabBarHealer.heal("player-closed+3s") }
+            // Republish the Top Shelf on playback EXIT: what you just watched is the thing the Home
+            // screen should now be offering to resume. Delayed a beat so the engine has landed the play
+            // record first, otherwise the snapshot captures the pre-play progress. Home's own re-seed
+            // also publishes, so this is the freshness pass for the case where the user leaves the app
+            // straight from the player and never lands back on Home. Cheap and self-deduping: the store
+            // diffs content and writes nothing when the shelf has not actually moved.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { TopShelfSnapshotWriter.publishCurrent() }
         }
         // The picker dismissing (or a profile switch settling) makes the shell visible again; re-assert
         // the bar in case it desynced while hidden, so the menu is never missing on return (issue #75).
@@ -154,6 +189,20 @@ struct RootView: View {
             set: { presented in if !presented { profiles.pickedThisLaunch = true } }
         )
     }
+
+    /// The deep link's detail page, presented only once the shell is actually ready for it: past the
+    /// splash, past the profile picker, and with no player up.
+    ///
+    /// The target stays PARKED in the router until then rather than being dropped, so the two cases
+    /// that matter both land: a cold launch started BY a Top Shelf tap (the link arrives long before
+    /// the shell mounts) and a tap that arrives while playback is up (it opens when the player closes).
+    /// The getter re-evaluates whenever those inputs change, so parking costs nothing.
+    private var deepLinkDetail: Binding<DeepLinkDetailTarget?> {
+        Binding(
+            get: { splashDone && shellVisible ? router.detailTarget : nil },
+            set: { target in if target == nil { router.detailTarget = nil } }
+        )
+    }
 }
 
 /// The app shell: Home · Discover · Library · Add-ons · Search · Settings.
@@ -166,6 +215,11 @@ struct RootTabView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
+    /// Observed only to SKIP arming the seeding nag while something is playing (the player covers the
+    /// shell); the same shared object RootView drives the player with.
+    @EnvironmentObject private var presenter: PlayerPresenter
+    /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
+    @State private var showSeedingNag = false
     @State private var selection = 0
     // Per-tab identity token. Each tab owns its own NavigationStack whose pushed pages persist
     // while the tab stays alive (tvOS keeps tabs mounted). Bumping the token of the tab you LEAVE
@@ -315,8 +369,18 @@ struct RootTabView: View {
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
         }
+        // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
+        // Apple TV still owes its first VortX-account sync. armLaunchNag waits out the splash + the
+        // profile picker so the sheet never fights a modal; skipped while something is playing. Always
+        // dismissible, never blocks the app.
+        .sheet(isPresented: $showSeedingNag) { MoveSeedingNagTV() }
+        .task { await armSeedingNag() }
         .onAppear {
             applyTabBarAccent()
+            // Same idea as applyTabBarAccent, for the other tvOS system-white default: the UITextField
+            // card. Stand it down once at shell appear so every field on tvOS shows the VortX surface
+            // authored behind it instead of an opaque near-white slab. See VortXGlass.applyTextFieldAppearance.
+            VortXGlass.applyTextFieldAppearance()
             updates.startMonitoring()   // launch check + hourly re-check while open
             let name = Self.tabName(selection)
             VXProbeState.shared.setRoute(name)
@@ -408,6 +472,15 @@ struct RootTabView: View {
     /// The focused / selected tab pill is system white by default; recolor it to the active accent
     /// with dark on-accent ink, and push the appearance onto any live tab bars so an accent change
     /// repaints without a relaunch.
+    /// Phase-0 seeding nag arm (com.vortx move): a named method (not an inline closure) so the shell
+    /// body's already-tight type-check budget pays nothing for it. Skips arming while something is
+    /// playing (the player covers the shell); MoveSeeding gates once-per-launch + needs-seeding.
+    private func armSeedingNag() async {
+        await MoveSeeding.armLaunchNag {
+            if presenter.request == nil { showSeedingNag = true }
+        }
+    }
+
     private func applyTabBarAccent() {
         let item = UITabBarItemAppearance()
         item.normal.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.textSecondary)]
@@ -417,17 +490,28 @@ struct RootTabView: View {
         item.focused.titleTextAttributes = [.foregroundColor: UIColor(Theme.Palette.onAccent)]
         item.focused.iconColor = UIColor(Theme.Palette.onAccent)
         let appearance = UITabBarAppearance()
-        // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and tint it with the
-        // SAME warm fill the SwiftUI VortXGlass material uses, so the tvOS top nav reads as VortX glass and
-        // matches the Mac / iOS chrome. Under Reduce Transparency, stand down to an opaque warm surface for
-        // legibility. RE-SKIN ONLY: this changes the bar's BACKGROUND appearance; the native TabView, its
-        // focus engine, tab tags/order, and the ember selection indicator below are all untouched.
+        // Warm liquid-glass top nav (redesign Phase A): keep the system's blurred bar and give it the REAL
+        // VortX glass treatment, so the tvOS top nav reads as VortX glass and matches the Mac / iOS chrome.
+        // Under Reduce Transparency, stand down to an opaque warm surface for legibility. RE-SKIN ONLY: this
+        // changes the bar's BACKGROUND appearance; the native TabView, its focus engine, tab tags/order, and
+        // the ember selection indicator below are all untouched.
+        //
+        // This used to be `backgroundColor = fillUIColor(barFillAlpha)`, which was a colour WASH and nothing
+        // else: no top highlight, no shadow, and no visible surface either. The wash painted the bar with the
+        // fixed near-black SCRIM tone, but this bar floats over the app's OWN dark chrome, so the scrim
+        // dragged it toward the canvas it was already sitting on instead of raising it. Measured on Apple TV
+        // 4K: the bar rendered at a 1.002:1 contrast ratio against the canvas, i.e. the app's highest chrome
+        // was invisible, while an inline settings card behind it read at 1.102:1. The bar now takes the `.lift`
+        // tone AND its 1px lit top edge via `tabBarBackgroundImage()` (drawn, because a native bar cannot host
+        // a SwiftUI material), over the system blur that `configureWithDefaultBackground` supplies, so content
+        // scrolling behind the bar is still sampled. The drop shadow is applied per-bar in `retintTabBars`,
+        // where the real `UITabBar` layer is in hand.
         if UIAccessibility.isReduceTransparencyEnabled {
             appearance.configureWithOpaqueBackground()
             appearance.backgroundColor = UIColor(Theme.Palette.surface1)
         } else {
             appearance.configureWithDefaultBackground()
-            appearance.backgroundColor = VortXGlass.fillUIColor(VortXGlass.barFillAlpha)
+            appearance.backgroundImage = VortXGlass.tabBarBackgroundImage()
         }
         appearance.selectionIndicatorTintColor = UIColor(Theme.Palette.accent)
         appearance.inlineLayoutAppearance = item
@@ -445,10 +529,38 @@ struct RootTabView: View {
         if let tabs = controller as? UITabBarController {
             tabs.tabBar.standardAppearance = appearance
             tabs.tabBar.scrollEdgeAppearance = appearance
+            applyTabBarShadow(to: tabs.tabBar)
             tabs.tabBar.setNeedsLayout()
         }
         controller.children.forEach { retintTabBars(under: $0, with: appearance) }
         retintTabBars(under: controller.presentedViewController, with: appearance)
+    }
+
+    /// Float the tvOS tab bar on the SAME drop shadow every other VortX glass surface casts.
+    ///
+    /// `UITabBarAppearance` has no drop-shadow knob at all (`shadowColor` / `shadowImage` are the 1px
+    /// separator line, not an elevation shadow), which is why the bar had none: a `UIBarAppearance` simply
+    /// cannot express one. The real `UITabBar` view is reachable here though, so the shadow goes on its
+    /// layer, reading its geometry straight from `VortXGlass.Shadow.bar` (the token the SwiftUI floating bar
+    /// / nav pill already uses) so the two stay in lockstep from ONE definition rather than drifting apart.
+    ///
+    /// `shadowPath` is deliberately left nil: Core Animation then derives the shadow from the layer's
+    /// composited alpha, which means it follows the bar's actual ROUNDED floating platter instead of the
+    /// square bounds a hand-built path would give. One bar, once per appearance pass, so the cost of the
+    /// alpha-derived shadow is irrelevant here. Skipped under Reduce Transparency, where the bar stands down
+    /// to a flat opaque surface and a float shadow would be off-message.
+    private func applyTabBarShadow(to tabBar: UITabBar) {
+        guard !UIAccessibility.isReduceTransparencyEnabled else {
+            tabBar.layer.shadowOpacity = 0
+            return
+        }
+        let shadow = VortXGlass.Shadow.bar
+        tabBar.layer.shadowColor = UIColor(shadow.color).cgColor
+        // The alpha is already carried by the token's colour, so the layer's own opacity stays at full.
+        tabBar.layer.shadowOpacity = 1
+        tabBar.layer.shadowRadius = shadow.radius
+        tabBar.layer.shadowOffset = CGSize(width: shadow.x, height: shadow.y)
+        tabBar.clipsToBounds = false
     }
 }
 

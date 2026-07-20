@@ -70,7 +70,7 @@ enum LibraryAutoAdd {
                 rememberAutoAdded(id)
                 NSLog("[autolib] auto-added %@ to account library (engine, loaded meta)", id)
             } else {
-                let type = (meta.type == "series") ? "series" : "movie"
+                let type = meta.usesSeriesLifecycle ? "series" : "movie"
                 Task { @MainActor in
                     // Only remember the auto-add once the account write actually succeeded; a failed resolve
                     // must retry on the next play, not be silently pinned as "already added".
@@ -86,5 +86,100 @@ enum LibraryAutoAdd {
             rememberAutoAdded(id)
             NSLog("[autolib] auto-added %@ to overlay-profile library (local overlay)", id)
         }
+    }
+
+    // MARK: - Watchlist (a lightweight per-profile "want to watch" ledger)
+
+    /// A pure app-side "want to watch" flag, kept in the SAME local-overlay style as the auto-added set above:
+    /// a per-profile UserDefaults record, engine-safe ids only, and NEVER a write into a `libraryItem` doc or
+    /// any account-parsed schema (the CLAUDE.md invariant that once corrupted official-client sync). So marking
+    /// a title for later cannot touch the account library or leak between profiles. Records carry the title's
+    /// type (and an optional name/poster snapshot) so the Upcoming calendar can route and render each entry
+    /// without a second meta lookup. This is intentionally SEPARATE from the Trakt / SIMKL remote watchlists in
+    /// `ExternalScrobbleProvider`: those mirror to a remote account; this is the on-device list a later pass may
+    /// choose to bridge to them.
+
+    /// One remembered watchlist title. Codable so the whole list round-trips through a single UserDefaults value.
+    struct WatchlistEntry: Codable, Equatable, Identifiable {
+        let id: String          // engine catalog id (tt… / tmdb…)
+        let type: String        // "series" | "movie"
+        let name: String?       // snapshot for a list row / calendar fallback
+        let poster: String?     // snapshot poster URL, if known at add time
+        let addedAt: Double     // epoch seconds, so the list can render newest-add first
+    }
+
+    /// Posted (main thread) after any watchlist mutation so a bookmark button or the Upcoming rail can refresh.
+    static let watchlistChangedNote = Notification.Name("vortx.watchlistChanged")
+
+    private static let watchlistKeyPrefix = "vortx.watchlist"
+    private static let watchlistCap = 1000   // bound the list so it can't grow without limit
+
+    /// Per-profile storage key (an overlay profile's list must never leak into another profile's or the account).
+    private static func watchlistKey() -> String {
+        if let id = ProfileStore.shared.activeID { return "\(watchlistKeyPrefix).\(id.uuidString)" }
+        return watchlistKeyPrefix
+    }
+
+    /// The active profile's watchlist, newest-add first. Fail-soft: a missing / garbled value reads as empty.
+    static func watchlist() -> [WatchlistEntry] {
+        guard let data = UserDefaults.standard.data(forKey: watchlistKey()),
+              let entries = try? JSONDecoder().decode([WatchlistEntry].self, from: data) else { return [] }
+        return entries.sorted { $0.addedAt > $1.addedAt }
+    }
+
+    private static func saveWatchlist(_ entries: [WatchlistEntry]) {
+        // Keep the newest `watchlistCap` so a huge list stays bounded (drop the oldest adds first).
+        let bounded = Array(entries.sorted { $0.addedAt > $1.addedAt }.prefix(watchlistCap))
+        if let data = try? JSONEncoder().encode(bounded) {
+            UserDefaults.standard.set(data, forKey: watchlistKey())
+        }
+        NotificationCenter.default.post(name: watchlistChangedNote, object: nil)
+    }
+
+    /// Whether a title is on the active profile's watchlist. Cheap enough for a button to read directly.
+    static func isWatchlisted(_ id: String) -> Bool {
+        guard let data = UserDefaults.standard.data(forKey: watchlistKey()),
+              let entries = try? JSONDecoder().decode([WatchlistEntry].self, from: data) else { return false }
+        return entries.contains { $0.id == id }
+    }
+
+    /// Add a title to the watchlist. Engine-safe ids ONLY (a synthetic magnet / paste-a-link id is rejected so
+    /// it can never poison sync if a later pass bridges the list upstream). Idempotent: a title already present
+    /// is left untouched. Returns true only when it actually added a new entry.
+    @discardableResult
+    static func addToWatchlist(id: String, type: String, name: String? = nil, poster: String? = nil) -> Bool {
+        guard id.hasPrefix("tt") || id.hasPrefix("tmdb") else { return false }
+        var entries = watchlist()
+        guard !entries.contains(where: { $0.id == id }) else { return false }
+        let normalizedType = (type == "series") ? "series" : "movie"
+        entries.append(WatchlistEntry(id: id, type: normalizedType, name: name, poster: poster,
+                                      addedAt: Date().timeIntervalSince1970))
+        saveWatchlist(entries)
+        NSLog("[watchlist] added %@ (%@)", id, normalizedType)
+        return true
+    }
+
+    /// Remove a title from the watchlist (no-op if it was not on it).
+    static func removeFromWatchlist(_ id: String) {
+        var entries = watchlist()
+        let before = entries.count
+        entries.removeAll { $0.id == id }
+        guard entries.count != before else { return }
+        saveWatchlist(entries)
+        NSLog("[watchlist] removed %@", id)
+    }
+
+    /// Flip a title's watchlist membership. Returns the NEW state (true = now on the watchlist), so a button can
+    /// set its own filled / outline state straight from the return value without a second `isWatchlisted` read.
+    @discardableResult
+    static func toggleWatchlist(id: String, type: String, name: String? = nil, poster: String? = nil) -> Bool {
+        if isWatchlisted(id) { removeFromWatchlist(id); return false }
+        return addToWatchlist(id: id, type: type, name: name, poster: poster)
+    }
+
+    /// The watchlisted ids of one type ("series" / "movie"), for the Upcoming calendar's per-type fan-out.
+    static func watchlistedIDs(ofType type: String) -> [String] {
+        let normalizedType = (type == "series") ? "series" : "movie"
+        return watchlist().filter { $0.type == normalizedType }.map(\.id)
     }
 }

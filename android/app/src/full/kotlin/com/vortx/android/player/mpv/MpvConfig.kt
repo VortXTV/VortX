@@ -1,5 +1,8 @@
 package com.vortx.android.player.mpv
 
+import android.content.Context
+import com.vortx.android.player.DiskCacheSetting
+
 /// The SINGLE source of the libmpv option set for VortX Android, ported line-for-line from the Apple
 /// reference `app/Sources/Player/MPVMetalViewController.swift` (`setupMpv`). This is the Android mirror
 /// of that 60-line `mpv_set_option` block: a change to the shared player behavior should land here AND
@@ -127,4 +130,14 @@ object MpvConfig {
         // Adaptive HLS: take the highest-bitrate rendition. Identical to Apple.
         "hls-bitrate" to HLS_BITRATE,
     )
+
+    /// The OPT-IN on-disk cache options (`cache-on-disk=yes` + `cache-dir=<path>`), applied pre-init
+    /// ALONGSIDE [baseOptions] when the viewer has enabled the disk cache in Settings. Empty (the default)
+    /// keeps mpv on its in-memory read-ahead, so shipping behavior is unchanged until opted in. The large
+    /// `demuxer-max-bytes` that actually fills the disk cache is set per-file by the player (device- and
+    /// free-disk-clamped via [DiskCacheSetting.resolvedMaxBytes]), mirroring the Apple loadFile split. This
+    /// is the "cache-on-disk toggle in MpvConfig" the Android parity map called for; the persistence +
+    /// free-disk safety math lives in [DiskCacheSetting].
+    fun diskCacheOptions(context: Context): List<Pair<String, String>> =
+        DiskCacheSetting.mpvOptions(context)
 }

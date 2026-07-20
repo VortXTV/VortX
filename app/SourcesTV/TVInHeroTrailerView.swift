@@ -22,7 +22,7 @@ import SwiftUI
 ///     mounts this view when a trailer exists, so reduced-motion / setting-off never starts a clip.
 ///   • Only LOOPBACK urls (the embedded node server) wait on an async server-reachability probe; remote
 ///     urls (the `/clip` resolver, a direct CDN stream) mount immediately, so the Lite build
-///     (`STREMIOX_NO_EMBEDDED_SERVER`) plays remote clips like any other target.
+///     (`VORTX_NO_EMBEDDED_SERVER`) plays remote clips like any other target.
 ///   • If libmpv reports a load failure (`endFileError`, e.g. ytdl extraction failed), the clip hides and
 ///     the still backdrop stays.
 ///
@@ -175,6 +175,7 @@ struct TVInHeroTrailerView: View {
     private func handleProperty(_ engine: any PlayerEngine, _ name: String, _ data: Any?) {
         switch name {
         case MPVProperty.timePos:
+            guard let event = data as? PlayerTimePositionEvent else { return }
             // First decoded time-pos means the clip really started; seek into the window (if any) and
             // arm the reveal beat exactly once.
             if !didStart {
@@ -185,7 +186,7 @@ struct TVInHeroTrailerView: View {
             }
             // Windowed mode: keep the snippet looping by re-seeking to the start once playback runs past
             // the window. A small guard band absorbs the time-pos event granularity so we never thrash.
-            if let window, let pos = data as? Double, pos >= window.start + window.length {
+            if let window, event.seconds >= window.start + window.length {
                 engine.seek(to: window.start)
             }
         case MPVProperty.endFileError:

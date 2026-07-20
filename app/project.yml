@@ -184,12 +184,12 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "181"
+        CURRENT_PROJECT_VERSION: "185"
         # Web-host target ONLY: this is the WKWebView app (ContentView/StremioWebView). The shared
         # NodeServer preload starts an 11471 reverse-proxy of web.stremio.com solely so that webview can
         # load the UI from a loopback origin. The native targets (VortXiOSNative, VortXTV) have no
         # webview, so this flag gates that proxy off there to shed footprint (issue #56, 2 GB Apple TV HD).
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_WEB_HOST"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_WEB_HOST"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -265,12 +265,36 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework, iOS slices), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # Phase 7 cutover slice 1: the vortx-core engine ABI (vortx-ffi staticlib xcframework;
+      # iOS device + simulator + macOS slices, built by vortx-core/scripts, kernel-only, with all
+      # non-vortx_* globals localized so it link-coexists with StremioXCore and Libdovi). Linked
+      # into THIS target only for now; it drives the flag-gated shadow ranking diff
+      # (SourcesShared/VortxBridge.swift). The live StreamRanking/CoreBridge path is untouched and
+      # the `vortxShadowRanking` default is OFF.
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        # VortxEngine module discovery. The vortx-ffi xcframework nests its header + module.modulemap
+        # under Headers/vortx/ (a flat Headers/ would collide with StremioXCore's module.modulemap in
+        # the shared Products/include/ copy step: "Multiple commands produce .../module.modulemap").
+        # Swift finds the nested module through this include path instead.
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # Phase 8 server slice: this target's VortxEngine ios-arm64 / ios-arm64-simulator slices are
+        # SERVER-INCLUSIVE (built by scripts/build-ffi-xcframework.sh with the ffi crate's `server`
+        # feature: vortx_server_start/port/base_url/stop). `canImport(VortxEngine)` cannot see
+        # symbols, only the module, so this condition is the per-target statement "the linked slice
+        # carries the server ABI"; SourcesShared/VortxNativeServer.swift compiles its real body
+        # under `canImport(VortxEngine) && VORTX_ENGINE_SERVER` and inert stubs elsewhere. Do NOT
+        # copy this to a target whose slice is kernel-only (an artifact from the script's
+        # --no-server fallback): it would fail at link. VortXTV carries it too now that the tvOS
+        # slices are server-inclusive (the engine's librqbit rust-tls swap unwalled the tier-3
+        # cross-compile).
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "181"
+        CURRENT_PROJECT_VERSION: "185"
         TARGETED_DEVICE_FAMILY: "1,2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
@@ -340,12 +364,25 @@ targets:
         name: Fetch node binary (macOS streaming server)
         outputFiles:
           - "$(SRCROOT)/Resources/node-darwin-arm64"
+    postBuildScripts:
+      # Embed the NATIVE Rust streaming server copy-if-present. The binary is a gitignored,
+      # script-produced artifact (app/Vendor/vortx-streaming-server, from ../scripts/
+      # build-mac-server.sh, which needs the engine checkout like the core xcframework build),
+      # so a checkout that never ran the script still builds and ships exactly the node path;
+      # MacNodeServer runs the binary only behind the vortxNativeServer flag (default OFF).
+      - script: |
+          if [ -f "${SRCROOT}/Vendor/vortx-streaming-server" ]; then
+            cp -f "${SRCROOT}/Vendor/vortx-streaming-server" "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/vortx-streaming-server"
+            chmod +x "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/vortx-streaming-server"
+          fi
+        name: Embed native streaming server (optional)
+        basedOnDependencyAnalysis: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "181"
+        CURRENT_PROJECT_VERSION: "185"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "YES"
         # Base plist (merged under the generated keys) carrying the ATS arbitrary-loads exception +
@@ -369,8 +406,20 @@ targets:
       path: VortXTV.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
+        # Shared container the app writes the Top Shelf snapshot into and the VortXTopShelf extension
+        # reads it back from (TopShelfSnapshot.appGroupID). The extension is a separate process with
+        # its own container, so this group is the ONLY channel between them. An unsigned build has no
+        # provisioned group: containerURL is then nil and the whole feature degrades to the static Top
+        # Shelf image (never a crash). Lite deliberately omits this (no extension in v1).
+        com.apple.security.application-groups:
+          - group.com.stremiox.tv
     sources:
-      - SourcesTV
+      # The Top Shelf extension's own source is EXCLUDED: it belongs to the VortXTopShelf target
+      # (below), and compiling a TVTopShelfContentProvider subclass into the app as well would put a
+      # second, unreachable principal class in the app binary.
+      - path: SourcesTV
+        excludes:
+          - TopShelfExtension/**
       - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
       - Sources/Player
       - Sources/NodeServer.swift
@@ -409,26 +458,97 @@ targets:
       # The Rust stremio-core engine (staticlib xcframework), linked, not embedded.
       - framework: Vendor/StremioXCore.xcframework
         embed: false
+      # Phase 8 tvOS: the vortx-core engine ABI, SERVER-INCLUSIVE tvos-arm64 / tvos-arm64-simulator
+      # slices (kernel + vortx_server_start/port/base_url/stop; the engine's librqbit rust-tls swap
+      # unwalled the tier-3 server cross-compile). Linked, not embedded, exactly like
+      # VortXiOSNative's iOS slices; all non-vortx_* globals are localized so it link-coexists with
+      # StremioXCore and Libdovi. Drives the flag-gated in-process engine server
+      # (SourcesShared/VortxNativeServer.swift); the `vortxNativeServer` default stays OFF, so
+      # nodejs-mobile keeps serving until the device-gated flip.
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
       # AVKit must be an explicit link: the only thing used from it is the
       # UIWindow.avDisplayManager CATEGORY (no link-time symbols), so autolink
       # plus the dead-stripping linker silently dropped the framework, the
       # category never loaded at runtime, and every avDisplayManager access
       # aborted with an unrecognized selector (sim AND device, 2026-06-10).
       - sdk: AVKit.framework
+      # Top Shelf extension, embedded into the app bundle (PlugIns/). tvOS loads it from there when
+      # VortX is the focused app on the Home screen.
+      - target: VortXTopShelf
+        embed: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        # VortxEngine module discovery, same as VortXiOSNative: the xcframework nests its header +
+        # module.modulemap under Headers/vortx/ (a flat Headers/ would collide with StremioXCore's
+        # module.modulemap in the shared Products/include/ copy step).
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # The linked tvOS VortxEngine slices are SERVER-INCLUSIVE, so this target compiles the REAL
+        # VortxNativeServer body (see the VortXiOSNative note for the two-layer gating). The
+        # `vortxNativeServer` @AppStorage flag stays default OFF (device-gated flip); with the
+        # condition set, the tvOS Settings toggle renders (VortxNativeServerFlag.isSupported).
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_ENGINE_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "181"
+        CURRENT_PROJECT_VERSION: "185"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES" # explicit UIScene adoption (tvOS 26 compliance)
         INFOPLIST_KEY_CFBundleDisplayName: VortX
+        # The app's own URL scheme, substituted into the shared ResourcesTV/Info-tvOS.plist
+        # (CFBundleURLTypes) and read back at runtime by TopShelfSnapshot.urlScheme. It is a per-target
+        # setting because VortX and VortX Lite can be installed side by side and two apps claiming one
+        # scheme leaves the OS's choice of handler undefined; Lite takes "vortx-lite" below.
+        VORTX_URL_SCHEME: vortx
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+  # tvOS Top Shelf extension: renders VortX's Continue Watching on the tvOS Home screen when VortX is
+  # focused. It runs in its OWN process, on the system's schedule, usually while the app is not
+  # running, so it cannot reach the engine or the app's UserDefaults. The app publishes a JSON
+  # snapshot into the shared App Group (group.com.stremiox.tv) and this target does nothing but read
+  # and render it, which is why its whole source list is two self-contained files.
+  #
+  # Embedded by VortXTV only. VortXTVLite is deliberately excluded in v1: Lite is the sideload-first
+  # build, and an embedded extension is a SECOND bundle id to provision on a free Apple ID. (Extending
+  # it to Lite later is this target duplicated with its own ids plus the app group on Lite.)
+  VortXTopShelf:
+    type: app-extension
+    platform: tvOS
+    entitlements:
+      path: VortXTopShelf.entitlements
+      properties:
+        # Must match the host app's group exactly, or the container the app writes is not the one this
+        # process reads and the shelf silently stays empty.
+        com.apple.security.application-groups:
+          - group.com.stremiox.tv
+    sources:
+      - path: SourcesTV/TopShelfExtension/ContentProvider.swift
+      # The wire contract, shared with the app. Foundation-only and self-contained on purpose, so the
+      # extension does NOT drag in CoreModels / the engine bridge. Same single-file pattern as the
+      # DiagnosticsLog / VXProbe / ServerDiagnostics includes on the web-host target above.
+      - path: SourcesShared/TopShelfSnapshot.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.topshelf
+        MARKETING_VERSION: "0.3.14"
+        CURRENT_PROJECT_VERSION: "185"
+        # BASE plist carrying the NSExtension dict (the extension point + principal class), which has no
+        # INFOPLIST_KEY_* equivalent and so cannot be expressed as build settings. Xcode merges its
+        # GENERATED keys on top, exactly as ResourcesTV/Info-tvOS.plist does for the app: that merge is
+        # what supplies CFBundleIdentifier / CFBundleVersion. Generating must stay ON, because an
+        # extension with no CFBundleIdentifier fails the parent app's embedded-binary validation with a
+        # (null) identifier.
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_FILE: SourcesTV/TopShelfExtension/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: VortX
+        # Substituted into the extension's plist so its deep links carry the SAME scheme the host app
+        # registers. Keep in step with VortXTV's VORTX_URL_SCHEME above.
+        VORTX_URL_SCHEME: vortx
+        CODE_SIGNING_ALLOWED: "YES"
+        CODE_SIGNING_REQUIRED: "NO"
   # Lite/debrid-only tvOS build. This omits NodeMobile and server.js entirely,
   # so the app cannot create or play torrents even if old preferences say otherwise.
   VortXTVLite:
@@ -438,8 +558,14 @@ targets:
       path: VortXTVLite.entitlements
       properties:
         com.apple.developer.kernel.increased-memory-limit: true
+        # NOTE: deliberately NO app-group here. Lite ships no Top Shelf extension in v1, so it needs no
+        # shared container; TopShelfSnapshot.containerURL is then nil on Lite and every publish is a
+        # silent no-op. Nothing else in the app changes.
     sources:
-      - SourcesTV
+      # Excluded for the same reason as VortXTV: the extension's source belongs to VortXTopShelf.
+      - path: SourcesTV
+        excludes:
+          - TopShelfExtension/**
       - SourcesShared # OS-agnostic layer: engine bridge, models, account, ranking, themes
       - Sources/Player
       - ResourcesTV/Assets.xcassets
@@ -480,14 +606,19 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) STREMIOX_NO_EMBEDDED_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
         MARKETING_VERSION: "0.3.14"
-        CURRENT_PROJECT_VERSION: "181"
+        CURRENT_PROJECT_VERSION: "185"
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_FILE: ResourcesTV/Info-tvOS.plist
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: VortX Lite
+        # Lite's OWN scheme: it shares Info-tvOS.plist with the Full build, so without a distinct value
+        # both apps would register "vortx" and a link's handler would be whichever the OS picked. Lite
+        # has no Top Shelf in v1, so nothing mints these links yet; registering its own scheme now is
+        # what keeps that collision from appearing the day Lite gets one.
+        VORTX_URL_SCHEME: vortx-lite
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).

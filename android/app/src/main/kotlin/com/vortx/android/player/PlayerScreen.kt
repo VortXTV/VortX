@@ -1,11 +1,31 @@
 package com.vortx.android.player
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.os.SystemClock
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -14,17 +34,44 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import com.vortx.android.VortXApplication
+import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Playable
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.skip.SegmentResolver
+import com.vortx.android.skip.SkipSegment
+import com.vortx.android.skip.SkipTimestampService
+import com.vortx.android.trickplay.TrickplaySession
+import com.vortx.android.ui.theme.vortxGlassProminent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -60,35 +107,177 @@ fun PlayerScreen(
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
     /// to [onBack] (return to the detail page, which shows the sources).
     onError: () -> Unit = onBack,
+    /// Called once when playback reaches the natural END of the stream (never for a user back-out).
+    /// Defaults to [onBack] so a host without an auto-advance flow keeps the old exit-to-detail
+    /// behavior; the phone shell wires it to the series Up Next auto-advance instead.
+    onEnded: () -> Unit = onBack,
+    /// Called ONCE when the live source is judged BAD -- the engine's own hasError, the stall
+    /// watchdog, or the runtime-mismatch verdict below (a file implausibly shorter than the title's
+    /// expected runtime, e.g. a ~10s junk file standing in for a removed episode). The host is
+    /// expected to auto-retry the next ranked source (the phone shell's bad-source ladder) WITHOUT
+    /// bouncing the viewer out. Null (the default) keeps the pre-existing behavior exactly: the
+    /// error overlay with its manual "Choose another source" action (the TV shell today).
+    onSourceFailed: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    // The hosting Activity + AudioManager, resolved once: the gesture layer (window brightness,
+    // stream volume), the audio-focus request, and PiP all hang off these two handles.
+    val hostActivity = remember(context) { context.findActivity() }
+    val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val currentOnBack by rememberUpdatedState(onBack)
     val currentOnProgress by rememberUpdatedState(onProgress)
     val currentOnError by rememberUpdatedState(onError)
+    val currentOnEnded by rememberUpdatedState(onEnded)
+    val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
     // current playback speed reflected in the speed control.
     var scaleMode by remember(playable.url) { mutableStateOf(VideoScaleMode.FIT) }
     var speed by remember(playable.url) { mutableStateOf(1.0f) }
 
+    // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
+    // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
+    // [CONTROLS_AUTO_HIDE_MS] of playback, re-shown (with the timer reset) by any interaction -- a tap on
+    // bare video toggles it, the double-tap seek re-shows it, every transport/track action re-arms it, and
+    // on TV any D-pad press while hidden re-reveals (consumed, so a blind press never fires an invisible
+    // control). The error overlay and the selection sheets are NOT gated (see PlayerChrome).
+    var controlsVisible by remember(playable.url) { mutableStateOf(true) }
+    // Monotonic interaction counter: bumping it restarts the auto-hide countdown without toggling
+    // visibility (the timer effect keys on it).
+    var controlsInteractionTick by remember(playable.url) { mutableStateOf(0) }
+    fun showControls() {
+        controlsVisible = true
+        controlsInteractionTick++
+    }
+
+    // PLAYER LOCK (touch-lock). Engaged from the chrome's lock control: the chrome hides and every
+    // tap/double-tap/key is swallowed so nothing mid-film seeks or pauses by accident (handing the
+    // phone over, pocketing it, a sprawled thumb). The ONLY interactive surface while locked is a
+    // small glass "Tap to unlock" affordance that a bare tap reveals (auto-hidden again after
+    // [UNLOCK_HINT_AUTO_HIDE_MS]); unlocking restores the normal chrome. Hardware Back deliberately
+    // keeps meaning "leave the player": the lock guards against accidental TOUCH, and trapping the
+    // viewer inside a locked player would be worse than any accidental exit.
+    var controlsLocked by remember(playable.url) { mutableStateOf(false) }
+    var unlockHintVisible by remember(playable.url) { mutableStateOf(false) }
+    var unlockHintTick by remember(playable.url) { mutableStateOf(0) }
+    fun revealUnlockHint() {
+        unlockHintVisible = true
+        unlockHintTick++
+    }
+
     // Force-to-ExoPlayer latch: flipped when the mpv engine reports a surface failure, so the remember
     // key changes and the engine is rebuilt on ExoPlayer. Keyed alongside the playable url so a new
     // stream starts fresh.
     var forceExoPlayer by remember(playable.url) { mutableStateOf(false) }
 
-    // Build the engine via the router. Rebuilt when the stream changes or the ExoPlayer latch flips.
-    // Release the previous engine on dispose (idempotent).
-    val engine = remember(playable.url, forceExoPlayer) {
-        if (forceExoPlayer) {
-            ExoPlayerEngine(context)
+    // ENGINE, built OFF the composition thread. The old `remember { ... .also { it.load() } }` ran the
+    // whole build synchronously in composition: for the libmpv route that is System.loadLibrary +
+    // native context create + mpv_initialize + the full option apply on the MAIN thread -- jank (and an
+    // ANR window) at every open. Now the route is decided first (pure logic), and:
+    //   - the mpv route builds + loads on a background dispatcher (the mpv handle is thread-safe by
+    //     contract; its callbacks already arrive on native worker threads);
+    //   - the ExoPlayer route stays on the main thread, REQUIRED: Media3 binds the player to the
+    //     constructing thread's looper and throws on cross-thread access, and Exo's own build is light.
+    // Until the engine lands, the composition shows the connecting state below (the same spinner the
+    // chrome shows pre-first-frame), never a dead black frame.
+    //
+    // Ownership is race-free via [engineHolder]: the built engine is set inside the build block (no
+    // suspension point between create and set), and every release path -- the keyed dispose below, the
+    // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
+    // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
+    val engineHolder = remember(playable.url, forceExoPlayer) { AtomicReference<PlayerEngine?>(null) }
+    var builtEngine by remember(playable.url, forceExoPlayer) { mutableStateOf<PlayerEngine?>(null) }
+    LaunchedEffect(playable.url, forceExoPlayer) {
+        val wantsMpv = !forceExoPlayer &&
+            PlayerEngineRouter.choose(playable, engineOverride) == PlayerEngineRouter.Engine.MPV
+        val engine: PlayerEngine = if (wantsMpv) {
+            // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
+            // (cancellation would leak it un-releasable); the block always completes, and the isActive
+            // check below hands a build that lost its composition straight to release.
+            withContext(Dispatchers.Default + NonCancellable) {
+                MpvEngineFactory.create(context)?.also {
+                    engineHolder.set(it)
+                    it.load(playable)
+                }
+            } ?: ExoPlayerEngine(context).also {
+                // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
+                engineHolder.set(it)
+                it.load(playable)
+            }
         } else {
-            PlayerEngineRouter.engine(context, playable, engineOverride)
-        }.also { it.load(playable) }
+            ExoPlayerEngine(context).also {
+                engineHolder.set(it)
+                it.load(playable)
+            }
+        }
+        if (!isActive) {
+            // The player left composition while the engine was still initializing; the dispose below
+            // may already have run (and found the holder empty), so this tail owns the release.
+            engineHolder.getAndSet(null)?.release()
+            return@LaunchedEffect
+        }
+        builtEngine = engine
+    }
+    DisposableEffect(playable.url, forceExoPlayer) {
+        onDispose { engineHolder.getAndSet(null)?.release() }
     }
 
-    DisposableEffect(engine) {
-        onDispose { engine.release() }
+    // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
+    // landscape on the hosting Activity while this screen is in composition, and restore the PRIOR
+    // request on exit so the browse shell keeps its own orientation freedom (the player is the ONLY
+    // surface locked; the app is not). The manifest's configChanges=orientation|screenSize means this
+    // flip resizes the surface in place instead of recreating the Activity, so the engine survives the
+    // rotation. Alongside it, hide the system bars (swipe reveals them transiently) for a true
+    // fullscreen frame, restored on exit. On Android TV both calls are harmless no-ops (the panel is
+    // already landscape and TVs show no bars). Keyed on Unit: enter/exit of the player, not per engine.
+    DisposableEffect(Unit) {
+        val activity = context.findActivity()
+        val previousOrientation = activity?.requestedOrientation
+            ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        val insetsController = activity?.window?.let { w ->
+            WindowInsetsControllerCompat(w, w.decorView).apply {
+                systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                hide(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+        onDispose {
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+            activity?.requestedOrientation = previousOrientation
+            // The brightness gesture only ever overrides the WINDOW level; hand the window back to
+            // the system setting so the browse shell never inherits a mid-film dimming.
+            clearWindowBrightness(activity)
+        }
+    }
+
+    // Engine still initializing (the off-main build above): hold the fullscreen frame with the same
+    // centered spinner + "Connecting" the chrome shows pre-first-frame, so the open is one continuous
+    // loading state instead of a blank flash. Hardware/gesture Back still works (the host's BackHandler
+    // wraps this screen). Deliberately AFTER the orientation/immersive effect so the connecting frame is
+    // already landscape + edge-to-edge.
+    val engine = builtEngine
+    if (engine == null) {
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
+                Text(
+                    text = "Connecting...",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        return
     }
 
     // Drive the engine against the host lifecycle: drop decode / pause when backgrounded, resume when it
@@ -98,7 +287,9 @@ fun PlayerScreen(
             when (event) {
                 Lifecycle.Event.ON_STOP -> engine.onEnterBackground()
                 Lifecycle.Event.ON_START -> engine.onEnterForeground()
-                Lifecycle.Event.ON_DESTROY -> engine.release()
+                // Release through the holder's single atomic claim, so a destroy-then-dispose pair can
+                // never double-release the same native engine.
+                Lifecycle.Event.ON_DESTROY -> engineHolder.getAndSet(null)?.release()
                 else -> Unit
             }
         }
@@ -109,9 +300,307 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
-    // When playback ends, hand control back to the detail page.
+    // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
+    // that connects but never delivers (or stops delivering) data: mpv's `paused-for-cache` can sit
+    // true forever with no error event, which used to mean an infinite silent black frame. This loop
+    // samples the transport once a second and trips [stallError] -- rendered through the chrome as the
+    // SAME error overlay + retry path the engines' own hasError drives -- when either bound passes with
+    // no position advance:
+    //   - [WATCHDOG_START_TIMEOUT_MS] before playback ever advanced (the source never produced data);
+    //   - the tighter [WATCHDOG_STALL_TIMEOUT_MS] once it had (a mid-stream stall that never recovers).
+    // A user pause resets the clock (holding position is then intent, not failure), a terminal
+    // error/ended state suspends it, and any position advance both re-arms the clock AND clears a
+    // previously tripped verdict, so a stream that recovers on its own heals back to normal playback.
+    var stallError by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(engine, playable.url) {
+        var lastPositionMs = -1L
+        var lastProgressAt = SystemClock.elapsedRealtime()
+        var everAdvanced = false
+        while (true) {
+            delay(WATCHDOG_POLL_MS)
+            val s = latestState
+            val now = SystemClock.elapsedRealtime()
+            if (s.hasError || s.hasEnded || s.isPaused) {
+                lastProgressAt = now
+                continue
+            }
+            if (s.positionMs != lastPositionMs) {
+                // First sample just seeds the baseline; only a CHANGE from a real prior sample proves
+                // data flowed (so a resume-seek jump does not count as playback by itself).
+                if (lastPositionMs >= 0L) everAdvanced = true
+                lastPositionMs = s.positionMs
+                lastProgressAt = now
+                if (stallError) stallError = false
+                continue
+            }
+            val bound = if (everAdvanced) WATCHDOG_STALL_TIMEOUT_MS else WATCHDOG_START_TIMEOUT_MS
+            if (now - lastProgressAt >= bound) stallError = true
+        }
+    }
+    // RUNTIME-MISMATCH = BAD SOURCE (the trust fix). "The file ended" must not mean "the episode was
+    // watched": a removed/not-in-debrid episode often resolves to a ~10s junk/sample file that plays
+    // cleanly to EOF, which used to mark the episode watched and auto-advance past it. The ground
+    // truth is [Playable.expectedDurationMs] (the catalog metadata runtime, attached at resolve
+    // time); the file's own demuxed duration is compared against it via [isJunkDuration]:
+    //   - EARLY: the moment the engine reports a real duration (available once demuxed, well before
+    //     the junk finishes playing), an implausibly short file is condemned on the spot -- the 10s
+    //     ideally never really plays. The engine is paused so the junk can't keep rolling (and can't
+    //     reach EOF) while the host swaps sources.
+    //   - EOF BACKSTOP: inside the ended dispatch below -- an EOF whose playhead sits far below the
+    //     expected runtime (a file that LIED about its duration, then ended early) is the same
+    //     verdict, applied before the ended signal can reach the host.
+    // With NO expected runtime (ad-hoc plays, downloads, live) the check falls back to a conservative
+    // absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS]. Trailers are exempt
+    // (short by design), and a live stream never reports a positive duration, so neither can trip it.
+    // The verdict is terminal for this file by construction (metadata and the demuxed length cannot
+    // change), so unlike [stallError] it never self-clears. A [Playable.userForcedSource] play (the
+    // viewer's own pick off the manual fallback) is exempt from the VERDICT -- their warned, explicit
+    // choice must play -- while the never-poison writeback gates below stay in force regardless.
+    var runtimeMismatch by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playerState.durationMs, playable.url) {
+        if (runtimeMismatch || playable.userForcedSource) return@LaunchedEffect
+        val fileMs = latestState.durationMs
+        if (fileMs <= 0L) return@LaunchedEffect
+        if (isJunkDuration(fileMs, playable)) runtimeMismatch = true
+    }
+    // Stop the condemned file immediately: pausing keeps it from playing (or EOF-ing) under the
+    // error surface while the host's retry ladder resolves the next source. Only the mismatch pauses
+    // here -- an engine error is already dead, and a stall verdict may still self-heal (see the
+    // watchdog above), so neither is touched (the #76 semantics stay exactly as they were).
+    LaunchedEffect(runtimeMismatch) {
+        if (runtimeMismatch) runCatching { engine.pause() }
+    }
+
+    // The one error verdict everything downstream renders and gates on: the engine's own hasError OR
+    // the watchdog's stall verdict OR the runtime-mismatch verdict.
+    val effectiveError = playerState.hasError || stallError || runtimeMismatch
+
+    // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
+    // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
+    // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
+    // every touch surface below can vacate the tiny window. Home-press entry is auto-enter on S+
+    // and MainActivity's onUserLeaveHint -> PlayerPipBridge on 26-30; the chrome's PiP button is
+    // the explicit entry. Fail-soft: an unsupported device/host yields supported=false and the
+    // player renders exactly as before.
+    val pip = rememberPlayerPip(
+        engine = engine,
+        isActivelyPlaying = !playerState.isPaused && !playerState.hasEnded && !effectiveError,
+        isPaused = playerState.isPaused,
+        durationKnown = playerState.durationMs > 0L,
+    )
+    // Crossing the PiP boundary: entering drops the chrome + any live gesture HUD (dead pixels in
+    // the small window); expanding back restores the controls so the viewer lands oriented.
+    var gestureHud by remember(playable.url) { mutableStateOf<PlayerGestureHud?>(null) }
+    LaunchedEffect(pip.isInPip) {
+        if (pip.isInPip) {
+            controlsVisible = false
+            gestureHud = null
+        } else {
+            showControls()
+        }
+    }
+
+    // System MediaSession over the live engine: headset/Bluetooth transport, the Android TV
+    // now-playing row, assistant play/pause. Scoped to this composition (no background playback
+    // exists to outlive it); rebuilt with the engine on a mid-session ExoPlayer fallback.
+    PlayerMediaSessionEffect(engine = engine, playable = playable, speed = speed)
+
+    // BAD-SOURCE DISPATCH: hand the verdict to the host's auto-retry ladder exactly once per source.
+    // Every bad-source class funnels through here -- a dead link (hasError), a silent stall
+    // (stallError), a wrong/junk file (runtimeMismatch) -- so the ladder is the single recovery
+    // path. With no [onSourceFailed] wired (the TV shell) this is inert and the chrome's error
+    // overlay + manual "Choose another source" behavior is byte-identical to before.
+    var sourceFailureDispatched by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(effectiveError) {
+        if (!effectiveError || sourceFailureDispatched) return@LaunchedEffect
+        val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
+        sourceFailureDispatched = true
+        dispatch()
+    }
+
+    // The auto-hide countdown: runs only while the controls are up and playback is actually rolling.
+    // Paused, buffering, or errored playback keeps the controls on screen (hiding them over a stall or a
+    // dead frame would look like a hang); any state flip or interaction tick restarts the countdown.
+    LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, effectiveError) {
+        if (!controlsVisible || playerState.isPaused || playerState.isBuffering || effectiveError) return@LaunchedEffect
+        delay(CONTROLS_AUTO_HIDE_MS)
+        controlsVisible = false
+    }
+
+    // The unlock affordance's own auto-hide: while locked, the small "Tap to unlock" pill stays up a
+    // couple of seconds after each reveal (any tap/key re-reveals + re-arms via [unlockHintTick]),
+    // then drops back to clean full-screen video.
+    LaunchedEffect(controlsLocked, unlockHintVisible, unlockHintTick) {
+        if (!controlsLocked || !unlockHintVisible) return@LaunchedEffect
+        delay(UNLOCK_HINT_AUTO_HIDE_MS)
+        unlockHintVisible = false
+    }
+
+    // ADD-ON SUBTITLES (the Android port of Apple SubtitleAddons.swift:37 `installedSources` +
+    // :54 `fetch`): once per load, union the installed subtitle-capable add-ons (minus any the
+    // active profile turned off) and fetch their external tracks for THIS title, keyed by the
+    // playable's imdb identity. Fail-soft at every step -- a trailer, an id-less playable, no
+    // subtitle add-ons installed, or a flaky add-on simply leaves the sheet's add-on section empty.
+    // The results list in the chrome's subtitle sheet under the embedded tracks; picking one mounts
+    // it on the live engine (mpv `sub-add` / the ExoPlayer side-loaded track rebuild) and
+    // auto-selects it once the engine reports the grown track list.
+    var addonSubtitles by remember(playable.url) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
+    val mountedAddonSubs = remember(playable.url) { mutableSetOf<String>() }
+    var pendingSubSelectAbove by remember(playable.url) { mutableStateOf<Int?>(null) }
+    LaunchedEffect(playable.url) {
+        if (playable.isTrailer) return@LaunchedEffect
+        val ref = playable.mediaRef ?: return@LaunchedEffect
+        val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
+        val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+        val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
+        if (sources.isEmpty()) return@LaunchedEffect
+        addonSubtitles = SubtitleAddonService.fetch(sources, type, videoId)
+    }
+    // A picked add-on subtitle has mounted when the engine's subtitle list grows past its pre-mount
+    // count; select the newly appended track (mpv appends on `sub-add`, the ExoPlayer rebuild
+    // appends the side-loaded config last). Idempotent on mpv, whose `sub-add` default flag already
+    // selects the new track.
+    LaunchedEffect(playerState.subtitleTracks) {
+        val preMountCount = pendingSubSelectAbove ?: return@LaunchedEffect
+        val tracks = latestState.subtitleTracks
+        if (tracks.size > preMountCount) {
+            tracks.lastOrNull()?.let { engine.selectSubtitleTrack(it.id) }
+            pendingSubSelectAbove = null
+        }
+    }
+
+    // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
+    // reports its track list, pick the audio + subtitle track per the persisted TrackPreferences, exactly
+    // ONCE per load. This closes the "manual select only" parity gap. A nil audio pick leaves the engine's
+    // own default; a -1 subtitle pick means "off". Runs after the engine's own default selection, so it
+    // overrides toward the user's language chain (e.g. a Turkish-only preference beats a French dub, #76).
+    val trackPreferences = remember(playable.url) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
+    }
+    var autoSelectDone by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playable.url, playerState.audioTracks, playerState.subtitleTracks) {
+        if (autoSelectDone) return@LaunchedEffect
+        val audioTracks = latestState.audioTracks
+        val subtitleTracks = latestState.subtitleTracks
+        if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
+        val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences)
+        pick.audioId?.let { engine.selectAudioTrack(it) }
+        val subId = pick.subtitleId
+        if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
+        autoSelectDone = true
+    }
+
+    // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
+    // SubtitleView style). The mpv engine also applies it pre-init; this covers the ExoPlayer path and any
+    // future live Settings change once the player-settings screen lands (Round 6).
+    LaunchedEffect(engine) { engine.applySubtitleStyle() }
+
+    // Skip segments (intro / recap / credits) for this title, fetched ONCE the engine reports a real
+    // duration (the crowd providers are keyed + clamped by runtime). Fail-soft: no [Playable.mediaRef]
+    // (an unmappable id / the offline preview), a title with no crowd data, or a flaky edge simply leaves
+    // an empty list and no skip button ever shows. Mirrors the Apple player's skip gate, which loads
+    // SkipTimestampService.candidates once it has the imdb id + duration and resolves them through
+    // SegmentResolver. This is the READ side; the in-player submit editor (SkipDBClient) is a later round.
+    var skipSegments by remember(playable.url) { mutableStateOf<List<SkipSegment>>(emptyList()) }
+    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
+        val ref = playable.mediaRef
+        val imdb = ref?.imdb
+        val durationMs = latestState.durationMs
+        if (imdb.isNullOrEmpty() || durationMs <= 0L) return@LaunchedEffect
+        SkipTimestampService.init(context.applicationContext)
+        val durationSec = durationMs / 1000.0
+        val candidates = SkipTimestampService.candidates(
+            metaId = imdb,
+            season = ref.season,
+            episode = ref.episode,
+            durationSeconds = durationSec,
+        )
+        skipSegments = SegmentResolver.resolve(candidates, durationSec)
+    }
+
+    // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
+    //   1. KEY + FETCH  -- below, once the engine reports a real duration.
+    //   2. CAPTURE      -- the wall-clock driver further down.
+    //   3. SERVE        -- [previewAt] handed to the chrome's scrubber.
+    // The session owns its own scope (it must outlive this composition to flush on exit), so it is only
+    // remembered here, never scoped to the composition.
+    val trickplay = remember(playable.url) { TrickplaySession(context) }
+
+    // KEY + FETCH. Gated on a real reported duration because the content key is
+    // sha1(imdb:season:episode:durationBucket) -- keying on 0 would compute the WRONG key and index a
+    // different pool row. This is the same `durationMs > 0` gate the skip-segment fetch above uses, so it
+    // is the established contract for "the engine now knows the title's real length".
+    //
+    // [TrickplaySession.configure] is idempotent and does the tmdb->imdb resolve itself: a hub/TMDB-catalog
+    // play arrives with mediaRef.imdb == null and only a numeric tmdb id, and a tt-only content key would
+    // silently drop it (the known past root cause of an account that contributed nothing from any device).
+    LaunchedEffect(playable.url, playerState.durationMs > 0L) {
+        val durationMs = latestState.durationMs
+        // A junk-length file must never key (or feed) the SHARED community pool: its duration bucket
+        // is the wrong file's, not the episode's. Same never-poison rule as the progress writes.
+        if (durationMs <= 0L || isJunkDuration(durationMs, playable)) return@LaunchedEffect
+        trickplay.configure(playable.mediaRef, durationMs / 1000.0)
+    }
+
+    // CAPTURE. A wall-clock driver, deliberately NOT a position-delta driver: Apple runs both (a timePos
+    // handler plus a timer) because a 4K/HDR debrid stream can coalesce or never emit position ticks, and
+    // the timer is the one that always fires. Android's [PlayerState] republishes position ~1s on both
+    // engines, but the timer is still the robust choice and needs no second code path.
+    //
+    // Gates mirror Apple's `maybeCaptureLocalTrickplay`: never grab while paused or buffering (a stalled
+    // frame is a duplicate at best, an unrendered black frame at worst), and never before a real duration
+    // (the session is not keyed yet, so the frame would be buffered against no title and thrown away).
+    // A null return is the normal, expected outcome on the ExoPlayer engine, which cannot read back a
+    // SurfaceView without breaking Dolby Vision -- see [PlayerEngine.captureFrameJpeg].
+    LaunchedEffect(engine, playable.url) {
+        while (true) {
+            delay((TrickplaySession.CAPTURE_INTERVAL_S * 1000).toLong())
+            val s = latestState
+            // The runtimeMismatch gate keeps a condemned file's frames out of the shared pool (the
+            // configure above already refused to key the session on a junk duration).
+            if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch) continue
+            val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
+            // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank
+            // it with the frame. Doing it at teardown instead would mean a JNI property read against an
+            // engine that may already be released, which is a native crash, not a catchable one.
+            trickplay.recordFrame(jpeg, s.positionMs / 1000.0, videoHeightOf(engine))
+        }
+    }
+
+    // TEARDOWN FLUSH. The session pushes progressively during playback (Apple learned that a teardown may
+    // never fire: the title ends, the device sleeps, auto-advance takes over, or the process is killed), so
+    // this is the backstop that sends the final, fullest set. It survives this composition because the
+    // session owns a SupervisorJob scope rather than a remembered one, and it deliberately touches only
+    // session state, never the engine that is being released alongside it.
+    DisposableEffect(playable.url) {
+        onDispose { trickplay.finishAndFlush() }
+    }
+
+    // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
+    // Next auto-advance for a series episode with a successor, or a plain return to the detail page
+    // otherwise ([onEnded] defaults to [onBack]). GATED on ended-and-not-errored: a failed source must
+    // surface the error overlay, never fire the next-episode auto-advance (the audit's wrong-auto-
+    // advance defect). The mpv engine now keeps hasEnded/hasError mutually exclusive at the source;
+    // this is the belt-and-suspenders at the dispatch seam, and it also covers the watchdog's verdict.
+    //
+    // EOF BACKSTOP (the runtime-mismatch second gate): only a GENUINE completion -- the playhead got
+    // through most of the expected runtime -- may reach [onEnded]. An EOF whose playhead sits
+    // implausibly short of the expected runtime means the FILE was wrong even though its duration
+    // header looked sane (or was never judged), so it is converted into the runtime-mismatch verdict
+    // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
+    // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
+    // auto-advance, whichever engine reported the EOF.
     LaunchedEffect(playerState.hasEnded) {
-        if (playerState.hasEnded) currentOnBack()
+        val s = latestState
+        if (!playerState.hasEnded || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        // A userForcedSource play skips the conversion (the viewer chose this exact file off the
+        // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
+        // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
+        if (!playable.userForcedSource && isJunkEof(s.positionMs, s.durationMs, playable)) {
+            runtimeMismatch = true
+            return@LaunchedEffect
+        }
+        currentOnEnded()
     }
 
     // Fail-soft watchdog: if the mpv engine flagged a surface-attach failure, rebuild on ExoPlayer. Only
@@ -124,33 +613,99 @@ fun PlayerScreen(
     // Periodic progress writeback while playing, so Continue Watching updates live. The engine's state
     // position advances ~1s on both engines (mpv's time-pos observer, ExoPlayer's position ticker), so a
     // throttled read here is accurate; the host debounces the engine dispatch.
+    //
+    // NEVER-POISON GATE: a junk-length file must not attribute progress to the real episode -- a tick
+    // of (pos~=10s, dur~=10s) reads as a NEAR-END ratio and the repo's end-of-session write would mark
+    // the episode WATCHED off it. Gated on the [runtimeMismatch] verdict AND the synchronous
+    // [isJunkDuration] read of the same snapshot, so even the first tick after the duration lands can
+    // never race the verdict state and slip a poisoned ratio through. A genuine mid-play error is NOT
+    // gated (a real 30-minute watch that then dies still deserves its resume point).
     LaunchedEffect(engine) {
         while (true) {
             delay(PROGRESS_REPORT_MS)
             val s = latestState
-            if (!s.isPaused && s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+                currentOnProgress(s.positionMs, s.durationMs)
+            }
         }
     }
 
     // Save-on-exit: emit the freshest position when the player leaves composition, so the host's
-    // end-of-session write records where the viewer actually stopped.
+    // end-of-session write records where the viewer actually stopped. Same never-poison gate as the
+    // periodic tick above: a condemned file's final (pos, dur) pair is the exact write that used to
+    // mark a 10-second junk file watched, so it is dropped entirely.
     DisposableEffect(engine) {
         onDispose {
             val s = latestState
-            if (s.durationMs > 0L) currentOnProgress(s.positionMs, s.durationMs)
+            if (s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, playable)) {
+                currentOnProgress(s.positionMs, s.durationMs)
+            }
+        }
+    }
+
+    // External progress sync (Trakt / SIMKL). Drives scrobble at the play / pause / stop transitions off
+    // the engine's live [PlayerState], through [ScrobbleService] which fans out to every connected
+    // provider (Trakt live scrobble; SIMKL watched-on-finish). A [Playable] with no [Playable.mediaRef]
+    // (the offline preview, an unmappable id) never scrobbles. [ScrobbleService]'s ops are fire-and-forget
+    // on its own scope, so nothing here blocks playback and the stop still completes after this leaves
+    // composition. See com.vortx.android.integrations.ScrobbleService.
+    val scrobbleRef = playable.mediaRef
+    // Latch the started/paused transitions so a play sends exactly one `start`, a resume sends one `start`,
+    // and a pause sends one `pause`, rather than a scrobble on every recomposition.
+    var scrobbleStarted by remember(playable.url) { mutableStateOf(false) }
+    var scrobblePauseSent by remember(playable.url) { mutableStateOf(false) }
+    LaunchedEffect(playerState.isPaused, playerState.durationMs > 0L, playerState.hasEnded) {
+        val ref = scrobbleRef ?: return@LaunchedEffect
+        // Never start scrobbling a condemned junk file (the mismatch verdict lands with the duration
+        // report, before or alongside the first possible start here).
+        if (runtimeMismatch) return@LaunchedEffect
+        ScrobbleService.init(context.applicationContext)
+        val s = latestState
+        if (s.durationMs <= 0L || s.hasEnded || isJunkDuration(s.durationMs, playable)) return@LaunchedEffect
+        val progress = s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
+        if (!s.isPaused) {
+            // First play, or a resume: Trakt uses `start` for both.
+            ScrobbleService.start(ref, progress)
+            scrobbleStarted = true
+            scrobblePauseSent = false
+        } else if (scrobbleStarted && !scrobblePauseSent) {
+            ScrobbleService.pause(ref, progress)
+            scrobblePauseSent = true
+        }
+    }
+    DisposableEffect(playable.url) {
+        onDispose {
+            val ref = scrobbleRef
+            if (ref != null && scrobbleStarted) {
+                val s = latestState
+                // NEVER-POISON GATE: a junk-length file's EOF ratio is ~100%, which Trakt records as
+                // WATCHED (>= 80%) and SIMKL writes to history. A condemned source therefore stops at
+                // 0% -- the session still closes cleanly server-side, but records nothing watched.
+                val junk = runtimeMismatch || isJunkDuration(s.durationMs, playable)
+                val progress = if (s.durationMs > 0L && !junk) {
+                    s.positionMs.toDouble() / s.durationMs.toDouble() * 100.0
+                } else {
+                    0.0
+                }
+                // Stop records the watch server-side (Trakt at >= 80%, plus a SIMKL history write).
+                ScrobbleService.stop(ref, progress)
+            }
         }
     }
 
     // AudioFocus: pause when another app takes audio (a call, another player) so VortX never talks over
     // it, and resume on gain. Standard AudioManager focus request (minSdk 26 carries AudioFocusRequest).
+    // The pause/resume DECISION is [AudioFocusPolicy] (pure, unit-tested): it pauses on every loss
+    // class (transient included; ducking film dialog is worse than pausing it) but only ever
+    // auto-RESUMES playback the policy itself paused, so a GAIN can no longer un-pause a film the
+    // viewer had paused deliberately before the interruption.
     DisposableEffect(engine) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val focusPolicy = AudioFocusPolicy()
         val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-            when (change) {
-                AudioManager.AUDIOFOCUS_LOSS,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> engine.pause()
-                AudioManager.AUDIOFOCUS_GAIN -> engine.play()
+            when (focusPolicy.onFocusChange(change, latestState.isPaused)) {
+                AudioFocusPolicy.Action.PAUSE -> engine.pause()
+                AudioFocusPolicy.Action.RESUME -> engine.play()
+                AudioFocusPolicy.Action.NONE -> Unit
             }
         }
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -166,30 +721,307 @@ fun PlayerScreen(
         onDispose { audioManager?.abandonAudioFocusRequest(request) }
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    // TV re-reveal path: when the chrome hides, its focusable buttons leave composition and D-pad input
+    // would dead-end. Parking focus on the root box lets the next key press land in [onKeyEvent] below,
+    // which consumes it and re-shows the controls (Back/Escape excepted, so Back still exits the player).
+    val rootFocus = remember { FocusRequester() }
+    LaunchedEffect(controlsVisible) {
+        if (!controlsVisible) runCatching { rootFocus.requestFocus() }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .focusRequester(rootFocus)
+            .onKeyEvent { event ->
+                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                // MEDIA transport keys (TV remote play/pause/ffwd/rew, BT keyboards) drive the
+                // engine directly, before every other branch: a deliberate hardware transport press
+                // is never the accidental touch the lock guards, and a blind press while the chrome
+                // is hidden should ACT, not merely reveal. Consuming here also keeps the window
+                // authoritative over the MediaSession for these keys (the session only receives
+                // media keys the foreground window did not handle), so D-pad focus handling below
+                // and in the chrome is untouched by the session by construction.
+                when (event.key) {
+                    Key.MediaPlayPause -> {
+                        showControls()
+                        engine.togglePause()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaPlay -> {
+                        showControls()
+                        engine.play()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaPause -> {
+                        showControls()
+                        engine.pause()
+                        return@onKeyEvent true
+                    }
+                    Key.MediaFastForward -> {
+                        showControls()
+                        engine.seekBy(DOUBLE_TAP_SEEK_MS)
+                        return@onKeyEvent true
+                    }
+                    Key.MediaRewind -> {
+                        showControls()
+                        engine.seekBy(-DOUBLE_TAP_SEEK_MS)
+                        return@onKeyEvent true
+                    }
+                    else -> Unit
+                }
+                if (controlsLocked) {
+                    // Locked: swallow everything except Back/Escape (leaving the player must always
+                    // work). OK/Enter UNLOCKS, so a D-pad-only device (TV, or a phone with a remote)
+                    // can always get out of the lock without a touchscreen; any other key just
+                    // surfaces the unlock affordance so the press is not a dead end.
+                    if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
+                    if (event.key == Key.Enter || event.key == Key.NumPadEnter || event.key == Key.DirectionCenter) {
+                        controlsLocked = false
+                        unlockHintVisible = false
+                        showControls()
+                        return@onKeyEvent true
+                    }
+                    revealUnlockHint()
+                    return@onKeyEvent true
+                }
+                if (!controlsVisible) {
+                    // Back must keep meaning "leave the player", never be swallowed into a reveal.
+                    if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
+                    showControls()
+                    true
+                } else {
+                    // A key travelling through while the chrome is up (D-pad focus moves between the
+                    // buttons bubble up here unconsumed) counts as interaction: re-arm the hide timer.
+                    controlsInteractionTick++
+                    false
+                }
+            }
+            .focusable(),
+    ) {
         engine.VideoSurface(modifier = Modifier.fillMaxSize(), emberArgb = emberAccent.toArgb(), scaleMode = scaleMode)
+
+        // Tap layer: single tap toggles the chrome; double-tap seeks (right half = +10s, left half =
+        // -10s, the standard mobile-player gesture) and re-shows the chrome so the seek is visible.
+        // Layered OVER the video surface and UNDER the chrome, so the chrome's own controls keep their
+        // taps (they hit-test first) and only bare-video taps land here. Keyed on the engine so a
+        // mid-session ExoPlayer fallback rebinds the gesture to the live engine. A PiP window
+        // receives no app touch input, so both detectors stand down while [pip.isInPip].
+        //
+        // The SECOND pointerInput is the drag-gesture surface (PlayerGestures.kt): left-half
+        // vertical = window brightness, right-half vertical = media volume, horizontal = seek with a
+        // live target HUD, committed on release. The two detectors run in parallel on this one Box;
+        // the drag consuming its position changes is what makes the tap detector give up on drags,
+        // so a brightness swipe never also toggles the chrome. Drags are withheld while locked (the
+        // lock's whole point), in PiP, and under the error overlay (seeking a dead source from a
+        // half-visible gesture would fight the retry ladder).
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(engine, controlsLocked, pip.isInPip) {
+                    if (pip.isInPip) return@pointerInput
+                    if (controlsLocked) {
+                        // Locked: taps only reveal the unlock affordance; the double-tap seek is
+                        // deliberately absent so no gesture can move playback.
+                        detectTapGestures(onTap = { revealUnlockHint() })
+                    } else {
+                        detectTapGestures(
+                            onTap = {
+                                if (controlsVisible) controlsVisible = false else showControls()
+                            },
+                            onDoubleTap = { offset ->
+                                val forward = offset.x >= size.width / 2
+                                engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
+                                showControls()
+                            },
+                        )
+                    }
+                }
+                .pointerInput(engine, controlsLocked, pip.isInPip, effectiveError) {
+                    if (controlsLocked || pip.isInPip || effectiveError) return@pointerInput
+                    detectPlayerDragGestures(
+                        currentPositionMs = { latestState.positionMs },
+                        currentDurationMs = { latestState.durationMs },
+                        currentBrightness = { windowBrightnessFraction(hostActivity) },
+                        currentVolumeFraction = { streamVolumeFraction(audioManager) },
+                        onBrightness = { setWindowBrightnessFraction(hostActivity, it) },
+                        onVolumeFraction = { setStreamVolumeFraction(audioManager, it) },
+                        onSeekCommit = { target ->
+                            showControls()
+                            engine.seekTo(target)
+                        },
+                        onHud = { gestureHud = it },
+                    )
+                },
+        )
 
         PlayerChrome(
             playable = playable,
-            state = playerState,
+            // The watchdog's stall verdict and the runtime-mismatch verdict both ride the same
+            // hasError the engines publish, so the chrome has exactly one error surface (the overlay
+            // + "Choose another source" retry path). A mismatch additionally clears hasEnded: the
+            // junk file may genuinely have EOF'd, but presenting "ended" for a wrong file would be
+            // the exact lie this fix removes.
+            state = when {
+                runtimeMismatch -> playerState.copy(hasError = true, hasEnded = false)
+                stallError -> playerState.copy(hasError = true)
+                else -> playerState
+            },
             dolbyVisionAvailable = displaySupportsDolbyVision(context),
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
+            // Also withheld in PiP: the tiny window gets video only (the system draws the PiP
+            // controls; ours would be unreachable dead pixels under them).
+            controlsVisible = controlsVisible && !controlsLocked && !pip.isInPip,
+            // Continuous interactions the chrome owns internally (scrubber drags, sheet opens) re-arm
+            // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
+            onInteraction = { showControls() },
             onBack = currentOnBack,
-            onTogglePause = engine::togglePause,
-            onSeek = engine::seekTo,
-            onSelectAudio = engine::selectAudioTrack,
-            onSelectSubtitle = engine::selectSubtitleTrack,
+            onTogglePause = { showControls(); engine.togglePause() },
+            onSeek = { showControls(); engine.seekTo(it) },
+            onSeekBy = { showControls(); engine.seekBy(it) },
+            onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
+            onSelectSubtitle = { showControls(); engine.selectSubtitleTrack(it) },
             onSetSpeed = { newSpeed ->
+                showControls()
                 speed = newSpeed
                 engine.setPlaybackSpeed(newSpeed)
             },
             onToggleScaleMode = {
+                showControls()
                 scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
             },
             onErrorRetry = currentOnError,
+            // The explicit PiP entry (user action); null on devices/hosts that cannot PiP, which
+            // hides the control entirely. Home-press entry rides auto-enter / onUserLeaveHint.
+            onEnterPip = if (pip.supported) {
+                { pip.enter() }
+            } else {
+                null
+            },
+            onLock = {
+                controlsLocked = true
+                controlsVisible = false
+                // Show the unlock pill once on engage so the viewer learns where unlock lives.
+                revealUnlockHint()
+            },
+            addonSubtitles = addonSubtitles,
+            onSelectAddonSubtitle = { sub ->
+                showControls()
+                // Mount once per URL: a re-pick of an already-mounted subtitle would only duplicate
+                // the track (it is selectable from the embedded list above once mounted).
+                if (mountedAddonSubs.add(sub.url)) {
+                    pendingSubSelectAbove = latestState.subtitleTracks.size
+                    engine.addExternalSubtitle(sub.url)
+                }
+            },
+            // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
+            // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null
+            // until (or unless) this title has a community sheet, and the scrubber then simply shows no
+            // thumbnail, exactly as it does today.
+            scrubPreview = trickplay::previewAt,
             modifier = Modifier.fillMaxSize(),
+        )
+
+        // The Skip Intro / Skip Recap / Skip Credits affordance, drawn OVER the chrome (declared last) at
+        // the bottom-right, clear of the transport bar. Shows only while the playhead sits inside a
+        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
+        // scrubber does), so it works identically on libmpv and ExoPlayer.
+        // While locked, the skip affordance is withheld too: it is a tappable seek, exactly the class
+        // of accidental input the lock exists to prevent. Withheld in PiP for the same reason the
+        // chrome is: nothing in the small window is tappable by the app.
+        if (!controlsLocked && !pip.isInPip) {
+            SkipButton(
+                segments = skipSegments,
+                positionMs = playerState.positionMs,
+                emberAccent = emberAccent,
+                onSkip = engine::seekTo,
+            )
+        }
+
+        // The live gesture HUD (seek target / brightness / volume), centered over everything the
+        // drag concerns. Rendered only while a drag is in flight; [gestureHud] is cleared on
+        // release/cancel and on entering PiP.
+        PlayerGestureHudOverlay(hud = gestureHud, emberAccent = emberAccent)
+
+        // The lock's single interactive surface: a small glass pill, revealed by any tap/key while
+        // locked and auto-hidden again. Drawn LAST so it sits above the tap layer and is the one
+        // thing a finger can actually hit.
+        if (controlsLocked && unlockHintVisible && !pip.isInPip) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 24.dp)
+                    .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+                    .clickable {
+                        controlsLocked = false
+                        unlockHintVisible = false
+                        showControls()
+                    }
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Lock,
+                    contentDescription = "Unlock player controls",
+                    tint = Color.White,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = "Tap to unlock",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                )
+            }
+        }
+    }
+}
+
+/// The Skip Intro / Skip Recap / Skip Credits button. Renders only while the playhead is inside one of the
+/// resolved [segments]; a tap seeks to that segment's end (ms). Positioned bottom-right, above the
+/// transport bar, as ember glass matching the player's other badges. The active-segment recompute is keyed
+/// on the whole SECOND (not the raw ms position) so it re-derives at most once per second, not per frame.
+@Composable
+private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
+    segments: List<SkipSegment>,
+    positionMs: Long,
+    emberAccent: Color,
+    onSkip: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    if (segments.isEmpty()) return
+    val positionSec = positionMs / 1000.0
+    // At most one segment applies at a time after the resolver's clamps (intro/recap sit early, credits/
+    // preview in the back half); if two overlapped, the earliest-starting wins so "Skip Intro" beats a
+    // stray late span.
+    val active = remember(segments, positionSec.toLong()) {
+        segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
+    } ?: return
+
+    Row(
+        modifier = modifier
+            .align(Alignment.BottomEnd)
+            .padding(end = 20.dp, bottom = 96.dp)
+            .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+            .clickable { onSkip((active.end * 1000).toLong()) }
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Icon(
+            imageVector = Icons.Filled.SkipNext,
+            contentDescription = active.label,
+            tint = Color.White,
+            modifier = Modifier.size(18.dp),
+        )
+        Text(
+            text = active.label,
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 14.sp,
         )
     }
 }
@@ -205,7 +1037,102 @@ private fun mpvSurfaceFailed(engine: PlayerEngine): Boolean {
     }.getOrDefault(false)
 }
 
+/// The source video height tagged onto an uploaded community sheet (the Worker's `src_height` metadata,
+/// which lets it prefer a set built from a better source). Derived from the engine-agnostic
+/// [PlayerEngine.playbackStats] "Resolution" entry ("1920x1080"), which BOTH engines already publish, so
+/// this needs no new engine API. Returns 0 when unknown, which the Worker accepts; Apple passes its
+/// `videoHeight` here. Never throws: an absent or unparseable entry is simply 0.
+private fun videoHeightOf(engine: PlayerEngine): Int {
+    val resolution = runCatching { engine.playbackStats() }.getOrNull()
+        ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
+    return resolution.substringAfter('x', "").toIntOrNull() ?: 0
+}
+
+/// Resolve the hosting [Activity] from a Compose [LocalContext], which may be a [ContextWrapper] chain
+/// (theme wrappers, configuration overrides). Null when unhosted (previews/tests), and every caller
+/// treats null as "no orientation/insets control", never a crash. Internal (was private): the PiP
+/// wiring (PlayerPip.kt) and the session-activity resolve (PlayerMediaSession.kt) walk the same chain.
+internal tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+/// The double-tap relative-seek step (ms). Matches the transport bar's Replay10/Forward10 buttons.
+private const val DOUBLE_TAP_SEEK_MS = 10_000L
+
+/// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
+/// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.
+private const val CONTROLS_AUTO_HIDE_MS = 3_500L
+
+/// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
+/// chrome's auto-hide: while locked the whole point is an undisturbed frame.
+private const val UNLOCK_HINT_AUTO_HIDE_MS = 2_500L
+
+/// Watchdog sampling cadence: once a second, matching the ~1s position republish of both engines, so a
+/// healthy stream is seen advancing on every tick.
+private const val WATCHDOG_POLL_MS = 1_000L
+
+/// How long a source may take from load to the FIRST position advance before the watchdog calls it
+/// failed. Generous: a cold debrid link or a torrent warm-up legitimately takes many seconds to first
+/// data, but half a minute of nothing is a dead source, not a slow one.
+private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
+
+/// How long an already-playing stream may hold position (un-paused) before the watchdog calls it
+/// stalled. Tighter than the start bound: mid-stream the pipeline is proven, so a long freeze is a
+/// dead connection, and the verdict self-clears if the stream recovers.
+private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
+
+/// Whether the FILE's demuxed duration is implausibly short for the title being played, i.e. the
+/// source resolved to the WRONG file (a removed episode's ~10s debrid junk/sample). With a known
+/// expected runtime ([Playable.expectedDurationMs], from catalog metadata) the file is junk when it
+/// runs under `min(expected/2, expected - 10min)`: half-length catches a sample/clip against any
+/// feature runtime, while the 10-minute slack keeps a legitimately shorter cut of a short episode
+/// out of the verdict (for anything under ~20 minutes expected, the slack term shrinks the
+/// threshold toward zero, so only truly tiny files are condemned). With NO expected runtime the
+/// only safe signal is the absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS].
+/// Trailers are exempt (short by design); a non-positive duration is "not demuxed yet", never junk.
+private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
+    if (playable.isTrailer || fileDurationMs <= 0L) return false
+    val expectedMs = playable.expectedDurationMs
+    if (expectedMs > 0L) {
+        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
+        return fileDurationMs < threshold
+    }
+    return fileDurationMs < JUNK_DURATION_FLOOR_MS
+}
+
+/// The EOF-side twin of [isJunkDuration]: whether an END-of-file arrived with the playhead
+/// implausibly short of the expected runtime. Catches the file that LIED about its duration (a sane
+/// header, a 10-second payload): the early duration check passed, but the EOF position tells the
+/// truth. Judged on the playhead (never the claimed duration) because the playhead is where playback
+/// REALLY got to. With no expected runtime, an EOF under the absolute floor of BOTH playhead and
+/// claimed duration is junk (a genuinely short file watched to its end); anything longer is trusted.
+private fun isJunkEof(positionMs: Long, fileDurationMs: Long, playable: Playable): Boolean {
+    if (playable.isTrailer) return false
+    val expectedMs = playable.expectedDurationMs
+    if (expectedMs > 0L) {
+        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
+        return positionMs < threshold
+    }
+    return positionMs < JUNK_DURATION_FLOOR_MS && fileDurationMs < JUNK_DURATION_FLOOR_MS
+}
+
+/// Slack subtracted from the expected runtime for the mismatch threshold, so credit-less cuts,
+/// ad-padded metadata runtimes, and slightly-off catalog numbers never condemn a real file.
+private const val EXPECTED_RUNTIME_SLACK_MS = 10 * 60_000L
+
+/// Conservative absolute junk floor when NO expected runtime is known: no real episode or movie
+/// file is under 2 minutes, but plenty of legitimate short content sits just above it, so this only
+/// catches outright samples/stubs. (Trailers never reach the check at all.)
+private const val JUNK_DURATION_FLOOR_MS = 2 * 60_000L
+
 internal val DefaultEmber = Color(0xFFD97706)
+
+/// Tile width for a captured trickplay frame, in pixels. 480 == the `maxWidth` Apple passes on both of its
+/// capture paths. The sheet builder downscales again to its own 320x180 tile, so this is only the
+/// intermediate that keeps a 4K grab from being carried around at full size.
+private const val TRICKPLAY_TILE_MAX_WIDTH = 480
 
 /// Progress writeback cadence: report the live position to the host every few seconds while playing. The
 /// host debounces the actual engine dispatch, so this only needs to be frequent enough that a save-on-

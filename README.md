@@ -11,7 +11,7 @@
   <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/v/release/vortxtv/VortX?label=latest&color=4c8dff" alt="Latest release"></a>
   <a href="https://github.com/VortXTV/VortX/releases/latest"><img src="https://img.shields.io/github/downloads/vortxtv/VortX/total?color=4c8dff" alt="Downloads"></a>
   <a href="https://github.com/VortXTV/VortX/blob/main/LICENSE"><img src="https://img.shields.io/github/license/vortxtv/VortX?color=4c8dff" alt="License"></a>
-  <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS%20%C2%B7%20macOS-4c8dff" alt="Platforms">
+  <img src="https://img.shields.io/badge/platforms-tvOS%20%C2%B7%20iOS%20%C2%B7%20iPadOS%20%C2%B7%20macOS%20%C2%B7%20Android-4c8dff" alt="Platforms">
 </p>
 <p align="center">
   <a href="https://www.reddit.com/r/Vortx"><img src="https://github.com/user-attachments/assets/05eced3b-efeb-4238-83af-d3a105d3a8f1" width="26" height="26" alt="reddit"></a>
@@ -19,43 +19,42 @@
 
 # VortX
 
-VortX is the native streaming app for Apple TV, iPhone, iPad, and Mac, **formerly StremioX**. Fully native apps built on the stremio-core engine and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
+VortX is the native streaming app for Apple TV, iPhone, iPad, and Mac. Fully native apps built on a native Rust engine and the libmpv player, with no web wrapper. **Android is here too, in beta** (one build for phone and Android TV, as a sideload APK), alongside the four Apple apps, with desktop (Windows, Linux, Mac) and more on the way.
 
-> **StremioX is now VortX, as of v0.3.5.** The app takes its new name, gold-on-obsidian icon, and animated intro starting with this release. It is an in-place update, so your library, add-ons, watch history, and settings are exactly where you left them, signed into the same account. The repository and docs follow next, along with a website, a subreddit, and a Discord. A later update will move VortX to a fresh identity all the way down; when that lands your library and history still return on sign-in, but local settings could start fresh, which is why this release adds **Backup & Restore**.
+## New in the 0.3.14 line
 
-## New in the 0.3.13 line
+0.3.14 is the correctness line, and it carries the biggest Android release VortX has shipped, in one beta. On Apple, the headline is the end of wrong-episode playback: episode identity is now proven end to end, so the episode you pick is the one that plays, the one whose details you see, and the one your progress saves to, even when a season pack, a cached debrid source, or a fast episode switch used to confuse them. Around it, the field reports from Beta 3 are fixed (Continue Watching coming back empty on #149, add-on subtitles returning with an optional my-languages filter on #148, subtitles no longer stuck on Loading, and Dolby Vision holding instead of dropping to HDR10), and the last pre-glass Apple surfaces move onto the shared glass design. Earlier in the line came **Trakt and SIMKL** as first-class integrations, **Plex, Jellyfin, and Emby** servers as source and catalog providers, **bring-your-own Live TV** (M3U and Xtream with EPG), **Smart source selection**, an Apple TV **Top Shelf**, and **Match Frame Rate** for judder-free 24p, across the Apple apps.
 
-0.3.13 is the community release: its headline is a player reliability series contributed by [jbecker-it](https://github.com/jbecker-it), his second contribution and his biggest yet (the pause-shortly-after-start crash is gone, watch progress saves on streams that never report a length, heavy scrubbing can no longer lose your place, and audio stays clean after big seeks), plus a set of community-reported fixes: add-on HTTP and HLS streams now appear, removed add-ons no longer ghost the Home customize list, and the diagnostic log saves without a QR code. Recent lines also brought **true Dolby Vision from MKVs delivered as local HLS**, the **launch profile picker on iPhone, iPad, and Mac**, **Liquid Glass** on the floating controls, and a free, **end-to-end-encrypted VortX account** that syncs your profiles and settings across devices, with the server only ever holding ciphertext:
+And Android arrives in the same beta, as a sideload APK for phone and Android TV:
 
-- **A Collections hub** on Home and Discover: Discover cards (Trending, Popular, Latest, Upcoming), Streaming Services shown with their logos, and Genres, each tapping into a browse grid. Reorderable, and toggleable per screen.
-- **Native debrid playback**: a cached torrent on your Real-Debrid, TorBox, AllDebrid, or Premiumize account plays instantly straight from the cache, with more than one service checked at once.
-- **True Dolby Vision across all four Apple targets** (Apple TV, iPhone, iPad, Mac) through Apple's AVPlayer, with an automatic fallback to the built-in libmpv player. (#76)
-- **Offline downloads** with a queue, **budget and box office** on movies, **spoiler-blurred** unwatched episodes, **in-player AirPlay**, an in-player **skip-segment editor**, **community scrub previews**, and **upcoming-movie release dates**.
-- **Per-profile add-ons** with live **health checks**, **Kids Mode**, **in-app debrid keys**, one-tap **quality presets**, **regex source filters**, library **export and import**, **Import from Stremio**, **anime skip**, **40+ languages** with right-to-left layout, **in-app updates** via an AltStore / SideStore source, and full **profile management on the web dashboard**.
+- **VortX account sign-in with realtime profile sync**: your profiles, other members' watch overlays, and profile deletions sync live with your other devices, on the same account and encryption as everywhere else. Sign-in on the TV itself, plus library, settings, and API-key sync, are still being ported.
+- **An in-process torrent streaming server**, so raw torrent sources play directly on the same engine lane the Apple apps use. Phone and TV.
+- **A first Android TV experience**: a 10-foot leanback surface with Home, Detail, and playback, plus Discover, Library, Search, and Settings.
+- **Profiles** with per-profile watch isolation, **preference-driven source ranking**, **offline downloads** (phone and tablet), **IPTV playlists** (M3U and Xtream with an XMLTV guide), **Picture-in-Picture with gesture controls and system media integration** (phone), **1080p trailers and subtitle fetching**, and a long list of **player fixes**.
 
-Full detail is in [CHANGELOG.md](CHANGELOG.md).
+Detail for every platform is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Backup, restore, and sync
 
 Three layers, so your setup always follows you:
 
 - **Your account already syncs the big things.** Your library, add-ons, and watch history live with your Stremio account and come back on any device the moment you sign in. That is automatic and does not change.
-- **Backup & Restore covers what the account does not hold (new in this release).** Your profiles, theme, player preferences, source filters, and server settings are local to each device. On iPhone, iPad, and Mac, open **Settings > Backup & Restore > Create Backup** to save all of that to a single file. No passwords are included: your account token stays in the Keychain and is never written to the file. **Restore** reads it back, including into a fresh install or into VortX after the deeper move. Keep the file somewhere safe (Files, iCloud Drive, AirDrop to another device).
+- **Backup & Restore covers what the account does not hold.** Your profiles, theme, player preferences, source filters, and server settings are local to each device. On iPhone, iPad, and Mac, open **Settings > Backup & Restore > Create Backup** to save all of that to a single file. No passwords are included: your account token stays in the Keychain and is never written to the file. **Restore** reads it back, including into a fresh install or into VortX after the deeper move. Keep the file somewhere safe (Files, iCloud Drive, AirDrop to another device).
 - **Apple TV, and where sync is heading.** tvOS has no file access, so a scan-with-your-phone backup is on the way: **Backup** shows a QR code, you scan it with your phone and sign in to a VortX account, and your settings save there; **Restore** shows another code to pull them straight back. That same mechanism becomes **VortX cloud sync**, so in time even local profiles and preferences sync across all your devices, the one gap the Stremio account does not cover today. It is built to carry over unchanged when VortX moves to its own core and server.
 
 ## Why this exists
 
-Stremio is a great engine and a great protocol, and VortX is built on it. But the Apple apps fell behind. Stremio's Apple TV, iPhone, and iPad builds stopped getting updates and went stale while the platform moved on, and the Apple TV option stayed feature limited. Apple users, and Apple TV users especially, were left on an old build.
+Apple hardware deserves a modern, native, actively developed streaming app, and Apple TV especially had been left behind. The native options stopped getting updates and went stale while the platform moved on, and the Apple TV experience stayed feature limited. Apple users, and Apple TV users especially, were left on an old build.
 
-VortX picks that up and carries it forward. It is a modern, native, actively developed streaming app for Apple TV, iPhone, iPad, and Mac, built on stremio-core (the same Rust engine the official apps use) and a real libmpv player, with no web wrapper. The aim is simple: the best native experience on Apple hardware, and the foundation for the best one anywhere. It builds _on_ Stremio with respect; it is not affiliated with anyone, and it takes nothing away.
+VortX is that app. It is a modern, native, actively developed streaming app for Apple TV, iPhone, iPad, and Mac, built on a native Rust engine and a real libmpv player, with no web wrapper. The aim is simple: the best native experience on Apple hardware, and the foundation for the best one anywhere. It is an independent project, not affiliated with anyone.
 
-One thing worth being straight about: I didn't hand-write the code. Claude (Anthropic's AI) wrote all of it. My part was the direction and the grind. I ran every build on my own devices, signed into my own account, kept finding the parts that were broken or felt off, and sent it back to redo until it was genuinely good enough to use every day. So this is "an AI wrote it and a real person beat it into shape," not a one-shot generated repo. A small but growing group of community contributors has since pitched in too (see Credits).
+A small but growing group of community contributors has pitched in too (see Credits).
 
-## Two builds: Full and Lite
+## Two builds: VortX and VortX Lite
 
 The Apple TV release ships in two flavors. Pick one; they are the same app otherwise, and your account, profiles, and settings are identical between them.
 
-|                                                                                    | **VortX (Full)**                       | **VortX Lite**                                                   |
+|                                                                                    | **VortX**                              | **VortX Lite**                                                   |
 | ---------------------------------------------------------------------------------- | -------------------------------------- | ---------------------------------------------------------------- |
 | File                                                                               | `VortX-tvOS-x.y.z.ipa` (~48 MB)        | `VortX-tvOS-lite-x.y.z.ipa` (~31 MB)                             |
 | Torrents and magnets                                                               | Yes, via the embedded streaming server | No, cannot play them at all                                      |
@@ -65,7 +64,7 @@ The Apple TV release ships in two flavors. Pick one; they are the same app other
 
 **Why a Lite build exists.** When you play a torrent your device joins a peer-to-peer swarm, and your IP is visible to everyone in it. Debrid and direct links are ordinary HTTPS downloads with none of that exposure. If you only ever stream through a debrid service, the Lite build removes the torrent engine entirely, so there is no way to accidentally start a peer connection, and the app is smaller and starts faster.
 
-**You do not need the Lite build to get this safety.** The Full build has a **Direct Links Only** switch in Settings that hides every torrent and magnet source and keeps the engine off. The Lite build is simply that choice made permanent, for people who would rather the capability not be present at all.
+**You do not need the Lite build to get this safety.** VortX itself has a **Direct Links Only** switch in Settings that hides every torrent and magnet source and keeps the engine off. The Lite build is simply that choice made permanent, for people who would rather the capability not be present at all.
 
 ## What it looks like (Apple TV)
 
@@ -105,11 +104,11 @@ Add-ons you have installed are listed and removable right in the app.
 
 ## What you get
 
-Every Apple app is fully native and runs on stremio-core, the same Rust engine the official apps use, compiled straight in. There is no web wrapper anywhere: Apple TV, iPhone, iPad, and Mac are all the real engine, the real native UI, and the native libmpv player (MPVKit-GPL). Because the real engine does the work, your catalogs, library, and Continue Watching come out right instead of being stitched together by hand. Torrents stream through the embedded streaming server, which now ships on the Mac too.
+Every Apple app is fully native and runs on a native Rust engine, compiled straight in. There is no web wrapper anywhere: Apple TV, iPhone, iPad, and Mac are all the real engine, the real native UI, and the native libmpv player (MPVKit-GPL). Because the real engine does the work, your catalogs, library, and Continue Watching come out right instead of being stitched together by hand. Torrents stream through the embedded streaming server, which now ships on the Mac too.
 
 **Apple TV, iPhone, iPad, and Mac are at parity.** The cinematic detail page, ranked Watch Now with the two-level quality picker, per-add-on source grouping, an interactive auto-rotating featured hero with a muted in-hero trailer, full Settings, profiles, themes, subtitle styling, and **Live TV** are on every Apple device. Where a platform has a natural extra, it gets it: trailers play through the embedded server on Apple TV and an in-app player on iPhone, iPad, and Mac.
 
-**Desktop and Android are in active development** on the same shared engine: a native desktop app for Windows, Linux, and Mac (via Tauri, with its own embedded torrent server), and an Android app for phone and TV. These are not shipped yet; the Apple apps are.
+**Android is in beta, and desktop is in active development**, both on the same shared engine. The Android app covers phone and Android TV and ships now as a sideload APK, with VortX account sign-in and realtime profile sync, an in-process torrent server, preference-driven source ranking, offline downloads, IPTV playlists, and Picture-in-Picture; sign-in on the TV itself and the remaining library, settings, and API-key sync are still being ported. The native desktop app for Windows, Linux, and Mac (via Tauri, with its own embedded torrent server) is not shipped yet.
 
 Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parity unless noted):
 
@@ -152,7 +151,7 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 - **Per-series quality memory**: Watch Now remembers, per series and per profile, the quality you last played and opens in it again. Cached and instant sources still win.
 - **Stall recovery**: if the picture freezes while it is not buffering, the player reloads the stream in place at your position; if a source keeps stalling, you land on the source list instead of a dead screen. You can also switch to another source mid-playback, and a failed stream offers the source list in one press.
 - **Live streams play properly**: live TV and event streams keep playing across segment boundaries instead of ending a few seconds in, with buffering tuned for live playlists. Contributed by [OrigamiSpace](https://github.com/OrigamiSpace).
-- **Trailers on every device**: a Trailer button on the detail page, plus the muted autoplay behind the featured hero. Apple TV plays trailers through the embedded server; iPhone, iPad, and Mac use an in-app player. (Full build.)
+- **Trailers on every device**: a Trailer button on the detail page, plus the muted autoplay behind the featured hero. Apple TV plays trailers through the embedded server; iPhone, iPad, and Mac use an in-app player. (Not the Lite build.)
 - **Subtitles from your add-ons**: the subtitles panel lists what your installed subtitle add-ons offer next to the file's embedded tracks; pick one and it loads on the spot.
 - **Stream link QR**: the player settings panel shows the playing stream as a QR code (a magnet for torrents), to scan with your phone and keep watching there.
 - Playback speed control, a live playback-info overlay (resolution, codec, hardware decode, FPS, dropped frames, buffer), skip intro / recap / credits (crowd-sourced timestamps merged with the file's chapter markers, with sanity guards), smart audio and subtitle selection from your preferred languages, language-grouped track pickers, subtitle styling and sync, bundled fonts for every script, a seekable scrubber with accelerating hold-to-seek, fit / zoom / stretch aspect modes, and resume across sessions.
@@ -179,11 +178,11 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 
 ## Installing
 
-The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the **Full** build `VortX-tvOS-x.y.z.ipa` with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), and the **macOS app** as a `.dmg`. None of this requires a jailbreak.
+The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the `VortX-tvOS-x.y.z.ipa` build with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), the **macOS app** as a `.dmg`, and the **Android APK** `VortX-Android-vx.y.z.apk` (one build for phone and Android TV). None of this requires a jailbreak.
 
 **Is it safe, and why the extra setup?** VortX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
 
-**iPhone, iPad, and Apple TV** use one of Methods 1 to 4 below; the signing identity you pick sets how long each install lasts. **macOS** is simpler (no re-signing, no expiry) and has its own section at the end.
+**iPhone, iPad, and Apple TV** use one of Methods 1 to 4 below; the signing identity you pick sets how long each install lasts. **macOS** and **Android** are simpler (no re-signing, no expiry) and each have their own section at the end.
 
 ### The trade-off to understand first
 
@@ -235,9 +234,19 @@ The Mac app does not expire and needs no Apple ID or re-signing. You clear Apple
 
 Torrents work on the Mac too (it bundles the streaming server). If you only use debrid or direct links, turn on **Direct Links Only** in Settings.
 
+### Android (the .apk): sideload and open
+
+The Android app is a single APK that runs on both phone and Android TV. It is a beta, debug-signed for testing, so there is no Play Store listing yet.
+
+1. From the [latest release](../../releases/latest), download `VortX-Android-vx.y.z.apk`.
+2. Open it from your browser or a file manager, and allow installs from that app when Android prompts (unknown-source installs stay blocked until you allow that one app).
+3. Open VortX and sign in with your VortX account.
+
+To update, download the newer APK and install it over the top; your sign-in and settings carry over.
+
 ### Updating
 
-Install the new version's IPA over the old one with the same method and the same Apple ID; your sign-in, profiles, and settings carry over. If you switch signing identities, iOS treats it as a different app and you start fresh. You can move between the Full and Lite builds the same way.
+Install the new version's IPA over the old one with the same method and the same Apple ID; your sign-in, profiles, and settings carry over. If you switch signing identities, iOS treats it as a different app and you start fresh. You can move between the two builds the same way.
 
 ## Security and privacy
 
@@ -256,16 +265,16 @@ You sign in with your own account and bring your own add-ons. No content is bund
 ## Built with
 
 - **Swift + SwiftUI**: the entire UI on Apple TV, iPhone, iPad, and Mac, with no web wrapper.
-- **stremio-core**: Stremio's open-source Rust engine (catalogs, add-ons, library, streams), linked as `StremioXCore.xcframework` and driven over a JSON/C bridge.
+- **Native Rust engine**: the open-source `stremio-core` crate (catalogs, add-ons, library, streams), linked as `StremioXCore.xcframework` and driven over a JSON/C bridge.
 - **libmpv via [MPVKit](https://github.com/mpvkit/MPVKit)**: the video player, with HDR and Dolby Vision tonemapping, track selection, and libass subtitles.
-- **nodejs-mobile**: the embedded streaming server (`server.js`) for torrents and the header-gated proxy, in the Full builds.
+- **nodejs-mobile**: the embedded streaming server (`server.js`) for torrents and the header-gated proxy, in the builds with the embedded server.
 - **XcodeGen**: the project is generated from `app/project.yml`, the checked-in source of truth.
 - **GitHub Actions**: builds and publishes the unsigned IPAs and the macOS `.dmg` from source.
-- **Kotlin + Jetpack Compose**: the in-progress Android phone and TV apps (`android/`), on the same shared engine.
+- **Kotlin + Jetpack Compose**: the Android phone and TV apps (`android/`), now in beta on the same shared engine.
 
 ## Building it yourself
 
-You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust nightly with rust-src (the native engine now powers Apple TV, iPhone, iPad, and Mac). MPVKit comes in over Swift Package Manager. No local Stremio install is needed: the fetch script downloads everything it cannot find.
+You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and Rust nightly with rust-src (the native engine now powers Apple TV, iPhone, iPad, and Mac). MPVKit comes in over Swift Package Manager. No local streaming-server install is needed: the fetch script downloads everything it cannot find.
 
 ```bash
 # 1) Streaming-server deps: NodeMobile (tvOS-enabled build from this repo's vendor
@@ -279,7 +288,7 @@ You'll need macOS with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen),
 
 # 3) Generate the project and build (unsigned, for sideloading)
 cd app && xcodegen generate
-# Full Apple TV build (with torrents):
+# Apple TV build with torrents:
 xcodebuild -scheme VortXTV         -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
 # Lite Apple TV build (no embedded server):
 xcodebuild -scheme VortXTVLite     -sdk appletvos -destination 'generic/platform=tvOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
@@ -298,30 +307,29 @@ xcodebuild -scheme VortXMac        -destination 'platform=macOS,arch=arm64'     
 
 ## How the tvOS app works
 
-It started out talking to add-ons by hand, and that kept getting small things wrong, so it was moved onto stremio-core, the open-source Rust engine. The engine is built as a static library, packaged as StremioXCore.xcframework, and talks to Swift as plain JSON over a C interface (see the `core/` folder). The SwiftUI screens send the engine actions and render whatever state it hands back, which is why the behavior lines up with the official app: it is the same engine. There's more in `docs/REBASE-stremio-core.md`.
+It started out talking to add-ons by hand, and that kept getting small things wrong, so it was moved onto a native Rust engine. The engine is built as a static library, packaged as StremioXCore.xcframework, and talks to Swift as plain JSON over a C interface (see the `core/` folder). The SwiftUI screens send the engine actions and render whatever state it hands back, so catalogs, library, and Continue Watching come out right instead of being stitched together by hand. There's more in `docs/REBASE-stremio-core.md`.
 
 ## What's next
 
-With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and, on the path to 1.0, VortX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
+With native apps across Apple shipping and Android now in beta, the work moves outward and deeper: completing Android (sign-in on the TV itself, the remaining library, settings, and API-key sync, and a Play Store listing), finishing the desktop (Windows, Linux, Mac via Tauri) build on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), a full Live TV channel guide, and, on the path to 1.0, VortX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/VortXTV/VortX/issues). Requests genuinely shape the roadmap.
 
 ## Known issues
 
 - **Profiles are per-device for now.** The roster and each profile's watch history live on the device. An early build (0.2.7 to 0.2.9 build 30) tried to sync them through the account's library storage; that could break library sync in official apps with a "Serialization error: state.watched" message. Current builds scrub those documents from the account automatically on launch, which fixes the official apps too. If you saw that error, open VortX once on this version and give the official app a minute to resync.
-- **Desktop and Android are still in development.** They run the shared engine but are not yet at the Apple apps' level of polish, and are not part of the released builds yet.
+- **Android is in beta, and desktop is still in development.** The Android app ships now as a sideload APK (phone and Android TV) but is not yet at the Apple apps' level of polish, and some sync legs and Android TV sign-in are still being ported. The desktop app runs the shared engine but is not part of the released builds yet.
 - **Unsigned builds.** You re-sign the IPA yourself, and depending on the signing method, reinstalling can require signing in again.
 
 ## Not affiliated
 
-This is an independent community project. It is not affiliated with or endorsed by Stremio, Anthropic, or Apple. All names and trademarks belong to their owners.
+This is an independent community project. It is not affiliated with or endorsed by Stremio or Apple. All names and trademarks belong to their owners.
 
 ## Credits
 
-- [Stremio](https://www.stremio.com/), for stremio-core, the streaming server, and the apps this picks up from.
+- [Stremio](https://www.stremio.com/), for stremio-core and the streaming server.
 - [mpv](https://mpv.io/) and [MPVKit](https://github.com/mpvkit/MPVKit), for the player.
 - [nodejs-mobile](https://github.com/nodejs-mobile/nodejs-mobile), for the embedded server runtime.
-- Claude (Anthropic) wrote the code.
 - [OrigamiSpace](https://github.com/OrigamiSpace), the first and most prolific community contributor: QR sign-in, live stream playback, live search, the Resume/Play hero and watched-state controls, the tab bar and focus fixes on real hardware, verified CI release builds, the Direct Links Only mode and the VortX Lite build, the stream-ranking reports that drove the cached-first fixes, the build-from-source report that made a fresh clone work for everyone, and the Apple TV search-suggestion interleaving.
 - [jbecker-it](https://github.com/jbecker-it), for the player reliability series in 0.3.13: the pause-crash relief, watch progress on durationless streams, the scrub and watched-mark guards, the post-seek audio fix, and the Continue Watching exit refresh, every fix root-caused and verified on real hardware.
 - **[SkipDB](https://skipdb.tv)**, the open, community-built skip-segment database, also created by [OrigamiSpace](https://github.com/OrigamiSpace). VortX's skip feature is built on it: we read from it, contribute every submission back to it, and publish our own skip data openly under the same [Open Database License](https://opendatacommons.org/licenses/odbl/) at [skip.vortx.tv/dump](https://skip.vortx.tv/dump). Open projects like this are why the ecosystem works, and VortX is proud to give back to it.
@@ -330,7 +338,7 @@ See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list.
 
 ## A note on the bundled streaming server
 
-The Full IPAs include `server.js`, the streaming server's own proprietary file, distributed for free inside the official apps. VortX has not modified it and claims no rights to it; it is bundled only so the app works out of the box. The Lite build omits it entirely. Swapping it for an open-source streaming server is on the [roadmap](ROADMAP.md).
+The IPAs that bundle the streaming server include `server.js`, the streaming server's own proprietary file, distributed for free inside the official apps. VortX has not modified it and claims no rights to it; it is bundled only so the app works out of the box. The Lite build omits it entirely. Swapping it for an open-source streaming server is on the [roadmap](ROADMAP.md).
 
 ## Star History
 
@@ -344,7 +352,7 @@ The Full IPAs include `server.js`, the streaming server's own proprietary file, 
 
 ## Legal and DMCA
 
-VortX is a client-side app: it browses metadata and plays media that **you** supply through the add-ons you install and the sources you provide. It is intended for content you own or are otherwise authorized to access. VortX does not host, store, index, or distribute any media, and it bundles no content and no add-ons. It is an independent project and is not affiliated with or endorsed by Stremio, Apple, Anthropic, or any add-on or content provider.
+VortX is a client-side app: it browses metadata and plays media that **you** supply through the add-ons you install and the sources you provide. It is intended for content you own or are otherwise authorized to access. VortX does not host, store, index, or distribute any media, and it bundles no content and no add-ons. It is an independent project and is not affiliated with or endorsed by Stremio, Apple, or any add-on or content provider.
 
 Because VortX hosts no content, a copyright complaint about a specific stream belongs with the add-on or server actually hosting it, not with this app. For the full disclaimer, third-party add-on policy, and how to file a copyright notice about this repository, see **[docs/LEGAL.md](docs/LEGAL.md)**.
 

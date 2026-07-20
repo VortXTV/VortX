@@ -122,6 +122,10 @@ struct PlaybackMeta: Hashable {
     let poster: String?
     let season: Int?
     let episode: Int?
+
+    var usesSeriesLifecycle: Bool {
+        EpisodePlaybackIdentity.usesSeriesLifecycle(type: type)
+    }
 }
 
 /// Manages the signed-in Stremio session: auth token (persisted), installed addons, and the
@@ -282,10 +286,22 @@ final class StremioAccount: ObservableObject {
         if !ProfileStore.shared.activeUsesEngineHistory {
             return ProfileStore.shared.resumeOffset(for: meta)
         }
+        // Wave 4: VortX owns the MAIN profile's resume. Read the engine's LOCAL library bucket BY ID (mirrored
+        // from doc.vortx.library, re-hydrated on cold devices) instead of the Stremio account datastore. Callers
+        // already try `core.engineResumeSeconds(for:)` first and only fall through to here when meta_details is
+        // not yet loaded (the Continue-Watching direct-resume race); this by-id read still finds the position, so
+        // gating the Stremio read off cannot lose resume. Only consult api.strem.io when the user opted into the
+        // two-way mirror (default OFF).
+        if let engine = CoreBridge.shared.engineResumeSecondsByLibraryId(for: meta) { return engine }
+        guard ProfileSync.alsoSyncToStremio else { return 0 }
         guard let key = authKey,
               let item = await rawLibraryItem(id: meta.libraryId, authKey: key),
               let state = item["state"] as? [String: Any] else { return 0 }
-        if meta.type == "series", let saved = state["video_id"] as? String, saved != meta.videoId { return 0 }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: state["video_id"] as? String,
+            requestedVideoID: meta.videoId
+        ) { return 0 }
         let ms = Self.numeric(state["timeOffset"])
         return ms > 0 ? ms / 1000 : 0
     }
@@ -300,6 +316,12 @@ final class StremioAccount: ObservableObject {
                                                durationSeconds: durationSeconds)
             return
         }
+        // Wave 4: VortX owns the MAIN profile's Continue Watching + resume. The position is already persisted to
+        // the engine's LOCAL library bucket by the co-located `CoreBridge.reportProgress` at every player call
+        // site (the engine Player's TimeChanged), and that bucket is mirrored to doc.vortx.library and re-hydrated
+        // on cold devices, so Continue Watching + resume survive with NO Stremio dependency. Do NOT write to the
+        // Stremio account datastore by default; only ALSO write it when the user opted into two-way sync (OFF).
+        guard ProfileSync.alsoSyncToStremio else { return }
         guard let key = authKey, durationSeconds > 0, positionSeconds >= 0 else { return }
         let now = Self.isoNow()
         var item = await rawLibraryItem(id: meta.libraryId, authKey: key) ?? Self.newLibraryItem(meta, now: now)

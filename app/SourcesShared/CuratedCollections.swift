@@ -135,10 +135,17 @@ final class CuratedCollectionsModel: ObservableObject {
             for preview in bucket
                 where preview.poster?.isEmpty == false && seen.insert(preview.id).inserted {
                 merged.append(preview)
-                if merged.count >= maxItemsPerCollection { return merged }
             }
         }
-        return merged
+        guard !merged.isEmpty else { return [] }
+        // Freshness (CuratedFreshness): build the FULL merged pool (the old early cap stopped inside the
+        // first query's bucket, so the second query never surfaced and the rail was the identical first-30
+        // every open), then start the 30-card window at a seeded per-app-open rotation. Each open shows a
+        // different slice of the same editorial pool; the model builds once per run (didLoad), so the rail
+        // is stable for the whole session.
+        let start = CuratedFreshness.rotation(key: definition.id, count: merged.count)
+        let rotated = Array(merged[start...]) + Array(merged[..<start])
+        return Array(rotated.prefix(maxItemsPerCollection))
     }
 }
 

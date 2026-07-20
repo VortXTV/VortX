@@ -3,14 +3,18 @@ package com.vortx.android.engine
 import android.content.Context
 import android.util.Log
 import com.vortx.android.auth.AuthIdentityStore
+import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.model.AddonOrder
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.InstalledAddon
+import com.vortx.android.model.LibraryItemInfo
+import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -18,6 +22,11 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.sources.SourcePinContext
+import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourcePreferencesStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -91,6 +100,34 @@ class EngineStremioRepository(
     /// [AuthIdentityStore]'s doc comment.
     private val identityStore by lazy { AuthIdentityStore(appContext) }
 
+    /// Source-ranking preferences + pins, the Android port of Apple `SourcePreferences` / `SourcePinStore`.
+    /// Read by [StreamRanking] through an immutable snapshot installed before each source rank (the frozen
+    /// snapshot pattern, so an off-thread rank never races a Settings edit). With no preferences set these
+    /// are all defaults, so ranking stays byte-identical to the core-only scorer.
+    private val sourcePrefs by lazy { SourcePreferencesStore(appContext) }
+    /// Per-profile pins: the store reads the ACTIVE profile id from [ProfileStore] for its per-profile
+    /// key, so one profile's pins can never leak into another (falls back to the shared default before
+    /// [ProfileStore] is initialized). Reload wave: [ProfileStore.select] fires the switch listener that
+    /// calls [SourcePinStore.reload] on a switch.
+    private val sourcePins by lazy {
+        SourcePinStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: SourcePinStore.DEFAULT_PROFILE }
+    }
+    private val trackPrefs by lazy { TrackPreferencesStore(appContext) }
+
+    /// Add-on order + per-profile on/off overlay (the Android port of Apple's
+    /// `VortXSyncManager.appliedAddonOrder` + `ProfileStore.activeDisabledAddons` pair). Per-profile
+    /// keying reads the ACTIVE profile id live on each call (same provider-lambda pattern as
+    /// [sourcePins]), so a profile switch needs no reload hook here.
+    private val addonPrefs by lazy {
+        AddonPrefsStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: AddonPrefsStore.DEFAULT_PROFILE }
+    }
+
+    /// One-time flag read for the vortx-core SHADOW ranking lane (engine cutover Phase 7 slice 1,
+    /// the Android analogue of the Apple VortxBridge shadow). Forced on the first stream rank; after
+    /// that the call-site guard is a single volatile read, so the default-OFF flag costs nothing and
+    /// the app behaves byte-identically until it is switched on. See [VortxRankingShadow].
+    private val shadowRankingConfigured by lazy { VortxRankingShadow.configure(appContext); true }
+
     /// Field names that changed in the most recent engine event. extraBufferCapacity + DROP_OLDEST
     /// keeps a burst of back-to-back events from ever suspending (blocking) the native callback thread
     /// that publishes them -- see the class doc.
@@ -133,6 +170,57 @@ class EngineStremioRepository(
 
     init {
         start()
+        // Reload-hook wiring (the seam earlier waves left): on a profile switch / sync fold, re-sync the
+        // per-profile source-ranking layer. SourcePreferences.reload() drops the memoized scores computed
+        // under the previous profile's flat filter keys (which ProfileStore.applyPlayback has just
+        // rewritten); SourcePinStore.reload() re-reads the new active profile's pins. No-op until
+        // ProfileStore is initialized (VortXApplication.onCreate), which always precedes engine
+        // construction, so this registers exactly once for the process.
+        ProfileStore.sharedOrNull()?.addSwitchListener {
+            sourcePrefs.reload()
+            sourcePins.reload()
+        }
+        // Home is per-profile (the CW rail swaps between the engine rail and the overlay rail on a
+        // switch, and a per-profile prefs apply can change what the board shows). Mirrors the tail of
+        // Apple `applyPlayback` calling `CoreBridge.rebuildBoardRows()`: a switch/fold re-dispatches the
+        // board load so homeUpdates converges immediately instead of riding the 3s safety poll.
+        ProfileStore.sharedOrNull()?.onRebuildBoard = { runCatching { dispatchHomeLoad() } }
+    }
+
+    // ---- Per-profile watch gate (Apple `ProfileStore.activeUsesEngineHistory`, Profiles.swift:275) ----
+
+    /// The profile store when an OVERLAY profile is active (a non-owner shared profile that keeps its
+    /// own PRIVATE watch history), else null (the owner and own-account profiles use the engine/account
+    /// library, exactly like before profiles existed). Every watch read/write in this repository
+    /// consults this FIRST — the Android mirror of Apple CoreBridge routing through
+    /// `ProfileStore.activeUsesEngineHistory`. The invariant it enforces: an overlay profile can never
+    /// READ the account's Continue Watching / library / watched ticks, and can never WRITE its progress
+    /// or marks into the account library (the never-poison rule from the documented sync incident).
+    private fun overlayProfiles(): ProfileStore? =
+        ProfileStore.sharedOrNull()?.takeIf { !it.activeUsesEngineHistory }
+
+    /// Re-shape an engine [MetaDetail] for an overlay profile: the per-ACCOUNT fields (saved-to-library
+    /// state, resume position, watched episode ticks) are replaced with the active profile's private
+    /// overlay state, so Detail/resume/ticks are per-profile with zero screen changes. Engine-backed
+    /// profiles get the detail back untouched.
+    private fun withOverlayState(detail: MetaDetail): MetaDetail {
+        val store = overlayProfiles() ?: return detail
+        val entry = store.watch[detail.id]
+        val libraryItem = entry?.let {
+            LibraryItemInfo(
+                id = detail.id,
+                removed = false,
+                temp = false,
+                videoId = it.videoId,
+                timeOffsetMs = it.timeOffsetMs.toLong(),
+                durationMs = it.durationMs.toLong(),
+                // A movie is watched in the overlay when its OWN meta id is in watchedVideoIds (that is
+                // exactly what markWatched appends and what Apple `cwItems`' finished-movie prune keys on).
+                timesWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+                flaggedWatched = if (detail.id in it.watchedVideoIds) 1 else 0,
+            )
+        }
+        return detail.copy(libraryItem = libraryItem, watchedVideoIds = store.watchedVideoIds(detail.id))
     }
 
     /// Initialize the engine once. Idempotent; safe to call from multiple repositories (the native
@@ -324,16 +412,33 @@ class EngineStremioRepository(
     /// so [homeUpdates] can call it on every event/poll tick cheaply.
     private fun homeSnapshot(): List<Catalog> {
         val titleMap = EngineState.parseAddonCatalogTitles(StremioCoreNative.getState(EngineActions.ctxField()))
-        val boardRows = EngineState.parseCatalogs(StremioCoreNative.getState(EngineActions.boardField()), titleMap)
+        val allBoardRows = EngineState.parseCatalogs(StremioCoreNative.getState(EngineActions.boardField()), titleMap)
+        // Per-profile add-on on/off overlay (Apple `buildBoardRows`' disabledAddons guard,
+        // CoreBridge.swift:2191): a disabled add-on's catalog rows must not render on this profile's
+        // Home. The row id is "<base>|<type>|<id>" (see [EngineState.parseCatalogs]); rows with no
+        // base ("row-N" fallbacks, the "continue" rail prepended below) are never filtered.
+        val disabledAddons = addonPrefs.disabledBases()
+        val boardRows = if (disabledAddons.isEmpty()) {
+            allBoardRows
+        } else {
+            allBoardRows.filter { row ->
+                val base = row.id.substringBefore('|', "")
+                base.isEmpty() || AddonOrder.normalize(base) !in disabledAddons
+            }
+        }
         // Suppressed right after sign-out: see [suppressHomeUntilFreshLoad]'s doc comment. The engine's
         // continue_watching_preview field keeps serving the PREVIOUS account's items indefinitely (an
         // engine quirk, not a race), so trusting it here would render a signed-out Home with another
         // account's "Continue Watching" posters. Board rows are unaffected (Logout correctly drives a
         // real reload) so they still render live.
-        val continueWatching = if (suppressHomeUntilFreshLoad) {
-            emptyList()
-        } else {
-            runCatching {
+        // Per-profile gate: an OVERLAY profile's Continue Watching is its private overlay, never the
+        // account's engine rail (Apple `ProfileStore.cwItems` vs the engine preview — the
+        // activeUsesEngineHistory split).
+        val overlayStore = overlayProfiles()
+        val continueWatching = when {
+            overlayStore != null -> runCatching { overlayStore.continueWatching() }.getOrDefault(emptyList())
+            suppressHomeUntilFreshLoad -> emptyList()
+            else -> runCatching {
                 EngineState.parseContinueWatching(StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()))
             }.getOrDefault(emptyList())
         }
@@ -381,12 +486,36 @@ class EngineStremioRepository(
         // the default (all types, last-watched); non-null = a verbatim echo of a
         // [com.vortx.android.model.LibraryTypeOption]/[com.vortx.android.model.LibrarySortOption]'s
         // `request`, mirroring Discover's selection contract.
+        // Per-profile gate: an OVERLAY profile's Library is its private overlay (every title it has
+        // watched or saved), never the account's engine library (Apple `ProfileStore.libraryItems`).
+        // Slice note: the overlay list ignores the type/sort chips for now (no pivot row renders).
+        overlayProfiles()?.let { store ->
+            return@runCatching LibraryResult(items = store.libraryItems())
+        }
         val dispatchAction = if (requestJson != null) EngineActions.loadLibrarySelect(requestJson) else EngineActions.loadLibrary()
         val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
         LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
     } }
 
+    override suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
+        withContext(Dispatchers.Default) { runCatching {
+            // Same field + same dispatch as [library] above (a derived read of the persisted ctx.library
+            // bucket, no add-on HTTP, ready immediately), differing only in the parse: the portable shape
+            // keeps each entry's resume state and drops the engine's removed/temp bookkeeping entries.
+            // Always the DEFAULT selection (no requestJson): an export is the whole library, never the
+            // type/sort pivot the Library screen happens to be showing.
+            val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
+            EngineState.parseLibraryPortable(state, now)
+        } }
+
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
+        // Per-profile gate: an overlay profile saves into its PRIVATE overlay, never the account
+        // library (Apple `ProfileStore.addLibraryEntry`; the never-poison invariant).
+        val store = overlayProfiles()
+        if (store != null) {
+            store.addLibraryEntry(metaId = item.id, name = item.name, type = item.type.id, poster = item.poster)
+            return@runCatching
+        }
         // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is
         // enough; the caller re-pulls [library] afterward to see the change (same pattern [signOut] uses
         // for its own synchronous ctx mutation).
@@ -394,12 +523,99 @@ class EngineStremioRepository(
     }
 
     override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
+        val store = overlayProfiles()
+        if (store != null) {
+            store.removeWatchEntry(id)
+            return@runCatching
+        }
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
     }
 
     override suspend fun installedAddons(): Result<List<InstalledAddon>> = withContext(Dispatchers.Default) { runCatching {
-        EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        // Display order = the user's applied add-on order (Apple `orderedByApplied` on the add-on
+        // list); newly installed add-ons fold in at the end in engine order. Each entry is stamped
+        // with the ACTIVE profile's on/off overlay so the Add-ons screen renders the eye toggle
+        // state without a second query.
+        val addons = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        val disabledAddons = addonPrefs.disabledBases()
+        addonPrefs.orderedByApplied(addons) { it.transportUrl }.map { addon ->
+            val disabled = AddonOrder.normalize(addon.transportUrl) in disabledAddons
+            if (disabled) addon.copy(isDisabled = true) else addon
+        }
     } }
+
+    override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            addonPrefs.setDisabled(transportUrl, disabled)
+            // A LOCAL overlay change the engine knows nothing about: poke our own reactive surfaces
+            // (ctxUpdates listeners re-read the add-on list; homeUpdates re-snapshots the filtered
+            // board) so the toggle shows everywhere immediately instead of riding the 3s safety poll.
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            Unit
+        } }
+
+    override suspend fun applyAddonOrder(transportUrls: List<String>): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            addonPrefs.setAppliedOrder(transportUrls)
+            // Same local-poke as [setAddonDisabled]: the list order + future meta picks changed.
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            Unit
+        } }
+
+    override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =
+        withContext(Dispatchers.Default) { runCatching {
+            // Per-profile gate first (Apple `setCatalogWatched`'s `overlaySetWatchedById` branch): an
+            // overlay profile's card mark toggles its OWN private watch overlay, never the account
+            // library (the never-poison invariant).
+            overlayProfiles()?.let { store ->
+                store.setWatched(isWatched, item.id, listOf(item.id), item.name, item.type.id, item.poster)
+                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                return@runCatching
+            }
+            // Engine path (Apple CoreBridge.swift:1624): hand `MetaItemMarkAsWatched` the engine's OWN
+            // serialized preview for this id when a resident catalog field holds it (`MetaItemPreview`
+            // deserializes through a legacy shape, so echoing beats reconstructing), falling back to
+            // the same minimal `{id,type,name,poster}` object [EngineActions.addToLibrary] already
+            // proves the deserializer accepts. The action creates a temporary library item when none
+            // exists -- exactly the mark-from-a-card use case.
+            val preview = rawMetaPreview(item.id) ?: JSONObject()
+                .put("id", item.id)
+                .put("type", item.type.id)
+                .put("name", item.name)
+                .also { if (item.poster != null) it.put("poster", item.poster) }
+            StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+        } }
+
+    /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog
+    /// field currently holds it. Mirrors Apple `CoreBridge.rawMetaPreview(forId:)`: catalog state
+    /// nests previews under `content` arrays a few levels down, so this is a bounded depth-first
+    /// search over the three catalog-shaped fields. Null when no resident field holds the id.
+    private fun rawMetaPreview(metaId: String): JSONObject? {
+        for (field in listOf(EngineActions.FIELD_BOARD, EngineActions.FIELD_DISCOVER, EngineActions.FIELD_SEARCH)) {
+            val root = runCatching { JSONObject(StremioCoreNative.getState("\"$field\"")) }.getOrNull() ?: continue
+            findMetaPreview(root, metaId)?.let { return it }
+        }
+        return null
+    }
+
+    /// Depth-first search for a meta preview (`{id, type, name, …}`) with the given id inside an
+    /// engine state object (Apple `CoreBridge.findMetaPreview`).
+    private fun findMetaPreview(node: Any?, metaId: String): JSONObject? {
+        when (node) {
+            is JSONObject -> {
+                if (node.optString("id") == metaId && node.opt("type") is String && node.opt("name") is String) return node
+                for (key in node.keys()) {
+                    findMetaPreview(node.opt(key), metaId)?.let { return it }
+                }
+            }
+            is org.json.JSONArray -> {
+                for (i in 0 until node.length()) {
+                    findMetaPreview(node.opt(i), metaId)?.let { return it }
+                }
+            }
+        }
+        return null
+    }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
         val normalized = normalizeAddonUrl(url)
@@ -489,8 +705,14 @@ class EngineStremioRepository(
         val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id)) {
             EngineState.parseMetaDetail(it) != null
         }
-        EngineState.parseMetaDetail(state)
+        // The applied add-on order rides the meta pick (#144 on Apple): the detail meta resolves from
+        // the user's #1 add-on (e.g. a localized meta provider), not whichever the engine lists first.
+        // An empty order (never reordered) keeps the old first-Ready pick byte-identically.
+        val detail = EngineState.parseMetaDetail(state, addonPrefs.appliedOrder())
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
+        // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
+        // overlay profile (no-op for engine-backed profiles).
+        withOverlayState(detail)
     } }
 
     override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = withContext(Dispatchers.Default) { runCatching {
@@ -513,16 +735,42 @@ class EngineStremioRepository(
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
         // first within each add-on block, and the strongest add-on block first. This is what makes the
         // hero "Watch" auto-pick and the source picker meaningful, mirroring Apple's ranked source list.
-        StreamRanking.rankedGroups(EngineState.parseStreamGroups(state))
+        //
+        // Build + install the user-preference snapshot FIRST (Apple's frozen snapshot: the ranker reads a
+        // stable copy off-thread, never the live store). Installing it also lets DetailViewModel's later
+        // media-server re-rank + best-source pick inherit the same preferences. The effective pin for this
+        // title (per-title, else provider) rides the rank so a pinned source floats to the top.
+        // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid words
+        // always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
+        // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
+        val snapshot = sourcePrefs.snapshot(
+            trackPrefs.current.audioLanguages,
+            isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+        )
+        StreamRanking.installReading(snapshot)
+        val pin = sourcePins.effectivePin(SourcePinContext(id, type == MediaType.SERIES))
+        // Per-profile add-on on/off overlay (Apple `assembleStreamGroups`' disabledAddons guard,
+        // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
+        // this profile. Groups with no base (a malformed request) are kept, never dropped.
+        val disabledAddons = addonPrefs.disabledBases()
+        val groups = EngineState.parseStreamGroups(state).filter { group ->
+            group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
+        }
+        // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
+        // kernel fire-and-forget and log the agreement (a diff count). It never touches the ranked
+        // list returned below; with the flag at its default OFF this line is one volatile read.
+        if (shadowRankingConfigured && VortxRankingShadow.enabled) VortxRankingShadow.compareAsync(groups, snapshot)
+        StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
     } }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
         // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
         // resolves through the user's own debrid account when a key is configured (native in-client
-        // debrid, the Android port of the Apple DebridResolver); without a key it still needs the
-        // in-process streaming server (nodejs-mobile, not yet wired), so it surfaces a clear error the
-        // player layer can show instead of failing opaquely.
+        // debrid, the Android port of the Apple DebridResolver); without a key it plays through the
+        // OWN in-process streaming server ([VortxServer], the vortx-core rqbit embed), and only when
+        // THAT is unavailable (no .so in this build, start failure, kill-switch flag off) does it
+        // surface a clear error the player layer can show instead of failing opaquely.
         val handle = source.id.substringBefore('#')
         // Flag DV/Atmos from the source's own tags so [PlayerEngineRouter] routes those to the ExoPlayer
         // engine (its DefaultRenderersFactory does the DV codec fallback + DefaultAudioSink negotiates
@@ -530,7 +778,19 @@ class EngineStremioRepository(
         val isDolbyVision = StreamRanking.isDolbyVision(source)
         val isAtmos = StreamRanking.isAtmos(source)
         if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
-            Playable(url = handle, title = source.title, viaStreamingServer = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
+            // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a
+            // Referer / User-Agent requirement) actually plays: both engines already apply
+            // [Playable.headers] (mpv http-header-fields, ExoPlayer data-source factory), and the
+            // download path forwards them off the same Playable. Direct-URL streams only: a
+            // debrid-resolved link below is a DIFFERENT host the add-on's headers were never meant for.
+            Playable(
+                url = handle,
+                title = source.title,
+                viaStreamingServer = false,
+                isDolbyVision = isDolbyVision,
+                isAtmos = isAtmos,
+                headers = source.requestHeaders,
+            )
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent
             // url == null, so the id-handle is the infoHash). If the user has a debrid key configured,
@@ -540,16 +800,44 @@ class EngineStremioRepository(
             //
             // Fail-soft: DebridResolver.resolve returns null on ANY failure (no key, not actually
             // cached, no playable file, provider/network error). With no key it never opens the key
-            // store. On null we surface the SAME clear error as before so the player layer shows a real
-            // message rather than failing opaquely, and torrents keep today's behavior when no debrid
-            // is configured.
+            // store. On null the raw torrent falls through to the in-process streaming server below,
+            // so a debrid-configured user keeps the exact direct path they have today.
             val resolved = debridResolver.resolve(infoHash = handle)
             if (resolved != null) {
                 Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false, isDolbyVision = isDolbyVision, isAtmos = isAtmos)
             } else {
-                throw UnsupportedOperationException(
-                    "Torrent playback needs a debrid key or the streaming-server bridge (not yet wired on Android).",
-                )
+                // No debrid (or not cached): serve the raw torrent through the OWN in-process
+                // streaming server, the same loopback contract the desktop node server speaks:
+                // GET {base}/{infoHash}/{fileIdx} is the Range-capable playback endpoint and
+                // auto-creates the torrent on first read (crates/streaming-server http routes).
+                // startIfNeeded is idempotent and BLOCKS briefly on the first call (bind), so it
+                // runs on IO, never the caller's dispatcher. Gated by the default-ON kill-switch
+                // flag [VortxServer.FLAG_KEY]: serving beats throwing, but the lane can be killed
+                // from Settings without a build. isTorrent = true keeps playback on the mpv
+                // engine and sizes its read-ahead for a local stream ([PlayerEngineRouter]);
+                // viaStreamingServer = true gives the player its "buffering from source" chrome.
+                val serverBase = withContext(Dispatchers.IO) {
+                    // Flag read + server start both on IO: resolve() may be entered from a
+                    // viewModelScope (Main), and the first prefs-file load and the first
+                    // nativeStart (bind) are real I/O.
+                    if (VortxServer.streamingEnabled(appContext)) VortxServer.startIfNeeded(appContext) else null
+                }
+                if (serverBase != null) {
+                    val infoHash = (source.infoHash ?: handle).lowercase()
+                    val fileIdx = source.fileIdx ?: 0
+                    Playable(
+                        url = "$serverBase/$infoHash/$fileIdx",
+                        title = source.title,
+                        viaStreamingServer = true,
+                        isTorrent = true,
+                        isDolbyVision = isDolbyVision,
+                        isAtmos = isAtmos,
+                    )
+                } else {
+                    throw UnsupportedOperationException(
+                        "Torrent playback needs a debrid key or the streaming server (unavailable in this build).",
+                    )
+                }
             }
         } else {
             throw UnsupportedOperationException(
@@ -576,8 +864,36 @@ class EngineStremioRepository(
     @Volatile private var playbackType: String? = null
     @Volatile private var playbackVideoId: String? = null
 
+    /// Overlay-profile playback context, captured at [beginPlaybackSession] so the per-profile
+    /// progress/watched writes in [reportProgress]/[endPlaybackSession] know WHICH title to record
+    /// against without an interface change (the engine path carries this inside the engine's own
+    /// `player` model instead). Null whenever the active profile is engine-backed.
+    @Volatile private var overlayMetaId: String? = null
+    @Volatile private var overlayName: String? = null
+    @Volatile private var overlayPoster: String? = null
+
     override suspend fun beginPlaybackSession(): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
-        val selected = buildPlayerSelected() ?: run {
+        overlayMetaId = null
+        overlayName = null
+        overlayPoster = null
+        val selected = buildPlayerSelected()
+        // Per-profile gate: an OVERLAY profile must NEVER load the engine Player — its TimeChanged
+        // ticks and watched marks write the ACCOUNT library (the shared history). Capture the meta
+        // context instead, so reportProgress/endPlaybackSession write the profile's PRIVATE overlay
+        // (Apple: StremioAccount/CoreBridge route to `ProfileStore.recordProgress` when
+        // `activeUsesEngineHistory` is false).
+        if (overlayProfiles() != null) {
+            val detail = currentMetaDetail()
+            playbackType = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("type")?.ifBlank { null }
+                ?: detail?.type?.id
+            playbackVideoId = selected?.optJSONObject("streamRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
+            overlayMetaId = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("id")?.ifBlank { null }
+                ?: detail?.id
+            overlayName = detail?.name
+            overlayPoster = detail?.poster
+            return@runCatching
+        }
+        if (selected == null) {
             playbackType = null
             playbackVideoId = null
             return@runCatching
@@ -592,10 +908,53 @@ class EngineStremioRepository(
 
     override suspend fun reportProgress(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
         if (durationMs <= 0L || positionMs < 0L) return@runCatching
+        // Per-profile gate: overlay progress goes to the profile's private overlay, never the engine.
+        val store = overlayProfiles()
+        if (store != null) {
+            val metaId = overlayMetaId ?: return@runCatching
+            store.recordProgress(
+                metaId = metaId,
+                videoId = playbackVideoId ?: metaId,   // a movie's video id IS its meta id (Apple PlaybackMeta)
+                positionSeconds = positionMs / 1000.0,
+                durationSeconds = durationMs / 1000.0,
+                name = overlayName ?: "",
+                type = playbackType ?: MediaType.MOVIE.id,
+                poster = overlayPoster,
+            )
+            return@runCatching
+        }
         StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
     } }
 
     override suspend fun endPlaybackSession(positionMs: Long, durationMs: Long): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        // Per-profile gate: final overlay write + near-end watched mark, then clear the context. The
+        // engine Player was never loaded for an overlay profile, so there is nothing to unload.
+        val store = overlayProfiles()
+        if (store != null) {
+            val metaId = overlayMetaId
+            if (metaId != null && durationMs > 0L && positionMs >= 0L) {
+                val videoId = playbackVideoId ?: metaId
+                val type = playbackType ?: MediaType.MOVIE.id
+                store.recordProgress(
+                    metaId = metaId, videoId = videoId,
+                    positionSeconds = positionMs / 1000.0, durationSeconds = durationMs / 1000.0,
+                    name = overlayName ?: "", type = type, poster = overlayPoster,
+                )
+                if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                    // Near-end: a series marks the EPISODE id watched; a movie marks its OWN meta id
+                    // (exactly what Apple `markWatched(meta:)` appends and what the finished-movie
+                    // Continue Watching prune keys on), then zeroes the offset (`finishedWatching`).
+                    store.markWatched(metaId, videoId, overlayName ?: "", type, overlayPoster)
+                    if (type != MediaType.SERIES.id) store.finishedWatching(metaId)
+                }
+            }
+            playbackType = null
+            playbackVideoId = null
+            overlayMetaId = null
+            overlayName = null
+            overlayPoster = null
+            return@runCatching
+        }
         if (durationMs > 0L && positionMs >= 0L) {
             StremioCoreNative.dispatch(EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE))
             // Watched-near-end: past the threshold, mark the finished item watched so it leaves Continue
@@ -674,9 +1033,17 @@ class EngineStremioRepository(
     // separate re-load, so ticks/progress/library-chip state flip live the instant the action returns.
 
     private fun currentMetaDetail(): MetaDetail? =
-        EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()))
+        EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()), addonPrefs.appliedOrder())
 
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        // Per-profile gate: an overlay profile's aggregate (movie-level) watched mark toggles its OWN
+        // meta id in the private overlay (Apple routes this to `ProfileStore.setWatched`), never the
+        // engine's MarkAsWatched (which would mutate the account library).
+        overlayProfiles()?.let { store ->
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+            store.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
@@ -689,23 +1056,44 @@ class EngineStremioRepository(
         episode: Int?,
         isWatched: Boolean,
     ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        overlayProfiles()?.let { store ->
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+            store.setWatched(isWatched, id, listOf(videoId), detail.name, type.id, detail.poster)
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
     } }
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
+            overlayProfiles()?.let { store ->
+                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+                val ids = detail.videos.filter { it.season == season }.map { it.id }
+                store.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
+                return@runCatching withOverlayState(detail)
+            }
             StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
         } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatching {
+            overlayProfiles()?.let { store ->
+                store.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
+                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
+                return@runCatching withOverlayState(detail)
+            }
             StremioCoreNative.dispatch(EngineActions.addToLibrary(id, type.id, name, poster))
             currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
         } }
 
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+        overlayProfiles()?.let { store ->
+            store.removeWatchEntry(id)
+            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
+            return@runCatching withOverlayState(detail)
+        }
         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
         currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
     } }
@@ -717,7 +1105,7 @@ class EngineStremioRepository(
     // withContext(Dispatchers.Default): called on every ctxUpdates tick, so its getState + parse
     // (via currentMetaDetail) must stay off the collector's (Main) context.
     override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = withContext(Dispatchers.Default) {
-        currentMetaDetail()?.takeIf { it.id == id }
+        currentMetaDetail()?.takeIf { it.id == id }?.let { withOverlayState(it) }
     }
 
     // ---- AuthRepository ----

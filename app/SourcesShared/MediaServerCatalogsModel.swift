@@ -82,7 +82,7 @@ final class MediaServerCatalogsModel: ObservableObject {
         let capped = Array(seeds.prefix(maxItems))
         let resolved: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview?).self) { group in
             for (i, seed) in capped.enumerated() {
-                group.addTask { (i, await cinemetaPreview(imdb: seed.imdb, type: kind, fallbackTitle: seed.title)) }
+                group.addTask { (i, await CinemetaPreviewResolver.preview(imdb: seed.imdb, type: kind, fallbackTitle: seed.title)) }
             }
             var acc: [(Int, MetaPreview)] = []
             for await (i, p) in group { if let p { acc.append((i, p)) } }
@@ -172,21 +172,7 @@ final class MediaServerCatalogsModel: ObservableObject {
         return URLSession(configuration: cfg)
     }
 
-    /// Resolve one title to a `MetaPreview` (poster + name) via Cinemeta, mirroring `TraktRailsModel`. A miss
-    /// falls back to a poster-less preview so the title still lists (the card shows its gradient).
-    private nonisolated static func cinemetaPreview(imdb: String, type: String, fallbackTitle: String) async -> MetaPreview? {
-        let safeType = (type == "series") ? "series" : "movie"
-        guard imdb.hasPrefix("tt"), let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(imdb).json"),
-              let (data, response) = try? await URLSession.shared.data(from: url),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let meta = obj["meta"] as? [String: Any] else {
-            guard imdb.hasPrefix("tt"), !fallbackTitle.isEmpty else { return nil }
-            return MetaPreview(id: imdb, type: safeType, name: fallbackTitle, poster: nil, posterShape: nil, popularity: nil)
-        }
-        let name = (meta["name"] as? String) ?? fallbackTitle
-        guard !name.isEmpty else { return nil }
-        return MetaPreview(id: imdb, type: safeType, name: name,
-                           poster: meta["poster"] as? String, posterShape: nil, popularity: nil)
-    }
+    // The Cinemeta resolve that used to live here (verbatim) now lives in `CinemetaPreviewResolver`, shared
+    // with the SIMKL rail so external-service rails cannot drift apart on their last mile. Behavior is
+    // unchanged: the extracted version IS this one, tt guard included.
 }

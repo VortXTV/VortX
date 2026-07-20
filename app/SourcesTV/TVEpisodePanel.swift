@@ -105,7 +105,7 @@ struct TVPlayerSourcesPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                         ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
-                            if stream.playableURL != nil {
+                            if stream.playableURL(isEpisode: true) != nil {
                                 Button { onSelect(stream) } label: {
                                     SourceRow(stream: stream, isCurrent: StreamRanking.signature(stream) == currentSignature)
                                 }
@@ -165,12 +165,22 @@ struct TVPlayerSourcesPanel: View {
 func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], seriesId: String,
                              seriesName: String, fallbackPoster: String?, continuity: String?,
                              binge: String?, core: CoreBridge, account: StremioAccount) async -> PlaybackRequest? {
+    let episodeNumber = v.episodeNumber
+    let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
+        season: v.season, episode: episodeNumber
+    ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
     var firstPlayableAt: Date?
     for _ in 0 ..< 80 {                                    // ~20s ceiling, matching the episode page
         groups = core.streamGroups(forStreamId: v.id)
-        if groups.contains(where: { $0.streams.contains { $0.playableURL != nil } }), firstPlayableAt == nil {
+        let hasCandidate = groups.contains { group in
+            group.streams.contains { stream in
+                stream.playableURL(isEpisode: true) != nil
+                    || (episode != nil && (stream.isTorrent || stream.isUsenet))
+            }
+        }
+        if hasCandidate, firstPlayableAt == nil {
             firstPlayableAt = Date()
         }
         let progress = core.streamLoadProgress(forStreamId: v.id)
@@ -180,17 +190,48 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
         try? await Task.sleep(for: .milliseconds(250))
     }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
-    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin),
-          let url = best.playableURL else { return nil }
-    core.loadEnginePlayer(for: best)
-    tvPrimeTorrentStream(best)   // no-op for direct / debrid URLs; the embedded server needs the create first
+    let candidates = StreamRanking.rankedCandidates(
+        groups, continuity: continuity, binge: binge, pin: pin
+    )
+    var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
+    for candidate in candidates {
+        let ref: DebridPlaybackRef?
+        if episode != nil, candidate.isTorrent || candidate.isUsenet {
+            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+                for: candidate, episode: episode
+            )
+        } else {
+            ref = nil
+        }
+        if let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+            isUsenet: candidate.isUsenet, resolvedURL: ref?.url,
+            fallbackURL: candidate.playableURL(isEpisode: true)
+        ) {
+            selected = (candidate, url, ref)
+            break
+        }
+    }
+    guard let selected else { return nil }
+    let stream = selected.stream
+    let rawBase = groups.first(where: { $0.streams.contains(stream) })?.id
+    let base = rawBase.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
+    let bindingSucceeded = core.loadEnginePlayer(
+        for: stream, videoId: v.id, base: base, resolvedURL: selected.ref?.url
+    )
+    let engineVideoID = EpisodePlaybackIdentity.boundVideoID(
+        requestedVideoID: v.id, bindingSucceeded: bindingSucceeded
+    )
+    if selected.ref == nil { tvPrimeTorrentStream(stream) }
     let meta = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
                             name: seriesName, poster: v.thumbnail ?? fallbackPoster,
                             season: v.season, episode: v.episode)
     let title = "\(seriesName)  ·  S\(v.season ?? 0)E\(v.episodeNumber)"
-    return PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
-                           sourceHint: StreamRanking.signature(best), torrent: best.isTorrent,
-                           bingeGroup: best.behaviorHints?.bingeGroup, headers: best.requestHeaders)
+    return PlaybackRequest(url: selected.url, title: title, meta: meta, episodes: episodes,
+                           sourceHint: StreamRanking.signature(stream),
+                           torrent: selected.ref == nil && stream.isTorrent,
+                           bingeGroup: stream.behaviorHints?.bingeGroup,
+                           headers: stream.requestHeaders, debridRef: selected.ref,
+                           sourceStream: stream, enginePlayerVideoId: engineVideoID)
 }
 
 /// Tell the embedded server to create the torrent engine (POST /{hash}/create) before the player opens its

@@ -43,7 +43,7 @@ cross-platform difference is capability, never look: the web client has **no bui
 | `danger` | `#DE4856` | destructive (log out, remove) |
 
 Themeable accents (chrome only; never change the layout): vortx gold (default), ember `#F27849` (the
-old StremioX accent), ocean, forest, royal, crimson, gold `#E2B44A`, rose, mono. Plus OLED true-black
+previous default accent), ocean, forest, royal, crimson, gold `#E2B44A`, rose, mono. Plus OLED true-black
 canvas option. Accent recolors the mark + all accent uses live.
 
 ### Typography
@@ -177,7 +177,7 @@ list-bullet, play-rectangle, bookmark, bookmark-fill, share, star-fill, checkmar
 weight.
 
 ## 7. Anti-patterns (the "looks like a prototype / not VortX" tells)
-The old StremioX ember accent; bare text glyphs; scattered equal-weight buttons (no clear primary);
+The old ember accent; bare text glyphs; scattered equal-weight buttons (no clear primary);
 flat uniform spacing; nested cards; borders used for elevation; a full-page backdrop wash (the backdrop
 is a banner); a generic poster scroller Home with no featured hero; microscopic text; gradient text;
 side-stripe accents.

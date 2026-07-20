@@ -1,8 +1,10 @@
 package com.vortx.android.player
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.os.Build
 import android.view.Display
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -21,10 +24,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
+import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Slider
@@ -40,11 +48,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.model.Playable
+import com.vortx.android.ui.theme.VortXGlass
+import com.vortx.android.ui.theme.vortxGlass
+import com.vortx.android.ui.theme.vortxGlassPanel
+import com.vortx.android.ui.theme.vortxGlassProminent
 
 /// The VortX-specific chrome layered over whichever [PlayerEngine] is live. It is fully engine-agnostic:
 /// it renders the [PlayerState] snapshot and calls back through the transport + track lambdas, never
@@ -63,14 +76,46 @@ fun PlayerChrome(
     emberAccent: Color,
     speed: Float,
     scaleMode: VideoScaleMode,
+    /// Whether the top scrim + control cluster and the bottom transport bar are drawn. The selection
+    /// sheets and the error overlay are NOT gated on it: a sheet the viewer opened must survive an
+    /// auto-hide tick, and an error must always be visible. The host owns the show/hide/auto-hide
+    /// policy; defaults to always-visible so the chrome stays usable in isolation.
+    controlsVisible: Boolean = true,
+    /// Reported for chrome-internal continuous interactions (scrubber drags, sheet opens) so the host
+    /// can re-arm its auto-hide timer. No-op by default.
+    onInteraction: () -> Unit = {},
     onBack: () -> Unit,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
+    /// Relative seek in milliseconds (negative = back): the +/-10s transport buttons drive this, and the
+    /// host also wires the double-tap gesture to the same engine seam. See [PlayerEngine.seekBy].
+    onSeekBy: (Long) -> Unit,
     onSelectAudio: (Int) -> Unit,
     onSelectSubtitle: (Int?) -> Unit,
     onSetSpeed: (Float) -> Unit,
     onToggleScaleMode: () -> Unit,
     onErrorRetry: () -> Unit,
+    /// Player Lock: engages the host's touch-lock (controls hidden, taps/gestures ignored until the
+    /// unlock affordance is used). Null hides the lock control entirely, keeping the chrome usable
+    /// in isolation and on hosts that opt out (the TV shell, where D-pad focus makes a touch-lock
+    /// meaningless).
+    onLock: (() -> Unit)? = null,
+    /// Picture-in-Picture: shrinks the player into the system PiP window (the host wires it to
+    /// [PlayerScreen]'s PiP handle). Null hides the control entirely: devices/hosts without PiP
+    /// support (no system feature, an activity that does not declare it) never show a dead button.
+    onEnterPip: (() -> Unit)? = null,
+    /// External subtitles offered by the installed subtitle add-ons for THIS title (the Apple
+    /// `SubtitleAddons` union, fetched by the host once per load). Listed in the subtitle sheet
+    /// under the file's embedded tracks; picking one mounts + selects it on the live engine via
+    /// [onSelectAddonSubtitle]. Empty (the default) leaves the sheet exactly as before.
+    addonSubtitles: List<AddonSubtitle> = emptyList(),
+    onSelectAddonSubtitle: (AddonSubtitle) -> Unit = {},
+    /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
+    /// no community sheet (the common case for a title nobody has contributed yet, and always so while
+    /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
+    /// what [com.vortx.android.trickplay.TrickplaySession.previewAt] guarantees: an in-memory crop of an
+    /// already-downloaded sprite. Defaults to no preview so the chrome stays usable in isolation.
+    scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
@@ -78,7 +123,8 @@ fun PlayerChrome(
 
     Box(modifier = modifier) {
         // Top scrim so the title, back button, and controls stay legible over bright video.
-        Column(
+        // Gated (with the transport bar below) on [controlsVisible]: this pair is what auto-hides.
+        if (controlsVisible) Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
@@ -109,12 +155,23 @@ fun PlayerChrome(
                         .padding(start = 4.dp),
                 )
                 // Control cluster: audio (when >1 track), subtitles (always, includes Off), speed, aspect.
+                // Opening a sheet counts as interaction so the host's auto-hide timer re-arms.
                 if (state.audioTracks.size > 1) {
-                    ChromeIcon(Icons.Filled.Audiotrack, "Audio track") { openSheet = ControlSheet.AUDIO }
+                    ChromeIcon(Icons.Filled.Audiotrack, "Audio track") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 }
-                ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { openSheet = ControlSheet.SUBTITLE }
-                ChromeIcon(Icons.Filled.Speed, "Playback speed") { openSheet = ControlSheet.SPEED }
+                ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
+                ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
+                // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
+                // therefore most protected-from-fat-finger) position.
+                onEnterPip?.let { pip ->
+                    ChromeIcon(Icons.Filled.PictureInPictureAlt, "Picture in picture") { pip() }
+                }
+                // Player Lock: hides the chrome and freezes touch input so nothing mid-film seeks or
+                // pauses by accident; the host draws the unlock affordance while locked.
+                onLock?.let { lock ->
+                    ChromeIcon(Icons.Filled.Lock, "Lock player controls") { lock() }
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
                 if (playable.viaStreamingServer) ChromeBadge("SOURCE", emberAccent)
@@ -127,11 +184,14 @@ fun PlayerChrome(
         }
 
         // Bottom transport: play/pause + scrubber, driven entirely by [state] (engine-agnostic).
-        TransportBar(
+        if (controlsVisible) TransportBar(
             state = state,
             emberAccent = emberAccent,
             onTogglePause = onTogglePause,
             onSeek = onSeek,
+            onSeekBy = onSeekBy,
+            onInteraction = onInteraction,
+            scrubPreview = scrubPreview,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter),
@@ -150,6 +210,12 @@ fun PlayerChrome(
                 options = buildList {
                     add(SheetOption("Off", state.subtitleTracks.none { it.selected }) { onSelectSubtitle(null) })
                     state.subtitleTracks.forEach { t -> add(SheetOption(trackLabel(t.title, t.lang), t.selected) { onSelectSubtitle(t.id) }) }
+                    // Add-on subtitles, after the embedded tracks (Apple lists them the same way):
+                    // picking one mounts it on the live engine, after which it also appears above as
+                    // a regular (selected) track.
+                    addonSubtitles.forEach { sub ->
+                        add(SheetOption("${sub.lang} · ${sub.addonName}", false) { onSelectAddonSubtitle(sub) })
+                    }
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -165,6 +231,31 @@ fun PlayerChrome(
             ControlSheet.NONE -> Unit
         }
 
+        // Buffering / connecting indicator: a centered spinner whenever the engine reports no data
+        // flowing -- the initial open (both engines publish isBuffering=true from load until the first
+        // frame), an mpv `paused-for-cache` mid-stream stall, an ExoPlayer rebuffer. Before this, an
+        // opening stream showed a bare black frame with a Pause glyph and an empty scrubber, which read
+        // as a hang. Suppressed under the terminal overlays: an error must show the error, not a spinner.
+        // The "Connecting" label is only added before a duration is known (nothing demuxed yet); a
+        // mid-stream rebuffer keeps the plain spinner.
+        if (state.isBuffering && !state.hasError && !state.hasEnded) {
+            Column(
+                modifier = Modifier.align(Alignment.Center),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
+                if (state.durationMs <= 0L) {
+                    Text(
+                        text = "Connecting...",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+        }
+
         // Error-to-sources fallback: a failed source lands here instead of a dead black frame.
         if (state.hasError) {
             PlayerErrorOverlay(emberAccent = emberAccent, onRetry = onErrorRetry, onBack = onBack)
@@ -177,6 +268,10 @@ private enum class ControlSheet { NONE, AUDIO, SUBTITLE, SPEED }
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+
+/// The relative-seek step (ms) for the transport's Replay10/Forward10 buttons. 10s matches the icon
+/// glyphs and the host's double-tap gesture step.
+private const val SEEK_STEP_MS = 10_000L
 
 private data class SheetOption(val label: String, val selected: Boolean, val onPick: () -> Unit)
 
@@ -200,7 +295,9 @@ private fun ControlSelectionSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color(0xFF11110F))
+                // The selection sheet is a VortX glass panel (was a flat near-black fill): high-alpha warm
+                // glass so track labels stay legible over bright video. Top-rounded, flush to the bottom.
+                .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -261,9 +358,9 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 15.sp,
+                    // Primary recovery action as ember glass (was a solid accent slab).
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(emberAccent)
+                        .vortxGlassProminent(shape = RoundedCornerShape(8.dp), tint = emberAccent)
                         .clickable(onClick = onRetry)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -271,9 +368,13 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     text = "Back",
                     color = Color.White,
                     fontSize = 15.sp,
+                    // Secondary action as neutral VortX glass (was a flat white 12% fill).
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color.White.copy(alpha = 0.12f))
+                        .vortxGlass(
+                            shape = RoundedCornerShape(8.dp),
+                            fillAlpha = VortXGlass.fieldFillAlpha,
+                            shadow = VortXGlass.Shadow.flat,
+                        )
                         .clickable(onClick = onBack)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -291,6 +392,11 @@ private fun TransportBar(
     emberAccent: Color,
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
+    onSeekBy: (Long) -> Unit,
+    /// Reported on every scrub drag frame so the host's auto-hide timer cannot expire mid-gesture and
+    /// yank the slider out from under the finger. No-op by default.
+    onInteraction: () -> Unit = {},
+    scrubPreview: (Double) -> Bitmap? = { null },
     modifier: Modifier = Modifier,
 ) {
     var scrubbing by remember { mutableStateOf(false) }
@@ -304,6 +410,16 @@ private fun TransportBar(
         else -> 0f
     }
 
+    // The community scrub thumbnail for wherever the finger currently is. Recomputed only when the
+    // scrubbed SECOND changes, not on every pixel of drag: `crop` allocates a bitmap, so keying on the raw
+    // float would allocate on every frame of the gesture and make scrubbing the jankiest thing in the
+    // player. One crop per second of scrubbed time is exactly the tile granularity anyway (tiles are 10s
+    // apart), so nothing visible is lost. This mirrors the SkipButton's per-second recompute key.
+    val scrubSeconds = if (duration > 0L) (scrubValue * duration / 1000.0) else 0.0
+    val previewBitmap = remember(scrubbing, scrubSeconds.toLong()) {
+        if (scrubbing && duration > 0L) scrubPreview(scrubSeconds) else null
+    }
+
     Column(
         modifier = modifier
             .background(
@@ -314,12 +430,41 @@ private fun TransportBar(
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
+        // Scrub preview, drawn ABOVE the transport row so it never covers the slider the finger is on.
+        // Present only while dragging a title that actually has a community sheet; otherwise the row is
+        // simply absent and the transport looks exactly as it does today.
+        previewBitmap?.let { bmp ->
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier
+                    .padding(start = 64.dp, bottom = 8.dp)
+                    .size(width = 160.dp, height = 90.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+            )
+        }
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onTogglePause) {
                 Icon(
                     imageVector = if (state.isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
                     contentDescription = if (state.isPaused) "Play" else "Pause",
                     tint = Color.White,
+                )
+            }
+            // The +/-10s jump controls (the relative seek the scrubber physically cannot do: 10s of a
+            // 2h film is under a pixel of slider travel). Gated like the slider on a known duration.
+            IconButton(onClick = { onSeekBy(-SEEK_STEP_MS) }, enabled = duration > 0L) {
+                Icon(
+                    imageVector = Icons.Filled.Replay10,
+                    contentDescription = "Back 10 seconds",
+                    tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
+                )
+            }
+            IconButton(onClick = { onSeekBy(SEEK_STEP_MS) }, enabled = duration > 0L) {
+                Icon(
+                    imageVector = Icons.Filled.Forward10,
+                    contentDescription = "Forward 10 seconds",
+                    tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }
             Text(
@@ -331,6 +476,7 @@ private fun TransportBar(
             Slider(
                 value = sliderValue,
                 onValueChange = {
+                    onInteraction()
                     scrubbing = true
                     scrubValue = it
                 },
@@ -375,8 +521,10 @@ private fun trimSpeed(speed: Float): String {
     return s.ifEmpty { "1" }
 }
 
-/// Milliseconds -> H:MM:SS / M:SS. Kept local; no dependency on any engine.
-private fun formatTime(ms: Long): String {
+/// Milliseconds -> H:MM:SS / M:SS. No dependency on any engine. Internal (was private): the gesture
+/// seek HUD (PlayerGestures.kt) renders the same H:MM:SS shape, and one formatter keeps the two
+/// surfaces from ever drifting.
+internal fun formatTime(ms: Long): String {
     val totalSeconds = (ms / 1000).coerceAtLeast(0L)
     val hours = totalSeconds / 3600
     val minutes = (totalSeconds % 3600) / 60
@@ -395,9 +543,10 @@ private fun ChromeBadge(text: String, accent: Color) {
         color = Color.White,
         fontSize = 10.sp,
         fontWeight = FontWeight.Bold,
+        // The SOURCE / DOLBY VISION / speed badges as ember glass (was a near-opaque accent fill): the
+        // prominent glass keeps the ember color but reads as tinted glass over the video frame.
         modifier = Modifier
-            .clip(RoundedCornerShape(4.dp))
-            .background(accent.copy(alpha = 0.85f))
+            .vortxGlassProminent(shape = RoundedCornerShape(6.dp), tint = accent)
             .padding(horizontal = 8.dp, vertical = 3.dp),
     )
 }

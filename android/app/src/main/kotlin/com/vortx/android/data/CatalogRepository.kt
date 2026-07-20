@@ -7,6 +7,7 @@ import com.vortx.android.model.DiscoverTypeOption
 import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.LibraryFilters
+import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.LibrarySortOption
 import com.vortx.android.model.LibraryTypeOption
@@ -77,6 +78,17 @@ interface CatalogRepository {
     /// type/sort option's `request`.
     suspend fun library(requestJson: String? = null): Result<LibraryResult>
 
+    /// The saved Library as PORTABLE export items: the same entries [library] returns, but carrying each
+    /// one's resume state and with the engine's `removed`/`temp` bookkeeping entries filtered out. Feeds
+    /// [com.vortx.android.library.LibraryTransfer]'s export; separate from [library] because the UI
+    /// projection ([MetaItem]) deliberately drops those fields.
+    ///
+    /// [now] is the ISO timestamp stamped on every exported item (the engine's entries carry a resume
+    /// state but no per-item last-watched clock). Default: an empty list, so a non-engine repository (the
+    /// Compose previews) reports "nothing to export" rather than pretending.
+    suspend fun libraryPortableItems(now: String): Result<List<LibraryPortability.Item>> =
+        Result.success(emptyList())
+
     /// Add a title to the Library (the "Save"/bookmark action from a poster's long-press menu or the
     /// detail page).
     suspend fun addToLibrary(item: MetaItem): Result<Unit>
@@ -99,6 +111,27 @@ interface CatalogRepository {
     /// control for [InstalledAddon.isProtected] entries, mirroring Apple `AddonsView`'s
     /// `!addon.isProtected` gate.
     suspend fun removeAddon(addon: InstalledAddon): Result<Unit>
+
+    /// Turn an installed add-on on/off for the ACTIVE profile (the Add-ons screen's eye toggle,
+    /// Apple `AddonsView.swift:424` -> `Profiles.swift:348 toggleAddon`). A per-profile RENDER-LAYER
+    /// overlay, never an engine/account change: a disabled add-on stays installed but is excluded
+    /// from this profile's Home board rows and stream-source groups. Default no-op so the offline
+    /// preview (which models no profiles) satisfies the contract unchanged.
+    suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean): Result<Unit> = Result.success(Unit)
+
+    /// Persist the user's add-on PRIORITY order (the Add-ons screen's drag-reorder, Apple
+    /// `AddonsView.swift:476 .onMove` -> `VortXSyncManager.applyInAppAddonOrder`). Display/pick-order
+    /// only -- the engine's `profile.addons` Vec is never rewritten, same as Apple. Default no-op for
+    /// the offline preview.
+    suspend fun applyAddonOrder(transportUrls: List<String>): Result<Unit> = Result.success(Unit)
+
+    /// Mark a CATALOG item watched/unwatched from its poster card, WITHOUT opening the detail page
+    /// first (Apple `iOSRootView.swift:4260` -> `CoreBridge.setCatalogWatched`). The detail screen's
+    /// [setWatched] cannot serve a card: its engine action (`MetaDetails -> MarkAsWatched`) acts on
+    /// the currently OPEN `meta_details`, which a card tap never loaded. The engine's
+    /// `MetaItemMarkAsWatched` creates a temporary library item when none exists, which is exactly
+    /// the card/discover use case. Default no-op for the offline preview.
+    suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> = Result.success(Unit)
 
     /// Full-text search across every add-on the user has installed.
     suspend fun search(query: String): Result<List<MetaItem>>

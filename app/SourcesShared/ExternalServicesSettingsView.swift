@@ -87,6 +87,12 @@ private struct TraktConnectCard: View {
     @AppStorage(ExternalSyncToggle.traktScrobble) private var scrobble = true
     @AppStorage(ExternalSyncToggle.traktWatchlist) private var watchlist = true
     @AppStorage(ExternalSyncToggle.traktImportWatched) private var importWatched = false
+    @AppStorage(ExternalSyncToggle.traktResumeSuggestion) private var resumeSuggestion = false
+    // Defaults MUST match the `default:` each key is read with at runtime (see ExternalSyncToggle.isOn),
+    // so a never-touched switch and the code behind it agree. Ratings default ON, like scrobble/watchlist.
+    @AppStorage(ExternalSyncToggle.traktRatings) private var ratings = true
+    // Default OFF: it adds a control to the detail page and announces viewing on the user's Trakt feed.
+    @AppStorage(ExternalSyncToggle.traktCheckin) private var checkin = false
 
     var body: some View {
         ProviderCard {
@@ -98,6 +104,25 @@ private struct TraktConnectCard: View {
                 Toggle("Show titles watched on Trakt as watched here", isOn: $importWatched)
                     .tint(Theme.Palette.accent)
                     .onChange(of: importWatched) { _ in WatchedIndex.shared.externalShadowChanged() }
+                // Gates the detail page's rating chip AND its mirror. Turning it off never deletes a
+                // rating: they live in the local shadow, so turning it back on brings them all back.
+                Toggle("Rate titles and sync your ratings", isOn: $ratings)
+                    .tint(Theme.Palette.accent)
+                // A SUGGESTION only: your position on this device is always what Play/Resume uses, and
+                // nothing here changes it. The copy says "offer" deliberately, because a tap is required.
+                Toggle("Offer to pick up where you left off on another device", isOn: $resumeSuggestion)
+                    .tint(Theme.Palette.accent)
+                    .onChange(of: resumeSuggestion) { on in
+                        // Turning it off drops the cached positions now rather than leaving them on disk for
+                        // a feature the user just declined. Turning it on lets the next pre-play open pull
+                        // (refreshIfStale's own toggle gate blocked every earlier attempt).
+                        if !on { TraktPlaybackShadow.shared.reset() }
+                    }
+                // Adds an "I'm watching this" action to detail pages, for a cinema or someone else's TV.
+                // Never fires on its own: what you play in VortX is already scrobbled, so this is only
+                // for viewing VortX cannot see, and it always takes a deliberate tap.
+                Toggle("Let me check in to what I watch elsewhere", isOn: $checkin)
+                    .tint(Theme.Palette.accent)
                 Button("Disconnect") { disconnect() }
                     .buttonStyle(ChipButtonStyle(selected: false))
             } else if let code {
@@ -155,9 +180,21 @@ private struct TraktConnectCard: View {
             // Wipe local shadow state so the imported watched badges drop now and no queued push can drain
             // into the next account that connects on this device (cross-account contamination).
             TraktSyncEngine.shared.reset()
+            // Same rule for the playback shadow: those are the disconnecting account's private positions,
+            // and leaving them cached would offer one person's resume points to the next account here.
+            TraktPlaybackShadow.shared.reset()
+            // And the ratings shadow: one person's scores must not show as the next account's "Your
+            // rating", nor drain to their Trakt from this device's queue. Same contamination rule.
+            TraktRatingsStore.shared.reset()
             await MainActor.run {
                 connected = false; code = nil; qr = nil
                 WatchedIndex.shared.externalShadowChanged()   // rebuild the read path without the shadow set
+                // Drop Home rows built from PRIVATE / friends-only Trakt lists: those titles were readable
+                // only through the session we just ended, so leaving them on-device would leak one account's
+                // private list into the next account that connects here. Same cross-account contamination
+                // rule as the shadow wipe above. Rows from PUBLIC lists survive (they never needed the
+                // connection, and the user built them as browse rows).
+                ImportedCatalogs.shared.removeConnectionScoped(provider: .trakt)
                 NotificationCenter.default.post(name: TraktRailsModel.disconnectedNote, object: nil)   // clear the Home watchlist rail now
             }
         }
@@ -239,7 +276,10 @@ private struct SIMKLConnectCard: View {
     private func disconnect() {
         Task {
             await SIMKLAuth.shared.signOut()
-            await MainActor.run { connected = false; pin = nil; qr = nil }
+            await MainActor.run {
+                connected = false; pin = nil; qr = nil
+                NotificationCenter.default.post(name: SIMKLRailsModel.disconnectedNote, object: nil)   // clear the Home plan-to-watch rail now
+            }
         }
     }
 }

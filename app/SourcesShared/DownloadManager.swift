@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Combine
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -26,9 +27,37 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// Most downloads we run at once. Beyond this, new downloads are created `.queued` and start
     /// automatically as running ones finish / fail / are cancelled / are paused (start-next-on-finish).
-    /// Kept small: each transfer is a multi-GB media file, and torrent transfers also pin the loopback
-    /// node server, so a low cap avoids thrashing bandwidth + disk + (for torrents) the server.
-    private static let maxConcurrentDownloads = 2
+    /// Kept small BY DEFAULT: each transfer is a multi-GB media file, and torrent transfers also pin the
+    /// loopback node server, so a low cap avoids thrashing bandwidth + disk + (for torrents) the server.
+    /// Now USER-CONFIGURABLE from the download queue manager (persisted). RAISING the cap fills the freed
+    /// slots immediately; LOWERING it NEVER stops an in-flight transfer (that could corrupt a partial
+    /// file), it only applies to future starts. Published so the queue view's stepper reflects it live.
+    @Published private(set) var maxConcurrentDownloads: Int = DownloadManager.defaultMaxConcurrent
+
+    /// UserDefaults key + bounds for the user-set concurrency cap. The range stays deliberately small for
+    /// the same bandwidth / disk / loopback-server reasons the default is 2.
+    static let maxConcurrentDefaultsKey = "vortx.downloads.maxConcurrent"
+    static let concurrencyRange = 1...5
+    private static let defaultMaxConcurrent = 2
+
+    /// Explicit drain order for `.queued` downloads (queue manager reorder). The queue otherwise drains
+    /// oldest-first by `addedAt`; this list lets the user move a pending item up or down. Persisted so a
+    /// reorder survives relaunch, and Published so the queue view renders the SAME order the drainer starts
+    /// in. May hold ids that are momentarily not `.queued` (harmless: the ordering read filters to live
+    /// queued rows) and is pruned of removed ids on the next terminal transition.
+    @Published private(set) var queueOrder: [UUID] = []
+    static let queueOrderDefaultsKey = "vortx.downloads.queueOrder"
+
+    /// UserDefaults / `@AppStorage` key for the opt-in "auto-delete watched downloads" setting: when ON,
+    /// a downloaded title whose content becomes fully finished-watched has its file + record removed to
+    /// reclaim storage. DEFAULT OFF (an absent key reads `false`, so the feature is inert until the user
+    /// turns it on). This constant is the single source of truth for the key name; the Settings toggle is
+    /// wired separately on the SAME key, and it is read here at each finished-watched signal.
+    static let autoDeleteWatchedDefaultsKey = "vortx.downloads.autoDeleteWatched"
+
+    /// Live subscription to the app-wide finished-watched signal (`WatchedIndex.ids`). Each emission runs
+    /// the opt-in auto-delete sweep. Held for the life of the singleton, so it never needs tearing down.
+    private var watchedCancellable: AnyCancellable?
 
     /// Maps a live URLSession task to the record it's filling, both ways, so a delegate callback (which
     /// arrives with only a task) resolves to a record id, and a pause/cancel(id:) resolves to its task.
@@ -51,6 +80,13 @@ final class DownloadManager: NSObject, ObservableObject {
     /// daemon staging failure is retried once from scratch, but a genuinely unwritable destination still
     /// surfaces its error on the second hit instead of looping.
     private var cannotCreateFileRetries: [UUID: Int] = [:]
+
+    /// Records parked after a completed-while-LOCKED background transfer failed to save with -3000: the device
+    /// was locked when nsurlsessiond finalized the file, so creating it under the default (Complete) protection
+    /// class failed. Restarting immediately would just re-download and fail again while still locked, so these
+    /// are held `.paused` and auto-resumed on `protectedDataDidBecomeAvailable` (device unlock). In memory only:
+    /// a cold relaunch leaves the record `.paused` (resumable by hand), never a dead `.failed`.
+    private var awaitingUnlockRetry: Set<UUID> = []
 
     /// Last progress tick forwarded to the store per record (#24). The OS delivers `didWriteData` many
     /// times per second per active download; unthrottled, each tick was a main-thread `records` publish
@@ -85,6 +121,49 @@ final class DownloadManager: NSObject, ObservableObject {
     /// instantly suspend the app and kill the node server mid-transfer.
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     #endif
+
+    /// Register for device-unlock so a download parked after a -3000 save failure auto-resumes instead of
+    /// dead-ending. Three triggers, all routed to `retryDownloadsAwaitingUnlock` (which no-ops when nothing
+    /// is parked or the device is still locked): `protectedDataDidBecomeAvailable` (the unlock itself),
+    /// `didBecomeActive`, and `willEnterForeground` — the last two are belt-and-braces flushes for an unlock
+    /// that happened while the app was suspended (that notification would have been missed) AND for the
+    /// unlocked-but-parked fallback below, which recovers on the next foreground. The singleton lives for the
+    /// process, so the observers never need removing.
+    override init() {
+        super.init()
+        // Restore the queue manager's settings (fail-soft): a missing / out-of-range cap falls back to the
+        // default, missing / garbage order data falls back to an empty order (plain addedAt draining).
+        if let stored = UserDefaults.standard.object(forKey: Self.maxConcurrentDefaultsKey) as? Int {
+            maxConcurrentDownloads = Self.clampConcurrency(stored)
+        }
+        queueOrder = (UserDefaults.standard.array(forKey: Self.queueOrderDefaultsKey) as? [String])?
+            .compactMap(UUID.init) ?? []
+        #if canImport(UIKit)
+        let center = NotificationCenter.default
+        center.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification,
+                           object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryDownloadsAwaitingUnlock() }
+        }
+        center.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                           object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryDownloadsAwaitingUnlock() }
+        }
+        center.addObserver(forName: UIApplication.willEnterForegroundNotification,
+                           object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryDownloadsAwaitingUnlock() }
+        }
+        #endif
+        // Opt-in auto-delete: react to the app-wide finished-watched signal. WatchedIndex republishes
+        // `ids` (on the main queue) on every watched/unwatched transition AND on profile switch, and it is
+        // deliberately quiescent DURING playback (its catch-up rebuild only fires once the player is
+        // dismissed), so a currently-playing downloaded file is never yanked out from under the player.
+        // Read-only: we only observe the set, never write watch state. Touching WatchedIndex.shared here
+        // also materializes it so the signal is live. The initial replay covers already-watched titles.
+        watchedCancellable = WatchedIndex.shared.$ids
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.autoDeleteFinishedWatchedIfEnabled() }
+            }
+    }
 
     // MARK: Sessions
 
@@ -168,7 +247,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
         // Honor the concurrency cap: start now only if a slot is free, else create the record `.queued` and
         // let it start when a running download finishes / fails / is cancelled / paused (start-next-on-finish).
-        let canStartNow = activeCount < Self.maxConcurrentDownloads
+        let canStartNow = activeCount < maxConcurrentDownloads
         let record = DownloadRecord(
             id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
             name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
@@ -184,7 +263,11 @@ final class DownloadManager: NSObject, ObservableObject {
         // a locked-device completion still trips -3000; the completion move also ensures it, this is belt+braces.
         try? DownloadStore.ensureDownloadsDirectoryExists()
 
-        if canStartNow { startTask(for: record, url: resolvedURL) }
+        if canStartNow {
+            startTask(for: record, url: resolvedURL)
+        } else {
+            appendToQueueOrder(record.id)   // record it in the reorderable drain order (queue manager)
+        }
         return record
     }
 
@@ -230,8 +313,9 @@ final class DownloadManager: NSObject, ObservableObject {
         // Respect the concurrency cap on resume too: if every slot is busy, re-queue instead of
         // starting now, so resuming several paused items can't blow past the cap. It starts when a
         // slot frees (start-next-on-finish), exactly like a freshly-queued download.
-        guard activeCount < Self.maxConcurrentDownloads else {
+        guard activeCount < maxConcurrentDownloads else {
             store.update(id: id) { $0.state = .queued }
+            appendToQueueOrder(id)   // rejoins the drain order at the tail (queue manager)
             return
         }
         store.update(id: id) { $0.state = .downloading }
@@ -264,10 +348,96 @@ final class DownloadManager: NSObject, ObservableObject {
         clearTask(id: id)
         resumeData[id] = nil
         cannotCreateFileRetries[id] = nil
+        awaitingUnlockRetry.remove(id)
         #if os(iOS)
         cancelAssetTask(id: id)
         #endif
         store.remove(id: id)
+        pruneQueueOrder()
+    }
+
+    // MARK: Queue manager (concurrency cap + reorder)
+
+    private static func clampConcurrency(_ value: Int) -> Int {
+        min(max(value, concurrencyRange.lowerBound), concurrencyRange.upperBound)
+    }
+
+    /// Set the max-concurrent-downloads cap (queue manager). Clamped to `concurrencyRange` and persisted.
+    /// RAISING the cap pulls queued items into the newly-freed slots right away; LOWERING it leaves every
+    /// running transfer alone (stopping one could corrupt a partial file) and simply gates future starts.
+    func setMaxConcurrentDownloads(_ value: Int) {
+        let clamped = Self.clampConcurrency(value)
+        guard clamped != maxConcurrentDownloads else { return }
+        maxConcurrentDownloads = clamped
+        UserDefaults.standard.set(clamped, forKey: Self.maxConcurrentDefaultsKey)
+        fillAvailableSlots()   // no-op when the cap dropped (activeCount already >= cap)
+    }
+
+    /// `.queued` records in the exact order they will start: explicit `queueOrder` first, then `addedAt`
+    /// for any id not yet in the order list. The queue view and the drainer both read THIS, so what the
+    /// user sees is what starts next.
+    func orderedQueuedRecords() -> [DownloadRecord] {
+        let rank = Dictionary(queueOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        return store.records
+            .filter { $0.state == .queued }
+            .sorted { a, b in
+                switch (rank[a.id], rank[b.id]) {
+                case let (x?, y?): return x < y
+                case (_?, nil):    return true            // an ordered item precedes an unordered one
+                case (nil, _?):    return false
+                case (nil, nil):   return a.addedAt < b.addedAt
+                }
+            }
+    }
+
+    /// Move a pending (`.queued`) download one place earlier / later in the drain order. A no-op when the
+    /// item is already at that end, or is no longer queued (it started or was paused between taps).
+    func moveQueuedEarlier(id: UUID) { reorderQueued(id: id, by: -1) }
+    func moveQueuedLater(id: UUID)   { reorderQueued(id: id, by: +1) }
+
+    private func reorderQueued(id: UUID, by delta: Int) {
+        var ids = orderedQueuedRecords().map(\.id)
+        guard let from = ids.firstIndex(of: id) else { return }
+        let to = from + delta
+        guard ids.indices.contains(to) else { return }   // already first / last: nothing to do
+        ids.swapAt(from, to)
+        // Persist this queued ordering as authoritative; the drainer reads it on the next free slot.
+        queueOrder = ids
+        UserDefaults.standard.set(ids.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
+    }
+
+    /// Append a freshly-queued download to the tail of the drain order. Idempotent, so a re-queue (e.g. a
+    /// paused item resumed while every slot is busy) never duplicates the id.
+    private func appendToQueueOrder(_ id: UUID) {
+        guard !queueOrder.contains(id) else { return }
+        queueOrder.append(id)
+        UserDefaults.standard.set(queueOrder.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
+    }
+
+    /// Drop ids whose record is gone (cancelled / auto-deleted). State flips (queued <-> downloading <->
+    /// paused) are left in place so a paused item keeps its position when it re-queues. Persists only on a
+    /// real change, so an ordinary terminal transition with a clean order pays nothing.
+    private func pruneQueueOrder() {
+        let filtered = queueOrder.filter { store.record(id: $0) != nil }
+        guard filtered != queueOrder else { return }
+        queueOrder = filtered
+        UserDefaults.standard.set(filtered.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
+    }
+
+    /// Pull queued downloads into EVERY free slot. `startNextQueued` starts one and re-arms itself from
+    /// `clearTask` on the next finish, but a cap raise opens several slots at once, so loop until the cap
+    /// is met or the queue is empty. Guarded against a no-progress spin: if a pass neither starts a task
+    /// nor shrinks the queue (e.g. every remaining record has a broken URL and was failed), stop.
+    private func fillAvailableSlots() {
+        func queuedCount() -> Int { store.records.filter { $0.state == .queued }.count }
+        while activeCount < maxConcurrentDownloads {
+            let beforeActive = activeCount
+            let beforeQueued = queuedCount()
+            startNextQueued()
+            // No forward progress (no task started AND the queue did not shrink) means the remainder is
+            // unstartable this pass; stop rather than spin.
+            if activeCount == beforeActive, queuedCount() == beforeQueued { break }
+        }
     }
 
     // MARK: Task lifecycle
@@ -424,7 +594,9 @@ final class DownloadManager: NSObject, ObservableObject {
         // tries to reconnect a task that is gone. No-op if the record was already removed (cancel).
         if store.record(id: id) != nil { store.update(id: id) { $0.taskIdentifier = nil } }
         endForegroundAssertionIfIdle()
-        // A slot just freed (finish / fail / pause / cancel): pull the next queued download in.
+        // Keep the reorderable drain order free of ids whose record is gone, then pull the next queued
+        // download into the slot that just freed (finish / fail / pause / cancel).
+        pruneQueueOrder()
         startNextQueued()
     }
 
@@ -434,14 +606,13 @@ final class DownloadManager: NSObject, ObservableObject {
     /// count of running downloads, which is what the cap gates on.
     private var activeCount: Int { taskForRecord.count }
 
-    /// Start the oldest `.queued` download if a slot is free. Picks the earliest-added queued record so
-    /// the queue drains in the order downloads were requested. Fail-soft: a queued record whose source
-    /// URL no longer parses is marked `.failed` and skipped, so one bad URL can't wedge the queue.
+    /// Start the next `.queued` download if a slot is free. Picks the head of the reorderable drain order
+    /// (`orderedQueuedRecords`, which falls back to earliest-added), so the queue drains in the order the
+    /// user set in the queue manager, or request order when untouched. Fail-soft: a queued record whose
+    /// source URL no longer parses is marked `.failed` and skipped, so one bad URL can't wedge the queue.
     private func startNextQueued() {
-        guard activeCount < Self.maxConcurrentDownloads else { return }
-        guard let next = store.records
-            .filter({ $0.state == .queued })
-            .min(by: { $0.addedAt < $1.addedAt }) else { return }
+        guard activeCount < maxConcurrentDownloads else { return }
+        guard let next = orderedQueuedRecords().first else { return }
         guard let url = URL(string: next.remoteURL) else {
             store.update(id: next.id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
             // Skipping a broken record freed nothing, but another queued record may now be startable.
@@ -658,6 +829,45 @@ final class DownloadManager: NSObject, ObservableObject {
         return known.contains(ext) ? ext : "mp4"
     }
 
+    /// Mirror one `[downloads]` breadcrumb into BOTH log sinks: `NSLog` (the unified log, pulled off-device
+    /// via devicectl/Console) AND `DiagnosticsLog` (the app's EXPORTABLE diagnostic trail, `vortx-diag.log`,
+    /// the file users actually attach to a report). The download subsystem historically logged only via
+    /// `NSLog`, so every -3000 branch and the full failure detail were INVISIBLE in exported logs, which is
+    /// why #132 could not be diagnosed from user reports (their trail carried [poster]/[engine]/[server] but
+    /// nothing from downloads). Route every downloads event through here. `nonisolated` + thread-safe on both
+    /// sinks, so it is callable from the @MainActor body and the off-main delegate Tasks alike.
+    private nonisolated func logDownload(_ message: String) {
+        NSLog("[downloads] %@", message)
+        DiagnosticsLog.log("downloads", message)
+    }
+
+    /// True when files under the default (Complete) protection class are creatable right now, i.e. the device
+    /// has been unlocked since boot and is not currently locked. On platforms without UIKit (native macOS)
+    /// there is no such gate, so writes are always permitted and a download never parks for unlock.
+    private var isProtectedDataAvailable: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.isProtectedDataAvailable
+        #else
+        return true
+        #endif
+    }
+
+    /// Resume every download parked by a completed-while-locked -3000 save failure, once the device is
+    /// unlocked again. Each still-`.paused` record goes back through `resume()` (which continues from stashed
+    /// resume data if the OS provided any, else restarts from the source) and its holding message is cleared.
+    /// A record the user cancelled or that changed state is skipped. No-op when nothing is parked (the common
+    /// case), so an ordinary unlock / foreground pays nothing.
+    private func retryDownloadsAwaitingUnlock() {
+        guard isProtectedDataAvailable, !awaitingUnlockRetry.isEmpty else { return }
+        let ids = awaitingUnlockRetry
+        awaitingUnlockRetry.removeAll()
+        for id in ids {
+            guard let record = store.record(id: id), record.state == .paused else { continue }
+            store.update(id: id) { $0.errorText = nil }
+            resume(id: id)
+        }
+    }
+
     /// True when a resolved playback URL is an adaptive HLS playlist (.m3u8): a single-file download task
     /// only fetches the tiny playlist, not the media segments. Cheap string check, no network. `nonisolated`
     /// (pure) so the off-main download delegate can call it too.
@@ -680,6 +890,60 @@ final class DownloadManager: NSObject, ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return false }
         return text.hasPrefix("#extm3u") || text.hasPrefix("#ext-x-")
             || text.hasPrefix("<!doctype") || text.hasPrefix("<html") || text.hasPrefix("<?xml") || text.hasPrefix("<head")
+    }
+
+    // MARK: Auto-delete watched downloads (opt-in)
+
+    /// Opt-in storage reclaim (DEFAULT OFF): when a downloaded title has become fully finished-watched,
+    /// delete its on-disk file and drop its record. Driven by the `WatchedIndex.ids` signal wired in
+    /// `init`. Read-only w.r.t. watch state — it only READS the finished-watched signal and calls the local
+    /// delete path (`DownloadStore.remove`, which unlinks the file and removes the row); it never marks,
+    /// unmarks, or otherwise mutates watch/progress/library state.
+    ///
+    /// SAFETY GUARDS: only a `.completed` record with NO live transfer is ever eligible, so a still
+    /// downloading, queued, paused, or failed item is never touched, and a partially-watched title is never
+    /// deleted (the watched signals we read are "finished" signals — `WatchedIndex.ids` holds only
+    /// watched/marked metas + fully-watched series, and an overlay's `watchedVideoIds` holds only finished
+    /// videos — so neither can report a partial watch). Fail-soft: `store.remove` swallows a missing/locked
+    /// file, and we snapshot the ids BEFORE deleting since `remove` mutates `store.records`.
+    private func autoDeleteFinishedWatchedIfEnabled() {
+        guard UserDefaults.standard.bool(forKey: Self.autoDeleteWatchedDefaultsKey) else { return }
+        // Never reclaim a file while a player is up: a downloaded title could be the one playing right now.
+        // WatchedIndex is already quiescent during playback (so this method's own trigger won't fire then),
+        // but this makes the guarantee self-contained for any future caller that sweeps mid-session.
+        guard !CoreBridge.shared.playerActive else { return }
+        let idsToDelete: [UUID] = store.records.compactMap { record in
+            guard record.state == .completed else { return nil }        // never in-flight / queued / paused / failed
+            guard taskForRecord[record.id] == nil else { return nil }   // never a record with a live byte transfer
+            #if os(iOS)
+            guard assetTaskForRecord[record.id] == nil else { return nil }   // nor a live HLS asset transfer
+            #endif
+            return isFinishedWatched(record) ? record.id : nil
+        }
+        for id in idsToDelete {
+            logDownload("auto-delete finished-watched download id=\(id.uuidString)")
+            store.remove(id: id)
+        }
+    }
+
+    /// True when this completed download's content has been FULLY finished-watched by the ACTIVE profile.
+    /// Read-only, and it honors the per-profile watch-history invariant exactly as `WatchedIndex` does:
+    ///  - OWNER profile (`activeUsesEngineHistory`): the engine-derived `WatchedIndex.ids`. A movie matches
+    ///    on its own id; an episode is reclaimed only once its WHOLE series is finished (per-episode engine
+    ///    ticks are not exposed here, so this stays conservative — it never deletes a partly-watched show).
+    ///  - OVERLAY profile: that profile's PRIVATE overlay only (never the account/engine set). Per-episode
+    ///    exact (`watchedVideoIds` holds each finished episode id), and a finished movie records its own id.
+    private func isFinishedWatched(_ record: DownloadRecord) -> Bool {
+        let profiles = ProfileStore.shared
+        let isEpisode = record.usesSeriesLifecycle
+        if profiles.activeUsesEngineHistory {
+            let watched = WatchedIndex.shared.ids
+            // Movie: contentId == videoId == metaId; either matches. Episode: only the series-completion
+            // rollup (contentId) counts — an episode id is not carried in the engine watched set.
+            return watched.contains(record.contentId) || (!isEpisode && watched.contains(record.videoId))
+        }
+        let overlay = profiles.watchedVideoIds(forMeta: record.contentId)
+        return overlay.contains(record.videoId) || overlay.contains(record.contentId)
     }
 }
 
@@ -795,30 +1059,74 @@ extension DownloadManager: URLSessionDownloadDelegate {
             if (error as NSError).code == NSURLErrorCancelled { return }
             if let resume { self.resumeData[id] = resume }
             let ns = error as NSError
-            // Self-healing retry for NSURLErrorCannotCreateFile (-3000). With ample free space this is not an
-            // out-of-space error: it is the background download daemon failing to create/write its OWN staging
-            // temp file, which is typically transient. Drop any stale resume data and restart the transfer ONCE
-            // from scratch so the daemon re-stages a fresh temp, instead of surfacing an opaque failure. The
-            // one-retry cap means a genuinely unwritable destination still ends in the clear message below.
+            // NSURLErrorCannotCreateFile (-3000) on a byte download. With ample free space this is NOT an
+            // out-of-space error; it has two distinct causes, handled differently below.
             if ns.code == NSURLErrorCannotCreateFile,
-               self.cannotCreateFileRetries[id, default: 0] < 1,
                let record = self.store.record(id: id), !record.isTorrent,
                let url = URL(string: record.remoteURL) {
-                self.resumeData[id] = nil
-                // clearTask resets cannotCreateFileRetries[id], so bump the count AFTER it or the one-retry
-                // cap never engages (it would loop -3000 forever).
-                self.clearTask(id: id)
-                self.cannotCreateFileRetries[id, default: 0] += 1
-                NSLog("[downloads] -3000 self-heal restart id=%@ attempt=%d", id.uuidString, self.cannotCreateFileRetries[id] ?? 1)
-                self.store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
-                self.startTask(for: record, url: url)
-                return
+                // (1) ROOT CAUSE of the reported "100% then couldn't save" (#132): the transfer FINISHED while
+                // the device was LOCKED, so nsurlsessiond could not create the completed file under the default
+                // (Complete) data-protection class and reported -3000 here (the error carries the source host,
+                // not a filesystem path, so it is the daemon's own create failure, not our move). Restarting
+                // NOW just re-downloads gigabytes and fails again while still locked, burning the one-shot
+                // self-heal for nothing (the "retry cap exhausted before the device unlocks" trap). Instead PARK
+                // the record `.paused` and auto-resume it on device unlock (protectedDataDidBecomeAvailable), so
+                // a completed-while-locked download recovers itself instead of dead-ending at "couldn't save".
+                // Keep any resume data the OS handed us (stashed above) so the retry continues rather than
+                // restarts. Do NOT consume the self-heal counter: a lock is not a defective destination.
+                if !self.isProtectedDataAvailable {
+                    self.awaitingUnlockRetry.insert(id)
+                    self.clearTask(id: id)
+                    self.store.update(id: id) {
+                        $0.state = .paused
+                        $0.errorText = String(localized: "Waiting to finish saving. It will retry automatically when you unlock your device.")
+                    }
+                    self.logDownload("-3000 completed-while-locked, parked for unlock retry id=\(id.uuidString) detail=\(Self.downloadFailureDetail(error))")
+                    return
+                }
+                // (2) Device is UNLOCKED, so this is a transient background-daemon staging failure. Drop any
+                // stale resume data and restart the transfer ONCE from scratch so the daemon re-stages a fresh
+                // temp. The one-retry cap means a genuinely unwritable destination still ends in the clear
+                // message below instead of looping.
+                if self.cannotCreateFileRetries[id, default: 0] < 1 {
+                    self.resumeData[id] = nil
+                    // clearTask resets cannotCreateFileRetries[id], so bump the count AFTER it or the one-retry
+                    // cap never engages (it would loop -3000 forever).
+                    self.clearTask(id: id)
+                    self.cannotCreateFileRetries[id, default: 0] += 1
+                    self.logDownload("-3000 self-heal restart id=\(id.uuidString) attempt=\(self.cannotCreateFileRetries[id] ?? 1) detail=\(Self.downloadFailureDetail(error))")
+                    self.store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
+                    self.startTask(for: record, url: url)
+                    return
+                }
+                // (3) FALLBACK — the device is UNLOCKED yet the one self-heal retry ALSO returned -3000. Do
+                // NOT dead-fail (the old behavior, which stranded a 100%-downloaded title at "couldn't save"
+                // and forced a full re-add: #132). A -3000 is a create failure, NOT out-of-space, and is
+                // transient far more often than terminal (a file created at finalize under a protection class
+                // still in flux, a background-daemon staging hiccup, an unlock that races the completion).
+                // Treat it as RECOVERABLE: park `.paused` + `awaitingUnlockRetry`, the SAME recovery path as
+                // case (1), so it auto-resumes on the next unlock / foreground instead of ending dead. Because
+                // `clearTask` resets the self-heal counter, each later resume gets a fresh self-heal-then-
+                // re-park cycle rather than burning through to a hard failure; a still-locked resume simply
+                // re-parks (retryDownloadsAwaitingUnlock guards on isProtectedDataAvailable). EXCEPTION: a
+                // -3000 whose underlying cause is ENOSPC really is a full volume, so let it fall through to the
+                // hard failure below rather than park-looping (which would re-download gigabytes every
+                // foreground and never succeed) — genuine out-of-space keeps failing as before.
+                if !Self.isOutOfSpace(error) {
+                    self.awaitingUnlockRetry.insert(id)
+                    self.clearTask(id: id)
+                    self.store.update(id: id) {
+                        $0.state = .paused
+                        $0.errorText = String(localized: "Waiting to finish saving. It will retry automatically when you unlock your device or reopen the app.")
+                    }
+                    self.logDownload("-3000 persisted after self-heal, parked for unlock/foreground retry id=\(id.uuidString) detail=\(Self.downloadFailureDetail(error))")
+                    return
+                }
             }
             // DIAGNOSTIC: the owner hit NSURLErrorCannotCreateFile (-3000) with ~200 GB free and a ~1 GB file,
             // so this is NOT out of space. Log the FULL error (domain/code/userInfo) so the true cause is
             // visible on-device, and surface the real domain/code instead of a wrong "storage" message.
-            NSLog("[downloads] task FAILED id=%@ code=%ld domain=%@ desc=%@ userInfo=%@",
-                  id.uuidString, ns.code, ns.domain, ns.localizedDescription, ns.userInfo as NSDictionary)
+            self.logDownload("task FAILED id=\(id.uuidString) code=\(ns.code) domain=\(ns.domain) desc=\(ns.localizedDescription) detail=\(Self.downloadFailureDetail(error)) userInfo=\(ns.userInfo)")
             self.store.update(id: id) {
                 $0.state = .failed
                 // Localize only the human prefix; the posix/path detail after it stays as-is (diagnostic).
@@ -898,6 +1206,20 @@ extension DownloadManager: URLSessionDownloadDelegate {
             if let upath = under.userInfo[NSFilePathErrorKey] as? String { parts.append("upath=\(upath)") }
         }
         return parts.joined(separator: " | ")
+    }
+
+    /// True when a failure is ultimately an out-of-space condition (POSIX ENOSPC, at the top level or as the
+    /// underlying error). A -3000 create failure backed by ENOSPC really is a full volume, so it must stay a
+    /// hard `.failed` (the user has to free space) instead of being parked for retry: parking would re-download
+    /// gigabytes and fail again at file-create on every foreground, never succeeding. Every OTHER -3000 is
+    /// transient and park-recoverable. Keeps the "genuine out-of-space keeps failing" invariant for the -3000
+    /// recovery path. `nonisolated` (pure) so the off-main delegate can call it.
+    nonisolated static func isOutOfSpace(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOSPC) { return true }
+        if let under = ns.userInfo[NSUnderlyingErrorKey] as? NSError,
+           under.domain == NSPOSIXErrorDomain, under.code == Int(ENOSPC) { return true }
+        return false
     }
 
     /// iOS has finished delivering every queued event for this background session (after relaunching the

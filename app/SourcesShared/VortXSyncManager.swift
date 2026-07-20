@@ -40,6 +40,12 @@ final class VortXSyncManager: ObservableObject {
 
     @Published private(set) var account: Account?
     @Published private(set) var isSignedIn = false
+    /// Wall-clock time of the LAST successful sync round-trip for the signed-in account: stamped on every
+    /// ACCEPTED push (pushSyncDocAt) and on every applied / definitively-empty pull (syncDown). Persisted
+    /// per account (lastSyncKey(for:)) so a relaunch still shows "last synced 2 hours ago", and published so
+    /// the seeding banner / SyncSettingsView repaint live. nil = this account has never completed a sync
+    /// from this device (or signed out).
+    @Published private(set) var lastSyncAt: Date?
 
     private let base = "https://api.vortx.tv"
     private let kcAccount = "vortx.sync.session.v1"
@@ -83,6 +89,61 @@ final class VortXSyncManager: ObservableObject {
     }
     private func persistLastSyncedVersion() { /* the computed setter above persists per-account; no-op kept so
         the advance-then-persist call sites read unchanged */ }
+    // #145 ORDERING GATE. "Has this device positively SEEN this account's document yet?", keyed PER ACCOUNT
+    // exactly like versionKey(for:). It is the single authority behind one rule: A DEVICE THAT HAS NOT YET
+    // APPLIED THE ACCOUNT'S DOC MUST NOT PUSH OVER IT, EVER. syncUp refuses while this is false, and syncDown
+    // treats false as an implicit `force` so neither the pending-push guard nor the version-wins guard can
+    // starve the very first restore.
+    //
+    // Why a SEPARATE key instead of `lastSyncedVersion == 0`: lastSyncedVersion is advanced by an accepted
+    // PUSH (pushSyncDocAt), not only by an apply, so on a device that already pushed once it reads "up to
+    // date" while having applied nothing. That is precisely the state that makes the #145 loss permanent (the
+    // next unforced pull dies at `pulled.version <= lastSyncedVersion`). This flag is written ONLY by syncDown,
+    // and only after the account's doc has actually been read: either a decrypted doc was applied, or the pull
+    // definitively reported the account HAS no doc (404 / empty), in which case there is nothing to push over
+    // and seeding is legitimate. A FAILED or undecryptable pull never sets it, so the fail-safe direction is
+    // "this device stays blocked from pushing" rather than "this device wipes the account".
+    //
+    // A fresh install starts at false because UserDefaults is empty, which is exactly the reinstall case. It is
+    // deliberately NOT cleared on signOut: per-account keying already isolates accounts, matching the
+    // lastSyncedVersion / lastAppliedProfileEditsAt precedent above.
+    private func appliedDocKey(for accountId: String?) -> String { "vortx.sync.didApplyAccountDoc." + (accountId ?? "") }
+    private var hasAppliedAccountDoc: Bool {
+        get { UserDefaults.standard.bool(forKey: appliedDocKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: appliedDocKey(for: account?.id)) }
+    }
+    /// Per-account "last successful sync" wall-clock stamp behind the published `lastSyncAt`. Keyed per
+    /// account exactly like versionKey(for:) so an account switch shows that account's own stamp. Under the
+    /// `vortx.sync.` prefix so SettingsBackup.deviceLocalKeyPrefixes keeps it out of every synced blob.
+    private func lastSyncKey(for accountId: String?) -> String { "vortx.sync.lastSuccessAt." + (accountId ?? "") }
+    /// Re-seed the published `lastSyncAt` from the persisted per-account stamp (sign-in / Keychain restore).
+    private func reloadLastSyncStamp() {
+        let t = UserDefaults.standard.double(forKey: lastSyncKey(for: account?.id))
+        lastSyncAt = t > 0 ? Date(timeIntervalSince1970: t) : nil
+    }
+    /// Record a successful sync round-trip NOW. The UserDefaults write rides the remote-apply suppression
+    /// window (nested calls are re-entrancy-safe, see withRemoteApplySuppressed) so stamping a push can
+    /// never arm ANOTHER push via the global didChange observer (a self-echo loop).
+    private func stampSyncSuccess() {
+        let now = Date()
+        withRemoteApplySuppressed {
+            UserDefaults.standard.set(now.timeIntervalSince1970, forKey: lastSyncKey(for: account?.id))
+        }
+        lastSyncAt = now
+    }
+    /// The Phase-0 seeding signal for the com.vortx move: this device is signed in AND has completed at
+    /// least one REAL sync round-trip with the account (an accepted push or an applied pull), so an
+    /// encrypted doc exists server-side and a future reinstall/bundle-id move restores it on sign-in.
+    /// `lastSyncedVersion > 0` backfills installs that synced before this build existed (it advances only
+    /// on an accepted push or an applied pull, never on an `.empty` account); `lastSyncAt` covers the
+    /// fresh path going forward. Deliberately NOT `hasAppliedAccountDoc`, which also flips on an `.empty`
+    /// pull, where nothing is backed up yet.
+    var hasCompletedFirstSync: Bool {
+        isSignedIn && (lastSyncAt != nil || lastSyncedVersion > 0)
+    }
+    /// In-flight guaranteed restore, so the sign-in kick, the Keychain-restored relaunch kick, and a syncUp
+    /// that is blocked by the gate all await ONE restore instead of racing several forced pulls at once.
+    private var restoreTask: Task<Bool, Never>?
     /// LWW stamp of the last web profileEdits applied, keyed PER ACCOUNT (mirroring versionKey(for:)) so an
     /// account switch cannot skip the new account's dashboard edits against the previous account's high-water
     /// mark. Persisted to UserDefaults so a sign-out / re-login for the SAME account does not re-window an old
@@ -94,6 +155,20 @@ final class VortXSyncManager: ObservableObject {
         get { UserDefaults.standard.double(forKey: editsAtKey(for: account?.id)) }
         set { UserDefaults.standard.set(newValue, forKey: editsAtKey(for: account?.id)) }
     }
+    /// The syncable keys the LAST account document this device APPLIED actually wrote, in migrated form (it
+    /// mirrors what SettingsBackup.restore persisted). Keyed PER ACCOUNT like the gates above, and stored under
+    /// the `vortx.sync.` prefix so SettingsBackup.deviceLocalKeyPrefixes already keeps it out of every synced blob
+    /// and backup file. SettingsBackup.mergedSyncBlob reads it on push to distinguish a setting the user
+    /// deliberately CLEARED on this device (absent locally AND in this baseline => delete from the push, so a
+    /// pull cannot re-pin it) from a key a peer authored after this device's last apply (absent AND not in the
+    /// baseline => keep). A fresh install has an EMPTY baseline, which is exactly why the reinstall guard still
+    /// holds: nothing is ever "absent AND in baseline", so no account key is deleted. Not reset on signOut
+    /// (per-account keying isolates accounts), matching lastSyncedVersion / hasAppliedAccountDoc above.
+    private func settingsBaselineKey(for accountId: String?) -> String { "vortx.sync.appliedSettingsKeys." + (accountId ?? "") }
+    private var appliedSettingsBaseline: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: settingsBaselineKey(for: account?.id)) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: settingsBaselineKey(for: account?.id)) }
+    }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
@@ -103,7 +178,11 @@ final class VortXSyncManager: ObservableObject {
     /// malicious/garbage synced `doc.addonOrder` can't balloon UserDefaults. Applied in the setter, which is the
     /// single chokepoint for both the in-app reorder and the syncDown apply.
     private static let maxAddonOrderEntries = 1024
-    static var appliedAddonOrder: [String] {
+    /// `nonisolated`: it only touches thread-safe `UserDefaults` (and Sendable `let` backing constants), so
+    /// nonisolated read sites like `CoreMetaDetails.meta` (the #144 detail-language pick, a plain Decodable
+    /// evaluated off the main actor) can consult the shared order without an actor hop. All existing
+    /// main-actor callers keep working (nonisolated members are callable from any context).
+    nonisolated static var appliedAddonOrder: [String] {
         get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
         set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
     }
@@ -214,7 +293,9 @@ final class VortXSyncManager: ObservableObject {
         guard let str = Keychain.string(kcAccount), let data = str.data(using: .utf8),
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
               let dk = Data(base64Encoded: p.dataKey) else { return }
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
+        reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
         // adopt(), so nothing would open the sync channel until the first scenePhase foreground transition.
         // On Apple TV that first transition can be minutes away (screensaver dismissal), leaving the device
@@ -227,8 +308,10 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signOut() {
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
+        lastSyncAt = nil   // the persisted per-account stamp stays (keyed by account id), the live value clears
         Keychain.set(nil, for: kcAccount)
         // The shared add-on ORDER is a global static with no account context, so a switched-in account would
         // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
@@ -259,6 +342,7 @@ final class VortXSyncManager: ObservableObject {
     }
 
     private func adopt(token: String, account acct: [String: Any], dataKey: Data) {
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         self.token = token
         self.dataKey = dataKey
         self.account = Account(
@@ -267,6 +351,7 @@ final class VortXSyncManager: ObservableObject {
             username: acct["username"] as? String ?? "",
             twoFactorEnabled: acct["twoFactorEnabled"] as? Bool ?? false)
         self.isSignedIn = true
+        reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         persist()
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
         // is active it would also be opened by scenePhase, but adopting here covers the in-place sign-in
@@ -280,7 +365,16 @@ final class VortXSyncManager: ObservableObject {
         // only on a real .doc pull (.failed/.empty do nothing), add-on installs are an install-only
         // union, and owner-library recovery requires the engine to have POSITIVELY reported an empty
         // account library first (see hydrateEngineFromOwnedAddons / recoverOwnerLibraryIfEmpty).
-        Task { await self.hydrateEngineFromOwnedAddons() }
+        //
+        // #145 M1: RESTORE BEFORE HYDRATE, and kick it here rather than relying on startRealtime() above, which
+        // is idempotent and no-ops when the channel is already live (a re-sign-in without a sign-out), leaving
+        // its restore kick unfired. Ordering: hydrate installs add-ons into the engine, which writes UserDefaults
+        // and arms a push, so restoring first means the account's doc is applied before anything can try to push
+        // over it. Both are single-flight / idempotent, so overlapping with startRealtime's kick is a no-op.
+        Task {
+            await self.restoreAccountDocIfNeeded()
+            await self.hydrateEngineFromOwnedAddons()
+        }
         // Reconciliation is decided by the UI after sign-in (reconcileAfterSignIn), so a sign-in never
         // blindly overwrites either side. A new account just gets seeded.
     }
@@ -431,14 +525,56 @@ final class VortXSyncManager: ObservableObject {
 
     /// Pull the doc plus its server version, so the foreground pull can apply only changes that are
     /// newer than what this device already has (and not re-apply its own last push).
-    private func pullDocVersioned() async -> (doc: [String: Any], version: Int)? {
-        guard dataKey != nil else { return nil }
+    ///
+    /// TRI-STATE (#145 M1), mirroring pullSyncDocResult: the old single-nil return collapsed "this account has
+    /// no doc yet", "the network blipped", and "the doc would not decrypt" into one value, so syncDown could not
+    /// tell "nothing to restore" from "I failed to read the account" and silently returned false either way.
+    /// That silent false is what let ONE unretried pull lose the reinstall race against the debounced push.
+    ///  - .doc:    decrypted, ready to apply.
+    ///  - .empty:  the server definitively says this account has no document (404, or 200 with no document).
+    ///             There is nothing to restore and nothing to push over.
+    ///  - .failed: we did NOT read the account. `retryable` separates a transient transport/server fault (worth
+    ///             another attempt) from a deterministic decrypt/parse refusal (retrying re-fails identically).
+    ///             Either way the caller must NOT treat this as an empty account.
+    private enum VersionedPull { case doc(doc: [String: Any], version: Int); case empty; case failed(retryable: Bool) }
+    private func pullDocVersionedResult() async -> VersionedPull {
+        guard dataKey != nil else { return .failed(retryable: false) }
         let (code, json) = await request("GET", "/v1/backup", auth: true)
-        guard code == 200, let docStr = json?["document"] as? String,
-              let version = json?["version"] as? Int,
-              let pt = openSyncDocument(docStr, version: version),
-              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return nil }
-        return (obj, version)
+        if code == 404 { return .empty }                                  // no backup yet
+        // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
+        // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
+        guard code == 200 else { return .failed(retryable: code == 0 || code >= 500) }
+        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty }  // 200, no document
+        // `version` stays `as? Int` (Swift's Int is 64-bit on every platform this app targets), so an epoch-ms
+        // version is carried whole. Never narrow this to a 32-bit type: a truncated version corrupts the AAD and
+        // GCM auth then fails on every Apple / web doc.
+        guard let version = json?["version"] as? Int else { return .failed(retryable: false) }
+        // A doc we cannot open is NOT an empty account. Refusing it (rather than falling through to a nil that
+        // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
+        guard let pt = openSyncDocument(docStr, version: version),
+              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed(retryable: false) }
+        return .doc(doc: obj, version: version)
+    }
+
+    /// pullDocVersionedResult with a bounded retry on TRANSIENT faults only (#145 M1). The reinstall restore was
+    /// a race between one unretried pull and a 2.5s-debounced destructive push: a single dropped packet on a
+    /// device still joining Wi-Fi lost it. Deterministic refusals (undecryptable doc, no data key) are not
+    /// retried because the retry re-fails identically; they stay .failed so the caller stays blocked rather than
+    /// seeding over a doc it never read. Bounded and short (~1.2s worst case) so the 10s while-active poll and
+    /// the foreground pull never stack up behind it.
+    private func pullDocVersionedRetrying(attempts: Int = 3) async -> VersionedPull {
+        var delayNanos: UInt64 = 400_000_000
+        for attempt in 0..<max(1, attempts) {
+            let result = await pullDocVersionedResult()
+            switch result {
+            case .doc, .empty: return result
+            case .failed(let retryable):
+                guard retryable, attempt < attempts - 1 else { return result }
+                try? await Task.sleep(nanoseconds: delayNanos)
+                delayNanos *= 2
+            }
+        }
+        return .failed(retryable: true)
     }
 
     /// Push a doc at an explicit version. Returns the worker's optimistic-concurrency verdict so the
@@ -460,6 +596,7 @@ final class VortXSyncManager: ObservableObject {
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
             if Self.writeSyncDocV2 { Self.markSawDocV2(account?.id ?? "") }  // H-1: account's stored doc is now v2
+            stampSyncSuccess()           // the account now holds this device's doc: "last synced" = now
             return .accepted(version: version)
         }
         // Rejected (a concurrent write won). The worker echoes the current stored version so we can retry
@@ -615,7 +752,25 @@ final class VortXSyncManager: ObservableObject {
         if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
-        for entry in engineLibrary { if let id = entry["id"] as? String { libraryByID[id] = entry } }
+        for entry in engineLibrary {
+            guard let id = entry["id"] as? String else { continue }
+            // Wave 4 clobber guard (Finding 1): do NOT let a bare, progress-less engine item (t == 0 AND d == 0,
+            // the signature of a freshly AddToLibrary'd title on a cold / recovered / post-import device whose
+            // engine re-adds owner titles at time 0) OVERWRITE a prior doc entry that already carries a resume
+            // offset. Without this, a second VortX-only device pushing 0 would destroy device A's stored progress
+            // for that title across the whole account. A genuine finish / rewind keeps d > 0 (only t goes to 0),
+            // so it still propagates the zero; only the "no state at all" case is preserved, merged onto the
+            // fresh engine metadata (name / poster / type) so the doc keeps both the offset and current title info.
+            if let prior = libraryByID[id],
+               Self.libSeconds(entry["t"]) == 0, Self.libSeconds(entry["d"]) == 0,
+               (Self.libSeconds(prior["t"]) > 0 || Self.libSeconds(prior["d"]) > 0) {
+                var merged = entry
+                merged["t"] = prior["t"]; merged["d"] = prior["d"]; merged["v"] = prior["v"]
+                libraryByID[id] = merged
+                continue
+            }
+            libraryByID[id] = entry
+        }
         // SUBTRACT the durable removal tombstones from the library union (the library analogue of subtracting
         // deletedAddons from the add-on union): a title the user removed must NOT come back, even if the engine
         // still briefly holds it OR a peer device's prior doc.vortx.library still carries it. Compared on the
@@ -670,8 +825,9 @@ final class VortXSyncManager: ObservableObject {
         // SUBTRACT the durable removal tombstones from the union (the add-on analogue of subtracting
         // deletedProfiles from the roster union): an add-on the user removed must NOT come back, even if
         // the engine still briefly holds it OR a peer device's prior doc.vortx.addons still carries it.
-        // Official/protected stubs are never tombstoned, so this never drops a default. Compared on the
-        // same normalized (trim+lowercase) transportUrl the tombstone is stored under.
+        // PROTECTED stubs (Cinemeta, Local Files) are never tombstoned, so this never drops an essential
+        // default; a removable official add-on the user deleted IS dropped (#137). Compared on the same
+        // normalized (trim+lowercase) transportUrl the tombstone is stored under.
         let removedAddons = AddonTombstones.all()
         var addonList: [[String: Any]] = []
         var seenAddonURLs = Set<String>()
@@ -710,8 +866,30 @@ final class VortXSyncManager: ObservableObject {
         // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
         // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
         // resurrecting them. Empty set is omitted so a fresh account never writes the key.
-        let deleted = store.deletedProfileIDs
-        if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
+        //
+        // READ-MERGE, never rebuild-from-local (#145 M6): UNION the account's already-owned tombstones
+        // (existingVortx) with the local set so a push can NEVER SHRINK the deleted-profiles set, symmetric
+        // with how foldDocTombstones protects deletedLibrary / deletedAddons. `v` is built FRESH here and
+        // wholesale REPLACES doc["vortx"] at the call site, so emitting only the LOCAL set silently DROPS
+        // every tombstone this device has not folded: a device that never saw a peer's delete republishes a
+        // doc without that tombstone, and the next peer union-merge RESURRECTS the deleted profile (with its
+        // watch overlay). A device whose local set is momentarily empty (a fresh reinstall before its first
+        // syncDown fold) erased the account's whole set in one push. This device may only ADD tombstones,
+        // never retract one another device authored; a profile is never un-deleted (the owner is never
+        // tombstoned), so the union only ever grows.
+        // The owner id is dropped defensively (it is never tombstoned; a stray one would erase the account
+        // owner). Ids read back out of the doc are normalized to the uppercase `uuidString` form this set is
+        // keyed on (UserProfile.normalizeID), exactly as Android's buildVortx normalizes the same read, so a
+        // foreign-cased id cannot fork into a second tombstone that matches no live profile. The owner id is
+        // filtered AFTER normalizing, so a lowercase owner id is caught rather than slipping through.
+        // Sorted so the emitted array is deterministic across pushes and byte-identical to Android's
+        // buildVortx for the same set (Set iteration order is otherwise arbitrary on both platforms).
+        var deleted = store.deletedProfileIDs
+        if let priorDeleted = existingVortx?["deletedProfiles"] as? [String] {
+            deleted.formUnion(priorDeleted.map { UserProfile.normalizeID($0) }
+                .filter { $0 != UserProfile.ownerID.uuidString })
+        }
+        if !deleted.isEmpty { v["deletedProfiles"] = deleted.sorted() }
         // Durable cross-device add-on REMOVAL tombstones (app-authoritative, exactly like deletedProfiles;
         // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
         // device uninstalls them on its next pull instead of re-hydrating them. Empty set is omitted.
@@ -751,9 +929,32 @@ final class VortXSyncManager: ObservableObject {
     /// Push this device's profiles + settings to the account. MERGES into the existing doc (preserving
     /// keys other surfaces wrote, e.g. the website's Stremio import) instead of replacing it, and carries
     /// the metadata keys explicitly because they live in the Keychain (SettingsBackup excludes them).
+    ///
+    /// `afterUserChoseThisDevice` is the ONE legitimate way past the restore gate below, and it exists only for
+    /// the three-way conflict prompt's "Keep this device" button. That prompt is shown only after
+    /// accountHasSyncData() positively READ the account's doc and the user, seeing that the account holds data,
+    /// chose to overwrite it. Never pass true from an automatic or engine-driven path: #145 is precisely what
+    /// happens when an unattended push decides on the user's behalf.
     @discardableResult
-    func syncUp() async -> Bool {
+    func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
         guard isSignedIn else { return false }
+        // #145 M1, THE ORDERING RULE: A DEVICE THAT HAS NOT YET APPLIED THE ACCOUNT'S DOC MUST NOT PUSH OVER IT.
+        // Restore first, then push. Every destructive-push path in the bug funnels through here (the debounced
+        // observer push, the engine-driven pushThisDevice calls, the background push), so this one gate closes
+        // all of them, and it does not depend on the restore winning a race: if the restore has not landed, the
+        // push does not happen at all. It is a REFUSAL, not a deferral: the local edit is not queued for later,
+        // because after the restore lands the account's state is the truth and re-pushing this device's
+        // pre-restore snapshot over it is the bug. A genuine post-restore edit arms its own push as usual.
+        if !hasAppliedAccountDoc, !afterUserChoseThisDevice {
+            // Try to satisfy the gate right now rather than dropping the push forever: on the reinstall path
+            // this is what turns "push over the account" into "restore, then push". Single-flight, so several
+            // blocked pushes plus the sign-in kick await ONE restore instead of stampeding the endpoint.
+            await restoreAccountDocIfNeeded()
+            guard hasAppliedAccountDoc else {
+                NSLog("[sync] push refused: this device has not applied the account's doc yet (#145 gate)")
+                return false
+            }
+        }
         // Build the merged doc from the current account base, then push with optimistic-concurrency
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
@@ -789,8 +990,22 @@ final class VortXSyncManager: ObservableObject {
         if let cloudRoster = Self.decodeRoster(fromSettingsBlob: doc["settings"]) {
             ProfileStore.shared.mergeInRoster(cloudRoster)
         }
-        guard let data = try? SettingsBackup.makeBackup() else { return nil }
-        doc["settings"] = data.base64EncodedString()
+        // READ-MERGE the settings blob onto the PULLED one, exactly like the tombstones/roster/apiKeys/vortx
+        // fields above and below (#145 M2). This used to be `makeBackup()`, a snapshot of THIS DEVICE'S
+        // UserDefaults domain, assigned straight over the pulled doc's settings. On a reinstalled device that
+        // domain is near-empty, so this single line erased the account's settings, every secondary profile's
+        // Continue Watching, and its searches. mergedSyncBlob keeps every account key this device does not have
+        // UNLESS the per-account applied-blob baseline (passed below) shows this device once applied it and the
+        // user has since CLEARED it, in which case that deliberate removal is honored as a delete rather than
+        // resurrected; and it lets a key this device DOES have win. See its doc comment for why not per-key LWW.
+        //
+        // nil = the account HAS a settings blob and it did not decode. Leave doc["settings"] exactly as
+        // pulled: pushing a local-only snapshot over a blob we could not read is the very bug, and an
+        // unreadable blob is the case where we know least about what we would be destroying. The rest of the
+        // doc still pushes; the settings blob is preserved verbatim for a client that can read it.
+        if let merged = SettingsBackup.mergedSyncBlob(onto: doc["settings"], appliedBaseline: appliedSettingsBaseline) {
+            doc["settings"] = merged.base64EncodedString()
+        }
         doc["format"] = 1
         // Pass the PULLED vortx block so vortxSummary can union the account-owned add-on set (never
         // shrink it from a degraded engine) and preserve addonsOwnedAt.
@@ -838,6 +1053,16 @@ final class VortXSyncManager: ObservableObject {
         // Keychain directly, so this is safe off the main actor). Set only when locally non-empty; NEVER remove
         // it on absence (another device authored it) - the same asymmetric read-merge guard as the debrid keys.
         if let blob = MediaServerStore.shared.syncBlob() { keys["vortx.mediaServers"] = blob }
+        // IPTV playlists (Live TV) ride the SAME encrypted apiKeys channel as ONE JSON blob. The playlist
+        // METADATA is a UserDefaults key, so it already rides the settings blob and survives a reinstall; the
+        // Xtream / M3U CREDENTIALS are Keychain-only, which SettingsBackup deliberately excludes, so they did
+        // NOT survive and the restored playlist came back dead (visible in Settings, impossible to re-register
+        // or refresh, no way back but re-typing the login). Mirroring them here is the same answer this channel
+        // already gives every other Keychain-only secret that must follow the account: debrid keys, Trakt /
+        // SIMKL tokens, media-server tokens. The ACCOUNT token is NOT among them and never can be: it is the key
+        // that opens this document. Set only when locally non-empty; NEVER remove it on absence (another device
+        // authored it) - the same asymmetric read-merge guard as the debrid keys.
+        if let blob = IPTVPlaylistStore.shared.syncBlob() { keys["vortx.iptv"] = blob }
         if keys.isEmpty { doc.removeValue(forKey: "apiKeys") } else { doc["apiKeys"] = keys }
         // Recent searches, per profile (SearchHistoryStore is UserDefaults-only so it does not ride the
         // SettingsBackup blob). Key by the same profile id the search UI uses (activeID), plus the
@@ -881,6 +1106,51 @@ final class VortXSyncManager: ObservableObject {
         return result
     }
 
+    /// GUARANTEED RESTORE (#145 M1). Make this device apply the account's document before it is ever allowed to
+    /// push over it. Returns true once the gate is open: either a doc was applied, or the account definitively
+    /// has none.
+    ///
+    /// This replaces a RACE with an ORDER. The old restore was one unforced syncDown() fired at sign-in, which
+    /// returned false silently on any transient network fault and bailed outright whenever hasPendingPush was
+    /// armed, while the sign-in flow itself guaranteed a UserDefaults write that armed it. So restore-vs-destroy
+    /// came down to whether one pull beat one 2.5s debounce. Here the restore is forced (syncDown treats a shut
+    /// gate as force, so neither the pending-push guard nor the version-wins guard can turn it away), retried
+    /// with backoff across transient faults, and, decisively, the push side WAITS on the outcome instead of
+    /// racing it: syncUp refuses while the gate is shut.
+    ///
+    /// Failure is safe by construction. If every attempt fails (offline, server down, undecryptable doc), the
+    /// gate stays shut, so this device keeps its local state and pushes nothing. It retries on the next launch,
+    /// foreground, poll tick, or blocked push. The cost of staying shut is that a user who is offline (or whose
+    /// doc will not open) cannot push until it opens; that is the correct trade against wiping their account,
+    /// and "Keep this device" in the conflict prompt remains the explicit, user-chosen way through.
+    @discardableResult
+    func restoreAccountDocIfNeeded() async -> Bool {
+        guard isSignedIn else { return false }
+        if hasAppliedAccountDoc { return true }
+        // Single-flight: adopt(), startRealtime(), and any blocked syncUp can all arrive at once. Assigning
+        // restoreTask before the first await means concurrent callers join this task rather than starting their
+        // own forced pulls. Safe on the main actor: the Task body cannot begin until this function suspends.
+        if let inFlight = restoreTask { return await inFlight.value }
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            defer { self.restoreTask = nil }
+            var delayNanos: UInt64 = 1_000_000_000
+            for attempt in 0..<5 {
+                await self.syncDown(force: true)
+                if self.hasAppliedAccountDoc { return true }
+                guard attempt < 4 else { break }
+                try? await Task.sleep(nanoseconds: delayNanos)
+                delayNanos = min(delayNanos * 2, 8_000_000_000)
+            }
+            if !self.hasAppliedAccountDoc {
+                NSLog("[sync] account doc not restored yet (#145 gate stays shut; pushes refused until it opens)")
+            }
+            return self.hasAppliedAccountDoc
+        }
+        restoreTask = task
+        return await task.value
+    }
+
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
     /// was restored.
     /// Pull the account's profiles + settings and apply them locally. Version-aware so it only applies
@@ -898,11 +1168,43 @@ final class VortXSyncManager: ObservableObject {
         // housekeeping is suppressed and no longer arms hasPendingPush (see the observer + suppressHousekeeping):
         // an idle receiving device has hasPendingPush == false, so it still applies a peer's newer settings. The
         // queued push fires on its own debounce and syncUp read-merges, so deferring here never loses anything.
-        if !force, hasPendingPush { return false }
-        guard let pulled = await pullDocVersioned() else { return false }
+        //
+        // #145 M1: this guard is CONDITIONAL ON HAVING ALREADY RESTORED. Both of the reasons it exists (do not
+        // revert the edit the user just made, the queued push will read-merge anyway) presuppose that this
+        // device already holds the account's state. On a device that has never applied the account's doc,
+        // neither holds: there is no "pre-edit value" to protect, and the queued push is the destructive one.
+        // Deferring to it is exactly the reinstall race, and it is armed unconditionally because the sign-in
+        // flow itself writes UserDefaults. So while the restore gate is closed, a never-restored device pulls
+        // regardless of a queued push, and syncUp refuses to let that push land first.
+        let mustRestore = !hasAppliedAccountDoc
+        let effectiveForce = force || mustRestore
+        if !effectiveForce, hasPendingPush { return false }
+        let pulled: (doc: [String: Any], version: Int)
+        switch await pullDocVersionedRetrying() {
+        case .doc(let doc, let version):
+            pulled = (doc, version)
+        case .empty:
+            // The account definitively HAS no document. Nothing to restore, and nothing this device could push
+            // over, so open the gate: a genuinely fresh account must still be seedable (reconcileAfterSignIn's
+            // .seededFromDevice path pushes through syncUp). Stamped inside the suppression window because it is
+            // a UserDefaults write, and an unsuppressed write here would arm the very push we are ordering.
+            withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+            return false
+        case .failed:
+            // We did NOT read the account (transient fault already retried, or an undecryptable doc). Leave the
+            // gate shut: syncUp stays blocked, so a failed read can never become a destructive push.
+            return false
+        }
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
         // is a no-op. lastSyncedVersion is persisted per account (versionKey(for:)) so this holds across relaunches.
-        if !force, pulled.version <= lastSyncedVersion { return false }
+        //
+        // #145 M1/M3: `effectiveForce` (not `force`) so a device that has never applied the account's doc is
+        // never turned away here. lastSyncedVersion is advanced by an accepted PUSH, not only by an apply, so on
+        // a device that already pushed once this guard reads "you are up to date" about a doc it has never read
+        // and returns false forever. That is what makes the loss permanent on the client, and with no peer to
+        // publish a newer version a single-device user never escapes it. Gating on hasAppliedAccountDoc instead
+        // of on the version is what breaks that: the version can lie about whether we restored, the flag cannot.
+        if !effectiveForce, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
@@ -921,10 +1223,26 @@ final class VortXSyncManager: ObservableObject {
             let localRosterBefore = ProfileStore.shared.profiles
             if ((try? SettingsBackup.restore(from: data)) ?? 0) > 0 {
                 restored = true
+                // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
+                // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
+                // setting the user later clears on THIS device (absent locally AND in this baseline) is deleted
+                // from the push instead of being resurrected by the account on the following pull. This is a
+                // UserDefaults write under the vortx.sync. prefix, so it stays inside this suppression window (no
+                // self-echo push) and never travels in a synced blob. REPLACE-not-union: the baseline tracks the
+                // LATEST applied doc's key set, not a growing history.
+                appliedSettingsBaseline = SettingsBackup.appliedKeys(from: data)
                 ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
                 ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
                 ProfileStore.shared.applyLocalTombstones()           // a profile deleted this session stays gone even if the pulled doc predates its tombstone (the resurrect window)
                 LastStreamStore.invalidateCache()                    // the restore wrote new lastStream behind the cache; re-read it
+                // Every OTHER store that reads UserDefaults once at init is just as blind to the restore:
+                // UserDefaults KVO does not fire for our dotted keys, so nothing above re-reads them. Worse,
+                // each re-persists its stale in-memory value on the next change (ThemeManager's didSet fires on
+                // ANY write, including a profile switch's applyTheme), flushing the pre-restore value straight
+                // back over the pulled one and making the loss permanent. Re-read them here, synchronously and
+                // inside the suppression window, so those writes cannot arm a self-echo push. Runs AFTER the
+                // roster settles: the per-profile stores key off ProfileStore.activeID.
+                SettingsBackup.reloadLiveStores()
             }
         }
         if let keys = doc["apiKeys"] as? [String: String] {
@@ -967,6 +1285,14 @@ final class VortXSyncManager: ObservableObject {
             if let blob = keys["vortx.mediaServers"] {
                 Task { @MainActor in MediaServerStore.shared.applySyncBlob(blob) }
             }
+            // IPTV playlists (Live TV): adopt a playlist registered on another device, and re-seed the Keychain
+            // credentials a reinstall dropped, which is what makes a restored playlist live again instead of a
+            // dead row. Union-merges by slug, honors removal tombstones, and writes a synced credential to the
+            // Keychain only when the local slot is empty (Keychain stays authoritative). Apply only when present
+            // so a doc without it never clears a locally-added playlist. Called SYNCHRONOUSLY (unlike the media
+            // servers above): the store is @MainActor and so is this region, so its UserDefaults writes stay
+            // inside the suppression window and cannot arm a self-echo push.
+            if let blob = keys["vortx.iptv"] { IPTVPlaylistStore.shared.applySyncBlob(blob) }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
@@ -992,7 +1318,7 @@ final class VortXSyncManager: ObservableObject {
         }
         // Cross-device add-on REMOVAL tombstones (the add-on analogue of the deletedProfiles fold above).
         // Reached ONLY inside this withRemoteApplySuppressed region, which runs after a STRICTLY-NEWER,
-        // SUCCESSFUL pullDocVersioned() — a .failed/.empty pull returns earlier, so a stale/partial sync
+        // SUCCESSFUL pullDocVersionedRetrying() . A .failed/.empty pull returns earlier, so a stale/partial sync
         // can NEVER drive an uninstall. Fold the app-authored doc.vortx.deletedAddons AND a (future)
         // web-authored doc.webAddonRemovals array into the durable local set, then uninstall any
         // tombstoned add-on still installed in the engine. The uninstall is HARD-GATED to non-official,
@@ -1063,6 +1389,11 @@ final class VortXSyncManager: ObservableObject {
                 if LibraryTombstones.merge(legacyIDs: removedLib, stampsRaw: removedLibTs) { restored = true }
             }
         }
+        // Wave 4 (Finding D): refresh the local owner-resume cache from the pulled owner library, so a WARM
+        // device (non-empty engine, which skips recoverOwnerLibraryIfEmpty) converges its resume offsets to the
+        // account truth without a cold relaunch. Runs after the tombstone fold above so a removed title is
+        // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
+        refreshOwnerResumeCache(from: doc)
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
@@ -1087,7 +1418,7 @@ final class VortXSyncManager: ObservableObject {
                 Self.shared.withRemoteApplySuppressed {
                     for addon in CoreBridge.shared.addons
                     where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
-                        && !addon.isOfficial && !addon.isProtected {
+                        && !addon.isProtected {
                         CoreBridge.shared.uninstallAddon(addon, tombstone: false)
                     }
                 }
@@ -1133,6 +1464,16 @@ final class VortXSyncManager: ObservableObject {
         // UserDefaults, which would otherwise fire the observer and re-arm a push (another self-echo path).
         lastSyncedVersion = max(lastSyncedVersion, pulled.version)
         persistLastSyncedVersion()
+        // #145 M1: OPEN THE RESTORE GATE. This is the ONLY place a decrypted doc opens it, and it is reached
+        // only after that doc has been applied above, so the flag cannot claim a restore that did not happen.
+        // Same reason as the version stamp for living inside the suppression window: it is a UserDefaults write,
+        // and arming a push from the act of restoring is the self-echo this region exists to prevent.
+        hasAppliedAccountDoc = true
+        // A decrypted account doc was applied: "last synced" = now. INSIDE the suppression window like the
+        // stamps above: stamping after the window closes would enqueue this write's didChange notification
+        // BEHIND the outer window's queued clear, so the observer would see it unsuppressed and arm a
+        // spurious push of the just-applied doc (the same self-echo class this region exists to prevent).
+        stampSyncSuccess()
         }   // end withRemoteApplySuppressed
         return restored
     }
@@ -1168,6 +1509,12 @@ final class VortXSyncManager: ObservableObject {
         // prior hydrate already did it, or while the installed set is still empty).
         baselineInstalledAddonsOnce()
         await recoverOwnerLibraryIfEmpty(from: doc)
+        // recoverOwnerLibraryIfEmpty just refreshed OwnerResumeStore (and, on a cold device, re-added the owner
+        // library at time 0). Paint Continue Watching once here from the engine preview UNION those cached
+        // offsets, so the rail fills immediately on a cold / migrated launch (#149) even for a warm device that
+        // skipped the re-add but converged new offsets. The per-title re-add library events also rebuild, but
+        // this final pass guarantees a consistent rail regardless of event coalescing.
+        CoreBridge.shared.rebuildContinueWatching()
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
@@ -1229,22 +1576,28 @@ final class VortXSyncManager: ObservableObject {
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
         guard !ownedLibrary.isEmpty else { return }
-        // Only recover when the engine's account library is genuinely empty (a fresh / cold device). Require
-        // the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
-        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account
-        // library while the engine is still loading its real one. A nil library defers recovery to a later
-        // call once the engine has emitted its library field.
-        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
-        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
-        guard !engineHasLibrary else { return }
         // SKIP any id the user removed (the library analogue of ownedAddons(from:) excluding AddonTombstones):
         // a cold/empty engine must not RE-ADD a title the user explicitly removed, which was the exact
         // resurrection path. The doc's deletedLibrary/deletedLibraryTs were folded into this local set on
         // syncDown AND, on a cold launch, by hydrateEngineFromOwnedAddons right before this runs, so even a
-        // doc that predates the removal is honored. stampIntent: false because this is a machine re-add of
-        // account-owned titles: stamping an addedAt here could mint a machine timestamp that beats a real
-        // removedAt this device has not folded yet, durably resurrecting a removed title.
+        // doc that predates the removal is honored.
         let removedLibrary = LibraryTombstones.all()
+        // Wave 4 (Finding 1a): the engine re-adds each title at time 0 (AddToLibrary has no offset, and
+        // stremio-core exposes no action to inject one), so cache the VortX-owned resume offsets from the doc
+        // UNCONDITIONALLY, before the engine-empty gate below. This is what lets a cold / recovered / post-import
+        // device resume exactly where device A left off; it must populate even when the engine still reports a
+        // (stale, mid-Logout) library, so it runs before the recovery guards. Never destroys.
+        refreshOwnerResumeCache(from: doc)
+        // Only RE-ADD titles to the engine when its account library is genuinely empty (a fresh / cold device).
+        // Require the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
+        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account library
+        // while the engine is still loading its real one. A nil library defers recovery to a later call.
+        guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
+        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
+        guard !engineHasLibrary else { return }
+        // stampIntent: false because this is a machine re-add of account-owned titles: stamping an addedAt here
+        // could mint a machine timestamp that beats a real removedAt this device has not folded yet, durably
+        // resurrecting a removed title.
         var recovered = 0
         for item in ownedLibrary {
             guard let id = item["id"] as? String, !id.isEmpty,
@@ -1260,14 +1613,30 @@ final class VortXSyncManager: ObservableObject {
         }
     }
 
-    /// Fold a pulled doc's app-owned tombstones (library + add-on, both the effective-removed arrays and the
-    /// {removedAt, addedAt} stamp companions) into the local last-writer-wins stores. Shared by the push-path
+    /// Fold a pulled doc's app-owned tombstones (profile + library + add-on; for library/add-on both the
+    /// effective-removed arrays and the {removedAt, addedAt} stamp companions) into the local
+    /// last-writer-wins stores. Profile tombstones are a plain union (no stamp companion). Shared by the push-path
     /// read-merge (mergeLocalIntoDoc) and the cold-launch hydrate so both honor the stamps the doc already
     /// carries; the max-fold is idempotent, so calling it on paths that also fold elsewhere is safe. Never
     /// passes webAddonRemovals (syncDown is the single mint chokepoint for stamp-less web removals). Callers
     /// wrap this in withRemoteApplySuppressed.
     private func foldDocTombstones(_ doc: [String: Any]) {
         let vortx = doc["vortx"] as? [String: Any]
+        // PROFILE tombstones FIRST (#145 M6): the doc's deletedProfiles must land in the local set BEFORE
+        // the callers act on the roster, and both callers do act on it.
+        //  - mergeLocalIntoDoc: mergeInRoster (called right after this) SUBTRACTS deletedProfileIDs from the
+        //    union, so folding first is what stops the pulled cloud roster from re-seeding a profile a peer
+        //    deleted and pushing it straight back up (resurrection). vortxSummary then emits the folded set.
+        //  - hydrateEngineFromOwnedAddons: a cold-launched device (no prior syncDown) honors the deletes the
+        //    doc already carries instead of treating every cloud profile as live.
+        // mergeDeletedTombstones is a union that also prunes the live roster, so it is monotone and
+        // idempotent exactly like the library/add-on folds below: folding a stale doc can only ADD a
+        // tombstone that a newer pull would add too, and can never retract one. That is why this needs no
+        // version gate. The owner id is dropped inside mergeDeletedTombstones. Callers suppress the push arm.
+        let profileIDs = (vortx?["deletedProfiles"] as? [String]) ?? []
+        if !profileIDs.isEmpty {
+            ProfileStore.shared.mergeDeletedTombstones(profileIDs)
+        }
         let libIDs = (vortx?["deletedLibrary"] as? [String]) ?? []
         let libTs = (vortx?["deletedLibraryTs"] as? [String: Any]) ?? [:]
         if !libIDs.isEmpty || !libTs.isEmpty {
@@ -1291,8 +1660,16 @@ final class VortXSyncManager: ObservableObject {
         guard !UserDefaults.standard.bool(forKey: Self.addonBaselineStampedKey) else { return }
         let installed = CoreBridge.shared.addons.filter { !$0.isOfficial && !$0.isProtected }
         guard !installed.isEmpty else { return }   // engine not hydrated yet: retry on a later call, flag unset
-        withRemoteApplySuppressed { AddonTombstones.baselineInstalled(installed.map { $0.transportUrl }) }
-        UserDefaults.standard.set(true, forKey: Self.addonBaselineStampedKey)
+        // #145 M1: the flag write belongs INSIDE the suppression window, with the stamping it guards. It used to
+        // sit outside, so this housekeeping (which is not a user edit and must not sync) still fired the global
+        // didChangeNotification observer, which armed hasPendingPush. That mattered far beyond a stray push: it
+        // runs on the sign-in path (adopt -> hydrateEngineFromOwnedAddons -> here), so every sign-in GUARANTEED
+        // the armed push that the old restore's hasPendingPush guard then deferred to. This one unsuppressed
+        // line is what made the reinstall race fire every time instead of occasionally.
+        withRemoteApplySuppressed {
+            AddonTombstones.baselineInstalled(installed.map { $0.transportUrl })
+            UserDefaults.standard.set(true, forKey: Self.addonBaselineStampedKey)
+        }
     }
 
     /// Snapshot the engine's CURRENT add-ons (full descriptors) into the account doc, anchoring
@@ -1307,6 +1684,79 @@ final class VortXSyncManager: ObservableObject {
         // syncUp's own guard would already abort, but checking here avoids a wasted makeBackup).
         if case .failed = await pullSyncDocResult() { return }
         await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
+    }
+
+    /// Wave 4: one-time-per-account import of the engine's (Stremio-synced) OWNER library + Continue Watching
+    /// into the VortX account doc, after which `CoreBridge.bootstrapAuth` stops seeding the engine with the
+    /// Stremio token and `StremioAccount.saveProgress`/`resumeOffset` stop hitting api.strem.io by default.
+    ///
+    /// Data-safe migration (design step 4 ordering): CAPTURE first, RECORD only after a confirmed non-failed
+    /// push, so the VortX copy is PROVEN to exist before the token-load is dropped. Never deletes: `vortxSummary`
+    /// FLOOR-unions the engine add-ons + owner library into `doc.vortx.*` (never shrinks, subtracts only the
+    /// user's own removal tombstones), so this can only ADD. Idempotent: once the per-account flag is set this
+    /// is a fast no-op, and a re-run after a reinstall (flag cleared) re-captures additively, losing nothing.
+    ///
+    /// `stremioToken` is the live Stremio authKey (Keychain-only; used solely to key the per-account flag and
+    /// is never written to the account doc).
+    func importOwnerLibraryFromStremioOnce(stremioToken: String) async {
+        guard !stremioToken.isEmpty else { return }
+        guard isSignedIn else { return }                                             // need a VortX account to import INTO
+        guard !ProfileSync.libraryImportedFromStremio(authKey: stremioToken) else { return }   // already migrated
+        // Make the engine load its account library into the readable `library` field so `vortxSummary` captures
+        // the FULL set (the engine persists its bucket locally, so this reflects the Stremio-pulled library).
+        await CoreBridge.shared.loadLibraryAndAwait()
+        // Require the engine to have POSITIVELY reported a library (`library != nil`): a nil library is "still
+        // loading / unknown", not "empty", so we never confirm the import against an unknown state. Retry next launch.
+        guard CoreBridge.shared.library != nil else { return }
+        // Confirm the VortX account doc is reachable (a `.failed`/`.empty` pull means a degraded network: retry
+        // next launch rather than mark imported while unreachable), then push the FLOOR union.
+        guard case .doc = await pullSyncDocResult() else { return }
+        guard await syncUp() else { return }   // push failed: do NOT record the import
+        // The VortX copy is confirmed on the server. Record it so the next launch can stop loading the Stremio
+        // token. The Keychain token is left intact (opt-in reconnect / two-way sync).
+        ProfileSync.markLibraryImportedFromStremio(authKey: stremioToken)
+        DiagnosticsLog.log("sync", "imported the Stremio-owned library into the VortX account (one-time); the engine can now run local")
+    }
+
+    /// Coerce a JSON numeric (Int / Double / NSNumber, or nil) to a whole-second Int, for owner-library
+    /// offset comparisons in the summary union guard.
+    private static func libSeconds(_ v: Any?) -> Int {
+        if let i = v as? Int { return i }
+        if let d = v as? Double { return Int(d) }
+        if let n = v as? NSNumber { return n.intValue }
+        return 0
+    }
+
+    /// True when the VortX account doc is currently pullable (a decryptable `.doc`). Used as a pre-flight gate
+    /// before the post-import engine Logout so we NEVER unload the engine's Stremio session (which resets the
+    /// engine profile, wiping its local library) unless we can immediately rebuild the owner library from the
+    /// account doc this launch. On an unreachable launch we keep the session and retry next launch: no empty UI.
+    func accountDocReachable() async -> Bool {
+        if case .doc = await pullSyncDocResult() { return true }
+        return false
+    }
+
+    /// Wave 4: refresh the local owner-resume cache (`OwnerResumeStore`) from a pulled doc's owner library.
+    /// stremio-core re-adds owner titles at time 0 (it has no action to inject a saved offset), so this cache is
+    /// the VortX-owned resume source. Called BOTH from recoverOwnerLibraryIfEmpty (cold device) AND from syncDown
+    /// (so a WARM device with a non-empty engine, which skips the re-add, still converges its resume offsets to
+    /// the account truth without a cold relaunch). Non-destructive: it only records offsets, and honors removal
+    /// tombstones so a removed title is never cached. A doc t==0 (a finished / rewound title) caches 0, which the
+    /// resume reads treat as "no resume", so a finish propagates correctly.
+    private func refreshOwnerResumeCache(from doc: [String: Any]) {
+        let vortx = doc["vortx"] as? [String: Any]
+        let ownedLibrary = (vortx?["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
+        guard !ownedLibrary.isEmpty else { return }
+        let removed = LibraryTombstones.all()
+        let entries: [(id: String, t: Double, d: Double, v: String?)] = ownedLibrary.compactMap { item in
+            guard let id = item["id"] as? String, !id.isEmpty,
+                  !removed.contains(LibraryTombstones.normalize(id)) else { return nil }
+            return (id: id,
+                    t: Double(Self.libSeconds(item["t"])),
+                    d: Double(Self.libSeconds(item["d"])),
+                    v: item["v"] as? String)
+        }
+        OwnerResumeStore.merge(entries)
     }
 
     /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an
@@ -1356,7 +1806,22 @@ final class VortXSyncManager: ObservableObject {
     /// so it can never delete a local-only profile; it only adopts the account's settings + fields.
     func useAccountData() async { await syncDown(force: true) }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
+    /// STAYS BEHIND THE #145 RESTORE GATE. Most callers are automatic, not user choices (the engine-driven
+    /// pushes in CoreBridge, the in-app add-on reorder, "Sync now" once rosterConflictWithAccount reports no
+    /// conflict), so on a reinstall this restores first and then pushes, which is the intended order. The
+    /// deliberate "Keep this device" button calls keepThisDeviceOverridingAccount() instead.
     @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
+
+    /// The user saw the three-way conflict prompt (shown only after accountHasSyncData() positively READ the
+    /// account's doc and reported .hasData) and explicitly chose to overwrite the account with this device.
+    /// That informed choice is the one legitimate push before this device has APPLIED the doc, so it is the only
+    /// caller allowed past the restore gate. It stamps the gate open first: the user has now decided this
+    /// device's state IS the account's state, so subsequent automatic pushes are no longer at risk of the #145
+    /// blind overwrite. Never wire this to an automatic path.
+    @discardableResult func keepThisDeviceOverridingAccount() async -> Bool {
+        withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+        return await syncUp(afterUserChoseThisDevice: true)
+    }
 
     /// Push this device's state when the app BACKGROUNDS, with a real time budget. A bare
     /// `Task { syncUp() }` on scenePhase == .background is an UNEXTENDED task the OS can suspend the instant
@@ -1561,7 +2026,15 @@ final class VortXSyncManager: ObservableObject {
         startPoll()
         // Catch up immediately on the way in (matches the scenePhase foreground pull), so a change made
         // while this device was backgrounded applies right away rather than waiting for the next push.
-        Task { await syncDown() }
+        // #145 M1: the restore runs FIRST and is the one that must not be lost. This is the entry point that
+        // covers the reinstall case with no sign-in UI at all: the session token lives in the Keychain, which
+        // survives an app delete, so restore() adopts the session while UserDefaults comes back empty. That is
+        // the device the old code let push its near-empty local domain over the account. It is a no-op once the
+        // gate is open, and the routine catch-up below then costs one cheap version-guarded pull.
+        Task {
+            await self.restoreAccountDocIfNeeded()
+            await self.syncDown()
+        }
     }
 
     /// Close the real-time channel: tear down the socket, reconnect, keep-alive, and the poll. Called on

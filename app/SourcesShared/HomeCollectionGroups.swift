@@ -3,6 +3,9 @@ import SwiftUI
 /// Nested collections (grouped Home rails): a SECOND tier above the flat add-on/editorial rails, where
 /// related rails are gathered under a big group header. The owner's structure, in this exact order, is:
 ///
+///   0. "For You"    — a single personalized "Because you watched <title>" rail seeded from the active
+///                     profile's recent watches (see `BecauseYouWatchedModel`); FIRST so it sits near the
+///                     top of the section. Read-only over watch history; dropped when there's no history.
 ///   1. "Streaming"  — the streaming-service rails (Netflix, Disney+, …) from `StreamingRailsModel`.
 ///   2. "Genres"     — a handful of top genres (Action, Comedy, Drama, …) from TMDB /discover-by-genre.
 ///   3. "Top New"    — the most popular movies + shows released in the last few months (TMDB popularity).
@@ -45,44 +48,63 @@ final class HomeGroupsModel: ObservableObject {
     /// At most this many cards per child rail, matching the editorial rails' density.
     private static let maxItemsPerRail = 30
 
-    /// The region the TMDB-backed groups were built for, so a locale change rebuilds and a routine
-    /// re-emit does not.
-    private var loadedRegion: String?
+    /// The key (region + recent-watch seed signature) the groups were built for, so a locale change OR a
+    /// new watch rebuilds while a routine re-emit does not. Folding the seed signature in keeps the
+    /// personalized "Because You Watched" group fresh without refetching the region-only groups needlessly.
+    private var loadedKey: String?
     private var loadTask: Task<Void, Never>?
 
-    /// Build the four groups for the region (default: device region). Idempotent: a second call for the
-    /// same region while loaded (or in flight) is a no-op, so it is safe to call from `onAppear` and every
-    /// Home re-emit. The whole section hides cleanly (stays empty) when nothing resolves.
-    func load(region: String = TMDBClient.deviceRegion) {
-        guard loadTask == nil, loadedRegion != region else { return }
+    /// Build the groups for the region (default: device region). `cw`/`library` (default empty) seed the
+    /// personalized "Because You Watched" group and are READ ONLY. Idempotent: a second call for the same
+    /// region + same recent watches while loaded (or in flight) is a no-op, so it is safe to call from
+    /// `onAppear` and every Home re-emit. The whole section hides cleanly (stays empty) when nothing resolves.
+    func load(region: String = TMDBClient.deviceRegion, cw: [CoreCWItem] = [], library: [CoreCWItem] = []) {
+        let key = region + "|" + BecauseYouWatchedModel.seedSignature(cw: cw, library: library)
+        guard loadTask == nil, loadedKey != key else { return }
         loadTask = Task { [weak self] in
-            let built = await Self.buildAll(region: region)
+            let built = await Self.buildAll(region: region, cw: cw, library: library)
             guard let self, !Task.isCancelled else { return }
             self.loadTask = nil
             // Keep whatever we had on a fully empty build (flaky network / no key) rather than blanking a
-            // populated section; leave `loadedRegion` nil so the next Home appearance retries.
+            // populated section; leave `loadedKey` nil so the next Home appearance retries.
             if built.isEmpty { return }
             self.groups = built
-            self.loadedRegion = region
+            self.loadedKey = key
         }
     }
 
-    /// Drop the groups and allow a fresh build (sign-out / TMDB-key change / region change).
+    /// Drop the groups and allow a fresh build (sign-out / TMDB-key change / region change / profile switch).
     func clear() {
         loadTask?.cancel()
         loadTask = nil
         groups = []
-        loadedRegion = nil
+        loadedKey = nil
     }
 
-    /// Build all four groups in parallel, preserving display order, dropping any group with no rails.
-    private static func buildAll(region: String) async -> [CollectionGroup] {
+    /// Build all groups in parallel, preserving display order, dropping any group with no rails.
+    private static func buildAll(region: String, cw: [CoreCWItem], library: [CoreCWItem]) async -> [CollectionGroup] {
+        async let because = buildBecauseYouWatchedGroup(cw: cw, library: library)
         async let streaming = buildStreamingGroup(region: region)
         async let genres = buildGenresGroup(region: region)
         async let topNew = buildTopNewGroup(region: region)
         async let new = buildNewGroup(region: region)
-        // Fixed display order: Streaming, Genres, Top New, New. Drop any empty group.
-        return [await streaming, await genres, await topNew, await new].compactMap { $0 }
+        // Fixed display order: Because You Watched (personalized, FIRST so it sits near the top of the
+        // section, right under the flat Continue Watching rails), then Streaming, Genres, Top New, New.
+        // Drop any empty group.
+        return [await because, await streaming, await genres, await topNew, await new].compactMap { $0 }
+    }
+
+    // MARK: Group 0 — Because You Watched (personalized)
+
+    /// Group 0 "Because You Watched": a single personalized rail of TMDB recommendations seeded from the
+    /// active profile's most recent watches (see `BecauseYouWatchedModel`). READ ONLY over the CW +
+    /// library passed in; no engine writes. Dropped when there's no TMDB key, no eligible history, or
+    /// nothing resolves, so it simply does not appear for a fresh / keyless profile. The child rail carries
+    /// the specific "Because you watched <title>" header; the group header stays a stable "For You".
+    private static func buildBecauseYouWatchedGroup(cw: [CoreCWItem], library: [CoreCWItem]) async -> CollectionGroup? {
+        guard let rail = await BecauseYouWatchedModel.build(cw: cw, library: library) else { return nil }
+        return CollectionGroup(id: "group.becauseYouWatched", title: String(localized: "For You"),
+                               eyebrow: String(localized: "Because you keep watching"), rails: [rail])
     }
 
     // MARK: Group 1 — Streaming

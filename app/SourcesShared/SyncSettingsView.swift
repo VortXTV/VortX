@@ -46,7 +46,10 @@ struct SyncSettingsView: View {
             // profiles (syncDown unions them back), so neither choice can silently delete a profile.
             Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() } }
             Button("Use account's data") { resolveConflict { await sync.useAccountData() } }
-            Button("Keep this device") { resolveConflict { await sync.pushThisDevice() } }
+            // keepThisDeviceOverridingAccount, not pushThisDevice: this prompt is only reached after the
+            // account's doc was positively READ, so the user is making an informed choice to overwrite it.
+            // That is the one push allowed past the #145 restore gate (an automatic push is not).
+            Button("Keep this device") { resolveConflict { await sync.keepThisDeviceOverridingAccount() } }
         } message: {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.")
         }

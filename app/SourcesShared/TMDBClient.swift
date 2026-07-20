@@ -955,6 +955,70 @@ enum TMDBClient {
         return CreditsResult(cast: members, overview: overview)
     }
 
+    // MARK: - Franchise / collection (belongs_to_collection -> collection parts)
+
+    /// A movie's franchise/collection: the collection's display name plus every entry as an engine-playable
+    /// card, in RELEASE ORDER. Identifiable by the TMDB collection id so a view can key the fetch.
+    struct CollectionResult: Hashable {
+        let id: Int
+        let name: String
+        let parts: [MetaPreview]
+    }
+
+    /// The TMDB collection a MOVIE belongs to (the `belongs_to_collection` on /movie/{id}), with every entry
+    /// resolved to a card in RELEASE ORDER, from the SAME keyless edge path every other call here uses (no
+    /// user key required). Movies only (TMDB tags no franchise on TV). Fail-soft: nil on a series / a
+    /// standalone film with no collection / no data / any error, matching this file's fail-soft contract.
+    /// Parts carry `tmdb:` ids (name + poster ride along from the collection payload), so a tapped card opens
+    /// through the detail view's existing tmdb-id resolution exactly like the person filmography, without a
+    /// per-entry external_ids round-trip. Entries with no poster are KEPT (the card shows a placeholder) so a
+    /// franchise row lists the WHOLE set rather than silently dropping a poster-less entry.
+    static func movieCollection(imdbID: String, type: String) async -> CollectionResult? {
+        guard type != "series", imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found["movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int,
+              let movie = await get("/movie/\(tmdbID)?api_key=\(key)"),
+              let collection = movie["belongs_to_collection"] as? [String: Any],
+              let collectionID = collection["id"] as? Int else { return nil }
+        guard let payload = await get("/collection/\(collectionID)?api_key=\(key)"),
+              let parts = payload["parts"] as? [[String: Any]] else { return nil }
+        let name = (payload["name"] as? String) ?? (collection["name"] as? String) ?? ""
+        // Release order: ISO `release_date` sorts lexicographically == chronologically; a dated entry sorts
+        // before an undated (unreleased / TBA) one, which lands at the end.
+        let ordered = parts.sorted { a, b in
+            let da = (a["release_date"] as? String) ?? "", db = (b["release_date"] as? String) ?? ""
+            if da.isEmpty != db.isEmpty { return !da.isEmpty }
+            return da < db
+        }
+        var seen = Set<String>()
+        let previews: [MetaPreview] = ordered.compactMap { entry in
+            guard let tid = entry["id"] as? Int,
+                  let title = ((entry["title"] as? String) ?? (entry["name"] as? String)), !title.isEmpty else { return nil }
+            let cid = "tmdb:\(tid)"
+            guard seen.insert(cid).inserted else { return nil }
+            let poster = (entry["poster_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
+            return MetaPreview(id: cid, type: "movie", name: title, poster: poster,
+                               posterShape: "poster", popularity: entry["popularity"] as? Double)
+        }
+        guard !previews.isEmpty else { return nil }
+        return CollectionResult(id: collectionID, name: name, parts: previews)
+    }
+
+    /// The framed "Part of the <X> Collection" header from a TMDB collection name. TMDB names already end in
+    /// "Collection" and usually start with "The" (e.g. "The Dark Knight Collection"), so strip both before
+    /// re-framing: "Part of the Dark Knight Collection", NOT "Part of the The Dark Knight Collection Collection".
+    /// Shared by both detail surfaces so the header reads the same on iOS/Mac and tvOS.
+    static func collectionRowTitle(_ name: String) -> String {
+        var base = name.trimmingCharacters(in: .whitespaces)
+        if base.lowercased().hasSuffix(" collection") {
+            base = String(base.dropLast(" collection".count)).trimmingCharacters(in: .whitespaces)
+        }
+        if base.lowercased().hasPrefix("the ") { base = String(base.dropFirst(4)) }
+        return base.isEmpty ? "Part of the Collection" : "Part of the \(base) Collection"
+    }
+
     // MARK: - Person (bio + filmography for the cast/person page)
 
     /// A cast member's biographical detail for the Person page header: name, a biography paragraph, birthday

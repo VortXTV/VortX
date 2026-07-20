@@ -1,8 +1,25 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// External sync provider credentials (Trakt device-code OAuth, SIMKL PIN flow). Injected into BuildConfig
+// from a GITIGNORED gradle property (local.properties) or a CI env var of the same name -- mirroring the
+// Apple release CI, which feeds $(TRAKT_CLIENT_ID)/$(TRAKT_CLIENT_SECRET)/$(SIMKL_CLIENT_ID) into the
+// Info.plist from GitHub Actions secrets (see .github/workflows/release-tvos.yml). The real values NEVER
+// live in this file (the repo is public); they sit only in the gitignored local.properties on a dev box,
+// and come from `secrets.*` in CI. An absent value resolves to "" so a fresh/public clone ships the
+// feature DORMANT: TraktAuth.isConfigured / SIMKLAuth.isConfigured stay false and nothing makes a network
+// call, exactly like the Apple side. local.properties precedes the env var so a dev override wins locally.
+val externalSyncProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun externalSyncSecret(name: String): String =
+    (externalSyncProps.getProperty(name) ?: System.getenv(name) ?: "").trim()
 
 android {
     namespace = "com.vortx.android"
@@ -15,8 +32,16 @@ android {
         applicationId = "com.vortx.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 185
+        versionName = "0.3.14"
+
+        // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
+        // SIMKLAuth). Empty default keeps the feature dormant on a public/unprovisioned build; see the
+        // externalSyncSecret() helper above. buildConfig = true is set in buildFeatures {} below.
+        buildConfigField("String", "TRAKT_CLIENT_ID", "\"${externalSyncSecret("TRAKT_CLIENT_ID")}\"")
+        buildConfigField("String", "TRAKT_CLIENT_SECRET", "\"${externalSyncSecret("TRAKT_CLIENT_SECRET")}\"")
+        buildConfigField("String", "SIMKL_CLIENT_ID", "\"${externalSyncSecret("SIMKL_CLIENT_ID")}\"")
+        buildConfigField("String", "SIMKL_CLIENT_SECRET", "\"${externalSyncSecret("SIMKL_CLIENT_SECRET")}\"")
 
         // Package ONLY the ABIs the Rust engine is cross-compiled for (the cargoNdkBuild task's
         // androidAbis list below). Without this, the libmpv AAR's extra armeabi-v7a/x86 slices made
@@ -77,14 +102,17 @@ android {
         disable += setOf(
             "MissingTranslation", // localeConfig ships English only for now (S01); see res/xml/locales_config.xml
             "ExtraTranslation",
-            // The LEANBACK_LAUNCHER intent-filter (AndroidManifest.xml, pre-S01) makes lint want a TV
-            // banner now. ANDROID-PLAN.md §0 "Form factors & packaging" explicitly schedules the TV
-            // banner + the rest of the TV manifest work for S13, not S01 -- don't fail every PR in the
-            // meantime for a deferred, already-planned requirement. Re-enable when S13 adds the banner.
-            "MissingTvBanner",
+            // MissingTvBanner is no longer suppressed: S13 landed the LEANBACK entry (TvActivity) with a
+            // real `android:banner` (res/drawable/tv_banner.xml) on both <application> and the TV activity,
+            // so the check now passes on its own merits rather than being silenced.
         )
         checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
         abortOnError = true
+    }
+
+    testOptions {
+        // Local JVM tests exercise pure source-index seams that still share files with fail-soft Android logs.
+        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -121,6 +149,15 @@ dependencies {
     // future session.
     implementation(libs.security.crypto)
 
+    // Tink, for `com.google.crypto.tink.subtle.X25519` ONLY -- the raw RFC 7748 X25519 scalar mult used by
+    // the VortX E2E-account device-pairing crypto (com.vortx.android.sync.VortXPairingCrypto). Its shared
+    // secret is byte-identical to the Apple app's CryptoKit Curve25519 and the webapp's WebCrypto X25519,
+    // which is what lets a pairing handoff cross platforms. Pinned (libs.versions.toml) to the SAME version
+    // security-crypto already pulls transitively, so this is an explicit re-declaration (self-documenting +
+    // stable), not a new artifact. All other account crypto (PBKDF2 / AES-GCM / HKDF) is hand-rolled over
+    // the JDK's javax.crypto in VortXCrypto, so Tink is the sole crypto dependency the account layer needs.
+    implementation(libs.tink.android)
+
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
     implementation(libs.lifecycle.viewmodel.compose)
@@ -138,6 +175,15 @@ dependencies {
     implementation(libs.media3.exoplayer.hls)
     implementation(libs.media3.ui)
     implementation(libs.media3.session)
+
+    // androidx.tv Compose-for-TV (S13): the Android TV 10-foot surface (com.vortx.android.ui.tv.*).
+    // Provides the focus-first `androidx.tv.material3.Surface`/`Text`/`MaterialTheme` the D-pad browse +
+    // detail tiles are built on. NOT flavor-scoped (no GPL native code), so both `full` and `play` carry
+    // it. Version + forward-metadata-compat rationale in gradle/libs.versions.toml (tvMaterial). The TV
+    // surface reuses the SAME repositories/ViewModels as the phone shell (HomeViewModel / DetailViewModel
+    // via StremioXViewModelFactory) -- this dependency only supplies the 10-foot presentation layer, never
+    // a parallel data path.
+    implementation(libs.tv.material)
 
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME
@@ -165,6 +211,25 @@ dependencies {
     // aren't GPL-licensed), so this is a plain `implementation`, not flavor-scoped.
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
+
+    // OkHttp (account realtime sync): the WebSocket client behind com.vortx.android.sync.VortXSyncRealtime
+    // (the SyncRoom wss channel). Already on the runtime classpath transitively via coil-network-okhttp at
+    // this exact version (see the catalog note), made explicit because sync code now imports okhttp3.*
+    // directly -- first-party code never leans on a transitive coordinate it doesn't declare. Both flavors
+    // (sync is not a licensing-boundary feature), so a plain `implementation`.
+    implementation(libs.okhttp)
+
+    // WorkManager (Round 5): the offline-downloads transport. com.vortx.android.downloads.DownloadWorker runs one
+    // download as a foreground-service worker, which is what gives the Android port the two properties Apple gets
+    // from its two URLSessions at once: the transfer survives process death (WorkManager persists the work and
+    // re-runs it in a fresh process, where Apple's in-memory resumeData would be gone), and the app process stays
+    // alive while it runs (so a loopback torrent transfer keeps the in-process streaming server up, which is what
+    // Apple needs its foreground session + beginBackgroundTask assertion for). Both flavors need it -- downloads are
+    // not a licensing-boundary feature -- so this is a plain `implementation`, not flavor-scoped.
+    implementation(libs.work.runtime.ktx)
+
+    testImplementation(libs.junit)
+    testImplementation(libs.json.jvm)
 }
 
 // =====================================================================================================
@@ -183,9 +248,28 @@ dependencies {
 // is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).
 // On a machine without the toolchain the task is skipped with a warning so the Kotlin/Compose build
 // still configures; the resulting APK simply won't contain the .so until built where cargo-ndk exists.
+// RELEASE-INTENT builds are the exception: see `engineRequired` below -- CI sets it, and then every
+// skip above becomes a hard build failure instead.
 // =====================================================================================================
 
-val coreCrateDir = rootProject.file("../core")
+// Fail-closed switch for release-intent builds. When VORTX_REQUIRE_ENGINE=1 (env) or
+// -Pvortx.requireEngine=true is set, a missing engine checkout, a missing cargo toolchain, or a
+// missing/empty .so output is a HARD build failure (GradleException) instead of the dev-machine
+// warn-and-skip: an APK from such a build must never silently ship without its engines. CI
+// (.github/workflows/android.yml) sets it on every build it distributes; dev machines without the
+// Rust toolchain keep the graceful skip so the Kotlin/Compose build still works.
+val engineRequired: Boolean =
+    System.getenv("VORTX_REQUIRE_ENGINE") == "1" ||
+        (project.findProperty("vortx.requireEngine") as? String)?.toBoolean() == true
+
+// stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout from (in order):
+// STREMIOX_CORE_DIR env, the `stremiox.core.dir` gradle property, a sibling `../../stremiox-core`
+// clone, else the legacy in-repo `../core` (removed from the public app repo). If none exist the
+// task's onlyIf skips the native build (APK ships without libstremiox_core.so), same as no-cargo.
+val coreCrateDir: File =
+    (System.getenv("STREMIOX_CORE_DIR") ?: (project.findProperty("stremiox.core.dir") as? String))?.let(::File)
+        ?: rootProject.file("../../stremiox-core").takeIf { it.exists() }
+        ?: rootProject.file("../core")
 val jniLibsOutDir = layout.buildDirectory.dir("rustJniLibs/android")
 
 // ABIs to ship. arm64 + x86_64 cover real devices (phones, Android TV, Fire TV) and the emulator.
@@ -202,6 +286,8 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
     // -o writes per-ABI subdirs (arm64-v8a/, x86_64/, ...) of .so files, the jniLibs layout.
+    // --locked: the engine repo tracks Cargo.lock, so a drifted dependency resolution FAILS the
+    // build instead of silently linking a different graph than the CI-proven runs.
     commandLine(
         buildList {
             add("cargo")
@@ -209,24 +295,51 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
             addAll(targetFlags)
             add("-p"); add(nativeApiLevel.toString())
             add("-o"); add(jniLibsOutDir.get().asFile.absolutePath)
-            add("build"); add("--release")
+            add("build"); add("--release"); add("--locked")
         },
     )
 
     // Skip gracefully when the toolchain is absent so non-Rust dev machines can still build the
-    // Kotlin/Compose app. CI (android.yml) installs cargo-ndk + the Android Rust targets, so there the
-    // task runs and the .so is packaged.
+    // Kotlin/Compose app -- UNLESS the build is release-intent (engineRequired), where a missing
+    // engine is a hard failure. CI (android.yml) installs cargo-ndk + the Android Rust targets and
+    // sets VORTX_REQUIRE_ENGINE=1, so there the task must run and the .so must be packaged.
     val cargoOnPath = System.getenv("PATH").orEmpty().split(File.pathSeparator).any { dir ->
         File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
     }
     onlyIf {
+        val manifestOk = File(coreCrateDir, "Cargo.toml").isFile
+        if (engineRequired && !(cargoOnPath && manifestOk)) {
+            val why = if (!manifestOk) "no crate manifest at ${coreCrateDir.path}/Cargo.toml" else "cargo is not on PATH"
+            throw GradleException(
+                "[stremiox-core] engine build REQUIRED (VORTX_REQUIRE_ENGINE / vortx.requireEngine) but $why; " +
+                    "refusing to package an APK without libstremiox_core.so.",
+            )
+        }
         if (!cargoOnPath) {
             logger.warn("[stremiox-core] cargo not on PATH; skipping native build. APK will lack libstremiox_core.so until built with the Rust + cargo-ndk toolchain installed.")
         }
-        cargoOnPath
+        if (!manifestOk) {
+            logger.warn("[stremiox-core] engine crate not found at ${coreCrateDir.path} (proprietary, private repo). Set STREMIOX_CORE_DIR or clone VortXTV/stremiox-core to ../../stremiox-core. APK will lack libstremiox_core.so.")
+        }
+        cargoOnPath && manifestOk
     }
     // Don't fail the whole build if cargo-ndk errors during early scaffolding; surface it instead.
     isIgnoreExitValue = false
+    // Fail-closed output proof (release-intent only): cargo-ndk exiting 0 is not enough -- a path
+    // drift in -o would leave the jniLibs merge packaging nothing. Require every shipped ABI's .so,
+    // non-empty, or fail the build.
+    doLast {
+        if (engineRequired) {
+            androidAbis.forEach { abi ->
+                val so = jniLibsOutDir.get().file("$abi/libstremiox_core.so").asFile
+                if (!so.isFile || so.length() == 0L) {
+                    throw GradleException(
+                        "[stremiox-core] engine build REQUIRED but no usable $abi/libstremiox_core.so at ${so.path} (missing or 0 bytes).",
+                    )
+                }
+            }
+        }
+    }
 }
 
 android {
@@ -255,4 +368,96 @@ android {
 // that collects jniLibs; depending on it for every variant covers debug + release.
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
     dependsOn(cargoNdkBuild)
+}
+
+// =====================================================================================================
+// vortx-core JNI (the OWN engine): build libvortx_ffi.so (features jni + server) into
+// src/main/jniLibs and package it. Sibling of the cargoNdkBuild block above, same pattern,
+// different crate: the source is the ENGINE branch's vortx-core workspace (crates/ffi), which is
+// not vendored in this tree (the vortx-core/ dir here carries the kernel crates only, no ffi/
+// streaming-server), so the checkout path comes from the environment:
+//
+//   VORTX_ENGINE_CORE_DIR=/path/to/engine-checkout/vortx-core   (env var), or
+//   -Pvortx.engine.coreDir=/path/to/engine-checkout/vortx-core  (gradle property)
+//
+// When neither is set (or cargo is absent) the task warn-skips and the build packages whatever
+// libvortx_ffi.so is already staged in src/main/jniLibs (the manual build documented in
+// src/main/jniLibs/README.md) -- the .so binaries stay gitignored either way. `--features
+// jni,server` carries BOTH JNI surfaces in the one .so: the VortxCore kernel bridge (shadow
+// ranking) and the VortxServer in-process streaming server (raw-torrent playback).
+// CARGO_TARGET_DIR is pinned to a task-owned scratch dir (target-andx) inside the engine checkout
+// so this cross-build never dirties that checkout's own target/ build cache.
+// =====================================================================================================
+
+val vortxEngineCoreDir: File? = (
+    System.getenv("VORTX_ENGINE_CORE_DIR")
+        ?: (project.findProperty("vortx.engine.coreDir") as? String)
+    )?.let(::File)
+
+val vortxJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
+
+val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
+    group = "rust"
+    description = "Cross-compile the engine branch's vortx-ffi (features jni,server) to libvortx_ffi.so via cargo-ndk."
+    workingDir = vortxEngineCoreDir ?: coreCrateDir // placeholder wd when unset; onlyIf gates the run
+
+    val targetFlags = androidAbis.flatMap { listOf("-t", it) }
+    // --locked: same fail-closed reproducibility contract as cargoNdkBuild above (the engine
+    // workspace tracks Cargo.lock; drifted resolution fails the build instead of moving silently).
+    commandLine(
+        buildList {
+            add("cargo")
+            add("ndk")
+            addAll(targetFlags)
+            add("-p"); add(nativeApiLevel.toString())
+            add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
+            add("build"); add("-p"); add("vortx-ffi")
+            add("--no-default-features"); add("--features"); add("jni,server")
+            add("--release"); add("--locked")
+        },
+    )
+    vortxEngineCoreDir?.let { environment("CARGO_TARGET_DIR", File(it, "target-andx").absolutePath) }
+
+    val cargoOnPath = System.getenv("PATH").orEmpty().split(File.pathSeparator).any { dir ->
+        File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
+    }
+    onlyIf {
+        val manifestOk = vortxEngineCoreDir?.let { File(it, "Cargo.toml").isFile } == true
+        if (engineRequired && !(cargoOnPath && manifestOk)) {
+            val why = if (!manifestOk) {
+                "no engine workspace manifest at ${vortxEngineCoreDir?.path ?: "<unset VORTX_ENGINE_CORE_DIR / vortx.engine.coreDir>"}/Cargo.toml"
+            } else {
+                "cargo is not on PATH"
+            }
+            throw GradleException(
+                "[vortx-ffi] engine build REQUIRED (VORTX_REQUIRE_ENGINE / vortx.requireEngine) but $why; " +
+                    "refusing to package an APK without a freshly built libvortx_ffi.so.",
+            )
+        }
+        if (!manifestOk) {
+            logger.warn("[vortx-ffi] VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir not set (or no Cargo.toml there); skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
+        } else if (!cargoOnPath) {
+            logger.warn("[vortx-ffi] cargo not on PATH; skipping libvortx_ffi.so build. The APK packages whatever .so is already staged in src/main/jniLibs.")
+        }
+        manifestOk && cargoOnPath
+    }
+    isIgnoreExitValue = false
+    // Fail-closed output proof (release-intent only), mirroring cargoNdkBuild's doLast: every shipped
+    // ABI must have a non-empty libvortx_ffi.so staged for the jniLibs merge, or the build fails.
+    doLast {
+        if (engineRequired) {
+            androidAbis.forEach { abi ->
+                val so = vortxJniLibsDir.file("$abi/libvortx_ffi.so").asFile
+                if (!so.isFile || so.length() == 0L) {
+                    throw GradleException(
+                        "[vortx-ffi] engine build REQUIRED but no usable $abi/libvortx_ffi.so at ${so.path} (missing or 0 bytes).",
+                    )
+                }
+            }
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(cargoNdkBuildVortxFfi)
 }

@@ -112,6 +112,17 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// owner dedupe by id, so no duplicate can form. (A roster only ever belongs to one account, so a
     /// fixed shared id is safe here; per-account uniqueness is not required.)
     static let ownerID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+    /// Canonical form of a profile id that arrived as a STRING from a sync doc (#145 M6). Mirrors Android
+    /// `UserProfile.normalizeId`, which is the case this must agree with byte-for-byte on the wire.
+    ///
+    /// Every id this app MINTS is a `UUID`, and Foundation's `uuidString` is always UPPERCASE, so the whole
+    /// tombstone system is uppercase-keyed: `tombstone(_:)` stores `id.uuidString` and `pruneTombstonedProfiles`
+    /// matches on `id.uuidString`. Ids read back OUT of a doc are plain strings and carry whatever case their
+    /// author used. An unnormalized lowercase id is therefore inert rather than harmless: it never equals the
+    /// owner id (so the defensive owner filter misses it), and it never matches a live profile's uuidString
+    /// (so the tombstone never prunes and the profile stays resurrected). Normalizing on the way in is what
+    /// keeps a foreign-cased id from forking into a second, non-matching tombstone.
+    static func normalizeID(_ raw: String) -> String { raw.uppercased() }
     /// Whether this profile's history is the account library itself (the owner, and any profile on
     /// its own account) or a private synced overlay (every other shared profile).
     var usesEngineHistory: Bool { isOwner || usesOwnAccount }
@@ -175,6 +186,23 @@ final class ProfileStore: ObservableObject {
     private static func watchCacheKey(_ id: UUID) -> String { "stremiox.profiles.watch." + id.uuidString }
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
+
+    /// Per-account "already imported the legacy Stremio roster + overlay watch into VortX" flag. Keyed by a
+    /// SHA-256 prefix of the Stremio authKey (the same shape as ProfileSync's repair flag) so the raw token
+    /// never lands in UserDefaults. Once set, the default path stops reading the Stremio datastore for the
+    /// roster + overlay watch: VortX (doc.vortx.*) is authoritative. The import itself is a UNION / last
+    /// writer wins fold, so it is idempotent; a re-run (for example after a reinstall clears this flag) can
+    /// never lose a profile or a watch record, it only re-confirms what the account already holds.
+    private static func stremioImportKey(_ authKey: String) -> String {
+        let digest = SHA256.hash(data: Data(authKey.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "vortx.profiles.stremioImportComplete.\(digest)"
+    }
+    private static func stremioImportDone(authKey: String) -> Bool {
+        UserDefaults.standard.bool(forKey: stremioImportKey(authKey))
+    }
+    private static func markStremioImportDone(authKey: String) {
+        UserDefaults.standard.set(true, forKey: stremioImportKey(authKey))
+    }
 
     /// Flat mirror of the ACTIVE profile's disabled add-on set, rewritten on every profile apply so
     /// the off-main board build (`buildBoardRows`) and the main-actor `streamGroups` can both read it
@@ -442,15 +470,15 @@ final class ProfileStore: ObservableObject {
         UserProfile.PlaybackPrefs(
             audioLang: d["audioLang"] as? String ?? base?.audioLang ?? "",
             subtitleLang: d["subtitleLang"] as? String ?? base?.subtitleLang ?? "",
-            forcedPolicy: d["forced"] as? String ?? base?.forcedPolicy ?? "",
-            subFont: d["subFont"] as? String ?? base?.subFont ?? "",
+            forcedPolicy: gatedForcedPolicy(d["forced"] as? String) ?? base?.forcedPolicy ?? "",
+            subFont: gatedSubFont(d["subFont"] as? String) ?? base?.subFont ?? "",
             subSize: d["subSize"] as? String ?? base?.subSize ?? "",
-            subColor: d["subColor"] as? String ?? base?.subColor ?? "",
-            subBackground: d["subBackground"] as? String ?? base?.subBackground ?? "",
-            subSizeScale: d["subSizeScale"] as? Double ?? base?.subSizeScale,
+            subColor: gatedSubColor(d["subColor"] as? String) ?? base?.subColor ?? "",
+            subBackground: gatedSubBackground(d["subBackground"] as? String) ?? base?.subBackground ?? "",
+            subSizeScale: gatedSubSizeScale(d["subSizeScale"] as? Double) ?? base?.subSizeScale,
             sourceTypeOrder: d["sourceTypeOrder"] as? [String] ?? base?.sourceTypeOrder,
             useAddonOrder: d["useAddonOrder"] as? Bool ?? base?.useAddonOrder,
-            safetyMode: d["safetyMode"] as? String ?? base?.safetyMode,
+            safetyMode: gatedSafetyMode(d["safetyMode"] as? String) ?? base?.safetyMode,
             instantOnly: d["instantOnly"] as? Bool ?? base?.instantOnly,
             hideDeadTorrents: d["hideDeadTorrents"] as? Bool ?? base?.hideDeadTorrents,
             hdrOnly: d["hdrOnly"] as? Bool ?? base?.hdrOnly,
@@ -485,6 +513,68 @@ final class ProfileStore: ObservableObject {
     private static func gatedMinResolution(_ raw: Int?) -> Int? {
         guard let raw else { return nil }
         return [0, 720, 1080, 2160].contains(raw) ? raw : nil
+    }
+
+    // MARK: Enum vocabulary gates
+    //
+    // The enum-valued playback fields arrive as FREE-FORM STRINGS from a synced doc that any client may have
+    // written, and they land (via applyPlayback) in the live UserDefaults the player and the Settings Pickers
+    // read. An unrecognized id is therefore not a cosmetic problem: `safetyMode != "off"` reads a junk value as
+    // safety-ON while the Picker has no tag to render it (so the row shows blank and the viewer cannot fix it),
+    // and the player asks libass for a colour/background that does not exist. The webapp shipped its own
+    // spellings ("moderate", "on", "shadow", "none", "cyan", "mint", "mono") and corrupted real accounts this
+    // way. Gate every one of them on the way IN, mapping the known foreign ids to the app's vocabulary and
+    // returning nil for anything else so the per-field `?? base?` fallback keeps the viewer's current setting
+    // rather than applying a value nothing can render. Same contract as gatedMaxResolution above.
+    //
+    // The allowed sets are read from the app's OWN source-of-truth arrays rather than restated here, so adding
+    // a subtitle colour or a safety mode cannot silently bypass the gate.
+
+    /// Canonical id, migrated legacy id, or nil when unrecognized.
+    private static func gatedId(_ raw: String?, allowed: [String], legacy: [String: String]) -> String? {
+        guard let raw else { return nil }
+        if allowed.contains(raw) { return raw }
+        return legacy[raw]
+    }
+
+    /// TrackPreferences.ForcedPolicy is the authority (off / forced / always). The webapp's "on" meant
+    /// "always show subtitles in my language", which is `always`.
+    private static func gatedForcedPolicy(_ raw: String?) -> String? {
+        gatedId(raw, allowed: TrackPreferences.ForcedPolicy.allCases.map(\.rawValue), legacy: ["on": "always"])
+    }
+
+    /// SourcePreferences.safetyModes is the authority (off / balanced / strict). The webapp said "moderate".
+    private static func gatedSafetyMode(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SourcePreferences.safetyModes, legacy: ["moderate": "balanced"])
+    }
+
+    /// SubtitleStyle.fonts is the authority (modern / classic). The webapp offered a web-only "mono".
+    /// (`map { $0.id }`, not `map(\.id)`: these are arrays of TUPLES, and a Swift key path cannot name a
+    /// tuple element. Same below.)
+    private static func gatedSubFont(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.fonts.map { $0.id }, legacy: ["mono": SubtitleStyle.defaultFont])
+    }
+
+    /// SubtitleStyle.colors is the authority (white / yellow / soft). The webapp offered web-only "cyan" and
+    /// "mint", which have no app equivalent, so they degrade to the default rather than guessing a hue.
+    private static func gatedSubColor(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.colors.map { $0.id },
+                legacy: ["cyan": SubtitleStyle.defaultColor, "mint": SubtitleStyle.defaultColor])
+    }
+
+    /// SubtitleStyle.backgrounds is the authority (outline / shaded / box). The webapp's "shadow" is closest to
+    /// `shaded`; its "none" (no backing, no outline) has no app equivalent and degrades to the default.
+    private static func gatedSubBackground(_ raw: String?) -> String? {
+        gatedId(raw, allowed: SubtitleStyle.backgrounds.map { $0.id },
+                legacy: ["shadow": "shaded", "none": SubtitleStyle.defaultBackground])
+    }
+
+    /// The fine subtitle multiplier, clamped into SubtitleStyle.sizeScaleRange (0.60...1.80). A doc value
+    /// outside the range would otherwise be stored and then re-clamped on every read; clamping on the way in
+    /// keeps the stored value and the applied value the same number. The webapp's floor was 0.7.
+    private static func gatedSubSizeScale(_ raw: Double?) -> Double? {
+        guard let raw, raw.isFinite else { return nil }
+        return min(max(raw, SubtitleStyle.sizeScaleRange.lowerBound), SubtitleStyle.sizeScaleRange.upperBound)
     }
 
     /// Push a profile's appearance (accent, OLED chrome, UI text scale) into the live ThemeManager.
@@ -761,9 +851,16 @@ final class ProfileStore: ObservableObject {
     /// Fold incoming tombstones (from another device's doc.vortx.deletedProfiles) into the local set,
     /// dropping the owner id defensively. Returns true when the set changed (so callers can prune the
     /// live roster of any now-tombstoned profile). The union means a tombstone propagates everywhere.
+    ///
+    /// This is the single INGEST chokepoint for ids that arrive as strings from a doc, so it normalizes here
+    /// rather than at each call site (#145 M6). Mirrors Android `mergeDeletedTombstones`, which normalizes the
+    /// same way. Without it, a foreign-cased id passes the owner filter, is stored in a set that
+    /// `pruneTombstonedProfiles` matches against uppercase `uuidString`, and so never prunes: the tombstone
+    /// lands but the deleted profile stays on screen. See `UserProfile.normalizeID`.
     @discardableResult
     func mergeDeletedTombstones(_ incoming: [String]) -> Bool {
-        let add = incoming.filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
+        let add = incoming.map { UserProfile.normalizeID($0) }
+            .filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
         guard !add.isEmpty else { return false }
         deletedProfileIDs.formUnion(add)
         saveDeletedTombstones()
@@ -797,30 +894,104 @@ final class ProfileStore: ObservableObject {
 
     // MARK: Roster sync (the profile list follows the primary account across devices)
 
-    /// Pull the remote roster once the account is reachable; newest side wins wholesale. AuthKeys
-    /// never sync (each device signs into own-account profiles once); looks, PINs, and identity do.
-    /// Runs the libraryItem repair FIRST: the old transport's documents break the official apps'
-    /// library sync until scrubbed (see ProfileSync), and any watch history found in them is
-    /// migrated into the local cache so nothing is lost.
+    /// Launch reconciliation for the roster + overlay watch. VortX (doc.vortx.*) is authoritative, so this
+    /// no longer reads the Stremio datastore as the source of truth on the normal path. It does three things:
+    ///   1. Runs the libraryItem repair scan FIRST (permanent safety): an old build on the same account can
+    ///      still write the legacy stremiox:* documents that break official Stremio library sync, and any
+    ///      watch history found in them is salvaged into the local cache so nothing is lost.
+    ///   2. Imports the legacy Stremio roster + overlay watch into the VortX account ONCE per account, then
+    ///      never reads Stremio for them again on the default path (VortX is authoritative thereafter).
+    ///   3. Keeps the legacy two-way Stremio sync alive ONLY while the opt-in "also sync to Stremio" mirror
+    ///      is on. By default the roster + overlays stay fresh through the VortX realtime syncDown / poll.
     func bootstrapSync() {
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
             let salvaged = await ProfileSync.prepare(authKey: key)
             if !salvaged.isEmpty { await MainActor.run { self.migrateSalvagedWatch(salvaged) } }
-            guard ProfileSync.cloudAvailable == true else { return }   // per-device profiles only
-            if let remote = await ProfileSync.fetchRoster(authKey: key) {
-                let localModified = Date(timeIntervalSince1970:
-                    UserDefaults.standard.double(forKey: Self.modifiedKey))
-                if remote.mtime > localModified {
-                    await MainActor.run { self.adoptRemoteRoster(remote.profiles) }
-                } else if localModified > remote.mtime {
-                    await ProfileSync.pushRoster(self.profiles, authKey: key)
-                }
-            } else if !profiles.isEmpty {
-                await ProfileSync.pushRoster(profiles, authKey: key)   // first device seeds the roster
+            guard ProfileSync.cloudAvailable == true else { return }   // Stremio custom collection unavailable
+            if !Self.stremioImportDone(authKey: key) {
+                await self.importProfilesFromStremio(authKey: key)
             }
-            refreshWatchFromServer()
+            // Opt-in legacy Stremio mirror (default OFF): only when the user turns it on does the app keep
+            // two-way syncing the roster + overlay watch with the Stremio datastore. Off by default because
+            // VortX owns the data now, so there is nothing more to read from Stremio here.
+            if ProfileSync.alsoSyncToStremio {
+                await self.syncRosterWithStremio(authKey: key)
+                await MainActor.run { self.refreshWatchFromServer() }
+            }
+        }
+    }
+
+    /// ONE-TIME migration of the legacy Stremio-datastore roster + per-profile overlay watch history into the
+    /// VortX account, so doc.vortx.* becomes the source of truth. Reuses the existing Stremio transport for the
+    /// READ only. Folds both classes NON-DESTRUCTIVELY: the roster is UNIONed (never shrinks, never drops a
+    /// local-only or Stremio-only profile) and each overlay is merged last-writer-wins per title (unioning
+    /// watched episodes), so a re-run can never lose a profile or a watch record. Then pushes the merged state
+    /// to VortX and, only once the VortX copy is confirmed (or there is no VortX account to import into yet),
+    /// stamps the per-account flag so it runs exactly once. The order is the data-safety rule: never mark the
+    /// import done while the data still lives only in Stremio.
+    private func importProfilesFromStremio(authKey: String) async {
+        // ORDER AFTER A VORTX PULL FIRST. On a reinstall the local delete-tombstone set is empty until a pull
+        // folds it, so pushing before folding could emit a doc that OMITS deletedProfiles and let a peer that
+        // still holds a deleted profile re-seed it into the cloud roster (the sync-wound resurrection). Pull
+        // first so the account's roster and its profile tombstones are folded into the local store before we
+        // merge Stremio in and push. Plain (not forced) so a genuine local edit made in the first seconds
+        // after launch, which arms a pending push, still defers this pull instead of being clobbered.
+        await VortXSyncManager.shared.syncDown()
+        // Read the legacy Stremio roster (do not merge yet: the overlays are folded first, below).
+        let remoteRoster = await ProfileSync.fetchRoster(authKey: authKey)
+        // Per-profile overlay watch, folded BEFORE the roster merge (last writer wins per title). Two reasons
+        // for the ordering: (1) collapseEmptyDuplicateSecondaries runs inside mergeInRoster and decides
+        // "empty" by reading the watch cache, so folding overlays first means a just-imported same-name
+        // secondary that HAS history is seen as history-bearing and is never dropped as an empty duplicate;
+        // (2) engine-backed (owner / own-account) profiles are skipped, since their history is the account
+        // library and applyRemoteOverlay refuses them anyway (the per-profile invariant). Reading the remote
+        // roster's own flags avoids depending on whether the profile is merged locally yet.
+        let overlayIDs = (remoteRoster?.profiles ?? []).filter { !$0.usesEngineHistory }.map(\.id)
+        for id in overlayIDs {
+            guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: authKey),
+                  !remote.isEmpty else { continue }
+            await MainActor.run { self.applyRemoteOverlay(profileID: id, entries: remote) }
+        }
+        // Roster: ADDITIVE union (incomingModified: nil). VortX is authoritative, so a shared profile keeps
+        // its VortX-owned fields (name, PIN, avatar, playback, isKids, disabledAddons) and Stremio only
+        // APPENDS profiles it alone has. Passing Stremio's real mtime here would let a stale frozen-Stremio
+        // record win a shared id wholesale and roll back a field the user changed on the new build, then
+        // propagate that revert on push. This matches every other mergeInRoster caller (all pass nil).
+        if let remoteRoster {
+            await MainActor.run { self.mergeInRoster(remoteRoster.profiles, incomingModified: nil) }
+        }
+        // Fold complete: push the merged roster + overlays into the VortX account so doc.vortx.* owns them.
+        // pushThisDevice() is syncUp(): it read-merges onto a freshly pulled account base (never clobbers
+        // another surface's keys, and vortxSummary unions the account's profile tombstones so the push can
+        // never shrink them) and reports whether the write landed.
+        let pushed = await VortXSyncManager.shared.pushThisDevice()
+        // STAMP THE FLAG ONLY once the VortX copy is confirmed, so the import is never marked done while the
+        // data lives only in Stremio. If there is no VortX account yet, there is nothing to confirm and
+        // nothing to strand (the data is already folded into the LOCAL store, and a later VortX sign-in pushes
+        // it up), so stamping is safe. A failed push while signed in leaves the flag unset, so the import
+        // retries next launch (idempotent), never leaving the Stremio data un-migrated.
+        let signedIntoVortx = await MainActor.run { VortXSyncManager.shared.isSignedIn }
+        if pushed || !signedIntoVortx {
+            Self.markStremioImportDone(authKey: authKey)
+        }
+    }
+
+    /// OPT-IN legacy Stremio roster sync (two-way), reached only when the user turns on "also sync to
+    /// Stremio". Mirrors the pre-independence behavior: adopt the account's roster when it is newer, else push
+    /// this device's roster to the Stremio datastore so the two stay in step for a user who keeps the mirror on.
+    private func syncRosterWithStremio(authKey: String) async {
+        if let remote = await ProfileSync.fetchRoster(authKey: authKey) {
+            let localModified = Date(timeIntervalSince1970:
+                UserDefaults.standard.double(forKey: Self.modifiedKey))
+            if remote.mtime > localModified {
+                await MainActor.run { self.adoptRemoteRoster(remote.profiles) }
+            } else if localModified > remote.mtime {
+                await ProfileSync.pushRoster(self.profiles, authKey: authKey)
+            }
+        } else if !profiles.isEmpty {
+            await ProfileSync.pushRoster(profiles, authKey: authKey)   // first device seeds the roster
         }
     }
 
@@ -1068,6 +1239,10 @@ final class ProfileStore: ObservableObject {
 
     private func schedulePushRoster() {
         pushRosterTask?.cancel()
+        // VortX authoritative: a roster edit already arms a debounced VortX syncUp (the persist() UserDefaults
+        // write fires the sync manager's observer), which carries the roster in doc.settings + doc.vortx.profiles.
+        // The legacy Stremio write is opt-in (default OFF), so it stays dormant unless the user turns on the mirror.
+        guard ProfileSync.alsoSyncToStremio else { return }
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         let snapshot = profiles
         pushRosterTask = Task {
@@ -1090,7 +1265,8 @@ final class ProfileStore: ObservableObject {
             // this a watched movie stays pinned forever by the watchedVideoIds keep-rule below), OR a near-end
             // offset. A series is unaffected: its keep-signal is EPISODE ids, never the series metaId, so it
             // rolls forward to the next episode as before. (libraryItems keeps finished movies; this is cwItems.)
-            if entry.type == "movie",
+            let usesSeriesLifecycle = EpisodePlaybackIdentity.usesSeriesLifecycle(type: entry.type)
+            if !usesSeriesLifecycle,
                entry.watchedVideoIds.contains(metaId)
                 || (entry.durationMs > 0 && Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95) { continue }
             guard entry.timeOffsetMs > 0 || !entry.watchedVideoIds.isEmpty else { continue }
@@ -1139,7 +1315,11 @@ final class ProfileStore: ObservableObject {
     /// Saved resume position in seconds (0 = start fresh); series only resume the same episode.
     func resumeOffset(for meta: PlaybackMeta) -> Double {
         guard let entry = watch[meta.libraryId] else { return 0 }
-        if meta.type == "series", let saved = entry.videoId, saved != meta.videoId { return 0 }
+        if EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+            usesSeriesLifecycle: meta.usesSeriesLifecycle,
+            savedVideoID: entry.videoId,
+            requestedVideoID: meta.videoId
+        ) { return 0 }
         return entry.timeOffsetMs > 0 ? Double(entry.timeOffsetMs) / 1000 : 0
     }
 
@@ -1208,8 +1388,12 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
-    /// Background refresh from the account, so history follows the profile across devices.
+    /// Background refresh of the active overlay from the legacy Stremio datastore. VortX authoritative: the
+    /// overlay round-trips through doc.vortx.byProfile (syncDown -> applyRemoteOverlay), refreshed by the
+    /// realtime poll / WebSocket, so this reads Stremio ONLY when the opt-in "also sync to Stremio" mirror is
+    /// on. On the default path a profile switch reads the local cache, which the VortX sync keeps fresh.
     func refreshWatchFromServer() {
+        guard ProfileSync.alsoSyncToStremio else { return }
         guard let profile = active, !profile.usesEngineHistory,
               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
         let id = profile.id
@@ -1240,8 +1424,11 @@ final class ProfileStore: ObservableObject {
         pushWatchTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
+            // VortX authoritative: the overlay rides doc.vortx.byProfile, so always nudge the VortX sync.
             VortXSyncManager.shared.requestSyncSoon()
-            if let profile, !profile.usesEngineHistory,
+            // The legacy Stremio overlay write is opt-in (default OFF); it stays dormant unless the mirror is on.
+            if ProfileSync.alsoSyncToStremio,
+               let profile, !profile.usesEngineHistory,
                let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty {
                 await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key)
             }

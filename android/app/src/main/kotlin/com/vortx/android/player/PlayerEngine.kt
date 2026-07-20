@@ -37,6 +37,18 @@ interface PlayerEngine {
     fun togglePause()
     fun seekTo(positionMs: Long)
 
+    /// RELATIVE seek: jump [deltaMs] milliseconds from the current position (negative = back), clamped
+    /// to [0, duration]. This is the seam the +/-10s controls and the double-tap gesture drive. The
+    /// default derives the target from the last published [state] snapshot + [seekTo], so any engine is
+    /// correct by construction; both concrete engines override with their native relative seek (mpv
+    /// `seek <s> relative`, ExoPlayer `currentPosition`) because the sampled state can lag the true
+    /// position by up to a poll tick.
+    fun seekBy(deltaMs: Long) {
+        val s = state.value
+        val upper = if (s.durationMs > 0L) s.durationMs else Long.MAX_VALUE
+        seekTo((s.positionMs + deltaMs).coerceIn(0L, upper))
+    }
+
     /// Set the playback speed multiplier (1.0 = normal). Both engines support this natively (ExoPlayer's
     /// `setPlaybackSpeed`, mpv's `speed` property); the chrome offers a small set of presets.
     fun setPlaybackSpeed(speed: Float)
@@ -49,6 +61,57 @@ interface PlayerEngine {
     /// Mount an additional external subtitle file at runtime and offset its timing (seconds, +/-).
     fun addExternalSubtitle(url: String)
     fun setSubtitleDelay(seconds: Double)
+
+    /// Offset the AUDIO track's timing relative to video (seconds, +/-) to fix a lip-sync drift. mpv's
+    /// `audio-delay`. ExoPlayer has no live audio-delay knob, so its implementation is a documented no-op
+    /// (the chrome hides the control when the mpv engine is not live). Mirrors Apple `setAudioDelay`.
+    fun setAudioDelay(seconds: Double) {}
+
+    /// Apply the persisted [SubtitleStyle] to the live engine (mpv `sub-*` properties / ExoPlayer
+    /// `SubtitleView` style). Both concrete engines override; the default is a no-op for any future engine
+    /// that renders no subtitles. Mirrors Apple `applySubtitleStyle`.
+    fun applySubtitleStyle() {}
+
+    /// Apply the device's [AudioOutputMode] (auto/stereo/surround/passthrough). The libmpv engine drives
+    /// its AO channel/passthrough policy; ExoPlayer's `DefaultAudioSink` self-negotiates and exposes no
+    /// runtime force, so its implementation is a documented no-op. Mirrors Apple `setAudioOutputMode`.
+    fun setAudioOutputMode(mode: AudioOutputMode) {}
+
+    /// Live audio volume, 0..100, and mute without losing the level. Both engines override (mpv `volume`/
+    /// `mute`; ExoPlayer `player.volume` 0..1). Mirrors Apple `setVolume` / `setMuted`.
+    fun setVolume(volume0to100: Double) {}
+    fun setMuted(muted: Boolean) {}
+
+    /// The container's chapter markers, for a chapter picker. mpv reads `chapter-list`; ExoPlayer has no
+    /// generic chapter API, so it returns empty (a documented no-op). Mirrors Apple `chapters`.
+    fun chapters(): List<PlayerChapter> = emptyList()
+
+    /// A label -> value list of live playback stats (resolution, codecs, bitrate, hwdec) for a stats
+    /// overlay. Both engines override with what their API exposes. Mirrors Apple `playbackStats`.
+    fun playbackStats(): List<Pair<String, String>> = emptyList()
+
+    /// Grab the CURRENT video frame as JPEG bytes, downscaled so its width is at most [maxWidth]. This is
+    /// the capture primitive the community-trickplay pipeline feeds
+    /// ([com.vortx.android.trickplay.TrickplaySession]); it is the Android analogue of Apple's
+    /// `PlayerEngine.captureFrameJPEGData(maxWidth:completion:)`, re-shaped as a `suspend` function
+    /// because every Android caller is already a coroutine (Apple needs a completion handler only because
+    /// its libmpv grab is serviced asynchronously on the Metal VO thread).
+    ///
+    /// Returns null when this engine cannot read the frame back, which is NOT an error and must stay
+    /// fail-soft: the session simply captures nothing and the title stays a fetch-only consumer of the
+    /// community pool. The default is null so any future engine is safe by construction.
+    ///
+    /// PLATFORM REALITY, and why this is not symmetric with Apple. Apple reads pixels back in-process on
+    /// BOTH engines (a Metal texture blit off mpv's VO; `AVPlayerItemVideoOutput.copyPixelBuffer` off
+    /// AVPlayer). Neither Android engine has an equivalent that survives the DV mandate:
+    ///   - [ExoPlayerEngine] renders through a Media3 `PlayerView` in SURFACE_TYPE_SURFACE_VIEW mode. A
+    ///     `SurfaceView`'s buffers are owned by the compositor and are NOT readable by the app; the only
+    ///     readback route is `TextureView`, which the DV/HDR passthrough path explicitly rules out. So it
+    ///     returns null (a documented no-op, like its `setAudioDelay` / `setAudioOutputMode`).
+    ///   - The libmpv engine CAN ask mpv to write a screenshot, so it implements this. See
+    ///     `MpvPlayer.captureFrameJpeg` for the `hwdec=mediacodec` caveat that governs whether the grab
+    ///     actually yields a real frame on a given device.
+    suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
 
     /// Lifecycle. [onEnterBackground] drops video decode (and, per policy, pauses); [onEnterForeground]
     /// resumes. [release] tears the engine down; the instance is unusable afterward.
@@ -76,6 +139,17 @@ data class PlayerTrack(
     val title: String,
     val lang: String? = null,
     val selected: Boolean = false,
+    /// The container's FORCED disposition (mpv track-list `forced` / ExoPlayer `SELECTION_FLAG_FORCED`).
+    /// [TrackSelector] keys the forced-subtitle policy off this flag, not the title text, so real forced
+    /// tracks auto-enable even when they carry no "forced" label. Mirrors Apple `MPVTrack.forced`.
+    val forced: Boolean = false,
+)
+
+/// A single chapter marker from the container, for the chrome's chapter picker. `startMs` is the chapter
+/// start in milliseconds. Mirrors Apple `MPVChapter`.
+data class PlayerChapter(
+    val title: String,
+    val startMs: Long,
 )
 
 /// The immutable transport + track snapshot the chrome renders. The engine copies-on-write and
@@ -86,8 +160,11 @@ data class PlayerState(
     val isPaused: Boolean = false,
     val isBuffering: Boolean = false,
     val hasEnded: Boolean = false,
-    /// Set when the live engine reports an unrecoverable playback error (ExoPlayer's `onPlayerError`),
-    /// so the chrome can offer a return-to-sources fallback instead of a dead black frame.
+    /// Set when the live engine reports an unrecoverable playback error (ExoPlayer's `onPlayerError`;
+    /// the mpv engine's END_FILE-before-real-playback, its only reachable error signal since the JNI
+    /// seam drops the END_FILE reason), so the chrome can offer a return-to-sources fallback instead of
+    /// a dead black frame. Mutually exclusive with [hasEnded] by construction: a failed source must
+    /// never read as a finished one (the host's next-episode auto-advance keys off [hasEnded]).
     val hasError: Boolean = false,
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),

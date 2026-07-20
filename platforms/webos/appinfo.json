@@ -1,0 +1,15 @@
+{
+  "id": "com.vortx.tv",
+  "version": "0.1.0",
+  "vendor": "VortX",
+  "type": "web",
+  "main": "index.html",
+  "title": "VortX",
+  "appDescription": "Watch your add-on catalogs on the big screen. Direct, debrid, and HLS-first streaming.",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "bgColor": "#15120e",
+  "iconColor": "#d97706",
+  "handlesRelaunch": true,
+  "disableBackHistoryAPI": true
+}
