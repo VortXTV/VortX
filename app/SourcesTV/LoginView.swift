@@ -144,6 +144,9 @@ struct LoginView: View {
             .foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.sm)
-            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
+            // The shared text-entry glass, matching ServerConfigView / StremioImportView / AddonStoreView
+            // (the system UITextField chrome is already stood down by applyTextFieldAppearance, so this
+            // surface is the one that renders).
+            .vortxGlassField(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous))
     }
 }

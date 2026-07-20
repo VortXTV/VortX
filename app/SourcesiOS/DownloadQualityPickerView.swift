@@ -113,14 +113,10 @@ struct DownloadQualityPickerView: View {
             }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                    .fill(Theme.Palette.surface1)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                    .strokeBorder(Theme.Palette.hairline, lineWidth: 1)
-            )
+            // Shared list-row glass (flat shadow, card-weight fill) instead of a hand-rolled surface1 +
+            // hairline plate; the preset's own 1px top highlight replaces the stroke. Matches the stream
+            // rows on the detail screen. The accent "Recommended" badge keeps its solid fill: meaning surface.
+            .vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
         .buttonStyle(.plain)
     }

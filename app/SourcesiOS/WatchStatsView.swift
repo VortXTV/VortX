@@ -61,10 +61,9 @@ struct WatchStatsView: View {
             .foregroundStyle(Theme.Palette.textPrimary)
             .padding(.horizontal, Theme.Space.sm)
             .padding(.vertical, Theme.Space.xs)
-            .background(
-                Capsule(style: .continuous).fill(Theme.Palette.surface2)
-                    .overlay(Capsule(style: .continuous).stroke(Theme.Palette.hairline, lineWidth: 1))
-            )
+            // The shared glass chip (idle) instead of a hand-rolled surface2 capsule, so the scope menu
+            // reads as the same inline pill chrome as the rest of the app's chips.
+            .vortxGlassChip(selected: false)
         }
         .menuStyle(.borderlessButton)
     }
@@ -120,7 +119,7 @@ struct WatchStatsView: View {
         }
         .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
         .padding(Theme.Space.sm)
-        .background(cardBackground)
+        .vortxSettingsCard()
     }
 
     // MARK: Longest binge
@@ -258,15 +257,10 @@ struct WatchStatsView: View {
 
     // MARK: Card chrome
 
-    private var cardBackground: some View {
-        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-            .fill(Theme.Palette.surface1)
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                    .stroke(Theme.Palette.hairline, lineWidth: 1)
-            )
-    }
-
+    // Stat tiles and cards sit on the shared settings-card glass (`vortxSettingsCard`), the same surface
+    // the settings screens use, instead of a hand-rolled surface1 + hairline plate. The chart bar fills
+    // (StatBar) and the poster placeholder below keep their solid fills on purpose: chart magnitude and
+    // skeleton surfaces are meaning/loading surfaces, not chrome.
     private func card<Content: View>(title: LocalizedStringKey, icon: String,
                                      @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
@@ -280,7 +274,7 @@ struct WatchStatsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Theme.Space.md)
-        .background(cardBackground)
+        .vortxSettingsCard()
     }
 
     // MARK: Formatting
