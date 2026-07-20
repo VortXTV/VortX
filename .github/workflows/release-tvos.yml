@@ -63,13 +63,9 @@ jobs:
     # which alone gets `contents: write` and consumes this job's output strictly through the
     # artifact handoff.
     environment: engine-ci
-    # Pinned explicit runner label: `macos-latest` is a MOVING alias (it means the macOS 15 arm64
-    # image today, per actions/runner-images), and a silent alias flip -- e.g. to the macOS 26
-    # image -- would swap the entire Xcode set and SDKs under the release lane with no diff in
-    # this file. The Xcode-selection step below already copes with image rotation WITHIN a
-    # version; pinning the label keeps that rotation bounded. Moving to a newer image is a
-    # deliberate edit here, verified by a run, not an alias drift.
-    runs-on: macos-15
+    # Pin the known-good arm64 lane explicitly. `macos-latest` is a moving alias, while macos-15
+    # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
+    runs-on: macos-26
     timeout-minutes: 90
     # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
@@ -166,20 +162,59 @@ jobs:
       - name: Show toolchain
         id: toolchain
         run: |
-          xcodebuild -version
-          xcrun --sdk appletvos --show-sdk-version
-          echo "xcode_version=$(xcodebuild -version | tr ' \n' '-')" >> "$GITHUB_OUTPUT"
-          echo "tvos_sdk=$(xcrun --sdk appletvos --show-sdk-version)" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # Release floor established by the known-launching Beta 3 lane. Image rotation may add or
+          # remove toolchains, so the runner label alone is not authority: reject any silent downgrade.
+          XCODE_FLOOR="26.6"
+          TVOS_SDK_FLOOR="26.5"
 
-      - name: Free disk space (device-only build, no simulators needed)
+          version_at_least() {
+            /usr/bin/awk -v actual="$1" -v floor="$2" 'BEGIN {
+              actual_count = split(actual, actual_parts, ".")
+              floor_count = split(floor, floor_parts, ".")
+              count = actual_count > floor_count ? actual_count : floor_count
+              for (i = 1; i <= count; i++) {
+                actual_part = i <= actual_count ? actual_parts[i] + 0 : 0
+                floor_part = i <= floor_count ? floor_parts[i] + 0 : 0
+                if (actual_part > floor_part) exit 0
+                if (actual_part < floor_part) exit 1
+              }
+              exit 0
+            }'
+          }
+
+          XCODE_INFO="$(xcodebuild -version)"
+          XCODE_VERSION="$(printf '%s\n' "$XCODE_INFO" | /usr/bin/awk 'NR == 1 { print $2 }')"
+          TVOS_SDK="$(xcrun --sdk appletvos --show-sdk-version)"
+          printf '%s\n' "$XCODE_INFO"
+          echo "tvOS SDK $TVOS_SDK"
+
+          VERSION_RE='^[0-9]+(\.[0-9]+)*$'
+          if ! [[ "$XCODE_VERSION" =~ $VERSION_RE ]]; then
+            echo "::error::could not parse selected Xcode version: '$XCODE_VERSION'"
+            exit 1
+          fi
+          if ! [[ "$TVOS_SDK" =~ $VERSION_RE ]]; then
+            echo "::error::could not parse selected tvOS SDK version: '$TVOS_SDK'"
+            exit 1
+          fi
+          if ! version_at_least "$XCODE_VERSION" "$XCODE_FLOOR"; then
+            echo "::error::Xcode $XCODE_VERSION is below the release floor $XCODE_FLOOR"
+            exit 1
+          fi
+          if ! version_at_least "$TVOS_SDK" "$TVOS_SDK_FLOOR"; then
+            echo "::error::tvOS SDK $TVOS_SDK is below the release floor $TVOS_SDK_FLOOR"
+            exit 1
+          fi
+          echo "toolchain floor verified: Xcode $XCODE_VERSION >= $XCODE_FLOOR; tvOS SDK $TVOS_SDK >= $TVOS_SDK_FLOOR"
+          echo "xcode_version=$(printf '%s\n' "$XCODE_INFO" | tr ' \n' '-')" >> "$GITHUB_OUTPUT"
+          echo "tvos_sdk=$TVOS_SDK" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space while preserving the tvOS launch-smoke runtime
         run: |
           echo "Before:"; df -h /
-          # The runner ships multiple Xcodes + every simulator runtime (tens of GB). We build for DEVICE
-          # only (never the simulator), so the simulator runtimes are pure dead weight, and only the active
-          # Xcode is used. Freeing them gives `hdiutil` room to build the macOS .dmg, which failed with
-          # "No space left on device" on the Beta-12 cut (four MPVKit-GPL apps fill the disk).
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
-          sudo rm -rf ~/Library/Developer/CoreSimulator/* || true
+          # The launch smoke below needs one installed tvOS runtime, so keep simulator state until its
+          # verdict-preserving cleanup. Unused Xcodes and stale DerivedData are still safe to reclaim now.
           sudo rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
           # Keep the Xcode selected above ($SELECTED_XCODE, already canonicalized to its real path);
           # never delete the active one by re-deriving its path (the brittle string-compare that deleted
@@ -366,6 +401,161 @@ jobs:
           if [ -n "$MASKED" ]; then echo "::add-mask::$MASKED"; fi
           echo "masked=$MASKED" >> "$GITHUB_OUTPUT"
 
+      # A device Release product cannot be installed into CoreSimulator. Build the same current
+      # source as a Release simulator product and require it to remain alive after first launch.
+      - name: Smoke-test tvOS launch in a simulator (fail closed)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          BUNDLE_ID="com.stremiox.tv"
+          SIM_UDID=""
+          SMOKE_DERIVED="$PWD/app/build/ci-smoke"
+          SMOKE_TMP="$(mktemp -d)"
+
+          cleanup() {
+            cleanup_status="$1"
+            trap - EXIT INT TERM
+            set +e
+            if [ -n "${SIM_UDID:-}" ]; then
+              xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1
+              xcrun simctl shutdown "$SIM_UDID" >/dev/null 2>&1
+            fi
+            rm -rf "$SMOKE_DERIVED" "$SMOKE_TMP"
+            # These were retained by the earlier disk cleanup solely for this smoke. Device SDKs
+            # live inside Xcode, so reclaiming simulator runtimes here does not affect later builds.
+            sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* >/dev/null 2>&1
+            rm -rf "$HOME/Library/Developer/CoreSimulator"/* >/dev/null 2>&1
+            exit "$cleanup_status"
+          }
+          trap 'cleanup $?' EXIT
+          trap 'cleanup 130' INT
+          trap 'cleanup 143' TERM
+
+          version_at_least() {
+            /usr/bin/awk -v actual="$1" -v floor="$2" 'BEGIN {
+              actual_count = split(actual, actual_parts, ".")
+              floor_count = split(floor, floor_parts, ".")
+              count = actual_count > floor_count ? actual_count : floor_count
+              for (i = 1; i <= count; i++) {
+                actual_part = i <= actual_count ? actual_parts[i] + 0 : 0
+                floor_part = i <= floor_count ? floor_parts[i] + 0 : 0
+                if (actual_part > floor_part) exit 0
+                if (actual_part < floor_part) exit 1
+              }
+              exit 0
+            }'
+          }
+
+          SIM_ROW="$(
+            xcrun simctl list devices available -j | jq -r '
+              [
+                .devices
+                | to_entries[]
+                | select(.key | test("SimRuntime\\.tvOS-[0-9-]+$"))
+                | (.key | capture("tvOS-(?<version>[0-9-]+)$").version | gsub("-"; ".")) as $runtime
+                | .value[]
+                | select(.isAvailable == true)
+                | { runtime: $runtime, udid: .udid, name: .name }
+              ]
+              | sort_by(.runtime | split(".") | map(tonumber))
+              | reverse
+              | if length == 0 then empty else .[0] | [.udid, .runtime, .name] | @tsv end
+            '
+          )"
+          if [ -z "$SIM_ROW" ]; then
+            echo "::error::no available tvOS simulator device is installed"
+            exit 1
+          fi
+          IFS=$'\t' read -r SIM_UDID SIM_RUNTIME SIM_NAME <<< "$SIM_ROW"
+          VERSION_RE='^[0-9]+(\.[0-9]+)*$'
+          if ! [[ "$SIM_RUNTIME" =~ $VERSION_RE ]] || ! version_at_least "$SIM_RUNTIME" "18.0"; then
+            echo "::error::selected simulator runtime '$SIM_RUNTIME' is below the app floor 18.0 or malformed"
+            exit 1
+          fi
+          echo "selected tvOS $SIM_RUNTIME simulator: $SIM_NAME ($SIM_UDID)"
+
+          xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
+            -configuration Release -destination "platform=tvOS Simulator,id=$SIM_UDID" \
+            -derivedDataPath "$SMOKE_DERIVED" CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" \
+            TRAKT_CLIENT_ID="${{ secrets.TRAKT_CLIENT_ID }}" \
+            TRAKT_CLIENT_SECRET="${{ secrets.TRAKT_CLIENT_SECRET }}" \
+            SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
+            SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
+
+          SIM_APP="$SMOKE_DERIVED/Build/Products/Release-appletvsimulator/VortXTV.app"
+          if [ ! -d "$SIM_APP" ]; then
+            echo "::error::simulator build succeeded without the expected app at $SIM_APP"
+            exit 1
+          fi
+
+          xcrun simctl shutdown "$SIM_UDID" >/dev/null 2>&1 || true
+          xcrun simctl boot "$SIM_UDID"
+          xcrun simctl bootstatus "$SIM_UDID" -b > "$SMOKE_TMP/bootstatus.log" 2>&1 &
+          BOOTSTATUS_PID=$!
+          for _ in $(seq 1 60); do
+            if ! jobs -pr | grep -qx "$BOOTSTATUS_PID"; then break; fi
+            sleep 2
+          done
+          if jobs -pr | grep -qx "$BOOTSTATUS_PID"; then
+            kill "$BOOTSTATUS_PID" >/dev/null 2>&1 || true
+            wait "$BOOTSTATUS_PID" >/dev/null 2>&1 || true
+            cat "$SMOKE_TMP/bootstatus.log"
+            echo "::error::tvOS simulator did not finish booting within 120 seconds"
+            exit 1
+          fi
+          if ! wait "$BOOTSTATUS_PID"; then
+            cat "$SMOKE_TMP/bootstatus.log"
+            echo "::error::tvOS simulator bootstatus failed"
+            exit 1
+          fi
+
+          xcrun simctl install "$SIM_UDID" "$SIM_APP"
+
+          snapshot_crashes() {
+            {
+              for crash_root in \
+                "$HOME/Library/Logs/DiagnosticReports" \
+                "$HOME/Library/Logs/CrashReporter" \
+                "$HOME/Library/Logs/CoreSimulator/$SIM_UDID" \
+                "$HOME/Library/Developer/CoreSimulator/Devices/$SIM_UDID/data/Library/Logs/DiagnosticReports" \
+                "$HOME/Library/Developer/CoreSimulator/Devices/$SIM_UDID/data/Library/Logs/CrashReporter"; do
+                if [ -d "$crash_root" ]; then
+                  find "$crash_root" -type f \( -iname 'VortX*.crash' -o -iname 'VortX*.ips' \) -print 2>/dev/null || true
+                fi
+              done
+            } | LC_ALL=C sort -u
+          }
+
+          snapshot_crashes > "$SMOKE_TMP/crashes.before"
+          LAUNCH_OUTPUT="$(xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID")"
+          printf '%s\n' "$LAUNCH_OUTPUT"
+          APP_PID="$(printf '%s\n' "$LAUNCH_OUTPUT" | sed -n 's/.*: \([0-9][0-9]*\)$/\1/p' | tail -1)"
+          PID_RE='^[0-9]+$'
+          if ! [[ "$APP_PID" =~ $PID_RE ]]; then
+            echo "::error::simctl launch did not return a process id"
+            exit 1
+          fi
+
+          sleep 5
+          snapshot_crashes > "$SMOKE_TMP/crashes.after"
+          NEW_CRASHES="$(comm -13 "$SMOKE_TMP/crashes.before" "$SMOKE_TMP/crashes.after")"
+          alive=true
+          if ! kill -0 "$APP_PID" 2>/dev/null; then alive=false; fi
+
+          if [ "$alive" != true ]; then
+            echo "::error::$BUNDLE_ID process $APP_PID exited within the five-second launch window"
+          fi
+          if [ -n "$NEW_CRASHES" ]; then
+            echo "::error::new VortX crash report appeared during launch smoke"
+            printf '%s\n' "$NEW_CRASHES"
+          fi
+          if [ "$alive" != true ] || [ -n "$NEW_CRASHES" ]; then
+            exit 1
+          fi
+          echo "launch smoke verified: $BUNDLE_ID process $APP_PID remained alive with no new VortX crash report"
+
       - name: Build tvOS (Full)
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
@@ -415,6 +605,94 @@ jobs:
             SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
+      - name: Verify tvOS device artifact metadata (fail closed)
+        run: |
+          set -euo pipefail
+          EXPECTED_MINOS="18.0"
+          TVOS_SDK_FLOOR="26.5"
+
+          version_at_least() {
+            /usr/bin/awk -v actual="$1" -v floor="$2" 'BEGIN {
+              actual_count = split(actual, actual_parts, ".")
+              floor_count = split(floor, floor_parts, ".")
+              count = actual_count > floor_count ? actual_count : floor_count
+              for (i = 1; i <= count; i++) {
+                actual_part = i <= actual_count ? actual_parts[i] + 0 : 0
+                floor_part = i <= floor_count ? floor_parts[i] + 0 : 0
+                if (actual_part > floor_part) exit 0
+                if (actual_part < floor_part) exit 1
+              }
+              exit 0
+            }'
+          }
+
+          assert_tvos_build_version() {
+            label="$1"
+            binary="$2"
+            if [ ! -f "$binary" ]; then
+              echo "::error::$label executable is missing at $binary"
+              return 1
+            fi
+            if ! load_commands="$(otool -l "$binary" 2>&1)"; then
+              echo "::error::$label is not a readable Mach-O executable: $load_commands"
+              return 1
+            fi
+
+            build_version_count="$(printf '%s\n' "$load_commands" | /usr/bin/awk '$1 == "cmd" && $2 == "LC_BUILD_VERSION" { count++ } END { print count + 0 }')"
+            if [ "$build_version_count" -ne 1 ]; then
+              echo "::error::$label has $build_version_count LC_BUILD_VERSION commands; expected exactly 1"
+              return 1
+            fi
+            build_version="$(printf '%s\n' "$load_commands" | /usr/bin/awk '
+              $1 == "cmd" && $2 == "LC_BUILD_VERSION" { capture = 1; next }
+              capture && $1 == "Load" && $2 == "command" { exit }
+              capture { print }
+            ')"
+
+            platform_count="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "platform" { count++ } END { print count + 0 }')"
+            minos_count="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "minos" { count++ } END { print count + 0 }')"
+            sdk_count="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "sdk" { count++ } END { print count + 0 }')"
+            if [ "$platform_count" -ne 1 ] || [ "$minos_count" -ne 1 ] || [ "$sdk_count" -ne 1 ]; then
+              echo "::error::$label has malformed LC_BUILD_VERSION fields (platform=$platform_count minos=$minos_count sdk=$sdk_count)"
+              return 1
+            fi
+
+            platform="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "platform" { print $2 }')"
+            minos="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "minos" { print $2 }')"
+            sdk="$(printf '%s\n' "$build_version" | /usr/bin/awk '$1 == "sdk" { print $2 }')"
+            echo "$label LC_BUILD_VERSION: platform=$platform minos=$minos sdk=$sdk"
+
+            # otool prints Apple's PLATFORM_TVOS either as its numeric value 3 or as TVOS.
+            if [ "$platform" != "3" ] && [ "$platform" != "TVOS" ]; then
+              echo "::error::$label platform '$platform' is not tvOS"
+              return 1
+            fi
+            if [ "$minos" != "$EXPECTED_MINOS" ]; then
+              echo "::error::$label minos $minos does not equal the project floor $EXPECTED_MINOS"
+              return 1
+            fi
+            VERSION_RE='^[0-9]+(\.[0-9]+)*$'
+            if ! [[ "$sdk" =~ $VERSION_RE ]]; then
+              echo "::error::$label SDK '$sdk' is malformed"
+              return 1
+            fi
+            if ! version_at_least "$sdk" "$TVOS_SDK_FLOOR"; then
+              echo "::error::$label SDK $sdk is below the release floor $TVOS_SDK_FLOOR"
+              return 1
+            fi
+          }
+
+          assert_tvos_build_version \
+            "VortXTV" \
+            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/VortXTV"
+          assert_tvos_build_version \
+            "VortXTVLite" \
+            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app/VortXTVLite"
+          assert_tvos_build_version \
+            "VortXTopShelf" \
+            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/PlugIns/VortXTopShelf.appex/VortXTopShelf"
+          echo "tvOS artifact metadata verified for Full, Lite, and Top Shelf"
+
       - name: Package the IPAs
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
@@ -425,7 +703,7 @@ jobs:
           (cd out/lite && zip -qry ../VortX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../VortX-iOS-ci.ipa Payload)
           # Reclaim disk before building the .dmg: the IPAs are zipped now, so the tvOS/iOS build
-          # trees and the unzipped payloads are dead weight, and the macos-latest runner disk is
+          # trees and the unzipped payloads are dead weight, and the macos-26 runner disk is
           # tight (four MPVKit-GPL builds + node). Without this, `hdiutil create` failed with
           # "No space left on device" on the macOS leg (the empty-asset release for v0.3.6).
           rm -rf out/full/Payload out/lite/Payload out/ios/Payload
