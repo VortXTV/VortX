@@ -236,7 +236,7 @@ Torrents work on the Mac too (it bundles the streaming server). If you only use 
 
 ### Android (the .apk): sideload and open
 
-The Android app is a single APK that runs on both phone and Android TV. It is a beta, debug-signed for testing, so there is no Play Store listing yet.
+The Android app is a single APK that runs on both phone and Android TV. It is a beta, debug-signed for testing, so there is no Play Store listing yet. On Android TV or Fire TV, the quick way is the **Downloader** app: enter **`dl.vortx.tv`** and it always fetches the newest APK.
 
 1. From the [latest release](../../releases/latest), download `VortX-Android-vx.y.z.apk`.
 2. Open it from your browser or a file manager, and allow installs from that app when Android prompts (unknown-source installs stay blocked until you allow that one app).
