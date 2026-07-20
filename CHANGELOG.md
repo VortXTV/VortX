@@ -4,9 +4,9 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.3.14 Beta 4 - 2026-07-20
+## 0.3.14 Beta 5 - 2026-07-20
 
-The correctness beta. The headline is the end of wrong-episode playback: episode identity is now proven end to end, from the file a season pack or debrid source selects to the progress that gets saved. Around it, fixes from the Beta 3 field reports (thank you ozdek and konrepo for the detailed logs), the remaining Apple surfaces join the glass design, and Android ships in the same beta with Picture-in-Picture, gestures, system media controls, IPTV Live, and real downloads.
+The correctness beta. (Beta 4's tag was superseded before any download existed: its tag predated the final build-tooling commit, so this identical build recut as Beta 5 with the tag pointing at the exact built commit.) The headline is the end of wrong-episode playback: episode identity is now proven end to end, from the file a season pack or debrid source selects to the progress that gets saved. Around it, fixes from the Beta 3 field reports (thank you ozdek and konrepo for the detailed logs), the remaining Apple surfaces join the glass design, and Android ships in the same beta with Picture-in-Picture, gestures, system media controls, IPTV Live, and real downloads.
 
 ### Added
 
