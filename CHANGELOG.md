@@ -6,11 +6,11 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 Beta 6 - 2026-07-20
 
-A hotfix over Beta 5. Beta 5 could not launch on Apple TV: a build-configuration regression left the Apple TV targets without an explicit minimum tvOS version, so the build system defaulted them to the runner's newest SDK and the app demanded a tvOS version newer than any shipping Apple TV. It installed but bounced straight back to the Home screen. The minimum tvOS is now pinned to 18.0, matching the code's actual floor, and Apple TV opens normally. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.
+A hotfix over Beta 5. Beta 5 could not launch on Apple TV: the Settings screen had accumulated enough sections that its compiled view type grew too large for the tvOS runtime to construct at launch, and the release build (produced on a regressed CI toolchain lane) emitted it in a form the device runtime rejected, so the app crashed within a fraction of a second of starting and returned to the Home screen. Two-layer fix: the Settings screen is restructured so its type stays small regardless of how many sections it holds, and the release pipeline is pinned to the verified known-good toolchain with fail-closed minimum-OS assertions and an automatic launch-smoke check, so a build that does not open can no longer ship. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.
 
 ### Fixed
 
-- **Apple TV launches again.** The Apple TV minimum-OS regression from Beta 5 is fixed by pinning the tvOS deployment target explicitly. Apple TV.
+- **Apple TV launches again.** The Beta 5 Apple TV launch crash is fixed at its root (the Settings screen is restructured so its compiled type cannot overflow the runtime), and the release pipeline now verifies the toolchain, the minimum OS, and an actual launch before it can publish. Apple TV.
 
 ## 0.3.14 Beta 5 - 2026-07-20
 
