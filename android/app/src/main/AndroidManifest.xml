@@ -48,11 +48,22 @@
              only LAUNCHER activities appear; on a TV only LEANBACK_LAUNCHER ones do, so a single APK still
              serves both form factors (the uses-feature leanback/touchscreen required=false above is what
              lets that one APK install on each). -->
+        <!-- Picture-in-Picture (player). The player is a composable inside this activity, so the PiP
+             declaration lives here: supportsPictureInPicture is what makes setPictureInPictureParams /
+             enterPictureInPictureMode legal, and resizeableActivity is declared explicitly (not left to
+             the targetSdk default) because PiP is a resize. The player composition alone arms PiP
+             (auto-enter on S+, onUserLeaveHint below it) and revokes it when it leaves composition, so a
+             Home press on the browse shell never PiPs the app. configChanges adds
+             smallestScreenSize|screenLayout: the fullscreen-to-PiP transition changes BOTH, and without
+             them the activity (and the live player engine in it) would be recreated at the exact moment
+             the video should keep rolling seamlessly. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:theme="@style/Theme.VortX.Splash"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:supportsPictureInPicture="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -68,12 +79,19 @@
              is inherited from <application>; it is repeated here so the launcher tile resolves even on
              launchers that read the per-activity banner first. Same splash theme + configChanges as
              MainActivity so a TV cold start shows the identical brand splash. -->
+        <!-- Same PiP declaration as MainActivity: the TV shell hands playback to the same PlayerScreen,
+             and Android TV supports PiP (auto-enter on S+ TVs; older TVs and the pre-S Home press fall
+             back to the in-player PiP control, since only MainActivity carries the onUserLeaveHint
+             override). Harmless where the launcher/device lacks the PiP feature: the player probes the
+             system feature + this flag at runtime and stands down. -->
         <activity
             android:name=".ui.tv.TvActivity"
             android:exported="true"
             android:banner="@drawable/tv_banner"
             android:theme="@style/Theme.VortX.Splash"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:supportsPictureInPicture="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
