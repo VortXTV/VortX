@@ -29,7 +29,7 @@ import Combine
 /// One instance per detail screen (`@StateObject`). The source-list section consumes ONLY
 /// `groups` / `best`; it must not derive the list from CoreBridge inside `body` anymore.
 @MainActor
-final class SourceListModel: ObservableObject {
+final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
 
     // MARK: Published output (the ONLY thing the source-list UI observes)
 
@@ -73,6 +73,13 @@ final class SourceListModel: ObservableObject {
         let inputsHash: Int
     }
 
+    /// Sendable weak indirection for the detached worker's main-actor publish. Capturing `weak self` directly
+    /// and then closing over that mutable weak capture inside `MainActor.run` is rejected in Swift 6 mode.
+    private final class WeakOwner: @unchecked Sendable {
+        weak var value: SourceListModel?
+        init(_ value: SourceListModel) { self.value = value }
+    }
+
     private weak var core: CoreBridge?
     private weak var torbox: TorBoxSearchSource?
     private weak var singularity: SourceIndexServeSource?
@@ -97,6 +104,7 @@ final class SourceListModel: ObservableObject {
     func bind(core: CoreBridge, torbox: TorBoxSearchSource,
               singularity: SourceIndexServeSource, mediaServers: MediaServerSource,
               debridCache: DebridCacheAwareness) {
+        SourceIndexLifecycleScope.shared.register(self)
         guard subscriptions.isEmpty else {
             trigger.send()
             return
@@ -176,6 +184,9 @@ final class SourceListModel: ObservableObject {
         let raw = ctx.streamId.map { core.streamGroups(forStreamId: $0) } ?? core.streamGroups()
         let torboxStreams = torbox.streams
         let singularityStreams = singularity.streams
+        let singularityEpoch = singularity.epoch
+        let sourceLifecycle = SourceIndexLifecycleClock.snapshot()
+        let includedSingularity = !singularityStreams.isEmpty
         let mediaServerGroups = mediaServers.groups
         // Freeze the ranking prefs HERE, on the main actor. StreamRanking reads SourcePreferences live at
         // score/filter time; its excludeRegex/includeRegex refs + @Published flags are reassigned on the
@@ -183,8 +194,9 @@ final class SourceListModel: ObservableObject {
         // would race. The snapshot is installed as a task-local INSIDE the detached task (Task.detached
         // does not inherit task-locals), so the off-main rank reads this frozen copy, never the singleton.
         let prefsSnapshot = SourcePreferences.shared.snapshot()
+        let owner = WeakOwner(self)
 
-        Task.detached(priority: .userInitiated) { [weak self] in
+        Task.detached(priority: .userInitiated) {
             // STEP 3 (delete fix), belt and suspenders: CoreBridge.streamGroups() already subtracts
             // tombstoned add-ons at the streams layer; re-filtering the snapshot here keeps the model
             // correct even for a caller that fed it un-subtracted groups.
@@ -218,9 +230,18 @@ final class SourceListModel: ObservableObject {
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
 
             await MainActor.run {
-                guard let self else { return }
+                guard let self = owner.value else { return }
                 // A newer rebuild superseded this one mid-flight: discard the stale result.
                 guard gen == self.generation else { return }
+                guard singularity.permitsDetachedPublish(
+                    sourceEpoch: singularityEpoch,
+                    lifecycle: sourceLifecycle,
+                    includedSingularity: includedSingularity
+                ) else {
+                    self.pendingSignature = nil
+                    self.trigger.send()
+                    return
+                }
                 self.pendingSignature = nil
                 self.publishedSignature = signature
                 // HEALTH METRIC: one line per rebuild. More than ~4/sec on a loading title means the
@@ -241,5 +262,19 @@ final class SourceListModel: ObservableObject {
                                        cachedHashes: cachedHashes, prefs: prefsSnapshot,
                                        metaId: ctx.metaId)
         }
+    }
+
+    /// A Source Index gate closure must make every pooled row unselectable before the throttled rebuild can run.
+    /// Blank all derived choices, invalidate detached work and signatures, then request a clean ordinary-source
+    /// snapshot. The rebuild may repopulate non-Singularity groups while the Source Index gate stays closed.
+    func sourceIndexLifecycleDidClose(retiredSourceGeneration _: UInt64) {
+        generation &+= 1
+        pendingSignature = nil
+        publishedSignature = nil
+        groups = []
+        best = nil
+        tiers = []
+        resolutionOptions = []
+        trigger.send()
     }
 }

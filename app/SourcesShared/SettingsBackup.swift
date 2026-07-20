@@ -316,8 +316,26 @@ enum SettingsBackup {
     /// Callers MUST follow a successful restore with `reloadLiveStores()` on the main actor, or the restored
     /// values stay invisible until a relaunch AND the stale in-memory copies get flushed back over them.
     @discardableResult
+    @MainActor
     static func restore(from data: Data) throws -> Int {
         let pairs = try decodeDomain(from: data)
+        var restoredConsent: Bool?
+        var restoredServe: Bool?
+        for (key, value) in pairs {
+            switch migratedKey(key) {
+            case MoatConsent.key:
+                restoredConsent = (value as? Bool) ?? (value as? NSNumber)?.boolValue
+            case SourceIndexClient.serveKey:
+                restoredServe = (value as? Bool) ?? (value as? NSNumber)?.boolValue
+            default:
+                break
+            }
+        }
+        // Signal before UserDefaults writes so an off/on restore cannot be hidden by a coalesced notification.
+        SourceIndexLifecycleScope.shared.preferencesWillApply(
+            consent: restoredConsent,
+            serve: restoredServe
+        )
         let defaults = UserDefaults.standard
         for (key, value) in pairs {
             defaults.set(value, forKey: migratedKey(key))

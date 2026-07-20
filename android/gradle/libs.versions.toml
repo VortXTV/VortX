@@ -88,6 +88,8 @@ work = "2.10.0"
 # dependency first-party instead of leaning on a transitive. 4.12.0 also predates Kotlin 2.3.0 (it is
 # built on Kotlin 1.8/1.9-era metadata), so the pinned 2.2.10 compiler reads it with wide margin.
 okhttp = "4.12.0"
+junit = "4.13.2"
+jsonJvm = "20240303"
 
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
@@ -122,6 +124,8 @@ coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp"
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+json-jvm = { group = "org.json", name = "json", version.ref = "jsonJvm" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

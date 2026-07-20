@@ -98,7 +98,7 @@ struct TVPlayerView: View {
 
     // Community-subtitle system (pooled subs P2, sync offset P3, embedded upload P4). All fail-soft + gated.
     @State private var pooledSubs: [SubtitlePoolClient.PooledSubtitle] = []
-    @State private var pooledSubsKey = ""
+    @State private var subtitlePoolRequests = SubtitlePoolClient.RequestOwnership()
     @State private var addedPooledIDs: Set<Int> = []
     @State private var pooledSeededOffset = false
     @State private var embeddedUploadDone = false
@@ -2086,7 +2086,8 @@ struct TVPlayerView: View {
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
         // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
-        subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
+        subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
+        subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
         addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false; langContributeDone = false
         loadIntoPlayer(newURL, headers: curHeaders, live: curIsLive)
         startLoadTimeout()
@@ -3289,15 +3290,24 @@ struct TVPlayerView: View {
         refreshSubFingerprint()
         let fp = subFingerprint
         let key = "\(contentKey)#\(fp ?? "")"
-        guard key != pooledSubsKey else { return }
-        pooledSubsKey = key
+        guard let requestID = subtitlePoolRequests.beginFetch(dedupeKey: key) else { return }
         Task { @MainActor in
             // SERVE moat gate: the pooled-subtitle READ is login-only on the worker (no VortX sign-in -> empty
             // list, the pool "shows nothing" bug). Thread the real account flag like SourceIndexClient does, so a
             // signed-in device stamps X-VX-Moat and the worker serves the pool.
+            let signedIn = VortXSyncManager.shared.isSignedIn
+            let publicationFence = SubtitlePoolClient.PublicationFence(contentKey: contentKey)
             let result = await SubtitlePoolClient.fetchPooled(contentKey: contentKey, lang: nil, fingerprint: fp,
-                                                              isSignedIn: VortXSyncManager.shared.isSignedIn)
-            guard communityContentKey == contentKey else { return }   // title changed mid-fetch
+                                                              isSignedIn: signedIn)
+            let mayPublish = publicationFence.permits(
+                currentContentKey: communityContentKey,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
+            guard mayPublish else {
+                subtitlePoolRequests.finishFetch(requestID, published: false)
+                return
+            }
+            guard subtitlePoolRequests.finishFetch(requestID, published: true) else { return }
             pooledSubs = result.subs
             VXProbe.log("subs", "subs pooled n=\(result.subs.count)")
             // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
@@ -3321,18 +3331,51 @@ struct TVPlayerView: View {
     /// P2: load a pooled subtitle into the player, reusing the exact external-subtitle path (download to a
     /// local file, then mpv `sub-add`). Shows the shared Loading… row state. Fail-soft.
     private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
-        guard subtitleLoadingURL == nil else { return }
-        subtitleLoadingURL = sub.url.absoluteString
+        guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
+              MoatConsent.contributeAndConsume,
+              VortXSyncManager.shared.isSignedIn else { return }
+        let marker = sub.url.absoluteString
+        let downloadID = subtitlePoolRequests.beginDownload()
+        subtitleLoadingURL = marker
         if showOptions, panelKind == .subtitles { panelRows = optionRows }
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
-            guard let localURL = await SubtitlePoolClient.download(sub, isSignedIn: VortXSyncManager.shared.isSignedIn) else {
-                subtitleLoadingURL = nil
-                if showOptions, panelKind == .subtitles { panelRows = optionRows }
+            let signedIn = VortXSyncManager.shared.isSignedIn
+            let publicationFence = SubtitlePoolClient.PublicationFence(contentKey: sub.contentKey)
+            let downloaded = await SubtitlePoolClient.download(sub, isSignedIn: signedIn)
+            let mayPublishDownload = publicationFence.permits(
+                currentContentKey: communityContentKey,
+                isSignedIn: VortXSyncManager.shared.isSignedIn
+            )
+            guard mayPublishDownload else {
+                if subtitlePoolRequests.finishDownload(downloadID) {
+                    subtitleLoadingURL = nil
+                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                }
                 return
             }
+            guard let localURL = downloaded else {
+                if subtitlePoolRequests.finishDownload(downloadID) {
+                    subtitleLoadingURL = nil
+                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                }
+                return
+            }
+            guard let externalID = subtitlePoolRequests.beginExternal(after: downloadID) else { return }
             let title = pooledLabel(sub)
             coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
+                let mayPublishExternal = publicationFence.permits(
+                    currentContentKey: communityContentKey,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                )
+                guard mayPublishExternal else {
+                    if subtitlePoolRequests.finishExternal(externalID) {
+                        subtitleLoadingURL = nil
+                        if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                    }
+                    return
+                }
+                guard subtitlePoolRequests.finishExternal(externalID) else { return }
                 subtitleLoadingURL = nil
                 if ok { addedPooledIDs.insert(sub.id) }
                 if showOptions, panelKind == .subtitles { panelRows = optionRows }
@@ -3842,7 +3885,8 @@ struct TVPlayerView: View {
         currentPlaybackIsResume = false; resumeSourceReresolved = false
         // New episode: reset the community-subtitle session (new content key + fingerprint) so pooled subs,
         // the seeded offset, and the embedded upload all re-run against the new episode (P2/P3/P4).
-        subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
+        subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
+        subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
         addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
         // Re-arm the watched marker for the NEW episode. Without this, the first episode of a binge sets
         // markedWatched=true at ~90% and every in-place auto-advanced episode after it is blocked by the

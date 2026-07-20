@@ -2188,8 +2188,8 @@ struct CoreStreamList: View {
         // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
         .onChange(of: core.streamLoadProgress().loaded) { _ in scheduleSourceRefresh() }
         // The Singularity pool answers asynchronously (a network fetch), so re-run the debrid cache check when
-        // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
-        // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
+        // its streams arrive: each pooled torrent infohash is checked against the user's own debrid account
+        // and resolves per-user instead of merely rendering.
         .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
         // Reset the render window when the list collapses (so re-expanding starts fresh at the top) or the
         // title changes (a new list should not inherit the previous title's expanded window).
@@ -2203,6 +2203,9 @@ struct CoreStreamList: View {
                             mediaServers: mediaServers, debridCache: debridCache)
             torboxSearch.refresh(imdbId: imdbId)
             mediaServers.refresh(imdb: imdbId, title: meta?.name)
+            refreshSourceIndex()
+        }
+        .onChange(of: sourceContentID) { _ in
             refreshSourceIndex()
         }
         .onDisappear { sourceRefreshDebounce?.cancel() }
@@ -2304,9 +2307,10 @@ struct CoreStreamList: View {
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
-        guard let contentID = sourceContentID else { return }
+        let contentID = sourceContentID
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
+        guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
         // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
         // itself would be wrong.
@@ -2324,9 +2328,9 @@ struct CoreStreamList: View {
             try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
             guard !Task.isCancelled else { return }
             let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
-            // Pool-INCLUDED: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
-            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
-            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
+            // Pool-INCLUDED: cache awareness needs raw torrents and TorBox-search NZBs that the Direct-links-only
+            // filter would drop, plus Singularity's torrent-only pool sources. Torrents resolve through debrid;
+            // TorBox-search NZBs resolve through TorBox. This remains orthogonal to the display filter.
             debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
             refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
         }

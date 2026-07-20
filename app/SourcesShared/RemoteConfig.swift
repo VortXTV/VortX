@@ -416,6 +416,9 @@ final class ResolvedConfig: @unchecked Sendable {
 
 actor RemoteConfig {
     static let shared = RemoteConfig()
+    static let sourceIndexFeatureDidInstall = Notification.Name("vortx.remoteConfig.sourceIndexDidInstall")
+    static let sourceIndexOldValueKey = "oldSourceIndexEnabled"
+    static let sourceIndexNewValueKey = "newSourceIndexEnabled"
 
     /// The snapshot every reader consults. Backed by a lock, not a bare `var`: a plain `static var` of a class
     /// type read on the player path while the actor swaps it would race ARC (the reader's retain-on-load vs the
@@ -429,9 +432,40 @@ actor RemoteConfig {
         snapshotLock.lock(); defer { snapshotLock.unlock() }
         return _snapshot
     }
-    /// Atomically replace the snapshot (writer side; called only under the actor).
-    private static func install(_ resolved: ResolvedConfig) {
-        snapshotLock.lock(); _snapshot = resolved; snapshotLock.unlock()
+    private struct SourceIndexInstallEvent {
+        let oldValue: Bool
+        let newValue: Bool
+        let transition: SourceIndexLifecycleTransition?
+    }
+
+    /// Atomically replace the snapshot, then synchronously retire the old Source Index generation on this
+    /// installing thread. The later MainActor notification only clears UI state; stale work is fenced now.
+    private static func install(_ resolved: ResolvedConfig) -> SourceIndexInstallEvent {
+        snapshotLock.lock()
+        let oldValue = _snapshot.isFeatureOn(
+            "sourceIndex", default: RemoteConfigDefaults.featureSourceIndex
+        )
+        let newValue = resolved.isFeatureOn(
+            "sourceIndex", default: RemoteConfigDefaults.featureSourceIndex
+        )
+        _snapshot = resolved
+        snapshotLock.unlock()
+        let transition = oldValue && !newValue ? SourceIndexLifecycleClock.closeSource() : nil
+        return SourceIndexInstallEvent(oldValue: oldValue, newValue: newValue, transition: transition)
+    }
+
+    private func installAndAnnounce(_ resolved: ResolvedConfig) async {
+        let event = Self.install(resolved)
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: Self.sourceIndexFeatureDidInstall,
+                object: event.transition,
+                userInfo: [
+                    Self.sourceIndexOldValueKey: event.oldValue,
+                    Self.sourceIndexNewValueKey: event.newValue,
+                ]
+            )
+        }
     }
 
     // Networking.
@@ -450,13 +484,13 @@ actor RemoteConfig {
 
     /// (1) Synchronously load the last-good cached JSON from Application Support and build the snapshot (else
     /// all-baked). (2) Kick a background refresh. Never throws.
-    func bootstrap() {
+    func bootstrap() async {
         if let cached = Self.loadCachedJSON(), let decoded = try? JSONDecoder().decode(RemoteConfigData.self, from: cached) {
             currentRaw = cached
-            Self.install(Self.validate(decoded))   // clamp once at swap time
+            await installAndAnnounce(Self.validate(decoded))   // clamp once at swap time
         } else {
             currentRaw = nil
-            Self.install(.baked)
+            await installAndAnnounce(.baked)
         }
         startPeriodicIfNeeded()
         Task { await refresh() }
@@ -496,12 +530,12 @@ actor RemoteConfig {
             // master.remoteConfigEnabled == false => discard fetched config to baked (kill switch for the
             // whole system). Do NOT persist a disabling config as last-good, so removing the field restores it.
             if decoded.master?.remoteConfigEnabled == false {
-                Self.install(.baked)
+                await installAndAnnounce(.baked)
                 return
             }
 
             let resolved = Self.validate(decoded)
-            Self.install(resolved)                   // locked replace; readers see old-or-new, never torn
+            await installAndAnnounce(resolved)       // locked replace; readers see old-or-new, never torn
             currentRaw = data
             Self.persist(json: data, etag: http.value(forHTTPHeaderField: "Etag"))
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastFetchKey)

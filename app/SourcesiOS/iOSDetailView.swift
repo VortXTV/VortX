@@ -630,8 +630,8 @@ struct iOSDetailView: View {
             refreshLanguageChips()   // recompute the "Also available in" chips as more sources answer (own debounce)
         }
         // The Singularity pool answers asynchronously, so re-run the debrid cache check when its streams
-        // arrive: a pooled torrent's infoHash gets checked against the user's own debrid (and a pooled nzb
-        // against their TorBox), so pooled sources RESOLVE per-user, not just render.
+        // arrive: each pooled torrent infohash is checked against the user's own debrid, so it resolves
+        // per-user instead of merely rendering.
         .onChange(of: sourceIndex.streams.count) { _ in
             if effectiveType != "series" { scheduleSourceRefresh() }
         }
@@ -2086,8 +2086,9 @@ struct iOSDetailView: View {
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
-        guard let contentID = SourceIndexClient.contentID(imdbId: ratingsImdbID) else { return }
+        let contentID = SourceIndexClient.contentID(imdbId: ratingsImdbID)
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        guard let contentID else { return }
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
         // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
@@ -3510,6 +3511,9 @@ struct iOSEpisodeStreams: View {
             mediaServers.refresh(imdb: showImdbID, season: shownVideo.season, episode: shownVideo.episode, title: meta.name)
             refreshSourceIndex()
         }
+        .onChange(of: shownVideo.id) { _ in
+            refreshSourceIndex()
+        }
         // Binge-desync fix #4 (Back target): when the player cover dismisses, continuous play may have
         // advanced past the episode this page was pushed for - follow the engine's resume episode so Back
         // lands on the CURRENT episode and Watch-Now plays it, not the launch episode.
@@ -3969,8 +3973,9 @@ struct iOSEpisodeStreams: View {
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
     private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
-        guard let contentID = episodeContentID else { return }
+        let contentID = episodeContentID
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
+        guard let contentID else { return }
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
         let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(forStreamId: shownVideo.id))

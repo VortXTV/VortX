@@ -293,6 +293,7 @@ final class VortXSyncManager: ObservableObject {
         guard let str = Keychain.string(kcAccount), let data = str.data(using: .utf8),
               let p = try? JSONDecoder().decode(Persisted.self, from: data),
               let dk = Data(base64Encoded: p.dataKey) else { return }
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         token = p.token; account = p.account; dataKey = dk; isSignedIn = true
         reloadLastSyncStamp()   // show this account's persisted "last synced" immediately on relaunch
         // A Keychain-restored session (app relaunch / reinstall) sets isSignedIn WITHOUT going through
@@ -307,6 +308,7 @@ final class VortXSyncManager: ObservableObject {
     }
 
     func signOut() {
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         lastSyncAt = nil   // the persisted per-account stamp stays (keyed by account id), the live value clears
@@ -340,6 +342,7 @@ final class VortXSyncManager: ObservableObject {
     }
 
     private func adopt(token: String, account acct: [String: Any], dataKey: Data) {
+        SourceIndexLifecycleScope.shared.sessionWillMutate()
         self.token = token
         self.dataKey = dataKey
         self.account = Account(
