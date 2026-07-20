@@ -1787,6 +1787,7 @@ struct PlayerScreen: View {
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
+        subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         srcProbeLoadStart = Date()   // [src-probe] a reload is a fresh attempt: re-anchor the elapsed clock
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive)
         startLoadTimeout()
@@ -2086,6 +2087,7 @@ struct PlayerScreen: View {
         // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
         appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
+        subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         srcProbeLoadStart = Date()   // [src-probe] fresh mpv mount: re-anchor the elapsed clock
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
@@ -2134,6 +2136,7 @@ struct PlayerScreen: View {
         // subtitles yet, so drop the added-set tracking so the picker is honest and reapply can re-add cleanly.
         appliedSize = false; appliedVolume = false; appliedAutoTracks = false
         addedSubURLs = []; addedPooledIDs = []
+        subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the old engine; a stranded latch would gate every later pick
         hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
         srcProbeLoadStart = Date()
@@ -2394,6 +2397,7 @@ struct PlayerScreen: View {
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         configureCommunityTrickplayProvisional()
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false   // re-apply saved volume to the new engine
+        subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the new load's picks
         pendingSubtitleReapply = nil; suppressedResumeFloor = nil   // a real source change: drop any pending switch-scoped subtitle/resume state
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
@@ -3640,11 +3644,17 @@ struct PlayerScreen: View {
             if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
         }
         if let sub = pick {
+            // Bind the engine BEFORE latching anything: in the engine demote/switch render gap
+            // `coordinator.player` is nil, and an optional-chained call would swallow the completion,
+            // stranding `subtitleLoadingURL` (every later pick then silently no-ops). Returning WITHOUT
+            // latching `autoAddonSubTried` lets the next list/track completion retry on the live engine.
+            guard let player = coordinator.player else { return }
             autoAddonSubTried = true
             subtitleLoadingURL = sub.url
-            coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+            player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                 subtitleLoadingURL = nil
-                if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
+                if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                 refreshSoon()
                 VXProbe.log("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok ? "Y" : "N"))")
             }
@@ -3760,10 +3770,18 @@ struct PlayerScreen: View {
                 return
             }
             let title = pooledLabel(sub)
-            coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
+            // The engine can vanish DURING the await above (demote/switch render gap): an optional-chained
+            // call would swallow the completion and strand the Loading… latch, so unlatch and revert.
+            guard let player = coordinator.player else {
+                subtitleLoadingURL = nil
+                if panel == .subtitles { panelRows = rows(for: .subtitles) }
+                return
+            }
+            player.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
                 subtitleLoadingURL = nil
                 VXProbe.log("subs", "community subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
-                if ok { addedPooledIDs.insert(sub.id) } else if !auto { subtitleLoadFailed = true }
+                // Same still-live-engine gate as the add-on rows: never record an add the live engine never saw.
+                if ok, player === coordinator.player { addedPooledIDs.insert(sub.id) } else if !ok, !auto { subtitleLoadFailed = true }
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
             }
         }
@@ -4030,15 +4048,23 @@ struct PlayerScreen: View {
                         // slow or hanging subtitle endpoint can't freeze the player. The row shows Loading…
                         // until the track arrives (or an alert surfaces if it never does). A cached subtitle
                         // reuses its on-disk file and loads instantly (no network).
-                        guard subtitleLoadingURL == nil else { return }
+                        // Bind the engine BEFORE latching subtitleLoadingURL: `coordinator.player` is a weak
+                        // reference that is nil in the engine demote/switch render gap, and an optional-chained
+                        // call there would swallow the completion, stranding the latch so EVERY later subtitle
+                        // pick is silently dead for the session (the "stuck on Loading…" report).
+                        guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
                         userPickedSubtitle = true
                         subtitleLoadingURL = sub.url
                         VXProbe.log("subs", "add-on subtitle selected lang=\(sub.lang) src=\(sub.addonName)")
                         if panel == .subtitles { panelRows = rows(for: .subtitles) }   // reflect Loading… in place
-                        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                        player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                             subtitleLoadingURL = nil
                             VXProbe.log("subs", "add-on subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
-                            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) } else { subtitleLoadFailed = true }
+                            // Record the add ONLY when it landed on the still-live engine: a demote/switch
+                            // mid-download applies the sub to the dead engine, and recording it would drop
+                            // the row from the list with nothing rendering.
+                            if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                            else if !ok { subtitleLoadFailed = true }
                             if panel == .subtitles { panelRows = rows(for: .subtitles) }
                         }
                     })
