@@ -223,7 +223,7 @@ object DownloadManager {
         // Honor the concurrency cap: start now only if a slot is free, else create the record QUEUED and let it
         // start when a running download finishes / fails / is cancelled / paused (start-next-on-finish).
         synchronized(lock) {
-            val canStartNow = activeIds.size < _maxConcurrentDownloads.value
+            val canStartNow = hasFreeSlot()
             val record = DownloadRecord(
                 id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
                 season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
@@ -269,7 +269,7 @@ object DownloadManager {
             val record = DownloadStore.record(id) ?: return
             awaitingUnlock.remove(id)
             persistAwaitingUnlock()
-            if (activeIds.size >= _maxConcurrentDownloads.value) {
+            if (!hasFreeSlot()) {
                 DownloadStore.update(id) { it.copy(state = DownloadState.QUEUED, errorText = null) }
                 appendToQueueOrder(id)
                 return
@@ -296,7 +296,16 @@ object DownloadManager {
 
     // MARK: Queue manager (concurrency cap + reorder)
 
-    private fun clampConcurrency(value: Int): Int = value.coerceIn(CONCURRENCY_RANGE)
+    private fun clampConcurrency(value: Int): Int = DownloadQueuePolicy.clampConcurrency(value, CONCURRENCY_RANGE)
+
+    /**
+     * The concurrency-cap gate, funnelled through [DownloadQueuePolicy] so EVERY start path (create, resume, queue
+     * drain, cap raise) enforces the cap identically. Reads the live [activeIds] count, so it must be called under
+     * [lock] like the state it gates. Kept as a thin instance wrapper (rather than inlining the policy call at each
+     * site) so the four call sites stay a single readable predicate.
+     */
+    private fun hasFreeSlot(): Boolean =
+        DownloadQueuePolicy.canStartNow(activeIds.size, _maxConcurrentDownloads.value)
 
     /**
      * Set the max-concurrent-downloads cap. Clamped to [CONCURRENCY_RANGE] and persisted. RAISING the cap pulls
@@ -317,12 +326,8 @@ object DownloadManager {
      * Queued records in the exact order they will start: explicit [queueOrder] first, then `addedAt` for any id not
      * yet in the order list. The queue view and the drainer both read THIS, so what the user sees is what starts next.
      */
-    fun orderedQueuedRecords(): List<DownloadRecord> {
-        val rank = _queueOrder.value.withIndex().associate { (index, id) -> id to index }
-        return DownloadStore.records.value
-            .filter { it.state == DownloadState.QUEUED }
-            .sortedWith(compareBy({ rank[it.id] ?: Int.MAX_VALUE }, { it.addedAt }))
-    }
+    fun orderedQueuedRecords(): List<DownloadRecord> =
+        DownloadQueuePolicy.orderedQueued(DownloadStore.records.value, _queueOrder.value)
 
     /** Move a pending download one place earlier / later in the drain order. */
     fun moveQueuedEarlier(id: String) = reorderQueued(id, -1)
@@ -330,13 +335,10 @@ object DownloadManager {
 
     private fun reorderQueued(id: String, delta: Int) {
         synchronized(lock) {
-            val ids = orderedQueuedRecords().map { it.id }.toMutableList()
-            val from = ids.indexOf(id)
-            if (from < 0) return
-            val to = from + delta
-            if (to !in ids.indices) return // already first / last: nothing to do
-            java.util.Collections.swap(ids, from, to)
-            _queueOrder.value = ids
+            val ids = orderedQueuedRecords().map { it.id }
+            // null == nothing to do: the id is not queued, or it is already at the end it is being moved toward.
+            val reordered = DownloadQueuePolicy.reorder(ids, id, delta) ?: return
+            _queueOrder.value = reordered
             persistQueueOrder()
         }
     }
@@ -374,7 +376,7 @@ object DownloadManager {
      */
     private fun fillAvailableSlots() {
         fun queuedCount() = DownloadStore.records.value.count { it.state == DownloadState.QUEUED }
-        while (activeIds.size < _maxConcurrentDownloads.value) {
+        while (hasFreeSlot()) {
             val beforeActive = activeIds.size
             val beforeQueued = queuedCount()
             startNextQueued()
@@ -388,7 +390,7 @@ object DownloadManager {
      * no longer parses is marked failed and skipped, so one bad URL can't wedge the queue.
      */
     private fun startNextQueued() {
-        if (activeIds.size >= _maxConcurrentDownloads.value) return
+        if (!hasFreeSlot()) return
         val next = orderedQueuedRecords().firstOrNull() ?: return
         if (next.remoteURL.toHttpUrlOrNull() == null) {
             DownloadStore.update(next.id) { it.copy(state = DownloadState.FAILED, errorText = "Invalid source URL") }
@@ -418,14 +420,19 @@ object DownloadManager {
      * storage" with ample free space (a bug Apple explicitly fixed; the same arithmetic applies here).
      */
     fun storageShortfall(record: DownloadRecord): Boolean {
-        if (record.bytesTotal <= 0) return false
-        val remaining = (record.bytesTotal - record.bytesDone).coerceAtLeast(0)
-        if (remaining == 0L) return false
+        // Fast path: an unknown or already-complete size can't short the volume, so skip the StatFs syscall entirely
+        // (this also preserves "a fresh download / torrent is allowed through" without touching the disk). The two
+        // guards together are exactly the policy's own early-outs (bytesTotal <= 0, and remaining == 0 i.e.
+        // bytesDone >= bytesTotal), so the delegated call below only ever runs the real free-space comparison.
+        if (record.bytesTotal <= 0 || record.bytesDone >= record.bytesTotal) return false
         val free = runCatching {
             val stat = StatFs(DownloadStore.downloadsDirectory().absolutePath)
             stat.availableBlocksLong * stat.blockSizeLong
         }.getOrNull() ?: return false
-        return free < remaining + STORAGE_MARGIN_BYTES
+        return DownloadQueuePolicy.hasStorageShortfall(
+            bytesTotal = record.bytesTotal, bytesDone = record.bytesDone,
+            freeBytes = free, marginBytes = STORAGE_MARGIN_BYTES,
+        )
     }
 
     /** Apple's ~200 MB margin, kept: the OS wants headroom and a partial write should not wedge the volume. */

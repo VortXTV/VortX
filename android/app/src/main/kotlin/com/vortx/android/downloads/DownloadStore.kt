@@ -233,7 +233,7 @@ object DownloadStore {
      * filesystem, so it is cheap enough to call while rendering a grouped list. Feeds the per-show folder header.
      */
     fun recordedSize(records: List<DownloadRecord>): String =
-        formatBytes(records.sumOf { maxOf(it.bytesDone, it.bytesTotal) })
+        formatBytes(DownloadQueuePolicy.recordedSizeBytes(records))
 
     fun formatBytes(bytes: Long): String {
         val context = appContext ?: return "$bytes B"
