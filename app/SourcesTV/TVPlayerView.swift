@@ -1701,18 +1701,27 @@ struct TVPlayerView: View {
                         // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
                         // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
                         // until the track arrives (then it moves into the embedded list above).
-                        guard subtitleLoadingURL == nil else { return }
+                        // Bind the engine BEFORE latching subtitleLoadingURL: `coordinator.player` is a weak
+                        // reference that is nil in the engine demote/switch render gap (see
+                        // demoteAVPlayerToMPV's deferral note), and an optional-chained call there would
+                        // swallow the completion, stranding the latch so EVERY later subtitle pick is
+                        // silently dead for the session (the "stuck on Loading…" report).
+                        guard subtitleLoadingURL == nil, let player = coordinator.player else { return }
                         userPickedSubtitle = true
                         subtitleLoadingURL = sub.url
                         refreshTracksSoon()
-                        let subtitleLoadToken = coordinator.player?.activeLoadToken
+                        let subtitleLoadToken = player.activeLoadToken
                         let subtitleVideoID = curMeta?.videoId
-                        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                        player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                             guard permitsSubtitlePublication(
                                 loadToken: subtitleLoadToken, videoID: subtitleVideoID
                             ) else { return }
                             subtitleLoadingURL = nil
-                            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                            // Record the add ONLY when it landed on the still-live engine: a demote/switch
+                            // mid-download applies the sub to the dead engine, and recording it would drop
+                            // the row from the list with nothing rendering (dead until panel re-open).
+                            if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                            else if !ok { showEngineNote(String(localized: "Subtitle failed to load")) }   // honest failure (iOS shows an alert; tvOS showed nothing)
                             refreshTracksSoon()
                             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on ok=\(ok))")
                         }
@@ -2691,7 +2700,16 @@ struct TVPlayerView: View {
         subtitleTracks = coordinator.player?.tracks(ofType: "sub") ?? []
     }
     private func refreshTracksSoon() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { refreshTracks() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            refreshTracks()
+            // panelRows is a SNAPSHOT (the f874120 sources-panel perf fix), so an async completion that
+            // changes track state (an add-on subtitle finishing its download, an engine re-read) must
+            // rebuild an OPEN panel or its rows go stale: the clicked add-on row otherwise says
+            // "Loading…" forever, success or failure (the stuck-on-loading report). Mirrors iOS
+            // PlayerScreen.refreshSoon, which has always rebuilt the open panel here. The sources /
+            // episodes panels additionally keep their own 1 Hz refresher.
+            if showOptions { panelRows = optionRows }
+        }
     }
 
     /// Reflect a track choice in the panel IMMEDIATELY, before mpv confirms on the next refreshTracksSoon re-read
@@ -2947,6 +2965,7 @@ struct TVPlayerView: View {
         // self-clears the floor once the restored playhead passes it.
         let reconcileResume: Double? = hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : (resumeSeconds ?? suppressedResumeFloor)   // capture BEFORE the reset below zeroes hasStartedPlaying
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
+        subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
         // Carry the live position into the mpv re-load UNCONDITIONALLY (maybeResume reads resumeSeconds once
         // duration lands; appliedResume was re-armed above). Pre-start this is an exact no-op (reconcileResume
@@ -3022,6 +3041,7 @@ struct TVPlayerView: View {
         engineSwitchedAt = Date()           // grace window swallows a stale event from the outgoing engine
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false
         appliedAutoTracks = false; loadErrorMsg = ""
+        subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the old engine; a stranded latch would gate every later pick
         // The new engine loads no external subtitles yet: drop the added-set tracking so the picker is honest
         // and the subtitle reapply can re-add cleanly.
         addedSubURLs = []; addedPooledIDs = []
@@ -3518,6 +3538,7 @@ struct TVPlayerView: View {
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; loadErrorMsg = ""
+        subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
         startLoadTimeout()
     }
@@ -3621,14 +3642,20 @@ struct TVPlayerView: View {
             if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
         }
         if let sub = pick {
+            // Bind the engine BEFORE latching anything: in the engine demote/switch render gap
+            // `coordinator.player` is nil, and an optional-chained call would swallow the completion,
+            // stranding `subtitleLoadingURL` (every later pick then silently no-ops). Returning WITHOUT
+            // latching `autoAddonSubTried` lets the next list/track completion retry on the live engine.
+            guard let player = coordinator.player else { return }
             autoAddonSubTried = true
             subtitleLoadingURL = sub.url
-            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
-            coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+            player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                 guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
                 subtitleLoadingURL = nil
-                if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
+                if ok, player === coordinator.player { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
                 refreshTracksSoon()
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok))")
             }
@@ -3775,9 +3802,19 @@ struct TVPlayerView: View {
             }
             guard let externalID = subtitlePoolRequests.beginExternal(after: downloadID) else { return }
             let title = pooledLabel(sub)
-            let subtitleLoadToken = coordinator.player?.activeLoadToken
+            // The engine can vanish DURING the await above (demote/switch render gap): an optional-chained
+            // call would swallow the completion and strand the Loading… latch, so unlatch, close the
+            // request ledger entry, and revert.
+            guard let player = coordinator.player else {
+                if subtitlePoolRequests.finishExternal(externalID) {
+                    subtitleLoadingURL = nil
+                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                }
+                return
+            }
+            let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
-            coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
+            player.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
                 let mayPublishExternal = publicationFence.permits(
                     currentContentKey: communityContentKey,
                     isSignedIn: VortXSyncManager.shared.isSignedIn
@@ -3794,7 +3831,8 @@ struct TVPlayerView: View {
                 }
                 guard subtitlePoolRequests.finishExternal(externalID) else { return }
                 subtitleLoadingURL = nil
-                if ok { addedPooledIDs.insert(sub.id) }
+                // Same still-live-engine gate as the add-on rows: never record an add the live engine never saw.
+                if ok, player === coordinator.player { addedPooledIDs.insert(sub.id) }
                 if showOptions, panelKind == .subtitles { panelRows = optionRows }
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community ok=\(ok))")
             }
