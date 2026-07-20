@@ -318,18 +318,15 @@ struct SettingsView: View {
     /// The persistent Settings twin of the launch nag (MoveSeedingNagTV): while this Apple TV owes its
     /// first VortX-account sync it prompts (the keyboard-free QR sign-in via LoginView, plus the QR
     /// backup-direction flow); once seeded it confirms with the live last-sync time.
+    // Layout is the ORIGINAL inline builder (do not extract or wrap in an added VStack/Group: that
+    // changed the banner's proposed width, button width, and spatial-focus grouping). Type erasure is
+    // NOT applied here: the `section()` helper below returns AnyView, so this whole banner enters
+    // SettingsView.body as a single AnyView already, which is what bounds body's metadata. The nested
+    // conditional here forms only as `section`'s Content parameter, off body's own type. See
+    // DIS-260720-02 / FAIL-260720-114.
     @ViewBuilder private var seedingBanner: some View {
         section(String(localized: "Moving day")) {
-            // Type-erased body (see below). This is the deepest nested conditional in Settings and
-            // the exact frame the Beta 5 launch crash logs point at; keeping its content AnyView-wrapped
-            // is the second line of defence behind `section` also returning AnyView. See FAIL-260720-113.
-            seedingBannerContent
-        }
-    }
-
-    private var seedingBannerContent: AnyView {
-        if vortxSync.hasCompletedFirstSync {
-            return AnyView(
+            if vortxSync.hasCompletedFirstSync {
                 HStack(spacing: Theme.Space.md) {
                     Image(systemName: "checkmark.icloud.fill")
                         .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
@@ -342,10 +339,7 @@ struct SettingsView: View {
                     }
                     Spacer(minLength: 0)
                 }
-            )
-        }
-        return AnyView(
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
+            } else {
                 Label(MoveSeeding.headline, systemImage: "shippingbox.fill")
                     .font(Theme.Typography.body.weight(.semibold))
                     .foregroundStyle(Theme.Palette.textPrimary)
@@ -370,7 +364,7 @@ struct SettingsView: View {
                     .buttonStyle(ChipButtonStyle(selected: false))
                 }
             }
-        )
+        }
     }
 
     // MARK: Account
@@ -1391,13 +1385,17 @@ struct SettingsView: View {
 
     // MARK: Section chrome
 
-    // Returns AnyView on purpose (do NOT change back to `some View`). SettingsView.body stacks ~22
-    // of these; with each section carrying its own opaque generic Content type, body's compile-time
-    // generic type grew large enough that the tvOS runtime metadata demangler could not instantiate
-    // it, crashing the app at launch on tvOS 26.5 the moment the com.vortx `seedingBanner` was added
-    // (Beta 5, built against SDK 26.2). Type-erasing every section here bounds body's metadata to a
-    // small, uniform type so the launch crash cannot recur on any build toolchain. See
-    // DIS-260720-02 / FAIL-260720-113.
+    // Returns AnyView on purpose (do NOT change back to `some View`). SettingsView.body stacks ~20 of
+    // these; with each carrying its own opaque generic Content type, body's compile-time generic type
+    // grew large enough that the tvOS 26.5 runtime metadata demangler could not instantiate it,
+    // crashing the app ~0.2s after launch (Beta 5, built on the SDK 26.2 lane; five paired-device logs
+    // map the failing opaque reference to the outer body's playbackSection slot). Adding the com.vortx
+    // `seedingBanner` grew the outer body from 19 to 20 children and crossed that threshold. Returning
+    // AnyView here type-erases every section so the OUTER body metadata (the proven-failing type) stays
+    // small and uniform. Note: each section's generic Content still forms as this function's parameter,
+    // off body's own type, so this bounds the proven-failing outer metadata; it is not a proof against
+    // every possible toolchain. The release-lane toolchain pin plus a signed-device launch gate close
+    // the rest. See DIS-260720-02 / FAIL-260720-114 / XV-260720-65.
     private func section<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> AnyView {
         AnyView(
             VStack(alignment: .leading, spacing: Theme.Space.md) {
