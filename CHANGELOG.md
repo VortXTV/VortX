@@ -4,6 +4,14 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 6 - 2026-07-20
+
+A hotfix over Beta 5. Beta 5 could not launch on Apple TV: a build-configuration regression left the Apple TV targets without an explicit minimum tvOS version, so the build system defaulted them to the runner's newest SDK and the app demanded a tvOS version newer than any shipping Apple TV. It installed but bounced straight back to the Home screen. The minimum tvOS is now pinned to 18.0, matching the code's actual floor, and Apple TV opens normally. Everything in Beta 5 is carried forward unchanged; iPhone, iPad, Mac, and Android were never affected.
+
+### Fixed
+
+- **Apple TV launches again.** The Apple TV minimum-OS regression from Beta 5 is fixed by pinning the tvOS deployment target explicitly. Apple TV.
+
 ## 0.3.14 Beta 5 - 2026-07-20
 
 The correctness beta. (Beta 4 exists as a tag and release page but never carried a download: its tag predated the final build-tooling commit, and the pipeline refuses artifacts whose tag does not name the built commit, so Beta 5 completes the same feature work at build 185 with the tag on the exact built commit.) The headline is the end of wrong-episode playback: episode identity is now proven end to end, from the file a season pack or debrid source selects to the progress that gets saved. Around it, fixes from the Beta 3 field reports (thank you ozdek and konrepo for the detailed logs), the remaining Apple surfaces join the glass design, and Android ships in the same beta with Picture-in-Picture, gestures, system media controls, IPTV Live, and real downloads.
